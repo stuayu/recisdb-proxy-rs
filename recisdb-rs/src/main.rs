@@ -7,7 +7,10 @@ use log::{debug, info};
 mod channels;
 mod commands;
 mod context;
+#[cfg(feature = "database")]
+mod database;
 mod io;
+mod ts_analyzer;
 mod tuner;
 mod utils;
 

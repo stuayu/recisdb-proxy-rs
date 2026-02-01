@@ -1,0 +1,41 @@
+[package]
+name = "bondriver-proxy-client"
+version = "0.1.0"
+authors = ["maleicacid <maleicacid824+dev@gmail.com>"]
+edition = "2021"
+description = "BonDriver network proxy client DLL"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kazuki0824/recisdb-rs.git"
+
+[lib]
+crate-type = ["cdylib"]
+name = "BonDriver_NetworkProxy"
+
+[features]
+default = []
+tls = ["tokio-rustls", "rustls", "rustls-pemfile", "rustls-native-certs"]
+
+[dependencies]
+recisdb-protocol = { path = "../recisdb-protocol" }
+
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "sync", "io-util", "time", "macros"] }
+bytes = "1.5"
+futures = "0.3"
+
+log = "0.4"
+env_logger = "0.11"
+once_cell = "1.19"
+parking_lot = "0.12"
+chrono = "0.4"
+
+# TLS support (optional)
+tokio-rustls = { version = "0.25", optional = true }
+rustls = { version = "0.22", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.7", optional = true }
+
+# Windows-specific
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["minwindef", "winnt", "libloaderapi", "processthreadsapi"] }
+
+[build-dependencies]

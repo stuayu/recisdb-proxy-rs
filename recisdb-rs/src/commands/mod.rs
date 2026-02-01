@@ -15,6 +15,9 @@ use crate::tuner::{Tunable, UnTunedTuner};
 
 pub(crate) mod utils;
 
+#[cfg(feature = "database")]
+pub(crate) mod database;
+
 /// The behavior the user requested are returned.
 /// If an error occurred during preparation, the program bails out with expect().
 pub(crate) fn process_command(
@@ -53,7 +56,7 @@ pub(crate) fn process_command(
             );
 
             // Open tuner and tune to channel
-            let tuned = match UnTunedTuner::new(device, 0)
+            let tuned = match UnTunedTuner::new(device)
                 .map_err(|e| utils::error_handler::handle_opening_error(e.into()))
                 .unwrap()
                 .tune(channel, lnb)
@@ -193,7 +196,7 @@ pub(crate) fn process_command(
         #[cfg(windows)]
         Commands::Enumerate { device, space } => {
             // Open tuner
-            let untuned = UnTunedTuner::new(device, buf_sz)
+            let untuned = UnTunedTuner::new(device)
                 .map_err(|e| utils::error_handler::handle_opening_error(e.into()))
                 .unwrap();
             if let Some(spacename_channels) = untuned.enum_channels(space) {
@@ -204,6 +207,93 @@ pub(crate) fn process_command(
             } else {
                 std::process::exit(1)
             }
+        }
+
+        #[cfg(feature = "database")]
+        Commands::Scan {
+            device,
+            range,
+            broadcast_type,
+            database,
+            timeout,
+            lnb,
+            continue_on_error,
+            verbose,
+        } => {
+            let exit_code = database::cmd_scan(
+                device,
+                range,
+                broadcast_type,
+                database,
+                timeout,
+                lnb,
+                continue_on_error,
+                verbose,
+            );
+            std::process::exit(exit_code)
+        }
+
+        #[cfg(feature = "database")]
+        Commands::Show {
+            database,
+            format,
+            broadcast_type,
+            nid,
+            tsid,
+            enabled_only,
+            sort,
+        } => {
+            let exit_code = database::cmd_show(
+                database,
+                format,
+                broadcast_type,
+                nid,
+                tsid,
+                enabled_only,
+                sort,
+            );
+            std::process::exit(exit_code)
+        }
+
+        #[cfg(feature = "database")]
+        Commands::Query {
+            database,
+            name,
+            sid,
+            nid,
+            tsid,
+            remote_key,
+            format,
+            detail,
+        } => {
+            let exit_code = database::cmd_query(
+                database,
+                name,
+                sid,
+                nid,
+                tsid,
+                remote_key,
+                format,
+                detail,
+            );
+            std::process::exit(exit_code)
+        }
+
+        #[cfg(feature = "database")]
+        Commands::Driver { action } => {
+            use crate::context::DriverAction;
+            let exit_code = match action {
+                DriverAction::Add { path, name, database: db } => {
+                    database::cmd_driver_add(path, name, db)
+                }
+                DriverAction::List { database: db, format } => {
+                    database::cmd_driver_list(db, format)
+                }
+                DriverAction::Remove { id_or_path, database: db, yes } => {
+                    database::cmd_driver_remove(id_or_path, db, yes)
+                }
+            };
+            std::process::exit(exit_code)
         }
     }
 }

@@ -1,0 +1,1628 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>BonDriver&#x81ea;&#x52d5;&#x30c1;&#x30e3;&#x30f3;&#x30cd;&#x30eb;&#x30b9;&#x30ad;&#x30e3;&#x30f3; &plus; DB&#x4fdd;&#x5b58;&#x5b9f;&#x88c5;&#x8a08;&#x753b;</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <h1 id="bondriver自動チャンネルスキャン--db保存実装計画">BonDriver自動チャンネルスキャン + DB保存実装計画</h1>
+<h2 id="1-データベース設計">1. データベース設計</h2>
+<h3 id="11-dbスクリーマ">1.1 DBスクリーマ</h3>
+<pre><code class="language-sql"><span class="hljs-comment">-- BonDriverごとのスキャン履歴管理</span>
+<span class="hljs-keyword">CREATE</span> <span class="hljs-keyword">TABLE</span> bon_drivers (
+    id <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">PRIMARY</span> KEY AUTOINCREMENT,
+    dll_path TEXT <span class="hljs-keyword">UNIQUE</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,
+    driver_name TEXT,
+    last_scan <span class="hljs-type">INTEGER</span>,
+    version TEXT,
+    created_at <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">DEFAULT</span> (strftime(<span class="hljs-string">&#x27;%s&#x27;</span>, <span class="hljs-string">&#x27;now&#x27;</span>)),
+    updated_at <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">DEFAULT</span> (strftime(<span class="hljs-string">&#x27;%s&#x27;</span>, <span class="hljs-string">&#x27;now&#x27;</span>))
+);
+
+<span class="hljs-comment">-- チャンネル情報データベース</span>
+<span class="hljs-keyword">CREATE</span> <span class="hljs-keyword">TABLE</span> channels (
+    id <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">PRIMARY</span> KEY AUTOINCREMENT,
+    bon_driver_id <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,
+    nid <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,           <span class="hljs-comment">-- ネットワークID</span>
+    sid <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,           <span class="hljs-comment">-- サービスID</span>
+    tsid <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,          <span class="hljs-comment">-- トランスポートストリームID</span>
+    manual_sheet <span class="hljs-type">INTEGER</span>,           <span class="hljs-comment">-- マニュアル枝番 (明示的に分けたい場合)</span>
+    raw_name TEXT,                  <span class="hljs-comment">-- 原始チャンネル名</span>
+    channel_name TEXT,              <span class="hljs-comment">-- チャンネル表示名</span>
+    physical_ch <span class="hljs-type">INTEGER</span>,            <span class="hljs-comment">-- 物理チャンネル番号</span>
+    is_enabled <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">DEFAULT</span> <span class="hljs-number">1</span>,
+    scan_time <span class="hljs-type">INTEGER</span>,              <span class="hljs-comment">-- スキャン日時</span>
+    service_type <span class="hljs-type">INTEGER</span>,           <span class="hljs-comment">-- サービス種別 (TV/Radio/Data)</span>
+    network_name TEXT,              <span class="hljs-comment">-- ネットワーク名 (BS/CSなど)</span>
+    <span class="hljs-keyword">UNIQUE</span>(bon_driver_id, nid, sid, tsid, manual_sheet)
+);
+
+<span class="hljs-comment">-- スキャン履歴ログ</span>
+<span class="hljs-keyword">CREATE</span> <span class="hljs-keyword">TABLE</span> scan_history (
+    id <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">PRIMARY</span> KEY AUTOINCREMENT,
+    bon_driver_id <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">NULL</span>,
+    scan_time <span class="hljs-type">INTEGER</span> <span class="hljs-keyword">DEFAULT</span> (strftime(<span class="hljs-string">&#x27;%s&#x27;</span>, <span class="hljs-string">&#x27;now&#x27;</span>)),
+    channel_count <span class="hljs-type">INTEGER</span>,
+    success <span class="hljs-type">INTEGER</span>,
+    error_message TEXT
+);
+
+<span class="hljs-comment">-- インデックス</span>
+<span class="hljs-keyword">CREATE</span> INDEX idx_channels_bon_driver <span class="hljs-keyword">ON</span> channels(bon_driver_id);
+<span class="hljs-keyword">CREATE</span> INDEX idx_channels_nid_sid_tsid <span class="hljs-keyword">ON</span> channels(nid, sid, tsid);
+<span class="hljs-keyword">CREATE</span> INDEX idx_channels_enabled <span class="hljs-keyword">ON</span> channels(is_enabled);
+<span class="hljs-keyword">CREATE</span> INDEX idx_scan_history_bon_driver <span class="hljs-keyword">ON</span> scan_history(bon_driver_id);
+</code></pre>
+<h3 id="12-データモデル">1.2 データモデル</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// database/models.rs</span>
+<span class="hljs-keyword">use</span> rusqlite::{Connection, <span class="hljs-type">Result</span>, params};
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">BonDriverInfo</span> {
+    <span class="hljs-keyword">pub</span> id: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> dll_path: <span class="hljs-type">String</span>,
+    <span class="hljs-keyword">pub</span> driver_name: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    <span class="hljs-keyword">pub</span> last_scan: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">i64</span>&gt;,
+    <span class="hljs-keyword">pub</span> version: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    <span class="hljs-keyword">pub</span> created_at: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> updated_at: <span class="hljs-type">i64</span>,
+}
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">ChannelInfo</span> {
+    <span class="hljs-keyword">pub</span> id: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> bon_driver_id: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> nid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> sid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> tsid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    <span class="hljs-keyword">pub</span> raw_name: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    <span class="hljs-keyword">pub</span> channel_name: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    <span class="hljs-keyword">pub</span> physical_ch: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u8</span>&gt;,
+    <span class="hljs-keyword">pub</span> is_enabled: <span class="hljs-type">bool</span>,
+    <span class="hljs-keyword">pub</span> scan_time: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> service_type: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u8</span>&gt;,
+    <span class="hljs-keyword">pub</span> network_name: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+}
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">ScanHistory</span> {
+    <span class="hljs-keyword">pub</span> id: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> bon_driver_id: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> scan_time: <span class="hljs-type">i64</span>,
+    <span class="hljs-keyword">pub</span> channel_count: <span class="hljs-type">i32</span>,
+    <span class="hljs-keyword">pub</span> success: <span class="hljs-type">bool</span>,
+    <span class="hljs-keyword">pub</span> error_message: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+}
+</code></pre>
+<h2 id="2-データベースモジュール実装">2. データベースモジュール実装</h2>
+<h3 id="21-データベース接続管理">2.1 データベース接続管理</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// database/mod.rs</span>
+<span class="hljs-keyword">use</span> rusqlite::{Connection, <span class="hljs-type">Result</span>};
+<span class="hljs-keyword">use</span> std::path::Path;
+<span class="hljs-keyword">use</span> std::sync::{Arc, Mutex};
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">Database</span> {
+    conn: Arc&lt;Mutex&lt;Connection&gt;&gt;,
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">Database</span> {
+    <span class="hljs-comment">/// 新規DBまたは既存DBを開く</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">new</span>(db_path: &amp;<span class="hljs-type">str</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-keyword">Self</span>&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = Connection::<span class="hljs-title function_ invoke__">open</span>(db_path)?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">db</span> = Database {
+            conn: Arc::<span class="hljs-title function_ invoke__">new</span>(Mutex::<span class="hljs-title function_ invoke__">new</span>(conn)),
+        };
+        db.<span class="hljs-title function_ invoke__">init_tables</span>()?;
+        <span class="hljs-title function_ invoke__">Ok</span>(db)
+    }
+
+    <span class="hljs-comment">/// データベース初期化（スクリーマ作成）</span>
+    <span class="hljs-keyword">fn</span> <span class="hljs-title function_">init_tables</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;()&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        conn.<span class="hljs-title function_ invoke__">execute_batch</span>(<span class="hljs-string">&quot;
+            CREATE TABLE IF NOT EXISTS bon_drivers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dll_path TEXT UNIQUE NOT NULL,
+                driver_name TEXT,
+                last_scan INTEGER,
+                version TEXT,
+                created_at INTEGER DEFAULT (strftime(&#x27;%s&#x27;, &#x27;now&#x27;)),
+                updated_at INTEGER DEFAULT (strftime(&#x27;%s&#x27;, &#x27;now&#x27;))
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bon_driver_id INTEGER NOT NULL,
+                nid INTEGER NOT NULL,
+                sid INTEGER NOT NULL,
+                tsid INTEGER NOT NULL,
+                manual_sheet INTEGER,
+                raw_name TEXT,
+                channel_name TEXT,
+                physical_ch INTEGER,
+                is_enabled INTEGER DEFAULT 1,
+                scan_time INTEGER,
+                service_type INTEGER,
+                network_name TEXT,
+                UNIQUE(bon_driver_id, nid, sid, tsid, manual_sheet),
+                FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bon_driver_id INTEGER NOT NULL,
+                scan_time INTEGER DEFAULT (strftime(&#x27;%s&#x27;, &#x27;now&#x27;)),
+                channel_count INTEGER,
+                success INTEGER,
+                error_message TEXT,
+                FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_channels_bon_driver ON channels(bon_driver_id);
+            CREATE INDEX IF NOT EXISTS idx_channels_nid_sid_tsid ON channels(nid, sid, tsid);
+            CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(is_enabled);
+            CREATE INDEX IF NOT EXISTS idx_scan_history_bon_driver ON scan_history(bon_driver_id);
+        &quot;</span>)?;
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(())
+    }
+
+    <span class="hljs-comment">/// 共通接続取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">connection</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> Arc&lt;Mutex&lt;Connection&gt;&gt; {
+        <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">clone</span>()
+    }
+}
+</code></pre>
+<h3 id="22-bondriver管理">2.2 BonDriver管理</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// database/bon_driver.rs</span>
+<span class="hljs-keyword">use</span> rusqlite::{params, <span class="hljs-type">Result</span>};
+<span class="hljs-keyword">use</span> std::time::{SystemTime, UNIX_EPOCH};
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">Database</span> {
+    <span class="hljs-comment">/// BonDriver情報を登録または更新</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">upsert_bon_driver</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        dll_path: &amp;<span class="hljs-type">str</span>,
+        driver_name: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+        version: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">i64</span>&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">now</span> = SystemTime::<span class="hljs-title function_ invoke__">now</span>()
+            .<span class="hljs-title function_ invoke__">duration_since</span>(UNIX_EPOCH)
+            .<span class="hljs-title function_ invoke__">unwrap</span>()
+            .<span class="hljs-title function_ invoke__">as_secs</span>() <span class="hljs-keyword">as</span> <span class="hljs-type">i64</span>;
+
+        conn.<span class="hljs-title function_ invoke__">execute</span>(
+            <span class="hljs-string">&quot;INSERT OR REPLACE INTO bon_drivers 
+             (dll_path, driver_name, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4)&quot;</span>,
+            params![dll_path, driver_name, version, now],
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">id</span> = conn.<span class="hljs-title function_ invoke__">last_insert_rowid</span>();
+        <span class="hljs-title function_ invoke__">Ok</span>(id)
+    }
+
+    <span class="hljs-comment">/// BonDriver IDを取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_bon_driver_id</span>(&amp;<span class="hljs-keyword">self</span>, dll_path: &amp;<span class="hljs-type">str</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Option</span>&lt;<span class="hljs-type">i64</span>&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT id FROM bon_drivers WHERE dll_path = ?1&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query</span>(params![dll_path])?;
+        
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(row) = rows.<span class="hljs-title function_ invoke__">next</span>()? {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-title function_ invoke__">Some</span>(row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?))
+        } <span class="hljs-keyword">else</span> {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-literal">None</span>)
+        }
+    }
+
+    <span class="hljs-comment">/// すべてのBonDriverを取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_all_bon_drivers</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;(<span class="hljs-type">i64</span>, <span class="hljs-type">String</span>, <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;)&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT id, dll_path, driver_name FROM bon_drivers ORDER BY updated_at DESC&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query_map</span>(params![], |row| {
+            <span class="hljs-title function_ invoke__">Ok</span>((
+                row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?,
+                row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">1</span>)?,
+                row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">2</span>)?,
+            ))
+        })?;
+        
+        rows.collect::&lt;<span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;_&gt;&gt;&gt;()
+    }
+}
+</code></pre>
+<h3 id="23-チャンネル情報管理">2.3 チャンネル情報管理</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// database/channel.rs</span>
+<span class="hljs-keyword">use</span> rusqlite::{params, <span class="hljs-type">Result</span>};
+<span class="hljs-keyword">use</span> crate::channels::ChannelType;
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">Database</span> {
+    <span class="hljs-comment">/// チャンネル情報を保存</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">save_channel</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+        nid: <span class="hljs-type">u16</span>,
+        sid: <span class="hljs-type">u16</span>,
+        tsid: <span class="hljs-type">u16</span>,
+        manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+        raw_name: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+        channel_name: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+        physical_ch: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u8</span>&gt;,
+        service_type: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u8</span>&gt;,
+        network_name: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;()&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">now</span> = SystemTime::<span class="hljs-title function_ invoke__">now</span>()
+            .<span class="hljs-title function_ invoke__">duration_since</span>(UNIX_EPOCH)
+            .<span class="hljs-title function_ invoke__">unwrap</span>()
+            .<span class="hljs-title function_ invoke__">as_secs</span>() <span class="hljs-keyword">as</span> <span class="hljs-type">i64</span>;
+
+        conn.<span class="hljs-title function_ invoke__">execute</span>(
+            <span class="hljs-string">&quot;INSERT OR REPLACE INTO channels 
+             (bon_driver_id, nid, sid, tsid, manual_sheet, raw_name, 
+              channel_name, physical_ch, scan_time, service_type, network_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)&quot;</span>,
+            params![
+                bon_driver_id,
+                nid,
+                sid,
+                tsid,
+                manual_sheet,
+                raw_name,
+                channel_name,
+                physical_ch,
+                now,
+                service_type,
+                network_name,
+            ],
+        )?;
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(())
+    }
+
+    <span class="hljs-comment">/// チャンネル情報を取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_channels_by_bon_driver</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;ChannelInfo&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT id, bon_driver_id, nid, sid, tsid, manual_sheet, raw_name,
+                    channel_name, physical_ch, is_enabled, scan_time, 
+                    service_type, network_name
+             FROM channels 
+             WHERE bon_driver_id = ?1 AND is_enabled = 1
+             ORDER BY nid, sid, tsid&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query_map</span>(params![bon_driver_id], |row| {
+            <span class="hljs-title function_ invoke__">Ok</span>(ChannelInfo {
+                id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?,
+                bon_driver_id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">1</span>)?,
+                nid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">2</span>)?,
+                sid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">3</span>)?,
+                tsid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">4</span>)?,
+                manual_sheet: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">5</span>)?,
+                raw_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">6</span>)?,
+                channel_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">7</span>)?,
+                physical_ch: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">8</span>)?,
+                is_enabled: row.get::&lt;_, <span class="hljs-type">i32</span>&gt;(<span class="hljs-number">9</span>)? == <span class="hljs-number">1</span>,
+                scan_time: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">10</span>)?,
+                service_type: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">11</span>)?,
+                network_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">12</span>)?,
+            })
+        })?;
+        
+        rows.collect::&lt;<span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;_&gt;&gt;&gt;()
+    }
+
+    <span class="hljs-comment">/// チャンネルを検索（NID/SID/TSID/ManSheetで）</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">find_channel</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+        nid: <span class="hljs-type">u16</span>,
+        sid: <span class="hljs-type">u16</span>,
+        tsid: <span class="hljs-type">u16</span>,
+        manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Option</span>&lt;ChannelInfo&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT id, bon_driver_id, nid, sid, tsid, manual_sheet, raw_name,
+                    channel_name, physical_ch, is_enabled, scan_time,
+                    service_type, network_name
+             FROM channels 
+             WHERE bon_driver_id = ?1 AND nid = ?2 AND sid = ?3 AND tsid = ?4 
+                   AND (manual_sheet IS NULL OR manual_sheet = ?5)&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query</span>(params![
+            bon_driver_id, 
+            nid, 
+            sid, 
+            tsid, 
+            manual_sheet
+        ])?;
+        
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(row) = rows.<span class="hljs-title function_ invoke__">next</span>()? {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-title function_ invoke__">Some</span>(ChannelInfo {
+                id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?,
+                bon_driver_id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">1</span>)?,
+                nid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">2</span>)?,
+                sid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">3</span>)?,
+                tsid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">4</span>)?,
+                manual_sheet: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">5</span>)?,
+                raw_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">6</span>)?,
+                channel_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">7</span>)?,
+                physical_ch: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">8</span>)?,
+                is_enabled: row.get::&lt;_, <span class="hljs-type">i32</span>&gt;(<span class="hljs-number">9</span>)? == <span class="hljs-number">1</span>,
+                scan_time: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">10</span>)?,
+                service_type: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">11</span>)?,
+                network_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">12</span>)?,
+            }))
+        } <span class="hljs-keyword">else</span> {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-literal">None</span>)
+        }
+    }
+
+    <span class="hljs-comment">/// TSIDを含めた検索</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">find_by_tsid</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+        tsid: <span class="hljs-type">u16</span>,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;ChannelInfo&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT id, bon_driver_id, nid, sid, tsid, manual_sheet, raw_name,
+                    channel_name, physical_ch, is_enabled, scan_time,
+                    service_type, network_name
+             FROM channels 
+             WHERE bon_driver_id = ?1 AND tsid = ?2 AND is_enabled = 1
+             ORDER BY nid, sid&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query_map</span>(params![bon_driver_id, tsid], |row| {
+            <span class="hljs-title function_ invoke__">Ok</span>(ChannelInfo {
+                id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?,
+                bon_driver_id: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">1</span>)?,
+                nid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">2</span>)?,
+                sid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">3</span>)?,
+                tsid: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">4</span>)?,
+                manual_sheet: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">5</span>)?,
+                raw_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">6</span>)?,
+                channel_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">7</span>)?,
+                physical_ch: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">8</span>)?,
+                is_enabled: row.get::&lt;_, <span class="hljs-type">i32</span>&gt;(<span class="hljs-number">9</span>)? == <span class="hljs-number">1</span>,
+                scan_time: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">10</span>)?,
+                service_type: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">11</span>)?,
+                network_name: row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">12</span>)?,
+            })
+        })?;
+        
+        rows.collect::&lt;<span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;_&gt;&gt;&gt;()
+    }
+}
+</code></pre>
+<h3 id="24-スキャン履歴管理">2.4 スキャン履歴管理</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// database/scan_history.rs</span>
+<span class="hljs-keyword">use</span> rusqlite::{params, <span class="hljs-type">Result</span>};
+<span class="hljs-keyword">use</span> std::time::{SystemTime, UNIX_EPOCH};
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">Database</span> {
+    <span class="hljs-comment">/// スキャン履歴を記録</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">record_scan</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+        channel_count: <span class="hljs-type">i32</span>,
+        success: <span class="hljs-type">bool</span>,
+        error_message: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;()&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        conn.<span class="hljs-title function_ invoke__">execute</span>(
+            <span class="hljs-string">&quot;INSERT INTO scan_history 
+             (bon_driver_id, channel_count, success, error_message)
+             VALUES (?1, ?2, ?3, ?4)&quot;</span>,
+            params![bon_driver_id, channel_count, success, error_message],
+        )?;
+        
+        <span class="hljs-comment">// BonDriverのlast_scanを更新</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">now</span> = SystemTime::<span class="hljs-title function_ invoke__">now</span>()
+            .<span class="hljs-title function_ invoke__">duration_since</span>(UNIX_EPOCH)
+            .<span class="hljs-title function_ invoke__">unwrap</span>()
+            .<span class="hljs-title function_ invoke__">as_secs</span>() <span class="hljs-keyword">as</span> <span class="hljs-type">i64</span>;
+        
+        conn.<span class="hljs-title function_ invoke__">execute</span>(
+            <span class="hljs-string">&quot;UPDATE bon_drivers SET last_scan = ?1 WHERE id = ?2&quot;</span>,
+            params![now, bon_driver_id],
+        )?;
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(())
+    }
+
+    <span class="hljs-comment">/// 最新のスキャン履歴を取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_latest_scan</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-type">Option</span>&lt;(<span class="hljs-type">i64</span>, <span class="hljs-type">i32</span>, <span class="hljs-type">bool</span>)&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">conn</span> = <span class="hljs-keyword">self</span>.conn.<span class="hljs-title function_ invoke__">lock</span>().<span class="hljs-title function_ invoke__">unwrap</span>();
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">stmt</span> = conn.<span class="hljs-title function_ invoke__">prepare</span>(
+            <span class="hljs-string">&quot;SELECT scan_time, channel_count, success
+             FROM scan_history 
+             WHERE bon_driver_id = ?1
+             ORDER BY scan_time DESC
+             LIMIT 1&quot;</span>,
+        )?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">rows</span> = stmt.<span class="hljs-title function_ invoke__">query</span>(params![bon_driver_id])?;
+        
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(row) = rows.<span class="hljs-title function_ invoke__">next</span>()? {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-title function_ invoke__">Some</span>((row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">0</span>)?, row.<span class="hljs-title function_ invoke__">get</span>(<span class="hljs-number">1</span>)?, row.get::&lt;_, <span class="hljs-type">i32</span>&gt;(<span class="hljs-number">2</span>)? == <span class="hljs-number">1</span>)))
+        } <span class="hljs-keyword">else</span> {
+            <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-literal">None</span>)
+        }
+    }
+}
+</code></pre>
+<h2 id="3-ts解析モジュール">3. TS解析モジュール</h2>
+<h3 id="31-pmtpatパケット解析">3.1 PMT/PATパケット解析</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// ts_analyzer/mod.rs</span>
+<span class="hljs-keyword">use</span> bitstream_io::{BitReader, BigEndian};
+<span class="hljs-keyword">use</span> std::io::Cursor;
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">TSElementaryStream</span> {
+    <span class="hljs-keyword">pub</span> stream_type: <span class="hljs-type">u8</span>,
+    <span class="hljs-keyword">pub</span> elementary_pid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> es_info_length: <span class="hljs-type">u16</span>,
+}
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">PMTSection</span> {
+    <span class="hljs-keyword">pub</span> program_number: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> pcr_pid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> program_info_length: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> streams: <span class="hljs-type">Vec</span>&lt;TSElementaryStream&gt;,
+}
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">PATEntry</span> {
+    <span class="hljs-keyword">pub</span> program_number: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> program_map_pid: <span class="hljs-type">u16</span>,
+}
+
+<span class="hljs-meta">#[derive(Debug, Clone)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">PATSection</span> {
+    <span class="hljs-keyword">pub</span> transport_stream_id: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> network_id: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> sections: <span class="hljs-type">Vec</span>&lt;PATEntry&gt;,
+}
+
+<span class="hljs-comment">/// PATパケットを解析</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">parse_pat</span>(packet: &amp;[<span class="hljs-type">u8</span>]) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;PATSection&gt; {
+    <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &lt; <span class="hljs-number">4</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">reader</span> = BitReader::<span class="hljs-title function_ invoke__">new</span>(Cursor::<span class="hljs-title function_ invoke__">new</span>(packet));
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_table_id</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_section_syntax_indicator</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_private_section</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">2</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">section_length</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">12</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &lt; section_length <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span> + <span class="hljs-number">3</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">transport_stream_id</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">16</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved2</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">2</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">version_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">5</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">current_next_indicator</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">if</span> current_next_indicator == <span class="hljs-number">0</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">section_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">last_section_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">entries</span> = Vec::<span class="hljs-title function_ invoke__">new</span>();
+    <span class="hljs-keyword">for</span> <span class="hljs-variable">_</span> <span class="hljs-keyword">in</span> <span class="hljs-number">0</span>..section_length / <span class="hljs-number">4</span> {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">program_number</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">16</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">3</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">program_map_pid</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">13</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        entries.<span class="hljs-title function_ invoke__">push</span>(PATEntry {
+            program_number,
+            program_map_pid,
+        });
+    }
+    
+    <span class="hljs-title function_ invoke__">Some</span>(PATSection {
+        transport_stream_id,
+        network_id: <span class="hljs-number">0</span>, <span class="hljs-comment">// 幾つかのBSストリームで設定可能</span>
+        sections: entries,
+    })
+}
+
+<span class="hljs-comment">/// PMTパケットを解析</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">parse_pmt</span>(packet: &amp;[<span class="hljs-type">u8</span>]) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;PMTSection&gt; {
+    <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &lt; <span class="hljs-number">4</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">reader</span> = BitReader::<span class="hljs-title function_ invoke__">new</span>(Cursor::<span class="hljs-title function_ invoke__">new</span>(packet));
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_table_id</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_section_syntax_indicator</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_private_section</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">2</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">section_length</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">12</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &lt; section_length <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span> + <span class="hljs-number">3</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">program_number</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">16</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved2</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">2</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">version_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">5</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">current_next_indicator</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">1</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">if</span> current_next_indicator == <span class="hljs-number">0</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_section_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_last_section_number</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">pcr_pid</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">13</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved3</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">3</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">program_info_length</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">12</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-comment">// Skip program_info_length</span>
+    reader.<span class="hljs-title function_ invoke__">skip</span>(program_info_length * <span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">streams</span> = Vec::<span class="hljs-title function_ invoke__">new</span>();
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">remaining</span> = section_length - <span class="hljs-number">9</span> - program_info_length;
+    
+    <span class="hljs-keyword">while</span> remaining &gt; <span class="hljs-number">4</span> {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">stream_type</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">3</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">elementary_pid</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">13</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">_reserved2</span> = reader.read::&lt;<span class="hljs-type">u8</span>&gt;(<span class="hljs-number">3</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">es_info_length</span> = reader.read::&lt;<span class="hljs-type">u16</span>&gt;(<span class="hljs-number">12</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        
+        streams.<span class="hljs-title function_ invoke__">push</span>(TSElementaryStream {
+            stream_type,
+            elementary_pid,
+            es_info_length,
+        });
+        
+        reader.<span class="hljs-title function_ invoke__">skip</span>(es_info_length * <span class="hljs-number">8</span>).<span class="hljs-title function_ invoke__">ok</span>()?;
+        remaining -= <span class="hljs-number">5</span> + es_info_length;
+    }
+    
+    <span class="hljs-title function_ invoke__">Some</span>(PMTSection {
+        program_number,
+        pcr_pid,
+        program_info_length,
+        streams,
+    })
+}
+
+<span class="hljs-comment">/// 視聴可能サービスを検出</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">detect_service_type</span>(streams: &amp;[TSElementaryStream]) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u8</span>&gt; {
+    <span class="hljs-comment">// MPEG2-Audio = 0x03 -&gt; 音声</span>
+    <span class="hljs-comment">// H.264 = 0x1B -&gt; 映像</span>
+    <span class="hljs-comment">// MPEG2-Video = 0x02 -&gt; 映像</span>
+    
+    <span class="hljs-keyword">for</span> <span class="hljs-variable">stream</span> <span class="hljs-keyword">in</span> streams {
+        <span class="hljs-keyword">match</span> stream.stream_type {
+            <span class="hljs-number">0x02</span> | <span class="hljs-number">0x1B</span> =&gt; <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x01</span>), <span class="hljs-comment">// TV Service</span>
+            <span class="hljs-number">0x03</span> =&gt; <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x02</span>),        <span class="hljs-comment">// Radio Service</span>
+            <span class="hljs-number">0x0C</span> =&gt; <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x03</span>),        <span class="hljs-comment">// Data Service</span>
+            _ =&gt; {}
+        }
+    }
+    
+    <span class="hljs-literal">None</span>
+}
+</code></pre>
+<h2 id="4-tsidsidnid抽出器">4. TSID/SID/NID抽出器</h2>
+<h3 id="41-tsパケットストリーム解析">4.1 TSパケットストリーム解析</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// ts_extractor/mod.rs</span>
+<span class="hljs-keyword">use</span> std::collections::HashMap;
+<span class="hljs-keyword">use</span> super::ts_analyzer::{parse_pat, parse_pmt, PATEntry, PMTSection};
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">TSChannelInfo</span> {
+    <span class="hljs-keyword">pub</span> tsid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> sid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> nid: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> program_number: <span class="hljs-type">u16</span>,
+    <span class="hljs-keyword">pub</span> pmt_pid: <span class="hljs-type">u16</span>,
+}
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">TSStreamExtractor</span> {
+    pat_buffer: <span class="hljs-type">Vec</span>&lt;<span class="hljs-type">u8</span>&gt;,
+    pmt_buffers: HashMap&lt;<span class="hljs-type">u16</span>, <span class="hljs-type">Vec</span>&lt;<span class="hljs-type">u8</span>&gt;&gt;, <span class="hljs-comment">// PID -&gt; buffer</span>
+    pmt_sections: HashMap&lt;<span class="hljs-type">u16</span>, PMTSection&gt;,
+    pat_sections: <span class="hljs-type">Vec</span>&lt;PATEntry&gt;,
+    tsid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    nid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">TSStreamExtractor</span> {
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">new</span>() <span class="hljs-punctuation">-&gt;</span> <span class="hljs-keyword">Self</span> {
+        <span class="hljs-keyword">Self</span> {
+            pat_buffer: Vec::<span class="hljs-title function_ invoke__">new</span>(),
+            pmt_buffers: HashMap::<span class="hljs-title function_ invoke__">new</span>(),
+            pmt_sections: HashMap::<span class="hljs-title function_ invoke__">new</span>(),
+            pat_sections: Vec::<span class="hljs-title function_ invoke__">new</span>(),
+            tsid: <span class="hljs-literal">None</span>,
+            nid: <span class="hljs-literal">None</span>,
+        }
+    }
+
+    <span class="hljs-comment">/// TSパケットを処理（188byteごとのパケット）</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">process_packet</span>(&amp;<span class="hljs-keyword">mut</span> <span class="hljs-keyword">self</span>, packet: &amp;[<span class="hljs-type">u8</span>]) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;<span class="hljs-type">Vec</span>&lt;TSChannelInfo&gt;&gt; {
+        <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &lt; <span class="hljs-number">4</span> {
+            <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+        }
+        
+        <span class="hljs-comment">// TSヘッダー解析</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">sync_byte</span> = packet[<span class="hljs-number">0</span>];
+        <span class="hljs-keyword">if</span> sync_byte != <span class="hljs-number">0x47</span> {
+            <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+        }
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">transport_error_indicator</span> = (packet[<span class="hljs-number">1</span>] &gt;&gt; <span class="hljs-number">7</span>) &amp; <span class="hljs-number">0x01</span>;
+        <span class="hljs-keyword">if</span> transport_error_indicator == <span class="hljs-number">1</span> {
+            <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+        }
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">payload_unit_start_indicator</span> = (packet[<span class="hljs-number">1</span>] &gt;&gt; <span class="hljs-number">6</span>) &amp; <span class="hljs-number">0x01</span>;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">transport_priority</span> = (packet[<span class="hljs-number">1</span>] &gt;&gt; <span class="hljs-number">5</span>) &amp; <span class="hljs-number">0x01</span>;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">pid</span> = ((packet[<span class="hljs-number">1</span>] <span class="hljs-keyword">as</span> <span class="hljs-type">u16</span> &amp; <span class="hljs-number">0x1F</span>) &lt;&lt; <span class="hljs-number">8</span>) | packet[<span class="hljs-number">2</span>] <span class="hljs-keyword">as</span> <span class="hljs-type">u16</span>;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">transport_scrambling_control</span> = (packet[<span class="hljs-number">3</span>] &gt;&gt; <span class="hljs-number">6</span>) &amp; <span class="hljs-number">0x03</span>;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">adaptation_field_control</span> = (packet[<span class="hljs-number">3</span>] &gt;&gt; <span class="hljs-number">4</span>) &amp; <span class="hljs-number">0x03</span>;
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">continuity_counter</span> = packet[<span class="hljs-number">3</span>] &amp; <span class="hljs-number">0x0F</span>;
+        
+        <span class="hljs-comment">// ペイロードの開始位置</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">payload_start</span> = <span class="hljs-number">4</span>;
+        
+        <span class="hljs-comment">// アダプテーションフィールドスキップ</span>
+        <span class="hljs-keyword">if</span> adaptation_field_control &amp; <span class="hljs-number">0x02</span> != <span class="hljs-number">0</span> {
+            <span class="hljs-keyword">if</span> packet.<span class="hljs-title function_ invoke__">len</span>() &gt; <span class="hljs-number">5</span> {
+                <span class="hljs-keyword">let</span> <span class="hljs-variable">adaptation_length</span> = packet[<span class="hljs-number">4</span>] <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span>;
+                payload_start += <span class="hljs-number">1</span> + adaptation_length;
+            }
+        }
+        
+        <span class="hljs-keyword">if</span> payload_start &gt;= packet.<span class="hljs-title function_ invoke__">len</span>() {
+            <span class="hljs-keyword">return</span> <span class="hljs-literal">None</span>;
+        }
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">payload</span> = &amp;packet[payload_start..];
+        
+        <span class="hljs-keyword">match</span> pid {
+            <span class="hljs-number">0x0000</span> =&gt; {
+                <span class="hljs-comment">// PAT</span>
+                <span class="hljs-keyword">if</span> payload_unit_start_indicator == <span class="hljs-number">1</span> {
+                    <span class="hljs-keyword">self</span>.pat_buffer.<span class="hljs-title function_ invoke__">clear</span>();
+                    <span class="hljs-keyword">self</span>.pat_buffer.<span class="hljs-title function_ invoke__">extend_from_slice</span>(payload);
+                    
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(pat) = <span class="hljs-title function_ invoke__">parse_pat</span>(&amp;<span class="hljs-keyword">self</span>.pat_buffer) {
+                        <span class="hljs-keyword">self</span>.pat_sections = pat.sections.<span class="hljs-title function_ invoke__">clone</span>();
+                        <span class="hljs-keyword">self</span>.tsid = <span class="hljs-title function_ invoke__">Some</span>(pat.transport_stream_id);
+                        <span class="hljs-comment">// NIDはBS/CSストリームで検出可能</span>
+                    }
+                } <span class="hljs-keyword">else</span> {
+                    <span class="hljs-keyword">self</span>.pat_buffer.<span class="hljs-title function_ invoke__">extend_from_slice</span>(payload);
+                }
+            }
+            
+            <span class="hljs-number">0x0001</span> =&gt; {
+                <span class="hljs-comment">// CAT - not used</span>
+            }
+            
+            <span class="hljs-number">0x0010</span>..=<span class="hljs-number">0x001F</span> =&gt; {
+                <span class="hljs-comment">// NIT (Network Information Table)</span>
+            }
+            
+            <span class="hljs-number">0x0020</span>..=<span class="hljs-number">0x0027</span> =&gt; {
+                <span class="hljs-comment">// SDT (Service Description Table)</span>
+            }
+            
+            <span class="hljs-number">0x0040</span>..=<span class="hljs-number">0x004F</span> =&gt; {
+                <span class="hljs-comment">// EIT</span>
+            }
+            
+            <span class="hljs-number">0x0080</span>..=<span class="hljs-number">0x008F</span> =&gt; {
+                <span class="hljs-comment">// DIT/SIT</span>
+            }
+            
+            <span class="hljs-number">0x0FFF</span> =&gt; {
+                <span class="hljs-comment">// NULL PID</span>
+            }
+            
+            _ =&gt; {
+                <span class="hljs-comment">// PMT candidates</span>
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(pat_entry) = <span class="hljs-keyword">self</span>.pat_sections.<span class="hljs-title function_ invoke__">iter</span>().<span class="hljs-title function_ invoke__">find</span>(|e| e.program_map_pid == pid) {
+                    <span class="hljs-keyword">if</span> payload_unit_start_indicator == <span class="hljs-number">1</span> {
+                        <span class="hljs-keyword">let</span> <span class="hljs-variable">buffer</span> = <span class="hljs-keyword">self</span>.pmt_buffers.<span class="hljs-title function_ invoke__">entry</span>(pid).<span class="hljs-title function_ invoke__">or_default</span>();
+                        buffer.<span class="hljs-title function_ invoke__">clear</span>();
+                        buffer.<span class="hljs-title function_ invoke__">extend_from_slice</span>(payload);
+                        
+                        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(pmt) = <span class="hljs-title function_ invoke__">parse_pmt</span>(buffer) {
+                            <span class="hljs-keyword">self</span>.pmt_sections.<span class="hljs-title function_ invoke__">insert</span>(pid, pmt);
+                        }
+                    } <span class="hljs-keyword">else</span> {
+                        <span class="hljs-keyword">let</span> <span class="hljs-variable">buffer</span> = <span class="hljs-keyword">self</span>.pmt_buffers.<span class="hljs-title function_ invoke__">entry</span>(pid).<span class="hljs-title function_ invoke__">or_default</span>();
+                        buffer.<span class="hljs-title function_ invoke__">extend_from_slice</span>(payload);
+                    }
+                }
+            }
+        }
+        
+        <span class="hljs-comment">// すべてのPMTが解析済みでPATが存在すれば、チャンネル情報を抽出</span>
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.pat_sections.<span class="hljs-title function_ invoke__">len</span>() &gt; <span class="hljs-number">0</span> &amp;&amp; <span class="hljs-keyword">self</span>.pmt_sections.<span class="hljs-title function_ invoke__">len</span>() == <span class="hljs-keyword">self</span>.pat_sections.<span class="hljs-title function_ invoke__">len</span>() {
+            <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">channels</span> = Vec::<span class="hljs-title function_ invoke__">new</span>();
+            <span class="hljs-keyword">let</span> <span class="hljs-variable">tsid</span> = <span class="hljs-keyword">self</span>.tsid.<span class="hljs-title function_ invoke__">unwrap_or</span>(<span class="hljs-number">0</span>);
+            
+            <span class="hljs-keyword">for</span> <span class="hljs-variable">pat_entry</span> <span class="hljs-keyword">in</span> &amp;<span class="hljs-keyword">self</span>.pat_sections {
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(pmt) = <span class="hljs-keyword">self</span>.pmt_sections.<span class="hljs-title function_ invoke__">get</span>(&amp;pat_entry.program_map_pid) {
+                    <span class="hljs-keyword">let</span> <span class="hljs-variable">service_type</span> = <span class="hljs-title function_ invoke__">detect_service_type</span>(&amp;pmt.streams);
+                    
+                    channels.<span class="hljs-title function_ invoke__">push</span>(TSChannelInfo {
+                        tsid,
+                        sid: pat_entry.program_number,
+                        nid: <span class="hljs-number">0</span>, <span class="hljs-comment">// NIDは別途SDT/NITから取得</span>
+                        program_number: pat_entry.program_number,
+                        pmt_pid: pat_entry.program_map_pid,
+                    });
+                }
+            }
+            
+            <span class="hljs-comment">// リセットして次の分析に備える</span>
+            <span class="hljs-keyword">self</span>.pmt_sections.<span class="hljs-title function_ invoke__">clear</span>();
+            <span class="hljs-keyword">self</span>.pmt_buffers.<span class="hljs-title function_ invoke__">clear</span>();
+            
+            <span class="hljs-keyword">if</span> channels.<span class="hljs-title function_ invoke__">len</span>() &gt; <span class="hljs-number">0</span> {
+                <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Some</span>(channels);
+            }
+        }
+        
+        <span class="hljs-literal">None</span>
+    }
+    
+    <span class="hljs-comment">/// TSID/NIDを取得</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_tsid</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt; {
+        <span class="hljs-keyword">self</span>.tsid
+    }
+    
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_nid</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt; {
+        <span class="hljs-keyword">self</span>.nid
+    }
+}
+</code></pre>
+<h2 id="5-チャンネルスキャンコマンド">5. チャンネルスキャンコマンド</h2>
+<h3 id="51-cliコマンドの拡張">5.1 CLIコマンドの拡張</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// context.rs - Commands enum拡張</span>
+<span class="hljs-meta">#[derive(Parser, Debug)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">enum</span> <span class="hljs-title class_">Commands</span> {
+    <span class="hljs-comment">// ... existing commands ...</span>
+    
+    <span class="hljs-comment">/// Scan BonDriver for available channels</span>
+    Scan {
+        <span class="hljs-comment">/// BonDriver DLL path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        device: <span class="hljs-type">String</span>,
+        
+        <span class="hljs-comment">/// Output database file path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        database: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+        
+        <span class="hljs-comment">/// Recreate database from scratch</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        recreate: <span class="hljs-type">bool</span>,
+        
+        <span class="hljs-comment">/// Timeout in seconds</span>
+        <span class="hljs-meta">#[clap(short, long, default_value = <span class="hljs-string">&quot;30&quot;</span>)]</span>
+        timeout: <span class="hljs-type">u64</span>,
+    },
+    
+    <span class="hljs-comment">/// Show scanned channels from database</span>
+    Show {
+        <span class="hljs-comment">/// BonDriver DLL path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        device: <span class="hljs-type">String</span>,
+        
+        <span class="hljs-comment">/// Database file path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        database: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+        
+        <span class="hljs-comment">/// Output format (json/table)</span>
+        <span class="hljs-meta">#[clap(short, long, default_value = <span class="hljs-string">&quot;table&quot;</span>)]</span>
+        format: <span class="hljs-type">String</span>,
+    },
+    
+    <span class="hljs-comment">/// Query channel from database</span>
+    Query {
+        <span class="hljs-comment">/// BonDriver DLL path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        device: <span class="hljs-type">String</span>,
+        
+        <span class="hljs-comment">/// Database file path</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        database: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+        
+        <span class="hljs-comment">/// Channel to query (e.g., BS101, CS110_1)</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        channel: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+        
+        <span class="hljs-comment">/// NID to query</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        nid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+        
+        <span class="hljs-comment">/// SID to query</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        sid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+        
+        <span class="hljs-comment">/// TSID to query</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        tsid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+        
+        <span class="hljs-comment">/// Manual sheet number</span>
+        <span class="hljs-meta">#[clap(short, long)]</span>
+        manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    },
+}
+</code></pre>
+<h3 id="52-スキャンコマンド実装">5.2 スキャンコマンド実装</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// commands/scan.rs</span>
+<span class="hljs-keyword">use</span> std::time::{Duration, Instant};
+<span class="hljs-keyword">use</span> log::{info, warn, error};
+<span class="hljs-keyword">use</span> crate::database::Database;
+<span class="hljs-keyword">use</span> crate::ts_extractor::TSStreamExtractor;
+<span class="hljs-keyword">use</span> crate::tuner::windows::UnTunedTuner;
+<span class="hljs-keyword">use</span> futures_time::time::TimeoutExt;
+
+<span class="hljs-keyword">const</span> TS_PACKET_SIZE: <span class="hljs-type">usize</span> = <span class="hljs-number">188</span>;
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">async</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">scan_bon_driver</span>(
+    device: &amp;<span class="hljs-type">str</span>,
+    db_path: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    recreate: <span class="hljs-type">bool</span>,
+    timeout_secs: <span class="hljs-type">u64</span>,
+) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;()&gt; {
+    <span class="hljs-comment">// Database setup</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">default_db</span> = <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;{}.sqlite&quot;</span>, device.<span class="hljs-title function_ invoke__">replace</span>(<span class="hljs-string">&quot;.dll&quot;</span>, <span class="hljs-string">&quot;&quot;</span>));
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">db_path</span> = db_path.<span class="hljs-title function_ invoke__">unwrap_or</span>(&amp;default_db);
+    
+    <span class="hljs-keyword">if</span> recreate {
+        std::fs::<span class="hljs-title function_ invoke__">remove_file</span>(db_path).<span class="hljs-title function_ invoke__">ok</span>();
+    }
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">db</span> = Database::<span class="hljs-title function_ invoke__">new</span>(db_path).<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+        std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, e.<span class="hljs-title function_ invoke__">to_string</span>())
+    })?;
+    
+    info!(<span class="hljs-string">&quot;Database: {}&quot;</span>, db_path);
+    
+    <span class="hljs-comment">// Open tuner</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">tuner</span> = UnTunedTuner::<span class="hljs-title function_ invoke__">new</span>(device.<span class="hljs-title function_ invoke__">to_string</span>(), <span class="hljs-number">200000</span>)
+        .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;Failed to open tuner: {}&quot;</span>, e))
+        })?;
+    
+    info!(<span class="hljs-string">&quot;Opened BonDriver: {}&quot;</span>, device);
+    
+    <span class="hljs-comment">// Try to enumerate channels</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">channel_names</span> = tuner.<span class="hljs-title function_ invoke__">enum_channels</span>(<span class="hljs-number">0</span>);
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(channels) = channel_names {
+        info!(<span class="hljs-string">&quot;Found {} channels via enumChannels&quot;</span>, channels.<span class="hljs-title function_ invoke__">len</span>());
+        <span class="hljs-title function_ invoke__">for</span> (i, ch) <span class="hljs-keyword">in</span> channels.<span class="hljs-title function_ invoke__">iter</span>().<span class="hljs-title function_ invoke__">enumerate</span>() {
+            info!(<span class="hljs-string">&quot;  {}: {}&quot;</span>, i, ch);
+        }
+    }
+    
+    <span class="hljs-comment">// Start TS capture for all channels</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">start_time</span> = Instant::<span class="hljs-title function_ invoke__">now</span>();
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">timeout</span> = Duration::<span class="hljs-title function_ invoke__">from_secs</span>(timeout_secs);
+    
+    <span class="hljs-comment">// We need to actually tune and capture TS packets</span>
+    <span class="hljs-comment">// For each channel, we need to:</span>
+    <span class="hljs-comment">// 1. Tune to the channel</span>
+    <span class="hljs-comment">// 2. Capture TS packets</span>
+    <span class="hljs-comment">// 3. Parse PMT/PAT for NID/SID/TSID</span>
+    
+    <span class="hljs-comment">// This is complex and requires actual hardware access</span>
+    <span class="hljs-comment">// For now, we&#x27;ll implement a stub that captures from tuned channel</span>
+    
+    info!(<span class="hljs-string">&quot;Starting channel scan (timeout: {}s)...&quot;</span>, timeout_secs);
+    
+    <span class="hljs-comment">// Update BonDriver info</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">bon_driver_id</span> = db.<span class="hljs-title function_ invoke__">upsert_bon_driver</span>(device, <span class="hljs-literal">None</span>, <span class="hljs-literal">None</span>)
+        .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+        })?;
+    
+    <span class="hljs-comment">// This is a simplified version</span>
+    <span class="hljs-comment">// In practice, you&#x27;d need to:</span>
+    <span class="hljs-comment">// 1. Tune to a known channel (e.g., BS101)</span>
+    <span class="hljs-comment">// 2. Capture and analyze TS packets for PMT/PAT</span>
+    <span class="hljs-comment">// 3. Extract NID/SID/TSID</span>
+    <span class="hljs-comment">// 4. Repeat for all channels</span>
+    
+    <span class="hljs-comment">// For now, we&#x27;ll store what we got from enumChannels</span>
+    <span class="hljs-comment">// and note that full TS analysis requires actual tuning</span>
+    
+    <span class="hljs-comment">// We&#x27;ll create a placeholder implementation</span>
+    <span class="hljs-comment">// that uses the channel name to derive some info</span>
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">channel_count</span> = <span class="hljs-number">0</span>;
+    
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(channels) = channel_names {
+        <span class="hljs-keyword">for</span> <span class="hljs-variable">ch_name</span> <span class="hljs-keyword">in</span> &amp;channels {
+            <span class="hljs-comment">// Try to parse channel name</span>
+            <span class="hljs-comment">// BS101 -&gt; BS network, TSID 1, SID 01?</span>
+            <span class="hljs-comment">// CS110_1 -&gt; CS network, TSID 1, SID 101?</span>
+            
+            <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">nid</span> = <span class="hljs-number">0</span>;
+            <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">tsid</span> = <span class="hljs-number">0</span>;
+            <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">sid</span> = <span class="hljs-number">0</span>;
+            <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">manual_sheet</span> = <span class="hljs-literal">None</span>;
+            
+            <span class="hljs-keyword">if</span> ch_name.<span class="hljs-title function_ invoke__">starts_with</span>(<span class="hljs-string">&quot;BS&quot;</span>) {
+                <span class="hljs-comment">// Parse BS channel</span>
+                <span class="hljs-keyword">let</span> <span class="hljs-variable">remaining</span> = &amp;ch_name[<span class="hljs-number">2</span>..];
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>((tsid_part, sid_part)) = remaining.<span class="hljs-title function_ invoke__">split_once</span>(<span class="hljs-string">&#x27;_&#x27;</span>) {
+                    <span class="hljs-comment">// BS101_01 format</span>
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(t) = tsid_part.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        tsid = t;
+                    }
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(s) = sid_part.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        sid = s;
+                    }
+                } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>((tsid_part, rest)) = remaining.<span class="hljs-title function_ invoke__">split_at</span>(<span class="hljs-number">1</span>) {
+                    <span class="hljs-comment">// BS1_01 format</span>
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(t) = tsid_part.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        tsid = t;
+                    }
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(s) = rest.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        sid = s;
+                    }
+                }
+                nid = <span class="hljs-number">0x0001</span>; <span class="hljs-comment">// BS network</span>
+            } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> ch_name.<span class="hljs-title function_ invoke__">starts_with</span>(<span class="hljs-string">&quot;CS&quot;</span>) {
+                <span class="hljs-comment">// Parse CS channel</span>
+                <span class="hljs-keyword">let</span> <span class="hljs-variable">remaining</span> = &amp;ch_name[<span class="hljs-number">2</span>..];
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>((tsid_part, sid_part)) = remaining.<span class="hljs-title function_ invoke__">split_once</span>(<span class="hljs-string">&#x27;_&#x27;</span>) {
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(t) = tsid_part.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        tsid = t;
+                    }
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(s) = sid_part.parse::&lt;<span class="hljs-type">u16</span>&gt;() {
+                        sid = s;
+                    }
+                }
+                nid = <span class="hljs-number">0x0002</span>; <span class="hljs-comment">// CS network</span>
+            } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>((physical_ch, extra)) = ch_name.<span class="hljs-title function_ invoke__">split_once</span>(<span class="hljs-string">&#x27;_&#x27;</span>) {
+                <span class="hljs-comment">// Physical channel with manual sheet</span>
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Ok</span>(phy) = physical_ch.parse::&lt;<span class="hljs-type">u8</span>&gt;() {
+                    tsid = <span class="hljs-number">0</span>; <span class="hljs-comment">// terrestrial</span>
+                    sid = <span class="hljs-number">0</span>;
+                    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(sheet) = extra.parse::&lt;<span class="hljs-type">u16</span>&gt;().<span class="hljs-title function_ invoke__">ok</span>() {
+                        manual_sheet = <span class="hljs-title function_ invoke__">Some</span>(sheet);
+                    }
+                }
+            }
+            
+            <span class="hljs-keyword">if</span> sid &gt; <span class="hljs-number">0</span> {
+                db.<span class="hljs-title function_ invoke__">save_channel</span>(
+                    bon_driver_id,
+                    nid,
+                    sid,
+                    tsid,
+                    manual_sheet,
+                    <span class="hljs-title function_ invoke__">Some</span>(ch_name),
+                    <span class="hljs-title function_ invoke__">Some</span>(ch_name),
+                    <span class="hljs-literal">None</span>, <span class="hljs-comment">// physical_ch</span>
+                    <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x01</span>), <span class="hljs-comment">// service type: TV</span>
+                    <span class="hljs-literal">None</span>,
+                ).<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                    std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB save error: {}&quot;</span>, e))
+                })?;
+                
+                channel_count += <span class="hljs-number">1</span>;
+                
+                info!(<span class="hljs-string">&quot;Saved channel: {} (NID={}, SID={}, TSID={})&quot;</span>, 
+                      ch_name, nid, sid, tsid);
+            }
+        }
+    }
+    
+    <span class="hljs-comment">// Record scan history</span>
+    db.<span class="hljs-title function_ invoke__">record_scan</span>(bon_driver_id, channel_count, <span class="hljs-literal">true</span>, <span class="hljs-literal">None</span>)
+        .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB record error: {}&quot;</span>, e))
+        })?;
+    
+    info!(<span class="hljs-string">&quot;Scan completed. Found {} channels.&quot;</span>, channel_count);
+    
+    <span class="hljs-title function_ invoke__">Ok</span>(())
+}
+</code></pre>
+<h2 id="6-データベース-backed-チャンネル選択">6. データベース-backed チャンネル選択</h2>
+<h3 id="61-拡張channeltype">6.1 拡張ChannelType</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// channels/mod.rs</span>
+<span class="hljs-meta">#[derive(Debug, Clone, PartialEq, Eq)]</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">enum</span> <span class="hljs-title class_">ChannelType</span> {
+    <span class="hljs-title function_ invoke__">Terrestrial</span>(<span class="hljs-type">u8</span>, TsFilter),
+    <span class="hljs-title function_ invoke__">Catv</span>(<span class="hljs-type">u8</span>, TsFilter),
+    <span class="hljs-title function_ invoke__">BS</span>(<span class="hljs-type">u8</span>, TsFilter),
+    <span class="hljs-title function_ invoke__">CS</span>(<span class="hljs-type">u8</span>, TsFilter),
+    <span class="hljs-title function_ invoke__">BonCh</span>(<span class="hljs-type">u8</span>),
+    <span class="hljs-title function_ invoke__">BonChSpace</span>(ChannelSpace),
+    
+    <span class="hljs-comment">// Database-backed channel</span>
+    Db {
+        nid: <span class="hljs-type">u16</span>,
+        sid: <span class="hljs-type">u16</span>,
+        tsid: <span class="hljs-type">u16</span>,
+        manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    },
+    
+    Undefined,
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">ChannelType</span> {
+    <span class="hljs-comment">/// Parse from database info</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">from_db_info</span>(
+        nid: <span class="hljs-type">u16</span>,
+        sid: <span class="hljs-type">u16</span>,
+        tsid: <span class="hljs-type">u16</span>,
+        manual_sheet: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+        network_name: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    ) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-keyword">Self</span> {
+        <span class="hljs-comment">// Determine channel type based on NID</span>
+        <span class="hljs-keyword">match</span> nid {
+            <span class="hljs-number">0x0001</span> =&gt; { <span class="hljs-comment">// BS network</span>
+                ChannelType::<span class="hljs-title function_ invoke__">BS</span>(<span class="hljs-number">0</span>, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid))
+            }
+            <span class="hljs-number">0x0002</span> =&gt; { <span class="hljs-comment">// CS network</span>
+                ChannelType::<span class="hljs-title function_ invoke__">CS</span>(<span class="hljs-number">0</span>, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid))
+            }
+            <span class="hljs-number">0x0000</span> =&gt; { <span class="hljs-comment">// Terrestrial</span>
+                ChannelType::<span class="hljs-title function_ invoke__">Terrestrial</span>(<span class="hljs-number">0</span>, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid))
+            }
+            _ =&gt; {
+                ChannelType::Db { nid, sid, tsid, manual_sheet }
+            }
+        }
+    }
+    
+    <span class="hljs-comment">/// Convert to unique key for DB storage</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">to_db_key</span>(&amp;<span class="hljs-keyword">self</span>) <span class="hljs-punctuation">-&gt;</span> (<span class="hljs-type">u16</span>, <span class="hljs-type">u16</span>, <span class="hljs-type">u16</span>, <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;) {
+        <span class="hljs-keyword">match</span> <span class="hljs-keyword">self</span> {
+            ChannelType::<span class="hljs-title function_ invoke__">BS</span>(ch, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid)) =&gt; (<span class="hljs-number">0x0001</span>, *sid, *ch <span class="hljs-keyword">as</span> <span class="hljs-type">u16</span>, <span class="hljs-literal">None</span>),
+            ChannelType::<span class="hljs-title function_ invoke__">CS</span>(ch, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid)) =&gt; (<span class="hljs-number">0x0002</span>, *sid, *ch <span class="hljs-keyword">as</span> <span class="hljs-type">u16</span>, <span class="hljs-literal">None</span>),
+            ChannelType::<span class="hljs-title function_ invoke__">Terrestrial</span>(ch, TsFilter::<span class="hljs-title function_ invoke__">AbsTsId</span>(sid)) =&gt; (<span class="hljs-number">0x0000</span>, *sid, *ch <span class="hljs-keyword">as</span> <span class="hljs-type">u16</span>, <span class="hljs-literal">None</span>),
+            ChannelType::Db { nid, sid, tsid, manual_sheet } =&gt; (*nid, *sid, *tsid, *manual_sheet),
+            _ =&gt; (<span class="hljs-number">0</span>, <span class="hljs-number">0</span>, <span class="hljs-number">0</span>, <span class="hljs-literal">None</span>),
+        }
+    }
+}
+</code></pre>
+<h3 id="62-データベースルックアップ">6.2 データベースルックアップ</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// commands/lookup.rs</span>
+<span class="hljs-keyword">use</span> crate::database::Database;
+<span class="hljs-keyword">use</span> crate::channels::{Channel, ChannelType};
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">ChannelLookup</span> {
+    db: Database,
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">ChannelLookup</span> {
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">new</span>(db_path: &amp;<span class="hljs-type">str</span>) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;<span class="hljs-keyword">Self</span>&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">db</span> = Database::<span class="hljs-title function_ invoke__">new</span>(db_path).<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, e.<span class="hljs-title function_ invoke__">to_string</span>())
+        })?;
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-keyword">Self</span> { db })
+    }
+    
+    <span class="hljs-comment">/// Lookup channel from database</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">lookup_channel</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        bon_driver_id: <span class="hljs-type">i64</span>,
+        channel_name: &amp;<span class="hljs-type">str</span>,
+    ) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;<span class="hljs-type">Option</span>&lt;Channel&gt;&gt; {
+        <span class="hljs-comment">// Try to parse channel name to extract NID/SID/TSID</span>
+        <span class="hljs-comment">// This is simplified - in practice you&#x27;d use the TS analyzer</span>
+        
+        <span class="hljs-comment">// For now, just check if channel exists in DB</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">channels</span> = <span class="hljs-keyword">self</span>.db.<span class="hljs-title function_ invoke__">get_channels_by_bon_driver</span>(bon_driver_id)
+            .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+            })?;
+        
+        <span class="hljs-keyword">for</span> <span class="hljs-variable">ch_info</span> <span class="hljs-keyword">in</span> channels {
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(db_name) = &amp;ch_info.channel_name {
+                <span class="hljs-keyword">if</span> db_name == channel_name {
+                    <span class="hljs-keyword">let</span> <span class="hljs-variable">ch_type</span> = ChannelType::<span class="hljs-title function_ invoke__">from_db_info</span>(
+                        ch_info.nid,
+                        ch_info.sid,
+                        ch_info.tsid,
+                        ch_info.manual_sheet,
+                        ch_info.network_name.<span class="hljs-title function_ invoke__">as_deref</span>(),
+                    );
+                    
+                    <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-title function_ invoke__">Some</span>(Channel {
+                        ch_type,
+                        raw_string: db_name.<span class="hljs-title function_ invoke__">clone</span>(),
+                    }));
+                }
+            }
+        }
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-literal">None</span>)
+    }
+    
+    <span class="hljs-comment">/// Get channels from database for BonDriver</span>
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_channels_for_bon_driver</span>(
+        &amp;<span class="hljs-keyword">self</span>,
+        dll_path: &amp;<span class="hljs-type">str</span>,
+    ) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;<span class="hljs-type">Vec</span>&lt;Channel&gt;&gt; {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">bon_driver_id</span> = <span class="hljs-keyword">self</span>.db.<span class="hljs-title function_ invoke__">get_bon_driver_id</span>(dll_path)
+            .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+            })?
+            .<span class="hljs-title function_ invoke__">ok_or_else</span>(|| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::NotFound, <span class="hljs-string">&quot;BonDriver not found in DB&quot;</span>)
+            })?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">channel_infos</span> = <span class="hljs-keyword">self</span>.db.<span class="hljs-title function_ invoke__">get_channels_by_bon_driver</span>(bon_driver_id)
+            .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+            })?;
+        
+        <span class="hljs-title function_ invoke__">Ok</span>(channel_infos.<span class="hljs-title function_ invoke__">into_iter</span>()
+            .<span class="hljs-title function_ invoke__">map</span>(|ch_info| {
+                <span class="hljs-keyword">let</span> <span class="hljs-variable">ch_type</span> = ChannelType::<span class="hljs-title function_ invoke__">from_db_info</span>(
+                    ch_info.nid,
+                    ch_info.sid,
+                    ch_info.tsid,
+                    ch_info.manual_sheet,
+                    ch_info.network_name.<span class="hljs-title function_ invoke__">as_deref</span>(),
+                );
+                
+                Channel {
+                    ch_type,
+                    raw_string: ch_info.channel_name
+                        .<span class="hljs-title function_ invoke__">or</span>(ch_info.raw_name)
+                        .<span class="hljs-title function_ invoke__">unwrap_or_else</span>(|| <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;{}_{}_{}&quot;</span>, ch_info.nid, ch_info.sid, ch_info.tsid)),
+                }
+            })
+            .<span class="hljs-title function_ invoke__">collect</span>())
+    }
+}
+</code></pre>
+<h2 id="7-db検索コマンド">7. DB検索コマンド</h2>
+<h3 id="71-データ表示コマンド">7.1 データ表示コマンド</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// commands/show.rs</span>
+<span class="hljs-keyword">use</span> prettytable::{Table, Row, Cell};
+<span class="hljs-keyword">use</span> serde_json;
+<span class="hljs-keyword">use</span> crate::database::Database;
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">show_channels</span>(
+    db_path: &amp;<span class="hljs-type">str</span>,
+    dll_path: &amp;<span class="hljs-type">str</span>,
+    format: &amp;<span class="hljs-type">str</span>,
+) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;()&gt; {
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">db</span> = Database::<span class="hljs-title function_ invoke__">new</span>(db_path).<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+        std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, e.<span class="hljs-title function_ invoke__">to_string</span>())
+    })?;
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">bon_driver_id</span> = db.<span class="hljs-title function_ invoke__">get_bon_driver_id</span>(dll_path)
+        .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+        })?
+        .<span class="hljs-title function_ invoke__">ok_or_else</span>(|| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::NotFound, <span class="hljs-string">&quot;BonDriver not found in DB&quot;</span>)
+        })?;
+    
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">channels</span> = db.<span class="hljs-title function_ invoke__">get_channels_by_bon_driver</span>(bon_driver_id)
+        .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+        })?;
+    
+    <span class="hljs-keyword">if</span> format == <span class="hljs-string">&quot;json&quot;</span> {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">json</span> = serde_json::<span class="hljs-title function_ invoke__">to_string_pretty</span>(&amp;channels)
+            .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;JSON error: {}&quot;</span>, e))
+            })?;
+        <span class="hljs-built_in">println!</span>(<span class="hljs-string">&quot;{}&quot;</span>, json);
+    } <span class="hljs-keyword">else</span> {
+        <span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">table</span> = Table::<span class="hljs-title function_ invoke__">new</span>();
+        table.<span class="hljs-title function_ invoke__">add_row</span>(Row::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-built_in">vec!</span>[
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;ID&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;NID&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;SID&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;TSID&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;ManSheet&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;Name&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;Physical&quot;</span>),
+            Cell::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-string">&quot;Service&quot;</span>),
+        ]));
+        
+        <span class="hljs-keyword">for</span> <span class="hljs-variable">ch</span> <span class="hljs-keyword">in</span> channels {
+            table.<span class="hljs-title function_ invoke__">add_row</span>(Row::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-built_in">vec!</span>[
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;ch.id.<span class="hljs-title function_ invoke__">to_string</span>()),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;<span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;{:04X}&quot;</span>, ch.nid)),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;<span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;{:04X}&quot;</span>, ch.sid)),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;<span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;{:04X}&quot;</span>, ch.tsid)),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;ch.manual_sheet.<span class="hljs-title function_ invoke__">map</span>(|v| v.<span class="hljs-title function_ invoke__">to_string</span>()).<span class="hljs-title function_ invoke__">unwrap_or_default</span>()),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;ch.channel_name.<span class="hljs-title function_ invoke__">unwrap_or_default</span>()),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;ch.physical_ch.<span class="hljs-title function_ invoke__">map</span>(|v| v.<span class="hljs-title function_ invoke__">to_string</span>()).<span class="hljs-title function_ invoke__">unwrap_or_default</span>()),
+                Cell::<span class="hljs-title function_ invoke__">new</span>(&amp;<span class="hljs-keyword">match</span> ch.service_type {
+                    <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x01</span>) =&gt; <span class="hljs-string">&quot;TV&quot;</span>,
+                    <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x02</span>) =&gt; <span class="hljs-string">&quot;Radio&quot;</span>,
+                    <span class="hljs-title function_ invoke__">Some</span>(<span class="hljs-number">0x03</span>) =&gt; <span class="hljs-string">&quot;Data&quot;</span>,
+                    _ =&gt; <span class="hljs-string">&quot;Unknown&quot;</span>,
+                }),
+            ]));
+        }
+        
+        table.<span class="hljs-title function_ invoke__">printstd</span>();
+    }
+    
+    <span class="hljs-title function_ invoke__">Ok</span>(())
+}
+</code></pre>
+<h2 id="8-integration-with-existing-commands">8. Integration with Existing Commands</h2>
+<h3 id="81-tune-command-with-db-support">8.1 Tune Command with DB Support</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// commands/tune.rs modifications</span>
+<span class="hljs-keyword">use</span> crate::database::Database;
+<span class="hljs-keyword">use</span> crate::commands::lookup::ChannelLookup;
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">async</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">tune_with_db</span>(
+    device: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    channel: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">String</span>&gt;,
+    tsid: <span class="hljs-type">Option</span>&lt;<span class="hljs-type">u16</span>&gt;,
+    db_path: <span class="hljs-type">Option</span>&lt;&amp;<span class="hljs-type">str</span>&gt;,
+    <span class="hljs-comment">// ... other parameters</span>
+) <span class="hljs-punctuation">-&gt;</span> std::io::<span class="hljs-type">Result</span>&lt;(...)&gt; {
+    <span class="hljs-comment">// Try database lookup first</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> (<span class="hljs-title function_ invoke__">Some</span>(db_path), <span class="hljs-title function_ invoke__">Some</span>(device), <span class="hljs-title function_ invoke__">Some</span>(ch)) = (&amp;db_path, &amp;device, &amp;channel) {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">lookup</span> = ChannelLookup::<span class="hljs-title function_ invoke__">new</span>(db_path)?;
+        
+        <span class="hljs-comment">// Get or create BonDriver ID</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">db</span> = Database::<span class="hljs-title function_ invoke__">new</span>(db_path).<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+            std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, e.<span class="hljs-title function_ invoke__">to_string</span>())
+        })?;
+        
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">bon_driver_id</span> = db.<span class="hljs-title function_ invoke__">upsert_bon_driver</span>(device, <span class="hljs-literal">None</span>, <span class="hljs-literal">None</span>)
+            .<span class="hljs-title function_ invoke__">map_err</span>(|e| {
+                std::io::Error::<span class="hljs-title function_ invoke__">new</span>(std::io::ErrorKind::Other, <span class="hljs-built_in">format!</span>(<span class="hljs-string">&quot;DB error: {}&quot;</span>, e))
+            })?;
+        
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(db_channel) = lookup.<span class="hljs-title function_ invoke__">lookup_channel</span>(bon_driver_id, ch)? {
+            <span class="hljs-comment">// Use database-backed channel info</span>
+            info!(<span class="hljs-string">&quot;Using database channel: NID={}, SID={}, TSID={}&quot;</span>, 
+                  db_channel.nid, db_channel.sid, db_channel.tsid);
+            
+            <span class="hljs-comment">// Convert to appropriate ChannelType for tuning</span>
+            <span class="hljs-comment">// ... tuning logic ...</span>
+        } <span class="hljs-keyword">else</span> {
+            warn!(<span class="hljs-string">&quot;Channel not found in database, using original parsing&quot;</span>);
+            <span class="hljs-comment">// Fall back to original channel parsing</span>
+        }
+    }
+    
+    <span class="hljs-comment">// Original tuning logic continues...</span>
+    <span class="hljs-comment">// ...</span>
+}
+</code></pre>
+<h2 id="9-sqlite-database-integration">9. SQLite Database Integration</h2>
+<h3 id="91-cargotoml-updates">9.1 Cargo.toml Updates</h3>
+<pre><code class="language-toml"><span class="hljs-comment"># Add to recisdb-rs/Cargo.toml</span>
+<span class="hljs-section">[dependencies]</span>
+<span class="hljs-attr">rusqlite</span> = { version = <span class="hljs-string">&quot;0.31&quot;</span>, features = [<span class="hljs-string">&quot;bundled&quot;</span>] }
+<span class="hljs-attr">serde</span> = { version = <span class="hljs-string">&quot;1.0&quot;</span>, features = [<span class="hljs-string">&quot;derive&quot;</span>] }
+<span class="hljs-attr">serde_json</span> = <span class="hljs-string">&quot;1.0&quot;</span>
+<span class="hljs-attr">prettytable-rs</span> = <span class="hljs-string">&quot;0.10&quot;</span>
+<span class="hljs-attr">bitstream-io</span> = <span class="hljs-string">&quot;0.2&quot;</span>
+</code></pre>
+<h3 id="92-module-structure">9.2 Module Structure</h3>
+<pre><code>src/
+├── database/
+│   ├── mod.rs
+│   ├── models.rs
+│   ├── bon_driver.rs
+│   ├── channel.rs
+│   └── scan_history.rs
+├── ts_analyzer/
+│   ├── mod.rs
+│   └── ps.rs
+├── ts_extractor/
+│   ├── mod.rs
+│   └── decoder.rs
+├── commands/
+│   ├── mod.rs
+│   ├── scan.rs
+│   ├── show.rs
+│   ├── lookup.rs
+│   └── tune.rs (modified)
+└── context.rs (modified)
+</code></pre>
+<h2 id="10-implementation-phases">10. Implementation Phases</h2>
+<h3 id="phase-1-database-foundation-1-2-weeks">Phase 1: Database Foundation (1-2 weeks)</h3>
+<ul>
+<li>Add SQLite dependencies</li>
+<li>Create database schema</li>
+<li>Implement basic CRUD operations</li>
+<li>Create models and basic query methods</li>
+</ul>
+<h3 id="phase-2-ts-analysis-2-3-weeks">Phase 2: TS Analysis (2-3 weeks)</h3>
+<ul>
+<li>Implement PAT/PMT parser</li>
+<li>Create TS packet demultiplexer</li>
+<li>Add NID/SID/TSID extraction from TS stream</li>
+<li>Test with real hardware</li>
+</ul>
+<h3 id="phase-3-scan-command-1-2-weeks">Phase 3: Scan Command (1-2 weeks)</h3>
+<ul>
+<li>Implement <code>scan</code> CLI command</li>
+<li>Integrate with BonDriver enumeration</li>
+<li>Store results in database</li>
+<li>Add error handling and timeout</li>
+</ul>
+<h3 id="phase-4-queryshow-commands-1-week">Phase 4: Query/Show Commands (1 week)</h3>
+<ul>
+<li>Implement <code>show</code> command for viewing channels</li>
+<li>Implement <code>query</code> command for specific lookups</li>
+<li>Add JSON output format</li>
+<li>Pretty table formatting</li>
+</ul>
+<h3 id="phase-5-database-backed-tuning-1-2-weeks">Phase 5: Database-backed Tuning (1-2 weeks)</h3>
+<ul>
+<li>Modify existing tune command to use DB</li>
+<li>Fallback to original parsing if DB lookup fails</li>
+<li>Support manual sheet numbers</li>
+<li>Add migration support for DB schema changes</li>
+</ul>
+<h3 id="phase-6-testing--documentation-1-week">Phase 6: Testing &amp; Documentation (1 week)</h3>
+<ul>
+<li>Unit tests for database operations</li>
+<li>Integration tests with hardware</li>
+<li>User documentation</li>
+<li>Example configurations</li>
+</ul>
+<h2 id="11-usage-examples">11. Usage Examples</h2>
+<h3 id="111-channel-scan">11.1 Channel Scan</h3>
+<pre><code class="language-bash"><span class="hljs-comment"># Scan BonDriver and store in default DB (BonDriver_XXXXXXXX.sqlite)</span>
+recisdb scan --device BonDriver_XXXXXXXX.dll
+
+<span class="hljs-comment"># Scan with custom DB location</span>
+recisdb scan --device BonDriver_XXXXXXXX.dll --database channels.db
+
+<span class="hljs-comment"># Recreate DB from scratch</span>
+recisdb scan --device BonDriver_XXXXXXXX.dll --recreate
+</code></pre>
+<h3 id="112-view-channels">11.2 View Channels</h3>
+<pre><code class="language-bash"><span class="hljs-comment"># Show channels in table format</span>
+recisdb show --device BonDriver_XXXXXXXX.dll
+
+<span class="hljs-comment"># Show in JSON format</span>
+recisdb show --device BonDriver_XXXXXXXX.dll --format json
+</code></pre>
+<h3 id="113-query-channels">11.3 Query Channels</h3>
+<pre><code class="language-bash"><span class="hljs-comment"># Query by channel name</span>
+recisdb query --device BonDriver_XXXXXXXX.dll --channel BS101
+
+<span class="hljs-comment"># Query by NID/SID/TSID</span>
+recisdb query --device BonDriver_XXXXXXXX.dll --nid 0x0001 --sid 0x0001 --tsid 0x0000
+
+<span class="hljs-comment"># Query with manual sheet</span>
+recisdb query --device BonDriver_XXXXXXXX.dll --manual-sheet 1
+</code></pre>
+<h3 id="114-database-backed-tune">11.4 Database-backed Tune</h3>
+<pre><code class="language-bash"><span class="hljs-comment"># Tune using database (will lookup NID/SID/TSID from DB)</span>
+recisdb tune --device BonDriver_XXXXXXXX.dll --channel BS101 --database channels.db
+
+<span class="hljs-comment"># Manual sheet (explicit grouping)</span>
+recisdb tune --device BonDriver_XXXXXXXX.dll --channel BS101 --manual-sheet 1 --database channels.db
+</code></pre>
+<h2 id="12-key-considerations">12. Key Considerations</h2>
+<h3 id="121-database-performance">12.1 Database Performance</h3>
+<ul>
+<li>Use SQLite with appropriate indexing</li>
+<li>Batch insert operations during scan</li>
+<li>Consider using WAL mode for concurrent access</li>
+<li>Implement connection pooling for multiple tuners</li>
+</ul>
+<h3 id="122-hardware-access">12.2 Hardware Access</h3>
+<ul>
+<li>TS analysis requires actual hardware access</li>
+<li>Need to handle different tuner types (PX4/PT3, etc.)</li>
+<li>Timeout handling for slow/unresponsive hardware</li>
+<li>Error recovery for hardware failures</li>
+</ul>
+<h3 id="123-manual-sheet-support">12.3 Manual Sheet Support</h3>
+<ul>
+<li>User can specify manual sheet number to distinguish channels with same NID/SID/TSID</li>
+<li>Stored in <code>manual_sheet</code> column (NULL for automatic)</li>
+<li>Used in unique constraint to prevent duplicates</li>
+</ul>
+<h3 id="124-migration-strategy">12.4 Migration Strategy</h3>
+<ul>
+<li>Version database schema</li>
+<li>Provide migration scripts</li>
+<li>Auto-detect old format and upgrade</li>
+</ul>
+<h3 id="125-security">12.5 Security</h3>
+<ul>
+<li>Validate all inputs from database</li>
+<li>Prevent SQL injection (use parameterized queries)</li>
+<li>Consider file permissions for database files</li>
+</ul>
+<h2 id="13-dependencies">13. Dependencies</h2>
+<pre><code>rusqlite = { version = &quot;0.31&quot;, features = [&quot;bundled&quot;] }  # SQLite bindings
+serde = { version = &quot;1.0&quot;, features = [&quot;derive&quot;] }       # Serialization
+serde_json = &quot;1.0&quot;                                        # JSON output
+prettytable-rs = &quot;0.10&quot;                                   # Pretty tables
+bitstream-io = &quot;0.2&quot;                                      # Bitstream parsing
+</code></pre>
+<p>This plan provides a complete implementation for BonDriver automatic channel scanning with database storage, supporting NID/SID/TSID/manual sheet grouping as requested.</p>
+
+            
+            
+        </body>
+        </html>

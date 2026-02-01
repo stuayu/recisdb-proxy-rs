@@ -51,6 +51,28 @@
             },
             "args": [],
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'recisdb-proxy'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=recisdb-proxy",
+                    "--package=recisdb-proxy"
+                ],
+                "filter": {
+                    "name": "recisdb-proxy",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--listen",
+                "127.0.0.1:12345",
+                "--verbose"
+            ],
+            "cwd": "${workspaceFolder}"
         }
     ]
 }

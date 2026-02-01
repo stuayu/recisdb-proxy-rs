@@ -11,6 +11,7 @@ include!(concat!(env!("OUT_DIR"), "/BonDriver_binding.rs"));
 mod ib1 {
     use super::{IBonDriver, BOOL, BYTE, DWORD};
 
+    #[link(name = "BonDriver_dynamic_cast_ffi", kind = "static")]
     extern "C" {
         //IBon1
         pub fn C_OpenTuner(b: *mut IBonDriver) -> BOOL;
@@ -18,7 +19,7 @@ mod ib1 {
         pub fn C_SetChannel(b: *mut IBonDriver, bCh: BYTE) -> BOOL;
         pub fn C_GetSignalLevel(b: *mut IBonDriver) -> f32;
         pub fn C_WaitTsStream(b: *mut IBonDriver, dwTimeOut: DWORD) -> DWORD;
-        pub fn C_GetReadyCount() -> DWORD;
+        pub fn C_GetReadyCount(b: *mut IBonDriver) -> DWORD;
         pub fn C_GetTsStream(
             b: *mut IBonDriver,
             pDst: *mut BYTE,
@@ -41,6 +42,7 @@ mod ib1 {
 mod ib2 {
     use super::{IBonDriver2, BOOL, DWORD, LPCTSTR};
 
+    #[link(name = "BonDriver_dynamic_cast_ffi", kind = "static")]
     extern "C" {
         //IBon2
         pub fn C_EnumTuningSpace(b: *mut IBonDriver2, dwSpace: DWORD) -> LPCTSTR;
@@ -53,6 +55,7 @@ mod ib2 {
 mod ib3 {
     use crate::tuner::windows::IBonDriver::{IBonDriver3, BOOL};
 
+    #[link(name = "BonDriver_dynamic_cast_ffi", kind = "static")]
     extern "C" {
         pub fn C_SetLnbPower(b: *mut IBonDriver3, bEnable: BOOL) -> BOOL;
     }
@@ -61,6 +64,7 @@ mod ib3 {
 mod ib_utils {
     use super::{IBonDriver, IBonDriver2, IBonDriver3};
 
+    #[link(name = "BonDriver_dynamic_cast_ffi", kind = "static")]
     extern "C" {
         pub(crate) fn interface_check_2(i: *mut IBonDriver) -> *mut IBonDriver2;
         pub(crate) fn interface_check_3(i: *mut IBonDriver2) -> *mut IBonDriver3;

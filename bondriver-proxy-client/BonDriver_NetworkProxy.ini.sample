@@ -1,0 +1,48 @@
+; BonDriver_NetworkProxy Configuration
+; Place this file in the same directory as the DLL
+; and rename it to BonDriver_NetworkProxy.ini
+
+[Server]
+; Proxy server address (IP:Port)
+Address = 127.0.0.1:12345
+
+; Default tuner path or group name (optional)
+; You can specify one of the following:
+;   - Full DLL path: C:\BonDriver\BonDriver_PX-MLT1.dll
+;   - Tuner group name: PX-MLT (will auto-select from MLT1, MLT2, etc.)
+; Leave empty to use server's default tuner selection
+Tuner =
+
+; Connection timeout in milliseconds (default: 5000)
+ConnectTimeout = 5000
+
+; Read timeout in milliseconds (default: 30000)
+ReadTimeout = 30000
+
+; =====================
+; Tuner Group Selection
+; =====================
+; When using group names (e.g., PX-MLT), the proxy server automatically
+; selects the best available driver from the group based on:
+; - Current load on each tuner
+; - Priority level of the client
+; - Exclusive lock requirements
+; The selection strategy is determined by the server configuration.
+; Priority = 0
+
+; Exclusive lock mode (default: 0)
+; Set to 1 or true to request exclusive access to the tuner
+; When enabled, this client gets highest priority and other clients are disconnected
+; Set to 0 or false to allow shared access
+; Exclusive = 0
+
+; =====================
+; TLS Configuration (requires tls feature enabled at compile time)
+; =====================
+; Enable TLS encryption
+; Set to 1 or true to enable TLS
+; TLS = 0
+
+; Path to CA certificate for TLS verification (PEM format)
+; If not specified, system root certificates will be used
+; TLSCACert = ca.pem

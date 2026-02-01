@@ -13,6 +13,31 @@ pub(crate) struct Cli {
     pub command: Commands,
 }
 
+/// Output format for channel listing.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Human-readable table format
+    #[default]
+    Table,
+    /// JSON format
+    Json,
+    /// CSV format
+    Csv,
+}
+
+/// Broadcast type filter.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum BroadcastType {
+    /// Terrestrial (ISDB-T)
+    Terrestrial,
+    /// BS (Broadcasting Satellite)
+    Bs,
+    /// CS (Communication Satellite)
+    Cs,
+    /// All types
+    All,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     /// Signal test.{n}
@@ -201,5 +226,172 @@ pub(crate) enum Commands {
         device: String,
         #[clap(short, long, required = true)]
         space: u32,
+    },
+
+    /// Scan channels and store results in the database.{n}
+    /// This subcommand tunes through all available channels and
+    /// extracts NID/TSID/SID and service names.
+    #[cfg(feature = "database")]
+    #[clap(name = "scan")]
+    Scan {
+        /// The device name (BonDriver DLL path or chardev path).
+        #[clap(short = 'i', long, value_name = "DEVICE_PATH", required = true)]
+        device: String,
+
+        /// Physical channels to scan (e.g., "13-62" for terrestrial).{n}
+        /// If not specified, scans all known channels for the device type.
+        #[clap(short, long)]
+        range: Option<String>,
+
+        /// Broadcast type to scan.
+        #[clap(value_enum, long, default_value = "all")]
+        broadcast_type: BroadcastType,
+
+        /// Database file path.{n}
+        /// If not specified, uses default location.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+
+        /// Timeout per channel in seconds.
+        #[clap(long, default_value = "5")]
+        timeout: u32,
+
+        /// LNB voltage (for satellite).
+        #[clap(value_enum, long = "lnb")]
+        lnb: Option<Voltage>,
+
+        /// Continue scanning even if some channels fail.
+        #[clap(long)]
+        continue_on_error: bool,
+
+        /// Show progress during scan.
+        #[clap(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Show channel list from the database.{n}
+    /// Displays stored channel information in various formats.
+    #[cfg(feature = "database")]
+    #[clap(name = "show")]
+    Show {
+        /// Database file path.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+
+        /// Output format.
+        #[clap(value_enum, long, short = 'f', default_value = "table")]
+        format: OutputFormat,
+
+        /// Filter by broadcast type.
+        #[clap(value_enum, long, short = 't')]
+        broadcast_type: Option<BroadcastType>,
+
+        /// Filter by network ID.
+        #[clap(long)]
+        nid: Option<u16>,
+
+        /// Filter by transport stream ID.
+        #[clap(long)]
+        tsid: Option<u16>,
+
+        /// Show only enabled channels.
+        #[clap(long)]
+        enabled_only: bool,
+
+        /// Sort by field (name, nid, sid, physical_ch).
+        #[clap(long, default_value = "physical_ch")]
+        sort: String,
+    },
+
+    /// Query channel information from the database.{n}
+    /// Find channels by various criteria and print details.
+    #[cfg(feature = "database")]
+    #[clap(name = "query")]
+    Query {
+        /// Database file path.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+
+        /// Search by channel name (partial match).
+        #[clap(long, short = 'n')]
+        name: Option<String>,
+
+        /// Search by service ID.
+        #[clap(long)]
+        sid: Option<u16>,
+
+        /// Search by network ID.
+        #[clap(long)]
+        nid: Option<u16>,
+
+        /// Search by transport stream ID.
+        #[clap(long)]
+        tsid: Option<u16>,
+
+        /// Search by remote control key ID.
+        #[clap(long)]
+        remote_key: Option<u8>,
+
+        /// Output format.
+        #[clap(value_enum, long, short = 'f', default_value = "table")]
+        format: OutputFormat,
+
+        /// Show detailed information.
+        #[clap(long, short = 'd')]
+        detail: bool,
+    },
+
+    /// Manage BonDrivers in the database.
+    #[cfg(feature = "database")]
+    #[clap(name = "driver")]
+    Driver {
+        #[clap(subcommand)]
+        action: DriverAction,
+    },
+}
+
+/// BonDriver management actions.
+#[cfg(feature = "database")]
+#[derive(Debug, Subcommand)]
+pub(crate) enum DriverAction {
+    /// Register a new BonDriver.
+    Add {
+        /// BonDriver DLL path.
+        #[clap(required = true)]
+        path: String,
+
+        /// Display name for the driver.
+        #[clap(long)]
+        name: Option<String>,
+
+        /// Database file path.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+    },
+
+    /// List registered BonDrivers.
+    List {
+        /// Database file path.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+
+        /// Output format.
+        #[clap(value_enum, long, short = 'f', default_value = "table")]
+        format: OutputFormat,
+    },
+
+    /// Remove a BonDriver (and its channels).
+    Remove {
+        /// BonDriver ID or path.
+        #[clap(required = true)]
+        id_or_path: String,
+
+        /// Database file path.
+        #[clap(long, value_name = "DB_PATH")]
+        database: Option<String>,
+
+        /// Skip confirmation.
+        #[clap(long, short = 'y')]
+        yes: bool,
     },
 }

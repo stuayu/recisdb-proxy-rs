@@ -1,0 +1,29 @@
+# recisdb-proxy Configuration File
+# Copy this file to recisdb-proxy.toml and modify as needed.
+
+[server]
+# Address to listen on (default: 0.0.0.0:12345)
+listen = "0.0.0.0:12345"
+
+# Web dashboard listen address (default: 0.0.0.0:8080)
+web_listen = "0.0.0.0:8080"
+
+# Default tuner device path (optional)
+# Linux: /dev/pt3video0 or 0|0 for DVB /dev/dvb/adapter0/frontend0
+# Windows: path to BonDriver DLL
+# tuner = "/dev/pt3video0"
+
+# Maximum concurrent connections (default: 64)
+max_connections = 64
+
+[database]
+# Path to the database file (default: recisdb-proxy.db)
+path = "recisdb-proxy.db"
+
+[logging]
+# Directory where log files are stored (default: logs)
+log_dir = "logs"
+
+# Number of days to keep log files (default: 7)
+retention_days = 7
+

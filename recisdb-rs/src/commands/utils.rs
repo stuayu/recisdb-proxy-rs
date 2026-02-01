@@ -103,7 +103,7 @@ pub(crate) fn get_src(
 ) -> Result<(Box<dyn AsyncBufRead + Unpin>, Option<u64>), Box<dyn Error>> {
     match (device, channel, source) {
         (Some(device), Some(channel), None) => {
-            let inner = UnTunedTuner::new(device, buf_sz)
+            let inner = UnTunedTuner::new(device)
                 .map_err(|e| error_handler::handle_opening_error(e.into()))
                 .unwrap()
                 .tune(channel, lnb)

@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>BonDriver &#x30cd;&#x30c3;&#x30c8;&#x30ef;&#x30fc;&#x30af;&#x30d7;&#x30ed;&#x30ad;&#x30b7;&#x30b7;&#x30b9;&#x30c6;&#x30e0;&#x5b9f;&#x88c5;&#x8a08;&#x753b;</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <h1 id="bondriver-ネットワークプロキシシステム実装計画">BonDriver ネットワークプロキシシステム実装計画</h1>
+<h2 id="概要">概要</h2>
+<p>recisdb-rsを拡張し、ネットワーク経由でTSストリームを配信するサーバーと、BonDriver互換DLLクライアントを実装する。</p>
+<h2 id="要件">要件</h2>
+<ul>
+<li><strong>TCP通信</strong>: パケットロスなし</li>
+<li><strong>低遅延</strong>: ロックフリーリングバッファ採用</li>
+<li><strong>BonDriver v1/v2/v3 互換</strong>: 全インターフェース実装</li>
+<li><strong>チャンネル共有</strong>: 同一チャンネルは1チューナーを複数クライアントで共有</li>
+<li><strong>クロスプラットフォーム</strong>: サーバーはLinux/Windows両対応</li>
+<li><strong>TLS認証</strong>: 証明書ベースのクライアント認証</li>
+</ul>
+<h2 id="システムアーキテクチャ">システムアーキテクチャ</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│  CLIENT (Windows)                                               │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  BonDriver_NetworkProxy.dll                               │  │
+│  │  - IBonDriver/2/3 インターフェース実装                      │  │
+│  │  - TCPクライアント (tokio)                                 │  │
+│  │  - リングバッファ (2MB, ロックフリー)                       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │ TCP
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SERVER (Rust)                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  recisdb-proxy-server                                     │  │
+│  │  - TCPリスナー (tokio)                                     │  │
+│  │  - セッション管理                                          │  │
+│  │  - TunerPool (チャンネル共有ロジック)                       │  │
+│  │  - broadcast::Sender でTS配信                             │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  既存チューナーバックエンド                                 │  │
+│  │  - BonDriver (Windows)                                    │  │
+│  │  - Character Device (Linux)                               │  │
+│  │  - DVBv5 (Linux)                                          │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="新規クレート構成">新規クレート構成</h2>
+<pre><code>recisdb-rs/
+├── Cargo.toml                    # ワークスペースに追加
+├── recisdb-protocol/             # 共通プロトコル定義
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── types.rs              # メッセージ型
+│       ├── codec.rs              # エンコード/デコード
+│       └── error.rs
+├── recisdb-proxy/                # サーバー
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs
+│       ├── server/
+│       │   ├── listener.rs       # TCP Accept
+│       │   └── session.rs        # クライアントセッション
+│       └── tuner/
+│           ├── pool.rs           # TunerPool管理
+│           ├── shared.rs         # SharedTuner (broadcast)
+│           └── channel_key.rs    # チャンネル識別キー
+└── bondriver-proxy-client/       # クライアントDLL
+    ├── Cargo.toml
+    ├── build.rs
+    └── src/
+        ├── lib.rs                # DLLエントリ + CreateBonDriver
+        ├── bondriver/
+        │   ├── interface.rs      # vtable構造体
+        │   └── exports.rs        # C呼び出し可能関数
+        └── client/
+            ├── connection.rs     # TCP接続管理
+            └── buffer.rs         # TSリングバッファ
+</code></pre>
+<h2 id="プロトコル仕様">プロトコル仕様</h2>
+<h3 id="フレームフォーマット">フレームフォーマット</h3>
+<pre><code>┌──────────┬──────────┬─────────────┬────────────────────┐
+│  Magic   │  Length  │   Type      │      Payload       │
+│  &quot;BNDP&quot;  │  u32 LE  │   u16 LE    │     (variable)     │
+└──────────┴──────────┴─────────────┴────────────────────┘
+</code></pre>
+<h3 id="主要メッセージタイプ">主要メッセージタイプ</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>名称</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0x0001</td>
+<td>OpenTuner</td>
+<td>C→S</td>
+<td>チューナーオープン要求</td>
+</tr>
+<tr>
+<td>0x0101</td>
+<td>SetChannel</td>
+<td>C→S</td>
+<td>チャンネル設定</td>
+</tr>
+<tr>
+<td>0x0102</td>
+<td>SetChannelSpace</td>
+<td>C→S</td>
+<td>Space/Channel設定</td>
+</tr>
+<tr>
+<td>0x0301</td>
+<td>GetSignalLevel</td>
+<td>C→S</td>
+<td>信号レベル取得</td>
+</tr>
+<tr>
+<td>0x0401</td>
+<td>StartStream</td>
+<td>C→S</td>
+<td>ストリーム開始</td>
+</tr>
+<tr>
+<td>0x0403</td>
+<td>StreamData</td>
+<td>S→C</td>
+<td>TSデータ送信</td>
+</tr>
+</tbody>
+</table>
+<h2 id="チャンネル共有ロジック">チャンネル共有ロジック</h2>
+<pre><code class="language-rust"><span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">TunerPool</span> {
+    tuners: RwLock&lt;HashMap&lt;ChannelKey, Arc&lt;SharedTuner&gt;&gt;&gt;,
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">TunerPool</span> {
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">async</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">get_or_create</span>(&amp;<span class="hljs-keyword">self</span>, tuner_path: &amp;<span class="hljs-type">str</span>, channel: &amp;Channel)
+        <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;Arc&lt;SharedTuner&gt;&gt;
+    {
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">key</span> = ChannelKey::<span class="hljs-title function_ invoke__">from</span>(tuner_path, channel);
+
+        <span class="hljs-comment">// 既存チューナーがあれば再利用</span>
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(tuner) = <span class="hljs-keyword">self</span>.tuners.<span class="hljs-title function_ invoke__">read</span>().<span class="hljs-keyword">await</span>.<span class="hljs-title function_ invoke__">get</span>(&amp;key) {
+            <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Ok</span>(Arc::<span class="hljs-title function_ invoke__">clone</span>(tuner));
+        }
+
+        <span class="hljs-comment">// なければ新規作成</span>
+        <span class="hljs-keyword">let</span> <span class="hljs-variable">shared</span> = <span class="hljs-keyword">self</span>.<span class="hljs-title function_ invoke__">create_tuner</span>(tuner_path, channel).<span class="hljs-keyword">await</span>?;
+        <span class="hljs-keyword">self</span>.tuners.<span class="hljs-title function_ invoke__">write</span>().<span class="hljs-keyword">await</span>.<span class="hljs-title function_ invoke__">insert</span>(key, Arc::<span class="hljs-title function_ invoke__">clone</span>(&amp;shared));
+        <span class="hljs-title function_ invoke__">Ok</span>(shared)
+    }
+}
+</code></pre>
+<h2 id="リングバッファ設計">リングバッファ設計</h2>
+<pre><code class="language-rust"><span class="hljs-keyword">const</span> RING_BUFFER_SIZE: <span class="hljs-type">usize</span> = <span class="hljs-number">2</span> * <span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>; <span class="hljs-comment">// 2MB</span>
+
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">struct</span> <span class="hljs-title class_">TsRingBuffer</span> {
+    buffer: <span class="hljs-type">Box</span>&lt;[<span class="hljs-type">u8</span>; RING_BUFFER_SIZE]&gt;,
+    write_pos: AtomicUsize,  <span class="hljs-comment">// Receiver Task が更新</span>
+    read_pos: AtomicUsize,   <span class="hljs-comment">// Main Thread (GetTsStream) が更新</span>
+}
+</code></pre>
+<h2 id="主要参照ファイル">主要参照ファイル</h2>
+<table>
+<thead>
+<tr>
+<th>ファイル</th>
+<th>参照理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>recisdb-rs/src/tuner/windows/IBonDriver.hpp</code></td>
+<td>BonDriverインターフェース定義</td>
+</tr>
+<tr>
+<td><code>recisdb-rs/src/tuner/windows/mod.rs</code></td>
+<td>AsyncRead実装パターン</td>
+</tr>
+<tr>
+<td><code>recisdb-rs/src/io.rs</code></td>
+<td>ストリーミングパイプライン</td>
+</tr>
+<tr>
+<td><code>recisdb-rs/src/channels.rs</code></td>
+<td>チャンネル型定義</td>
+</tr>
+</tbody>
+</table>
+<h2 id="実装フェーズ">実装フェーズ</h2>
+<h3 id="phase-1-プロトコル基盤">Phase 1: プロトコル基盤</h3>
+<ul>
+<li><code>recisdb-protocol</code> クレート作成</li>
+<li>メッセージ型・コーデック実装</li>
+<li>ユニットテスト</li>
+</ul>
+<h3 id="phase-2-サーバーコア">Phase 2: サーバーコア</h3>
+<ul>
+<li><code>recisdb-proxy</code> クレート作成</li>
+<li>TunerPool実装</li>
+<li>TCPリスナー・セッション管理</li>
+</ul>
+<h3 id="phase-3-クライアントコア">Phase 3: クライアントコア</h3>
+<ul>
+<li><code>bondriver-proxy-client</code> クレート作成</li>
+<li>リングバッファ実装</li>
+<li>IBonDriver vtable実装</li>
+</ul>
+<h3 id="phase-4-統合テスト">Phase 4: 統合・テスト</h3>
+<ul>
+<li>全IBonDriverメソッド実装</li>
+<li>設定ファイルサポート</li>
+<li>TVTest等での動作確認</li>
+</ul>
+<h2 id="tls認証設計">TLS認証設計</h2>
+<h3 id="証明書構成">証明書構成</h3>
+<pre><code>certs/
+├── ca.crt              # CA証明書（サーバー・クライアント共通）
+├── server.crt          # サーバー証明書
+├── server.key          # サーバー秘密鍵
+├── client.crt          # クライアント証明書
+└── client.key          # クライアント秘密鍵
+</code></pre>
+<h3 id="サーバー側tls設定">サーバー側TLS設定</h3>
+<pre><code class="language-rust"><span class="hljs-keyword">use</span> tokio_rustls::TlsAcceptor;
+<span class="hljs-keyword">use</span> rustls::{ServerConfig, Certificate, PrivateKey};
+
+<span class="hljs-keyword">let</span> <span class="hljs-variable">config</span> = ServerConfig::<span class="hljs-title function_ invoke__">builder</span>()
+    .<span class="hljs-title function_ invoke__">with_safe_defaults</span>()
+    .<span class="hljs-title function_ invoke__">with_client_cert_verifier</span>(
+        AllowAnyAuthenticatedClient::<span class="hljs-title function_ invoke__">new</span>(root_cert_store)
+    )
+    .<span class="hljs-title function_ invoke__">with_single_cert</span>(server_certs, server_key)?;
+
+<span class="hljs-keyword">let</span> <span class="hljs-variable">acceptor</span> = TlsAcceptor::<span class="hljs-title function_ invoke__">from</span>(Arc::<span class="hljs-title function_ invoke__">new</span>(config));
+</code></pre>
+<h3 id="クライアント側tls設定">クライアント側TLS設定</h3>
+<pre><code class="language-rust"><span class="hljs-keyword">use</span> tokio_rustls::TlsConnector;
+<span class="hljs-keyword">use</span> rustls::{ClientConfig, Certificate, PrivateKey};
+
+<span class="hljs-keyword">let</span> <span class="hljs-variable">config</span> = ClientConfig::<span class="hljs-title function_ invoke__">builder</span>()
+    .<span class="hljs-title function_ invoke__">with_safe_defaults</span>()
+    .<span class="hljs-title function_ invoke__">with_root_certificates</span>(root_cert_store)
+    .<span class="hljs-title function_ invoke__">with_client_auth_cert</span>(client_certs, client_key)?;
+
+<span class="hljs-keyword">let</span> <span class="hljs-variable">connector</span> = TlsConnector::<span class="hljs-title function_ invoke__">from</span>(Arc::<span class="hljs-title function_ invoke__">new</span>(config));
+</code></pre>
+<h3 id="設定ファイル拡張">設定ファイル拡張</h3>
+<p><strong>サーバー (recisdb-proxy.toml)</strong></p>
+<pre><code class="language-toml"><span class="hljs-section">[tls]</span>
+<span class="hljs-attr">enabled</span> = <span class="hljs-literal">true</span>
+<span class="hljs-attr">ca_cert</span> = <span class="hljs-string">&quot;/etc/recisdb-proxy/certs/ca.crt&quot;</span>
+<span class="hljs-attr">server_cert</span> = <span class="hljs-string">&quot;/etc/recisdb-proxy/certs/server.crt&quot;</span>
+<span class="hljs-attr">server_key</span> = <span class="hljs-string">&quot;/etc/recisdb-proxy/certs/server.key&quot;</span>
+<span class="hljs-attr">require_client_cert</span> = <span class="hljs-literal">true</span>
+</code></pre>
+<p><strong>クライアント (BonDriver_NetworkProxy.ini)</strong></p>
+<pre><code class="language-ini"><span class="hljs-section">[TLS]</span>
+<span class="hljs-attr">Enabled</span>=<span class="hljs-number">1</span>
+<span class="hljs-attr">CaCert</span>=ca.crt
+<span class="hljs-attr">ClientCert</span>=client.crt
+<span class="hljs-attr">ClientKey</span>=client.key
+</code></pre>
+<h2 id="クロスプラットフォーム対応">クロスプラットフォーム対応</h2>
+<h3 id="サーバー側チューナー抽象化">サーバー側チューナー抽象化</h3>
+<pre><code class="language-rust"><span class="hljs-comment">// tuner/backend.rs</span>
+<span class="hljs-keyword">pub</span> <span class="hljs-keyword">enum</span> <span class="hljs-title class_">TunerBackend</span> {
+    <span class="hljs-meta">#[cfg(target_os = <span class="hljs-string">&quot;linux&quot;</span>)]</span>
+    <span class="hljs-title function_ invoke__">CharacterDevice</span>(character_device::Tuner),
+    <span class="hljs-meta">#[cfg(target_os = <span class="hljs-string">&quot;linux&quot;</span>)]</span>
+    <span class="hljs-title function_ invoke__">DvbV5</span>(dvbv5::Tuner),
+    <span class="hljs-meta">#[cfg(target_os = <span class="hljs-string">&quot;windows&quot;</span>)]</span>
+    <span class="hljs-title function_ invoke__">BonDriver</span>(windows::Tuner),
+}
+
+<span class="hljs-keyword">impl</span> <span class="hljs-title class_">TunerBackend</span> {
+    <span class="hljs-keyword">pub</span> <span class="hljs-keyword">async</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">open</span>(path: &amp;<span class="hljs-type">str</span>) <span class="hljs-punctuation">-&gt;</span> <span class="hljs-type">Result</span>&lt;<span class="hljs-keyword">Self</span>, TunerError&gt; {
+        <span class="hljs-meta">#[cfg(target_os = <span class="hljs-string">&quot;linux&quot;</span>)]</span>
+        {
+            <span class="hljs-keyword">if</span> path.<span class="hljs-title function_ invoke__">contains</span>(<span class="hljs-string">&quot;/dev/dvb/&quot;</span>) {
+                <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-keyword">Self</span>::<span class="hljs-title function_ invoke__">DvbV5</span>(dvbv5::Tuner::<span class="hljs-title function_ invoke__">new</span>(path)?));
+            }
+            <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-keyword">Self</span>::<span class="hljs-title function_ invoke__">CharacterDevice</span>(character_device::Tuner::<span class="hljs-title function_ invoke__">new</span>(path)?));
+        }
+        <span class="hljs-meta">#[cfg(target_os = <span class="hljs-string">&quot;windows&quot;</span>)]</span>
+        {
+            <span class="hljs-keyword">return</span> <span class="hljs-title function_ invoke__">Ok</span>(<span class="hljs-keyword">Self</span>::<span class="hljs-title function_ invoke__">BonDriver</span>(windows::Tuner::<span class="hljs-title function_ invoke__">new</span>(path)?));
+        }
+    }
+}
+</code></pre>
+<h3 id="依存関係-cargotoml">依存関係 (Cargo.toml)</h3>
+<pre><code class="language-toml"><span class="hljs-section">[dependencies]</span>
+<span class="hljs-attr">tokio-rustls</span> = <span class="hljs-string">&quot;0.25&quot;</span>
+<span class="hljs-attr">rustls</span> = <span class="hljs-string">&quot;0.22&quot;</span>
+<span class="hljs-attr">rustls-pemfile</span> = <span class="hljs-string">&quot;2&quot;</span>
+
+<span class="hljs-section">[target.&#x27;cfg(unix)&#x27;.dependencies]</span>
+<span class="hljs-attr">nix</span> = { version = <span class="hljs-string">&quot;0.28&quot;</span>, features = [<span class="hljs-string">&quot;ioctl&quot;</span>] }
+<span class="hljs-attr">dvbv5</span> = { version = <span class="hljs-string">&quot;0.1&quot;</span>, optional = <span class="hljs-literal">true</span> }
+
+<span class="hljs-section">[target.&#x27;cfg(windows)&#x27;.dependencies]</span>
+<span class="hljs-attr">libloading</span> = <span class="hljs-string">&quot;0.8&quot;</span>
+</code></pre>
+<h2 id="検証方法">検証方法</h2>
+<ol>
+<li>
+<p><strong>サーバー起動テスト</strong></p>
+<pre><code class="language-bash">cargo run -p recisdb-proxy -- --listen 0.0.0.0:12345 --tuner /dev/pt3video0
+</code></pre>
+</li>
+<li>
+<p><strong>クライアントDLLビルド</strong></p>
+<pre><code class="language-bash">cargo build -p bondriver-proxy-client --release --target x86_64-pc-windows-msvc
+</code></pre>
+</li>
+<li>
+<p><strong>TVTestで動作確認</strong></p>
+<ul>
+<li>BonDriver_NetworkProxy.dll をTVTestのBonDriverフォルダに配置</li>
+<li>BonDriver_NetworkProxy.ini でサーバーアドレス設定</li>
+<li>TVTestでチャンネル選局・視聴確認</li>
+</ul>
+</li>
+<li>
+<p><strong>チャンネル共有テスト</strong></p>
+<ul>
+<li>複数TVTestインスタンスで同一チャンネルを選局</li>
+<li>サーバーログでチューナー共有を確認</li>
+</ul>
+</li>
+</ol>
+
+            
+            
+        </body>
+        </html>

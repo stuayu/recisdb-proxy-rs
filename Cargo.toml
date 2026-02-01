@@ -2,7 +2,10 @@
 resolver = "2"
 members = [
   "b25-sys",
-  "recisdb-rs"
+  "recisdb-rs",
+  "recisdb-protocol",
+  "recisdb-proxy",
+  "bondriver-proxy-client"
 ]
 
 [patch.crates-io]

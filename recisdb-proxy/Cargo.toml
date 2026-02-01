@@ -1,0 +1,66 @@
+[package]
+name = "recisdb-proxy"
+version = "0.1.0"
+authors = ["maleicacid <maleicacid824+dev@gmail.com>"]
+edition = "2021"
+description = "Network proxy server for recisdb BonDriver"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kazuki0824/recisdb-rs.git"
+build = "build.rs"
+
+[[bin]]
+name = "recisdb-proxy"
+path = "src/main.rs"
+
+[features]
+default = []
+tls = ["tokio-rustls", "rustls", "rustls-pemfile"]
+
+[dependencies]
+recisdb-protocol = { path = "../recisdb-protocol" }
+# TODO: recisdb integration requires build.rs changes for C++ wrapper
+# recisdb = { path = "../recisdb-rs", default-features = false, features = ["bg-runtime"] }
+
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.5"
+futures = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+futures-executor = "0.3"
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-appender = "0.2"
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# BonDriver support (Windows)
+cpp_utils = "0.3.0"
+
+# TLS support (optional)
+tokio-rustls = { version = "0.25", optional = true }
+rustls = { version = "0.22", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+encoding_rs = "0.8.35"
+b25-sys = { path = "../b25-sys", features = ["prioritized_card_reader"] }
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8.0"
+
+[build-dependencies]
+bindgen = { version = "0.71.1", default-features = false, features = ["runtime"] }
+cc = { version = "1.2", features = ["parallel"] }
+glob = "0.3"

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\prog\\\\recisdb-rs\\\\BonDriver\")",
+      "Bash(cargo *)",
+      "Bash(powershell.exe -Command \"cd ''C:\\\\prog\\\\recisdb-rs\\\\recisdb-proxy''; cargo check 2>&1\")",
+      "Bash(powershell.exe -Command \"cd ''C:\\\\prog\\\\recisdb-rs\\\\recisdb-proxy''; cargo test 2>&1\")",
+      "Bash(grep:*)",
+      "Bash(dir C:progrecisdb-rstargetdebugbuildrecisdb-4e4a3179f8b40ea1out)",
+      "Bash(dumpbin:*)",
+      "Bash(nm:*)",
+      "Bash(lib:*)",
+      "Bash(powershell:*)"
+    ]
+  }
+}

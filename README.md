@@ -18,6 +18,46 @@ recisdb-rs and b25-sys are more convenient Rust wrapper for libaribb25. recisdb 
 - Rust による実装でシングルボード向け低メモリ消費、連続録画時のエラー防止を目指す
 - チャンネル名ハードコード・二重バッファなど、従来のソフトウェアの設計の問題を自分なりに修正
 - ECM/EMM ロギング・デバッグ機能
+- **統合Webダッシュボード** - リアルタイム監視と設定管理が可能
+
+## recisdb-proxy: Network Proxy Server
+
+recisdb-proxy は、BonDriver をネットワーク経由で複数のクライアントに共有できるプロキシサーバーです。
+
+### 主な機能
+
+- **複数クライアント対応**: 複数のTVTest等がネットワーク経由で同一サーバーのBonDriverにアクセス可能
+- **チャンネル優先度制御**: クライアント側から優先度を指定可能
+- **排他ロック機能**: 高優先度クライアントは独占的にチューナーをロック可能
+- **インスタンス制限**: BonDriver毎に同時使用チャンネル数を制限
+- **Webダッシュボード**: ブラウザからリアルタイム監視・DB設定編集が可能
+
+### Webダッシュボード
+
+デフォルトで `http://localhost:8080` で利用可能。以下が確認・設定できます：
+
+- チューナーの利用状況（インスタンス数、最大制限等）
+- 接続中のクライアント情報（セッション、IPアドレス、現在チャンネル等）
+- サーバー統計（セッション数、稼働時間等）
+- **DB設定値の直接編集**（max_instances、display_name等）
+
+詳細は [WEB_DASHBOARD.md](docs/WEB_DASHBOARD.md) を参照してください。
+
+### 起動方法
+
+```bash
+recisdb-proxy --listen 0.0.0.0:12345 --web-listen 0.0.0.0:8080
+```
+
+または設定ファイル `recisdb-proxy.toml` を使用：
+
+```toml
+[server]
+listen = "0.0.0.0:12345"
+web_listen = "0.0.0.0:8080"
+tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
+max_connections = 64
+```
 
 ## Description
 
