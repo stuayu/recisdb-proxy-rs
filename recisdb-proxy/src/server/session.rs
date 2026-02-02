@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
     broadcast_region::{classify_nid, get_prefecture_name},
@@ -19,7 +19,8 @@ use recisdb_protocol::{
 };
 
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
+use crate::tuner::{ChannelKey, SharedTuner, TunerPool, ts_analyzer::TsPacketAnalyzer};
+use crate::tuner::quality_scorer::QualityScorer;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::web::SessionRegistry;
 
@@ -107,6 +108,32 @@ pub struct Session {
     virtual_channel_mappings: HashMap<String, HashMap<(u16, u16), Vec<VirtualChannelMapping>>>,
     /// Session registry for web dashboard.
     session_registry: Arc<SessionRegistry>,
+    /// Current channel info string (for history).
+    current_channel_info: Option<String>,
+    /// Current channel name (for history).
+    current_channel_name: Option<String>,
+    /// Shutdown receiver for remote disconnect.
+    shutdown_rx: mpsc::Receiver<()>,
+    /// TS packet analyzer for this session.
+    ts_quality_analyzer: TsPacketAnalyzer,
+    /// Accumulated TS quality counters.
+    packets_dropped: u64,
+    packets_scrambled: u64,
+    packets_error: u64,
+    bytes_since_last: u64,
+    interval_packets_total: u64,
+    interval_packets_dropped: u64,
+    /// Session start time.
+    session_started_at: std::time::Instant,
+    /// Signal sampling for average.
+    signal_samples: u64,
+    signal_level_sum: f64,
+    /// Session history DB ID.
+    session_history_id: Option<i64>,
+    /// Disconnect reason.
+    disconnect_reason: Option<String>,
+    /// Current BonDriver ID (if resolved).
+    current_bon_driver_id: Option<i64>,
 }
 
 impl Session {
@@ -119,6 +146,7 @@ impl Session {
         database: DatabaseHandle,
         default_tuner: Option<String>,
         session_registry: Arc<SessionRegistry>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) -> Self {
         Self {
             id,
@@ -141,6 +169,22 @@ impl Session {
             space_list_cache: HashMap::new(),
             virtual_channel_mappings: HashMap::new(),
             session_registry,
+            current_channel_info: None,
+            current_channel_name: None,
+            shutdown_rx,
+            ts_quality_analyzer: TsPacketAnalyzer::new(),
+            packets_dropped: 0,
+            packets_scrambled: 0,
+            packets_error: 0,
+            bytes_since_last: 0,
+            interval_packets_total: 0,
+            interval_packets_dropped: 0,
+            session_started_at: std::time::Instant::now(),
+            signal_samples: 0,
+            signal_level_sum: 0.0,
+            session_history_id: None,
+            disconnect_reason: None,
+            current_bon_driver_id: None,
         }
     }
 
@@ -148,6 +192,15 @@ impl Session {
     #[allow(dead_code)]
     pub fn database(&self) -> &DatabaseHandle {
         &self.database
+    }
+
+    async fn refresh_current_bon_driver_id(&mut self) {
+        if let Some(path) = &self.current_tuner_path {
+            let db = self.database.lock().await;
+            self.current_bon_driver_id = db.get_bon_driver_by_path(path).ok().flatten().map(|d| d.id);
+        } else {
+            self.current_bon_driver_id = None;
+        }
     }
 
     async fn build_channel_map_for_space(&self, tuner_path: &str, space: u32)
@@ -285,7 +338,7 @@ impl Session {
     }
 
     /// Get channel map for a specific space and region (for virtual space filtering).
-    async fn ensure_channel_map_with_region(&mut self, space: u32, region_name: &str) -> Vec<ChannelEntry> {
+    async fn ensure_channel_map_with_region(&mut self, _space: u32, region_name: &str) -> Vec<ChannelEntry> {
         let db = self.database.lock().await;
 
         let all = match db.get_all_channels_with_drivers() {
@@ -680,6 +733,21 @@ impl Session {
 
     /// Run the session, processing messages until disconnection.
     pub async fn run(&mut self) -> std::io::Result<()> {
+        // Insert session start record
+        let started_at = chrono::Utc::now().timestamp();
+        if let Ok(db) = self.database.lock().await.insert_session_start(
+            self.id,
+            &self.addr.to_string(),
+            self.current_tuner_path.as_deref(),
+            self.current_channel_info.as_deref(),
+            self.current_channel_name.as_deref(),
+            started_at,
+        ) {
+            self.session_history_id = Some(db);
+        } else {
+            warn!("[Session {}] Failed to insert session history start", self.id);
+        }
+
         loop {
             // Process any complete messages in the buffer first
             if let Some(msg) = self.try_decode_message()? {
@@ -697,6 +765,12 @@ impl Session {
 
                 tokio::select! {
                     biased;
+
+                    // Remote shutdown request
+                    _ = self.shutdown_rx.recv() => {
+                        self.disconnect_reason = Some("remote_shutdown".to_string());
+                        break;
+                    }
 
                     // Check for incoming TS data
                     ts_result = async {
@@ -716,20 +790,36 @@ impl Session {
                     result = self.socket.read(&mut tmp_buf) => {
                         let n = result?;
                         if n == 0 {
+                            self.disconnect_reason = Some("client_disconnect".to_string());
                             break; // Connection closed
                         }
                         self.read_buf.extend_from_slice(&tmp_buf[..n]);
                     }
                 }
             } else {
-                // Not streaming, just wait for messages
-                match self.read_message().await? {
-                    Some(msg) => {
-                        if !self.handle_message(msg).await? {
-                            break;
+                // Not streaming, just wait for messages or shutdown
+                let socket = &mut self.socket;
+                let read_buf = &mut self.read_buf;
+                let shutdown_rx = &mut self.shutdown_rx;
+
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        self.disconnect_reason = Some("remote_shutdown".to_string());
+                        break;
+                    }
+                    result = Self::read_message_with(socket, read_buf, self.id) => {
+                        match result? {
+                            Some(msg) => {
+                                if !self.handle_message(msg).await? {
+                                    break;
+                                }
+                            }
+                            None => {
+                                self.disconnect_reason = Some("client_disconnect".to_string());
+                                break;
+                            }
                         }
                     }
-                    None => break, // Connection closed
                 }
             }
         }
@@ -778,29 +868,33 @@ impl Session {
         }
     }
 
-    /// Read and decode a client message.
-    async fn read_message(&mut self) -> std::io::Result<Option<ClientMessage>> {
+    /// Read and decode a client message (borrowed socket/buffer).
+    async fn read_message_with(
+        socket: &mut TcpStream,
+        read_buf: &mut BytesMut,
+        session_id: u64,
+    ) -> std::io::Result<Option<ClientMessage>> {
         loop {
             // Try to decode a header from the buffer
-            if self.read_buf.len() >= HEADER_SIZE {
-                match decode_header(&self.read_buf) {
+            if read_buf.len() >= HEADER_SIZE {
+                match decode_header(read_buf) {
                     Ok(Some(header)) => {
                         let total_len = HEADER_SIZE + header.payload_len as usize;
-                        if self.read_buf.len() >= total_len {
+                        if read_buf.len() >= total_len {
                             // We have a complete frame
-                            let _ = self.read_buf.split_to(HEADER_SIZE);
-                            let payload = self.read_buf.split_to(header.payload_len as usize);
+                            let _ = read_buf.split_to(HEADER_SIZE);
+                            let payload = read_buf.split_to(header.payload_len as usize);
 
                             match decode_client_message(
                                 header.message_type,
                                 Bytes::from(payload.to_vec()),
                             ) {
                                 Ok(msg) => {
-                                    trace!("[Session {}] Received: {:?}", self.id, msg);
+                                    trace!("[Session {}] Received: {:?}", session_id, msg);
                                     return Ok(Some(msg));
                                 }
                                 Err(e) => {
-                                    error!("[Session {}] Failed to decode message: {}", self.id, e);
+                                    error!("[Session {}] Failed to decode message: {}", session_id, e);
                                     continue;
                                 }
                             }
@@ -810,7 +904,7 @@ impl Session {
                         // Need more data
                     }
                     Err(e) => {
-                        error!("[Session {}] Protocol error: {}", self.id, e);
+                        error!("[Session {}] Protocol error: {}", session_id, e);
                         return Ok(None);
                     }
                 }
@@ -818,11 +912,11 @@ impl Session {
 
             // Read more data from socket
             let mut tmp_buf = [0u8; 4096];
-            let n = self.socket.read(&mut tmp_buf).await?;
+            let n = socket.read(&mut tmp_buf).await?;
             if n == 0 {
                 return Ok(None); // Connection closed
             }
-            self.read_buf.extend_from_slice(&tmp_buf[..n]);
+            read_buf.extend_from_slice(&tmp_buf[..n]);
         }
     }
 
@@ -1058,6 +1152,7 @@ impl Session {
             self.current_tuner_path = Some(resolved_path.clone());
             self.current_group_name = None;
             self.group_driver_paths.clear();
+            self.refresh_current_bon_driver_id().await;
         }
 
         self.clear_caches();
@@ -1091,12 +1186,23 @@ impl Session {
     }
 
     /// Handle SetChannel message (IBonDriver v1 style).
-    async fn handle_set_channel(&mut self, channel: u8, _priority: i32, _exclusive: bool) -> std::io::Result<()> {
+    async fn handle_set_channel(&mut self, channel: u8, priority: i32, exclusive: bool) -> std::io::Result<()> {
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             return self
                 .send_error(ErrorCode::InvalidState, "Tuner not open")
                 .await;
         }
+
+        self.session_registry
+            .update_client_controls(self.id, Some(priority), Some(exclusive))
+            .await;
+        let (effective_priority_opt, effective_exclusive) = self
+            .session_registry
+            .get_effective_controls(self.id)
+            .await
+            .unwrap_or((Some(priority), exclusive));
+        let priority = effective_priority_opt.unwrap_or(priority);
+        let exclusive = effective_exclusive;
 
         let tuner_path = match &self.current_tuner_path {
             Some(p) => p.clone(),
@@ -1205,6 +1311,17 @@ impl Session {
     async fn handle_set_channel_space(&mut self, space: u32, channel: u32, priority: i32, exclusive: bool) -> std::io::Result<()> {
         info!("[Session {}] HandleSetChannelSpace called: space={}, channel={}, priority={}, exclusive={}", 
               self.id, space, channel, priority, exclusive);
+
+        self.session_registry
+            .update_client_controls(self.id, Some(priority), Some(exclusive))
+            .await;
+        let (effective_priority, effective_exclusive) = self
+            .session_registry
+            .get_effective_controls(self.id)
+            .await
+            .unwrap_or((Some(priority), exclusive));
+        let priority = effective_priority.unwrap_or(priority);
+        let exclusive = effective_exclusive;
         
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             error!("[Session {}] SetChannelSpace: Tuner not open (state: {:?})", self.id, self.state);
@@ -1341,6 +1458,23 @@ impl Session {
                 }
             }
 
+            // Sort candidate drivers by quality score (descending)
+            if !candidate_drivers.is_empty() {
+                let mut score_map: HashMap<String, f64> = HashMap::new();
+                for (driver_path, _) in candidate_drivers.iter() {
+                    if score_map.contains_key(driver_path) {
+                        continue;
+                    }
+                    let score = db.get_driver_quality_score_by_path(driver_path).unwrap_or(1.0);
+                    score_map.insert(driver_path.clone(), score);
+                }
+                candidate_drivers.sort_by(|a, b| {
+                    let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
+                    let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
+                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+
             // Now select the driver with available capacity
             // Priority: 1) Driver already streaming this channel, 2) Driver with available capacity
             let mut selected_driver: Option<(String, u32)> = None;
@@ -1412,6 +1546,8 @@ impl Session {
             match selected_driver {
                 Some((path, driver_space)) => {
                     debug!("[Session {}] Final selected driver for channel: {} (space {})", self.id, path, driver_space);
+                    self.current_tuner_path = Some(path.clone());
+                    self.refresh_current_bon_driver_id().await;
                     // For satellite broadcasts, update actual_space to the one from the selected driver
                     if region_name == "BS" || region_name == "CS" {
                         let actual_space = driver_space;
@@ -1530,7 +1666,8 @@ impl Session {
 
                             // Update session registry with channel info and name
                             let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                            self.session_registry.update_channel(self.id, Some(channel_info)).await;
+                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                            self.current_channel_info = Some(channel_info);
 
                             // Try to get channel name from database
                             let channel_name = {
@@ -1541,7 +1678,8 @@ impl Session {
                                     None
                                 }
                             };
-                            self.session_registry.update_channel_name(self.id, channel_name).await;
+                            self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+                            self.current_channel_name = channel_name;
 
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
@@ -1816,7 +1954,8 @@ impl Session {
 
                 // Update session registry with channel info and name
                 let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                self.session_registry.update_channel(self.id, Some(channel_info)).await;
+                self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                self.current_channel_info = Some(channel_info);
 
                 // Try to get channel name from database
                 let channel_name = {
@@ -1827,7 +1966,8 @@ impl Session {
                         None
                     }
                 };
-                self.session_registry.update_channel_name(self.id, channel_name).await;
+                self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+                self.current_channel_name = channel_name;
 
                 // Wait for first TS data to arrive (indicates driver is ready)
                 // Timeout after 30 seconds to avoid hanging indefinitely
@@ -2057,6 +2197,7 @@ impl Session {
 
         // Set current tuner path
         self.current_tuner_path = Some(tuner_id.clone());
+        self.refresh_current_bon_driver_id().await;
 
         // Create channel key and tune
         let key = ChannelKey::space_channel(&tuner_id, space, channel);
@@ -2216,12 +2357,22 @@ impl Session {
     async fn send_ts_data(&mut self, data: Bytes) -> std::io::Result<()> {
         self.ts_msgs_sent += 1;
         self.ts_bytes_sent += data.len() as u64;
+        self.bytes_since_last += data.len() as u64;
+
+        // Analyze TS quality for this session
+        let delta = self.ts_quality_analyzer.analyze(&data);
+        self.packets_dropped += delta.packets_dropped;
+        self.packets_scrambled += delta.packets_scrambled;
+        self.packets_error += delta.packets_error;
+        self.interval_packets_total += delta.packets_total;
+        self.interval_packets_dropped += delta.packets_dropped;
 
         if self.last_ts_log.elapsed().as_secs_f32() >= 1.0 {
             info!(
                 "[Session {}] TsData sending: msgs={} bytes={}",
                 self.id, self.ts_msgs_sent, self.ts_bytes_sent
             );
+            let elapsed = self.last_ts_log.elapsed().as_secs_f64().max(0.001);
             self.last_ts_log = std::time::Instant::now();
 
             // Update session registry with signal and packet stats
@@ -2229,7 +2380,39 @@ impl Session {
                 let signal_level = tuner.signal_level();
                 // Use bytes sent to this client (not tuner's received packets)
                 let packets_sent = self.ts_bytes_sent / 188; // TS packet size
-                self.session_registry.update_stats(self.id, signal_level, packets_sent).await;
+
+                let bitrate_mbps = (self.bytes_since_last as f64 * 8.0) / 1_000_000.0 / elapsed;
+                let packet_loss_rate = if self.interval_packets_total > 0 {
+                    (self.interval_packets_dropped as f64 / self.interval_packets_total as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                self.session_registry.update_stats(
+                    self.id,
+                    signal_level,
+                    packets_sent,
+                    self.packets_dropped,
+                    self.packets_scrambled,
+                    self.packets_error,
+                    bitrate_mbps,
+                ).await;
+
+                let timestamp_ms = chrono::Utc::now().timestamp_millis();
+                self.session_registry.push_metrics_sample(
+                    self.id,
+                    timestamp_ms,
+                    bitrate_mbps,
+                    packet_loss_rate,
+                    signal_level,
+                ).await;
+
+                self.signal_samples += 1;
+                self.signal_level_sum += signal_level as f64;
+
+                self.bytes_since_last = 0;
+                self.interval_packets_total = 0;
+                self.interval_packets_dropped = 0;
             }
         }
 
@@ -2275,7 +2458,63 @@ impl Session {
             }
         }
         self.ts_receiver = None;
+        let final_tuner_path = self.current_tuner_path.clone();
         self.current_tuner_path = None;
+
+        // Update session history and driver quality stats
+        if self.disconnect_reason.is_none() {
+            self.disconnect_reason = Some("client_disconnect".to_string());
+        }
+
+        let duration_secs = self.session_started_at.elapsed().as_secs() as i64;
+        let average_signal = if self.signal_samples > 0 {
+            Some(self.signal_level_sum / self.signal_samples as f64)
+        } else {
+            None
+        };
+
+        let average_bitrate_mbps = if duration_secs > 0 {
+            Some((self.ts_bytes_sent as f64 * 8.0) / 1_000_000.0 / duration_secs as f64)
+        } else {
+            None
+        };
+
+        if let Some(history_id) = self.session_history_id {
+            let ended_at = chrono::Utc::now().timestamp();
+            let db = self.database.lock().await;
+            if let Err(e) = db.update_session_end(
+                history_id,
+                ended_at,
+                duration_secs,
+                self.ts_bytes_sent / 188,
+                self.packets_dropped,
+                self.packets_scrambled,
+                self.packets_error,
+                self.ts_bytes_sent,
+                average_bitrate_mbps,
+                average_signal,
+                self.disconnect_reason.as_deref(),
+                final_tuner_path.as_deref(),
+                self.current_channel_info.as_deref(),
+                self.current_channel_name.as_deref(),
+            ) {
+                warn!("[Session {}] Failed to update session history: {}", self.id, e);
+            }
+        }
+
+        if let Some(driver_id) = self.current_bon_driver_id {
+            let db = self.database.lock().await;
+            if let Err(e) = QualityScorer::update_stats(
+                &db,
+                driver_id,
+                self.ts_bytes_sent / 188,
+                self.packets_dropped,
+                self.packets_scrambled,
+                self.packets_error,
+            ) {
+                warn!("[Session {}] Failed to update driver quality stats: {}", self.id, e);
+            }
+        }
 
         // Update session registry
         self.session_registry.update_tuner(self.id, None).await;
@@ -2309,9 +2548,19 @@ impl Session {
         _group_name: String,
         _space_idx: u32,
         _channel: u32,
-        _priority: i32,
-        _exclusive: bool,
+        priority: i32,
+        exclusive: bool,
     ) -> std::io::Result<()> {
+        self.session_registry
+            .update_client_controls(self.id, Some(priority), Some(exclusive))
+            .await;
+        let (effective_priority, effective_exclusive) = self
+            .session_registry
+            .get_effective_controls(self.id)
+            .await
+            .unwrap_or((Some(priority), exclusive));
+        let priority = effective_priority.unwrap_or(priority);
+        let exclusive = effective_exclusive;
         // TODO: Implement group-based channel selection
         self.send_message(ServerMessage::SetChannelSpaceAck {
             success: false,

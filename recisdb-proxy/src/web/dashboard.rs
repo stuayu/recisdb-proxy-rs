@@ -85,6 +85,12 @@ const HTML_CONTENT: &str = r#"
         tr:hover { background: #f9f9f9; }
         code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
 
+        /* Performance graphs */
+        .performance-graphs { display: flex; gap: 12px; flex-wrap: wrap; }
+        .graph-container { background: #f8f9fa; padding: 10px 12px; border-radius: 8px; flex: 1; min-width: 220px; }
+        .graph-container h4 { font-size: 12px; color: #666; margin-bottom: 6px; }
+        .sparkline { width: 100%; height: 70px; }
+
         /* Buttons */
         .btn { display: inline-block; padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; transition: all 0.2s; }
         .btn-primary { background: #667eea; color: white; }
@@ -156,11 +162,24 @@ const HTML_CONTENT: &str = r#"
         th.sortable.asc::after { content: '▲'; opacity: 1; }
         th.sortable.desc::after { content: '▼'; opacity: 1; }
 
+        .sort-bar { display: flex; gap: 10px; align-items: center; margin: 8px 0 12px; flex-wrap: wrap; }
+        .sort-bar label { color: #666; font-size: 12px; }
+        .mobile-only { display: none; }
+
         @media (max-width: 768px) {
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .tabs { flex-wrap: wrap; }
             .tab { flex: 1; min-width: 80px; text-align: center; padding: 10px; font-size: 12px; }
             h1 { font-size: 18px; }
+
+            .mobile-only { display: flex; }
+
+            .responsive-table thead { display: none; }
+            .responsive-table, .responsive-table tbody, .responsive-table tr, .responsive-table td { display: block; width: 100%; }
+            .responsive-table tr { background: #fff; border: 1px solid #eee; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+            .responsive-table td { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f0f0; text-align: right; }
+            .responsive-table td::before { content: attr(data-label); flex: 0 0 40%; color: #666; font-size: 11px; font-weight: 600; text-align: left; }
+            .responsive-table td:last-child { border-bottom: none; }
         }
     </style>
 </head>
@@ -180,7 +199,9 @@ const HTML_CONTENT: &str = r#"
             <button class="tab active" data-tab="overview">概要</button>
             <button class="tab" data-tab="bondrivers">BonDriver</button>
             <button class="tab" data-tab="channels">チャンネル</button>
-            <button class="tab" data-tab="history">スキャン履歴</button>
+            <button class="tab" data-tab="scan-history">スキャン履歴</button>
+            <button class="tab" data-tab="session-history">セッション履歴</button>
+            <button class="tab" data-tab="alerts">アラート</button>
             <button class="tab" data-tab="settings">設定</button>
         </nav>
 
@@ -209,21 +230,50 @@ const HTML_CONTENT: &str = r#"
                 <h3>接続中のクライアント</h3>
                 <button class="btn btn-secondary btn-sm" onclick="refreshClients()">更新</button>
             </div>
-            <table id="clients-table">
+            <table id="clients-table" class="responsive-table sortable-table">
                 <thead>
                     <tr>
-                        <th>セッションID</th>
-                        <th>クライアント</th>
-                        <th>状態</th>
-                        <th>チャンネル</th>
-                        <th>信号レベル</th>
-                        <th>送信パケット</th>
+                        <th class="sortable" data-sort-type="number">セッションID</th>
+                        <th class="sortable" data-sort-type="text">クライアント</th>
+                        <th class="sortable" data-sort-type="text">ホスト名</th>
+                        <th class="sortable" data-sort-type="text">状態</th>
+                        <th class="sortable" data-sort-type="text">チャンネル</th>
+                        <th class="sortable" data-sort-type="number">信号レベル</th>
+                        <th class="sortable" data-sort-type="number">送信パケット</th>
+                        <th class="sortable" data-sort-type="number">Drop</th>
+                        <th class="sortable" data-sort-type="number">Scramble</th>
+                        <th class="sortable" data-sort-type="number">Error</th>
+                        <th class="sortable" data-sort-type="number">ビットレート</th>
+                        <th class="sortable" data-sort-type="number">優先度</th>
+                        <th class="sortable" data-sort-type="text">排他</th>
+                        <th class="sortable" data-sort-type="text">上書き</th>
+                        <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="clients-body">
-                    <tr><td colspan="6" class="empty-state">接続中のクライアントはありません</td></tr>
+                    <tr><td colspan="14" class="empty-state">接続中のクライアントはありません</td></tr>
                 </tbody>
             </table>
+            <div id="client-metrics-panel" style="margin-top: 16px; display: none;">
+                <div class="section-header" style="margin-bottom: 8px;">
+                    <h3>クライアント詳細</h3>
+                    <span id="client-metrics-title" style="color:#666;font-size:12px;"></span>
+                </div>
+                <div class="performance-graphs">
+                    <div class="graph-container">
+                        <h4>ビットレート (Mbps)</h4>
+                        <svg id="bitrate-graph" class="sparkline"></svg>
+                    </div>
+                    <div class="graph-container">
+                        <h4>パケットロス率 (%)</h4>
+                        <svg id="packet-loss-graph" class="sparkline"></svg>
+                    </div>
+                    <div class="graph-container">
+                        <h4>信号レベル (dB)</h4>
+                        <svg id="signal-graph" class="sparkline"></svg>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- BonDriver Tab -->
@@ -232,20 +282,23 @@ const HTML_CONTENT: &str = r#"
                 <h3>BonDriver 一覧</h3>
                 <button class="btn btn-secondary btn-sm" onclick="refreshBonDrivers()">更新</button>
             </div>
-            <table id="bondrivers-table">
+            <table id="bondrivers-table" class="responsive-table sortable-table">
                 <thead>
                     <tr>
-                        <th>DLLパス</th>
-                        <th>表示名</th>
-                        <th>グループ名</th>
-                        <th>最大インスタンス</th>
-                        <th>自動スキャン</th>
-                        <th>次回スキャン</th>
+                        <th class="sortable" data-sort-type="text">DLLパス</th>
+                        <th class="sortable" data-sort-type="text">表示名</th>
+                        <th class="sortable" data-sort-type="text">グループ名</th>
+                        <th class="sortable" data-sort-type="number">品質スコア</th>
+                        <th class="sortable" data-sort-type="number">Drop率</th>
+                        <th class="sortable" data-sort-type="number">総セッション</th>
+                        <th class="sortable" data-sort-type="number">最大インスタンス</th>
+                        <th class="sortable" data-sort-type="text">自動スキャン</th>
+                        <th class="sortable" data-sort-type="datetime">次回スキャン</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="bondrivers-body">
-                    <tr><td colspan="7" class="loading">読み込み中...</td></tr>
+                    <tr><td colspan="10" class="loading">読み込み中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -269,7 +322,21 @@ const HTML_CONTENT: &str = r#"
                     <button class="btn btn-secondary btn-sm" onclick="refreshChannels()">更新</button>
                 </div>
             </div>
-            <table id="channels-table">
+            <div class="sort-bar mobile-only">
+                <label for="channel-sort-key">並び替え</label>
+                <select id="channel-sort-key" onchange="setChannelSortFromUI()">
+                    <option value="is_enabled">有効</option>
+                    <option value="channel_name">チャンネル名</option>
+                    <option value="nid">NID/SID/TSID</option>
+                    <option value="band_type">バンド</option>
+                    <option value="terrestrial_region">地域</option>
+                    <option value="network_name">ネットワーク</option>
+                    <option value="tuner_count">チューナー</option>
+                    <option value="priority">優先度</option>
+                </select>
+                <button class="btn btn-secondary btn-sm" id="channel-sort-order" onclick="toggleChannelSortOrder()">昇順</button>
+            </div>
+            <table id="channels-table" class="responsive-table">
                 <thead>
                     <tr>
                         <th class="sortable" data-sort="is_enabled">有効</th>
@@ -321,23 +388,96 @@ const HTML_CONTENT: &str = r#"
         </div>
 
         <!-- History Tab -->
-        <div id="history" class="tab-content">
+        <div id="scan-history" class="tab-content">
             <div class="section-header">
                 <h3>スキャン履歴</h3>
                 <button class="btn btn-secondary btn-sm" onclick="refreshHistory()">更新</button>
             </div>
-            <table id="history-table">
+            <table id="history-table" class="responsive-table sortable-table">
                 <thead>
                     <tr>
-                        <th>日時</th>
-                        <th>BonDriver ID</th>
-                        <th>結果</th>
-                        <th>チャンネル数</th>
-                        <th>メッセージ</th>
+                        <th class="sortable" data-sort-type="datetime">日時</th>
+                        <th class="sortable" data-sort-type="number">BonDriver ID</th>
+                        <th class="sortable" data-sort-type="text">結果</th>
+                        <th class="sortable" data-sort-type="number">チャンネル数</th>
+                        <th class="sortable" data-sort-type="text">メッセージ</th>
                     </tr>
                 </thead>
                 <tbody id="history-body">
                     <tr><td colspan="5" class="loading">読み込み中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Session History Tab -->
+        <div id="session-history" class="tab-content">
+            <div class="section-header">
+                <h3>セッション履歴</h3>
+                <div class="filter-bar">
+                    <input type="text" id="session-filter-address" placeholder="クライアントアドレスで絞り込み">
+                    <button class="btn btn-secondary btn-sm" onclick="refreshSessionHistory()">更新</button>
+                </div>
+            </div>
+            <table id="session-history-table" class="responsive-table sortable-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort-type="datetime">開始</th>
+                        <th class="sortable" data-sort-type="datetime">終了</th>
+                        <th class="sortable" data-sort-type="text">クライアント</th>
+                        <th class="sortable" data-sort-type="text">チャンネル</th>
+                        <th class="sortable" data-sort-type="number">時間</th>
+                        <th class="sortable" data-sort-type="number">送信パケット</th>
+                        <th class="sortable" data-sort-type="number">Drop</th>
+                        <th class="sortable" data-sort-type="number">Scramble</th>
+                        <th class="sortable" data-sort-type="number">Error</th>
+                        <th class="sortable" data-sort-type="number">平均ビットレート</th>
+                    </tr>
+                </thead>
+                <tbody id="session-history-body">
+                    <tr><td colspan="10" class="empty-state">セッション履歴がありません</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Alerts Tab -->
+        <div id="alerts" class="tab-content">
+            <div class="section-header">
+                <h3>アクティブアラート</h3>
+                <button class="btn btn-secondary btn-sm" onclick="refreshAlerts()">更新</button>
+            </div>
+            <table id="alerts-table" class="responsive-table sortable-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort-type="datetime">発生時刻</th>
+                        <th class="sortable" data-sort-type="number">ルールID</th>
+                        <th class="sortable" data-sort-type="number">セッション</th>
+                        <th class="sortable" data-sort-type="text">メッセージ</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="alerts-body">
+                    <tr><td colspan="5" class="empty-state">アクティブアラートはありません</td></tr>
+                </tbody>
+            </table>
+
+            <div class="section-header" style="margin-top: 20px;">
+                <h3>アラートルール</h3>
+                <button class="btn btn-primary btn-sm" onclick="openModal('alert-rule-modal')">ルール追加</button>
+            </div>
+            <table id="alert-rules-table" class="responsive-table sortable-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort-type="number">ID</th>
+                        <th class="sortable" data-sort-type="text">名前</th>
+                        <th class="sortable" data-sort-type="text">メトリクス</th>
+                        <th class="sortable" data-sort-type="text">条件</th>
+                        <th class="sortable" data-sort-type="number">閾値</th>
+                        <th class="sortable" data-sort-type="text">有効</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="alert-rules-body">
+                    <tr><td colspan="7" class="empty-state">ルールがありません</td></tr>
                 </tbody>
             </table>
         </div>
@@ -392,6 +532,64 @@ const HTML_CONTENT: &str = r#"
             </form>
         </div>
     </div>
+    
+        <div id="alert-rule-modal" class="modal">
+            <div class="modal-content">
+                <h3>アラートルール追加</h3>
+                <form id="alert-rule-form">
+                    <div class="form-group">
+                        <label>名前</label>
+                        <input type="text" id="ar-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label>メトリクス</label>
+                        <select id="ar-metric">
+                            <option value="drop_rate">drop_rate</option>
+                            <option value="scramble_rate">scramble_rate</option>
+                            <option value="error_rate">error_rate</option>
+                            <option value="signal_level">signal_level</option>
+                            <option value="bitrate">bitrate</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>条件</label>
+                        <select id="ar-condition">
+                            <option value="gt">gt</option>
+                            <option value="gte">gte</option>
+                            <option value="lt">lt</option>
+                            <option value="lte">lte</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>閾値</label>
+                        <input type="number" id="ar-threshold" step="0.01" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Webhook URL (任意)</label>
+                        <input type="text" id="ar-webhook-url" placeholder="https://...">
+                    </div>
+                    <div class="form-group">
+                        <label>Webhook フォーマット</label>
+                        <select id="ar-webhook-format">
+                            <option value="generic">generic</option>
+                            <option value="discord">discord</option>
+                            <option value="slack">slack</option>
+                            <option value="line">line</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-check">
+                            <input type="checkbox" id="ar-enabled" checked>
+                            有効にする
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeModal('alert-rule-modal')">キャンセル</button>
+                        <button type="submit" class="btn btn-primary">保存</button>
+                    </div>
+                </form>
+            </div>
+        </div>
 
     <!-- Channel Edit Modal -->
     <div class="modal" id="channel-modal">
@@ -426,6 +624,37 @@ const HTML_CONTENT: &str = r#"
         </div>
     </div>
 
+    <div id="client-override-modal" class="modal">
+        <div class="modal-content">
+            <h3>クライアント制御の上書き</h3>
+            <form id="client-override-form">
+                <input type="hidden" id="override-session-id">
+                <div class="form-group">
+                    <label>優先度</label>
+                    <input type="number" id="override-priority" placeholder="未設定は空欄">
+                    <label class="form-check" style="margin-top:6px;">
+                        <input type="checkbox" id="override-priority-enabled">
+                        優先度を上書きする
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="override-exclusive">
+                        排他ロックを強制
+                    </label>
+                    <label class="form-check" style="margin-top:6px;">
+                        <input type="checkbox" id="override-exclusive-enabled">
+                        排他を上書きする
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('client-override-modal')">キャンセル</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -438,7 +667,9 @@ const HTML_CONTENT: &str = r#"
                 // Load data for the tab
                 if (tab.dataset.tab === 'bondrivers') refreshBonDrivers();
                 else if (tab.dataset.tab === 'channels') refreshChannels();
-                else if (tab.dataset.tab === 'history') refreshHistory();
+                else if (tab.dataset.tab === 'scan-history') refreshHistory();
+                else if (tab.dataset.tab === 'session-history') refreshSessionHistory();
+                else if (tab.dataset.tab === 'alerts') { refreshAlerts(); refreshAlertRules(); }
             });
         });
 
@@ -465,6 +696,78 @@ const HTML_CONTENT: &str = r#"
         function escapeHtml(str) {
             if (!str) return '';
             return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);
+        }
+
+        function applyResponsiveLabels(tableId) {
+            const table = document.getElementById(tableId);
+            if (!table) return;
+            const headers = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim());
+            table.querySelectorAll('tbody tr').forEach(tr => {
+                tr.querySelectorAll('td').forEach((td, index) => {
+                    if (td.hasAttribute('colspan')) return;
+                    if (!td.hasAttribute('data-label')) {
+                        td.setAttribute('data-label', headers[index] || '');
+                    }
+                });
+            });
+        }
+
+        function parseSortValue(value, type) {
+            if (type === 'number') {
+                const num = parseFloat(String(value).replace(/[^0-9.\-]/g, ''));
+                return isNaN(num) ? 0 : num;
+            }
+            if (type === 'datetime') {
+                const num = parseInt(value, 10);
+                if (!isNaN(num)) return num;
+                const time = Date.parse(String(value));
+                return isNaN(time) ? 0 : time;
+            }
+            return String(value).toLowerCase();
+        }
+
+        function enableTableSorting(tableId) {
+            const table = document.getElementById(tableId);
+            if (!table) return;
+            const headers = Array.from(table.querySelectorAll('thead th.sortable'));
+            headers.forEach((th, index) => {
+                th.addEventListener('click', () => {
+                    const type = th.dataset.sortType || 'text';
+                    const isAsc = !th.classList.contains('asc');
+                    headers.forEach(h => h.classList.remove('asc', 'desc'));
+                    th.classList.add(isAsc ? 'asc' : 'desc');
+
+                    const tbody = table.querySelector('tbody');
+                    if (!tbody) return;
+                    const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.querySelector('.empty-state') && !r.querySelector('.loading'));
+                    rows.sort((a, b) => {
+                        const aCell = a.children[index];
+                        const bCell = b.children[index];
+                        const aVal = aCell?.dataset.sortValue ?? aCell?.textContent ?? '';
+                        const bVal = bCell?.dataset.sortValue ?? bCell?.textContent ?? '';
+                        const va = parseSortValue(aVal, type);
+                        const vb = parseSortValue(bVal, type);
+                        if (va < vb) return isAsc ? -1 : 1;
+                        if (va > vb) return isAsc ? 1 : -1;
+                        return 0;
+                    });
+                    rows.forEach(row => tbody.appendChild(row));
+                });
+            });
+        }
+
+        function renderOverrideBadge(c) {
+            const hasOverride = (c.override_priority !== null && c.override_priority !== undefined) ||
+                (c.override_exclusive !== null && c.override_exclusive !== undefined);
+            if (!hasOverride) return '<span class="badge badge-info">なし</span> ';
+            const parts = [];
+            if (c.override_priority !== null && c.override_priority !== undefined) {
+                parts.push(`P=${c.override_priority}`);
+            }
+            if (c.override_exclusive !== null && c.override_exclusive !== undefined) {
+                parts.push(`E=${c.override_exclusive ? 'ON' : 'OFF'}`);
+            }
+            return `<span class="badge badge-warning">${parts.join(' ')}</span> `;
         }
 
         // BandType: 0=Terrestrial, 1=BS, 2=CS, 3=4K, 4=Other, 5=CATV, 6=SKY
@@ -516,56 +819,190 @@ const HTML_CONTENT: &str = r#"
                 document.getElementById('stat-clients').textContent = data.count || 0;
 
                 if (!data.clients || data.clients.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">接続中のクライアントはありません</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="14" class="empty-state">接続中のクライアントはありません</td></tr>';
+                    applyResponsiveLabels('clients-table');
                     return;
                 }
 
                 tbody.innerHTML = data.clients.map(c => `
-                    <tr>
-                        <td>${c.session_id}</td>
-                        <td>${escapeHtml(c.address)} <span style="color:#999;font-size:11px">(${formatDuration(c.connected_seconds)})</span></td>
-                        <td><span class="badge ${c.is_streaming ? 'badge-success' : 'badge-warning'}">${c.is_streaming ? 'ストリーミング中' : '待機中'}</span></td>
-                        <td title="${escapeHtml(c.tuner_path || '')}">${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
-                        <td>${c.signal_level || '-'} dB</td>
-                        <td>${formatPackets(c.packets_sent)}</td>
+                    <tr onclick="selectClient(${c.session_id})" style="cursor:pointer;">
+                        <td data-sort-value="${c.session_id}">${c.session_id}</td>
+                        <td data-sort-value="${escapeHtml(c.address)}">${escapeHtml(c.address)} <span style="color:#999;font-size:11px">(${formatDuration(c.connected_seconds)})</span></td>
+                        <td data-sort-value="${escapeHtml(c.host || '-')}">${escapeHtml(c.host || '-')}</td>
+                        <td data-sort-value="${c.is_streaming ? '1' : '0'}"><span class="badge ${c.is_streaming ? 'badge-success' : 'badge-warning'}">${c.is_streaming ? 'ストリーミング中' : '待機中'}</span></td>
+                        <td data-sort-value="${escapeHtml(c.channel_name || c.channel_info || '-')}">${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
+                        <td data-sort-value="${c.signal_level || 0}">${c.signal_level || '-'} dB</td>
+                        <td data-sort-value="${c.packets_sent || 0}">${formatPackets(c.packets_sent)}</td>
+                        <td data-sort-value="${c.packets_dropped || 0}">${formatPackets(c.packets_dropped)}</td>
+                        <td data-sort-value="${c.packets_scrambled || 0}">${formatPackets(c.packets_scrambled)}</td>
+                        <td data-sort-value="${c.packets_error || 0}">${formatPackets(c.packets_error)}</td>
+                        <td data-sort-value="${c.current_bitrate_mbps || 0}">${c.current_bitrate_mbps || '-'} Mbps</td>
+                        <td data-sort-value="${c.effective_priority !== null && c.effective_priority !== undefined ? c.effective_priority : -99999}">${c.effective_priority !== null && c.effective_priority !== undefined ? c.effective_priority : '-'}</td>
+                        <td data-sort-value="${c.effective_exclusive ? '1' : '0'}"><span class="badge ${c.effective_exclusive ? 'badge-danger' : 'badge-success'}">${c.effective_exclusive ? 'ON' : 'OFF'}</span></td>
+                        <td data-sort-value="${(c.override_priority !== null && c.override_priority !== undefined) || (c.override_exclusive !== null && c.override_exclusive !== undefined) ? '1' : '0'}">
+                            ${renderOverrideBadge(c)}
+                            <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); openOverrideModal(${c.session_id}, ${c.override_priority !== null && c.override_priority !== undefined ? c.override_priority : 'null'}, ${c.override_exclusive !== null && c.override_exclusive !== undefined ? c.override_exclusive : 'null'});">設定</button>
+                            <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); clearOverride(${c.session_id});">解除</button>
+                        </td>
+                        <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); disconnectClient(${c.session_id});">切断</button></td>
                     </tr>
                 `).join('');
+                applyResponsiveLabels('clients-table');
             } catch (e) { console.error('Failed to refresh clients:', e); }
         }
+
+        let activeClientId = null;
+
+        function selectClient(id) {
+            activeClientId = id;
+            document.getElementById('client-metrics-panel').style.display = 'block';
+            document.getElementById('client-metrics-title').textContent = `Session ${id}`;
+            updateClientMetrics();
+        }
+
+        async function disconnectClient(id) {
+            if (!confirm('このセッションを切断しますか？')) return;
+            try {
+                const res = await fetch(`/api/client/${id}/disconnect`, { method: 'POST' });
+                const data = await res.json();
+                if (!data.success) alert('切断に失敗しました');
+            } catch (e) { alert('切断に失敗しました: ' + e.message); }
+        }
+
+        function drawSparkline(svgId, data, color, minY, maxY) {
+            const svg = document.getElementById(svgId);
+            if (!svg) return;
+            const width = svg.clientWidth || 300;
+            const height = svg.clientHeight || 70;
+            svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+            if (!data || data.length === 0) {
+                svg.innerHTML = '';
+                return;
+            }
+
+            const values = data.map(d => d[1]);
+            const minVal = minY !== null ? minY : Math.min(...values);
+            const maxVal = maxY !== null ? maxY : Math.max(...values);
+            const range = (maxVal - minVal) || 1;
+
+            const points = data.map((d, i) => {
+                const x = (i / Math.max(1, data.length - 1)) * width;
+                const y = height - ((d[1] - minVal) / range) * height;
+                return `${x},${y}`;
+            }).join(' ');
+
+            svg.innerHTML = `<polyline fill="none" stroke="${color}" stroke-width="2" points="${points}" />`;
+        }
+
+        async function updateClientMetrics() {
+            if (!activeClientId) return;
+            try {
+                const res = await fetch(`/api/client/${activeClientId}/metrics-history`);
+                const data = await res.json();
+                if (!data.success) return;
+                drawSparkline('bitrate-graph', data.bitrate, '#4CAF50', 0, null);
+                drawSparkline('packet-loss-graph', data.packet_loss, '#FF5722', 0, null);
+                drawSparkline('signal-graph', data.signal_level, '#2196F3', 0, null);
+            } catch (e) { console.error('Failed to update metrics:', e); }
+        }
+
+        function openOverrideModal(sessionId, overridePriority, overrideExclusive) {
+            document.getElementById('override-session-id').value = sessionId;
+            document.getElementById('override-priority').value = overridePriority !== null ? overridePriority : '';
+            document.getElementById('override-exclusive').checked = overrideExclusive === true;
+            document.getElementById('override-priority-enabled').checked = overridePriority !== null;
+            document.getElementById('override-exclusive-enabled').checked = overrideExclusive !== null;
+            openModal('client-override-modal');
+        }
+
+        async function clearOverride(sessionId) {
+            if (!confirm('上書きを解除しますか？')) return;
+            try {
+                const res = await fetch(`/api/client/${sessionId}/controls`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        override_priority: null,
+                        override_exclusive: null
+                    })
+                });
+                const data = await res.json();
+                if (data.success) refreshClients();
+            } catch (e) { alert('解除に失敗しました: ' + e.message); }
+        }
+
+        document.getElementById('client-override-form').onsubmit = async (e) => {
+            e.preventDefault();
+            const sessionId = document.getElementById('override-session-id').value;
+            const priorityValue = document.getElementById('override-priority').value;
+            const priorityEnabled = document.getElementById('override-priority-enabled').checked;
+            const exclusiveEnabled = document.getElementById('override-exclusive-enabled').checked;
+            const overridePriority = priorityEnabled ? (priorityValue === '' ? 0 : parseInt(priorityValue, 10)) : null;
+            const overrideExclusive = exclusiveEnabled ? document.getElementById('override-exclusive').checked : null;
+
+            try {
+                const res = await fetch(`/api/client/${sessionId}/controls`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        override_priority: overridePriority,
+                        override_exclusive: overrideExclusive
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    closeModal('client-override-modal');
+                    refreshClients();
+                } else {
+                    alert('更新に失敗しました');
+                }
+            } catch (e) { alert('更新に失敗しました: ' + e.message); }
+        };
 
         // BonDrivers
         async function refreshBonDrivers() {
             try {
-                const res = await fetch('/api/bondrivers');
+                const res = await fetch('/api/bondrivers/ranking');
                 const data = await res.json();
                 const tbody = document.getElementById('bondrivers-body');
                 const filter = document.getElementById('channel-bondriver-filter');
 
-                if (!data.success || !data.bondrivers) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">BonDriverが登録されていません</td></tr>';
+                if (!data.success || !data.items) {
+                    tbody.innerHTML = '<tr><td colspan="10" class="empty-state">BonDriverが登録されていません</td></tr>';
+                    applyResponsiveLabels('bondrivers-table');
                     return;
                 }
 
+                const bondrivers = data.items.map(i => i.driver);
+
                 // Update filter dropdown
                 filter.innerHTML = '<option value="">すべてのBonDriver</option>' +
-                    data.bondrivers.map(d => `<option value="${d.id}">${escapeHtml(d.driver_name || d.dll_path)}</option>`).join('');
+                    bondrivers.map(d => `<option value="${d.id}">${escapeHtml(d.driver_name || d.dll_path)}</option>`).join('');
 
-                tbody.innerHTML = data.bondrivers.map(d => {
+                tbody.innerHTML = data.items.map(item => {
+                    const d = item.driver;
                     const nextScan = d.next_scan_at ? formatDateTime(d.next_scan_at) : '-';
+                    const quality = (item.quality_score * 100).toFixed(1) + '%';
+                    const dropRate = (item.recent_drop_rate * 100).toFixed(2) + '%';
                     return `
                     <tr>
-                        <td><code>${escapeHtml(d.dll_path)}</code></td>
-                        <td>${escapeHtml(d.driver_name) || '-'}</td>
-                        <td>${escapeHtml(d.group_name) || '-'}</td>
-                        <td>${d.max_instances}</td>
-                        <td><span class="badge ${d.auto_scan_enabled ? 'badge-success' : 'badge-danger'}">${d.auto_scan_enabled ? 'ON' : 'OFF'}</span></td>
-                        <td>${nextScan}</td>
+                        <td data-sort-value="${escapeHtml(d.dll_path)}"><code>${escapeHtml(d.dll_path)}</code></td>
+                        <td data-sort-value="${escapeHtml(d.driver_name || '-')}">${escapeHtml(d.driver_name) || '-'}</td>
+                        <td data-sort-value="${escapeHtml(d.group_name || '-')}">${escapeHtml(d.group_name) || '-'}</td>
+                        <td data-sort-value="${item.quality_score}">${quality}</td>
+                        <td data-sort-value="${item.recent_drop_rate}">${dropRate}</td>
+                        <td data-sort-value="${item.total_sessions}">${item.total_sessions}</td>
+                        <td data-sort-value="${d.max_instances}">${d.max_instances}</td>
+                        <td data-sort-value="${d.auto_scan_enabled ? '1' : '0'}"><span class="badge ${d.auto_scan_enabled ? 'badge-success' : 'badge-danger'}">${d.auto_scan_enabled ? 'ON' : 'OFF'}</span></td>
+                        <td data-sort-value="${d.next_scan_at || 0}">${nextScan}</td>
                         <td>
                             <button class="btn btn-primary btn-sm" onclick='editBonDriver(${JSON.stringify(d)})'>編集</button>
                             <button class="btn btn-warning btn-sm" onclick="triggerScan(${d.id})">スキャン</button>
                         </td>
                     </tr>
                 `}).join('');
+                applyResponsiveLabels('bondrivers-table');
             } catch (e) { console.error('Failed to refresh bondrivers:', e); }
         }
 
@@ -628,6 +1065,7 @@ const HTML_CONTENT: &str = r#"
             const tbody = document.getElementById('channels-body');
             if (channelData.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="9" class="empty-state">チャンネルがありません</td></tr>';
+                applyResponsiveLabels('channels-table');
                 return;
             }
 
@@ -674,6 +1112,7 @@ const HTML_CONTENT: &str = r#"
                     </td>
                 </tr>
             `).join('');
+            applyResponsiveLabels('channels-table');
         }
 
         function sortChannels(key) {
@@ -683,13 +1122,41 @@ const HTML_CONTENT: &str = r#"
                 channelSortKey = key;
                 channelSortAsc = true;
             }
-            // Update header styles
+            updateChannelSortIndicators();
+            updateChannelSortUI();
+            renderChannels();
+        }
+
+        function updateChannelSortIndicators() {
             document.querySelectorAll('#channels-table th.sortable').forEach(th => {
                 th.classList.remove('asc', 'desc');
-                if (th.dataset.sort === key) {
+                if (th.dataset.sort === channelSortKey) {
                     th.classList.add(channelSortAsc ? 'asc' : 'desc');
                 }
             });
+        }
+
+        function updateChannelSortUI() {
+            const select = document.getElementById('channel-sort-key');
+            const orderBtn = document.getElementById('channel-sort-order');
+            if (select) select.value = channelSortKey;
+            if (orderBtn) orderBtn.textContent = channelSortAsc ? '昇順' : '降順';
+        }
+
+        function setChannelSortFromUI() {
+            const select = document.getElementById('channel-sort-key');
+            if (!select) return;
+            channelSortKey = select.value;
+            channelSortAsc = true;
+            updateChannelSortIndicators();
+            updateChannelSortUI();
+            renderChannels();
+        }
+
+        function toggleChannelSortOrder() {
+            channelSortAsc = !channelSortAsc;
+            updateChannelSortIndicators();
+            updateChannelSortUI();
             renderChannels();
         }
 
@@ -717,6 +1184,8 @@ const HTML_CONTENT: &str = r#"
                 } else {
                     channelData = data.channels;
                 }
+                updateChannelSortIndicators();
+                updateChannelSortUI();
                 renderChannels();
             } catch (e) { console.error('Failed to refresh channels:', e); }
         }
@@ -789,20 +1258,152 @@ const HTML_CONTENT: &str = r#"
 
                 if (!data.success || !data.history || data.history.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="5" class="empty-state">スキャン履歴がありません</td></tr>';
+                    applyResponsiveLabels('history-table');
                     return;
                 }
 
                 tbody.innerHTML = data.history.map(h => `
                     <tr>
-                        <td>${formatDateTime(h.scan_time)}</td>
-                        <td>${h.bon_driver_id}</td>
-                        <td><span class="badge ${h.success ? 'badge-success' : 'badge-danger'}">${h.success ? '成功' : '失敗'}</span></td>
-                        <td>${h.channel_count !== null ? h.channel_count : '-'}</td>
-                        <td>${escapeHtml(h.error_message) || '-'}</td>
+                        <td data-sort-value="${h.scan_time || 0}">${formatDateTime(h.scan_time)}</td>
+                        <td data-sort-value="${h.bon_driver_id}">${h.bon_driver_id}</td>
+                        <td data-sort-value="${h.success ? '1' : '0'}"><span class="badge ${h.success ? 'badge-success' : 'badge-danger'}">${h.success ? '成功' : '失敗'}</span></td>
+                        <td data-sort-value="${h.channel_count !== null ? h.channel_count : -1}">${h.channel_count !== null ? h.channel_count : '-'}</td>
+                        <td data-sort-value="${escapeHtml(h.error_message || '-')}">${escapeHtml(h.error_message) || '-'}</td>
                     </tr>
                 `).join('');
+                applyResponsiveLabels('history-table');
             } catch (e) { console.error('Failed to refresh history:', e); }
         }
+
+        // Session History
+        async function refreshSessionHistory() {
+            try {
+                const address = document.getElementById('session-filter-address').value || '';
+                const url = address ? `/api/session-history?client_address=${encodeURIComponent(address)}` : '/api/session-history';
+                const res = await fetch(url);
+                const data = await res.json();
+                const tbody = document.getElementById('session-history-body');
+
+                if (!data.success || !data.history || data.history.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="10" class="empty-state">セッション履歴がありません</td></tr>';
+                    applyResponsiveLabels('session-history-table');
+                    return;
+                }
+
+                tbody.innerHTML = data.history.map(h => `
+                    <tr>
+                        <td data-sort-value="${h.started_at || 0}">${formatDateTime(h.started_at)}</td>
+                        <td data-sort-value="${h.ended_at || 0}">${formatDateTime(h.ended_at)}</td>
+                        <td data-sort-value="${escapeHtml(h.client_address)}">${escapeHtml(h.client_address)}</td>
+                        <td data-sort-value="${escapeHtml(h.channel_name || h.channel_info || '-')}">${escapeHtml(h.channel_name || h.channel_info || '-') }</td>
+                        <td data-sort-value="${h.duration_secs || 0}">${formatDuration(h.duration_secs)}</td>
+                        <td data-sort-value="${h.packets_sent || 0}">${formatPackets(h.packets_sent)}</td>
+                        <td data-sort-value="${h.packets_dropped || 0}">${formatPackets(h.packets_dropped)}</td>
+                        <td data-sort-value="${h.packets_scrambled || 0}">${formatPackets(h.packets_scrambled)}</td>
+                        <td data-sort-value="${h.packets_error || 0}">${formatPackets(h.packets_error)}</td>
+                        <td data-sort-value="${h.average_bitrate_mbps !== null && h.average_bitrate_mbps !== undefined ? h.average_bitrate_mbps : 0}">${h.average_bitrate_mbps !== null && h.average_bitrate_mbps !== undefined ? h.average_bitrate_mbps.toFixed(2) + ' Mbps' : '-'}</td>
+                    </tr>
+                `).join('');
+                applyResponsiveLabels('session-history-table');
+            } catch (e) { console.error('Failed to refresh session history:', e); }
+        }
+
+        // Alerts
+        async function refreshAlerts() {
+            try {
+                const res = await fetch('/api/alerts');
+                const data = await res.json();
+                const tbody = document.getElementById('alerts-body');
+
+                if (!data.success || !data.alerts || data.alerts.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">アクティブアラートはありません</td></tr>';
+                    applyResponsiveLabels('alerts-table');
+                    return;
+                }
+
+                tbody.innerHTML = data.alerts.map(a => `
+                    <tr>
+                        <td data-sort-value="${a.triggered_at || 0}">${formatDateTime(a.triggered_at)}</td>
+                        <td data-sort-value="${a.rule_id}">${a.rule_id}</td>
+                        <td data-sort-value="${a.session_id || 0}">${a.session_id || '-'}</td>
+                        <td data-sort-value="${escapeHtml(a.message || '-')}">${escapeHtml(a.message || '-') }</td>
+                        <td><button class="btn btn-success btn-sm" onclick="acknowledgeAlert(${a.id})">確認</button></td>
+                    </tr>
+                `).join('');
+                applyResponsiveLabels('alerts-table');
+            } catch (e) { console.error('Failed to refresh alerts:', e); }
+        }
+
+        async function refreshAlertRules() {
+            try {
+                const res = await fetch('/api/alert-rules');
+                const data = await res.json();
+                const tbody = document.getElementById('alert-rules-body');
+
+                if (!data.success || !data.rules || data.rules.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">ルールがありません</td></tr>';
+                    applyResponsiveLabels('alert-rules-table');
+                    return;
+                }
+
+                tbody.innerHTML = data.rules.map(r => `
+                    <tr>
+                        <td data-sort-value="${r.id}">${r.id}</td>
+                        <td data-sort-value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</td>
+                        <td data-sort-value="${escapeHtml(r.metric)}">${escapeHtml(r.metric)}</td>
+                        <td data-sort-value="${escapeHtml(r.condition)}">${escapeHtml(r.condition)}</td>
+                        <td data-sort-value="${r.threshold}">${r.threshold}</td>
+                        <td data-sort-value="${r.is_enabled ? '1' : '0'}"><span class="badge ${r.is_enabled ? 'badge-success' : 'badge-danger'}">${r.is_enabled ? 'ON' : 'OFF'}</span></td>
+                        <td><button class="btn btn-danger btn-sm" onclick="deleteAlertRule(${r.id})">削除</button></td>
+                    </tr>
+                `).join('');
+                applyResponsiveLabels('alert-rules-table');
+            } catch (e) { console.error('Failed to refresh alert rules:', e); }
+        }
+
+        async function acknowledgeAlert(id) {
+            try {
+                const res = await fetch(`/api/alerts/${id}/acknowledge`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) refreshAlerts();
+            } catch (e) { alert('確認に失敗しました: ' + e.message); }
+        }
+
+        async function deleteAlertRule(id) {
+            if (!confirm('このルールを削除しますか？')) return;
+            try {
+                const res = await fetch(`/api/alert-rules/${id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) refreshAlertRules();
+            } catch (e) { alert('削除に失敗しました: ' + e.message); }
+        }
+
+        document.getElementById('alert-rule-form').onsubmit = async (e) => {
+            e.preventDefault();
+            try {
+                const res = await fetch('/api/alert-rules', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: document.getElementById('ar-name').value,
+                        metric: document.getElementById('ar-metric').value,
+                        condition: document.getElementById('ar-condition').value,
+                        threshold: parseFloat(document.getElementById('ar-threshold').value),
+                        severity: 'warning',
+                        is_enabled: document.getElementById('ar-enabled').checked,
+                        webhook_url: document.getElementById('ar-webhook-url').value || null,
+                        webhook_format: document.getElementById('ar-webhook-format').value
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    closeModal('alert-rule-modal');
+                    refreshAlertRules();
+                } else {
+                    alert('エラー: ' + data.error);
+                }
+            } catch (e) { alert('保存に失敗しました: ' + e.message); }
+        };
 
         // Scan Config Functions
         async function loadScanConfig() {
@@ -873,7 +1474,13 @@ const HTML_CONTENT: &str = r#"
             refreshStats();
             refreshClients();
             loadScanConfig();
-            setInterval(() => { refreshStats(); refreshClients(); }, 2000);
+            enableTableSorting('clients-table');
+            enableTableSorting('bondrivers-table');
+            enableTableSorting('history-table');
+            enableTableSorting('session-history-table');
+            enableTableSorting('alerts-table');
+            enableTableSorting('alert-rules-table');
+            setInterval(() => { refreshStats(); refreshClients(); updateClientMetrics(); }, 2000);
         });
     </script>
 </body>

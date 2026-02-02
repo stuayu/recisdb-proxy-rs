@@ -15,6 +15,7 @@ path = "src/main.rs"
 [features]
 default = []
 tls = ["tokio-rustls", "rustls", "rustls-pemfile"]
+webhook = ["reqwest"]
 
 [dependencies]
 recisdb-protocol = { path = "../recisdb-protocol" }
@@ -43,6 +44,8 @@ toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
+reqwest = { version = "0.11", features = ["json"], optional = true }
+dns-lookup = "1.0"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }

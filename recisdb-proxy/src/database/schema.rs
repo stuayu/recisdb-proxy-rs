@@ -82,6 +82,76 @@ CREATE TABLE IF NOT EXISTS scan_scheduler_config (
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
+-- Session history table
+CREATE TABLE IF NOT EXISTS session_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    client_address TEXT NOT NULL,
+    tuner_path TEXT,
+    channel_info TEXT,
+    channel_name TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    duration_secs INTEGER,
+    packets_sent INTEGER DEFAULT 0,
+    packets_dropped INTEGER DEFAULT 0,
+    packets_scrambled INTEGER DEFAULT 0,
+    packets_error INTEGER DEFAULT 0,
+    bytes_sent INTEGER DEFAULT 0,
+    average_bitrate_mbps REAL,
+    average_signal_level REAL,
+    disconnect_reason TEXT,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
+-- Alert rules table
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    metric TEXT NOT NULL,       -- 'drop_rate', 'scramble_rate', 'error_rate', 'signal_level', 'bitrate'
+    condition TEXT NOT NULL,    -- 'gt', 'lt', 'gte', 'lte'
+    threshold REAL NOT NULL,
+    severity TEXT DEFAULT 'warning',
+    is_enabled INTEGER DEFAULT 1,
+    webhook_url TEXT,
+    webhook_format TEXT DEFAULT 'generic',
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
+-- Alert history table
+CREATE TABLE IF NOT EXISTS alert_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    session_id INTEGER,
+    triggered_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    metric_value REAL,
+    message TEXT,
+    acknowledged INTEGER DEFAULT 0,
+    FOREIGN KEY(rule_id) REFERENCES alert_rules(id) ON DELETE CASCADE
+);
+
+-- Driver quality stats table
+CREATE TABLE IF NOT EXISTS driver_quality_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bon_driver_id INTEGER NOT NULL,
+    -- Cumulative stats
+    total_packets INTEGER DEFAULT 0,
+    dropped_packets INTEGER DEFAULT 0,
+    scrambled_packets INTEGER DEFAULT 0,
+    error_packets INTEGER DEFAULT 0,
+    total_sessions INTEGER DEFAULT 0,
+    -- Calculated score (0.0 - 1.0, higher is better)
+    quality_score REAL DEFAULT 1.0,
+    -- Recent stats (last 24h)
+    recent_drop_rate REAL DEFAULT 0.0,
+    recent_error_rate REAL DEFAULT 0.0,
+    -- Timestamp
+    last_updated INTEGER DEFAULT (strftime('%s', 'now')),
+    UNIQUE(bon_driver_id),
+    FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
+);
+
 -- Indexes for efficient queries
 CREATE INDEX IF NOT EXISTS idx_bon_drivers_group_name ON bon_drivers(group_name);
 CREATE INDEX IF NOT EXISTS idx_channels_bon_driver ON channels(bon_driver_id);
@@ -90,6 +160,11 @@ CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(is_enabled);
 CREATE INDEX IF NOT EXISTS idx_channels_nid_tsid_priority ON channels(nid, tsid, priority DESC, is_enabled);
 CREATE INDEX IF NOT EXISTS idx_scan_history_bon_driver ON scan_history(bon_driver_id);
 CREATE INDEX IF NOT EXISTS idx_channels_band_type ON channels(band_type, is_enabled);
+CREATE INDEX IF NOT EXISTS idx_session_history_session_id ON session_history(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_history_created_at ON session_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(is_enabled);
+CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history(rule_id);
+CREATE INDEX IF NOT EXISTS idx_driver_quality_stats_driver ON driver_quality_stats(bon_driver_id);
 
 -- Trigger to update updated_at on bon_drivers
 CREATE TRIGGER IF NOT EXISTS bon_drivers_updated_at
@@ -128,5 +203,9 @@ mod tests {
         assert!(tables.contains(&"bon_drivers".to_string()));
         assert!(tables.contains(&"channels".to_string()));
         assert!(tables.contains(&"scan_history".to_string()));
+        assert!(tables.contains(&"session_history".to_string()));
+        assert!(tables.contains(&"alert_rules".to_string()));
+        assert!(tables.contains(&"alert_history".to_string()));
+        assert!(tables.contains(&"driver_quality_stats".to_string()));
     }
 }

@@ -90,6 +90,34 @@ pub struct ScanHistoryInfo {
     pub error_message: Option<String>,
 }
 
+/// Session history query.
+#[derive(Debug, Deserialize)]
+pub struct SessionHistoryQuery {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub client_address: Option<String>,
+}
+
+/// Alert rule create/update request.
+#[derive(Debug, Deserialize)]
+pub struct AlertRuleRequest {
+    pub name: String,
+    pub metric: String,
+    pub condition: String,
+    pub threshold: f64,
+    pub severity: Option<String>,
+    pub is_enabled: Option<bool>,
+    pub webhook_url: Option<String>,
+    pub webhook_format: Option<String>,
+}
+
+/// Client control override request.
+#[derive(Debug, Deserialize)]
+pub struct ClientControlOverrideRequest {
+    pub override_priority: Option<Option<i32>>,
+    pub override_exclusive: Option<Option<bool>>,
+}
+
 // ============================================================================
 // Client/Session endpoints
 // ============================================================================
@@ -103,16 +131,29 @@ pub async fn get_clients(
     let clients: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {
+            let effective_priority = s.override_priority.or(s.client_priority);
+            let effective_exclusive = s.override_exclusive.unwrap_or(s.client_exclusive);
             json!({
                 "session_id": s.id,
                 "address": s.addr,
+                "host": s.host,
                 "tuner_path": s.tuner_path,
                 "channel_info": s.channel_info,
                 "channel_name": s.channel_name,
                 "is_streaming": s.is_streaming,
                 "connected_seconds": s.connected_seconds(),
                 "signal_level": format!("{:.1}", s.signal_level),
-                "packets_sent": s.packets_sent
+                "packets_sent": s.packets_sent,
+                "packets_dropped": s.packets_dropped,
+                "packets_scrambled": s.packets_scrambled,
+                "packets_error": s.packets_error,
+                "current_bitrate_mbps": format!("{:.2}", s.current_bitrate_mbps),
+                "client_priority": s.client_priority,
+                "client_exclusive": s.client_exclusive,
+                "override_priority": s.override_priority,
+                "override_exclusive": s.override_exclusive,
+                "effective_priority": effective_priority,
+                "effective_exclusive": effective_exclusive
             })
         })
         .collect();
@@ -909,5 +950,259 @@ pub async fn update_scan_config(
             "scan_timeout_secs": config.scan_timeout_secs,
         }
     }))
+}
+
+// ============================================================================
+// Session history & client metrics endpoints
+// ============================================================================
+
+/// Get session history (paginated).
+pub async fn get_session_history(
+    State(web_state): State<Arc<WebState>>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> impl IntoResponse {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(50).clamp(1, 200);
+
+    let db = web_state.database.lock().await;
+    match db.get_session_history(page, per_page, query.client_address.as_deref()) {
+        Ok((rows, total)) => Json(json!({
+            "success": true,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "history": rows
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Get time-series quality data for a client.
+pub async fn get_client_quality(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let sessions = web_state.session_registry.get_all().await;
+    if let Some(session) = sessions.into_iter().find(|s| s.id == id) {
+        let bitrate: Vec<(i64, f64)> = session.metrics_history.bitrate_history.into_iter().collect();
+        let packet_loss: Vec<(i64, f64)> = session.metrics_history.packet_loss_history.into_iter().collect();
+
+        return Json(json!({
+            "success": true,
+            "bitrate": bitrate,
+            "packet_loss": packet_loss,
+        }));
+    }
+
+    Json(json!({
+        "success": false,
+        "error": "Session not found"
+    }))
+}
+
+/// Get metrics history for a client (bitrate, packet loss, signal level).
+pub async fn get_client_metrics_history(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let sessions = web_state.session_registry.get_all().await;
+    if let Some(session) = sessions.into_iter().find(|s| s.id == id) {
+        let bitrate: Vec<(i64, f64)> = session.metrics_history.bitrate_history.into_iter().collect();
+        let packet_loss: Vec<(i64, f64)> = session.metrics_history.packet_loss_history.into_iter().collect();
+        let signal_level: Vec<(i64, f32)> = session.metrics_history.signal_history.into_iter().collect();
+
+        return Json(json!({
+            "success": true,
+            "bitrate": bitrate,
+            "packet_loss": packet_loss,
+            "signal_level": signal_level
+        }));
+    }
+
+    Json(json!({
+        "success": false,
+        "error": "Session not found"
+    }))
+}
+
+/// Disconnect a client session remotely.
+pub async fn disconnect_client(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let ok = web_state.session_registry.request_shutdown(id).await;
+    Json(json!({
+        "success": ok
+    }))
+}
+
+/// Override client controls (priority/exclusive).
+pub async fn override_client_controls(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ClientControlOverrideRequest>,
+) -> impl IntoResponse {
+    // Treat JSON null as explicit clear. Absence means no change.
+    web_state
+        .session_registry
+        .update_override_controls(id, payload.override_priority, payload.override_exclusive)
+        .await;
+    Json(json!({
+        "success": true
+    }))
+}
+
+// ============================================================================
+// Alert endpoints
+// ============================================================================
+
+/// Get active alerts.
+pub async fn get_alerts(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.get_active_alerts() {
+        Ok(alerts) => Json(json!({
+            "success": true,
+            "alerts": alerts,
+            "count": alerts.len()
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Get alert rules.
+pub async fn get_alert_rules(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.get_alert_rules() {
+        Ok(rules) => Json(json!({
+            "success": true,
+            "rules": rules,
+            "count": rules.len()
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Create alert rule.
+pub async fn create_alert_rule(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<AlertRuleRequest>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    let severity = payload.severity.unwrap_or_else(|| "warning".to_string());
+    let is_enabled = payload.is_enabled.unwrap_or(true);
+
+    match db.create_alert_rule(
+        &payload.name,
+        &payload.metric,
+        &payload.condition,
+        payload.threshold,
+        &severity,
+        is_enabled,
+        payload.webhook_url.as_deref(),
+        payload.webhook_format.as_deref(),
+    ) {
+        Ok(id) => Json(json!({
+            "success": true,
+            "id": id
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Delete alert rule.
+pub async fn delete_alert_rule(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.delete_alert_rule(id) {
+        Ok(_) => Json(json!({"success": true})),
+        Err(e) => Json(json!({"success": false, "error": e.to_string()})),
+    }
+}
+
+/// Acknowledge alert.
+pub async fn acknowledge_alert(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.acknowledge_alert_history(id) {
+        Ok(_) => Json(json!({"success": true})),
+        Err(e) => Json(json!({"success": false, "error": e.to_string()})),
+    }
+}
+
+// ============================================================================
+// BonDriver quality endpoints
+// ============================================================================
+
+/// Get quality stats for a BonDriver.
+pub async fn get_bondriver_quality(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.get_driver_quality_stats(id) {
+        Ok(Some(stats)) => Json(json!({
+            "success": true,
+            "stats": stats
+        })),
+        Ok(None) => Json(json!({
+            "success": false,
+            "error": "Stats not found"
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Get BonDriver ranking by quality score.
+pub async fn get_bondrivers_ranking(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.get_bondrivers_ranking() {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(driver, score, recent_drop_rate, total_sessions)| {
+                    json!({
+                        "driver": driver,
+                        "quality_score": score,
+                        "recent_drop_rate": recent_drop_rate,
+                        "total_sessions": total_sessions
+                    })
+                })
+                .collect();
+            Json(json!({
+                "success": true,
+                "items": items,
+                "count": items.len()
+            }))
+        }
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
 }
 

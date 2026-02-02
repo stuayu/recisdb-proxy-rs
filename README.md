@@ -1,293 +1,107 @@
-recisdb
-=======
+recisdb-proxy
+==============
 
-![ci workflow](https://github.com/kazuki0824/recisdb-rs/actions/workflows/rust.yml/badge.svg)
-[![Release](https://github.com/kazuki0824/recisdb-rs/actions/workflows/release.yml/badge.svg)](https://github.com/kazuki0824/recisdb-rs/actions/workflows/release.yml)
+recisdb-proxy は、BonDriver をネットワーク経由で複数のクライアントに共有できるプロキシサーバーです。  
+優先度・排他制御と Web ダッシュボードを備え、チューナーの利用状況を可視化しながら運用できます。
 
-Rust で書かれたテレビチューナーリーダー / ARIB STD-B25 デコーダーです。  
-従来の recpt1 / dvbv5-zap / b25 / arib-b25-stream-test コマンドの代替として利用できます。
-
-Tools for reading ARIB STD-B25, and dealing with some kinds of tuner devices. Works fine on both Windows and Linux.  
-recisdb-rs and b25-sys are more convenient Rust wrapper for libaribb25. recisdb can read both Unix character device-based and BonDriver-based TV sources. 
+この README は Proxy 機能に特化した概要です。他クレートの詳細はドキュメントを参照してください。
 
 ---
 
-## Features
+## 主な機能
 
-- クロスプラットフォーム (BonDriver / キャラクタデバイス (chardev) / DVBv5 デバイスすべてに対応)
-- Rust による実装でシングルボード向け低メモリ消費、連続録画時のエラー防止を目指す
-- チャンネル名ハードコード・二重バッファなど、従来のソフトウェアの設計の問題を自分なりに修正
-- ECM/EMM ロギング・デバッグ機能
-- **統合Webダッシュボード** - リアルタイム監視と設定管理が可能
+- **複数クライアント対応**: 複数の TVTest 等が同一サーバーの BonDriver にアクセス可能
+- **チャンネル優先度制御**: クライアント側から優先度を指定
+- **排他ロック機能**: 高優先度クライアントがチューナーを独占可能
+- **インスタンス制限**: BonDriver ごとの同時使用チャンネル数を制限
+- **Web ダッシュボード**: ブラウザからリアルタイム監視・DB 設定編集が可能
 
-## recisdb-proxy: Network Proxy Server
+## 使い始める
 
-recisdb-proxy は、BonDriver をネットワーク経由で複数のクライアントに共有できるプロキシサーバーです。
+### インストール
 
-### 主な機能
+[Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から実行ファイルを取得してください。  
+Linux では Debian パッケージ、Windows では x64 向け実行ファイルが提供されています。
 
-- **複数クライアント対応**: 複数のTVTest等がネットワーク経由で同一サーバーのBonDriverにアクセス可能
-- **チャンネル優先度制御**: クライアント側から優先度を指定可能
-- **排他ロック機能**: 高優先度クライアントは独占的にチューナーをロック可能
-- **インスタンス制限**: BonDriver毎に同時使用チャンネル数を制限
-- **Webダッシュボード**: ブラウザからリアルタイム監視・DB設定編集が可能
-
-### Webダッシュボード
-
-デフォルトで `http://localhost:8080` で利用可能。以下が確認・設定できます：
-
-- チューナーの利用状況（インスタンス数、最大制限等）
-- 接続中のクライアント情報（セッション、IPアドレス、現在チャンネル等）
-- サーバー統計（セッション数、稼働時間等）
-- **DB設定値の直接編集**（max_instances、display_name等）
-
-詳細は [WEB_DASHBOARD.md](docs/WEB_DASHBOARD.md) を参照してください。
-
-### 起動方法
+### 起動例
 
 ```bash
-recisdb-proxy --listen 0.0.0.0:12345 --web-listen 0.0.0.0:8080
+recisdb-proxy --listen 0.0.0.0:12345 --web-listen 0.0.0.0:8080 -t <登録するBonDriverのパス>
 ```
 
-または設定ファイル `recisdb-proxy.toml` を使用：
+### 設定ファイル
+
+設定ファイルの例は [recisdb-proxy/recisdb-proxy.toml.example](recisdb-proxy/recisdb-proxy.toml.example) を参照してください。
 
 ```toml
 [server]
 listen = "0.0.0.0:12345"
 web_listen = "0.0.0.0:8080"
-tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
+tuner = Main
 max_connections = 64
 ```
 
-## Description
+## Web ダッシュボード
 
-- recisdb-rs: reads a bitstream from both character devices and BonDriver
-- b25-sys: a wrapper for libaribb25 written in Rust
+デフォルトで http://localhost:8080 で利用可能です。以下を確認・設定できます。
 
-## Installation
+- チューナーの利用状況（インスタンス数、最大制限など）
+- 接続中のクライアント情報（セッション、IP アドレス、現在チャンネルなど）
+- サーバー統計（セッション数、稼働時間など）
+- **DB 設定値の直接編集**（max_instances、display_name など）
+- チューナーグループの設定はWEB上から実施可能です。
 
-[Releases](https://github.com/kazuki0824/recisdb-rs/releases) に Ubuntu 20.04 以降向けの Debian パッケージ (.deb) と、Windows (x64) 向けの実行ファイル (.exe) を用意しています。  
+### 画面キャプチャ
 
-Linux では、下記のコマンドで recisdb をインストールできます。  
-以下は v1.2.3 をインストールする例です。依存パッケージは自動的にインストールされます。
+| ダッシュボード概要 | チューナー詳細 |
+| --- | --- |
+| ![ダッシュボード概要](docs/assets/maindashboard_1.png) | ![チューナー詳細](docs/assets/maindashboard_2.png) |
+| **チャンネル一覧** | **チャンネルスキャン履歴** |
+| ![チャンネル一覧](docs/assets/maindashboard_3.png) | ![チャンネルスキャン履歴](docs/assets/maindashboard_4.png) |
+| **セッション履歴** | **アラート設定** |
+| ![セッション履歴](docs/assets/maindashboard_5.png) | ![アラート設定](docs/assets/maindashboard_6.png) |
+| **グローバル設定** | **スマホ画面** |
+| ![グローバル設定](docs/assets/maindashboard_7.png) | ![スマホ画面](docs/assets/maindashboard_8.png) |
 
-```bash
-# x86_64 環境
-wget https://github.com/kazuki0824/recisdb-rs/releases/download/1.2.3/recisdb_1.2.3-1_amd64.deb
-sudo apt install ./recisdb_1.2.3-1_amd64.deb
-rm ./recisdb_1.2.3-1_amd64.deb
+詳細は [docs/WEB_DASHBOARD.md](docs/WEB_DASHBOARD.md) を参照してください。
 
-# arm64 環境
-wget https://github.com/kazuki0824/recisdb-rs/releases/download/1.2.3/recisdb_1.2.3-1_arm64.deb
-sudo apt install ./recisdb_1.2.3-1_arm64.deb
-rm ./recisdb_1.2.3-1_arm64.deb
-```
-Windows では `recisdb.exe` をダウンロードし、適当なフォルダに配置してください。
+## クライアント設定
 
----
+TVTest などから接続するための設定例は [bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample](bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample) を参照してください。
 
-## Usage
+## ビルド
 
-### General
-
-recisdb には、3 つのサブコマンドがあります。
-
-`recisdb checksignal` : チャンネルを選局し、信号レベル (dB) を確認します。
-```bash
-recisdb checksignal [OPTIONS] --device <CANONICAL_PATH> --channel <CHANNEL>
-```  
-
-`recisdb tune` : チャンネルを選局し、指定された出力先に受信した TS データを書き出します。
-```bash
-recisdb tune [OPTIONS] --device <CANONICAL_PATH> --channel <CHANNEL> <OUTPUT>
-```
-> [!NOTE]  
-> **v1.1.0 から `--no-simd` オプションが追加されました。**  
-> decode 時に SIGILL が発生する場合、AVX2 命令がご使用の CPU に実装されていないことが考えられます。
-> その際はこのオプションを使用することで問題を回避できます。
-
-> [!NOTE]  
-> **v1.2.0 から `-e` / `--exit-on-card-error` オプションが追加されました。**  
-> B-CAS カードの抜き取りなどの理由でデコーダーがエラーを返した場合、プログラムを終了します。  
-> 逆にデフォルトでは、プログラムを終了せずにデコーダーなしで処理を続行します。
-
-> [!NOTE]  
-> **v1.3.0 から RECISDB_INPUT_BUF_BYTES 環境変数により、入力バッファのサイズを指定できるようになりました。**  
-> 外部からの入力ストリームをデフォルトで200000バイトまでバッファリングするようになりました。
-> この値は、RECISDB_INPUT_BUF_BYTES 環境変数により制御できます。
-> CSのリアルタイム視聴においてドロップが発生する減少への対策として実装しています。
-
-`recisdb decode` : 指定された入力ファイルを ARIB STD-B25 に基づきデコードし、指定された出力先に TS データを書き出します。  
-```bash
-recisdb decode [OPTIONS] --input <file> <OUTPUT>
-```
-
-詳しいオプションは `recisdb --help` / `recisdb <SUBCOMMAND> --help` を参照してください。
-
-### Channel
-
-`-c` または `--channel` でのチャンネル指定フォーマットは下記の通りです。  
-**recpt1 のチャンネル指定フォーマットとは微妙に異なるため注意してください。**
-
-- `-c T27` (地上波: 27ch)
-  - recpt1 では単に 27 と指定するが、recisdb では T27 と指定する
-- `-c T60` (地上波: 60ch)
-  - 通常地上波の物理チャンネルは 52ch までだが、CATV のコミュニティチャンネルでは 62ch まで使われていることがある
-- `-c C30` (CATV: 30ch)
-  - ISDB-T の CATV チャンネルでは C を付ける
-- `-c BS1_0` (BS: BS01/TS0)
-  - BS01_0 と BS1_0 の両方のフォーマットに対応
-- `-c BS03 --tsid 16433` (BS: BS03/TS1 (TSID = 0x4031))
-  - BS ではスロット (相対 TS 番号) の代わりに TSID を指定して選局することも可能
-  - この例では明示的に BS03 (トランスポンダ) の中から TSID = 0x4031 を持つ TS (NHK BSプレミアム) を選局している
-- `-c BS23_3` (BS: BS23/TS3)
-- `-c CS02` (CS: ND02)
-  - CS2 と CS02 の両方のフォーマットに対応
-- `-c CS24` (CS: ND24)
-
-> [!IMPORTANT]  
-> 現時点では、ISDB-T / ISDB-S 以外の放送方式 (ISDB-C / DVB-S2 など) には対応していません。
-
-> [!NOTE]  
-> **接続/認識されているチューナーデバイスの確認やチャンネルスキャンには、recisdb をチューナーコマンドとして利用する [ISDBScanner](https://github.com/tsukumijima/ISDBScanner) が便利です。**  
-> 受信可能な日本のテレビチャンネル (ISDB-T/ISDB-S) を全自動でスキャンし、スキャン結果を EDCB (EDCB-Wine)・Mirakurun・mirakc の各設定ファイルや JSON 形式で出力できます。
-
-### Linux
-
-Linux では、キャラクタデバイス (chardev) または DVBv5 デバイスを指定して選局します。
-
-> [!NOTE]  
-> **DVB デバイスのサポートは v1.2.0 から追加されたものです。**  
-> v1.1.0 以前のバージョンでは、DVB デバイスを操作することはできません。
-
-> [!WARNING]  
-> **DVB 版ドライバ利用時のみ、BS の選局にはスロット番号 (相対 TS 番号) ではなく、recisdb 本体にハードコードされた各スロットと TSID の対照表が利用されます。**  
-> DVB 版ドライバでは DVBv5 API の仕様上、BS のみ選局時に TSID を明示的に指定する必要があります。しかし DVB 版ドライバではチューナーが持つ TMCC 情報へのアクセス手段がないため、選局に必要な TSID を相対 TS 番号から算出することができません。   
-> このため、**もし今後 BS の帯域再編が行われた場合、帯域再編後も DVB 版ドライバで BS を受信するには、`--tsid` で TSID を明示的に指定するか、recisdb 自体を新バージョンへ更新する必要があります。**
-
-> [!WARNING]  
-> **chardev 版ドライバで `--tsid` オプションの指定に対応しているのは [tsukumijima/px4_drv](https://github.com/tsukumijima/px4_drv) v0.4.0 以降のみです。**  
-> これ以外の chardev 版ドライバ ([pt3_drv](https://github.com/m-tsudo/pt3) など) では `--tsid` 指定は動作しないものと思われます。  
-> DVB 版ドライバはすべて `--tsid` オプションの指定に対応しています。
-
-#### Examples
-
-```bash
-# キャラクタデバイスをオープンし、地上波 18ch を選局し、信号レベル (dB) を確認
-recisdb checksignal --device /dev/px4video2 --channel T18
-
-# DVB デバイス (/dev/dvb/adapter1/frontend0) をオープンし、地上波 27ch を選局し、スクランブル解除せずに /tmp/recorded.m2ts に保存
-recisdb tune --device /dev/dvb/adapter1/frontend0 -c T27 --no-decode /tmp/recorded.m2ts
-
-# キャラクタデバイスをオープンし、CATV (ISDB-T) 30ch を選局し、30 秒間の録画データを recorded.m2ts に保存
-recisdb tune --device /dev/px4video3 --channel C30 --time 30 recorded.m2ts
-
-# キャラクタデバイスをオープンし、BS03 の相対 TS 番号 1 を選局し、パイプ渡しで ffplay で再生
-recisdb tune --device /dev/px4video0 --channel BS3_1 - | ffplay -i -
-
-# DVB デバイス (/dev/dvb/adapter0/frontend0) をオープンし、BS03 の相対 TS 番号 1 を選局し (LNB 給電あり: 15V)、20 秒間の録画データを recorded.m2ts に保存
-recisdb tune --device /dev/dvb/adapter0/frontend0 -c BS03_1 --lnb 15v --time 20 recorded.m2ts
-
-# 略記法で DVB デバイス (/dev/dvb/adapter2/frontend0) をオープンし、BS03 (TSID = 0x4031) を選局し、スクランブル解除せずに sudo tee で /root/recorded.m2ts に保存
-recisdb tune --device "2|0" -c BS3 --tsid 0x4031 --no-decode - | sudo tee /root/recorded.m2ts > /dev/null
-
-# キャラクタデバイスをオープンし、CS04 を選局し、スクランブル解除せずに /tmp/recorded.m2ts に保存
-recisdb tune --device /dev/px4video5 -c CS04 --no-decode /tmp/recorded.m2ts
-
-# スクランブル解除されていない $HOME/scrambled.m2ts をNULL パケットの除去を行わずにスクランブル解除し、descrambled.m2ts に保存
-recisdb decode -i $HOME/scrambled.m2ts --no-strip ./descrambled.m2ts
-```
-
-### Windows
-
-Windows では、BonDriver のファイルパスと、BonDriver 上のチャンネル空間番号 / チャンネル通し番号を指定して選局します。  
-**BonDriver インターフェイスの技術的制約により、Linux 版とはチャンネル指定方法が異なるため注意してください。**
-
-- チャンネル: `<ChannelSpace>-<Channel>` のフォーマット (例: `1-12`) で指定
-- デバイス: BonDriver (.dll) へのファイルパスを指定
-
-> [!WARNING]  
-> **Windows (BonDriver) 対応は実験的なものであり、動作検証はあまり行われていません。**  
-> **このため、一部の BonDriver やチューナーでは正常に動作しない可能性があります。**  
-> また、現時点では Windows 版には `recisdb checksignal` は実装されていません。
-
-#### Examples
-
-```powershell
-# BonDriver_mirakc.dll をオープンし、チャンネル空間番号:0 / チャンネル通し番号:8 を選局し、録画データを recorded.m2ts に保存
-recisdb.exe tune --device .\BonDriver_mirakc.dll -c 0-8 -t 20 recorded.m2ts
-
-# スクランブル解除されていない %USERPROFILE%\Desktop\scrambled.m2ts をスクランブル解除し、descrambled.m2ts に保存
-recisdb.exe decode -i %USERPROFILE%\Desktop\scrambled.m2ts .\descrambled.m2ts
-```
-
----
-
-## Build
-
-recisdb をビルドするには Rust が必要です。  
-Rust がインストールされていない場合は、[Rustup](https://www.rust-lang.org/ja/tools/install) をインストールしてください。
-
-### Ubuntu / Debian
-
-> [!NOTE]  
-> 以下のコマンドは Ubuntu 22.04 でのインストール方法です。
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-上記のコマンドで Rustup をインストールできます。  
-Rustup をインストールするだけで、Rust とビルドに必要なツールチェーンが同時にインストールされます。
+Rust が必要です。Rust が未導入の場合は [Rustup](https://www.rust-lang.org/ja/tools/install) をインストールしてください。
 
 ```bash
 # リポジトリを submodule を含めて clone
-git clone --recursive https://github.com/kazuki0824/recisdb-rs.git
-cd recisdb-rs
+git clone --recursive https://github.com/stuayu/recisdb-proxy-rs.git
+cd recisdb-proxy-rs
 
-# 依存パッケージをインストール
-sudo apt install -y build-essential libclang-dev cmake libdvbv5-dev libpcsclite-dev libudev-dev pkg-config
-
-# ビルド
-## -F dvb を指定すると libdvbv5 経由での DVB デバイスの操作がサポートされる
-cargo build -F dvb --release
-
-# インストール
-sudo cp -a target/release/recisdb /usr/local/bin
-
-# または、cargo install でインストール
-cargo install -F dvb --path recisdb-rs
+# ビルド(現在はデバッグビルドしかサポートしてません)
+cargo build -p recisdb-proxy
 ```
 
-Rust をインストールしたら、上記のコマンドで recisdb をビルドできます。  
-ビルドした recisdb は、`target/release/recisdb` に生成されます。
+ビルド結果は [target/debug/](target/debug/) に生成されます。
 
-`cargo install` を使うと、パスの通った場所へ実行ファイルを自動的に配置できます。
+---
 
-> [!IMPORTANT]  
-> `cargo build` を実行する際、`-F dvb` を指定すると libdvbv5 経由での DVB デバイスの操作がサポートされます。  
-> `-F dvb` を指定してビルドした場合、動作には別途 `libdvbv5-0` パッケージが必要になります。
+## ドキュメント
 
-### Windows (MSVC)
-
-執筆中…
-
-### Windows (MSYS MinGW)
-
-執筆中…
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/BonDriverCapacityControl.md](docs/BonDriverCapacityControl.md)
+- [docs/PriorityChannelSelection.md](docs/PriorityChannelSelection.md)
+- [docs/WEB_DASHBOARD.md](docs/WEB_DASHBOARD.md)
 
 ---
 
 ## Licence
 
-[GPL v3](https://github.com/kazuki0824/recisdb-rs/blob/master/LICENSE)
-
-## Author
-
-[maleicacid](https://github.com/kazuki0824)
+[GPL v3](https://github.com/stuayu/recisdb-proxy-rs/blob/master/LICENSE)
 
 ## Special thanks
 
+このアプリケーションは [recisdb-rs](https://github.com/kazuki0824/recisdb-rs) をベースに転送機能を組み込んで実装をしています。   
 このアプリケーションは [px4_drv](https://github.com/nns779/px4_drv) を参考にして実装されています。  
 また [libaribb25](https://github.com/tsukumijima/libaribb25) のラッパー実装を含んでいます。
 

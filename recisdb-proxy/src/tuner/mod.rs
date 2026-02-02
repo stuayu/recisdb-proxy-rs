@@ -16,9 +16,11 @@ pub mod pool;
 pub mod selector;
 pub mod shared;
 pub mod ts_parser;
+pub mod ts_analyzer;
 pub mod b25_pipe;
 pub mod space_generator;
 pub mod group_space;
+pub mod quality_scorer;
 
 pub use channel_key::ChannelKey;
 #[allow(unused_imports)]
@@ -29,3 +31,4 @@ pub use selector::{ChannelCandidate, FallbackResult, SelectError, TuneError, Tun
 pub use shared::SharedTuner;
 pub use space_generator::{SpaceGenerator, SpaceMapping, ChannelInfo as SpaceGenChannelInfo};
 pub use group_space::{GroupSpaceInfo, DriverInfo, DriverSelector, DriverSelectionStrategy};
+pub use quality_scorer::{BonDriverWithScore, QualityScorer};

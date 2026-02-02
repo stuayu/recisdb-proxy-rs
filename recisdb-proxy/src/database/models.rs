@@ -1,9 +1,10 @@
 //! Database model definitions.
 
 use recisdb_protocol::ChannelInfo;
+use serde::Serialize;
 
 /// BonDriver record from database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BonDriverRecord {
     pub id: i64,
     pub dll_path: String,
@@ -26,7 +27,7 @@ pub struct BonDriverRecord {
 }
 
 /// Channel record from database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChannelRecord {
     pub id: i64,
     pub bon_driver_id: i64,
@@ -109,7 +110,7 @@ pub struct ClientChannelRecord {
 }
 
 /// Scan history record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScanHistoryRecord {
     pub id: i64,
     pub bon_driver_id: i64,
@@ -117,6 +118,73 @@ pub struct ScanHistoryRecord {
     pub channel_count: Option<i32>,
     pub success: bool,
     pub error_message: Option<String>,
+}
+
+/// Session history record.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionHistoryRecord {
+    pub id: i64,
+    pub session_id: i64,
+    pub client_address: String,
+    pub tuner_path: Option<String>,
+    pub channel_info: Option<String>,
+    pub channel_name: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub duration_secs: Option<i64>,
+    pub packets_sent: i64,
+    pub packets_dropped: i64,
+    pub packets_scrambled: i64,
+    pub packets_error: i64,
+    pub bytes_sent: i64,
+    pub average_bitrate_mbps: Option<f64>,
+    pub average_signal_level: Option<f64>,
+    pub disconnect_reason: Option<String>,
+    pub created_at: i64,
+}
+
+/// Alert rule record.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertRuleRecord {
+    pub id: i64,
+    pub name: String,
+    pub metric: String,
+    pub condition: String,
+    pub threshold: f64,
+    pub severity: String,
+    pub is_enabled: bool,
+    pub webhook_url: Option<String>,
+    pub webhook_format: Option<String>,
+    pub created_at: i64,
+}
+
+/// Alert history record.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertHistoryRecord {
+    pub id: i64,
+    pub rule_id: i64,
+    pub session_id: Option<i64>,
+    pub triggered_at: i64,
+    pub resolved_at: Option<i64>,
+    pub metric_value: Option<f64>,
+    pub message: Option<String>,
+    pub acknowledged: bool,
+}
+
+/// Driver quality stats record.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriverQualityStats {
+    pub id: i64,
+    pub bon_driver_id: i64,
+    pub total_packets: i64,
+    pub dropped_packets: i64,
+    pub scrambled_packets: i64,
+    pub error_packets: i64,
+    pub total_sessions: i64,
+    pub quality_score: f64,
+    pub recent_drop_rate: f64,
+    pub recent_error_rate: f64,
+    pub last_updated: i64,
 }
 
 /// Result of merging scan results into database.

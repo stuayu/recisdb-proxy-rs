@@ -10,7 +10,8 @@
       "Bash(dumpbin:*)",
       "Bash(nm:*)",
       "Bash(lib:*)",
-      "Bash(powershell:*)"
+      "Bash(powershell:*)",
+      "Bash(wc:*)"
     ]
   }
 }

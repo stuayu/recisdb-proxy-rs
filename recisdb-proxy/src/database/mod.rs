@@ -7,6 +7,9 @@
 
 mod bon_driver;
 mod channel;
+mod driver_quality;
+mod alert;
+mod session_history;
 mod models;
 mod schema;
 
@@ -104,6 +107,10 @@ impl Database {
         self.add_column_if_not_exists("channels", "band_type", "INTEGER")?;
         self.add_column_if_not_exists("channels", "region_id", "INTEGER")?;
         self.add_column_if_not_exists("channels", "terrestrial_region", "TEXT")?;
+
+        // Migration 003: Add webhook columns to alert_rules if they don't exist
+        self.add_column_if_not_exists("alert_rules", "webhook_url", "TEXT")?;
+        self.add_column_if_not_exists("alert_rules", "webhook_format", "TEXT DEFAULT 'generic'")?;
 
         // Migration 002: Fill band_type and terrestrial_region for existing channels
         // This updates all NULL values in these columns based on NID
@@ -262,12 +269,12 @@ mod tests {
         let count: i32 = db
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('bon_drivers', 'channels', 'scan_history')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('bon_drivers', 'channels', 'scan_history', 'session_history', 'alert_rules', 'alert_history', 'driver_quality_stats')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
 
-        assert_eq!(count, 3);
+        assert_eq!(count, 7);
     }
 }

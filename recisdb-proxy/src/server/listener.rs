@@ -119,9 +119,18 @@ async fn handle_connection(
     socket.set_nodelay(true)?;
 
     // Register the session
-    session_registry.register(session_id, addr).await;
+    let shutdown_rx = session_registry.register(session_id, addr).await;
 
-    let mut session = Session::new(session_id, addr, socket, tuner_pool, database, default_tuner, Arc::clone(&session_registry));
+    let mut session = Session::new(
+        session_id,
+        addr,
+        socket,
+        tuner_pool,
+        database,
+        default_tuner,
+        Arc::clone(&session_registry),
+        shutdown_rx,
+    );
     let result = session.run().await;
 
     // Unregister the session when done

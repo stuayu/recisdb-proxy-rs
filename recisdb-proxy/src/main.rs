@@ -14,6 +14,7 @@ mod bondriver;
 mod database;
 mod logging;
 mod metrics;
+mod alert;
 mod scheduler;
 mod server;
 mod ts_analyzer;
@@ -318,6 +319,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create session registry for tracking active sessions
     let session_registry = Arc::new(web::SessionRegistry::new());
+
+    // Start alert manager
+    let alert_db = db.clone();
+    let alert_registry = Arc::clone(&session_registry);
+    tokio::spawn(async move {
+        let manager = alert::AlertManager::new(alert_db, alert_registry);
+        manager.run().await;
+    });
 
     // Create server
     let server = Server::new(config, Arc::clone(&session_registry));

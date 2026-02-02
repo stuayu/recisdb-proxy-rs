@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 use log::info;
 
@@ -28,6 +29,38 @@ pub struct SessionMetrics {
     last_ts_update: std::sync::Mutex<Instant>,
     /// Average signal level (last 10 measurements).
     signal_level_samples: std::sync::Mutex<Vec<f32>>,
+}
+
+/// Stream quality samples (last 60 seconds).
+pub struct StreamQualityWindow {
+    pub bitrate_samples: VecDeque<(Instant, f64)>,
+    pub packet_loss_samples: VecDeque<(Instant, f64)>,
+}
+
+impl StreamQualityWindow {
+    pub fn new() -> Self {
+        Self {
+            bitrate_samples: VecDeque::new(),
+            packet_loss_samples: VecDeque::new(),
+        }
+    }
+
+    pub fn push_sample(&mut self, bitrate_mbps: f64, packet_loss_rate: f64) {
+        let now = Instant::now();
+        self.bitrate_samples.push_back((now, bitrate_mbps));
+        self.packet_loss_samples.push_back((now, packet_loss_rate));
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        while self.bitrate_samples.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+            self.bitrate_samples.pop_front();
+        }
+        while self.packet_loss_samples.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+            self.packet_loss_samples.pop_front();
+        }
+    }
 }
 
 impl SessionMetrics {
