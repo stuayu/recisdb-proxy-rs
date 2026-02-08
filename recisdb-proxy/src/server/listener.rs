@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::database::Database;
 use crate::server::session::Session;
-use crate::tuner::TunerPool;
+use crate::tuner::{TunerPool, TunerPoolConfig};
 use crate::web::SessionRegistry;
 
 /// Database handle type.
@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub default_tuner: Option<String>,
     /// Database handle.
     pub database: DatabaseHandle,
+    /// Tuner optimization configuration.
+    pub tuner_config: TunerPoolConfig,
     /// TLS configuration (optional).
     #[cfg(feature = "tls")]
     pub tls_config: Option<TlsConfig>,
@@ -52,9 +54,10 @@ impl Server {
     /// Create a new server with the given configuration.
     pub fn new(config: ServerConfig, session_registry: Arc<SessionRegistry>) -> Self {
         let database = config.database.clone();
+        let tuner_config = config.tuner_config.clone();
         Self {
             config,
-            tuner_pool: Arc::new(TunerPool::default()),
+            tuner_pool: Arc::new(TunerPool::new_with_config(16, tuner_config)),
             database,
             session_registry,
         }

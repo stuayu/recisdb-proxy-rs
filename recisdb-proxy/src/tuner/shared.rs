@@ -206,7 +206,6 @@ impl SharedTuner {
         }
 
         let shared = Arc::clone(self);
-        let tx = self.tx.clone();
 
         let handle = tokio::spawn(async move {
             info!("Starting tuner reader for {:?}", shared.key);
@@ -249,7 +248,7 @@ impl SharedTuner {
                         let data = Bytes::copy_from_slice(&buf[..n]);
 
                         // Broadcast to all subscribers
-                        match tx.send(data) {
+                        match shared.tx.send(data) {
                             Ok(count) => {
                                 trace!("Broadcast {} bytes to {} receivers", n, count);
                             }
@@ -306,6 +305,340 @@ impl SharedTuner {
         self.is_running.store(false, Ordering::SeqCst);
         
         info!("[SharedTuner] Reader stopped for {:?}", self.key);
+    }
+
+    /// Set the reader task handle (used by warm start).
+    pub async fn set_reader_handle(&self, handle: tokio::task::JoinHandle<()>) {
+        *self.reader_handle.lock().await = Some(handle);
+    }
+
+    pub(crate) fn run_bondriver_reader_with_tuner(
+        shared: Arc<Self>,
+        tuner: BonDriverTuner,
+        tuner_path: String,
+        space: u32,
+        channel: u32,
+        ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        shared.is_running.store(true, Ordering::SeqCst);
+        info!("[SharedTuner] Using BonDriver: {}", tuner_path);
+
+        // Set channel with error handling
+        info!("[SharedTuner] Setting channel: space={}, channel={}", space, channel);
+        let set_channel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tuner.set_channel(space, channel)
+        }));
+
+        match set_channel_result {
+            Ok(Ok(())) => {
+                info!("[SharedTuner] Channel set successfully");
+            }
+            Ok(Err(e)) => {
+                error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
+                       space, channel, e, e.kind());
+                shared.is_running.store(false, Ordering::SeqCst);
+
+                let err_msg = match e.kind() {
+                    std::io::ErrorKind::AddrNotAvailable =>
+                        format!("Channel not available - check space/channel number or signal is too weak"),
+                    std::io::ErrorKind::Unsupported =>
+                        format!("IBonDriver version does not support SetChannel2"),
+                    _ => format!("SetChannel error: {}", e)
+                };
+
+                let _ = ready_tx.send(Err(err_msg));
+                return;
+            }
+            Err(panic_err) => {
+                error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
+                shared.is_running.store(false, Ordering::SeqCst);
+                let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
+                return;
+            }
+        }
+
+        // Wait a moment for the tuner to lock onto the signal
+        info!("[SharedTuner] Waiting for tuner to lock...");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // Check signal level
+        let initial_signal = tuner.get_signal_level();
+        info!("[SharedTuner] Initial signal level: {:.1}dB", initial_signal);
+
+        // Purge any stale data from the buffer
+        tuner.purge_ts_stream();
+
+        // Short stabilization wait for new driver to have something in buffer
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // ===== B25 decoder init =====
+        let b25_opt = DecoderOptions {
+            strip: true,
+            emm: true,
+            simd: true,
+            round: 4,
+            enable_working_key: false,
+        };
+
+        let mut b25 = match B25Pipe::new(b25_opt) {
+            Ok(d) => {
+                info!("[SharedTuner] B25 decoder enabled");
+                Some(d)
+            }
+            Err(e) => {
+                error!("[SharedTuner] Failed to init B25 decoder: {}", e);
+                error!("[SharedTuner] Falling back to raw TS streaming");
+                None
+            }
+        };
+
+        // Track decoder state
+        let mut b25_needs_reset = false;
+        let mut consecutive_b25_errors = 0;
+
+        // Reset packet counter for the new channel
+        shared.reset_packet_count();
+
+        // Signal that we're ready
+        info!("[SharedTuner] BonDriver ready, signaling...");
+        let _ = ready_tx.send(Ok(()));
+
+        info!("[SharedTuner] Reader task started for {:?}", shared.key);
+
+        // Use a larger initial buffer, and expand dynamically if needed
+        let mut buf = vec![0u8; TS_CHUNK_SIZE];
+        let mut buf_size = TS_CHUNK_SIZE;
+        let mut consecutive_empty = 0u64;
+        let mut total_bytes_read = 0u64;
+        let mut last_log_time = std::time::Instant::now();
+        let mut last_status_log = std::time::Instant::now();
+        let mut reader_first_read = true;
+        let reader_start_time = std::time::Instant::now();
+        let mut broadcast_send_errors: u64 = 0;
+
+        loop {
+            // Check if we should stop due to explicit stop signal
+            if !shared.is_running.load(Ordering::SeqCst) {
+                info!("[SharedTuner] BREAK: Stop signal received for {:?}", shared.key);
+                break;
+            }
+
+            // Log status every 5 seconds for debugging
+            if last_status_log.elapsed().as_secs() >= 5 {
+                let level = tuner.get_signal_level();
+                info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, is_running={}, elapsed={}s",
+                      total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.is_running.load(Ordering::SeqCst), reader_start_time.elapsed().as_secs());
+                last_status_log = std::time::Instant::now();
+            }
+
+            // Wait for TS data to be available
+            let wait_result = tuner.wait_ts_stream(1000);
+            if !wait_result {
+                consecutive_empty = consecutive_empty.saturating_add(1);
+                if consecutive_empty % 50 == 1 {
+                    info!("[SharedTuner] wait_ts_stream returned false ({} times), total_bytes={}, elapsed={}ms",
+                          consecutive_empty, total_bytes_read, reader_start_time.elapsed().as_millis());
+                }
+            }
+
+            // Read TS data with panic safety
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tuner.get_ts_stream(&mut buf)
+            })) {
+                Ok(Ok((n, remaining))) => {
+                    // Check if BonDriver is requesting more buffer space
+                    if n > buf.len() {
+                        // BonDriver returned a size larger than our current buffer
+                        // Expand the buffer to accommodate this size, plus some headroom
+                        let new_size = (n * 2).max(buf_size * 2).min(16 * 1024 * 1024); // Cap at 16MB
+                        info!("[SharedTuner] Expanding buffer from {} to {} bytes due to BonDriver request: n={}",
+                              buf_size, new_size, n);
+                        buf.resize(new_size, 0);
+                        buf_size = new_size;
+
+                        // Retry with larger buffer
+                        if remaining > 0 {
+                            warn!("[SharedTuner] GetTsStream returned size {} exceeds buffer {}, remaining={}. Retrying with expanded buffer...",
+                                  n, buf.len(), remaining);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                    }
+
+                    // Clip the returned size to buffer size (safety measure)
+                    let n = std::cmp::min(n, buf.len());
+
+                    // Log at INFO level only if we got significant data
+                    if n > 0 && n % 327680 == 0 {  // Log every 5MB
+                        info!("[SharedTuner] GetTsStream: n={} bytes, remaining={}", n, remaining);
+                    }
+
+                    if n == 0 {
+                        consecutive_empty = consecutive_empty.saturating_add(1);
+                        if consecutive_empty == 1 {
+                            warn!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...",
+                                  total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
+                        }
+                        if reader_first_read && reader_start_time.elapsed().as_secs() < 30 {
+                            if consecutive_empty % 100 == 1 && consecutive_empty > 1 {
+                                let signal = tuner.get_signal_level();
+                                debug!("[SharedTuner] Early startup: waiting for TS data ({} empty reads, {}s elapsed, signal={:.1}dB)",
+                                       consecutive_empty, reader_start_time.elapsed().as_secs(), signal);
+                            }
+                        } else if consecutive_empty % 500 == 1 {
+                            let signal = tuner.get_signal_level();
+                            debug!("[SharedTuner] Still waiting for TS data after {} empty reads, total_bytes={}, signal={:.1}dB, elapsed={}ms",
+                                   consecutive_empty, total_bytes_read, signal, reader_start_time.elapsed().as_millis());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+
+                    // Got data!
+                    if reader_first_read {
+                        info!("[SharedTuner] FIRST_DATA_RECEIVED: {} bytes after {} empty reads, elapsed={}ms, STARTUP_SUCCESSFUL",
+                              n, consecutive_empty, reader_start_time.elapsed().as_millis());
+                        reader_first_read = false;
+                    } else if consecutive_empty > 0 {
+                        debug!("[SharedTuner] Got data after {} empty reads: {} bytes", consecutive_empty, n);
+                    }
+                    consecutive_empty = 0;
+                    total_bytes_read += n as u64;
+
+                    // Increment packet count
+                    let packet_count = (n / 188) as u64;
+                    if packet_count > 0 {
+                        shared.increment_packet_count(packet_count);
+                    }
+
+                    // Broadcast to all subscribers
+                    let raw = &buf[..n];
+
+                    // Data validation before B25 decode (log only on first packet)
+                    if reader_first_read && n > 0 {
+                        // Safely log first few bytes
+                        info!("[SharedTuner] First TS packet received: size={} bytes, has_b25_decoder={}", n, b25.is_some());
+                    }
+
+                    // B25 decode with panic safety
+                    if let Some(b25_decoder) = &mut b25 {
+                        if !b25_needs_reset {
+                            // Wrap B25 push in panic safety
+                            let push_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                b25_decoder.push(raw)
+                            }));
+
+                            match push_result {
+                                Ok(Ok(decoded)) => {
+                                    if decoded.is_empty() {
+                                        consecutive_b25_errors = 0;
+                                        continue;
+                                    }
+
+                                    consecutive_b25_errors = 0;
+
+                                    let packet_count = (decoded.len() / 188) as u64;
+                                    if packet_count > 0 {
+                                        shared.increment_packet_count(packet_count);
+                                    }
+
+                                    let data = Bytes::from(decoded);
+
+                                    match shared.tx.send(data) {
+                                        Ok(_count) => {}
+                                        Err(_e) => {
+                                            broadcast_send_errors += 1;
+                                            if broadcast_send_errors == 1 || broadcast_send_errors % 100 == 0 {
+                                                warn!("[SharedTuner] Broadcast send failed ({} times total) for {:?} - no active receivers",
+                                                      broadcast_send_errors, shared.key);
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Err(_)) => {
+                                    consecutive_b25_errors += 1;
+                                    // Log error count without error details (to avoid binary data in logs)
+                                    if consecutive_b25_errors == 1 {
+                                        warn!("[SharedTuner] B25 decode error detected");
+                                    }
+
+                                    if consecutive_b25_errors >= 10 {
+                                        error!("[SharedTuner] Too many B25 errors, resetting decoder");
+                                        b25_needs_reset = true;
+                                    }
+
+                                    let data = Bytes::copy_from_slice(raw);
+                                    let _ = shared.tx.send(data);
+                                }
+                                Err(_panic_err) => {
+                                    error!("[SharedTuner] PANIC in B25 decoder push - disabling decoder and falling back to raw TS");
+                                    b25_needs_reset = true;
+
+                                    // Fall back to raw TS
+                                    let data = Bytes::copy_from_slice(raw);
+                                    let _ = shared.tx.send(data);
+                                }
+                            }
+                        } else {
+                            // B25 decoder in error state, skip decode and use raw TS
+                            let data = Bytes::copy_from_slice(raw);
+                            let _ = shared.tx.send(data);
+                        }
+                    } else {
+                        // No B25 decoder, use raw TS
+                        let data = Bytes::copy_from_slice(raw);
+                        let _ = shared.tx.send(data);
+                    }
+
+                    // Update signal level and log periodically
+                    if last_log_time.elapsed().as_secs() >= 5 {
+                        let level = tuner.get_signal_level();
+                        shared.set_signal_level(level);
+                        info!("[SharedTuner] {:?}: {} bytes sent, signal={:.1}dB",
+                              shared.key, total_bytes_read, level);
+                        last_log_time = std::time::Instant::now();
+                    }
+                }
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        consecutive_empty = consecutive_empty.saturating_add(1);
+                        if consecutive_empty % 50 == 1 && !reader_first_read {
+                            info!("[SharedTuner] get_ts_stream WouldBlock ({} times), total_bytes={}", consecutive_empty, total_bytes_read);
+                        }
+                        let max_attempts = if reader_first_read { 40000 } else { 1000 };
+                        if consecutive_empty > max_attempts {
+                            error!("[SharedTuner] Too many WouldBlock errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+
+                    if reader_first_read && reader_start_time.elapsed().as_secs() < 30 {
+                        warn!("[SharedTuner] Early startup error (ignored): {} (kind={:?}), elapsed={}s, continuing to wait",
+                              e, e.kind(), reader_start_time.elapsed().as_secs());
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
+
+                    warn!("[SharedTuner] Error reading TS data: {} (kind={:?}), total_bytes={}", e, e.kind(), total_bytes_read);
+                    consecutive_empty = consecutive_empty.saturating_add(1);
+                    if consecutive_empty > 1000 {
+                        error!("[SharedTuner] Too many consecutive errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(panic_err) => {
+                    error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
+                    shared.is_running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+
+        shared.is_running.store(false, Ordering::SeqCst);
+        info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
     }
 
     /// Start reading from a BonDriver.
@@ -371,8 +704,6 @@ impl SharedTuner {
         }
 
         let shared = Arc::clone(self);
-        let tx = self.tx.clone();
-
         info!("[SharedTuner] Starting BonDriver reader for {:?}", self.key);
 
         // Use a oneshot channel to signal when the reader is ready
@@ -387,9 +718,6 @@ impl SharedTuner {
         let handle = tokio::task::spawn_blocking(move || {
             // Wrap everything in catch_unwind to prevent panic from crashing the process
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Set is_running to true at the beginning of the task
-                shared.is_running.store(true, Ordering::SeqCst);
-
                 // Open BonDriver
                 info!("[SharedTuner] Opening BonDriver: {}", tuner_path);
                 let tuner = match BonDriverTuner::new(&tuner_path) {
@@ -412,321 +740,14 @@ impl SharedTuner {
                         return;
                     }
                 };
-
-                // Set channel with error handling
-                info!("[SharedTuner] Setting channel: space={}, channel={}", space, channel);
-                let set_channel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tuner.set_channel(space, channel)
-                }));
-                
-                match set_channel_result {
-                    Ok(Ok(())) => {
-                        info!("[SharedTuner] Channel set successfully");
-                    }
-                    Ok(Err(e)) => {
-                        error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})", 
-                               space, channel, e, e.kind());
-                        shared.is_running.store(false, Ordering::SeqCst);
-                        
-                        let err_msg = match e.kind() {
-                            std::io::ErrorKind::AddrNotAvailable =>
-                                format!("Channel not available - check space/channel number or signal is too weak"),
-                            std::io::ErrorKind::Unsupported =>
-                                format!("IBonDriver version does not support SetChannel2"),
-                            _ => format!("SetChannel error: {}", e)
-                        };
-                        
-                        let _ = ready_tx.send(Err(err_msg));
-                        return;
-                    }
-                    Err(panic_err) => {
-                        error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
-                        shared.is_running.store(false, Ordering::SeqCst);
-                        let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
-                        return;
-                    }
-                }
-
-                // Wait a moment for the tuner to lock onto the signal
-                info!("[SharedTuner] Waiting for tuner to lock...");
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-
-                // Check signal level
-                let initial_signal = tuner.get_signal_level();
-                info!("[SharedTuner] Initial signal level: {:.1}dB", initial_signal);
-
-                // Purge any stale data from the buffer
-                tuner.purge_ts_stream();
-                
-                // Short stabilization wait for new driver to have something in buffer
-                std::thread::sleep(std::time::Duration::from_millis(500));
-
-                // ===== B25 decoder init =====
-                let b25_opt = DecoderOptions {
-                    strip: true,
-                    emm: true,
-                    simd: true,
-                    round: 4,
-                    enable_working_key: false,
-                };
-
-                let mut b25 = match B25Pipe::new(b25_opt) {
-                    Ok(d) => {
-                        info!("[SharedTuner] B25 decoder enabled");
-                        Some(d)
-                    }
-                    Err(e) => {
-                        error!("[SharedTuner] Failed to init B25 decoder: {}", e);
-                        error!("[SharedTuner] Falling back to raw TS streaming");
-                        None
-                    }
-                };
-                
-                // Track decoder state
-                let mut b25_needs_reset = false;
-                let mut consecutive_b25_errors = 0;
-
-                // Reset packet counter for the new channel
-                shared.reset_packet_count();
-
-                // Signal that we're ready
-                info!("[SharedTuner] BonDriver ready, signaling...");
-                let _ = ready_tx.send(Ok(()));
-
-                info!("[SharedTuner] Reader task started for {:?}", shared.key);
-
-                // Use a larger initial buffer, and expand dynamically if needed
-                let mut buf = vec![0u8; TS_CHUNK_SIZE];
-                let mut buf_size = TS_CHUNK_SIZE;
-                let mut consecutive_empty = 0u64;
-                let mut total_bytes_read = 0u64;
-                let mut last_log_time = std::time::Instant::now();
-                let mut last_status_log = std::time::Instant::now();
-                let mut reader_first_read = true;
-                let reader_start_time = std::time::Instant::now();
-
-                loop {
-                    // Check if we should stop due to explicit stop signal
-                    if !shared.is_running.load(Ordering::SeqCst) {
-                        info!("[SharedTuner] BREAK: Stop signal received for {:?}", shared.key);
-                        break;
-                    }
-
-                    // Log status every 5 seconds for debugging
-                    if last_status_log.elapsed().as_secs() >= 5 {
-                        let level = tuner.get_signal_level();
-                        info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, is_running={}, elapsed={}s",
-                              total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.is_running.load(Ordering::SeqCst), reader_start_time.elapsed().as_secs());
-                        last_status_log = std::time::Instant::now();
-                    }
-
-                    // Wait for TS data to be available
-                    let wait_result = tuner.wait_ts_stream(1000);
-                    if !wait_result {
-                        consecutive_empty = consecutive_empty.saturating_add(1);
-                        if consecutive_empty % 50 == 1 {
-                            info!("[SharedTuner] wait_ts_stream returned false ({} times), total_bytes={}, elapsed={}ms", 
-                                  consecutive_empty, total_bytes_read, reader_start_time.elapsed().as_millis());
-                        }
-                    }
-
-                    // Read TS data with panic safety
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tuner.get_ts_stream(&mut buf)
-                    })) {
-                        Ok(Ok((n, remaining))) => {
-                            // Check if BonDriver is requesting more buffer space
-                            if n > buf.len() {
-                                // BonDriver returned a size larger than our current buffer
-                                // Expand the buffer to accommodate this size, plus some headroom
-                                let new_size = (n * 2).max(buf_size * 2).min(16 * 1024 * 1024); // Cap at 16MB
-                                info!("[SharedTuner] Expanding buffer from {} to {} bytes due to BonDriver request: n={}", 
-                                      buf_size, new_size, n);
-                                buf.resize(new_size, 0);
-                                buf_size = new_size;
-                                
-                                // Retry with larger buffer
-                                if remaining > 0 {
-                                    warn!("[SharedTuner] GetTsStream returned size {} exceeds buffer {}, remaining={}. Retrying with expanded buffer...", 
-                                          n, buf.len(), remaining);
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                    continue;
-                                }
-                            }
-                            
-                            // Clip the returned size to buffer size (safety measure)
-                            let n = std::cmp::min(n, buf.len());
-                            
-                            // Log at INFO level only if we got significant data
-                            if n > 0 && n % 327680 == 0 {  // Log every 5MB
-                                info!("[SharedTuner] GetTsStream: n={} bytes, remaining={}", n, remaining);
-                            }
-                            
-                            if n == 0 {
-                                consecutive_empty = consecutive_empty.saturating_add(1);
-                                if consecutive_empty == 1 {
-                                    warn!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...", 
-                                          total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
-                                }
-                                if reader_first_read && reader_start_time.elapsed().as_secs() < 30 {
-                                    if consecutive_empty % 100 == 1 && consecutive_empty > 1 {
-                                        let signal = tuner.get_signal_level();
-                                        debug!("[SharedTuner] Early startup: waiting for TS data ({} empty reads, {}s elapsed, signal={:.1}dB)", 
-                                               consecutive_empty, reader_start_time.elapsed().as_secs(), signal);
-                                    }
-                                } else if consecutive_empty % 500 == 1 {
-                                    let signal = tuner.get_signal_level();
-                                    debug!("[SharedTuner] Still waiting for TS data after {} empty reads, total_bytes={}, signal={:.1}dB, elapsed={}ms", 
-                                           consecutive_empty, total_bytes_read, signal, reader_start_time.elapsed().as_millis());
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                                continue;
-                            }
-
-                            // Got data!
-                            if reader_first_read {
-                                info!("[SharedTuner] FIRST_DATA_RECEIVED: {} bytes after {} empty reads, elapsed={}ms, STARTUP_SUCCESSFUL", 
-                                      n, consecutive_empty, reader_start_time.elapsed().as_millis());
-                                reader_first_read = false;
-                            } else if consecutive_empty > 0 {
-                                debug!("[SharedTuner] Got data after {} empty reads: {} bytes", consecutive_empty, n);
-                            }
-                            consecutive_empty = 0;
-                            total_bytes_read += n as u64;
-
-                            // Increment packet count
-                            let packet_count = (n / 188) as u64;
-                            if packet_count > 0 {
-                                shared.increment_packet_count(packet_count);
-                            }
-
-                            // Broadcast to all subscribers
-                            let raw = &buf[..n];
-                            
-                            // Data validation before B25 decode (log only on first packet)
-                            if reader_first_read && n > 0 {
-                                // Safely log first few bytes
-                                info!("[SharedTuner] First TS packet received: size={} bytes, has_b25_decoder={}", n, b25.is_some());
-                            }
-
-                            // ★B25 decode with panic safety
-                            if let Some(b25_decoder) = &mut b25 {
-                                if !b25_needs_reset {
-                                    // Wrap B25 push in panic safety
-                                    let push_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        b25_decoder.push(raw)
-                                    }));
-                                    
-                                    match push_result {
-                                        Ok(Ok(decoded)) => {
-                                            if decoded.is_empty() {
-                                                consecutive_b25_errors = 0;
-                                                continue;
-                                            }
-
-                                            consecutive_b25_errors = 0;
-
-                                            let packet_count = (decoded.len() / 188) as u64;
-                                            if packet_count > 0 {
-                                                shared.increment_packet_count(packet_count);
-                                            }
-
-                                            let data = Bytes::from(decoded);
-
-                                            match tx.send(data) {
-                                                Ok(_count) => {
-                                                    // Broadcast successful
-                                                }
-                                                Err(_e) => {
-                                                    // Broadcast error - likely buffer overflow
-                                                    // This is expected when subscribers fall behind
-                                                }
-                                            }
-                                        }
-                                        Ok(Err(e)) => {
-                                            consecutive_b25_errors += 1;
-                                            // Log error count without error details (to avoid binary data in logs)
-                                            if consecutive_b25_errors == 1 {
-                                                warn!("[SharedTuner] B25 decode error detected");
-                                            }
-
-                                            if consecutive_b25_errors >= 10 {
-                                                error!("[SharedTuner] Too many B25 errors, resetting decoder");
-                                                b25_needs_reset = true;
-                                            }
-
-                                            let data = Bytes::copy_from_slice(raw);
-                                            let _ = tx.send(data);
-                                        }
-                                        Err(panic_err) => {
-                                            error!("[SharedTuner] PANIC in B25 decoder push - disabling decoder and falling back to raw TS");
-                                            b25_needs_reset = true;
-                                            
-                                            // Fall back to raw TS
-                                            let data = Bytes::copy_from_slice(raw);
-                                            let _ = tx.send(data);
-                                        }
-                                    }
-                                } else {
-                                    // B25 decoder in error state, skip decode and use raw TS
-                                    let data = Bytes::copy_from_slice(raw);
-                                    let _ = tx.send(data);
-                                }
-                            } else {
-                                // No B25 decoder, use raw TS
-                                let data = Bytes::copy_from_slice(raw);
-                                let _ = tx.send(data);
-                            }
-
-                            // Update signal level and log periodically
-                            if last_log_time.elapsed().as_secs() >= 5 {
-                                let level = tuner.get_signal_level();
-                                shared.set_signal_level(level);
-                                info!("[SharedTuner] {:?}: {} bytes sent, signal={:.1}dB",
-                                      shared.key, total_bytes_read, level);
-                                last_log_time = std::time::Instant::now();
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                consecutive_empty = consecutive_empty.saturating_add(1);
-                                if consecutive_empty % 50 == 1 && !reader_first_read {
-                                    info!("[SharedTuner] get_ts_stream WouldBlock ({} times), total_bytes={}", consecutive_empty, total_bytes_read);
-                                }
-                                let max_attempts = if reader_first_read { 40000 } else { 1000 };
-                                if consecutive_empty > max_attempts {
-                                    error!("[SharedTuner] Too many WouldBlock errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                                continue;
-                            }
-                            
-                            if reader_first_read && reader_start_time.elapsed().as_secs() < 30 {
-                                warn!("[SharedTuner] Early startup error (ignored): {} (kind={:?}), elapsed={}s, continuing to wait", 
-                                      e, e.kind(), reader_start_time.elapsed().as_secs());
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                                continue;
-                            }
-                            
-                            warn!("[SharedTuner] Error reading TS data: {} (kind={:?}), total_bytes={}", e, e.kind(), total_bytes_read);
-                            consecutive_empty = consecutive_empty.saturating_add(1);
-                            if consecutive_empty > 1000 {
-                                error!("[SharedTuner] Too many consecutive errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(panic_err) => {
-                            error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
-                            shared.is_running.store(false, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                }
-
-                shared.is_running.store(false, Ordering::SeqCst);
-                info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
+                SharedTuner::run_bondriver_reader_with_tuner(
+                    Arc::clone(&shared),
+                    tuner,
+                    tuner_path.clone(),
+                    space,
+                    channel,
+                    ready_tx,
+                );
             }));
             
             // Handle panic at top level

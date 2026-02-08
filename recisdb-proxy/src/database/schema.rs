@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS scan_scheduler_config (
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
+-- Tuner optimization configuration table
+CREATE TABLE IF NOT EXISTS tuner_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    keep_alive_secs INTEGER DEFAULT 60,
+    prewarm_enabled INTEGER DEFAULT 1,
+    prewarm_timeout_secs INTEGER DEFAULT 30,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 -- Session history table
 CREATE TABLE IF NOT EXISTS session_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,5 +216,6 @@ mod tests {
         assert!(tables.contains(&"alert_rules".to_string()));
         assert!(tables.contains(&"alert_history".to_string()));
         assert!(tables.contains(&"driver_quality_stats".to_string()));
+        assert!(tables.contains(&"tuner_config".to_string()));
     }
 }

@@ -22,6 +22,14 @@ pub struct ScanSchedulerInfo {
     pub scan_timeout_secs: u64,
 }
 
+/// Tuner optimization configuration (for Web API).
+#[derive(Debug, Clone, Serialize)]
+pub struct TunerConfigInfo {
+    pub keep_alive_secs: u64,
+    pub prewarm_enabled: bool,
+    pub prewarm_timeout_secs: u64,
+}
+
 /// Information about an active session.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
@@ -296,6 +304,8 @@ pub struct WebState {
     pub session_registry: Arc<SessionRegistry>,
     /// Scan scheduler configuration.
     pub scan_config: RwLock<ScanSchedulerInfo>,
+    /// Tuner optimization configuration.
+    pub tuner_config: RwLock<TunerConfigInfo>,
 }
 
 impl WebState {
@@ -310,6 +320,11 @@ impl WebState {
                 max_concurrent_scans: 1,
                 scan_timeout_secs: 900,
             }),
+            tuner_config: RwLock::new(TunerConfigInfo {
+                keep_alive_secs: 60,
+                prewarm_enabled: true,
+                prewarm_timeout_secs: 30,
+            }),
         }
     }
 
@@ -318,8 +333,8 @@ impl WebState {
         *self.scan_config.write().await = config;
     }
 
-    /// Get scan scheduler configuration.
-    pub async fn get_scan_config(&self) -> ScanSchedulerInfo {
-        self.scan_config.read().await.clone()
+    /// Update tuner optimization configuration.
+    pub async fn update_tuner_config(&self, config: TunerConfigInfo) {
+        *self.tuner_config.write().await = config;
     }
 }

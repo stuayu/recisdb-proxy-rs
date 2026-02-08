@@ -341,36 +341,47 @@ struct ServiceInfo {
 
 use crate::ts_analyzer::{TsAnalyzer, AnalyzerConfig};
 
-/// Scan a space/channel range using BonDriverTuner.
+/// Scan channels in a space by enumerating BonDriver's channel list.
 /// This runs in a blocking thread to avoid Send/Sync issues with raw pointers.
 fn scan_space_blocking(
     dll_path: &str,
     space: u32,
-    channel_start: u32,
-    channel_end: u32,
 ) -> Result<Vec<ScanChannelResult>, Box<dyn std::error::Error + Send + Sync>> {
     info!("scan_space_blocking: Loading BonDriver {}", dll_path);
     let tuner = BonDriverTuner::new(dll_path)?;
     info!("scan_space_blocking: BonDriver loaded, version {}", tuner.version());
 
-    // Enumerate tuning spaces
-    let mut space_idx = 0;
-    while let Some(space_name) = tuner.enum_tuning_space(space_idx) {
-        info!("scan_space_blocking: Space {}: {}", space_idx, space_name);
-        space_idx += 1;
+    // Enumerate channels defined by BonDriver for this space
+    let mut channels: Vec<(u32, String)> = Vec::new();
+    let mut ch_idx: u32 = 0;
+    // BonDriver implementations may not return None reliably,
+    // so cap at a reasonable maximum as a safety net.
+    const MAX_CHANNELS: u32 = 1024;
+    let mut consecutive_none: u32 = 0;
+    while ch_idx < MAX_CHANNELS {
+        match tuner.enum_channel_name(space, ch_idx) {
+            Some(name) => {
+                channels.push((ch_idx, name));
+                consecutive_none = 0;
+            }
+            None => {
+                // Some BonDrivers have gaps in channel indices.
+                // Allow up to 3 consecutive Nones before stopping.
+                consecutive_none += 1;
+                if consecutive_none > 3 {
+                    break;
+                }
+            }
+        }
+        ch_idx += 1;
     }
+
+    info!("scan_space_blocking: Space {} has {} channels defined by BonDriver", space, channels.len());
 
     let mut results = Vec::new();
 
-    for channel in channel_start..=channel_end {
-        // Get channel name from BonDriver
-        let channel_name = match tuner.enum_channel_name(space, channel) {
-            Some(name) => name,
-            None => {
-                debug!("scan_space_blocking: No channel name for space={}, channel={}", space, channel);
-                continue;
-            }
-        };
+    for (channel, channel_name) in &channels {
+        let channel = *channel;
 
         debug!("scan_space_blocking: Trying space={}, channel={} ({})", space, channel, channel_name);
 
@@ -402,7 +413,16 @@ fn scan_space_blocking(
         // Retry up to 3 times if NID is missing or invalid (0x0000)
         let mut analysis_result = None;
         for attempt in 0..3 {
-            let result = analyze_ts_stream(&tuner);
+            // catch_unwind to prevent panics (e.g. from FFI) from crashing the process
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                analyze_ts_stream(&tuner)
+            })) {
+                Ok(r) => r,
+                Err(panic_err) => {
+                    error!("scan_space_blocking: PANIC in analyze_ts_stream (attempt {}/3): {:?}", attempt + 1, panic_err);
+                    Err("panic in analyze_ts_stream".into())
+                }
+            };
             
             match result {
                 Ok((Some(nid), tsid, svcs)) if nid == 0x0000 => {
@@ -474,7 +494,7 @@ fn scan_space_blocking(
         results.push(ScanChannelResult {
             space,
             channel,
-            channel_name,
+            channel_name: channel_name.clone(),
             signal_level,
             network_id,
             transport_stream_id,
@@ -724,8 +744,7 @@ async fn perform_scan(
             for (space, space_name) in spaces {
                 info!("perform_scan: Scanning space {} ({})", space, space_name);
 
-                // channel 範囲はひとまず 0..63（scan_space_blocking 内で enum_channel_name が None ならスキップされる）
-                match scan_space_blocking(&dll, space, 0, 63) {
+                match scan_space_blocking(&dll, space) {
                     Ok(r) => results.extend(r),
                     Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
                 }
@@ -743,7 +762,7 @@ async fn perform_scan(
             let dll = dll_path.clone();
 
             let results = tokio::task::spawn_blocking(move || {
-                scan_space_blocking(&dll, space, 0, 63)
+                scan_space_blocking(&dll, space)
             })
             .await??;
 

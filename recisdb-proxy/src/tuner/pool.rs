@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::oneshot;
 
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::shared::SharedTuner;
@@ -52,23 +53,167 @@ pub enum TunerPoolError {
     NotFound(String),
 }
 
+/// Tuner pool configuration for optimization behavior.
+#[derive(Debug, Clone)]
+pub struct TunerPoolConfig {
+    pub keep_alive_secs: u64,
+    pub prewarm_enabled: bool,
+    pub prewarm_timeout_secs: u64,
+}
+
+impl Default for TunerPoolConfig {
+    fn default() -> Self {
+        Self {
+            keep_alive_secs: 60,
+            prewarm_enabled: true,
+            prewarm_timeout_secs: 30,
+        }
+    }
+}
+
 /// Pool of shared tuner instances.
 ///
 /// Manages tuner lifecycle and enables channel sharing between clients.
 pub struct TunerPool {
     /// Map of channel keys to shared tuner instances.
     tuners: RwLock<HashMap<ChannelKey, Arc<SharedTuner>>>,
+    /// Pending idle-close tasks.
+    idle_tasks: Mutex<HashMap<ChannelKey, IdleHandle>>,
     /// Maximum number of concurrent tuner instances.
     max_tuners: usize,
+    /// Tuner optimization configuration.
+    config: RwLock<TunerPoolConfig>,
+}
+
+struct IdleHandle {
+    cancel_tx: oneshot::Sender<()>,
 }
 
 impl TunerPool {
     /// Create a new tuner pool.
     pub fn new(max_tuners: usize) -> Self {
+        Self::new_with_config(max_tuners, TunerPoolConfig::default())
+    }
+
+    /// Create a new tuner pool with configuration.
+    pub fn new_with_config(max_tuners: usize, config: TunerPoolConfig) -> Self {
         Self {
             tuners: RwLock::new(HashMap::new()),
+            idle_tasks: Mutex::new(HashMap::new()),
             max_tuners,
+            config: RwLock::new(config),
         }
+    }
+
+    /// Update tuner optimization configuration.
+    pub async fn update_config(self: &Arc<Self>, config: TunerPoolConfig) {
+        let old_keep_alive = {
+            let mut guard = self.config.write().await;
+            let old = guard.keep_alive_secs;
+            *guard = config.clone();
+            old
+        };
+
+        if old_keep_alive != config.keep_alive_secs {
+            self.cancel_all_idle().await;
+
+            let idle_tuners: Vec<(ChannelKey, Arc<SharedTuner>)> = {
+                let tuners = self.tuners.read().await;
+                tuners
+                    .iter()
+                    .filter(|(_, tuner)| !tuner.has_subscribers())
+                    .map(|(key, tuner)| (key.clone(), Arc::clone(tuner)))
+                    .collect()
+            };
+
+            for (key, tuner) in idle_tuners {
+                self.schedule_idle_close(key, tuner).await;
+            }
+        }
+    }
+
+    /// Get current tuner optimization configuration.
+    pub async fn config(&self) -> TunerPoolConfig {
+        self.config.read().await.clone()
+    }
+
+    /// Cancel an idle-close timer if it exists.
+    pub async fn cancel_idle_close(&self, key: &ChannelKey) {
+        let mut idle_tasks = self.idle_tasks.lock().await;
+        if let Some(handle) = idle_tasks.remove(key) {
+            let _ = handle.cancel_tx.send(());
+        }
+    }
+
+    /// Cancel all idle-close timers.
+    pub async fn cancel_all_idle(&self) {
+        let mut idle_tasks = self.idle_tasks.lock().await;
+        for (_, handle) in idle_tasks.drain() {
+            let _ = handle.cancel_tx.send(());
+        }
+    }
+
+    /// Schedule a delayed close when the tuner becomes idle.
+    pub async fn schedule_idle_close(self: &Arc<Self>, key: ChannelKey, tuner: Arc<SharedTuner>) {
+        let keep_alive_secs = self.config.read().await.keep_alive_secs;
+        if keep_alive_secs == 0 {
+            info!("Keep-alive disabled, stopping reader for {:?}", key);
+            tuner.stop_reader().await;
+            let _ = self.remove(&key).await;
+            return;
+        }
+
+        {
+            let idle_tasks = self.idle_tasks.lock().await;
+            if idle_tasks.contains_key(&key) {
+                info!("Keep-alive already scheduled for {:?}", key);
+                return;
+            }
+        }
+
+        self.cancel_idle_close(&key).await;
+
+        info!("Scheduling keep-alive close in {}s for {:?}", keep_alive_secs, key);
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        {
+            let mut idle_tasks = self.idle_tasks.lock().await;
+            idle_tasks.insert(key.clone(), IdleHandle { cancel_tx });
+        }
+
+        let pool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let sleep = tokio::time::sleep(std::time::Duration::from_secs(keep_alive_secs));
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                _ = &mut sleep => {
+                    if let Some(pool) = pool.upgrade() {
+                        if !tuner.has_subscribers() {
+                            info!("Keep-alive timeout reached, stopping reader for {:?}", key);
+                            tuner.stop_reader().await;
+                            let mut tuners = pool.tuners.write().await;
+                            if let Some(current) = tuners.get(&key) {
+                                if Arc::ptr_eq(current, &tuner) {
+                                    tuners.remove(&key);
+                                }
+                            }
+                        } else {
+                            info!("Keep-alive timeout reached but subscribers present for {:?}", key);
+                        }
+                        let mut idle_tasks = pool.idle_tasks.lock().await;
+                        idle_tasks.remove(&key);
+                    }
+                }
+                _ = cancel_rx => {
+                    if let Some(pool) = pool.upgrade() {
+                        info!("Keep-alive close canceled for {:?}", key);
+                        let mut idle_tasks = pool.idle_tasks.lock().await;
+                        idle_tasks.remove(&key);
+                    }
+                }
+            }
+        });
     }
 
     /// Get an existing shared tuner for the given key, if one exists.
@@ -94,6 +239,7 @@ impl TunerPool {
         {
             let tuners = self.tuners.read().await;
             if let Some(tuner) = tuners.get(&key) {
+                self.cancel_idle_close(&key).await;
                 debug!("Reusing existing tuner for {:?}", key);
                 return Ok(Arc::clone(tuner));
             }
@@ -104,6 +250,7 @@ impl TunerPool {
 
         // Double-check after acquiring write lock
         if let Some(tuner) = tuners.get(&key) {
+            self.cancel_idle_close(&key).await;
             debug!("Reusing existing tuner for {:?} (after lock)", key);
             return Ok(Arc::clone(tuner));
         }

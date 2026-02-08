@@ -19,7 +19,7 @@ use recisdb_protocol::{
 };
 
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::{ChannelKey, SharedTuner, TunerPool, ts_analyzer::TsPacketAnalyzer};
+use crate::tuner::{ChannelKey, SharedTuner, TunerPool, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
 use crate::tuner::quality_scorer::QualityScorer;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::web::SessionRegistry;
@@ -85,6 +85,10 @@ pub struct Session {
     database: DatabaseHandle,
     /// Currently open tuner.
     current_tuner: Option<Arc<SharedTuner>>,
+    /// Warm tuner handle for pre-opened BonDriver.
+    warm_tuner: Option<WarmTunerHandle>,
+    /// Warm tuner path.
+    warm_tuner_path: Option<String>,
     /// Current tuner path.
     current_tuner_path: Option<String>,
     /// Default tuner path.
@@ -134,6 +138,13 @@ pub struct Session {
     disconnect_reason: Option<String>,
     /// Current BonDriver ID (if resolved).
     current_bon_driver_id: Option<i64>,
+    /// Last time we flushed metrics to DB.
+    last_db_flush: std::time::Instant,
+    /// Previously flushed counters (for computing deltas).
+    flushed_packets: u64,
+    flushed_dropped: u64,
+    flushed_scrambled: u64,
+    flushed_error: u64,
 }
 
 impl Session {
@@ -157,6 +168,8 @@ impl Session {
             tuner_pool,
             database,
             current_tuner: None,
+            warm_tuner: None,
+            warm_tuner_path: None,
             current_tuner_path: None,
             default_tuner,
             current_group_name: None,
@@ -185,6 +198,11 @@ impl Session {
             session_history_id: None,
             disconnect_reason: None,
             current_bon_driver_id: None,
+            last_db_flush: std::time::Instant::now(),
+            flushed_packets: 0,
+            flushed_dropped: 0,
+            flushed_scrambled: 0,
+            flushed_error: 0,
         }
     }
 
@@ -201,6 +219,61 @@ impl Session {
         } else {
             self.current_bon_driver_id = None;
         }
+    }
+
+    async fn stop_warm_tuner(&mut self) {
+        if let Some(warm) = self.warm_tuner.take() {
+            warm.shutdown().await;
+        }
+        self.warm_tuner_path = None;
+    }
+
+    async fn maybe_start_warm_tuner(&mut self, tuner_path: &str) {
+        let config = self.tuner_pool.config().await;
+        if !config.prewarm_enabled {
+            return;
+        }
+
+        self.stop_warm_tuner().await;
+
+        let warm = WarmTunerHandle::spawn(tuner_path.to_string(), config.prewarm_timeout_secs);
+        self.warm_tuner_path = Some(tuner_path.to_string());
+        self.warm_tuner = Some(warm);
+    }
+
+    async fn start_reader_with_warm(
+        &mut self,
+        tuner: Arc<SharedTuner>,
+        tuner_path: String,
+        space: u32,
+        channel: u32,
+    ) -> std::io::Result<()> {
+        let config = self.tuner_pool.config().await;
+        if !config.prewarm_enabled {
+            self.stop_warm_tuner().await;
+            return tuner.start_bondriver_reader(tuner_path, space, channel).await;
+        }
+
+        if let Some(mut warm) = self.warm_tuner.take() {
+            if self.warm_tuner_path.as_deref() == Some(tuner_path.as_str()) {
+                match warm.activate(Arc::clone(&tuner), tuner_path.clone(), space, channel).await {
+                    Ok(()) => {
+                        self.warm_tuner_path = None;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("[Session {}] Warm tuner activation failed: {}", self.id, e);
+                        warm.shutdown().await;
+                        self.warm_tuner_path = None;
+                    }
+                }
+            } else {
+                warm.shutdown().await;
+                self.warm_tuner_path = None;
+            }
+        }
+
+        tuner.start_bondriver_reader(tuner_path, space, channel).await
     }
 
     async fn build_channel_map_for_space(&self, tuner_path: &str, space: u32)
@@ -775,14 +848,26 @@ impl Session {
                     // Check for incoming TS data
                     ts_result = async {
                         if let Some(rx) = &mut self.ts_receiver {
-                            rx.recv().await.ok()
+                            Some(rx.recv().await)
                         } else {
                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             None
                         }
                     } => {
-                        if let Some(data) = ts_result {
-                            self.send_ts_data(data).await?;
+                        match ts_result {
+                            Some(Ok(data)) => {
+                                self.send_ts_data(data).await?;
+                            }
+                            Some(Err(broadcast::error::RecvError::Lagged(count))) => {
+                                warn!("[Session {}] Broadcast receiver lagged, skipped {} messages", self.id, count);
+                                self.packets_dropped += count;
+                            }
+                            Some(Err(broadcast::error::RecvError::Closed)) => {
+                                info!("[Session {}] Broadcast channel closed", self.id);
+                                self.disconnect_reason = Some("broadcast_closed".to_string());
+                                break;
+                            }
+                            None => {}
                         }
                     }
 
@@ -938,7 +1023,7 @@ impl Session {
             ClientMessage::CloseTuner => {
                 self.handle_close_tuner().await?;
             }
-            ClientMessage::SetChannel { channel, priority: _, exclusive: _ } => {
+            ClientMessage::SetChannel { channel: _, priority: _, exclusive: _ } => {
                 // TODO: Implement group-aware channel selection
                 self.send_message(ServerMessage::SetChannelAck {
                     success: false,
@@ -1153,6 +1238,11 @@ impl Session {
             self.current_group_name = None;
             self.group_driver_paths.clear();
             self.refresh_current_bon_driver_id().await;
+            self.maybe_start_warm_tuner(&resolved_path).await;
+        }
+
+        if is_group {
+            self.stop_warm_tuner().await;
         }
 
         self.clear_caches();
@@ -1201,8 +1291,8 @@ impl Session {
             .get_effective_controls(self.id)
             .await
             .unwrap_or((Some(priority), exclusive));
-        let priority = effective_priority_opt.unwrap_or(priority);
-        let exclusive = effective_exclusive;
+        let _priority = effective_priority_opt.unwrap_or(priority);
+        let _exclusive = effective_exclusive;
 
         let tuner_path = match &self.current_tuner_path {
             Some(p) => p.clone(),
@@ -1253,7 +1343,8 @@ impl Session {
         {
             Ok(tuner) => {
                 // Start the BonDriver reader (will restart if already running)
-                if let Err(e) = tuner.start_bondriver_reader(
+                if let Err(e) = self.start_reader_with_warm(
+                    Arc::clone(&tuner),
                     tuner_path.clone(),
                     0,  // v1 style uses space=0
                     channel as u32,
@@ -1320,8 +1411,8 @@ impl Session {
             .get_effective_controls(self.id)
             .await
             .unwrap_or((Some(priority), exclusive));
-        let priority = effective_priority.unwrap_or(priority);
-        let exclusive = effective_exclusive;
+        let _priority = effective_priority.unwrap_or(priority);
+        let _exclusive = effective_exclusive;
         
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             error!("[Session {}] SetChannelSpace: Tuner not open (state: {:?})", self.id, self.state);
@@ -1550,7 +1641,7 @@ impl Session {
                     self.refresh_current_bon_driver_id().await;
                     // For satellite broadcasts, update actual_space to the one from the selected driver
                     if region_name == "BS" || region_name == "CS" {
-                        let actual_space = driver_space;
+                        let _actual_space = driver_space;
                     }
                     path
                 }
@@ -1600,7 +1691,7 @@ impl Session {
         };
 
         // ★ Get max instances for this BonDriver
-        let max_instances = {
+        let _max_instances = {
             let db = self.database.lock().await;
             db.get_max_instances_for_path(&tuner_path).unwrap_or(1)
         };
@@ -1891,7 +1982,8 @@ impl Session {
                 // Start the BonDriver reader if not already running
                 if !tuner.is_running() {
                     info!("[Session {}] Starting BonDriver reader for new tuner", self.id);
-                    if let Err(e) = tuner.start_bondriver_reader(
+                    if let Err(e) = self.start_reader_with_warm(
+                        Arc::clone(&tuner),
                         actual_tuner_path.clone(),
                         actual_actual_space,
                         actual_bon_channel,
@@ -1911,7 +2003,8 @@ impl Session {
                                 match self.tuner_pool.get_or_create(fallback_key, 2, || async { Ok(()) }).await {
                                     Ok(fb_tuner) => {
                                         if !fb_tuner.is_running() {
-                                            if let Ok(_) = fb_tuner.start_bondriver_reader(
+                                            if let Ok(_) = self.start_reader_with_warm(
+                                                Arc::clone(&fb_tuner),
                                                 fallback_path.clone(),
                                                 *fallback_space,
                                                 actual_bon_channel,
@@ -2068,6 +2161,7 @@ impl Session {
         let rx = tuner.subscribe();
         self.ts_receiver = Some(rx);
         self.state = SessionState::Streaming;
+        self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
         // Update session registry
         self.session_registry.update_streaming(self.id, true).await;
@@ -2090,8 +2184,10 @@ impl Session {
             // ★ Check if this was the last subscriber
             // If so, automatically stop the reader
             if tuner.subscriber_count() == 0 {
-                info!("[Session {}] No more subscribers after StopStream, stopping reader for {:?}", self.id, tuner.key);
-                tuner.stop_reader().await;
+                info!("[Session {}] No more subscribers after StopStream, scheduling keep-alive close for {:?}", self.id, tuner.key);
+                self.tuner_pool
+                    .schedule_idle_close(tuner.key.clone(), Arc::clone(tuner))
+                    .await;
             }
         }
         self.ts_receiver = None;
@@ -2210,7 +2306,8 @@ impl Session {
             Ok(tuner) => {
                 // Start the BonDriver reader if not already running
                 if !tuner.is_running() {
-                    if let Err(e) = tuner.start_bondriver_reader(
+                    if let Err(e) = self.start_reader_with_warm(
+                        Arc::clone(&tuner),
                         tuner_id.clone(),
                         space,
                         channel,
@@ -2413,6 +2510,12 @@ impl Session {
                 self.bytes_since_last = 0;
                 self.interval_packets_total = 0;
                 self.interval_packets_dropped = 0;
+
+                // Periodic DB flush (every 30 seconds)
+                if self.last_db_flush.elapsed().as_secs() >= 30 {
+                    self.flush_metrics_to_db().await;
+                    self.last_db_flush = std::time::Instant::now();
+                }
             }
         }
 
@@ -2440,8 +2543,80 @@ impl Session {
         .await
     }
 
+    /// Flush current session metrics to DB (periodic update during streaming).
+    async fn flush_metrics_to_db(&mut self) {
+        let duration_secs = self.session_started_at.elapsed().as_secs() as i64;
+        let average_signal = if self.signal_samples > 0 {
+            Some(self.signal_level_sum / self.signal_samples as f64)
+        } else {
+            None
+        };
+        let average_bitrate_mbps = if duration_secs > 0 {
+            Some((self.ts_bytes_sent as f64 * 8.0) / 1_000_000.0 / duration_secs as f64)
+        } else {
+            None
+        };
+
+        let current_packets = self.ts_bytes_sent / 188;
+
+        // Update session history progress
+        if let Some(history_id) = self.session_history_id {
+            let db = self.database.lock().await;
+            if let Err(e) = db.update_session_progress(
+                history_id,
+                duration_secs,
+                current_packets,
+                self.packets_dropped,
+                self.packets_scrambled,
+                self.packets_error,
+                self.ts_bytes_sent,
+                average_bitrate_mbps,
+                average_signal,
+                self.current_tuner_path.as_deref(),
+                self.current_channel_info.as_deref(),
+                self.current_channel_name.as_deref(),
+            ) {
+                warn!("[Session {}] Failed to flush session progress to DB: {}", self.id, e);
+            }
+        }
+
+        // Update driver quality stats (delta-based, no session count increment)
+        if let Some(driver_id) = self.current_bon_driver_id {
+            let delta_packets = current_packets - self.flushed_packets;
+            let delta_dropped = self.packets_dropped - self.flushed_dropped;
+            let delta_scrambled = self.packets_scrambled - self.flushed_scrambled;
+            let delta_error = self.packets_error - self.flushed_error;
+
+            let db = self.database.lock().await;
+            if let Err(e) = QualityScorer::update_stats_delta(
+                &db,
+                driver_id,
+                delta_packets,
+                delta_dropped,
+                delta_scrambled,
+                delta_error,
+                current_packets,
+                self.packets_dropped,
+                self.packets_error,
+                false,
+            ) {
+                warn!("[Session {}] Failed to flush driver quality stats to DB: {}", self.id, e);
+            }
+
+            // Update flushed counters
+            self.flushed_packets = current_packets;
+            self.flushed_dropped = self.packets_dropped;
+            self.flushed_scrambled = self.packets_scrambled;
+            self.flushed_error = self.packets_error;
+        }
+
+        debug!("[Session {}] Flushed metrics to DB (duration={}s, dropped={}, scrambled={}, error={})",
+            self.id, duration_secs, self.packets_dropped, self.packets_scrambled, self.packets_error);
+    }
+
     /// Clean up session resources.
     async fn cleanup(&mut self) {
+        self.stop_warm_tuner().await;
         // Unsubscribe from tuner and check if we should stop reader
         if let Some(tuner) = self.current_tuner.take() {
             // Unsubscribe only if we have an active subscription
@@ -2453,8 +2628,10 @@ impl Session {
             // This handles the case where StopStream was called before disconnect
             // (ts_receiver is None but tuner may still have no subscribers)
             if tuner.subscriber_count() == 0 {
-                info!("[Session {}] No more subscribers, stopping reader for {:?}", self.id, tuner.key);
-                tuner.stop_reader().await;
+                info!("[Session {}] No more subscribers, scheduling keep-alive close for {:?}", self.id, tuner.key);
+                self.tuner_pool
+                    .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
+                    .await;
             }
         }
         self.ts_receiver = None;
@@ -2503,14 +2680,24 @@ impl Session {
         }
 
         if let Some(driver_id) = self.current_bon_driver_id {
+            let current_packets = self.ts_bytes_sent / 188;
+            let delta_packets = current_packets - self.flushed_packets;
+            let delta_dropped = self.packets_dropped - self.flushed_dropped;
+            let delta_scrambled = self.packets_scrambled - self.flushed_scrambled;
+            let delta_error = self.packets_error - self.flushed_error;
+
             let db = self.database.lock().await;
-            if let Err(e) = QualityScorer::update_stats(
+            if let Err(e) = QualityScorer::update_stats_delta(
                 &db,
                 driver_id,
-                self.ts_bytes_sent / 188,
+                delta_packets,
+                delta_dropped,
+                delta_scrambled,
+                delta_error,
+                current_packets,
                 self.packets_dropped,
-                self.packets_scrambled,
                 self.packets_error,
+                true, // increment session count at session end
             ) {
                 warn!("[Session {}] Failed to update driver quality stats: {}", self.id, e);
             }
@@ -2531,6 +2718,7 @@ impl Session {
         }
 
         info!("[Session {}] Opening tuner group: {}", self.id, group_name);
+        self.stop_warm_tuner().await;
 
         // TODO: Implement group space info building
         // For now, send error

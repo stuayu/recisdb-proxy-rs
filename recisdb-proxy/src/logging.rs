@@ -17,10 +17,12 @@ use std::sync::Arc;
 /// * `log_dir` - Directory where log files will be stored
 /// * `retention_days` - Number of days to keep log files
 /// * `verbose` - Whether to enable debug-level logging
+/// * `level` - Log level override from config file (e.g. "warn", "info", "error")
 pub fn init_logging(
     log_dir: &Path,
     retention_days: u64,
     verbose: bool,
+    level: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
@@ -35,12 +37,14 @@ pub fn init_logging(
     // Wrap the guard in an Arc and leak it to keep it alive for the program lifetime
     let _ = Box::leak(Box::new(Arc::new(guard)));
 
-    // Set up the filter
-    let env_filter = if verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"))
+    // Priority: RUST_LOG env > --verbose flag > config file level > default "info"
+    let default_level = if verbose {
+        "debug"
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        level.unwrap_or("info")
     };
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
 
     // Build the subscriber with both console and file output
     // Use tracing_log to bridge log:: macros to tracing

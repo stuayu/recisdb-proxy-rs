@@ -6,6 +6,6 @@
 
 extern "C" {
     const BOOL C_SetLnbPower(IBonDriver3 * b, const BOOL bEnable) {
-        return b->SetLnbPower(bEnable);
+        try { return b->SetLnbPower(bEnable); } catch (...) { return 0; }
     }
 }

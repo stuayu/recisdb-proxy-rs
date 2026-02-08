@@ -21,14 +21,16 @@ pub mod b25_pipe;
 pub mod space_generator;
 pub mod group_space;
 pub mod quality_scorer;
+pub mod warm;
 
 pub use channel_key::ChannelKey;
 #[allow(unused_imports)]
 pub use lock::{ExclusiveLockGuard, LockError, SharedLockGuard, TunerLock};
-pub use pool::TunerPool;
+pub use pool::{TunerPool, TunerPoolConfig};
 #[allow(unused_imports)]
 pub use selector::{ChannelCandidate, FallbackResult, SelectError, TuneError, TunerSelector};
 pub use shared::SharedTuner;
+pub use warm::WarmTunerHandle;
 pub use space_generator::{SpaceGenerator, SpaceMapping, ChannelInfo as SpaceGenChannelInfo};
 pub use group_space::{GroupSpaceInfo, DriverInfo, DriverSelector, DriverSelectionStrategy};
 pub use quality_scorer::{BonDriverWithScore, QualityScorer};

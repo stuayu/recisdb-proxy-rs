@@ -11,7 +11,9 @@
       "Bash(nm:*)",
       "Bash(lib:*)",
       "Bash(powershell:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(dir \"c:\\\\prog\\\\recisdb-rs\")",
+      "Bash(Select-String -Pattern \"^error\")"
     ]
   }
 }

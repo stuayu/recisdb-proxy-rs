@@ -71,6 +71,7 @@ fn build_bondriver_wrapper() {
         .cpp(true)
         .warnings(false)
         .flag_if_supported("/utf-8") // 文字コード警告(C4819)の抑止に有効
+        .flag_if_supported("/EHa")   // SEH例外もcatch(...)で捕捉可能にする
         .compile("BonDriver_dynamic_cast_ffi");
 }
 

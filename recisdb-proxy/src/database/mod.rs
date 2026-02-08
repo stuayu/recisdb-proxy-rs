@@ -251,6 +251,56 @@ impl Database {
     }
 }
 
+/// Tuner optimization configuration storage.
+impl Database {
+    /// Get tuner optimization configuration from database.
+    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT keep_alive_secs, prewarm_enabled, prewarm_timeout_secs 
+             FROM tuner_config WHERE id = 1"
+        )?;
+
+        let result = stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, u64>(2)?,
+            ))
+        });
+
+        match result {
+            Ok((keep_alive, prewarm_enabled, prewarm_timeout)) => {
+                Ok((keep_alive, prewarm_enabled, prewarm_timeout))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO tuner_config (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs) 
+                     VALUES (1, 60, 1, 30)",
+                    [],
+                )?;
+                Ok((60, true, 30))
+            }
+            Err(e) => Err(DatabaseError::Sqlite(e)),
+        }
+    }
+
+    /// Update tuner optimization configuration.
+    pub fn update_tuner_config(
+        &self,
+        keep_alive_secs: u64,
+        prewarm_enabled: bool,
+        prewarm_timeout_secs: u64,
+    ) -> Result<()> {
+        let prewarm_enabled = if prewarm_enabled { 1 } else { 0 };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tuner_config (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs, updated_at) 
+             VALUES (1, ?1, ?2, ?3, strftime('%s', 'now'))",
+            rusqlite::params![keep_alive_secs, prewarm_enabled, prewarm_timeout_secs],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,12 +319,12 @@ mod tests {
         let count: i32 = db
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('bon_drivers', 'channels', 'scan_history', 'session_history', 'alert_rules', 'alert_history', 'driver_quality_stats')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('bon_drivers', 'channels', 'scan_history', 'session_history', 'alert_rules', 'alert_history', 'driver_quality_stats', 'tuner_config')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
 
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
     }
 }

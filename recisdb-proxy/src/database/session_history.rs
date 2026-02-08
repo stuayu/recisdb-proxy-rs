@@ -63,6 +63,53 @@ impl Database {
         Ok(())
     }
 
+    /// Update session progress (periodic update during streaming, does NOT set ended_at).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_session_progress(
+        &self,
+        id: i64,
+        duration_secs: i64,
+        packets_sent: u64,
+        packets_dropped: u64,
+        packets_scrambled: u64,
+        packets_error: u64,
+        bytes_sent: u64,
+        average_bitrate_mbps: Option<f64>,
+        average_signal_level: Option<f64>,
+        tuner_path: Option<&str>,
+        channel_info: Option<&str>,
+        channel_name: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_history SET duration_secs = ?2, packets_sent = ?3, packets_dropped = ?4, packets_scrambled = ?5, packets_error = ?6, bytes_sent = ?7, average_bitrate_mbps = ?8, average_signal_level = ?9, tuner_path = ?10, channel_info = ?11, channel_name = ?12 WHERE id = ?1",
+            params![
+                id,
+                duration_secs,
+                packets_sent as i64,
+                packets_dropped as i64,
+                packets_scrambled as i64,
+                packets_error as i64,
+                bytes_sent as i64,
+                average_bitrate_mbps,
+                average_signal_level,
+                tuner_path,
+                channel_info,
+                channel_name,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get total session count from database.
+    pub fn get_total_session_count(&self) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_history",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Get session history with pagination and optional client address filter.
     pub fn get_session_history(
         &self,

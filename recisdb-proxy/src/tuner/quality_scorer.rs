@@ -67,6 +67,65 @@ impl QualityScorer {
         Ok(())
     }
 
+    /// Update driver quality stats with delta packets.
+    /// When `increment_sessions` is false, only adds packet deltas without incrementing session count.
+    pub fn update_stats_delta(
+        db: &Database,
+        bon_driver_id: i64,
+        delta_packets: u64,
+        delta_dropped: u64,
+        delta_scrambled: u64,
+        delta_errors: u64,
+        session_packets: u64,
+        session_dropped: u64,
+        session_errors: u64,
+        increment_sessions: bool,
+    ) -> Result<()> {
+        let current = db.get_driver_quality_stats(bon_driver_id)?;
+
+        let total_packets = current.as_ref().map(|s| s.total_packets).unwrap_or(0) + delta_packets as i64;
+        let dropped_packets = current.as_ref().map(|s| s.dropped_packets).unwrap_or(0) + delta_dropped as i64;
+        let scrambled_packets = current.as_ref().map(|s| s.scrambled_packets).unwrap_or(0) + delta_scrambled as i64;
+        let error_packets = current.as_ref().map(|s| s.error_packets).unwrap_or(0) + delta_errors as i64;
+        let total_sessions = current.as_ref().map(|s| s.total_sessions).unwrap_or(0)
+            + if increment_sessions { 1 } else { 0 };
+
+        let stats = DriverQualityStats {
+            id: current.as_ref().map(|s| s.id).unwrap_or(0),
+            bon_driver_id,
+            total_packets,
+            dropped_packets,
+            scrambled_packets,
+            error_packets,
+            total_sessions,
+            quality_score: 1.0,
+            recent_drop_rate: 0.0,
+            recent_error_rate: 0.0,
+            last_updated: chrono::Utc::now().timestamp(),
+        };
+
+        let quality_score = Self::calculate_score(&stats);
+
+        let session_total = session_packets.max(1) as f64;
+        let recent_drop_rate = session_dropped as f64 / session_total;
+        let recent_error_rate = session_errors as f64 / session_total;
+
+        db.upsert_driver_quality_stats(
+            bon_driver_id,
+            total_packets,
+            dropped_packets,
+            scrambled_packets,
+            error_packets,
+            total_sessions,
+            quality_score,
+            recent_drop_rate,
+            recent_error_rate,
+            chrono::Utc::now().timestamp(),
+        )?;
+
+        Ok(())
+    }
+
     /// Calculate quality score (0.0 - 1.0).
     /// score = 1.0 - (drop_rate * 0.5 + error_rate * 0.3 + scramble_rate * 0.2)
     pub fn calculate_score(stats: &DriverQualityStats) -> f64 {

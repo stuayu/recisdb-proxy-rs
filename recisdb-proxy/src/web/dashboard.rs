@@ -385,6 +385,35 @@ const HTML_CONTENT: &str = r#"
 
                 <div id="config-message" style="margin-top: 15px; display: none;"></div>
             </div>
+
+            <h3 style="margin-top: 30px;">チューナ最適化設定</h3>
+            <div class="settings-form">
+                <div class="form-group">
+                    <label for="tuner-keep-alive">Keep-Alive（秒）</label>
+                    <input type="number" id="tuner-keep-alive" min="0" value="60">
+                    <small>最終クライアント切断後にチューナを保持する時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="tuner-prewarm-enabled" checked>
+                        Pre-Warm を有効にする
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-prewarm-timeout">Pre-Warm タイムアウト（秒）</label>
+                    <input type="number" id="tuner-prewarm-timeout" min="1" value="30">
+                    <small>OpenTuner 後に SetChannel が来ない場合の待機時間</small>
+                </div>
+
+                <div style="margin-top: 20px; display: flex; gap: 10px;">
+                    <button class="btn btn-primary" onclick="saveTunerConfig()">保存</button>
+                    <button class="btn btn-secondary" onclick="loadTunerConfig()">リセット</button>
+                </div>
+
+                <div id="tuner-config-message" style="margin-top: 15px; display: none;"></div>
+            </div>
         </div>
 
         <!-- History Tab -->
@@ -803,7 +832,7 @@ const HTML_CONTENT: &str = r#"
 
                 if (stats.success && stats.stats) {
                     document.getElementById('stat-active-tuners').textContent = stats.stats.active_tuners || 0;
-                    document.getElementById('stat-sessions').textContent = stats.stats.total_sessions || 0;
+                    document.getElementById('stat-sessions').textContent = stats.stats.total_sessions_db || 0;
                 }
                 if (channels.success) {
                     document.getElementById('stat-channels').textContent = channels.count || 0;
@@ -1469,11 +1498,76 @@ const HTML_CONTENT: &str = r#"
             document.getElementById('config-message').style.display = 'none';
         }
 
+        // Tuner Config Functions
+        async function loadTunerConfig() {
+            try {
+                const response = await fetch('/api/tuner-config');
+                const data = await response.json();
+                if (data.success && data.config) {
+                    document.getElementById('tuner-keep-alive').value = data.config.keep_alive_secs;
+                    document.getElementById('tuner-prewarm-enabled').checked = !!data.config.prewarm_enabled;
+                    document.getElementById('tuner-prewarm-timeout').value = data.config.prewarm_timeout_secs;
+                    hideTunerConfigMessage();
+                }
+            } catch (e) { console.error('Failed to load tuner config:', e); }
+        }
+
+        async function saveTunerConfig() {
+            const config = {
+                keep_alive_secs: parseInt(document.getElementById('tuner-keep-alive').value),
+                prewarm_enabled: document.getElementById('tuner-prewarm-enabled').checked,
+                prewarm_timeout_secs: parseInt(document.getElementById('tuner-prewarm-timeout').value)
+            };
+
+            if (config.keep_alive_secs < 0 || config.prewarm_timeout_secs <= 0) {
+                showTunerConfigMessage('入力値を確認してください', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/tuner-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showTunerConfigMessage('設定を保存しました', 'success');
+                } else {
+                    showTunerConfigMessage('設定の保存に失敗しました: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                showTunerConfigMessage('設定の保存に失敗しました: ' + e.message, 'error');
+            }
+        }
+
+        function showTunerConfigMessage(message, type) {
+            const msgEl = document.getElementById('tuner-config-message');
+            msgEl.textContent = message;
+            msgEl.style.display = 'block';
+            msgEl.style.padding = '10px 12px';
+            msgEl.style.borderRadius = '4px';
+            msgEl.style.fontSize = '13px';
+            if (type === 'success') {
+                msgEl.style.background = '#d4edda';
+                msgEl.style.color = '#155724';
+            } else {
+                msgEl.style.background = '#f8d7da';
+                msgEl.style.color = '#721c24';
+            }
+            setTimeout(hideTunerConfigMessage, 5000);
+        }
+
+        function hideTunerConfigMessage() {
+            document.getElementById('tuner-config-message').style.display = 'none';
+        }
+
         // Initialize
         window.addEventListener('load', () => {
             refreshStats();
             refreshClients();
             loadScanConfig();
+            loadTunerConfig();
             enableTableSorting('clients-table');
             enableTableSorting('bondrivers-table');
             enableTableSorting('history-table');

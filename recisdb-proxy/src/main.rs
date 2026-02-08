@@ -25,6 +25,7 @@ mod web;
 use scheduler::{ScanScheduler, scan_scheduler::ScanSchedulerConfig};
 
 use server::{Server, ServerConfig};
+use tuner::TunerPoolConfig;
 
 /// recisdb-proxy - Network proxy server for BonDriver
 #[derive(Parser, Debug)]
@@ -129,6 +130,7 @@ struct ServerSection {
 struct LoggingSection {
     log_dir: Option<String>,
     retention_days: Option<u64>,
+    level: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -157,10 +159,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = Args::parse();
 
-    // Load config file if specified
-    let file_config = if let Some(config_path) = &args.config {
+    // Load config file: explicit path > auto-detect > default
+    let config_path = args.config.clone().or_else(|| {
+        let default_path = PathBuf::from("recisdb-proxy.toml");
+        if default_path.exists() {
+            Some(default_path)
+        } else {
+            None
+        }
+    });
+    let file_config = if let Some(config_path) = &config_path {
         match load_config(config_path) {
-            Ok(c) => c,
+            Ok(c) => {
+                eprintln!("Loaded config from: {}", config_path.display());
+                c
+            }
             Err(e) => {
                 eprintln!("Failed to load config file: {}", e);
                 return Err(e);
@@ -184,7 +197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize logging with file output and rotation
-    logging::init_logging(&log_dir, log_retention_days, args.verbose)
+    let log_level = file_config.logging.level.as_deref();
+    logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level)
         .expect("Failed to initialize logging");
 
     // Use log macros which are now bridged to tracing
@@ -277,12 +291,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
     };
 
+    // Load tuner optimization config from database
+    let tuner_config = {
+        let db_lock = db.lock().await;
+        match db_lock.get_tuner_config() {
+            Ok((keep_alive_secs, prewarm_enabled, prewarm_timeout_secs)) => {
+                info!(
+                    "Loaded tuner config from database: keep_alive={}s, prewarm_enabled={}, prewarm_timeout={}s",
+                    keep_alive_secs,
+                    prewarm_enabled,
+                    prewarm_timeout_secs
+                );
+                TunerPoolConfig {
+                    keep_alive_secs,
+                    prewarm_enabled,
+                    prewarm_timeout_secs,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load tuner config from database: {}", e);
+                TunerPoolConfig::default()
+            }
+        }
+    };
+
     // Build server config
     let config = ServerConfig {
         listen_addr,
         max_connections,
         default_tuner: default_tuner.clone(),
         database: db.clone(),
+        tuner_config: tuner_config.clone(),
         #[cfg(feature = "tls")]
         tls_config,
     };
@@ -342,12 +381,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let tuner_config_for_web = Some(web::state::TunerConfigInfo {
+        keep_alive_secs: tuner_config.keep_alive_secs,
+        prewarm_enabled: tuner_config.prewarm_enabled,
+        prewarm_timeout_secs: tuner_config.prewarm_timeout_secs,
+    });
+
     // Start web dashboard server
     let web_db = db.clone();
     let web_tuner_pool = Arc::clone(server.tuner_pool());
     let web_session_registry = Arc::clone(&session_registry);
     tokio::spawn(async move {
-        match web::start_web_server(web_listen_addr, web_db, web_tuner_pool, web_session_registry, scan_config_for_web).await {
+        match web::start_web_server(
+            web_listen_addr,
+            web_db,
+            web_tuner_pool,
+            web_session_registry,
+            scan_config_for_web,
+            tuner_config_for_web,
+        ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),
         }

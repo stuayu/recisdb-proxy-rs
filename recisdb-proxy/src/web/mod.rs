@@ -25,10 +25,14 @@ pub async fn start_web_server(
     tuner_pool: Arc<TunerPool>,
     session_registry: Arc<SessionRegistry>,
     scan_config: Option<state::ScanSchedulerInfo>,
+    tuner_config: Option<state::TunerConfigInfo>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(database, tuner_pool, session_registry);
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
+    }
+    if let Some(config) = tuner_config {
+        *web_state.tuner_config.write().await = config;
     }
     let web_state = Arc::new(web_state);
 
@@ -69,6 +73,9 @@ pub async fn start_web_server(
         // Scan scheduler configuration API
         .route("/api/scan-config", get(api::get_scan_config))
         .route("/api/scan-config", post(api::update_scan_config))
+        // Tuner optimization configuration API
+        .route("/api/tuner-config", get(api::get_tuner_config))
+        .route("/api/tuner-config", post(api::update_tuner_config))
         // Dashboard route
         .route("/", get(dashboard::index))
         .with_state(web_state)

@@ -11,6 +11,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::web::state::WebState;
+use crate::tuner::TunerPoolConfig;
 
 // ============================================================================
 // Data structures
@@ -24,6 +25,7 @@ pub struct ServerStats {
     pub total_tuners: usize,
     pub active_tuners: usize,
     pub uptime_seconds: u64,
+    pub total_sessions_db: u64,
 }
 
 /// Full BonDriver information for API.
@@ -184,12 +186,18 @@ pub async fn get_stats(
         }
     }
 
+    let total_sessions_db = {
+        let db = web_state.database.lock().await;
+        db.get_total_session_count().unwrap_or(0)
+    };
+
     let stats = ServerStats {
         total_sessions: active_sessions as u64,
         active_sessions: active_sessions as u64,
         total_tuners,
         active_tuners,
         uptime_seconds: 0,
+        total_sessions_db,
     };
 
     Json(json!({
@@ -859,6 +867,99 @@ pub async fn update_config(
 // ============================================================================
 // Scan scheduler configuration endpoints
 // ============================================================================
+
+/// Get tuner optimization configuration.
+pub async fn get_tuner_config(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    match db.get_tuner_config() {
+        Ok((keep_alive, prewarm_enabled, prewarm_timeout)) => Json(json!({
+            "success": true,
+            "config": {
+                "keep_alive_secs": keep_alive,
+                "prewarm_enabled": prewarm_enabled,
+                "prewarm_timeout_secs": prewarm_timeout,
+            }
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Update tuner optimization configuration request.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTunerConfigRequest {
+    pub keep_alive_secs: Option<u64>,
+    pub prewarm_enabled: Option<bool>,
+    pub prewarm_timeout_secs: Option<u64>,
+}
+
+/// Update tuner optimization configuration.
+pub async fn update_tuner_config(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdateTunerConfigRequest>,
+) -> impl IntoResponse {
+    let (keep_alive, prewarm_enabled, prewarm_timeout) = {
+        let db = web_state.database.lock().await;
+
+        let (mut keep_alive, mut prewarm_enabled, mut prewarm_timeout) =
+            match db.get_tuner_config() {
+                Ok(config) => config,
+                Err(_) => (60, true, 30),
+            };
+
+        if let Some(val) = payload.keep_alive_secs {
+            if val > 0 {
+                keep_alive = val;
+            }
+        }
+        if let Some(val) = payload.prewarm_enabled {
+            prewarm_enabled = val;
+        }
+        if let Some(val) = payload.prewarm_timeout_secs {
+            if val > 0 {
+                prewarm_timeout = val;
+            }
+        }
+
+        if let Err(e) = db.update_tuner_config(keep_alive, prewarm_enabled, prewarm_timeout) {
+            return Json(json!({
+                "success": false,
+                "error": format!("Failed to save configuration: {}", e)
+            }));
+        }
+
+        (keep_alive, prewarm_enabled, prewarm_timeout)
+    };
+
+    let config = crate::web::state::TunerConfigInfo {
+        keep_alive_secs: keep_alive,
+        prewarm_enabled,
+        prewarm_timeout_secs: prewarm_timeout,
+    };
+    web_state.update_tuner_config(config.clone()).await;
+
+    let pool_config = TunerPoolConfig {
+        keep_alive_secs: keep_alive,
+        prewarm_enabled,
+        prewarm_timeout_secs: prewarm_timeout,
+    };
+    web_state.tuner_pool.update_config(pool_config).await;
+
+    Json(json!({
+        "success": true,
+        "message": "Tuner configuration saved successfully",
+        "config": {
+            "keep_alive_secs": config.keep_alive_secs,
+            "prewarm_enabled": config.prewarm_enabled,
+            "prewarm_timeout_secs": config.prewarm_timeout_secs,
+        }
+    }))
+}
 
 /// Get scan scheduler configuration.
 pub async fn get_scan_config(

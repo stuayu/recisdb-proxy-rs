@@ -83,10 +83,10 @@ mod ib_utils {
         if ptr.is_null() {
             return None;
         }
+        const MAX_WIDE_LEN: usize = 32768;
         unsafe {
-            let len = (0..std::isize::MAX)
-                .position(|i| *ptr.offset(i) == 0)
-                .unwrap();
+            let len = (0..MAX_WIDE_LEN as isize)
+                .position(|i| *ptr.offset(i) == 0)?;
             if len == 0 {
                 return None;
             }
@@ -190,35 +190,40 @@ impl IBon {
     }
 
 
-    pub(crate) fn GetTsStream<'a>(
+    /// GetTsStream using BYTE** version (zero-copy).
+    /// Most BonDriver implementations (especially proxy-based ones like BonDriverProxyEx)
+    /// only implement this version properly. The BYTE* copy version is often unimplemented.
+    pub(crate) fn GetTsStream(
         &self,
-        buf: &'a mut [u8],
-    ) -> Result<(&'a [u8], usize), io::Error> {
-        // ★ 重要：毎回「このバッファに最大いくつ書けるか」を入れて渡す
-        let mut size: u32 = buf.len().min(u32::MAX as usize) as u32;
+        buf: &mut [u8],
+    ) -> Result<(usize, usize), io::Error> {
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut size: u32 = 0;
         let mut remaining: u32 = 0;
 
         let iface = self.ibon1.as_ptr();
         unsafe {
-            let ok = ib1::C_GetTsStream(
+            let ok = ib1::C_GetTsStream2(
                 iface,
-                buf.as_mut_ptr(),
+                &mut ptr as *mut *mut u8,
                 &mut size as *mut u32,
                 &mut remaining as *mut u32,
             ) != 0;
 
-            if !ok {
-                // BonDriver によっては「データ無し」で FALSE を返すことがあるので EOF は不適切
+            if !ok || ptr.is_null() {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream no data"));
             }
 
-            // 念のためガード（FFIが壊れていると size が異常値になることがある）
             let size_usize = size as usize;
-            if size_usize > buf.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "GetTsStream returned size > buffer"));
+            if size_usize == 0 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream size=0"));
             }
 
-            Ok((&buf[..size_usize], remaining as usize))
+            // Copy from BonDriver's internal buffer to caller's buffer
+            let copy_len = size_usize.min(buf.len());
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
+
+            Ok((copy_len, remaining as usize))
         }
     }
 
@@ -356,9 +361,8 @@ impl BonDriverTuner {
 
     /// Get TS stream data.
     pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
-        let ibon: &IBon = &*self.ibon; // ManuallyDrop<IBon> -> &IBon
-        let (slice, remaining) = ibon.GetTsStream(buf)?; // PascalCase
-        Ok((slice.len(), remaining))
+        let ibon: &IBon = &*self.ibon;
+        ibon.GetTsStream(buf)
     }
 
     /// Purge the TS stream buffer.
