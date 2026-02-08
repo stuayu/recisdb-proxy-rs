@@ -213,12 +213,14 @@ pub struct IBonDriver {
 
 /// IBonDriver2 object structure.
 #[repr(C)]
+#[allow(dead_code)]
 pub struct IBonDriver2 {
     pub vtbl: *const IBonDriver2Vtbl,
 }
 
 /// IBonDriver3 object structure.
 #[repr(C)]
+#[allow(dead_code)]
 pub struct IBonDriver3 {
     pub vtbl: *const IBonDriver3Vtbl,
 }
@@ -230,6 +232,7 @@ pub fn to_wide_string(s: &str) -> Vec<u16> {
 
 /// Converts a Rust Option<String> to a static wide string pointer.
 /// The returned pointer is valid for the lifetime of the program.
+#[allow(dead_code)]
 pub fn to_static_wide_string(s: Option<&str>) -> LPCTSTR {
     match s {
         Some(s) => {

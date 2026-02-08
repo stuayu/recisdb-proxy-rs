@@ -3,7 +3,6 @@
 //! This module handles parsing of various descriptors found in
 //! NIT, SDT, and other tables.
 
-use super::descriptor_tag;
 
 /// Service descriptor (0x48).
 #[derive(Debug, Clone, Default)]
@@ -166,7 +165,7 @@ impl SatelliteDeliveryDescriptor {
         let frequency = bcd_to_u32(&data[0..4]) * 10; // Convert to kHz
 
         // Orbital position: 4 BCD digits (2 bytes)
-        let orbital_position = ((bcd_to_u32(&data[4..6]) & 0xFFFF) as u16);
+        let orbital_position = (bcd_to_u32(&data[4..6]) & 0xFFFF) as u16;
 
         let west_east_flag = data[6] & 0x80 != 0;
         let polarization = (data[6] >> 5) & 0x03;

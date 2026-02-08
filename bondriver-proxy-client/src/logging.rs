@@ -20,7 +20,6 @@ fn get_dll_path() -> Option<PathBuf> {
 
     // HMODULE for our DLL
     extern "system" {
-        fn GetModuleHandleW(lpModuleName: *const u16) -> *mut std::ffi::c_void;
         fn GetModuleFileNameW(hModule: *mut std::ffi::c_void, lpFilename: *mut u16, nSize: u32) -> u32;
     }
 
@@ -145,6 +144,7 @@ pub fn log_error(context: &str, error: &dyn std::fmt::Display) {
 }
 
 /// Log a panic to the file.
+#[allow(deprecated)]
 pub fn log_panic(info: &std::panic::PanicInfo) {
     log_message(&format!("[PANIC] {}", info));
     if let Some(location) = info.location() {

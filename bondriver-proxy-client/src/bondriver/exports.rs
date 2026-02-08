@@ -1,4 +1,5 @@
 //! BonDriver exported functions.
+#![allow(dead_code, static_mut_refs)]
 //!
 //! This module implements the BonDriver interface functions that are called
 //! by the host application (e.g., TVTest).

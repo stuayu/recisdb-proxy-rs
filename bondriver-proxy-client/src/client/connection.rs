@@ -111,11 +111,13 @@ impl Connection {
     }
 
     /// Get the BonDriver version.
+    #[allow(dead_code)]
     pub fn bondriver_version(&self) -> u8 {
         *self.bondriver_version.lock()
     }
 
     /// Get the signal level.
+    #[allow(dead_code)]
     pub fn signal_level(&self) -> f32 {
         *self.signal_level.lock()
     }
@@ -275,6 +277,7 @@ impl Connection {
     }
 
     /// Send hello message with timeout (for connection setup).
+    #[allow(dead_code)]
     fn send_hello_with_timeout(&self, timeout: Duration) -> bool {
         let resp = self.send_request_with_timeout(
             ClientMessage::Hello {
@@ -364,7 +367,7 @@ impl Connection {
     }
 
     /// Set channel (IBonDriver v1).
-    pub fn set_channel(&self, channel: u8, force: bool) -> bool {
+    pub fn set_channel(&self, channel: u8, _force: bool) -> bool {
         let resp = self.send_request(ClientMessage::SetChannel { channel, priority: 0, exclusive: false });
 
         match resp {

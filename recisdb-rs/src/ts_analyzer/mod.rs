@@ -30,13 +30,21 @@ mod sdt;
 mod analyzer;
 mod descriptors;
 
+#[allow(unused_imports)]
 pub use packet::{TsPacket, TsHeader, AdaptationField, TS_PACKET_SIZE, SYNC_BYTE};
+#[allow(unused_imports)]
 pub use psi::{PsiSection, PsiHeader};
+#[allow(unused_imports)]
 pub use pat::{PatTable, PatEntry};
+#[allow(unused_imports)]
 pub use pmt::{PmtTable, PmtStream};
+#[allow(unused_imports)]
 pub use nit::{NitTable, NitTransportStream};
+#[allow(unused_imports)]
 pub use sdt::{SdtTable, SdtService};
+#[allow(unused_imports)]
 pub use analyzer::{TsAnalyzer, AnalyzerConfig, AnalyzerResult};
+#[allow(unused_imports)]
 pub use descriptors::{ServiceDescriptor, TerrestrialDeliveryDescriptor};
 
 /// Well-known PIDs in MPEG-TS.

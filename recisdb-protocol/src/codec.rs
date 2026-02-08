@@ -671,14 +671,6 @@ pub fn decode_client_message(
             };
             Ok(ClientMessage::GetChannelList { filter })
         }
-        // Treat both OpenTuner and SetChannelSpace message types as group variants
-        // when they come with group names (determined by context/implementation)
-        // For now, return unknown to force explicit group-based routing
-        msg_type @ (MessageType::OpenTuner | MessageType::SetChannelSpace) => {
-            // Group messages should be routed differently
-            // This is a placeholder - actual implementation should use separate message types
-            Err(ProtocolError::UnknownMessageType(msg_type as u16))
-        }
         _ => Err(ProtocolError::UnknownMessageType(msg_type as u16)),
     }
 }

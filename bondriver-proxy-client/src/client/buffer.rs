@@ -22,6 +22,7 @@ pub struct TsRingBuffer {
     read_pos: AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl TsRingBuffer {
     /// Create a new ring buffer.
     pub fn new() -> Self {

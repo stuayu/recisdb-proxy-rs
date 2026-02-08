@@ -22,7 +22,7 @@ fn main() {
             .header("src/tuner/windows/IBonDriver.hpp")
             .dynamic_library_name("BonDriver")
             .dynamic_link_require_all(true)
-            .parse_callbacks(Box::new(bindgen::CargoCallbacks));
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
         bg
             // Finish the builder and generate the bindings.

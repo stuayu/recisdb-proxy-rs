@@ -3,9 +3,7 @@
 //! The NIT is transmitted on PID 0x0010 and contains information about
 //! the network and transport streams, including physical channel parameters.
 
-use super::descriptors::{
-    find_descriptor, parse_descriptor_loop, NetworkNameDescriptor, TerrestrialDeliveryDescriptor,
-};
+use super::descriptors::{find_descriptor, NetworkNameDescriptor, TerrestrialDeliveryDescriptor};
 use super::psi::PsiSection;
 use super::{descriptor_tag, table_id};
 
