@@ -498,9 +498,9 @@ const HTML_CONTENT: &str = r#"
                     <tr>
                         <th class="sortable" data-sort-type="number">ID</th>
                         <th class="sortable" data-sort-type="text">名前</th>
-                        <th class="sortable" data-sort-type="text">メトリクス</th>
-                        <th class="sortable" data-sort-type="text">条件</th>
-                        <th class="sortable" data-sort-type="number">閾値</th>
+                        <th class="sortable" data-sort-type="text">監視項目</th>
+                        <th class="sortable" data-sort-type="text">条件（比較）</th>
+                        <th class="sortable" data-sort-type="number">しきい値</th>
                         <th class="sortable" data-sort-type="text">有効</th>
                         <th>操作</th>
                     </tr>
@@ -569,42 +569,48 @@ const HTML_CONTENT: &str = r#"
                     <div class="form-group">
                         <label>名前</label>
                         <input type="text" id="ar-name" required>
+                        <small>例: Drop率が高いときに通知</small>
                     </div>
                     <div class="form-group">
-                        <label>メトリクス</label>
+                        <label>監視項目</label>
                         <select id="ar-metric">
-                            <option value="drop_rate">drop_rate</option>
-                            <option value="scramble_rate">scramble_rate</option>
-                            <option value="error_rate">error_rate</option>
-                            <option value="signal_level">signal_level</option>
-                            <option value="bitrate">bitrate</option>
+                            <option value="drop_rate">Drop率</option>
+                            <option value="scramble_rate">Scramble率</option>
+                            <option value="error_rate">Error率</option>
+                            <option value="signal_level">信号レベル</option>
+                            <option value="bitrate">ビットレート</option>
                         </select>
+                        <small>数値の監視項目を選びます（文字列の一致/部分一致はありません）</small>
                     </div>
                     <div class="form-group">
-                        <label>条件</label>
+                        <label>条件（比較）</label>
                         <select id="ar-condition">
-                            <option value="gt">gt</option>
-                            <option value="gte">gte</option>
-                            <option value="lt">lt</option>
-                            <option value="lte">lte</option>
+                            <option value="gt">より大きい (>)</option>
+                            <option value="gte">以上 (>=)</option>
+                            <option value="lt">より小さい (<)</option>
+                            <option value="lte">以下 (<=)</option>
                         </select>
+                        <small>例: Drop率 が 0.05 以上 なら通知</small>
                     </div>
                     <div class="form-group">
-                        <label>閾値</label>
+                        <label>しきい値</label>
                         <input type="number" id="ar-threshold" step="0.01" required>
+                        <small>数値を入力（例: 0.05, 15, 2800）</small>
                     </div>
                     <div class="form-group">
-                        <label>Webhook URL (任意)</label>
+                        <label>Webhook URL（任意）</label>
                         <input type="text" id="ar-webhook-url" placeholder="https://...">
+                        <small>Discord/Slack/LINE などの Webhook URL</small>
                     </div>
                     <div class="form-group">
-                        <label>Webhook フォーマット</label>
+                        <label>Webhook 形式</label>
                         <select id="ar-webhook-format">
-                            <option value="generic">generic</option>
-                            <option value="discord">discord</option>
-                            <option value="slack">slack</option>
-                            <option value="line">line</option>
+                            <option value="generic">汎用（JSON）</option>
+                            <option value="discord">Discord</option>
+                            <option value="slack">Slack</option>
+                            <option value="line">LINE</option>
                         </select>
+                        <small>送信先に合わせて選択します</small>
                     </div>
                     <div class="form-group">
                         <label class="form-check">
@@ -1363,6 +1369,27 @@ const HTML_CONTENT: &str = r#"
             } catch (e) { console.error('Failed to refresh alerts:', e); }
         }
 
+        function formatMetricLabel(metric) {
+            switch (metric) {
+                case 'drop_rate': return 'Drop率';
+                case 'scramble_rate': return 'Scramble率';
+                case 'error_rate': return 'Error率';
+                case 'signal_level': return '信号レベル';
+                case 'bitrate': return 'ビットレート';
+                default: return metric;
+            }
+        }
+
+        function formatConditionLabel(condition) {
+            switch (condition) {
+                case 'gt': return 'より大きい (>)';
+                case 'gte': return '以上 (>=)';
+                case 'lt': return 'より小さい (<)';
+                case 'lte': return '以下 (<=)';
+                default: return condition;
+            }
+        }
+
         async function refreshAlertRules() {
             try {
                 const res = await fetch('/api/alert-rules');
@@ -1379,8 +1406,8 @@ const HTML_CONTENT: &str = r#"
                     <tr>
                         <td data-sort-value="${r.id}">${r.id}</td>
                         <td data-sort-value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</td>
-                        <td data-sort-value="${escapeHtml(r.metric)}">${escapeHtml(r.metric)}</td>
-                        <td data-sort-value="${escapeHtml(r.condition)}">${escapeHtml(r.condition)}</td>
+                        <td data-sort-value="${escapeHtml(r.metric)}">${escapeHtml(formatMetricLabel(r.metric))}</td>
+                        <td data-sort-value="${escapeHtml(r.condition)}">${escapeHtml(formatConditionLabel(r.condition))}</td>
                         <td data-sort-value="${r.threshold}">${r.threshold}</td>
                         <td data-sort-value="${r.is_enabled ? '1' : '0'}"><span class="badge ${r.is_enabled ? 'badge-success' : 'badge-danger'}">${r.is_enabled ? 'ON' : 'OFF'}</span></td>
                         <td><button class="btn btn-danger btn-sm" onclick="deleteAlertRule(${r.id})">削除</button></td>

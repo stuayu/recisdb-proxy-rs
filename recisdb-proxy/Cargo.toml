@@ -13,7 +13,7 @@ name = "recisdb-proxy"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["webhook"]
 tls = ["tokio-rustls", "rustls", "rustls-pemfile"]
 webhook = ["reqwest"]
 
