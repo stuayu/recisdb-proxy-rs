@@ -425,6 +425,8 @@ const HTML_CONTENT: &str = r#"
                     <option value="terrestrial_region">地域</option>
                     <option value="network_name">ネットワーク</option>
                     <option value="tuner_count">チューナー</option>
+                    <option value="bon_space">BonSpace</option>
+                    <option value="bon_channel">BonChannel</option>
                     <option value="priority">優先度</option>
                 </select>
                 <button class="btn btn-secondary btn-sm" id="channel-sort-order" onclick="toggleChannelSortOrder()">昇順</button>
@@ -439,12 +441,14 @@ const HTML_CONTENT: &str = r#"
                         <th class="sortable" data-sort="terrestrial_region">地域</th>
                         <th class="sortable" data-sort="network_name">ネットワーク</th>
                         <th class="sortable" data-sort="tuner_count">チューナー</th>
+                        <th class="sortable" data-sort="bon_space">BonSpace</th>
+                        <th class="sortable" data-sort="bon_channel">BonChannel</th>
                         <th class="sortable" data-sort="priority">優先度</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="channels-body">
-                    <tr><td colspan="9" class="loading">読み込み中...</td></tr>
+                    <tr><td colspan="11" class="loading">読み込み中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1291,13 +1295,29 @@ const HTML_CONTENT: &str = r#"
             const table = document.getElementById('clients-table');
             if (!table) return;
 
+            const isMobile = window.matchMedia('(max-width: 768px)').matches;
             const rows = table.querySelectorAll('tr');
-            Object.entries(clientsColumnVisibility).forEach(([k, visible]) => {
-                const col = parseInt(k, 10);
+            const checks = document.querySelectorAll('#clients-column-picker input[type="checkbox"][data-col]');
+
+            checks.forEach(chk => {
+                const col = parseInt(chk.dataset.col, 10);
+                const visible = !!chk.checked;
+
                 rows.forEach(row => {
                     const cell = row.children[col - 1];
                     if (!cell) return;
-                    cell.style.display = visible === false ? 'none' : '';
+
+                    if (!visible) {
+                        cell.style.display = 'none';
+                        return;
+                    }
+
+                    // レスポンシブCSSで display:none が当たる列でも、GUI選択時は表示を優先する
+                    if (isMobile) {
+                        cell.style.display = '';
+                    } else {
+                        cell.style.display = 'table-cell';
+                    }
                 });
             });
         }
@@ -1351,6 +1371,10 @@ const HTML_CONTENT: &str = r#"
                     return (channel.network_name || '').toLowerCase();
                 case 'tuner_count':
                     return channel.tuner_count ?? 0;
+                case 'bon_space':
+                    return channel.bon_space ?? -1;
+                case 'bon_channel':
+                    return channel.bon_channel ?? -1;
                 default:
                     return channel[key];
             }
@@ -1359,7 +1383,7 @@ const HTML_CONTENT: &str = r#"
         function renderChannels() {
             const tbody = document.getElementById('channels-body');
             if (channelData.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="empty-state">チャンネルがありません</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません</td></tr>';
                 applyResponsiveLabels('channels-table');
                 return;
             }
@@ -1409,7 +1433,9 @@ const HTML_CONTENT: &str = r#"
                     <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
                     <td>${escapeHtml(c.terrestrial_region || '-')}</td>
                     <td>${escapeHtml(c.network_name || '-')}</td>
-                    <td>${c.tuner_count ? `<span class="badge badge-info" title="${escapeHtml((c.tuner_names || []).join(', '))}">${c.tuner_count}台</span>` : (c.bon_space !== null ? c.bon_space + '/' + c.bon_channel : '-')}</td>
+                    <td>${c.tuner_count ? `<span class="badge badge-info" title="${escapeHtml((c.tuner_names || []).join(', '))}">${c.tuner_count}台</span>` : '-'}</td>
+                    <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
+                    <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
                     <td>${c.priority}</td>
                     <td>
                         <button class="btn btn-primary btn-sm" onclick='editChannel(${JSON.stringify(c)})'>編集</button>
@@ -1897,6 +1923,10 @@ const HTML_CONTENT: &str = r#"
             enableTableSorting('alerts-table');
             enableTableSorting('alert-rules-table');
             setInterval(() => { refreshStats(); refreshClients(); updateClientMetrics(); }, 2000);
+        });
+
+        window.addEventListener('resize', () => {
+            applyClientColumnVisibility();
         });
     </script>
 </body>
