@@ -929,29 +929,100 @@ const HTML_CONTENT: &str = r#"
             return String(value).toLowerCase();
         }
 
+        function compareParsedSortValues(a, b, type) {
+            if (type === 'number' || type === 'datetime') {
+                return (a ?? 0) - (b ?? 0);
+            }
+            const sa = String(a ?? '').toLowerCase();
+            const sb = String(b ?? '').toLowerCase();
+            return sa.localeCompare(sb, 'ja');
+        }
+
+        const tableSortStates = {};
+
+        function normalizeTableSortRules(headers, rules) {
+            const maxIndex = headers.length - 1;
+            const normalized = [];
+            const used = new Set();
+            for (const r of rules || []) {
+                const index = Number.isInteger(r?.index) ? r.index : -1;
+                if (index < 0 || index > maxIndex || used.has(index)) continue;
+                normalized.push({ index, asc: r.asc !== false });
+                used.add(index);
+                if (normalized.length >= 3) break;
+            }
+            return normalized;
+        }
+
+        function updateTableSortHeaderUI(headers, rules) {
+            headers.forEach(h => {
+                h.classList.remove('asc', 'desc');
+                h.removeAttribute('title');
+            });
+
+            rules.forEach((r, i) => {
+                const th = headers[r.index];
+                if (!th) return;
+                if (i === 0) {
+                    th.classList.add(r.asc ? 'asc' : 'desc');
+                }
+                const dir = r.asc ? '昇順' : '降順';
+                th.setAttribute('title', `第${i + 1}キー (${dir})`);
+            });
+        }
+
         function enableTableSorting(tableId) {
             const table = document.getElementById(tableId);
             if (!table) return;
             const headers = Array.from(table.querySelectorAll('thead th.sortable'));
+            tableSortStates[tableId] = normalizeTableSortRules(headers, tableSortStates[tableId] || []);
+            updateTableSortHeaderUI(headers, tableSortStates[tableId]);
+
             headers.forEach((th, index) => {
-                th.addEventListener('click', () => {
-                    const type = th.dataset.sortType || 'text';
-                    const isAsc = !th.classList.contains('asc');
-                    headers.forEach(h => h.classList.remove('asc', 'desc'));
-                    th.classList.add(isAsc ? 'asc' : 'desc');
+                th.addEventListener('click', (ev) => {
+                    let rules = normalizeTableSortRules(headers, tableSortStates[tableId] || []);
+                    const existingIdx = rules.findIndex(r => r.index === index);
+
+                    if (ev.shiftKey) {
+                        // Shift+クリック: 第2/第3キーとして追加・更新
+                        if (existingIdx >= 0) {
+                            rules[existingIdx].asc = !rules[existingIdx].asc;
+                        } else {
+                            rules.push({ index, asc: true });
+                        }
+                    } else {
+                        // 通常クリック: 第1キーに昇格（同一第1キーなら昇降反転）
+                        if (existingIdx === 0) {
+                            rules[0].asc = !rules[0].asc;
+                        } else {
+                            let asc = true;
+                            if (existingIdx > 0) {
+                                asc = rules[existingIdx].asc;
+                                rules.splice(existingIdx, 1);
+                            }
+                            rules.unshift({ index, asc });
+                        }
+                    }
+
+                    rules = normalizeTableSortRules(headers, rules);
+                    tableSortStates[tableId] = rules;
+                    updateTableSortHeaderUI(headers, rules);
 
                     const tbody = table.querySelector('tbody');
                     if (!tbody) return;
                     const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.querySelector('.empty-state') && !r.querySelector('.loading'));
                     rows.sort((a, b) => {
-                        const aCell = a.children[index];
-                        const bCell = b.children[index];
-                        const aVal = aCell?.dataset.sortValue ?? aCell?.textContent ?? '';
-                        const bVal = bCell?.dataset.sortValue ?? bCell?.textContent ?? '';
-                        const va = parseSortValue(aVal, type);
-                        const vb = parseSortValue(bVal, type);
-                        if (va < vb) return isAsc ? -1 : 1;
-                        if (va > vb) return isAsc ? 1 : -1;
+                        for (const rule of rules) {
+                            const colType = headers[rule.index]?.dataset.sortType || 'text';
+                            const aCell = a.children[rule.index];
+                            const bCell = b.children[rule.index];
+                            const aVal = aCell?.dataset.sortValue ?? aCell?.textContent ?? '';
+                            const bVal = bCell?.dataset.sortValue ?? bCell?.textContent ?? '';
+                            const va = parseSortValue(aVal, colType);
+                            const vb = parseSortValue(bVal, colType);
+                            const cmp = compareParsedSortValues(va, vb, colType);
+                            if (cmp !== 0) return rule.asc ? cmp : -cmp;
+                        }
                         return 0;
                     });
                     rows.forEach(row => tbody.appendChild(row));
