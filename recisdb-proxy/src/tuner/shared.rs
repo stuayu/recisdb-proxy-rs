@@ -16,7 +16,9 @@ use tokio::sync::broadcast;
 use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::lock::TunerLock;
+use crate::tuner::logo_collector::ChannelLogoCollector;
 use crate::tuner::ts_analyzer::{TsPacketAnalyzer, TsStreamQuality};
+use crate::tuner::pool::TunerPoolConfig;
 
 /// Capacity of the broadcast channel for TS data.
 /// Increased to 4096 (256MB of 64KB chunks) to support multiple simultaneous subscribers
@@ -28,6 +30,26 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// Increased to 256KB to handle BonDrivers (like FukuDLL) that may return
 /// data in larger chunks than standard 64KB.
 const TS_CHUNK_SIZE: usize = 262144; // 256KB buffer
+
+/// Runtime startup tuning parameters for delayed network-backed drivers.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderStartupConfig {
+    pub set_channel_retry_interval_ms: u64,
+    pub set_channel_retry_timeout_ms: u64,
+    pub signal_poll_interval_ms: u64,
+    pub signal_wait_timeout_ms: u64,
+}
+
+impl From<&TunerPoolConfig> for ReaderStartupConfig {
+    fn from(cfg: &TunerPoolConfig) -> Self {
+        Self {
+            set_channel_retry_interval_ms: cfg.set_channel_retry_interval_ms,
+            set_channel_retry_timeout_ms: cfg.set_channel_retry_timeout_ms,
+            signal_poll_interval_ms: cfg.signal_poll_interval_ms,
+            signal_wait_timeout_ms: cfg.signal_wait_timeout_ms,
+        }
+    }
+}
 
 /// A shared tuner instance that can broadcast TS data to multiple clients.
 pub struct SharedTuner {
@@ -318,52 +340,92 @@ impl SharedTuner {
         tuner_path: String,
         space: u32,
         channel: u32,
+        startup_config: ReaderStartupConfig,
         ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
         shared.is_running.store(true, Ordering::SeqCst);
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
-        // Set channel with error handling
+        // Set channel with retry for network-latency environments
         info!("[SharedTuner] Setting channel: space={}, channel={}", space, channel);
-        let set_channel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tuner.set_channel(space, channel)
-        }));
+        let set_start = std::time::Instant::now();
+        let mut set_attempts: u32 = 0;
 
-        match set_channel_result {
-            Ok(Ok(())) => {
-                info!("[SharedTuner] Channel set successfully");
-            }
-            Ok(Err(e)) => {
-                error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
-                       space, channel, e, e.kind());
-                shared.is_running.store(false, Ordering::SeqCst);
+        loop {
+            set_attempts += 1;
 
-                let err_msg = match e.kind() {
-                    std::io::ErrorKind::AddrNotAvailable =>
-                        format!("Channel not available - check space/channel number or signal is too weak"),
-                    std::io::ErrorKind::Unsupported =>
-                        format!("IBonDriver version does not support SetChannel2"),
-                    _ => format!("SetChannel error: {}", e)
-                };
+            let set_channel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tuner.set_channel(space, channel)
+            }));
 
-                let _ = ready_tx.send(Err(err_msg));
-                return;
-            }
-            Err(panic_err) => {
-                error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
-                shared.is_running.store(false, Ordering::SeqCst);
-                let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
-                return;
+            match set_channel_result {
+                Ok(Ok(())) => {
+                    info!(
+                        "[SharedTuner] Channel set successfully (attempt {}, elapsed {}ms)",
+                        set_attempts,
+                        set_start.elapsed().as_millis()
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let elapsed = set_start.elapsed().as_millis() as u64;
+                    let can_retry = elapsed < startup_config.set_channel_retry_timeout_ms;
+
+                    if can_retry && e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        warn!(
+                            "[SharedTuner] SetChannel delayed/unavailable (attempt {}, elapsed {}ms): {}. Retrying...",
+                            set_attempts,
+                            elapsed,
+                            e
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(startup_config.set_channel_retry_interval_ms));
+                        continue;
+                    }
+
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        warn!("[SharedTuner] Channel unavailable space={} channel={}: {}",
+                              space, channel, e);
+                    } else {
+                        error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
+                               space, channel, e, e.kind());
+                    }
+                    shared.is_running.store(false, Ordering::SeqCst);
+
+                    let err_msg = match e.kind() {
+                        std::io::ErrorKind::AddrNotAvailable =>
+                            "Channel not available - check space/channel number or signal is too weak".to_string(),
+                        std::io::ErrorKind::Unsupported =>
+                            "IBonDriver version does not support SetChannel2".to_string(),
+                        _ => format!("SetChannel error: {}", e)
+                    };
+
+                    let _ = ready_tx.send(Err(err_msg));
+                    return;
+                }
+                Err(panic_err) => {
+                    error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
+                    shared.is_running.store(false, Ordering::SeqCst);
+                    let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
+                    return;
+                }
             }
         }
 
-        // Wait a moment for the tuner to lock onto the signal
-        info!("[SharedTuner] Waiting for tuner to lock...");
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // Wait for signal to become observable (network/driver latency can be several seconds)
+        info!("[SharedTuner] Waiting for tuner signal lock...");
+        let signal_start = std::time::Instant::now();
+        let mut initial_signal = tuner.get_signal_level();
 
-        // Check signal level
-        let initial_signal = tuner.get_signal_level();
-        info!("[SharedTuner] Initial signal level: {:.1}dB", initial_signal);
+        while initial_signal <= 0.0 && signal_start.elapsed().as_millis() < startup_config.signal_wait_timeout_ms as u128 {
+            std::thread::sleep(std::time::Duration::from_millis(startup_config.signal_poll_interval_ms));
+            initial_signal = tuner.get_signal_level();
+        }
+
+        info!(
+            "[SharedTuner] Initial signal level: {:.1}dB (elapsed {}ms)",
+            initial_signal,
+            signal_start.elapsed().as_millis()
+        );
 
         // Purge any stale data from the buffer
         tuner.purge_ts_stream();
@@ -415,6 +477,7 @@ impl SharedTuner {
         let mut reader_first_read = true;
         let reader_start_time = std::time::Instant::now();
         let mut broadcast_send_errors: u64 = 0;
+        let mut logo_collector = ChannelLogoCollector::new();
 
         loop {
             // Check if we should stop due to explicit stop signal
@@ -513,6 +576,9 @@ impl SharedTuner {
 
                     // Broadcast to all subscribers
                     let raw = &buf[..n];
+
+                    // Best-effort logo extraction from SDT/CDT stream.
+                    logo_collector.process_ts_chunk(raw);
 
                     // Data validation before B25 decode (log only on first packet)
                     if reader_first_read && n > 0 {
@@ -651,6 +717,7 @@ impl SharedTuner {
         tuner_path: String,
         space: u32,
         channel: u32,
+        startup_config: ReaderStartupConfig,
     ) -> Result<(), std::io::Error> {
         // Check if reader is already running and stop it properly
         if self.is_running() {
@@ -746,6 +813,7 @@ impl SharedTuner {
                     tuner_path.clone(),
                     space,
                     channel,
+                    startup_config,
                     ready_tx,
                 );
             }));
@@ -772,8 +840,19 @@ impl SharedTuner {
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
-                error!("[SharedTuner] Reader failed to start: {}", e);
-                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                let kind = if e.contains("Channel not available") {
+                    std::io::ErrorKind::AddrNotAvailable
+                } else {
+                    std::io::ErrorKind::Other
+                };
+
+                if kind == std::io::ErrorKind::AddrNotAvailable {
+                    warn!("[SharedTuner] Reader failed to start: {}", e);
+                } else {
+                    error!("[SharedTuner] Reader failed to start: {}", e);
+                }
+
+                Err(std::io::Error::new(kind, e))
             }
             Ok(Err(_)) => {
                 error!("[SharedTuner] Reader channel closed unexpectedly");

@@ -46,12 +46,18 @@ mod stub {
             ))
         }
 
+        pub fn purge_ts_stream(&self) {}
+
         pub fn enum_tuning_space(&self, _space: u32) -> Option<String> {
             None
         }
 
         pub fn enum_channel_name(&self, _space: u32, _channel: u32) -> Option<String> {
             None
+        }
+
+        pub fn version(&self) -> u8 {
+            0
         }
     }
 }

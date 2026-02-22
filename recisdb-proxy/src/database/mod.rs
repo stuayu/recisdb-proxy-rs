@@ -112,6 +112,16 @@ impl Database {
         self.add_column_if_not_exists("alert_rules", "webhook_url", "TEXT")?;
         self.add_column_if_not_exists("alert_rules", "webhook_format", "TEXT DEFAULT 'generic'")?;
 
+        // Migration 004: Add global scan timing config columns if they don't exist
+        self.add_column_if_not_exists("scan_scheduler_config", "signal_lock_wait_ms", "INTEGER DEFAULT 500")?;
+        self.add_column_if_not_exists("scan_scheduler_config", "ts_read_timeout_ms", "INTEGER DEFAULT 300000")?;
+
+        // Migration 005: Add tuner startup timing config columns if they don't exist
+        self.add_column_if_not_exists("tuner_config", "set_channel_retry_interval_ms", "INTEGER DEFAULT 500")?;
+        self.add_column_if_not_exists("tuner_config", "set_channel_retry_timeout_ms", "INTEGER DEFAULT 10000")?;
+        self.add_column_if_not_exists("tuner_config", "signal_poll_interval_ms", "INTEGER DEFAULT 500")?;
+        self.add_column_if_not_exists("tuner_config", "signal_wait_timeout_ms", "INTEGER DEFAULT 10000")?;
+
         // Migration 002: Fill band_type and terrestrial_region for existing channels
         // This updates all NULL values in these columns based on NID
         self.conn.execute_batch(
@@ -211,9 +221,9 @@ impl std::fmt::Debug for Database {
 /// Scan scheduler configuration storage.
 impl Database {
     /// Get scan scheduler configuration from database.
-    pub fn get_scan_scheduler_config(&self) -> Result<(u64, usize, u64)> {
+    pub fn get_scan_scheduler_config(&self) -> Result<(u64, usize, u64, u64, u64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT check_interval_secs, max_concurrent_scans, scan_timeout_secs 
+            "SELECT check_interval_secs, max_concurrent_scans, scan_timeout_secs, signal_lock_wait_ms, ts_read_timeout_ms
              FROM scan_scheduler_config WHERE id = 1"
         )?;
 
@@ -222,30 +232,47 @@ impl Database {
                 row.get::<_, u64>(0)?,
                 row.get::<_, usize>(1)?,
                 row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
             ))
         });
 
         match result {
-            Ok((interval, concurrent, timeout)) => Ok((interval, concurrent, timeout)),
+            Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms)) => {
+                Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Initialize with defaults if not exists
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO scan_scheduler_config (id, check_interval_secs, max_concurrent_scans, scan_timeout_secs) 
-                     VALUES (1, 60, 1, 900)",
+                    "INSERT OR IGNORE INTO scan_scheduler_config (id, check_interval_secs, max_concurrent_scans, scan_timeout_secs, signal_lock_wait_ms, ts_read_timeout_ms)
+                     VALUES (1, 60, 1, 900, 500, 300000)",
                     [],
                 )?;
-                Ok((60, 1, 900))
+                Ok((60, 1, 900, 500, 300000))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
         }
     }
 
     /// Update scan scheduler configuration.
-    pub fn update_scan_scheduler_config(&self, check_interval: u64, max_concurrent: usize, timeout: u64) -> Result<()> {
+    pub fn update_scan_scheduler_config(
+        &self,
+        check_interval: u64,
+        max_concurrent: usize,
+        timeout: u64,
+        signal_lock_wait_ms: u64,
+        ts_read_timeout_ms: u64,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO scan_scheduler_config (id, check_interval_secs, max_concurrent_scans, scan_timeout_secs, updated_at) 
-             VALUES (1, ?1, ?2, ?3, strftime('%s', 'now'))",
-            rusqlite::params![check_interval, max_concurrent as i32, timeout],
+            "INSERT OR REPLACE INTO scan_scheduler_config (id, check_interval_secs, max_concurrent_scans, scan_timeout_secs, signal_lock_wait_ms, ts_read_timeout_ms, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
+            rusqlite::params![
+                check_interval,
+                max_concurrent as i32,
+                timeout,
+                signal_lock_wait_ms,
+                ts_read_timeout_ms
+            ],
         )?;
         Ok(())
     }
@@ -254,9 +281,11 @@ impl Database {
 /// Tuner optimization configuration storage.
 impl Database {
     /// Get tuner optimization configuration from database.
-    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64)> {
+    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64, u64, u64, u64, u64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT keep_alive_secs, prewarm_enabled, prewarm_timeout_secs 
+            "SELECT keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
+                    set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
+                    signal_poll_interval_ms, signal_wait_timeout_ms
              FROM tuner_config WHERE id = 1"
         )?;
 
@@ -265,20 +294,43 @@ impl Database {
                 row.get::<_, u64>(0)?,
                 row.get::<_, i64>(1)? != 0,
                 row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, u64>(6)?,
             ))
         });
 
         match result {
-            Ok((keep_alive, prewarm_enabled, prewarm_timeout)) => {
-                Ok((keep_alive, prewarm_enabled, prewarm_timeout))
+            Ok((
+                keep_alive,
+                prewarm_enabled,
+                prewarm_timeout,
+                set_channel_retry_interval_ms,
+                set_channel_retry_timeout_ms,
+                signal_poll_interval_ms,
+                signal_wait_timeout_ms,
+            )) => {
+                Ok((
+                    keep_alive,
+                    prewarm_enabled,
+                    prewarm_timeout,
+                    set_channel_retry_interval_ms,
+                    set_channel_retry_timeout_ms,
+                    signal_poll_interval_ms,
+                    signal_wait_timeout_ms,
+                ))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO tuner_config (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs) 
-                     VALUES (1, 60, 1, 30)",
+                    "INSERT OR IGNORE INTO tuner_config
+                     (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
+                      set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
+                      signal_poll_interval_ms, signal_wait_timeout_ms)
+                     VALUES (1, 60, 1, 30, 500, 10000, 500, 10000)",
                     [],
                 )?;
-                Ok((60, true, 30))
+                Ok((60, true, 30, 500, 10000, 500, 10000))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
         }
@@ -290,12 +342,27 @@ impl Database {
         keep_alive_secs: u64,
         prewarm_enabled: bool,
         prewarm_timeout_secs: u64,
+        set_channel_retry_interval_ms: u64,
+        set_channel_retry_timeout_ms: u64,
+        signal_poll_interval_ms: u64,
+        signal_wait_timeout_ms: u64,
     ) -> Result<()> {
         let prewarm_enabled = if prewarm_enabled { 1 } else { 0 };
         self.conn.execute(
-            "INSERT OR REPLACE INTO tuner_config (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs, updated_at) 
-             VALUES (1, ?1, ?2, ?3, strftime('%s', 'now'))",
-            rusqlite::params![keep_alive_secs, prewarm_enabled, prewarm_timeout_secs],
+            "INSERT OR REPLACE INTO tuner_config
+             (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
+              set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
+              signal_poll_interval_ms, signal_wait_timeout_ms, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s', 'now'))",
+            rusqlite::params![
+                keep_alive_secs,
+                prewarm_enabled,
+                prewarm_timeout_secs,
+                set_channel_retry_interval_ms,
+                set_channel_retry_timeout_ms,
+                signal_poll_interval_ms,
+                signal_wait_timeout_ms
+            ],
         )?;
         Ok(())
     }

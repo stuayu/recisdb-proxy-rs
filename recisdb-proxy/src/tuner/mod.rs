@@ -22,6 +22,7 @@ pub mod space_generator;
 pub mod group_space;
 pub mod quality_scorer;
 pub mod warm;
+pub mod logo_collector;
 
 pub use channel_key::ChannelKey;
 #[allow(unused_imports)]

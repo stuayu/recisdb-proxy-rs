@@ -51,6 +51,7 @@ pub async fn start_web_server(
         .route("/api/session-history", get(api::get_session_history))
         // BonDriver API
         .route("/api/bondrivers", get(api::get_bondrivers))
+        .route("/api/bondriver", post(api::create_bondriver))
         .route("/api/bondriver/:id", get(api::get_bondriver))
         .route("/api/bondriver/:id", post(api::update_bondriver))
         .route("/api/bondriver/:id", delete(api::delete_bondriver))
@@ -78,6 +79,7 @@ pub async fn start_web_server(
         .route("/api/tuner-config", post(api::update_tuner_config))
         // Dashboard route
         .route("/", get(dashboard::index))
+        .route("/logos/:file", get(api::get_logo))
         .with_state(web_state)
         .layer(CorsLayer::permissive());
 

@@ -4,11 +4,15 @@ use crate::channels::Channel;
 pub use self::linux::{Tuner, UnTunedTuner};
 #[cfg(target_os = "windows")]
 pub use self::windows::{Tuner, UnTunedTuner};
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub use self::unsupported::{Tuner, UnTunedTuner};
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod unsupported;
 
 mod error;
 

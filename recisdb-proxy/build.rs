@@ -4,19 +4,13 @@
 //! Compiles C++ wrapper code for BonDriver interface on Windows.
 
 fn main() {
-    #[cfg(target_os = "windows")]
-    {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
         build_bondriver_wrapper();
-        build_aribb24_wrapper(); // ★追加
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // No-op on non-Windows platforms
+        build_aribb24_wrapper();
     }
 }
 
-#[cfg(target_os = "windows")]
 fn build_bondriver_wrapper() {
     use std::env;
     use std::path::PathBuf;
@@ -76,7 +70,6 @@ fn build_bondriver_wrapper() {
 }
 
 
-#[cfg(target_os = "windows")]
 fn build_aribb24_wrapper() {
     use std::env;
     use std::path::PathBuf;
@@ -106,6 +99,8 @@ fn build_aribb24_wrapper() {
 
     // asprintf/vasprintf を有効化（aribb24.c のログ等にも効く場合あり）[4](https://github.com/nkoriyama/aribb24/blob/master/src/drcs.c)
     b.define("HAVE_VASPRINTF", Some("1"));
+    b.define("_GNU_SOURCE", Some("1"));
+    b.define("__USE_MINGW_ANSI_STDIO", Some("1"));
 
     // 本体 + 依存
     b.file(wrap_c);

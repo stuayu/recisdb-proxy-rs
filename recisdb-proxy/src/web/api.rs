@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     response::IntoResponse,
     Json,
 };
@@ -12,6 +12,36 @@ use std::sync::Arc;
 
 use crate::web::state::WebState;
 use crate::tuner::TunerPoolConfig;
+use crate::database::NewBonDriver;
+
+/// Get channel logo image file.
+pub async fn get_logo(
+    Path(file): Path<String>,
+) -> impl IntoResponse {
+    // Accept only safe filename patterns: <nid>_<sid>.png
+    if !file
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
+        || !file.ends_with(".png")
+    {
+        return (StatusCode::BAD_REQUEST, "invalid logo file").into_response();
+    }
+
+    let path = std::path::PathBuf::from("logos").join(&file);
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "image/png")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read logo").into_response(),
+    }
+}
 
 // ============================================================================
 // Data structures
@@ -300,6 +330,7 @@ pub async fn get_bondriver(
 /// Update BonDriver request.
 #[derive(Debug, Deserialize)]
 pub struct UpdateBonDriverRequest {
+    pub dll_path: Option<String>,
     pub driver_name: Option<String>,
     pub group_name: Option<String>,
     pub max_instances: Option<i32>,
@@ -309,6 +340,104 @@ pub struct UpdateBonDriverRequest {
     pub passive_scan_enabled: Option<bool>,
 }
 
+/// Create BonDriver request.
+#[derive(Debug, Deserialize)]
+pub struct CreateBonDriverRequest {
+    pub dll_path: String,
+    pub driver_name: Option<String>,
+    pub group_name: Option<String>,
+    pub max_instances: Option<i32>,
+    pub auto_scan_enabled: Option<bool>,
+    pub scan_interval_hours: Option<i32>,
+    pub scan_priority: Option<i32>,
+    pub passive_scan_enabled: Option<bool>,
+}
+
+/// Create BonDriver.
+pub async fn create_bondriver(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<CreateBonDriverRequest>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    let dll_path = payload.dll_path.trim();
+    if dll_path.is_empty() {
+        return Json(json!({
+            "success": false,
+            "error": "dll_path is required"
+        }));
+    }
+
+    match db.get_bon_driver_by_path(dll_path) {
+        Ok(Some(_)) => {
+            return Json(json!({
+                "success": false,
+                "error": "BonDriver already exists"
+            }));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Json(json!({
+                "success": false,
+                "error": e.to_string()
+            }));
+        }
+    }
+
+    let mut new_driver = NewBonDriver::new(dll_path.to_string());
+    if let Some(name) = payload.driver_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        new_driver.driver_name = Some(name.to_string());
+    }
+    if let Some(max_instances) = payload.max_instances {
+        if max_instances > 0 {
+            new_driver.max_instances = Some(max_instances);
+        }
+    }
+
+    let id = match db.insert_bon_driver(&new_driver) {
+        Ok(id) => id,
+        Err(e) => {
+            return Json(json!({
+                "success": false,
+                "error": e.to_string()
+            }));
+        }
+    };
+
+    if let Some(group) = payload.group_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = db.set_group_name(id, Some(group)) {
+            return Json(json!({
+                "success": false,
+                "error": format!("Failed to set group_name: {}", e)
+            }));
+        }
+    }
+
+    if payload.auto_scan_enabled.is_some()
+        || payload.scan_interval_hours.is_some()
+        || payload.scan_priority.is_some()
+        || payload.passive_scan_enabled.is_some()
+    {
+        let auto_scan = payload.auto_scan_enabled.unwrap_or(false);
+        let interval = payload.scan_interval_hours.unwrap_or(24);
+        let priority = payload.scan_priority.unwrap_or(0);
+        let passive = payload.passive_scan_enabled.unwrap_or(false);
+
+        if let Err(e) = db.update_scan_config(id, Some(auto_scan), Some(interval), Some(priority), Some(passive)) {
+            return Json(json!({
+                "success": false,
+                "error": format!("Failed to update scan config: {}", e)
+            }));
+        }
+    }
+
+    Json(json!({
+        "success": true,
+        "id": id,
+        "message": "BonDriver created successfully"
+    }))
+}
+
 /// Update BonDriver.
 pub async fn update_bondriver(
     State(web_state): State<Arc<WebState>>,
@@ -316,6 +445,15 @@ pub async fn update_bondriver(
     Json(payload): Json<UpdateBonDriverRequest>,
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
+
+    if let Some(path) = payload.dll_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = db.update_bon_driver_path(id, path) {
+            return Json(json!({
+                "success": false,
+                "error": format!("Failed to update dll_path: {}", e)
+            }));
+        }
+    }
 
     // Update individual fields
     if let Some(max_instances) = payload.max_instances {
@@ -875,12 +1013,24 @@ pub async fn get_tuner_config(
     let db = web_state.database.lock().await;
 
     match db.get_tuner_config() {
-        Ok((keep_alive, prewarm_enabled, prewarm_timeout)) => Json(json!({
+        Ok((
+            keep_alive,
+            prewarm_enabled,
+            prewarm_timeout,
+            set_channel_retry_interval_ms,
+            set_channel_retry_timeout_ms,
+            signal_poll_interval_ms,
+            signal_wait_timeout_ms,
+        )) => Json(json!({
             "success": true,
             "config": {
                 "keep_alive_secs": keep_alive,
                 "prewarm_enabled": prewarm_enabled,
                 "prewarm_timeout_secs": prewarm_timeout,
+                "set_channel_retry_interval_ms": set_channel_retry_interval_ms,
+                "set_channel_retry_timeout_ms": set_channel_retry_timeout_ms,
+                "signal_poll_interval_ms": signal_poll_interval_ms,
+                "signal_wait_timeout_ms": signal_wait_timeout_ms,
             }
         })),
         Err(e) => Json(json!({
@@ -896,6 +1046,10 @@ pub struct UpdateTunerConfigRequest {
     pub keep_alive_secs: Option<u64>,
     pub prewarm_enabled: Option<bool>,
     pub prewarm_timeout_secs: Option<u64>,
+    pub set_channel_retry_interval_ms: Option<u64>,
+    pub set_channel_retry_timeout_ms: Option<u64>,
+    pub signal_poll_interval_ms: Option<u64>,
+    pub signal_wait_timeout_ms: Option<u64>,
 }
 
 /// Update tuner optimization configuration.
@@ -903,13 +1057,29 @@ pub async fn update_tuner_config(
     State(web_state): State<Arc<WebState>>,
     Json(payload): Json<UpdateTunerConfigRequest>,
 ) -> impl IntoResponse {
-    let (keep_alive, prewarm_enabled, prewarm_timeout) = {
+    let (
+        keep_alive,
+        prewarm_enabled,
+        prewarm_timeout,
+        set_channel_retry_interval_ms,
+        set_channel_retry_timeout_ms,
+        signal_poll_interval_ms,
+        signal_wait_timeout_ms,
+    ) = {
         let db = web_state.database.lock().await;
 
-        let (mut keep_alive, mut prewarm_enabled, mut prewarm_timeout) =
+        let (
+            mut keep_alive,
+            mut prewarm_enabled,
+            mut prewarm_timeout,
+            mut set_channel_retry_interval_ms,
+            mut set_channel_retry_timeout_ms,
+            mut signal_poll_interval_ms,
+            mut signal_wait_timeout_ms,
+        ) =
             match db.get_tuner_config() {
                 Ok(config) => config,
-                Err(_) => (60, true, 30),
+                Err(_) => (60, true, 30, 500, 10_000, 500, 10_000),
             };
 
         if let Some(val) = payload.keep_alive_secs {
@@ -926,20 +1096,61 @@ pub async fn update_tuner_config(
             }
         }
 
-        if let Err(e) = db.update_tuner_config(keep_alive, prewarm_enabled, prewarm_timeout) {
+        if let Some(val) = payload.set_channel_retry_interval_ms {
+            if val > 0 {
+                set_channel_retry_interval_ms = val;
+            }
+        }
+        if let Some(val) = payload.set_channel_retry_timeout_ms {
+            if val > 0 {
+                set_channel_retry_timeout_ms = val;
+            }
+        }
+        if let Some(val) = payload.signal_poll_interval_ms {
+            if val > 0 {
+                signal_poll_interval_ms = val;
+            }
+        }
+        if let Some(val) = payload.signal_wait_timeout_ms {
+            if val > 0 {
+                signal_wait_timeout_ms = val;
+            }
+        }
+
+        if let Err(e) = db.update_tuner_config(
+            keep_alive,
+            prewarm_enabled,
+            prewarm_timeout,
+            set_channel_retry_interval_ms,
+            set_channel_retry_timeout_ms,
+            signal_poll_interval_ms,
+            signal_wait_timeout_ms,
+        ) {
             return Json(json!({
                 "success": false,
                 "error": format!("Failed to save configuration: {}", e)
             }));
         }
 
-        (keep_alive, prewarm_enabled, prewarm_timeout)
+        (
+            keep_alive,
+            prewarm_enabled,
+            prewarm_timeout,
+            set_channel_retry_interval_ms,
+            set_channel_retry_timeout_ms,
+            signal_poll_interval_ms,
+            signal_wait_timeout_ms,
+        )
     };
 
     let config = crate::web::state::TunerConfigInfo {
         keep_alive_secs: keep_alive,
         prewarm_enabled,
         prewarm_timeout_secs: prewarm_timeout,
+        set_channel_retry_interval_ms,
+        set_channel_retry_timeout_ms,
+        signal_poll_interval_ms,
+        signal_wait_timeout_ms,
     };
     web_state.update_tuner_config(config.clone()).await;
 
@@ -947,6 +1158,10 @@ pub async fn update_tuner_config(
         keep_alive_secs: keep_alive,
         prewarm_enabled,
         prewarm_timeout_secs: prewarm_timeout,
+        set_channel_retry_interval_ms,
+        set_channel_retry_timeout_ms,
+        signal_poll_interval_ms,
+        signal_wait_timeout_ms,
     };
     web_state.tuner_pool.update_config(pool_config).await;
 
@@ -957,6 +1172,10 @@ pub async fn update_tuner_config(
             "keep_alive_secs": config.keep_alive_secs,
             "prewarm_enabled": config.prewarm_enabled,
             "prewarm_timeout_secs": config.prewarm_timeout_secs,
+            "set_channel_retry_interval_ms": config.set_channel_retry_interval_ms,
+            "set_channel_retry_timeout_ms": config.set_channel_retry_timeout_ms,
+            "signal_poll_interval_ms": config.signal_poll_interval_ms,
+            "signal_wait_timeout_ms": config.signal_wait_timeout_ms,
         }
     }))
 }
@@ -968,13 +1187,15 @@ pub async fn get_scan_config(
     let db = web_state.database.lock().await;
     
     match db.get_scan_scheduler_config() {
-        Ok((interval, concurrent, timeout)) => {
+        Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms)) => {
             Json(json!({
                 "success": true,
                 "config": {
                     "check_interval_secs": interval,
                     "max_concurrent_scans": concurrent,
                     "scan_timeout_secs": timeout,
+                    "signal_lock_wait_ms": signal_lock_wait_ms,
+                    "ts_read_timeout_ms": ts_read_timeout_ms,
                 }
             }))
         }
@@ -993,6 +1214,8 @@ pub struct UpdateScanConfigRequest {
     pub check_interval_secs: Option<u64>,
     pub max_concurrent_scans: Option<usize>,
     pub scan_timeout_secs: Option<u64>,
+    pub signal_lock_wait_ms: Option<u64>,
+    pub ts_read_timeout_ms: Option<u64>,
 }
 
 /// Update scan scheduler configuration.
@@ -1003,10 +1226,10 @@ pub async fn update_scan_config(
     // Get current config from database
     let db = web_state.database.lock().await;
     
-    let (mut interval, mut concurrent, mut timeout) = 
+    let (mut interval, mut concurrent, mut timeout, mut signal_lock_wait_ms, mut ts_read_timeout_ms) =
         match db.get_scan_scheduler_config() {
             Ok(config) => config,
-            Err(_) => (60, 1, 900),
+            Err(_) => (60, 1, 900, 500, 300000),
         };
 
     // Update with provided values
@@ -1025,9 +1248,25 @@ pub async fn update_scan_config(
             timeout = val;
         }
     }
+    if let Some(val) = payload.signal_lock_wait_ms {
+        if val > 0 {
+            signal_lock_wait_ms = val;
+        }
+    }
+    if let Some(val) = payload.ts_read_timeout_ms {
+        if val > 0 {
+            ts_read_timeout_ms = val;
+        }
+    }
 
     // Save to database
-    if let Err(e) = db.update_scan_scheduler_config(interval, concurrent, timeout) {
+    if let Err(e) = db.update_scan_scheduler_config(
+        interval,
+        concurrent,
+        timeout,
+        signal_lock_wait_ms,
+        ts_read_timeout_ms,
+    ) {
         return Json(json!({
             "success": false,
             "error": format!("Failed to save configuration: {}", e)
@@ -1039,6 +1278,8 @@ pub async fn update_scan_config(
         check_interval_secs: interval,
         max_concurrent_scans: concurrent,
         scan_timeout_secs: timeout,
+        signal_lock_wait_ms,
+        ts_read_timeout_ms,
     };
     web_state.update_scan_config(config.clone()).await;
 
@@ -1049,6 +1290,8 @@ pub async fn update_scan_config(
             "check_interval_secs": config.check_interval_secs,
             "max_concurrent_scans": config.max_concurrent_scans,
             "scan_timeout_secs": config.scan_timeout_secs,
+            "signal_lock_wait_ms": config.signal_lock_wait_ms,
+            "ts_read_timeout_ms": config.ts_read_timeout_ms,
         }
     }))
 }

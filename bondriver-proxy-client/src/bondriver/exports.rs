@@ -634,7 +634,11 @@ pub unsafe extern "system" fn set_channel2(
 
     file_log!(debug, "SetChannel2: Calling connection.set_channel_space...");
 
-    if state.connection.set_channel_space(space, channel, 0, false) {
+    let priority = state.connection.default_priority();
+    let exclusive = state.connection.default_exclusive();
+    file_log!(debug, "SetChannel2: priority={}, exclusive={}", priority, exclusive);
+
+    if state.connection.set_channel_space(space, channel, priority, exclusive) {
         state.cur_space = space;
         state.cur_channel = channel;
 

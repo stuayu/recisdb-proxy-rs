@@ -85,6 +85,50 @@ const HTML_CONTENT: &str = r#"
         tr:hover { background: #f9f9f9; }
         code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
 
+        /* Desktop/Tablet: keep table usable with horizontal scroll */
+        .tab-content { overflow-x: auto; }
+        .responsive-table { min-width: 720px; }
+        #clients-table { min-width: 1700px; }
+
+        /* Viewport-adaptive column reduction for connection dashboard */
+        @media (max-width: 1400px) {
+            #clients-table th:nth-child(8),
+            #clients-table td:nth-child(8),
+            #clients-table th:nth-child(9),
+            #clients-table td:nth-child(9),
+            #clients-table th:nth-child(10),
+            #clients-table td:nth-child(10),
+            #clients-table th:nth-child(11),
+            #clients-table td:nth-child(11) {
+                display: none;
+            }
+            #clients-table { min-width: 1300px; }
+        }
+
+        @media (max-width: 1200px) {
+            #clients-table th:nth-child(3),
+            #clients-table td:nth-child(3),
+            #clients-table th:nth-child(12),
+            #clients-table td:nth-child(12),
+            #clients-table th:nth-child(15),
+            #clients-table td:nth-child(15) {
+                display: none;
+            }
+            #clients-table { min-width: 1050px; }
+        }
+
+        @media (max-width: 992px) {
+            #clients-table th:nth-child(5),
+            #clients-table td:nth-child(5),
+            #clients-table th:nth-child(13),
+            #clients-table td:nth-child(13),
+            #clients-table th:nth-child(14),
+            #clients-table td:nth-child(14) {
+                display: none;
+            }
+            #clients-table { min-width: 860px; }
+        }
+
         /* Performance graphs */
         .performance-graphs { display: flex; gap: 12px; flex-wrap: wrap; }
         .graph-container { background: #f8f9fa; padding: 10px 12px; border-radius: 8px; flex: 1; min-width: 220px; }
@@ -111,6 +155,16 @@ const HTML_CONTENT: &str = r#"
         .badge-danger { background: #f8d7da; color: #721c24; }
         .badge-warning { background: #fff3cd; color: #856404; }
         .badge-info { background: #d1ecf1; color: #0c5460; }
+
+        .channel-logo {
+            width: 24px;
+            height: 24px;
+            object-fit: contain;
+            vertical-align: middle;
+            margin-right: 6px;
+            border-radius: 3px;
+            background: #fff;
+        }
 
         /* Modal */
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.5); }
@@ -152,6 +206,33 @@ const HTML_CONTENT: &str = r#"
         .filter-bar { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
         .filter-bar select, .filter-bar input { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
 
+        .column-picker {
+            margin: 8px 0 12px;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+        }
+        .column-picker summary {
+            cursor: pointer;
+            font-size: 13px;
+            color: #444;
+            font-weight: 600;
+        }
+        .column-picker-grid {
+            margin-top: 10px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px 12px;
+        }
+        .column-picker-grid label {
+            font-size: 12px;
+            color: #444;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
         /* Loading */
         .loading { text-align: center; padding: 20px; color: #666; }
 
@@ -177,9 +258,11 @@ const HTML_CONTENT: &str = r#"
             .responsive-table thead { display: none; }
             .responsive-table, .responsive-table tbody, .responsive-table tr, .responsive-table td { display: block; width: 100%; }
             .responsive-table tr { background: #fff; border: 1px solid #eee; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
-            .responsive-table td { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f0f0; text-align: right; }
-            .responsive-table td::before { content: attr(data-label); flex: 0 0 40%; color: #666; font-size: 11px; font-weight: 600; text-align: left; }
+            .responsive-table td { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f0f0; text-align: right; flex-wrap: wrap; }
+            .responsive-table td::before { content: attr(data-label); flex: 0 0 45%; color: #666; font-size: 11px; font-weight: 600; text-align: left; }
             .responsive-table td:last-child { border-bottom: none; }
+
+            #clients-table { min-width: 100%; }
         }
     </style>
 </head>
@@ -230,6 +313,10 @@ const HTML_CONTENT: &str = r#"
                 <h3>接続中のクライアント</h3>
                 <button class="btn btn-secondary btn-sm" onclick="refreshClients()">更新</button>
             </div>
+            <details class="column-picker" id="clients-column-picker-wrap">
+                <summary>表示列を調整</summary>
+                <div class="column-picker-grid" id="clients-column-picker"></div>
+            </details>
             <table id="clients-table" class="responsive-table sortable-table">
                 <thead>
                     <tr>
@@ -237,6 +324,7 @@ const HTML_CONTENT: &str = r#"
                         <th class="sortable" data-sort-type="text">クライアント</th>
                         <th class="sortable" data-sort-type="text">ホスト名</th>
                         <th class="sortable" data-sort-type="text">状態</th>
+                        <th class="sortable" data-sort-type="text">選択チューナー</th>
                         <th class="sortable" data-sort-type="text">チャンネル</th>
                         <th class="sortable" data-sort-type="number">信号レベル</th>
                         <th class="sortable" data-sort-type="number">送信パケット</th>
@@ -251,7 +339,7 @@ const HTML_CONTENT: &str = r#"
                     </tr>
                 </thead>
                 <tbody id="clients-body">
-                    <tr><td colspan="14" class="empty-state">接続中のクライアントはありません</td></tr>
+                    <tr><td colspan="16" class="empty-state">接続中のクライアントはありません</td></tr>
                 </tbody>
             </table>
             <div id="client-metrics-panel" style="margin-top: 16px; display: none;">
@@ -280,7 +368,10 @@ const HTML_CONTENT: &str = r#"
         <div id="bondrivers" class="tab-content">
             <div class="section-header">
                 <h3>BonDriver 一覧</h3>
-                <button class="btn btn-secondary btn-sm" onclick="refreshBonDrivers()">更新</button>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn btn-primary btn-sm" onclick="openCreateBonDriver()">追加</button>
+                    <button class="btn btn-secondary btn-sm" onclick="refreshBonDrivers()">更新</button>
+                </div>
             </div>
             <table id="bondrivers-table" class="responsive-table sortable-table">
                 <thead>
@@ -328,6 +419,8 @@ const HTML_CONTENT: &str = r#"
                     <option value="is_enabled">有効</option>
                     <option value="channel_name">チャンネル名</option>
                     <option value="nid">NID/SID/TSID</option>
+                    <option value="sid">SID</option>
+                    <option value="tsid">TSID</option>
                     <option value="band_type">バンド</option>
                     <option value="terrestrial_region">地域</option>
                     <option value="network_name">ネットワーク</option>
@@ -378,6 +471,18 @@ const HTML_CONTENT: &str = r#"
                     <small>各BonDriver単位でのスキャンタイムアウト時間</small>
                 </div>
 
+                <div class="form-group">
+                    <label for="signal-lock-wait">SetChannel後の待機時間（ミリ秒）</label>
+                    <input type="number" id="signal-lock-wait" min="1" value="500">
+                    <small>SetChannel2応答後に信号判定/読み出しを開始するまでの待機時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="ts-read-timeout">映像データ読み出し時間（ミリ秒）</label>
+                    <input type="number" id="ts-read-timeout" min="1" value="300000">
+                    <small>チャンネル解析時にTSデータを読み出す最大時間</small>
+                </div>
+
                 <div style="margin-top: 20px; display: flex; gap: 10px;">
                     <button class="btn btn-primary" onclick="saveScanConfig()">保存</button>
                     <button class="btn btn-secondary" onclick="loadScanConfig()">リセット</button>
@@ -405,6 +510,30 @@ const HTML_CONTENT: &str = r#"
                     <label for="tuner-prewarm-timeout">Pre-Warm タイムアウト（秒）</label>
                     <input type="number" id="tuner-prewarm-timeout" min="1" value="30">
                     <small>OpenTuner 後に SetChannel が来ない場合の待機時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-setch-retry-interval">SetChannel リトライ間隔（ms）</label>
+                    <input type="number" id="tuner-setch-retry-interval" min="1" value="500">
+                    <small>SetChannel 失敗時の再試行間隔（ネットワーク遅延向け）</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-setch-retry-timeout">SetChannel リトライ上限時間（ms）</label>
+                    <input type="number" id="tuner-setch-retry-timeout" min="1" value="10000">
+                    <small>SetChannel 成功を待つ最大時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-signal-poll-interval">シグナル値ポーリング間隔（ms）</label>
+                    <input type="number" id="tuner-signal-poll-interval" min="1" value="500">
+                    <small>SetChannel 後に信号値を確認する間隔</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-signal-wait-timeout">シグナル待機上限時間（ms）</label>
+                    <input type="number" id="tuner-signal-wait-timeout" min="1" value="10000">
+                    <small>信号値が返るまで待つ最大時間</small>
                 </div>
 
                 <div style="margin-top: 20px; display: flex; gap: 10px;">
@@ -520,7 +649,7 @@ const HTML_CONTENT: &str = r#"
                 <input type="hidden" id="bd-id">
                 <div class="form-group">
                     <label>DLLパス</label>
-                    <input type="text" id="bd-path" readonly>
+                    <input type="text" id="bd-path" placeholder="例: BonDriver_PX-W3U4.dll" required>
                 </div>
                 <div class="form-group">
                     <label>表示名</label>
@@ -816,6 +945,12 @@ const HTML_CONTENT: &str = r#"
             return bandType !== null && bandType !== undefined ? (classes[bandType] || 'badge-danger') : '';
         }
 
+        function getChannelLogoHtml(c) {
+            if (c.nid === null || c.nid === undefined || c.sid === null || c.sid === undefined) return '';
+            const src = `/logos/${c.nid}_${c.sid}.png`;
+            return `<img class="channel-logo" src="${src}" alt="logo" onerror="this.style.display='none'">`;
+        }
+
         // Modal functions
         function openModal(id) { document.getElementById(id).classList.add('active'); }
         function closeModal(id) { document.getElementById(id).classList.remove('active'); }
@@ -854,8 +989,9 @@ const HTML_CONTENT: &str = r#"
                 document.getElementById('stat-clients').textContent = data.count || 0;
 
                 if (!data.clients || data.clients.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="14" class="empty-state">接続中のクライアントはありません</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="16" class="empty-state">接続中のクライアントはありません</td></tr>';
                     applyResponsiveLabels('clients-table');
+                    applyClientColumnVisibility();
                     return;
                 }
 
@@ -865,6 +1001,7 @@ const HTML_CONTENT: &str = r#"
                         <td data-sort-value="${escapeHtml(c.address)}">${escapeHtml(c.address)} <span style="color:#999;font-size:11px">(${formatDuration(c.connected_seconds)})</span></td>
                         <td data-sort-value="${escapeHtml(c.host || '-')}">${escapeHtml(c.host || '-')}</td>
                         <td data-sort-value="${c.is_streaming ? '1' : '0'}"><span class="badge ${c.is_streaming ? 'badge-success' : 'badge-warning'}">${c.is_streaming ? 'ストリーミング中' : '待機中'}</span></td>
+                        <td data-sort-value="${escapeHtml(c.tuner_path || '-')}"><code>${escapeHtml(c.tuner_path || '-')}</code></td>
                         <td data-sort-value="${escapeHtml(c.channel_name || c.channel_info || '-')}">${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
                         <td data-sort-value="${c.signal_level || 0}">${c.signal_level || '-'} dB</td>
                         <td data-sort-value="${c.packets_sent || 0}">${formatPackets(c.packets_sent)}</td>
@@ -883,6 +1020,7 @@ const HTML_CONTENT: &str = r#"
                     </tr>
                 `).join('');
                 applyResponsiveLabels('clients-table');
+                applyClientColumnVisibility();
             } catch (e) { console.error('Failed to refresh clients:', e); }
         }
 
@@ -1034,6 +1172,7 @@ const HTML_CONTENT: &str = r#"
                         <td>
                             <button class="btn btn-primary btn-sm" onclick='editBonDriver(${JSON.stringify(d)})'>編集</button>
                             <button class="btn btn-warning btn-sm" onclick="triggerScan(${d.id})">スキャン</button>
+                            <button class="btn btn-danger btn-sm" onclick="deleteBonDriver(${d.id}, '${escapeHtml((d.driver_name || d.dll_path)).replace(/'/g, "\\'")}')">削除</button>
                         </td>
                     </tr>
                 `}).join('');
@@ -1042,6 +1181,7 @@ const HTML_CONTENT: &str = r#"
         }
 
         function editBonDriver(d) {
+            document.querySelector('#bondriver-modal h3').textContent = 'BonDriver 設定編集';
             document.getElementById('bd-id').value = d.id;
             document.getElementById('bd-path').value = d.dll_path;
             document.getElementById('bd-name').value = d.driver_name || '';
@@ -1054,22 +1194,39 @@ const HTML_CONTENT: &str = r#"
             openModal('bondriver-modal');
         }
 
+        function openCreateBonDriver() {
+            document.querySelector('#bondriver-modal h3').textContent = 'BonDriver 追加';
+            document.getElementById('bd-id').value = '';
+            document.getElementById('bd-path').value = '';
+            document.getElementById('bd-name').value = '';
+            document.getElementById('bd-group-name').value = '';
+            document.getElementById('bd-max-instances').value = 1;
+            document.getElementById('bd-auto-scan').checked = false;
+            document.getElementById('bd-scan-interval').value = 24;
+            document.getElementById('bd-scan-priority').value = 0;
+            document.getElementById('bd-passive-scan').checked = false;
+            openModal('bondriver-modal');
+        }
+
         document.getElementById('bondriver-form').onsubmit = async (e) => {
             e.preventDefault();
             const id = document.getElementById('bd-id').value;
+            const payload = {
+                dll_path: document.getElementById('bd-path').value,
+                driver_name: document.getElementById('bd-name').value || null,
+                group_name: document.getElementById('bd-group-name').value || null,
+                max_instances: parseInt(document.getElementById('bd-max-instances').value),
+                auto_scan_enabled: document.getElementById('bd-auto-scan').checked,
+                scan_interval_hours: parseInt(document.getElementById('bd-scan-interval').value),
+                scan_priority: parseInt(document.getElementById('bd-scan-priority').value),
+                passive_scan_enabled: document.getElementById('bd-passive-scan').checked
+            };
             try {
-                const res = await fetch(`/api/bondriver/${id}`, {
+                const isCreate = !id;
+                const res = await fetch(isCreate ? '/api/bondriver' : `/api/bondriver/${id}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        driver_name: document.getElementById('bd-name').value || null,
-                        group_name: document.getElementById('bd-group-name').value || null,
-                        max_instances: parseInt(document.getElementById('bd-max-instances').value),
-                        auto_scan_enabled: document.getElementById('bd-auto-scan').checked,
-                        scan_interval_hours: parseInt(document.getElementById('bd-scan-interval').value),
-                        scan_priority: parseInt(document.getElementById('bd-scan-priority').value),
-                        passive_scan_enabled: document.getElementById('bd-passive-scan').checked
-                    })
+                    body: JSON.stringify(payload)
                 });
                 const data = await res.json();
                 if (data.success) {
@@ -1080,6 +1237,22 @@ const HTML_CONTENT: &str = r#"
                 }
             } catch (e) { alert('保存に失敗しました: ' + e.message); }
         };
+
+        async function deleteBonDriver(id, name) {
+            if (!confirm(`BonDriver「${name}」を削除しますか？\n関連チャンネルとスキャン履歴も削除されます。`)) return;
+            try {
+                const res = await fetch(`/api/bondriver/${id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    refreshBonDrivers();
+                    refreshChannels();
+                } else {
+                    alert('削除に失敗しました: ' + (data.error || 'unknown error'));
+                }
+            } catch (e) {
+                alert('削除に失敗しました: ' + e.message);
+            }
+        }
 
         async function triggerScan(id) {
             if (!confirm('このBonDriverでスキャンを開始しますか？')) return;
@@ -1096,6 +1269,93 @@ const HTML_CONTENT: &str = r#"
         let channelSortKey = 'nid';
         let channelSortAsc = true;
 
+        // Clients table column visibility
+        let clientsColumnVisibility = {};
+
+        function loadClientColumnPrefs() {
+            try {
+                const raw = localStorage.getItem('clientsTableColumnVisibility');
+                if (!raw) return {};
+                const parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' ? parsed : {};
+            } catch (_) {
+                return {};
+            }
+        }
+
+        function saveClientColumnPrefs() {
+            localStorage.setItem('clientsTableColumnVisibility', JSON.stringify(clientsColumnVisibility));
+        }
+
+        function applyClientColumnVisibility() {
+            const table = document.getElementById('clients-table');
+            if (!table) return;
+
+            const rows = table.querySelectorAll('tr');
+            Object.entries(clientsColumnVisibility).forEach(([k, visible]) => {
+                const col = parseInt(k, 10);
+                rows.forEach(row => {
+                    const cell = row.children[col - 1];
+                    if (!cell) return;
+                    cell.style.display = visible === false ? 'none' : '';
+                });
+            });
+        }
+
+        function initClientsColumnPicker() {
+            const picker = document.getElementById('clients-column-picker');
+            const table = document.getElementById('clients-table');
+            if (!picker || !table) return;
+
+            const headers = Array.from(table.querySelectorAll('thead th'));
+            clientsColumnVisibility = loadClientColumnPrefs();
+
+            picker.innerHTML = headers.map((th, idx) => {
+                const col = idx + 1;
+                const label = th.textContent.trim() || `列${col}`;
+                const checked = clientsColumnVisibility[col] !== false;
+                const locked = (label === 'セッションID' || label === '操作');
+                return `
+                    <label>
+                        <input type="checkbox" data-col="${col}" ${checked ? 'checked' : ''} ${locked ? 'disabled' : ''}>
+                        ${escapeHtml(label)}
+                    </label>
+                `;
+            }).join('');
+
+            picker.querySelectorAll('input[type="checkbox"]').forEach(chk => {
+                chk.addEventListener('change', (e) => {
+                    const col = parseInt(e.target.dataset.col, 10);
+                    clientsColumnVisibility[col] = !!e.target.checked;
+                    saveClientColumnPrefs();
+                    applyClientColumnVisibility();
+                });
+            });
+
+            applyClientColumnVisibility();
+        }
+
+        function getChannelSortValue(channel, key) {
+            switch (key) {
+                case 'nid':
+                    return [channel.nid ?? -1, channel.sid ?? -1, channel.tsid ?? -1];
+                case 'sid':
+                    return channel.sid ?? -1;
+                case 'tsid':
+                    return channel.tsid ?? -1;
+                case 'channel_name':
+                    return (channel.channel_name || channel.raw_name || '').toLowerCase();
+                case 'terrestrial_region':
+                    return (channel.terrestrial_region || '').toLowerCase();
+                case 'network_name':
+                    return (channel.network_name || '').toLowerCase();
+                case 'tuner_count':
+                    return channel.tuner_count ?? 0;
+                default:
+                    return channel[key];
+            }
+        }
+
         function renderChannels() {
             const tbody = document.getElementById('channels-body');
             if (channelData.length === 0) {
@@ -1106,8 +1366,17 @@ const HTML_CONTENT: &str = r#"
 
             // Sort the data
             const sorted = [...channelData].sort((a, b) => {
-                let va = a[channelSortKey];
-                let vb = b[channelSortKey];
+                let va = getChannelSortValue(a, channelSortKey);
+                let vb = getChannelSortValue(b, channelSortKey);
+
+                // Composite compare for NID/SID/TSID
+                if (Array.isArray(va) && Array.isArray(vb)) {
+                    for (let i = 0; i < Math.min(va.length, vb.length); i++) {
+                        const diff = (va[i] ?? 0) - (vb[i] ?? 0);
+                        if (diff !== 0) return channelSortAsc ? diff : -diff;
+                    }
+                    return 0;
+                }
 
                 // Handle null/undefined
                 if (va === null || va === undefined) va = '';
@@ -1135,7 +1404,7 @@ const HTML_CONTENT: &str = r#"
                             <span class="toggle-slider"></span>
                         </label>
                     </td>
-                    <td>${escapeHtml(c.channel_name || c.raw_name || '-')}</td>
+                    <td>${getChannelLogoHtml(c)}${escapeHtml(c.channel_name || c.raw_name || '-')}</td>
                     <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
                     <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
                     <td>${escapeHtml(c.terrestrial_region || '-')}</td>
@@ -1470,6 +1739,8 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('check-interval').value = data.config.check_interval_secs;
                     document.getElementById('max-concurrent').value = data.config.max_concurrent_scans;
                     document.getElementById('scan-timeout').value = data.config.scan_timeout_secs;
+                    document.getElementById('signal-lock-wait').value = data.config.signal_lock_wait_ms ?? 500;
+                    document.getElementById('ts-read-timeout').value = data.config.ts_read_timeout_ms ?? 300000;
                     hideConfigMessage();
                 }
             } catch (e) { console.error('Failed to load scan config:', e); }
@@ -1479,10 +1750,18 @@ const HTML_CONTENT: &str = r#"
             const config = {
                 check_interval_secs: parseInt(document.getElementById('check-interval').value),
                 max_concurrent_scans: parseInt(document.getElementById('max-concurrent').value),
-                scan_timeout_secs: parseInt(document.getElementById('scan-timeout').value)
+                scan_timeout_secs: parseInt(document.getElementById('scan-timeout').value),
+                signal_lock_wait_ms: parseInt(document.getElementById('signal-lock-wait').value),
+                ts_read_timeout_ms: parseInt(document.getElementById('ts-read-timeout').value)
             };
 
-            if (config.check_interval_secs <= 0 || config.max_concurrent_scans <= 0 || config.scan_timeout_secs <= 0) {
+            if (
+                config.check_interval_secs <= 0 ||
+                config.max_concurrent_scans <= 0 ||
+                config.scan_timeout_secs <= 0 ||
+                config.signal_lock_wait_ms <= 0 ||
+                config.ts_read_timeout_ms <= 0
+            ) {
                 showConfigMessage('すべてのフィールドに正の数値を入力してください', 'error');
                 return;
             }
@@ -1534,6 +1813,10 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tuner-keep-alive').value = data.config.keep_alive_secs;
                     document.getElementById('tuner-prewarm-enabled').checked = !!data.config.prewarm_enabled;
                     document.getElementById('tuner-prewarm-timeout').value = data.config.prewarm_timeout_secs;
+                    document.getElementById('tuner-setch-retry-interval').value = data.config.set_channel_retry_interval_ms ?? 500;
+                    document.getElementById('tuner-setch-retry-timeout').value = data.config.set_channel_retry_timeout_ms ?? 10000;
+                    document.getElementById('tuner-signal-poll-interval').value = data.config.signal_poll_interval_ms ?? 500;
+                    document.getElementById('tuner-signal-wait-timeout').value = data.config.signal_wait_timeout_ms ?? 10000;
                     hideTunerConfigMessage();
                 }
             } catch (e) { console.error('Failed to load tuner config:', e); }
@@ -1543,10 +1826,21 @@ const HTML_CONTENT: &str = r#"
             const config = {
                 keep_alive_secs: parseInt(document.getElementById('tuner-keep-alive').value),
                 prewarm_enabled: document.getElementById('tuner-prewarm-enabled').checked,
-                prewarm_timeout_secs: parseInt(document.getElementById('tuner-prewarm-timeout').value)
+                prewarm_timeout_secs: parseInt(document.getElementById('tuner-prewarm-timeout').value),
+                set_channel_retry_interval_ms: parseInt(document.getElementById('tuner-setch-retry-interval').value),
+                set_channel_retry_timeout_ms: parseInt(document.getElementById('tuner-setch-retry-timeout').value),
+                signal_poll_interval_ms: parseInt(document.getElementById('tuner-signal-poll-interval').value),
+                signal_wait_timeout_ms: parseInt(document.getElementById('tuner-signal-wait-timeout').value)
             };
 
-            if (config.keep_alive_secs < 0 || config.prewarm_timeout_secs <= 0) {
+            if (
+                config.keep_alive_secs < 0 ||
+                config.prewarm_timeout_secs <= 0 ||
+                config.set_channel_retry_interval_ms <= 0 ||
+                config.set_channel_retry_timeout_ms <= 0 ||
+                config.signal_poll_interval_ms <= 0 ||
+                config.signal_wait_timeout_ms <= 0
+            ) {
                 showTunerConfigMessage('入力値を確認してください', 'error');
                 return;
             }
@@ -1591,6 +1885,7 @@ const HTML_CONTENT: &str = r#"
 
         // Initialize
         window.addEventListener('load', () => {
+            initClientsColumnPicker();
             refreshStats();
             refreshClients();
             loadScanConfig();

@@ -28,13 +28,13 @@ ReadTimeout = 30000
 ; - Priority level of the client
 ; - Exclusive lock requirements
 ; The selection strategy is determined by the server configuration.
-; Priority = 0
+Priority = 0
 
 ; Exclusive lock mode (default: 0)
 ; Set to 1 or true to request exclusive access to the tuner
 ; When enabled, this client gets highest priority and other clients are disconnected
 ; Set to 0 or false to allow shared access
-; Exclusive = 0
+Exclusive = 0
 
 ; =====================
 ; TLS Configuration (requires tls feature enabled at compile time)

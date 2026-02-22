@@ -52,6 +52,12 @@ pub(crate) mod error_handler {
         std::process::exit(1);
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    pub(crate) fn handle_opening_error(e: io::Error) -> ! {
+        error!("Cannot open the device on this platform: {}", e);
+        std::process::exit(1);
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn handle_tuning_error(e: io::Error) -> ! {
         if let Some(raw_os_error) = e.raw_os_error() {
@@ -90,6 +96,12 @@ pub(crate) mod error_handler {
     #[cfg(target_os = "windows")]
     pub(crate) fn handle_tuning_error(e: io::Error) -> ! {
         error!("Cannot tune the device. (Unexpected error: {})", e);
+        std::process::exit(1);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    pub(crate) fn handle_tuning_error(e: io::Error) -> ! {
+        error!("Cannot tune the device on this platform: {}", e);
         std::process::exit(1);
     }
 }

@@ -52,6 +52,8 @@ fn main() {
     compiler
         .cpp(true)
         .warnings(false)
+        // Ensure MSVC treats sources as C++ even if global CL flags force C mode (/TC).
+        .flag_if_supported("/TP")
         .flag_if_supported("/EHa")   // SEH例外もcatch(...)で捕捉可能にする
         .compile("BonDriver_dynamic_cast_ffi");
 }

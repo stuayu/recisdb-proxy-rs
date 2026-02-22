@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS scan_scheduler_config (
     check_interval_secs INTEGER DEFAULT 60,
     max_concurrent_scans INTEGER DEFAULT 1,
     scan_timeout_secs INTEGER DEFAULT 900,
+    signal_lock_wait_ms INTEGER DEFAULT 500,
+    ts_read_timeout_ms INTEGER DEFAULT 300000,
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
@@ -88,6 +90,10 @@ CREATE TABLE IF NOT EXISTS tuner_config (
     keep_alive_secs INTEGER DEFAULT 60,
     prewarm_enabled INTEGER DEFAULT 1,
     prewarm_timeout_secs INTEGER DEFAULT 30,
+    set_channel_retry_interval_ms INTEGER DEFAULT 500,
+    set_channel_retry_timeout_ms INTEGER DEFAULT 10000,
+    signal_poll_interval_ms INTEGER DEFAULT 500,
+    signal_wait_timeout_ms INTEGER DEFAULT 10000,
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 

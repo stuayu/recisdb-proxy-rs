@@ -28,6 +28,7 @@ impl Default for TargetVar {
 fn prep_cmake(cx: TargetVar) -> cmake::Config {
     let mut cm = cmake::Config::new("./externals/libaribb25");
     cm.very_verbose(true);
+    cm.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
 
     // Disble AVX2 for x64
     if matches!(cx.arch, Some(ref arch) if arch == "x86_64") {
@@ -62,7 +63,7 @@ fn prep_cmake(cx: TargetVar) -> cmake::Config {
                 panic!("target_env:={sys_name} not supported.")
             }
             (true, _) => {
-                cm.generator("MinGW Makefiles");
+                cm.generator("Ninja");
             }
         }
     }

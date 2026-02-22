@@ -20,6 +20,10 @@ pub struct ScanSchedulerInfo {
     pub max_concurrent_scans: usize,
     /// Scan timeout per BonDriver (seconds).
     pub scan_timeout_secs: u64,
+    /// Wait time after SetChannel before checking signal/read (milliseconds).
+    pub signal_lock_wait_ms: u64,
+    /// Max time to read/analyze TS for one channel (milliseconds).
+    pub ts_read_timeout_ms: u64,
 }
 
 /// Tuner optimization configuration (for Web API).
@@ -28,6 +32,10 @@ pub struct TunerConfigInfo {
     pub keep_alive_secs: u64,
     pub prewarm_enabled: bool,
     pub prewarm_timeout_secs: u64,
+    pub set_channel_retry_interval_ms: u64,
+    pub set_channel_retry_timeout_ms: u64,
+    pub signal_poll_interval_ms: u64,
+    pub signal_wait_timeout_ms: u64,
 }
 
 /// Information about an active session.
@@ -319,11 +327,17 @@ impl WebState {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,
                 scan_timeout_secs: 900,
+                signal_lock_wait_ms: 500,
+                ts_read_timeout_ms: 300000,
             }),
             tuner_config: RwLock::new(TunerConfigInfo {
                 keep_alive_secs: 60,
                 prewarm_enabled: true,
                 prewarm_timeout_secs: 30,
+                set_channel_retry_interval_ms: 500,
+                set_channel_retry_timeout_ms: 10_000,
+                signal_poll_interval_ms: 500,
+                signal_wait_timeout_ms: 10_000,
             }),
         }
     }

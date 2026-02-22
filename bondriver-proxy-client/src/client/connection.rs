@@ -47,6 +47,10 @@ pub struct ConnectionConfig {
     pub tuner_path: String,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
+    /// Default client priority sent with channel set requests.
+    pub client_priority: i32,
+    /// Default exclusive lock flag sent with channel set requests.
+    pub client_exclusive: bool,
     /// Enable TLS connection.
     #[cfg(feature = "tls")]
     pub tls_enabled: bool,
@@ -62,6 +66,8 @@ impl Default for ConnectionConfig {
             tuner_path: String::new(),
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(5),
+            client_priority: 0,
+            client_exclusive: false,
             #[cfg(feature = "tls")]
             tls_enabled: false,
             #[cfg(feature = "tls")]
@@ -120,6 +126,16 @@ impl Connection {
     #[allow(dead_code)]
     pub fn signal_level(&self) -> f32 {
         *self.signal_level.lock()
+    }
+
+    /// Get default client priority from configuration.
+    pub fn default_priority(&self) -> i32 {
+        self.config.client_priority
+    }
+
+    /// Get default exclusive lock flag from configuration.
+    pub fn default_exclusive(&self) -> bool {
+        self.config.client_exclusive
     }
 
     /// Get a reference to the ring buffer.
@@ -368,7 +384,11 @@ impl Connection {
 
     /// Set channel (IBonDriver v1).
     pub fn set_channel(&self, channel: u8, _force: bool) -> bool {
-        let resp = self.send_request(ClientMessage::SetChannel { channel, priority: 0, exclusive: false });
+        let resp = self.send_request(ClientMessage::SetChannel {
+            channel,
+            priority: self.config.client_priority,
+            exclusive: self.config.client_exclusive,
+        });
 
         match resp {
             Some(ServerMessage::SetChannelAck { success, .. }) => success,

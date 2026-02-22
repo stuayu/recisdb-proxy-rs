@@ -160,7 +160,7 @@ impl IBon {
                 Ok(())
             } else {
                 let msg = format!("SetChannel failed for channel={} - channel may not exist or tuner not ready", ch);
-                error!("[BonDriver] {}", msg);
+                debug!("[BonDriver] {}", msg);
                 Err(io::Error::new(io::ErrorKind::AddrNotAvailable, msg))
             }
         }
@@ -175,7 +175,7 @@ impl IBon {
                 Ok(())
             } else {
                 let msg = format!("SetChannel2 failed for space={}, channel={} - channel may not exist or tuner not ready", space, ch);
-                error!("[BonDriver] {}", msg);
+                debug!("[BonDriver] {}", msg);
                 Err(io::Error::new(io::ErrorKind::AddrNotAvailable, msg))
             }
         }

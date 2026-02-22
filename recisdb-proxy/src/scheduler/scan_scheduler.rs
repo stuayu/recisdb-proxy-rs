@@ -40,6 +40,10 @@ pub struct ScanSchedulerConfig {
     pub max_concurrent_scans: usize,
     /// Scan timeout per BonDriver (seconds).
     pub scan_timeout_secs: u64,
+    /// Wait time after `SetChannel` before signal lock check (milliseconds).
+    pub signal_lock_wait_ms: u64,
+    /// Maximum TS read/analyze duration per channel (milliseconds).
+    pub ts_read_timeout_ms: u64,
 }
 
 impl Default for ScanSchedulerConfig {
@@ -48,6 +52,8 @@ impl Default for ScanSchedulerConfig {
             check_interval_secs: 60,        // Check every minute
             max_concurrent_scans: 1,         // One scan at a time
             scan_timeout_secs: 900,          // 15 minute timeout
+            signal_lock_wait_ms: 500,
+            ts_read_timeout_ms: 300000,
         }
     }
 }
@@ -176,6 +182,8 @@ impl ScanScheduler {
         let tuner_pool = self.tuner_pool.clone();
         let active_scans = self.active_scans.clone();
         let timeout_secs = self.config.scan_timeout_secs;
+        let signal_lock_wait_ms = self.config.signal_lock_wait_ms;
+        let ts_read_timeout_ms = self.config.ts_read_timeout_ms;
 
         // Increment active scan count
         active_scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -186,7 +194,13 @@ impl ScanScheduler {
             // Perform the scan with timeout
             let scan_result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                perform_scan(&driver, database.clone(), tuner_pool),
+                perform_scan(
+                    &driver,
+                    database.clone(),
+                    tuner_pool,
+                    signal_lock_wait_ms,
+                    ts_read_timeout_ms,
+                ),
             )
             .await;
 
@@ -291,17 +305,17 @@ impl ScanScheduler {
 /// Minimum signal level to consider a channel as having signal.
 const MIN_SIGNAL_LEVEL: f32 = 3.0;
 
-/// Time to wait for signal lock after setting channel (milliseconds).
-const SIGNAL_LOCK_WAIT_MS: u64 = 500;
-
-/// Maximum time to wait for TS analysis (milliseconds).
-const TS_ANALYSIS_TIMEOUT_MS: u64 = 300000;
-
 /// TS パケット長
 const TS_PACKET_SIZE: usize = 188;
 
 /// Buffer size for TS stream reading.
 const TS_BUFFER_SIZE: usize = TS_PACKET_SIZE * 1024; // ~192KB
+
+/// BonDriver 実装差対策：enum_tuning_space が None を返さない場合の保険
+const MAX_SPACES: u32 = 64;
+
+/// BonDriver 実装差対策：enum_channel_name が None を返さない場合の保険
+const MAX_CHANNELS: u32 = 1024;
 
 /// WaitTsStream 1回あたりの待機(ms)
 const TS_WAIT_MS: u32 = 200;
@@ -341,46 +355,87 @@ struct ServiceInfo {
 
 use crate::ts_analyzer::{TsAnalyzer, AnalyzerConfig};
 
+/// Enumerate available spaces and channels from BonDriver in one pass.
+fn enumerate_spaces_and_channels_blocking(
+    dll_path: &str,
+) -> Result<Vec<(u32, String, Vec<(u32, String)>)>, Box<dyn std::error::Error + Send + Sync>> {
+    info!("enumerate_spaces_and_channels: Loading BonDriver {}", dll_path);
+    let tuner = BonDriverTuner::new(dll_path)?;
+    info!(
+        "enumerate_spaces_and_channels: BonDriver loaded, version {}",
+        tuner.version()
+    );
+
+    let mut plans: Vec<(u32, String, Vec<(u32, String)>)> = Vec::new();
+    let mut space_idx: u32 = 0;
+
+    while space_idx < MAX_SPACES {
+        let Some(space_name) = tuner.enum_tuning_space(space_idx) else {
+            break;
+        };
+
+        let mut channels: Vec<(u32, String)> = Vec::new();
+        let mut ch_idx: u32 = 0;
+        let mut consecutive_none: u32 = 0;
+
+        while ch_idx < MAX_CHANNELS {
+            match tuner.enum_channel_name(space_idx, ch_idx) {
+                Some(name) => {
+                    channels.push((ch_idx, name));
+                    consecutive_none = 0;
+                }
+                None => {
+                    // Some BonDrivers have gaps in channel indices.
+                    // Allow up to 3 consecutive Nones before stopping.
+                    consecutive_none += 1;
+                    if consecutive_none > 3 {
+                        break;
+                    }
+                }
+            }
+            ch_idx += 1;
+        }
+
+        info!(
+            "enumerate_spaces_and_channels: Found space {} ({}) with {} channels",
+            space_idx,
+            space_name,
+            channels.len()
+        );
+
+        plans.push((space_idx, space_name, channels));
+        space_idx += 1;
+    }
+
+    Ok(plans)
+}
+
 /// Scan channels in a space by enumerating BonDriver's channel list.
 /// This runs in a blocking thread to avoid Send/Sync issues with raw pointers.
 fn scan_space_blocking(
     dll_path: &str,
     space: u32,
+    channels: &[(u32, String)],
+    signal_lock_wait_ms: u64,
+    ts_read_timeout_ms: u64,
 ) -> Result<Vec<ScanChannelResult>, Box<dyn std::error::Error + Send + Sync>> {
     info!("scan_space_blocking: Loading BonDriver {}", dll_path);
     let tuner = BonDriverTuner::new(dll_path)?;
     info!("scan_space_blocking: BonDriver loaded, version {}", tuner.version());
 
-    // Enumerate channels defined by BonDriver for this space
-    let mut channels: Vec<(u32, String)> = Vec::new();
-    let mut ch_idx: u32 = 0;
-    // BonDriver implementations may not return None reliably,
-    // so cap at a reasonable maximum as a safety net.
-    const MAX_CHANNELS: u32 = 1024;
-    let mut consecutive_none: u32 = 0;
-    while ch_idx < MAX_CHANNELS {
-        match tuner.enum_channel_name(space, ch_idx) {
-            Some(name) => {
-                channels.push((ch_idx, name));
-                consecutive_none = 0;
-            }
-            None => {
-                // Some BonDrivers have gaps in channel indices.
-                // Allow up to 3 consecutive Nones before stopping.
-                consecutive_none += 1;
-                if consecutive_none > 3 {
-                    break;
-                }
-            }
-        }
-        ch_idx += 1;
-    }
-
-    info!("scan_space_blocking: Space {} has {} channels defined by BonDriver", space, channels.len());
+    info!(
+        "scan_space_blocking: Space {} scanning {} channels from pre-fetched list",
+        space,
+        channels.len()
+    );
 
     let mut results = Vec::new();
+    let mut consecutive_set_channel_failures: u32 = 0;
+    let mut total_set_channel_failures: u32 = 0;
+    const MAX_CONSECUTIVE_SET_CHANNEL_FAILURES: u32 = 8;
+    const MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS: u32 = 16;
 
-    for (channel, channel_name) in &channels {
+    for (channel, channel_name) in channels {
         let channel = *channel;
 
         debug!("scan_space_blocking: Trying space={}, channel={} ({})", space, channel, channel_name);
@@ -388,14 +443,38 @@ fn scan_space_blocking(
         // Set channel
         if let Err(e) = tuner.set_channel(space, channel) {
             debug!("scan_space_blocking: SetChannel failed: {}", e);
+
+            consecutive_set_channel_failures += 1;
+            total_set_channel_failures += 1;
+
+            if results.is_empty() && total_set_channel_failures >= MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS {
+                warn!(
+                    "scan_space_blocking: Aborting space {} after {} SetChannel failures with no successful lock",
+                    space,
+                    total_set_channel_failures
+                );
+                break;
+            }
+
+            if consecutive_set_channel_failures >= MAX_CONSECUTIVE_SET_CHANNEL_FAILURES {
+                warn!(
+                    "scan_space_blocking: Aborting space {} after {} consecutive SetChannel failures",
+                    space,
+                    consecutive_set_channel_failures
+                );
+                break;
+            }
+
             continue;
         }
+
+        consecutive_set_channel_failures = 0;
 
         // Purge any old data
         tuner.purge_ts_stream();
 
         // Wait for signal lock (blocking sleep)
-        std::thread::sleep(std::time::Duration::from_millis(SIGNAL_LOCK_WAIT_MS));
+        std::thread::sleep(std::time::Duration::from_millis(signal_lock_wait_ms));
 
         // Check signal level
         let signal_level = tuner.get_signal_level();
@@ -415,7 +494,7 @@ fn scan_space_blocking(
         for attempt in 0..3 {
             // catch_unwind to prevent panics (e.g. from FFI) from crashing the process
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                analyze_ts_stream(&tuner)
+                analyze_ts_stream(&tuner, ts_read_timeout_ms)
             })) {
                 Ok(r) => r,
                 Err(panic_err) => {
@@ -508,6 +587,7 @@ fn scan_space_blocking(
 /// Analyze TS stream to extract TSID, NID, and service information.
 fn analyze_ts_stream(
     tuner: &BonDriverTuner,
+    ts_read_timeout_ms: u64,
 ) -> Result<(Option<u16>, Option<u16>, Vec<ServiceInfo>), Box<dyn std::error::Error + Send + Sync>> {
     debug!("analyze_ts_stream: Starting TS analysis");
 
@@ -525,7 +605,7 @@ fn analyze_ts_stream(
     let mut carry: Vec<u8> = Vec::with_capacity(TS_PACKET_SIZE * 4);
 
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(TS_ANALYSIS_TIMEOUT_MS);
+    let timeout = std::time::Duration::from_millis(ts_read_timeout_ms);
 
     let mut total_bytes_read = 0usize;
     let mut reads = 0usize;
@@ -687,88 +767,83 @@ async fn perform_scan(
     driver: &BonDriverRecord,
     database: DatabaseHandle,
     _tuner_pool: Arc<TunerPool>,
+    signal_lock_wait_ms: u64,
+    ts_read_timeout_ms: u64,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     debug!("perform_scan: Starting scan for {}", driver.dll_path);
 
     let dll_path = driver.dll_path.clone();
     let driver_id = driver.id;
+    let is_initial_scan = driver.next_scan_at.is_none();
 
     // Get existing channel spaces from database to know what to scan
-    let scan_ranges = {
+    let scan_ranges = if is_initial_scan {
+        info!(
+            "perform_scan: Initial scan for {} detected; treating DB spaces as empty",
+            driver.dll_path
+        );
+        Vec::new()
+    } else {
         let db = database.lock().await;
         db.get_tuning_spaces(driver_id).unwrap_or_default()
     };
 
-    // Collect all scan results
-    let mut all_results = Vec::new();
-
+    // Channel scan always uses BonDriver enumeration results directly.
+    // DB spaces are not used as a runtime filter.
     if scan_ranges.is_empty() {
-        warn!("perform_scan: No known spaces, enumerating spaces from BonDriver");
+        warn!("perform_scan: No known spaces in DB; scanning all spaces reported by BonDriver");
+    } else {
+        info!(
+            "perform_scan: Ignoring DB space filter during scan and using BonDriver-enumerated spaces"
+        );
+    }
 
-        let dll = dll_path.clone();
-        let results = tokio::task::spawn_blocking(move || {
-            let mut results = Vec::new();
+    // Collect all scan results
+    let dll = dll_path.clone();
+    let all_results = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::new();
 
-            // 1) BonDriver を一度ロードして、実在する tuning space を列挙する
-            let tuner = match BonDriverTuner::new(&dll) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("perform_scan: Failed to load BonDriver for space enumeration: {}", e);
-                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results);
-                }
-            };
-
-            // BonDriver 実装差対策：enum_tuning_space が None を返さない場合の保険
-            const MAX_SPACES: u32 = 64;
-
-            let mut spaces: Vec<(u32, String)> = Vec::new();
-            let mut space_idx: u32 = 0;
-
-            while space_idx < MAX_SPACES {
-                match tuner.enum_tuning_space(space_idx) {
-                    Some(space_name) => {
-                        info!("perform_scan: Found space {}: {}", space_idx, space_name);
-                        spaces.push((space_idx, space_name));
-                        space_idx += 1;
-                    }
-                    None => break,
-                }
-            }
-
-            if spaces.is_empty() {
-                warn!("perform_scan: BonDriver reported no tuning spaces");
+        // 1) Open tuner and enumerate spaces/channels first
+        let plans = match enumerate_spaces_and_channels_blocking(&dll) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("perform_scan: Failed to enumerate spaces/channels: {}", e);
                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results);
             }
+        };
 
-            // 2) 列挙された space だけスキャンする
-            for (space, space_name) in spaces {
-                info!("perform_scan: Scanning space {} ({})", space, space_name);
+        if plans.is_empty() {
+            warn!("perform_scan: BonDriver reported no tuning spaces");
+            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results);
+        }
 
-                match scan_space_blocking(&dll, space) {
-                    Ok(r) => results.extend(r),
-                    Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
-                }
+        // 2) Use all (space, channel list) from enumeration to run scans
+        for (space, space_name, channels) in plans {
+            if channels.is_empty() {
+                warn!(
+                    "perform_scan: Space {} ({}) has no channels from BonDriver enumeration",
+                    space,
+                    space_name
+                );
+                continue;
             }
 
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
-        })
-        .await??;
+            info!(
+                "perform_scan: Scanning space {} ({}) with {} channels",
+                space,
+                space_name,
+                channels.len()
+            );
 
-        all_results = results;
-    } else {
-        // Scan known spaces（元のままでOK）
-        for (space, space_name) in scan_ranges {
-            info!("perform_scan: Scanning space {} ({})", space, space_name);
-            let dll = dll_path.clone();
-
-            let results = tokio::task::spawn_blocking(move || {
-                scan_space_blocking(&dll, space)
-            })
-            .await??;
-
-            all_results.extend(results);
+            match scan_space_blocking(&dll, space, &channels, signal_lock_wait_ms, ts_read_timeout_ms) {
+                Ok(r) => results.extend(r),
+                Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
+            }
         }
-    }
+
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
+    })
+    .await??;
 
     // Convert results to ChannelInfo
     let channel_infos = scan_results_to_channel_infos(&all_results);
@@ -816,6 +891,8 @@ mod tests {
         assert_eq!(config.check_interval_secs, 60);
         assert_eq!(config.max_concurrent_scans, 1);
         assert_eq!(config.scan_timeout_secs, 900);
+        assert_eq!(config.signal_lock_wait_ms, 500);
+        assert_eq!(config.ts_read_timeout_ms, 300000);
     }
 }
 

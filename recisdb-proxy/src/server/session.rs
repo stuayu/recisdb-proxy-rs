@@ -249,14 +249,26 @@ impl Session {
         channel: u32,
     ) -> std::io::Result<()> {
         let config = self.tuner_pool.config().await;
+        let startup_config = crate::tuner::shared::ReaderStartupConfig::from(&config);
         if !config.prewarm_enabled {
             self.stop_warm_tuner().await;
-            return tuner.start_bondriver_reader(tuner_path, space, channel).await;
+            return tuner
+                .start_bondriver_reader(tuner_path, space, channel, startup_config)
+                .await;
         }
 
         if let Some(mut warm) = self.warm_tuner.take() {
             if self.warm_tuner_path.as_deref() == Some(tuner_path.as_str()) {
-                match warm.activate(Arc::clone(&tuner), tuner_path.clone(), space, channel).await {
+                match warm
+                    .activate(
+                        Arc::clone(&tuner),
+                        tuner_path.clone(),
+                        space,
+                        channel,
+                        startup_config,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         self.warm_tuner_path = None;
                         return Ok(());
@@ -273,7 +285,9 @@ impl Session {
             }
         }
 
-        tuner.start_bondriver_reader(tuner_path, space, channel).await
+        tuner
+            .start_bondriver_reader(tuner_path, space, channel, startup_config)
+            .await
     }
 
     async fn build_channel_map_for_space(&self, tuner_path: &str, space: u32)
@@ -1018,24 +1032,25 @@ impl Session {
                 self.handle_open_tuner(tuner_path).await?;
             }
             ClientMessage::OpenTunerWithGroup { group_name } => {
-                self.handle_open_tuner_with_group(group_name).await?;
+                // Reuse OpenTuner path resolution (group_name is supported there).
+                self.handle_open_tuner(group_name).await?;
             }
             ClientMessage::CloseTuner => {
                 self.handle_close_tuner().await?;
             }
-            ClientMessage::SetChannel { channel: _, priority: _, exclusive: _ } => {
-                // TODO: Implement group-aware channel selection
-                self.send_message(ServerMessage::SetChannelAck {
-                    success: false,
-                    error_code: 0xFF00, // Not implemented
-                })
-                .await?;
+            ClientMessage::SetChannel { channel, priority, exclusive } => {
+                self.handle_set_channel(channel, priority, exclusive).await?;
             }
             ClientMessage::SetChannelSpace { space, channel, priority, exclusive } => {
                 self.handle_set_channel_space(space, channel, priority, exclusive).await?;
             }
             ClientMessage::SetChannelSpaceInGroup { group_name, space_idx, channel, priority, exclusive } => {
-                self.handle_set_channel_space_in_group(group_name, space_idx, channel, priority, exclusive).await?;
+                // Group mode is handled by `handle_set_channel_space` via current group context.
+                // Keep the explicit group open path for compatibility.
+                if self.current_group_name.as_deref() != Some(group_name.as_str()) {
+                    self.handle_open_tuner(group_name).await?;
+                }
+                self.handle_set_channel_space(space_idx, channel, priority, exclusive).await?;
             }
             ClientMessage::GetSignalLevel => {
                 self.handle_get_signal_level().await?;
@@ -1349,8 +1364,12 @@ impl Session {
                     0,  // v1 style uses space=0
                     channel as u32,
                 ).await {
-                    error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})", 
-                           self.id, tuner_path, e, e.kind());
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        warn!("[Session {}] Channel unavailable on {}: {}", self.id, tuner_path, e);
+                    } else {
+                        error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})", 
+                               self.id, tuner_path, e, e.kind());
+                    }
                     
                     // Provide more specific error messages based on error kind
                     let error_msg = match e.kind() {
@@ -1736,6 +1755,13 @@ impl Session {
                             info!("[Session {}] Same channel already running on driver {}, reusing existing tuner", 
                                   self.id, existing_key.tuner_path);
 
+                            // Track the actual physical tuner path currently used.
+                            self.current_tuner_path = Some(existing_key.tuner_path.clone());
+                            self.refresh_current_bon_driver_id().await;
+                            self.session_registry
+                                .update_tuner(self.id, Some(existing_key.tuner_path.clone()))
+                                .await;
+
                             // Unsubscribe from old tuner if we had one
                             let old_tuner = self.current_tuner.take();
                             if let Some(old) = old_tuner {
@@ -1978,6 +2004,13 @@ impl Session {
         match tuner_result {
             Ok(tuner) => {
                 info!("[Session {}] Tuner pool returned tuner, is_running={}", self.id, tuner.is_running());
+
+                // Track the actual physical tuner path selected for this session.
+                self.current_tuner_path = Some(actual_tuner_path.clone());
+                self.refresh_current_bon_driver_id().await;
+                self.session_registry
+                    .update_tuner(self.id, Some(actual_tuner_path.clone()))
+                    .await;
                 
                 // Start the BonDriver reader if not already running
                 if !tuner.is_running() {
@@ -1988,7 +2021,11 @@ impl Session {
                         actual_actual_space,
                         actual_bon_channel,
                     ).await {
-                        error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                            warn!("[Session {}] Channel unavailable: {}", self.id, e);
+                        } else {
+                            error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+                        }
                         // Check if we have more fallback drivers to try
                         if !fallback_candidates.is_empty() {
                             warn!("[Session {}] BonDriver reader startup failed, attempting fallback drivers", self.id);
@@ -2312,7 +2349,11 @@ impl Session {
                         space,
                         channel,
                     ).await {
-                        error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                            warn!("[Session {}] Channel unavailable: {}", self.id, e);
+                        } else {
+                            error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+                        }
                         return self.send_message(ServerMessage::SelectLogicalChannelAck {
                             success: false,
                             error_code: ErrorCode::ChannelSetFailed.into(),

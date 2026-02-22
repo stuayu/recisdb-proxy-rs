@@ -59,6 +59,10 @@ pub struct TunerPoolConfig {
     pub keep_alive_secs: u64,
     pub prewarm_enabled: bool,
     pub prewarm_timeout_secs: u64,
+    pub set_channel_retry_interval_ms: u64,
+    pub set_channel_retry_timeout_ms: u64,
+    pub signal_poll_interval_ms: u64,
+    pub signal_wait_timeout_ms: u64,
 }
 
 impl Default for TunerPoolConfig {
@@ -67,6 +71,10 @@ impl Default for TunerPoolConfig {
             keep_alive_secs: 60,
             prewarm_enabled: true,
             prewarm_timeout_secs: 30,
+            set_channel_retry_interval_ms: 500,
+            set_channel_retry_timeout_ms: 10_000,
+            signal_poll_interval_ms: 500,
+            signal_wait_timeout_ms: 10_000,
         }
     }
 }

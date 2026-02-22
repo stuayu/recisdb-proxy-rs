@@ -164,6 +164,19 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(30));
 
+    let client_priority = section
+        .get("Priority")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let client_exclusive = section
+        .get("Exclusive")
+        .map(|s| {
+            let lower = s.to_lowercase();
+            lower == "1" || lower == "true" || lower == "yes" || lower == "on"
+        })
+        .unwrap_or(false);
+
     // TLS settings
     #[cfg(feature = "tls")]
     let tls_enabled = section
@@ -185,6 +198,8 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         tuner_path,
         connect_timeout,
         read_timeout,
+        client_priority,
+        client_exclusive,
         #[cfg(feature = "tls")]
         tls_enabled,
         #[cfg(feature = "tls")]
@@ -212,6 +227,18 @@ fn load_from_env() -> ConnectionConfig {
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(30));
 
+    let client_priority = std::env::var("BONDRIVER_PROXY_PRIORITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let client_exclusive = std::env::var("BONDRIVER_PROXY_EXCLUSIVE")
+        .map(|s| {
+            let lower = s.to_lowercase();
+            lower == "1" || lower == "true" || lower == "yes" || lower == "on"
+        })
+        .unwrap_or(false);
+
     debug!("Using environment/default config: server={}, tuner={}", server_addr, tuner_path);
 
     ConnectionConfig {
@@ -219,6 +246,8 @@ fn load_from_env() -> ConnectionConfig {
         tuner_path,
         connect_timeout,
         read_timeout,
+        client_priority,
+        client_exclusive,
         #[cfg(feature = "tls")]
         tls_enabled: std::env::var("BONDRIVER_PROXY_TLS")
             .map(|s| s == "1" || s.to_lowercase() == "true")

@@ -295,17 +295,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tuner_config = {
         let db_lock = db.lock().await;
         match db_lock.get_tuner_config() {
-            Ok((keep_alive_secs, prewarm_enabled, prewarm_timeout_secs)) => {
+            Ok((
+                keep_alive_secs,
+                prewarm_enabled,
+                prewarm_timeout_secs,
+                set_channel_retry_interval_ms,
+                set_channel_retry_timeout_ms,
+                signal_poll_interval_ms,
+                signal_wait_timeout_ms,
+            )) => {
                 info!(
-                    "Loaded tuner config from database: keep_alive={}s, prewarm_enabled={}, prewarm_timeout={}s",
+                    "Loaded tuner config from database: keep_alive={}s, prewarm_enabled={}, prewarm_timeout={}s, set_retry_interval={}ms, set_retry_timeout={}ms, signal_poll={}ms, signal_wait_timeout={}ms",
                     keep_alive_secs,
                     prewarm_enabled,
-                    prewarm_timeout_secs
+                    prewarm_timeout_secs,
+                    set_channel_retry_interval_ms,
+                    set_channel_retry_timeout_ms,
+                    signal_poll_interval_ms,
+                    signal_wait_timeout_ms
                 );
                 TunerPoolConfig {
                     keep_alive_secs,
                     prewarm_enabled,
                     prewarm_timeout_secs,
+                    set_channel_retry_interval_ms,
+                    set_channel_retry_timeout_ms,
+                    signal_poll_interval_ms,
+                    signal_wait_timeout_ms,
                 }
             }
             Err(e) => {
@@ -376,6 +392,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_interval_secs: args.scan_interval,
             max_concurrent_scans: args.max_concurrent_scans,
             scan_timeout_secs: 900, // From ScanSchedulerConfig default
+            signal_lock_wait_ms: 500,
+            ts_read_timeout_ms: 300000,
         })
     } else {
         None
@@ -385,6 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep_alive_secs: tuner_config.keep_alive_secs,
         prewarm_enabled: tuner_config.prewarm_enabled,
         prewarm_timeout_secs: tuner_config.prewarm_timeout_secs,
+        set_channel_retry_interval_ms: tuner_config.set_channel_retry_interval_ms,
+        set_channel_retry_timeout_ms: tuner_config.set_channel_retry_timeout_ms,
+        signal_poll_interval_ms: tuner_config.signal_poll_interval_ms,
+        signal_wait_timeout_ms: tuner_config.signal_wait_timeout_ms,
     });
 
     // Start web dashboard server
@@ -408,17 +430,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Web dashboard listening on http://{}", web_listen_addr);
 
     // Load scan scheduler configuration from database
-    let (db_check_interval, db_max_concurrent, db_timeout) = {
+    let (db_check_interval, db_max_concurrent, db_timeout, db_signal_lock_wait_ms, db_ts_read_timeout_ms) = {
         let db_lock = db.lock().await;
         match db_lock.get_scan_scheduler_config() {
             Ok(config) => {
-                info!("Loaded scan scheduler config from database: interval={}s, concurrent={}, timeout={}s",
-                      config.0, config.1, config.2);
+                info!(
+                    "Loaded scan scheduler config from database: interval={}s, concurrent={}, timeout={}s, signal_lock_wait={}ms, ts_read_timeout={}ms",
+                    config.0,
+                    config.1,
+                    config.2,
+                    config.3,
+                    config.4
+                );
                 config
             }
             Err(e) => {
                 warn!("Failed to load scan scheduler config from database: {}", e);
-                (args.scan_interval, args.max_concurrent_scans, 900)
+                (args.scan_interval, args.max_concurrent_scans, 900, 500, 300000)
             }
         }
     };
@@ -429,6 +457,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_interval_secs: db_check_interval,
             max_concurrent_scans: db_max_concurrent,
             scan_timeout_secs: db_timeout,
+            signal_lock_wait_ms: db_signal_lock_wait_ms,
+            ts_read_timeout_ms: db_ts_read_timeout_ms,
         };
 
         let scheduler = Arc::new(ScanScheduler::new(

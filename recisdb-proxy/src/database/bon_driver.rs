@@ -314,6 +314,15 @@ impl Database {
         Ok(())
     }
 
+    /// Update DLL path for a BonDriver by ID.
+    pub fn update_bon_driver_path(&self, id: i64, dll_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bon_drivers SET dll_path = ?1, updated_at = strftime('%s', 'now') WHERE id = ?2",
+            params![dll_path, id],
+        )?;
+        Ok(())
+    }
+
     /// Get all BonDrivers in a group by group_name.
     pub fn get_group_drivers(&self, group_name: &str) -> Result<Vec<BonDriverRecord>> {
         let mut stmt = self.conn.prepare(

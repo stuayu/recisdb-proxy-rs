@@ -31,7 +31,7 @@ mod analyzer;
 mod descriptors;
 
 pub use packet::{TsPacket, TsHeader, AdaptationField, TS_PACKET_SIZE, SYNC_BYTE};
-pub use psi::{PsiSection, PsiHeader};
+pub use psi::{PsiSection, PsiHeader, SectionCollector};
 pub use pat::{PatTable, PatEntry};
 pub use pmt::{PmtTable, PmtStream};
 pub use nit::{NitTable, NitTransportStream};

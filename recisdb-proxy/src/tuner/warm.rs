@@ -7,7 +7,7 @@ use log::{error, info, warn};
 use tokio::sync::oneshot;
 
 use crate::bondriver::BonDriverTuner;
-use crate::tuner::shared::SharedTuner;
+use crate::tuner::shared::{ReaderStartupConfig, SharedTuner};
 
 pub enum WarmCommand {
     Start {
@@ -15,6 +15,7 @@ pub enum WarmCommand {
         tuner_path: String,
         space: u32,
         channel: u32,
+        startup_config: ReaderStartupConfig,
         ready_tx: oneshot::Sender<Result<(), String>>,
     },
     Shutdown,
@@ -58,13 +59,14 @@ impl WarmTunerHandle {
                 };
 
                 match cmd {
-                    Some(WarmCommand::Start { shared, tuner_path, space, channel, ready_tx }) => {
+                    Some(WarmCommand::Start { shared, tuner_path, space, channel, startup_config, ready_tx }) => {
                         SharedTuner::run_bondriver_reader_with_tuner(
                             shared,
                             tuner,
                             tuner_path,
                             space,
                             channel,
+                            startup_config,
                             ready_tx,
                         );
                     }
@@ -119,6 +121,7 @@ impl WarmTunerHandle {
         tuner_path: String,
         space: u32,
         channel: u32,
+        startup_config: ReaderStartupConfig,
     ) -> Result<(), std::io::Error> {
         self.ensure_ready().await.map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::Other, err)
@@ -130,6 +133,7 @@ impl WarmTunerHandle {
             tuner_path,
             space,
             channel,
+            startup_config,
             ready_tx: start_tx,
         };
 
