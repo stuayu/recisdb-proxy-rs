@@ -414,8 +414,8 @@ const HTML_CONTENT: &str = r#"
                 </div>
             </div>
             <div class="sort-bar mobile-only">
-                <label for="channel-sort-key">並び替え</label>
-                <select id="channel-sort-key" onchange="setChannelSortFromUI()">
+                <label for="channel-sort-key-1">並び替え</label>
+                <select id="channel-sort-key-1" onchange="setChannelSortFromUI()">
                     <option value="is_enabled">有効</option>
                     <option value="channel_name">チャンネル名</option>
                     <option value="nid">NID/SID/TSID</option>
@@ -429,7 +429,42 @@ const HTML_CONTENT: &str = r#"
                     <option value="bon_channel">BonChannel</option>
                     <option value="priority">優先度</option>
                 </select>
-                <button class="btn btn-secondary btn-sm" id="channel-sort-order" onclick="toggleChannelSortOrder()">昇順</button>
+
+                <select id="channel-sort-key-2" onchange="setChannelSortFromUI()">
+                    <option value="">（第2キーなし）</option>
+                    <option value="is_enabled">有効</option>
+                    <option value="channel_name">チャンネル名</option>
+                    <option value="nid">NID/SID/TSID</option>
+                    <option value="sid">SID</option>
+                    <option value="tsid">TSID</option>
+                    <option value="band_type">バンド</option>
+                    <option value="terrestrial_region">地域</option>
+                    <option value="network_name">ネットワーク</option>
+                    <option value="tuner_count">チューナー</option>
+                    <option value="bon_space">BonSpace</option>
+                    <option value="bon_channel">BonChannel</option>
+                    <option value="priority">優先度</option>
+                </select>
+
+                <select id="channel-sort-key-3" onchange="setChannelSortFromUI()">
+                    <option value="">（第3キーなし）</option>
+                    <option value="is_enabled">有効</option>
+                    <option value="channel_name">チャンネル名</option>
+                    <option value="nid">NID/SID/TSID</option>
+                    <option value="sid">SID</option>
+                    <option value="tsid">TSID</option>
+                    <option value="band_type">バンド</option>
+                    <option value="terrestrial_region">地域</option>
+                    <option value="network_name">ネットワーク</option>
+                    <option value="tuner_count">チューナー</option>
+                    <option value="bon_space">BonSpace</option>
+                    <option value="bon_channel">BonChannel</option>
+                    <option value="priority">優先度</option>
+                </select>
+
+                <button class="btn btn-secondary btn-sm" id="channel-sort-order-1" onclick="toggleChannelSortOrder(0)">第1:昇順</button>
+                <button class="btn btn-secondary btn-sm" id="channel-sort-order-2" onclick="toggleChannelSortOrder(1)">第2:昇順</button>
+                <button class="btn btn-secondary btn-sm" id="channel-sort-order-3" onclick="toggleChannelSortOrder(2)">第3:昇順</button>
             </div>
             <table id="channels-table" class="responsive-table">
                 <thead>
@@ -1270,8 +1305,11 @@ const HTML_CONTENT: &str = r#"
 
         // Channels - sorting state
         let channelData = [];
-        let channelSortKey = 'nid';
-        let channelSortAsc = true;
+        let channelSortRules = [
+            { key: 'nid', asc: true },
+            { key: 'sid', asc: true },
+            { key: 'tsid', asc: true },
+        ];
 
         // Clients table column visibility
         let clientsColumnVisibility = {};
@@ -1358,7 +1396,7 @@ const HTML_CONTENT: &str = r#"
         function getChannelSortValue(channel, key) {
             switch (key) {
                 case 'nid':
-                    return [channel.nid ?? -1, channel.sid ?? -1, channel.tsid ?? -1];
+                    return channel.nid ?? -1;
                 case 'sid':
                     return channel.sid ?? -1;
                 case 'tsid':
@@ -1380,6 +1418,46 @@ const HTML_CONTENT: &str = r#"
             }
         }
 
+        function normalizeChannelSortRules(rules) {
+            const allowed = new Set([
+                'is_enabled', 'channel_name', 'nid', 'sid', 'tsid', 'band_type',
+                'terrestrial_region', 'network_name', 'tuner_count',
+                'bon_space', 'bon_channel', 'priority'
+            ]);
+
+            const unique = [];
+            const used = new Set();
+            for (const rule of rules) {
+                const key = rule?.key;
+                if (!key || !allowed.has(key) || used.has(key)) continue;
+                unique.push({ key, asc: rule.asc !== false });
+                used.add(key);
+                if (unique.length >= 3) break;
+            }
+
+            if (unique.length === 0) unique.push({ key: 'nid', asc: true });
+            return unique;
+        }
+
+        function compareChannelValues(a, b) {
+            let va = a;
+            let vb = b;
+
+            if (va === null || va === undefined) va = '';
+            if (vb === null || vb === undefined) vb = '';
+
+            if (typeof va === 'number' && typeof vb === 'number') {
+                return va - vb;
+            }
+            if (typeof va === 'boolean' && typeof vb === 'boolean') {
+                return va === vb ? 0 : (va ? -1 : 1);
+            }
+
+            const strA = String(va).toLowerCase();
+            const strB = String(vb).toLowerCase();
+            return strA.localeCompare(strB, 'ja');
+        }
+
         function renderChannels() {
             const tbody = document.getElementById('channels-body');
             if (channelData.length === 0) {
@@ -1388,36 +1466,16 @@ const HTML_CONTENT: &str = r#"
                 return;
             }
 
-            // Sort the data
+            // Sort the data (multi-key)
+            const rules = normalizeChannelSortRules(channelSortRules);
             const sorted = [...channelData].sort((a, b) => {
-                let va = getChannelSortValue(a, channelSortKey);
-                let vb = getChannelSortValue(b, channelSortKey);
-
-                // Composite compare for NID/SID/TSID
-                if (Array.isArray(va) && Array.isArray(vb)) {
-                    for (let i = 0; i < Math.min(va.length, vb.length); i++) {
-                        const diff = (va[i] ?? 0) - (vb[i] ?? 0);
-                        if (diff !== 0) return channelSortAsc ? diff : -diff;
-                    }
-                    return 0;
+                for (const rule of rules) {
+                    const va = getChannelSortValue(a, rule.key);
+                    const vb = getChannelSortValue(b, rule.key);
+                    const cmp = compareChannelValues(va, vb);
+                    if (cmp !== 0) return rule.asc ? cmp : -cmp;
                 }
-
-                // Handle null/undefined
-                if (va === null || va === undefined) va = '';
-                if (vb === null || vb === undefined) vb = '';
-
-                // Numeric comparison for number fields
-                if (typeof va === 'number' && typeof vb === 'number') {
-                    return channelSortAsc ? va - vb : vb - va;
-                }
-                // Boolean comparison
-                if (typeof va === 'boolean') {
-                    return channelSortAsc ? (va === vb ? 0 : va ? -1 : 1) : (va === vb ? 0 : va ? 1 : -1);
-                }
-                // String comparison
-                const strA = String(va).toLowerCase();
-                const strB = String(vb).toLowerCase();
-                return channelSortAsc ? strA.localeCompare(strB, 'ja') : strB.localeCompare(strA, 'ja');
+                return 0;
             });
 
             tbody.innerHTML = sorted.map(c => `
@@ -1446,11 +1504,18 @@ const HTML_CONTENT: &str = r#"
         }
 
         function sortChannels(key) {
-            if (channelSortKey === key) {
-                channelSortAsc = !channelSortAsc;
+            channelSortRules = normalizeChannelSortRules(channelSortRules);
+            const idx = channelSortRules.findIndex(r => r.key === key);
+            if (idx === 0) {
+                channelSortRules[0].asc = !channelSortRules[0].asc;
             } else {
-                channelSortKey = key;
-                channelSortAsc = true;
+                let asc = true;
+                if (idx > 0) {
+                    asc = channelSortRules[idx].asc;
+                    channelSortRules.splice(idx, 1);
+                }
+                channelSortRules.unshift({ key, asc });
+                channelSortRules = normalizeChannelSortRules(channelSortRules);
             }
             updateChannelSortIndicators();
             updateChannelSortUI();
@@ -1460,31 +1525,72 @@ const HTML_CONTENT: &str = r#"
         function updateChannelSortIndicators() {
             document.querySelectorAll('#channels-table th.sortable').forEach(th => {
                 th.classList.remove('asc', 'desc');
-                if (th.dataset.sort === channelSortKey) {
-                    th.classList.add(channelSortAsc ? 'asc' : 'desc');
+                th.removeAttribute('title');
+            });
+
+            const rules = normalizeChannelSortRules(channelSortRules);
+            document.querySelectorAll('#channels-table th.sortable').forEach(th => {
+                const key = th.dataset.sort;
+                const idx = rules.findIndex(r => r.key === key);
+                if (idx === 0) {
+                    th.classList.add(rules[0].asc ? 'asc' : 'desc');
+                    th.setAttribute('title', '第1ソートキー');
+                } else if (idx > 0) {
+                    th.setAttribute('title', `第${idx + 1}ソートキー`);
                 }
             });
         }
 
         function updateChannelSortUI() {
-            const select = document.getElementById('channel-sort-key');
-            const orderBtn = document.getElementById('channel-sort-order');
-            if (select) select.value = channelSortKey;
-            if (orderBtn) orderBtn.textContent = channelSortAsc ? '昇順' : '降順';
+            channelSortRules = normalizeChannelSortRules(channelSortRules);
+
+            const key1 = document.getElementById('channel-sort-key-1');
+            const key2 = document.getElementById('channel-sort-key-2');
+            const key3 = document.getElementById('channel-sort-key-3');
+            const order1 = document.getElementById('channel-sort-order-1');
+            const order2 = document.getElementById('channel-sort-order-2');
+            const order3 = document.getElementById('channel-sort-order-3');
+
+            const r1 = channelSortRules[0];
+            const r2 = channelSortRules[1];
+            const r3 = channelSortRules[2];
+
+            if (key1 && r1) key1.value = r1.key;
+            if (key2) key2.value = r2 ? r2.key : '';
+            if (key3) key3.value = r3 ? r3.key : '';
+
+            if (order1 && r1) order1.textContent = `第1:${r1.asc ? '昇順' : '降順'}`;
+            if (order2) {
+                order2.disabled = !r2;
+                order2.textContent = `第2:${r2 ? (r2.asc ? '昇順' : '降順') : '-'}`;
+            }
+            if (order3) {
+                order3.disabled = !r3;
+                order3.textContent = `第3:${r3 ? (r3.asc ? '昇順' : '降順') : '-'}`;
+            }
         }
 
         function setChannelSortFromUI() {
-            const select = document.getElementById('channel-sort-key');
-            if (!select) return;
-            channelSortKey = select.value;
-            channelSortAsc = true;
+            const key1 = document.getElementById('channel-sort-key-1')?.value;
+            const key2 = document.getElementById('channel-sort-key-2')?.value;
+            const key3 = document.getElementById('channel-sort-key-3')?.value;
+
+            const oldAsc = new Map(normalizeChannelSortRules(channelSortRules).map(r => [r.key, r.asc]));
+            channelSortRules = normalizeChannelSortRules([
+                { key: key1, asc: oldAsc.has(key1) ? oldAsc.get(key1) : true },
+                { key: key2, asc: oldAsc.has(key2) ? oldAsc.get(key2) : true },
+                { key: key3, asc: oldAsc.has(key3) ? oldAsc.get(key3) : true },
+            ]);
+
             updateChannelSortIndicators();
             updateChannelSortUI();
             renderChannels();
         }
 
-        function toggleChannelSortOrder() {
-            channelSortAsc = !channelSortAsc;
+        function toggleChannelSortOrder(index) {
+            channelSortRules = normalizeChannelSortRules(channelSortRules);
+            if (index < 0 || index >= channelSortRules.length) return;
+            channelSortRules[index].asc = !channelSortRules[index].asc;
             updateChannelSortIndicators();
             updateChannelSortUI();
             renderChannels();
