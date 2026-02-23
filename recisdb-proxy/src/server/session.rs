@@ -367,6 +367,27 @@ impl Session {
         Ok(())
     }
 
+    async fn restart_tsreplace_pipeline_if_streaming(&mut self) {
+        if self.state != SessionState::Streaming {
+            return;
+        }
+
+        if let Err(e) = self.start_tsreplace_pipeline().await {
+            if self.tsreplace_passthrough_on_error {
+                warn!(
+                    "[Session {}] tsreplace restart failed on channel switch, fallback to raw TS: {}",
+                    self.id, e
+                );
+                self.stop_tsreplace_pipeline().await;
+            } else {
+                warn!(
+                    "[Session {}] tsreplace restart failed on channel switch: {}",
+                    self.id, e
+                );
+            }
+        }
+    }
+
     /// Get a reference to the database.
     #[allow(dead_code)]
     pub fn database(&self) -> &DatabaseHandle {
@@ -1054,25 +1075,43 @@ impl Session {
                         match ts_result {
                             Some(Ok(data)) => {
                                 if let Some(tx) = &self.tsreplace_input_tx {
-                                    if tx.send(data.clone()).await.is_err() {
-                                        warn!("[Session {}] tsreplace input channel closed", self.id);
-                                        if self.tsreplace_passthrough_on_error {
-                                            self.stop_tsreplace_pipeline().await;
-                                            self.send_ts_data(data).await?;
-                                        } else {
-                                            self.disconnect_reason = Some("tsreplace_input_closed".to_string());
-                                            break;
+                                    match tx.try_send(data.clone()) {
+                                        Ok(()) => {
+                                            if self.tsreplace_passthrough_on_error
+                                                && self.tsreplace_last_output_at.elapsed() > self.tsreplace_read_timeout
+                                            {
+                                                warn!(
+                                                    "[Session {}] tsreplace stalled for {:?}, fallback to raw TS",
+                                                    self.id,
+                                                    self.tsreplace_last_output_at.elapsed()
+                                                );
+                                                self.stop_tsreplace_pipeline().await;
+                                                self.send_ts_data(data).await?;
+                                            }
                                         }
-                                    } else if self.tsreplace_passthrough_on_error
-                                        && self.tsreplace_last_output_at.elapsed() > self.tsreplace_read_timeout
-                                    {
-                                        warn!(
-                                            "[Session {}] tsreplace stalled for {:?}, fallback to raw TS",
-                                            self.id,
-                                            self.tsreplace_last_output_at.elapsed()
-                                        );
-                                        self.stop_tsreplace_pipeline().await;
-                                        self.send_ts_data(data).await?;
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            warn!(
+                                                "[Session {}] tsreplace input queue full; treating as stall",
+                                                self.id
+                                            );
+                                            if self.tsreplace_passthrough_on_error {
+                                                self.stop_tsreplace_pipeline().await;
+                                                self.send_ts_data(data).await?;
+                                            } else {
+                                                self.disconnect_reason = Some("tsreplace_input_backpressure".to_string());
+                                                break;
+                                            }
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            warn!("[Session {}] tsreplace input channel closed", self.id);
+                                            if self.tsreplace_passthrough_on_error {
+                                                self.stop_tsreplace_pipeline().await;
+                                                self.send_ts_data(data).await?;
+                                            } else {
+                                                self.disconnect_reason = Some("tsreplace_input_closed".to_string());
+                                                break;
+                                            }
+                                        }
                                     }
                                 } else {
                                     self.send_ts_data(data).await?;
@@ -1605,6 +1644,8 @@ impl Session {
                 if let Some(tuner) = &self.current_tuner {
                     tuner.notify_channel_change();
                 }
+
+                self.restart_tsreplace_pipeline_if_streaming().await;
                 
                 self.send_message(ServerMessage::SetChannelAck {
                     success: true,
@@ -2258,6 +2299,7 @@ impl Session {
                                                 if self.state == SessionState::Streaming {
                                                     self.ts_receiver = Some(fb_tuner.clone().subscribe());
                                                 }
+                                                self.restart_tsreplace_pipeline_if_streaming().await;
                                                 return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                                             }
                                         }
@@ -2287,6 +2329,8 @@ impl Session {
                     info!("[Session {}] Re-subscribing to new tuner after channel switch", self.id);
                     self.ts_receiver = Some(tuner.subscribe());
                 }
+
+                self.restart_tsreplace_pipeline_if_streaming().await;
 
                 // Update session registry with channel info and name
                 let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
@@ -2594,6 +2638,8 @@ impl Session {
                 if let Some(tuner) = &self.current_tuner {
                     tuner.notify_channel_change();
                 }
+
+                self.restart_tsreplace_pipeline_if_streaming().await;
 
                 if self.state == SessionState::Ready {
                     self.state = SessionState::TunerOpen;
