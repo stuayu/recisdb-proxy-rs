@@ -19,6 +19,11 @@ use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
 use thiserror::Error;
 
+const DEFAULT_TSREPLACE_COMMAND_PATH: &str = "tsreplace";
+const DEFAULT_TSREPLACE_ARGUMENTS: &str = "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -";
+const DEFAULT_TSREPLACE_READ_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR: bool = true;
+
 /// Database error types.
 #[derive(Error, Debug)]
 pub enum DatabaseError {
@@ -370,8 +375,72 @@ impl Database {
 
 /// tsreplace configuration storage.
 impl Database {
+    fn ensure_tsreplace_config_compat(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tsreplace_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER DEFAULT 0,
+                command_path TEXT DEFAULT 'tsreplace',
+                arguments TEXT DEFAULT '',
+                read_timeout_ms INTEGER DEFAULT 10000,
+                passthrough_on_error INTEGER DEFAULT 1,
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            );",
+        )?;
+
+        self.add_column_if_not_exists("tsreplace_config", "enabled", "INTEGER DEFAULT 0")?;
+        self.add_column_if_not_exists("tsreplace_config", "command_path", "TEXT DEFAULT 'tsreplace'")?;
+        self.add_column_if_not_exists("tsreplace_config", "arguments", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("tsreplace_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
+        self.add_column_if_not_exists("tsreplace_config", "passthrough_on_error", "INTEGER DEFAULT 1")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "updated_at",
+            "INTEGER DEFAULT (strftime('%s', 'now'))",
+        )?;
+
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tsreplace_config
+             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, updated_at)
+             VALUES (1, 0, ?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+            rusqlite::params![
+                DEFAULT_TSREPLACE_COMMAND_PATH,
+                DEFAULT_TSREPLACE_ARGUMENTS,
+                DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
+                if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 }
+            ],
+        )?;
+
+        // If parameters are unspecified in legacy DB rows, apply requested defaults.
+        self.conn.execute(
+            "UPDATE tsreplace_config
+             SET command_path = ?1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1 AND (command_path IS NULL OR trim(command_path) = '')",
+            rusqlite::params![DEFAULT_TSREPLACE_COMMAND_PATH],
+        )?;
+        self.conn.execute(
+            "UPDATE tsreplace_config
+             SET arguments = ?1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1 AND (arguments IS NULL OR trim(arguments) = '')",
+            rusqlite::params![DEFAULT_TSREPLACE_ARGUMENTS],
+        )?;
+        self.conn.execute(
+            "UPDATE tsreplace_config
+             SET read_timeout_ms = ?1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1 AND (read_timeout_ms IS NULL OR read_timeout_ms <= 0)",
+            rusqlite::params![DEFAULT_TSREPLACE_READ_TIMEOUT_MS],
+        )?;
+
+        Ok(())
+    }
+
     /// Get tsreplace configuration from database.
     pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool)> {
+        self.ensure_tsreplace_config_compat()?;
+
         let mut stmt = self.conn.prepare(
             "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error
              FROM tsreplace_config WHERE id = 1"
@@ -395,10 +464,21 @@ impl Database {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO tsreplace_config
                      (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)
-                     VALUES (1, 0, 'tsreplace', '', 10000, 1)",
-                    [],
+                     VALUES (1, 0, ?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        DEFAULT_TSREPLACE_COMMAND_PATH,
+                        DEFAULT_TSREPLACE_ARGUMENTS,
+                        DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
+                        if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 }
+                    ],
                 )?;
-                Ok((false, "tsreplace".to_string(), "".to_string(), 10_000, true))
+                Ok((
+                    false,
+                    DEFAULT_TSREPLACE_COMMAND_PATH.to_string(),
+                    DEFAULT_TSREPLACE_ARGUMENTS.to_string(),
+                    DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
+                    DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR,
+                ))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
         }

@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS tsreplace_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     enabled INTEGER DEFAULT 0,
     command_path TEXT DEFAULT 'tsreplace',
-    arguments TEXT DEFAULT '',
+    arguments TEXT DEFAULT '-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -',
     read_timeout_ms INTEGER DEFAULT 10000,
     passthrough_on_error INTEGER DEFAULT 1,
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
