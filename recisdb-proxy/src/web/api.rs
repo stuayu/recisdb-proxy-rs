@@ -1180,6 +1180,102 @@ pub async fn update_tuner_config(
     }))
 }
 
+/// Get external encoder (tsreplace) configuration.
+pub async fn get_tsreplace_config(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    match db.get_tsreplace_config() {
+        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => {
+            Json(json!({
+                "success": true,
+                "config": {
+                    "enabled": enabled,
+                    "command_path": command_path,
+                    "arguments": arguments,
+                    "read_timeout_ms": read_timeout_ms,
+                    "passthrough_on_error": passthrough_on_error,
+                }
+            }))
+        }
+        Err(e) => Json(json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+/// Update external encoder (tsreplace) configuration request.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTsreplaceConfigRequest {
+    pub enabled: Option<bool>,
+    pub command_path: Option<String>,
+    pub arguments: Option<String>,
+    pub read_timeout_ms: Option<u64>,
+    pub passthrough_on_error: Option<bool>,
+}
+
+/// Update external encoder (tsreplace) configuration.
+pub async fn update_tsreplace_config(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdateTsreplaceConfigRequest>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    let (mut enabled, mut command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error) =
+        match db.get_tsreplace_config() {
+            Ok(config) => config,
+            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true),
+        };
+
+    if let Some(val) = payload.enabled {
+        enabled = val;
+    }
+    if let Some(val) = payload.command_path {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            command_path = trimmed.to_string();
+        }
+    }
+    if let Some(val) = payload.arguments {
+        arguments = val;
+    }
+    if let Some(val) = payload.read_timeout_ms {
+        if val > 0 {
+            read_timeout_ms = val;
+        }
+    }
+    if let Some(val) = payload.passthrough_on_error {
+        passthrough_on_error = val;
+    }
+
+    if let Err(e) = db.update_tsreplace_config(
+        enabled,
+        &command_path,
+        &arguments,
+        read_timeout_ms,
+        passthrough_on_error,
+    ) {
+        return Json(json!({
+            "success": false,
+            "error": format!("Failed to save configuration: {}", e)
+        }));
+    }
+
+    Json(json!({
+        "success": true,
+        "message": "tsreplace configuration saved successfully",
+        "config": {
+            "enabled": enabled,
+            "command_path": command_path,
+            "arguments": arguments,
+            "read_timeout_ms": read_timeout_ms,
+            "passthrough_on_error": passthrough_on_error,
+        }
+    }))
+}
+
 /// Get scan scheduler configuration.
 pub async fn get_scan_config(
     State(web_state): State<Arc<WebState>>,

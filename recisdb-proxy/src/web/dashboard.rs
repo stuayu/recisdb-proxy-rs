@@ -582,6 +582,48 @@ const HTML_CONTENT: &str = r#"
 
                 <div id="tuner-config-message" style="margin-top: 15px; display: none;"></div>
             </div>
+
+            <h3 style="margin-top: 30px;">外部エンコード（tsreplace）設定</h3>
+            <div class="settings-form">
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="tsreplace-enabled">
+                        tsreplace連携を有効にする
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-command-path">実行コマンド</label>
+                    <input type="text" id="tsreplace-command-path" placeholder="例: tsreplace または /usr/local/bin/tsreplace">
+                    <small>PATH解決されるコマンド名、または絶対パス</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-arguments">引数テンプレート</label>
+                    <input type="text" id="tsreplace-arguments" placeholder="例: --preset fast --output -">
+                    <small>起動時に付与する引数（空欄可）</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-read-timeout">読み取りタイムアウト（ms）</label>
+                    <input type="number" id="tsreplace-read-timeout" min="1" value="10000">
+                    <small>外部プロセス出力を待つ最大時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="tsreplace-passthrough-on-error" checked>
+                        エラー時は非エンコードTSでフォールバック
+                    </label>
+                </div>
+
+                <div style="margin-top: 20px; display: flex; gap: 10px;">
+                    <button class="btn btn-primary" onclick="saveTsreplaceConfig()">保存</button>
+                    <button class="btn btn-secondary" onclick="loadTsreplaceConfig()">リセット</button>
+                </div>
+
+                <div id="tsreplace-config-message" style="margin-top: 15px; display: none;"></div>
+            </div>
         </div>
 
         <!-- History Tab -->
@@ -2086,6 +2128,83 @@ const HTML_CONTENT: &str = r#"
             document.getElementById('tuner-config-message').style.display = 'none';
         }
 
+        // tsreplace Config Functions
+        async function loadTsreplaceConfig() {
+            try {
+                const response = await fetch('/api/tsreplace-config');
+                const data = await response.json();
+                if (data.success && data.config) {
+                    document.getElementById('tsreplace-enabled').checked = !!data.config.enabled;
+                    document.getElementById('tsreplace-command-path').value = data.config.command_path || 'tsreplace';
+                    document.getElementById('tsreplace-arguments').value = data.config.arguments || '';
+                    document.getElementById('tsreplace-read-timeout').value = data.config.read_timeout_ms ?? 10000;
+                    document.getElementById('tsreplace-passthrough-on-error').checked = !!data.config.passthrough_on_error;
+                    hideTsreplaceConfigMessage();
+                }
+            } catch (e) {
+                console.error('Failed to load tsreplace config:', e);
+            }
+        }
+
+        async function saveTsreplaceConfig() {
+            const commandPath = document.getElementById('tsreplace-command-path').value.trim();
+            const readTimeoutMs = parseInt(document.getElementById('tsreplace-read-timeout').value, 10);
+
+            if (!commandPath) {
+                showTsreplaceConfigMessage('実行コマンドは必須です', 'error');
+                return;
+            }
+            if (!Number.isFinite(readTimeoutMs) || readTimeoutMs <= 0) {
+                showTsreplaceConfigMessage('読み取りタイムアウトは正の数値を入力してください', 'error');
+                return;
+            }
+
+            const payload = {
+                enabled: document.getElementById('tsreplace-enabled').checked,
+                command_path: commandPath,
+                arguments: document.getElementById('tsreplace-arguments').value,
+                read_timeout_ms: readTimeoutMs,
+                passthrough_on_error: document.getElementById('tsreplace-passthrough-on-error').checked,
+            };
+
+            try {
+                const response = await fetch('/api/tsreplace-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showTsreplaceConfigMessage('設定を保存しました', 'success');
+                } else {
+                    showTsreplaceConfigMessage('設定の保存に失敗しました: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                showTsreplaceConfigMessage('設定の保存に失敗しました: ' + e.message, 'error');
+            }
+        }
+
+        function showTsreplaceConfigMessage(message, type) {
+            const msgEl = document.getElementById('tsreplace-config-message');
+            msgEl.textContent = message;
+            msgEl.style.display = 'block';
+            msgEl.style.padding = '10px 12px';
+            msgEl.style.borderRadius = '4px';
+            msgEl.style.fontSize = '13px';
+            if (type === 'success') {
+                msgEl.style.background = '#d4edda';
+                msgEl.style.color = '#155724';
+            } else {
+                msgEl.style.background = '#f8d7da';
+                msgEl.style.color = '#721c24';
+            }
+            setTimeout(hideTsreplaceConfigMessage, 5000);
+        }
+
+        function hideTsreplaceConfigMessage() {
+            document.getElementById('tsreplace-config-message').style.display = 'none';
+        }
+
         // Initialize
         window.addEventListener('load', () => {
             initClientsColumnPicker();
@@ -2093,6 +2212,7 @@ const HTML_CONTENT: &str = r#"
             refreshClients();
             loadScanConfig();
             loadTunerConfig();
+            loadTsreplaceConfig();
             enableTableSorting('clients-table');
             enableTableSorting('bondrivers-table');
             enableTableSorting('history-table');

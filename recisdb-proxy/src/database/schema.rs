@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS tuner_config (
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
+-- External encoder (tsreplace) configuration table
+CREATE TABLE IF NOT EXISTS tsreplace_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER DEFAULT 0,
+    command_path TEXT DEFAULT 'tsreplace',
+    arguments TEXT DEFAULT '',
+    read_timeout_ms INTEGER DEFAULT 10000,
+    passthrough_on_error INTEGER DEFAULT 1,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 -- Session history table
 CREATE TABLE IF NOT EXISTS session_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

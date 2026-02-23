@@ -368,6 +368,67 @@ impl Database {
     }
 }
 
+/// tsreplace configuration storage.
+impl Database {
+    /// Get tsreplace configuration from database.
+    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error
+             FROM tsreplace_config WHERE id = 1"
+        )?;
+
+        let result = stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? != 0,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        });
+
+        match result {
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => {
+                Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO tsreplace_config
+                     (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)
+                     VALUES (1, 0, 'tsreplace', '', 10000, 1)",
+                    [],
+                )?;
+                Ok((false, "tsreplace".to_string(), "".to_string(), 10_000, true))
+            }
+            Err(e) => Err(DatabaseError::Sqlite(e)),
+        }
+    }
+
+    /// Update tsreplace configuration.
+    pub fn update_tsreplace_config(
+        &self,
+        enabled: bool,
+        command_path: &str,
+        arguments: &str,
+        read_timeout_ms: u64,
+        passthrough_on_error: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tsreplace_config
+             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
+            rusqlite::params![
+                if enabled { 1 } else { 0 },
+                command_path,
+                arguments,
+                read_timeout_ms,
+                if passthrough_on_error { 1 } else { 0 }
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

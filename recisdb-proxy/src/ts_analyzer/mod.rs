@@ -37,7 +37,7 @@ pub use pmt::{PmtTable, PmtStream};
 pub use nit::{NitTable, NitTransportStream};
 pub use sdt::{SdtTable, SdtService};
 pub use analyzer::{TsAnalyzer, AnalyzerConfig, AnalyzerResult};
-pub use descriptors::{ServiceDescriptor, TerrestrialDeliveryDescriptor};
+pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliveryDescriptor};
 
 /// Well-known PIDs in MPEG-TS.
 pub mod pid {

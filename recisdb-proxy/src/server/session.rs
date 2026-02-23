@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
@@ -37,6 +38,15 @@ enum SessionState {
     Streaming,
     /// Session is closing.
     Closing,
+}
+
+#[derive(Debug, Clone)]
+struct TsreplaceRuntimeConfig {
+    enabled: bool,
+    command_path: String,
+    arguments: String,
+    read_timeout_ms: u64,
+    passthrough_on_error: bool,
 }
 
 fn fallback_space_label(actual_space: u32) -> String {
@@ -145,6 +155,18 @@ pub struct Session {
     flushed_dropped: u64,
     flushed_scrambled: u64,
     flushed_error: u64,
+    /// tsreplace stdin input channel.
+    tsreplace_input_tx: Option<mpsc::Sender<Bytes>>,
+    /// tsreplace stdout output channel.
+    tsreplace_output_rx: Option<mpsc::Receiver<Bytes>>,
+    /// tsreplace process handle.
+    tsreplace_child: Option<Child>,
+    /// tsreplace output stall timeout.
+    tsreplace_read_timeout: std::time::Duration,
+    /// Fallback to raw TS when tsreplace fails/stalls.
+    tsreplace_passthrough_on_error: bool,
+    /// Last time encoded output was received.
+    tsreplace_last_output_at: std::time::Instant,
 }
 
 impl Session {
@@ -203,7 +225,146 @@ impl Session {
             flushed_dropped: 0,
             flushed_scrambled: 0,
             flushed_error: 0,
+            tsreplace_input_tx: None,
+            tsreplace_output_rx: None,
+            tsreplace_child: None,
+            tsreplace_read_timeout: std::time::Duration::from_millis(10_000),
+            tsreplace_passthrough_on_error: true,
+            tsreplace_last_output_at: std::time::Instant::now(),
         }
+    }
+
+    async fn load_tsreplace_runtime_config(&self) -> TsreplaceRuntimeConfig {
+        let db = self.database.lock().await;
+        match db.get_tsreplace_config() {
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => TsreplaceRuntimeConfig {
+                enabled,
+                command_path,
+                arguments,
+                read_timeout_ms,
+                passthrough_on_error,
+            },
+            Err(e) => {
+                warn!("[Session {}] Failed to load tsreplace config: {}", self.id, e);
+                TsreplaceRuntimeConfig {
+                    enabled: false,
+                    command_path: "tsreplace".to_string(),
+                    arguments: String::new(),
+                    read_timeout_ms: 10_000,
+                    passthrough_on_error: true,
+                }
+            }
+        }
+    }
+
+    async fn stop_tsreplace_pipeline(&mut self) {
+        self.tsreplace_input_tx = None;
+        self.tsreplace_output_rx = None;
+
+        if let Some(mut child) = self.tsreplace_child.take() {
+            if let Err(e) = child.start_kill() {
+                debug!("[Session {}] tsreplace kill skipped: {}", self.id, e);
+            }
+            let _ = child.wait().await;
+        }
+    }
+
+    async fn start_tsreplace_pipeline(&mut self) -> std::io::Result<()> {
+        self.stop_tsreplace_pipeline().await;
+
+        let cfg = self.load_tsreplace_runtime_config().await;
+        self.tsreplace_passthrough_on_error = cfg.passthrough_on_error;
+        self.tsreplace_read_timeout = std::time::Duration::from_millis(cfg.read_timeout_ms.max(1));
+
+        if !cfg.enabled {
+            return Ok(());
+        }
+
+        let mut cmd = Command::new(&cfg.command_path);
+        for arg in cfg.arguments.split_whitespace() {
+            cmd.arg(arg);
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn tsreplace '{}': {}", cfg.command_path, e),
+            )
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace stdin not available")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace stdout not available")
+        })?;
+
+        let stderr = child.stderr.take();
+
+        let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(64);
+        let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
+
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(chunk) = in_rx.recv().await {
+                if let Err(e) = stdin.write_all(&chunk).await {
+                    warn!("[tsreplace] stdin write failed: {}", e);
+                    break;
+                }
+            }
+            let _ = stdin.shutdown().await;
+        });
+
+        tokio::spawn(async move {
+            let mut stdout = stdout;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if out_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[tsreplace] stdout read failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => debug!("[tsreplace] {}", line),
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!("[tsreplace] stderr read failed: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        self.tsreplace_input_tx = Some(in_tx);
+        self.tsreplace_output_rx = Some(out_rx);
+        self.tsreplace_child = Some(child);
+        self.tsreplace_last_output_at = std::time::Instant::now();
+
+        info!(
+            "[Session {}] tsreplace pipeline started: command='{}' args='{}'",
+            self.id, cfg.command_path, cfg.arguments
+        );
+
+        Ok(())
     }
 
     /// Get a reference to the database.
@@ -859,6 +1020,28 @@ impl Session {
                         break;
                     }
 
+                    // Encoded output from tsreplace
+                    encoded_result = async {
+                        if let Some(rx) = &mut self.tsreplace_output_rx {
+                            rx.recv().await
+                        } else {
+                            None
+                        }
+                    } => {
+                        if let Some(data) = encoded_result {
+                            self.tsreplace_last_output_at = std::time::Instant::now();
+                            self.send_ts_data(data).await?;
+                        } else if self.tsreplace_output_rx.is_some() {
+                            warn!("[Session {}] tsreplace output channel closed", self.id);
+                            if self.tsreplace_passthrough_on_error {
+                                self.stop_tsreplace_pipeline().await;
+                            } else {
+                                self.disconnect_reason = Some("tsreplace_output_closed".to_string());
+                                break;
+                            }
+                        }
+                    }
+
                     // Check for incoming TS data
                     ts_result = async {
                         if let Some(rx) = &mut self.ts_receiver {
@@ -870,7 +1053,30 @@ impl Session {
                     } => {
                         match ts_result {
                             Some(Ok(data)) => {
-                                self.send_ts_data(data).await?;
+                                if let Some(tx) = &self.tsreplace_input_tx {
+                                    if tx.send(data.clone()).await.is_err() {
+                                        warn!("[Session {}] tsreplace input channel closed", self.id);
+                                        if self.tsreplace_passthrough_on_error {
+                                            self.stop_tsreplace_pipeline().await;
+                                            self.send_ts_data(data).await?;
+                                        } else {
+                                            self.disconnect_reason = Some("tsreplace_input_closed".to_string());
+                                            break;
+                                        }
+                                    } else if self.tsreplace_passthrough_on_error
+                                        && self.tsreplace_last_output_at.elapsed() > self.tsreplace_read_timeout
+                                    {
+                                        warn!(
+                                            "[Session {}] tsreplace stalled for {:?}, fallback to raw TS",
+                                            self.id,
+                                            self.tsreplace_last_output_at.elapsed()
+                                        );
+                                        self.stop_tsreplace_pipeline().await;
+                                        self.send_ts_data(data).await?;
+                                    }
+                                } else {
+                                    self.send_ts_data(data).await?;
+                                }
                             }
                             Some(Err(broadcast::error::RecvError::Lagged(count))) => {
                                 warn!("[Session {}] Broadcast receiver lagged, skipped {} messages", self.id, count);
@@ -2200,6 +2406,23 @@ impl Session {
         self.state = SessionState::Streaming;
         self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
+        if let Err(e) = self.start_tsreplace_pipeline().await {
+            if self.tsreplace_passthrough_on_error {
+                warn!("[Session {}] tsreplace unavailable, fallback to raw TS: {}", self.id, e);
+                self.stop_tsreplace_pipeline().await;
+            } else {
+                tuner.unsubscribe();
+                self.ts_receiver = None;
+                self.state = SessionState::TunerOpen;
+                return self
+                    .send_message(ServerMessage::StartStreamAck {
+                        success: false,
+                        error_code: ErrorCode::TunerOpenFailed.into(),
+                    })
+                    .await;
+            }
+        }
+
         // Update session registry
         self.session_registry.update_streaming(self.id, true).await;
 
@@ -2228,6 +2451,7 @@ impl Session {
             }
         }
         self.ts_receiver = None;
+        self.stop_tsreplace_pipeline().await;
         self.state = SessionState::TunerOpen;
 
         // Update session registry
@@ -2676,6 +2900,7 @@ impl Session {
             }
         }
         self.ts_receiver = None;
+        self.stop_tsreplace_pipeline().await;
         let final_tuner_path = self.current_tuner_path.clone();
         self.current_tuner_path = None;
 

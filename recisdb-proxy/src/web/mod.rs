@@ -77,6 +77,9 @@ pub async fn start_web_server(
         // Tuner optimization configuration API
         .route("/api/tuner-config", get(api::get_tuner_config))
         .route("/api/tuner-config", post(api::update_tuner_config))
+        // External encoder (tsreplace) configuration API
+        .route("/api/tsreplace-config", get(api::get_tsreplace_config))
+        .route("/api/tsreplace-config", post(api::update_tsreplace_config))
         // Dashboard route
         .route("/", get(dashboard::index))
         .route("/logos/:file", get(api::get_logo))
