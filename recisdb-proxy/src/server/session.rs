@@ -432,6 +432,78 @@ impl Session {
         self.warm_tuner = Some(warm);
     }
 
+    /// Try fallback drivers when the primary driver fails.
+    /// `skip_paths` contains driver paths that have already been tried and should be skipped.
+    /// Returns `Some((tuner, path))` on success, `None` if all fallback candidates fail.
+    async fn try_fallback_drivers(
+        &mut self,
+        fallback_candidates: &[(String, u32, u32)],
+        skip_paths: &[&str],
+    ) -> Option<(Arc<SharedTuner>, String)> {
+        for (fallback_path, fallback_space, fallback_bon_channel) in fallback_candidates.iter() {
+            if skip_paths.iter().any(|s| s == fallback_path) {
+                continue;
+            }
+
+            // Check whether this DLL has room for another instance.
+            let fallback_key = ChannelKey::space_channel(fallback_path, *fallback_space, *fallback_bon_channel);
+            let fb_max_instances = {
+                let db = self.database.lock().await;
+                db.get_max_instances_for_path(fallback_path).unwrap_or(1)
+            };
+            let guard_keys = self.tuner_pool.keys().await;
+            let mut fb_running = 0i32;
+            for gk in &guard_keys {
+                if gk.tuner_path == *fallback_path && *gk != fallback_key {
+                    if let Some(other) = self.tuner_pool.get(gk).await {
+                        if other.is_running() {
+                            fb_running += 1;
+                        }
+                    }
+                }
+            }
+            // +1 because we would start a new instance on this DLL
+            if (fb_running + 1) > fb_max_instances {
+                debug!("[Session {}] Fallback {} skipped: at capacity ({}/{})",
+                       self.id, fallback_path, fb_running, fb_max_instances);
+                continue;
+            }
+
+            info!("[Session {}] Trying fallback driver: {} (space {}, ch {})", self.id, fallback_path, fallback_space, fallback_bon_channel);
+
+            match self.tuner_pool.get_or_create(fallback_key.clone(), 2, || async { Ok(()) }).await {
+                Ok(fb_tuner) => {
+                    if fb_tuner.is_running() {
+                        // Already running the same channel — reuse it directly
+                        info!("[Session {}] Fallback driver {} already running same channel, reusing", self.id, fallback_path);
+                        return Some((fb_tuner, fallback_path.clone()));
+                    }
+                    // Not running — start the reader
+                    match self.start_reader_with_warm(
+                        Arc::clone(&fb_tuner),
+                        fallback_path.clone(),
+                        *fallback_space,
+                        *fallback_bon_channel,
+                    ).await {
+                        Ok(_) => {
+                            info!("[Session {}] Successfully started BonDriver reader with fallback driver: {}", self.id, fallback_path);
+                            return Some((fb_tuner, fallback_path.clone()));
+                        }
+                        Err(e) => {
+                            warn!("[Session {}] Fallback driver {} reader start failed: {}", self.id, fallback_path, e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[Session {}] Fallback driver {} creation failed: {}", self.id, fallback_path, e);
+                    continue;
+                }
+            }
+        }
+        None
+    }
+
     async fn start_reader_with_warm(
         &mut self,
         tuner: Arc<SharedTuner>,
@@ -1712,6 +1784,18 @@ impl Session {
         // ★ In group mode, find which driver has this channel (matching by NID+TSID)
         // NID+TSID matching allows different BonDrivers to use different bon_channel values
         // for the same logical channel (same NID+TSID).
+        // Collect all (driver_path, ChannelKeySpec) for this NID+TSID across group drivers
+        // so that same-channel reuse check can work across different bon_channel values.
+        let mut nid_tsid_channel_keys: Vec<(String, ChannelKeySpec)> = Vec::new();
+
+        // ★ Capture the current session's tuner key BEFORE driver selection.
+        // If this session is the sole subscriber, its slot will be freed during
+        // channel switch, so it should NOT count against driver capacity.
+        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
+        let old_tuner_will_free_slot = self.current_tuner.as_ref()
+            .map(|t| t.subscriber_count() == 1)
+            .unwrap_or(false) && self.ts_receiver.is_some();
+
         let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty() {
             // Group mode: find the driver that has this NID+TSID AND has available capacity
             debug!("[Session {}] SetChannelSpace: In group mode, searching for NID=0x{:04X} TSID=0x{:04X}", 
@@ -1761,6 +1845,14 @@ impl Session {
                 });
             }
 
+            // Build NID+TSID → ChannelKey mapping for same-channel reuse across drivers
+            for (dp, ds, dc) in &candidate_drivers {
+                nid_tsid_channel_keys.push((
+                    dp.clone(),
+                    ChannelKeySpec::SpaceChannel { space: *ds, channel: *dc },
+                ));
+            }
+
             // Now select the driver with available capacity
             // Priority: 1) Driver already streaming this channel, 2) Driver with available capacity
             let mut selected_driver: Option<(String, u32, u32)> = None;
@@ -1796,6 +1888,11 @@ impl Session {
                     let mut driver_instances = 0i32;
                     for k in keys.iter() {
                         if k.tuner_path == *driver_path {
+                            // Skip the current session's own tuner if it will be freed
+                            // during channel switch (sole subscriber → slot released).
+                            if old_tuner_will_free_slot && old_tuner_key.as_ref() == Some(k) {
+                                continue;
+                            }
                             if let Some(tuner) = self.tuner_pool.get(&k).await {
                                 if tuner.is_running() {
                                     driver_instances += 1;
@@ -1884,12 +1981,6 @@ impl Session {
             }
         };
 
-        // ★ Get max instances for this BonDriver
-        let _max_instances = {
-            let db = self.database.lock().await;
-            db.get_max_instances_for_path(&tuner_path).unwrap_or(1)
-        };
-
         // ★ If exclusive is requested, kick off all other tuners on this BonDriver
         if exclusive {
             info!("[Session {}] Exclusive access requested - forcing all other tuners off", self.id);
@@ -1906,75 +1997,102 @@ impl Session {
             }
         }
 
-        // ★ Check if requesting a channel that's already running (same space/channel, any driver in group)
+        // ★ Check if requesting a channel that's already running (same NID+TSID, any driver in group)
         let keys = self.tuner_pool.keys().await;
         let new_key = ChannelKey::space_channel(&tuner_path, actual_space, actual_bon_channel);
         
         // First pass: check for same channel running on ANY driver
-        // In group mode, we want to reuse existing streaming even if on a different driver
+        // In group mode, we use NID+TSID-aware matching via nid_tsid_channel_keys
+        // to handle different bon_channel values across drivers for the same logical channel.
         for existing_key in keys.iter() {
-            // Check if this is the same channel (space + channel match)
-            if existing_key.channel == new_key.channel {
-                // Same channel found - check if we should reuse it
-                let should_reuse = if !self.group_driver_paths.is_empty() {
-                    // Group mode: reuse if the driver is in our group
-                    self.group_driver_paths.contains(&existing_key.tuner_path)
-                } else {
-                    // Single tuner mode: reuse only if same driver
-                    existing_key.tuner_path == tuner_path
-                };
-                
-                if should_reuse {
-                    if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
-                        if existing_tuner.is_running() {
-                            info!("[Session {}] Same channel already running on driver {}, reusing existing tuner", 
-                                  self.id, existing_key.tuner_path);
+            // Determine if this existing tuner is streaming the same logical channel
+            let is_same_channel = if !nid_tsid_channel_keys.is_empty() {
+                // Group mode: check if existing key matches ANY candidate for this NID+TSID
+                // This correctly handles different bon_channel values across drivers
+                nid_tsid_channel_keys.iter().any(|(path, spec)|
+                    existing_key.tuner_path == *path && existing_key.channel == *spec
+                )
+            } else {
+                // Single tuner mode: exact ChannelKeySpec match on same driver
+                existing_key.channel == new_key.channel && existing_key.tuner_path == tuner_path
+            };
 
-                            // Track the actual physical tuner path currently used.
-                            self.current_tuner_path = Some(existing_key.tuner_path.clone());
-                            self.refresh_current_bon_driver_id().await;
-                            self.session_registry
-                                .update_tuner(self.id, Some(existing_key.tuner_path.clone()))
-                                .await;
+            if is_same_channel {
+                if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
+                    if existing_tuner.is_running() {
+                        info!("[Session {}] Same channel already running on driver {}, reusing existing tuner", 
+                              self.id, existing_key.tuner_path);
 
-                            // Unsubscribe from old tuner if we had one
-                            let old_tuner = self.current_tuner.take();
-                            if let Some(old) = old_tuner {
+                        // ★ Cancel any pending idle close FIRST, before anything else.
+                        // This prevents a race where the idle timer fires between
+                        // SetChannelSpaceAck and the subsequent StartStream subscribe.
+                        self.tuner_pool.cancel_idle_close(&existing_key).await;
+
+                        // Track the actual physical tuner path currently used.
+                        self.current_tuner_path = Some(existing_key.tuner_path.clone());
+                        self.refresh_current_bon_driver_id().await;
+                        self.session_registry
+                            .update_tuner(self.id, Some(existing_key.tuner_path.clone()))
+                            .await;
+
+                        // Unsubscribe from old tuner if we had one,
+                        // BUT skip the cycle when old tuner IS the same SharedTuner
+                        // (solo re-tune: unsubscribe would drop count to 0 → stop reader).
+                        let old_tuner = self.current_tuner.take();
+                        if let Some(old) = old_tuner {
+                            let same_tuner = Arc::ptr_eq(&old, &existing_tuner);
+                            if same_tuner {
+                                // Same tuner re-tune: keep subscription as-is, just refresh ts_receiver
+                                debug!("[Session {}] Re-tune to same channel, keeping existing subscription", self.id);
+                                if self.state == SessionState::Streaming {
+                                    // Drop and re-create a fresh receiver to discard stale buffered data
+                                    old.unsubscribe();
+                                    self.ts_receiver = Some(existing_tuner.subscribe());
+                                }
+                                self.current_tuner = Some(existing_tuner.clone());
+                            } else {
+                                // Different tuner: unsubscribe from old, subscribe to existing
                                 if self.ts_receiver.is_some() {
                                     old.unsubscribe();
+                                    self.ts_receiver = None;
                                     debug!("[Session {}] Unsubscribed from old tuner", self.id);
                                     if old.subscriber_count() == 0 {
-                                        old.stop_reader().await;
+                                        // Don't await stop_reader inline; schedule idle close instead
+                                        // so we don't block the reuse path for 1+ seconds.
+                                        self.tuner_pool.schedule_idle_close(old.key.clone(), old).await;
                                     }
                                 }
+                                if self.state == SessionState::Streaming {
+                                    self.ts_receiver = Some(existing_tuner.subscribe());
+                                }
+                                self.current_tuner = Some(existing_tuner.clone());
                             }
-
-                            // Subscribe to the existing tuner
+                        } else {
+                            // No old tuner (first channel selection)
                             if self.state == SessionState::Streaming {
                                 self.ts_receiver = Some(existing_tuner.subscribe());
                             }
-
                             self.current_tuner = Some(existing_tuner.clone());
-
-                            // Update session registry with channel info and name
-                            let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                            self.current_channel_info = Some(channel_info);
-
-                            // Try to get channel name from database
-                            let channel_name = {
-                                let db = self.database.lock().await;
-                                if let Ok(Some(driver)) = db.get_bon_driver_by_path(&existing_key.tuner_path) {
-                                    db.get_channel_name(driver.id, actual_space, actual_bon_channel).unwrap_or(None)
-                                } else {
-                                    None
-                                }
-                            };
-                            self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
-                            self.current_channel_name = channel_name;
-
-                            return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
+
+                        // Update session registry with channel info and name
+                        let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
+                        self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                        self.current_channel_info = Some(channel_info);
+
+                        // Try to get channel name from database
+                        let channel_name = {
+                            let db = self.database.lock().await;
+                            if let Ok(Some(driver)) = db.get_bon_driver_by_path(&existing_key.tuner_path) {
+                                db.get_channel_name(driver.id, actual_space, actual_bon_channel).unwrap_or(None)
+                            } else {
+                                None
+                            }
+                        };
+                        self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+                        self.current_channel_name = channel_name;
+
+                        return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                     }
                 }
             }
@@ -1992,16 +2110,46 @@ impl Session {
                 debug!("[Session {}] Unsubscribed from old tuner, remaining subscribers: {}", 
                        self.id, tuner.subscriber_count());
                 
-                // Check if we should stop the reader (only if no more subscribers)
+                // If no more subscribers, handle cleanup.
                 if tuner.subscriber_count() == 0 {
-                    info!("[Session {}] Last subscriber left, stopping reader for {:?}", self.id, tuner.key);
-                    tuner.stop_reader().await;
-                    
-                    // Wait briefly for the reader to shut down
-                    let mut wait_attempts = 0;
-                    while tuner.is_running() && wait_attempts < 20 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        wait_attempts += 1;
+                    if tuner.key.tuner_path == tuner_path {
+                        // Same DLL channel switch.  Whether we must stop the old
+                        // reader depends on whether the DLL supports multiple
+                        // concurrent instances.
+                        let old_dll_max = {
+                            let db = self.database.lock().await;
+                            db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
+                        };
+                        // Count how many tuners are currently running on this DLL
+                        let old_dll_running = {
+                            let ks = self.tuner_pool.keys().await;
+                            let mut n = 0i32;
+                            for k in &ks {
+                                if k.tuner_path == tuner.key.tuner_path {
+                                    if let Some(t) = self.tuner_pool.get(k).await {
+                                        if t.is_running() { n += 1; }
+                                    }
+                                }
+                            }
+                            n
+                        };
+                        if old_dll_running >= old_dll_max {
+                            // At or over capacity — must stop one to make room.
+                            info!("[Session {}] Same DLL switch (max_instances={}), stopping old reader for {:?}",
+                                  self.id, old_dll_max, tuner.key);
+                            tuner.stop_reader().await;
+                            self.tuner_pool.remove(&tuner.key).await;
+                        } else {
+                            // DLL has spare capacity — old tuner can idle-close later.
+                            info!("[Session {}] Same DLL switch (max_instances={}, running={}), scheduling idle close for {:?}",
+                                  self.id, old_dll_max, old_dll_running, tuner.key);
+                            self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
+                        }
+                    } else {
+                        // Different DLL: non-blocking idle close so we don't block
+                        // the channel-switch path for 1+ seconds.
+                        info!("[Session {}] Different DLL switch, scheduling idle close for {:?}", self.id, tuner.key);
+                        self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
                     }
                 }
             }
@@ -2020,26 +2168,32 @@ impl Session {
         let (group_name, max_instances) = driver_info;
         
         // Store candidate drivers for fallback in case the primary driver fails
-        // Rebuild the list from the database
-        let fallback_candidates = if !self.group_driver_paths.is_empty() {
-            // In group mode, find all group drivers that have this channel
+        // Rebuild the list from the database using NID+TSID matching (not bon_channel)
+        let fallback_candidates: Vec<(String, u32, u32)> = if !self.group_driver_paths.is_empty() {
+            // In group mode, find all group drivers that have this NID+TSID
             let db = self.database.lock().await;
             let all_channels = db.get_all_channels_with_drivers().unwrap_or_default();
-            let mut candidates: Vec<(String, u32)> = Vec::new();
+            let mut candidates: Vec<(String, u32, u32)> = Vec::new();  // (driver_path, space, bon_channel)
             
             for (ch, bd_opt) in &all_channels {
                 let Some(bd) = bd_opt else { continue; };
                 if !self.group_driver_paths.contains(&bd.dll_path) {
                     continue;
                 }
-                if ch.space == actual_space && ch.channel == actual_bon_channel {
-                    candidates.push((bd.dll_path.clone(), ch.space));
+                // Match by NID+TSID so each driver gets its own correct bon_channel
+                if ch.nid as u16 == entry.nid && ch.tsid as u16 == entry.tsid && ch.is_enabled {
+                    candidates.push((bd.dll_path.clone(), ch.space, ch.channel));
                 }
             }
             candidates
         } else {
             vec![]
         };
+
+        // ★ Re-take fresh keys snapshot for capacity check
+        // (The previous `keys` was obtained before old tuner unsubscribe/stop,
+        //  and other sessions may have modified the pool since then)
+        let keys = self.tuner_pool.keys().await;
 
         // ★ Count current running instances
         // In group mode, count only instances of the SELECTED driver (not all group drivers)
@@ -2128,9 +2282,27 @@ impl Session {
                     }
                 }
             } else {
-                // New priority is not higher - refuse the change
-                error!("[Session {}] Cannot switch: new priority {} not higher than lowest priority {}", 
-                       self.id, channel_priority, lowest_priority_value);
+                // New priority is not higher on the selected driver.
+                // In group mode, try other drivers that may have capacity.
+                warn!("[Session {}] Driver {} at capacity and priority {} not higher than lowest {}; trying fallback drivers",
+                      self.id, tuner_path, channel_priority, lowest_priority_value);
+                if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&tuner_path]).await {
+                    self.current_tuner_path = Some(fb_path.clone());
+                    self.refresh_current_bon_driver_id().await;
+                    self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                    self.current_tuner = Some(fb_tuner.clone());
+                    if self.state == SessionState::Streaming {
+                        self.ts_receiver = Some(fb_tuner.subscribe());
+                    }
+                    self.restart_tsreplace_pipeline_if_streaming().await;
+
+                    let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
+                    self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                    self.current_channel_info = Some(channel_info);
+                    return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
+                }
+                error!("[Session {}] Cannot switch: all drivers at capacity and priority insufficient",
+                       self.id);
                 return self.send_message(ServerMessage::SetChannelSpaceAck {
                     success: false,
                     error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2140,7 +2312,7 @@ impl Session {
 
         // ★ No existing tuner found - create new one
         // In group mode, if the primary driver fails, try fallback candidates
-        let key = ChannelKey::space_channel(&tuner_path, actual_space, actual_bon_channel);
+        let mut key = ChannelKey::space_channel(&tuner_path, actual_space, actual_bon_channel);
 
         info!("[Session {}] Creating new tuner for key: {:?}", self.id, key);
 
@@ -2149,30 +2321,19 @@ impl Session {
         let mut actual_tuner_path = tuner_path.clone();
         let mut actual_actual_space = actual_space;
         
-        // If primary fails and we have fallback candidates, try them
+        // If primary fails and we have fallback candidates, try them via the shared helper
         if tuner_result.is_err() && !fallback_candidates.is_empty() {
-            warn!("[Session {}] Primary driver {} creation/initialization failed, trying fallback candidates", self.id, tuner_path);
-            for (fallback_path, fallback_space) in fallback_candidates.iter() {
-                if fallback_path == &tuner_path {
-                    continue;  // Skip the primary driver we already tried
-                }
-                
-                let fallback_key = ChannelKey::space_channel(fallback_path, *fallback_space, actual_bon_channel);
-                info!("[Session {}] Trying fallback driver: {} (space {})", self.id, fallback_path, fallback_space);
-                
-                match self.tuner_pool.get_or_create(fallback_key.clone(), 2, || async { Ok(()) }).await {
-                    Ok(tuner) => {
-                        info!("[Session {}] Successfully created tuner with fallback driver: {}", self.id, fallback_path);
-                        tuner_result = Ok(tuner);
-                        actual_tuner_path = fallback_path.clone();
-                        actual_actual_space = *fallback_space;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("[Session {}] Fallback driver {} also failed: {}", self.id, fallback_path, e);
-                        continue;
-                    }
-                }
+            warn!("[Session {}] Primary driver {} creation failed, trying fallback candidates", self.id, tuner_path);
+            if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&tuner_path]).await {
+                // Find the matching (space, bon_channel) for this fallback path
+                let (fb_space, fb_bon_ch) = fallback_candidates.iter()
+                    .find(|(p, _, _)| p == &fb_path)
+                    .map(|(_, s, c)| (*s, *c))
+                    .unwrap_or((actual_space, actual_bon_channel));
+                tuner_result = Ok(fb_tuner);
+                actual_tuner_path = fb_path.clone();
+                actual_actual_space = fb_space;
+                key = ChannelKey::space_channel(&fb_path, fb_space, fb_bon_ch);
             }
         }
 
@@ -2189,6 +2350,57 @@ impl Session {
                 
                 // Start the BonDriver reader if not already running
                 if !tuner.is_running() {
+                    // ★ Safety guard: verify the same physical BonDriver is not
+                    //   already at its max_instances limit before starting a new
+                    //   reader.  A DLL with max_instances > 1 CAN have multiple
+                    //   channels open simultaneously.
+                    let guard_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&actual_tuner_path).unwrap_or(1)
+                    };
+                    let guard_keys = self.tuner_pool.keys().await;
+                    let mut same_dll_running = 0i32;
+                    for gk in &guard_keys {
+                        if gk.tuner_path == actual_tuner_path && *gk != key {
+                            if let Some(other) = self.tuner_pool.get(gk).await {
+                                if other.is_running() {
+                                    same_dll_running += 1;
+                                }
+                            }
+                        }
+                    }
+                    // +1 because we are about to start a new instance
+                    let conflict_found = (same_dll_running + 1) > guard_max;
+                    if conflict_found {
+                        warn!(
+                            "[Session {}] CONFLICT: driver {} already has {}/{} instances running, cannot start another",
+                            self.id, actual_tuner_path, same_dll_running, guard_max
+                        );
+                    }
+                    if conflict_found {
+                        // Primary driver has a conflict — try fallback candidates
+                        warn!("[Session {}] Primary driver {} has conflict, trying fallback candidates", self.id, actual_tuner_path);
+                        if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&actual_tuner_path]).await {
+                            self.current_tuner_path = Some(fb_path.clone());
+                            self.refresh_current_bon_driver_id().await;
+                            self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                            self.current_tuner = Some(fb_tuner.clone());
+                            if self.state == SessionState::Streaming {
+                                self.ts_receiver = Some(fb_tuner.subscribe());
+                            }
+                            self.restart_tsreplace_pipeline_if_streaming().await;
+
+                            let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
+                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                            self.current_channel_info = Some(channel_info);
+                            return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
+                        }
+                        return self.send_message(ServerMessage::SetChannelSpaceAck {
+                            success: false,
+                            error_code: ErrorCode::ChannelSetFailed.into(),
+                        }).await;
+                    }
+
                     info!("[Session {}] Starting BonDriver reader for new tuner", self.id);
                     if let Err(e) = self.start_reader_with_warm(
                         Arc::clone(&tuner),
@@ -2201,42 +2413,21 @@ impl Session {
                         } else {
                             error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
                         }
-                        // Check if we have more fallback drivers to try
-                        if !fallback_candidates.is_empty() {
-                            warn!("[Session {}] BonDriver reader startup failed, attempting fallback drivers", self.id);
-                            for (fallback_path, fallback_space) in fallback_candidates.iter() {
-                                if fallback_path == &actual_tuner_path {
-                                    continue;  // Already tried this one
-                                }
-                                
-                                let fallback_key = ChannelKey::space_channel(fallback_path, *fallback_space, actual_bon_channel);
-                                info!("[Session {}] Trying fallback (reader failed): {} (space {})", self.id, fallback_path, fallback_space);
-                                
-                                match self.tuner_pool.get_or_create(fallback_key, 2, || async { Ok(()) }).await {
-                                    Ok(fb_tuner) => {
-                                        if !fb_tuner.is_running() {
-                                            if let Ok(_) = self.start_reader_with_warm(
-                                                Arc::clone(&fb_tuner),
-                                                fallback_path.clone(),
-                                                *fallback_space,
-                                                actual_bon_channel,
-                                            ).await {
-                                                info!("[Session {}] Successfully started BonDriver reader with fallback driver", self.id);
-                                                // Use the fallback tuner from here on
-                                                self.current_tuner = Some(fb_tuner.clone());
-                                                if self.state == SessionState::Streaming {
-                                                    self.ts_receiver = Some(fb_tuner.clone().subscribe());
-                                                }
-                                                self.restart_tsreplace_pipeline_if_streaming().await;
-                                                return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        continue;
-                                    }
-                                }
+                        // Try fallback drivers
+                        if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&actual_tuner_path]).await {
+                            self.current_tuner_path = Some(fb_path.clone());
+                            self.refresh_current_bon_driver_id().await;
+                            self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                            self.current_tuner = Some(fb_tuner.clone());
+                            if self.state == SessionState::Streaming {
+                                self.ts_receiver = Some(fb_tuner.subscribe());
                             }
+                            self.restart_tsreplace_pipeline_if_streaming().await;
+
+                            let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
+                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+                            self.current_channel_info = Some(channel_info);
+                            return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
                         return self.send_message(ServerMessage::SetChannelSpaceAck {
                             success: false,
