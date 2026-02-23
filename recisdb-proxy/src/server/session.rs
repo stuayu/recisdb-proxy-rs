@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
-    broadcast_region::{classify_nid, get_prefecture_name},
+    broadcast_region::{classify_nid, TerrestrialRegion},
     decode_client_message, decode_header, encode_server_message, ClientChannelInfo,
     ClientMessage, ErrorCode, ServerMessage, HEADER_SIZE, PROTOCOL_VERSION,
 };
@@ -63,8 +63,10 @@ fn fallback_space_label(actual_space: u32) -> String {
 
 #[derive(Clone, Debug)]
 struct ChannelEntry {
-    bon_channel: u32,     // 実際の物理チャンネル番号
+    bon_channel: u32,     // 実際の物理チャンネル番号 (代表ドライバのもの)
     name: String,         // 表示名
+    nid: u16,             // Network ID (NID+TSIDでの一意識別用)
+    tsid: u16,            // Transport Stream ID
 }
 
 /// Multiple driver mappings for a single virtual channel
@@ -114,9 +116,10 @@ pub struct Session {
     ts_msgs_sent: u64,
     last_ts_log: std::time::Instant,
     channel_map_cache: HashMap<u32, Vec<ChannelEntry>>,
-    // ★追加: 仮想space_idx(0..N-1) -> (actual_space, name) のマップをチューナごとにキャッシュ
-    // 例: [(0, "宮城"), (0, "福島"), (1, "BS"), (2, "CS")]
-    space_list_cache: HashMap<String, Vec<(u32, String)>>,
+    // ★追加: 仮想space_idx(0..N-1) -> (actual_space, display_name, region_key) のマップをチューナごとにキャッシュ
+    // 例: [(0, "地デジ", "宮城"), (0, "地デジ", "福島"), (1, "BS", "BS"), (2, "CS", "CS")]
+    // region_key はチャンネルフィルタリング用、display_name は EnumTuningSpace 表示用
+    space_list_cache: HashMap<String, Vec<(u32, String, String)>>,
     // ★追加: 仮想チャンネル (NID, TSID) -> 複数のドライバー/スペース/チャンネル マッピング
     // 同じNID+TSIDが複数のドライバーに存在する場合、すべてのマッピングを保持
     virtual_channel_mappings: HashMap<String, HashMap<(u16, u16), Vec<VirtualChannelMapping>>>,
@@ -494,7 +497,7 @@ impl Session {
             Err(_) => return vec![],
         };
 
-        let mut uniq: BTreeMap<u32, String> = BTreeMap::new();
+        let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
 
         for (ch, bd_opt) in all {
             let Some(bd) = bd_opt else { continue; };
@@ -507,11 +510,11 @@ impl Session {
                 .or(ch.ts_name.clone())
                 .unwrap_or_else(|| format!("CH{}", ch.channel));
 
-            uniq.entry(ch.channel).or_insert(name);
+            uniq.entry(ch.channel).or_insert((name, ch.nid as u16, ch.tsid as u16));
         }
 
         uniq.into_iter()
-            .map(|(bon_channel, name)| ChannelEntry { bon_channel, name })
+            .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
             .collect()
     }
 
@@ -533,7 +536,7 @@ impl Session {
                 },
             };
 
-            let mut uniq: BTreeMap<u32, String> = BTreeMap::new();
+            let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
 
             for (ch, bd_opt) in all {
                 let Some(bd) = bd_opt else { continue; };
@@ -552,11 +555,11 @@ impl Session {
                     .or(ch.ts_name.clone())
                     .unwrap_or_else(|| format!("CH{}", bch));
 
-                uniq.entry(bch).or_insert(name);
+                uniq.entry(bch).or_insert((name, ch.nid as u16, ch.tsid as u16));
             }
 
             uniq.into_iter()
-                .map(|(bon_channel, name)| ChannelEntry { bon_channel, name })
+                .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
                 .collect::<Vec<_>>()
         } else {
             // Single tuner mode
@@ -583,7 +586,7 @@ impl Session {
                 },
             };
 
-            let mut uniq: BTreeMap<u32, String> = BTreeMap::new();
+            let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
 
             for (ch, bd_opt) in all {
                 let Some(bd) = bd_opt else { continue; };
@@ -599,11 +602,11 @@ impl Session {
                     .or(ch.ts_name.clone())
                     .unwrap_or_else(|| format!("CH{}", bch));
 
-                uniq.entry(bch).or_insert(name);
+                uniq.entry(bch).or_insert((name, ch.nid as u16, ch.tsid as u16));
             }
 
             uniq.into_iter()
-                .map(|(bon_channel, name)| ChannelEntry { bon_channel, name })
+                .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
                 .collect::<Vec<_>>()
         };
 
@@ -636,7 +639,8 @@ impl Session {
             )
         };
 
-        let mut uniq: BTreeMap<u32, String> = BTreeMap::new();
+        // NID+TSIDをキーにして重複排除（異なるBonDriverが同じNID+TSIDに違うbon_channelを使う場合の対策）
+        let mut uniq: BTreeMap<(u16, u16), (u32, String)> = BTreeMap::new();
 
         for (ch, bd_opt) in all {
             let Some(bd) = bd_opt else { continue; };
@@ -651,46 +655,40 @@ impl Session {
                 }
             }
 
-            // Filter by region/broadcast type first
-            // For terrestrial (地上波), filter by prefecture name
+            // Filter by region/broadcast type
+            // For terrestrial, filter by TerrestrialRegion display_name (広域圏: "関東", "東北", etc.)
             // For BS/CS, filter by broadcast type string ("BS" or "CS")
-            let ch_matches = if region_name == "BS" || region_name == "CS" {
-                // For BS/CS, check by broadcast type
-                let (btype, _) = classify_nid(ch.nid as u16);
-                let expected_type = if region_name == "BS" {
-                    recisdb_protocol::types::BroadcastType::BS
-                } else {
-                    recisdb_protocol::types::BroadcastType::CS
-                };
-                btype == expected_type
-            } else {
-                // For terrestrial, filter by prefecture name
-                let ch_region = get_prefecture_name(ch.nid as u16).unwrap_or("Unknown");
-                ch_region == region_name
+            let ch_matches = {
+                let (btype, region) = classify_nid(ch.nid as u16);
+                match btype {
+                    recisdb_protocol::types::BroadcastType::BS => region_name == "BS",
+                    recisdb_protocol::types::BroadcastType::CS => region_name == "CS",
+                    recisdb_protocol::types::BroadcastType::Terrestrial => {
+                        let ch_region = region.map(|r| match r {
+                            TerrestrialRegion::Unknown(_) => "Unknown",
+                            _ => r.display_name(),
+                        }).unwrap_or("Unknown");
+                        ch_region == region_name
+                    }
+                }
             };
 
             if !ch_matches { continue; }
-
-            // For terrestrial, BS/CS with multiple spaces, accept all matching channels
-            // This allows channels distributed across different physical spaces to be aggregated
-            if region_name != "BS" && region_name != "CS" {
-                // For terrestrial, still accept multiple spaces (from different drivers)
-                // Don't filter by space - aggregate all channels for this region
-            }
-
-            let bch = ch.channel;
             if !ch.is_enabled { continue; }
+
+            let nid_tsid = (ch.nid as u16, ch.tsid as u16);
+            let bch = ch.channel;
 
             let name = ch.service_name
                 .clone()
                 .or(ch.ts_name.clone())
                 .unwrap_or_else(|| format!("CH{}", bch));
 
-            uniq.entry(bch).or_insert(name);
+            uniq.entry(nid_tsid).or_insert((bch, name));
         }
 
         uniq.into_iter()
-            .map(|(bon_channel, name)| ChannelEntry { bon_channel, name })
+            .map(|((nid, tsid), (bon_channel, name))| ChannelEntry { bon_channel, name, nid, tsid })
             .collect::<Vec<_>>()
     }
 
@@ -717,7 +715,7 @@ impl Session {
             if let Some(v) = self.space_list_cache.get(&cache_key) {
                 trace!("[Session {}] ensure_space_list: using cache for group {} (spaces: {:?})", 
                     self.id, self.current_group_name.as_ref().unwrap_or(&"unknown".to_string()), v);
-                return v.iter().map(|(actual_space, _)| *actual_space).collect();
+                return v.iter().map(|(actual_space, _, _)| *actual_space).collect();
             }
 
             let db = self.database.lock().await;
@@ -762,25 +760,22 @@ impl Session {
                 }
                 nid_tsid_seen.insert(nid_tsid);
                 
-                // Get region name: prefecture name for terrestrial, "BS"/"CS" for satellite
-                let is_terrestrial = get_prefecture_name(ch.nid as u16).is_some();
-                let region_name = if let Some(pref) = get_prefecture_name(ch.nid as u16) {
-                    pref.to_string()
-                } else {
-                    // For BS/CS, use broadcast type
-                    let (btype, _) = classify_nid(ch.nid as u16);
-                    debug!("[Session {}] NID=0x{:04X} is_terrestrial=false, btype={:?}", 
-                        self.id, ch.nid, btype);
-                    match btype {
-                        recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
-                        recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
-                        _ => "Unknown".to_string(),
+                // Get region name: TerrestrialRegion display_name for terrestrial (広域圏), "BS"/"CS" for satellite
+                let (btype, terrestrial_region) = classify_nid(ch.nid as u16);
+                let is_terrestrial = matches!(btype, recisdb_protocol::types::BroadcastType::Terrestrial)
+                    && terrestrial_region.as_ref().map_or(false, |r| !matches!(r, TerrestrialRegion::Unknown(_)));
+                let region_name = match btype {
+                    recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
+                    recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
+                    recisdb_protocol::types::BroadcastType::Terrestrial => {
+                        terrestrial_region.as_ref().map(|r| match r {
+                            TerrestrialRegion::Unknown(_) => "Unknown".to_string(),
+                            _ => r.display_name().to_string(),
+                        }).unwrap_or_else(|| "Unknown".to_string())
                     }
                 };
-                if is_terrestrial {
-                    debug!("[Session {}] NID=0x{:04X} is_terrestrial=true, region={}", 
-                        self.id, ch.nid, region_name);
-                }
+                debug!("[Session {}] NID=0x{:04X} btype={:?} region={}", 
+                    self.id, ch.nid, btype, region_name);
 
                 
                 // For all regions, only register once per region name (prevent duplicates)
@@ -791,13 +786,12 @@ impl Session {
                 }
                 region_seen.insert(region_name.clone());
                 
-                // Get space name from DB or fallback
-                let db_name = db.get_tuning_space_name(bd.id, ch.space)
-                    .unwrap_or(None)
-                    .filter(|n| !n.trim().is_empty());
-                
-                // Build display name: region name if available, else DB name, else fallback
-                let name = db_name.unwrap_or_else(|| format!("{} (Space {})", region_name, ch.space));
+                // Build display name based on region
+                let name = if is_terrestrial {
+                    format!("地デジ ({})", region_name)
+                } else {
+                    region_name.clone()
+                };
                 
                 // For BS/CS, use the actual space from the first driver we see
                 // For terrestrial, use actual space as-is
@@ -807,25 +801,26 @@ impl Session {
 
             // Build the final list with proper sorting
             // Order: 地上波 (terrestrial by region) -> BS -> CS
-            let mut terrestrial_spaces: Vec<(u32, String)> = Vec::new();
-            let mut bs_space: Option<(u32, String)> = None;
-            let mut cs_space: Option<(u32, String)> = None;
+            // Tuple: (actual_space, display_name, region_key)
+            let mut terrestrial_spaces: Vec<(u32, String, String)> = Vec::new();
+            let mut bs_space: Option<(u32, String, String)> = None;
+            let mut cs_space: Option<(u32, String, String)> = None;
             
             for (region, (space, name)) in space_region_names {
                 if region == "BS" {
-                    bs_space = Some((space, name));
+                    bs_space = Some((space, name, region));
                 } else if region == "CS" {
-                    cs_space = Some((space, name));
+                    cs_space = Some((space, name, region));
                 } else {
-                    terrestrial_spaces.push((space, name));
+                    terrestrial_spaces.push((space, name, region));
                 }
             }
             
-            // Sort terrestrial spaces by region name
-            terrestrial_spaces.sort_by(|a, b| a.1.cmp(&b.1));
+            // Sort terrestrial spaces by region key
+            terrestrial_spaces.sort_by(|a, b| a.2.cmp(&b.2));
             
             // Build final list: terrestrial first, then BS, then CS
-            let mut list: Vec<(u32, String)> = terrestrial_spaces;
+            let mut list: Vec<(u32, String, String)> = terrestrial_spaces;
             if let Some(bs) = bs_space {
                 list.push(bs);
             }
@@ -843,7 +838,7 @@ impl Session {
             }
             self.virtual_channel_mappings.insert(cache_key, group_mappings);
             
-            return list.iter().map(|(actual_space, _)| *actual_space).collect();
+            return list.iter().map(|(actual_space, _, _)| *actual_space).collect();
         }
 
         // Single tuner mode
@@ -854,7 +849,7 @@ impl Session {
         }
         if let Some(v) = self.space_list_cache.get(&tuner_path) {
             trace!("[Session {}] ensure_space_list: using cache for {} (spaces: {:?})", self.id, tuner_path, v);
-            return v.iter().map(|(actual_space, _)| *actual_space).collect();
+            return v.iter().map(|(actual_space, _, _)| *actual_space).collect();
         }
 
         let db = self.database.lock().await;
@@ -896,25 +891,22 @@ impl Session {
             }
             nid_tsid_seen.insert(nid_tsid);
             
-            // Get region name: prefecture name for terrestrial, "BS"/"CS" for satellite
-            let is_terrestrial = get_prefecture_name(ch.nid as u16).is_some();
-            let region_name = if let Some(pref) = get_prefecture_name(ch.nid as u16) {
-                pref.to_string()
-            } else {
-                // For BS/CS, use broadcast type
-                let (btype, _) = classify_nid(ch.nid as u16);
-                debug!("[Session {}] NID=0x{:04X} is_terrestrial=false, btype={:?}", 
-                    self.id, ch.nid, btype);
-                match btype {
-                    recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
-                    recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
-                    _ => "Unknown".to_string(),
+            // Get region name: TerrestrialRegion display_name for terrestrial (広域圏), "BS"/"CS" for satellite
+            let (btype, terrestrial_region) = classify_nid(ch.nid as u16);
+            let is_terrestrial = matches!(btype, recisdb_protocol::types::BroadcastType::Terrestrial)
+                && terrestrial_region.as_ref().map_or(false, |r| !matches!(r, TerrestrialRegion::Unknown(_)));
+            let region_name = match btype {
+                recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
+                recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
+                recisdb_protocol::types::BroadcastType::Terrestrial => {
+                    terrestrial_region.as_ref().map(|r| match r {
+                        TerrestrialRegion::Unknown(_) => "Unknown".to_string(),
+                        _ => r.display_name().to_string(),
+                    }).unwrap_or_else(|| "Unknown".to_string())
                 }
             };
-            if is_terrestrial {
-                debug!("[Session {}] NID=0x{:04X} is_terrestrial=true, region={}", 
-                    self.id, ch.nid, region_name);
-            }
+            debug!("[Session {}] NID=0x{:04X} btype={:?} region={}", 
+                self.id, ch.nid, btype, region_name);
             
             // For all regions, only register once per region name (prevent duplicates)
             // This applies to both BS/CS and terrestrial
@@ -924,38 +916,38 @@ impl Session {
             }
             region_seen.insert(region_name.clone());
             
-            // Get space name from DB or fallback
-            let db_name = db.get_tuning_space_name(bd.id, ch.space)
-                .unwrap_or(None)
-                .filter(|n| !n.trim().is_empty());
-            
-            // Build display name: region name if available, else DB name, else fallback
-            let name = db_name.unwrap_or_else(|| format!("{} (Space {})", region_name, ch.space));
+            // Build display name based on region
+            let name = if is_terrestrial {
+                format!("地デジ ({})", region_name)
+            } else {
+                region_name.clone()
+            };
             
             space_region_names.insert(region_name, (ch.space, name));
         }
 
         // Build the final list with proper sorting
         // Order: 地上波 (terrestrial by region) -> BS -> CS
-        let mut terrestrial_spaces: Vec<(u32, String)> = Vec::new();
-        let mut bs_space: Option<(u32, String)> = None;
-        let mut cs_space: Option<(u32, String)> = None;
+        // Tuple: (actual_space, display_name, region_key)
+        let mut terrestrial_spaces: Vec<(u32, String, String)> = Vec::new();
+        let mut bs_space: Option<(u32, String, String)> = None;
+        let mut cs_space: Option<(u32, String, String)> = None;
         
         for (region, (space, name)) in space_region_names {
             if region == "BS" {
-                bs_space = Some((space, name));
+                bs_space = Some((space, name, region));
             } else if region == "CS" {
-                cs_space = Some((space, name));
+                cs_space = Some((space, name, region));
             } else {
-                terrestrial_spaces.push((space, name));
+                terrestrial_spaces.push((space, name, region));
             }
         }
         
-        // Sort terrestrial spaces by region name
-        terrestrial_spaces.sort_by(|a, b| a.1.cmp(&b.1));
+        // Sort terrestrial spaces by region key
+        terrestrial_spaces.sort_by(|a, b| a.2.cmp(&b.2));
         
         // Build final list: terrestrial first, then BS, then CS
-        let mut list: Vec<(u32, String)> = terrestrial_spaces;
+        let mut list: Vec<(u32, String, String)> = terrestrial_spaces;
         if let Some(bs) = bs_space {
             list.push(bs);
         }
@@ -969,23 +961,26 @@ impl Session {
         self.space_list_cache.insert(tuner_path.clone(), list.clone());
         self.virtual_channel_mappings.insert(tuner_path, nid_tsid_mappings);
         
-        list.iter().map(|(actual_space, _)| *actual_space).collect()
+        list.iter().map(|(actual_space, _, _)| *actual_space).collect()
     }
 
     /// TVTest が渡す仮想 space_idx を、DBの実 space へ変換
     async fn map_space_idx_to_actual(&mut self, space_idx: u32) -> Option<u32> {
         let list = self.get_space_list_with_names().await;
-        list.get(space_idx as usize).map(|(actual_space, _)| *actual_space)
+        list.get(space_idx as usize).map(|(actual_space, _, _)| *actual_space)
     }
 
-    /// Map virtual space index to (actual_space, region_name) for filtering.
+    /// Map virtual space index to (actual_space, region_key) for filtering.
+    /// Returns the region_key (e.g., "宮城", "BS", "CS") used for channel matching,
+    /// NOT the display name (which may differ, e.g., "地デジ").
     async fn map_space_idx_to_actual_with_region(&mut self, space_idx: u32) -> Option<(u32, String)> {
         let list = self.get_space_list_with_names().await;
-        list.get(space_idx as usize).cloned()
+        list.get(space_idx as usize).map(|(actual_space, _display_name, region_key)| (*actual_space, region_key.clone()))
     }
 
     /// Get space list with names (for internal use).
-    async fn get_space_list_with_names(&mut self) -> Vec<(u32, String)> {
+    /// Returns Vec<(actual_space, display_name, region_key)>.
+    async fn get_space_list_with_names(&mut self) -> Vec<(u32, String, String)> {
         // If group is set, get spaces from all group drivers
         if !self.group_driver_paths.is_empty() {
             let cache_key = format!("group_{}", self.current_group_name.as_ref().unwrap_or(&"unknown".to_string()));
@@ -1714,69 +1709,17 @@ impl Session {
             }).await;
         };
 
-        let actual_bon_channel = entry.bon_channel;
-
-        // Extract NID+TSID from the region name and virtual space to find all possible mappings
-        // This allows us to try multiple drivers if the same NID+TSID is available on multiple drivers
-        let db = self.database.lock().await;
-        let all_channels = db.get_all_channels_with_drivers().unwrap_or_default();
-        drop(db);
-
-        // Find all NID+TSID combinations for channels in this region and actual_space
-        let mut nid_tsid_candidates: Vec<(u16, u16)> = Vec::new();
-        for (ch, bd_opt) in &all_channels {
-            let Some(bd) = bd_opt else { continue; };
+        // ★ In group mode, find which driver has this channel (matching by NID+TSID)
+        // NID+TSID matching allows different BonDrivers to use different bon_channel values
+        // for the same logical channel (same NID+TSID).
+        let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty() {
+            // Group mode: find the driver that has this NID+TSID AND has available capacity
+            debug!("[Session {}] SetChannelSpace: In group mode, searching for NID=0x{:04X} TSID=0x{:04X}", 
+                   self.id, entry.nid, entry.tsid);
             
-            // Check if in group or single tuner mode
-            if !self.group_driver_paths.is_empty() {
-                if !self.group_driver_paths.contains(&bd.dll_path) {
-                    continue;
-                }
-            } else if let Some(ref current_path) = self.current_tuner_path {
-                if bd.dll_path != *current_path {
-                    continue;
-                }
-            }
-            
-            if ch.is_enabled {
-                // Check if this channel is in our region-filtered map (don't filter by space yet)
-                let (btype, _) = classify_nid(ch.nid as u16);
-                let ch_region = if let Some(pref) = get_prefecture_name(ch.nid as u16) {
-                    pref.to_string()
-                } else {
-                    match btype {
-                        recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
-                        recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
-                        _ => "Unknown".to_string(),
-                    }
-                };
-                
-                // For terrestrial, we may need to search multiple spaces
-                // For BS/CS, we already know space filtering doesn't apply
-                let is_satellite = region_name == "BS" || region_name == "CS";
-                let space_matches = if is_satellite {
-                    true  // Already filtered by region above
-                } else {
-                    // For terrestrial, all spaces in the same region are acceptable
-                    true
-                };
-                
-                if ch_region == region_name && space_matches {
-                    nid_tsid_candidates.push((ch.nid as u16, ch.tsid as u16));
-                }
-            }
-        }
-
-        // ★ In group mode, find which driver has this channel
-        let tuner_path = if !self.group_driver_paths.is_empty() {
-            // Group mode: find the driver that has this channel AND has available capacity
-            debug!("[Session {}] SetChannelSpace: In group mode, searching for driver with channel {}", 
-                   self.id, actual_bon_channel);
-            
-            // For BS/CS with multiple possible spaces, we need to search all drivers for the channel
-            // Query all channels and find which drivers have this channel
+            // Query all channels and find which drivers have this NID+TSID
             let db = self.database.lock().await;
-            let mut candidate_drivers: Vec<(String, u32)> = Vec::new();  // (driver_path, actual_space)
+            let mut candidate_drivers: Vec<(String, u32, u32)> = Vec::new();  // (driver_path, actual_space, bon_channel)
 
             match db.get_all_channels_with_drivers() {
                 Ok(all_channels) => {
@@ -1788,31 +1731,11 @@ impl Session {
                             continue;
                         }
                         
-                        // For terrestrial, check exact space match
-                        // For BS/CS, accept any space in the same region
-                        let is_satellite = region_name == "BS" || region_name == "CS";
-                        let space_matches = if is_satellite {
-                            // Check if this channel matches our region (BS/CS)
-                            let ch_matches = if region_name == "BS" || region_name == "CS" {
-                                let (btype, _) = classify_nid(ch.nid as u16);
-                                let expected_type = if region_name == "BS" {
-                                    recisdb_protocol::types::BroadcastType::BS
-                                } else {
-                                    recisdb_protocol::types::BroadcastType::CS
-                                };
-                                btype == expected_type
-                            } else {
-                                false
-                            };
-                            ch_matches
-                        } else {
-                            ch.space == actual_space
-                        };
-                        
-                        // Check if this is the channel we're looking for
-                        if space_matches && ch.channel == actual_bon_channel && ch.is_enabled {
-                            candidate_drivers.push((bd.dll_path.clone(), ch.space));
-                            debug!("[Session {}] Found channel in driver {} (space {})", self.id, bd.dll_path, ch.space);
+                        // Match by NID+TSID (this correctly handles different bon_channel values across drivers)
+                        if ch.nid as u16 == entry.nid && ch.tsid as u16 == entry.tsid && ch.is_enabled {
+                            candidate_drivers.push((bd.dll_path.clone(), ch.space, ch.channel));
+                            debug!("[Session {}] Found NID+TSID match in driver {} (space {}, ch {})", 
+                                self.id, bd.dll_path, ch.space, ch.channel);
                         }
                     }
                 }
@@ -1824,7 +1747,7 @@ impl Session {
             // Sort candidate drivers by quality score (descending)
             if !candidate_drivers.is_empty() {
                 let mut score_map: HashMap<String, f64> = HashMap::new();
-                for (driver_path, _) in candidate_drivers.iter() {
+                for (driver_path, _, _) in candidate_drivers.iter() {
                     if score_map.contains_key(driver_path) {
                         continue;
                     }
@@ -1840,22 +1763,22 @@ impl Session {
 
             // Now select the driver with available capacity
             // Priority: 1) Driver already streaming this channel, 2) Driver with available capacity
-            let mut selected_driver: Option<(String, u32)> = None;
+            let mut selected_driver: Option<(String, u32, u32)> = None;
             let keys = self.tuner_pool.keys().await;
             
-            // First, check if any driver is already streaming this channel
-            for (driver_path, driver_space) in candidate_drivers.iter() {
+            // First, check if any driver is already streaming this channel (by its own space+bon_channel)
+            for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
                 let new_channel_key = ChannelKeySpec::SpaceChannel { 
                     space: *driver_space, 
-                    channel: actual_bon_channel 
+                    channel: *driver_bon_channel 
                 };
                 for k in keys.iter() {
                     if k.tuner_path == *driver_path && k.channel == new_channel_key {
                         if let Some(tuner) = self.tuner_pool.get(&k).await {
                             if tuner.is_running() {
-                                selected_driver = Some((driver_path.clone(), *driver_space));
-                                debug!("[Session {}] Selected driver (already streaming this channel): {} (space {})", 
-                                       self.id, driver_path, driver_space);
+                                selected_driver = Some((driver_path.clone(), *driver_space, *driver_bon_channel));
+                                debug!("[Session {}] Selected driver (already streaming this channel): {} (space {}, ch {})", 
+                                       self.id, driver_path, driver_space, driver_bon_channel);
                                 break;
                             }
                         }
@@ -1868,7 +1791,7 @@ impl Session {
 
             // If not found, select driver with available capacity
             if selected_driver.is_none() {
-                for (driver_path, driver_space) in candidate_drivers.iter() {
+                for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
                     // Count current instances on this driver
                     let mut driver_instances = 0i32;
                     for k in keys.iter() {
@@ -1889,8 +1812,9 @@ impl Session {
                     
                     // Prefer driver with available capacity
                     if driver_instances < max_instances {
-                        selected_driver = Some((driver_path.clone(), *driver_space));
-                        debug!("[Session {}] Selected driver (with capacity): {} (space {})", self.id, driver_path, driver_space);
+                        selected_driver = Some((driver_path.clone(), *driver_space, *driver_bon_channel));
+                        debug!("[Session {}] Selected driver (with capacity): {} (space {}, ch {})", 
+                            self.id, driver_path, driver_space, driver_bon_channel);
                         break;
                     }
                 }
@@ -1899,26 +1823,26 @@ impl Session {
             // If no driver with capacity, use first candidate (will fail at capacity check)
             if selected_driver.is_none() && !candidate_drivers.is_empty() {
                 selected_driver = Some(candidate_drivers[0].clone());
-                debug!("[Session {}] Selected driver (all full, will check priority): {} (space {})", 
-                       self.id, selected_driver.as_ref().unwrap().0, selected_driver.as_ref().unwrap().1);
+                debug!("[Session {}] Selected driver (all full, will check priority): {} (space {}, ch {})", 
+                       self.id, selected_driver.as_ref().unwrap().0, 
+                       selected_driver.as_ref().unwrap().1,
+                       selected_driver.as_ref().unwrap().2);
             }
 
             drop(db); // Release database lock
 
-            // Update actual_space if we found a different space for this channel
+            // Use the selected driver's space and bon_channel
             match selected_driver {
-                Some((path, driver_space)) => {
-                    debug!("[Session {}] Final selected driver for channel: {} (space {})", self.id, path, driver_space);
+                Some((path, driver_space, driver_bon_channel)) => {
+                    debug!("[Session {}] Final selected driver for channel: {} (space {}, ch {})", 
+                        self.id, path, driver_space, driver_bon_channel);
                     self.current_tuner_path = Some(path.clone());
                     self.refresh_current_bon_driver_id().await;
-                    // For satellite broadcasts, update actual_space to the one from the selected driver
-                    if region_name == "BS" || region_name == "CS" {
-                        let _actual_space = driver_space;
-                    }
-                    path
+                    (path, driver_space, driver_bon_channel)
                 }
                 None => {
-                    error!("[Session {}] SetChannelSpace: Channel not found in any group driver", self.id);
+                    error!("[Session {}] SetChannelSpace: Channel NID=0x{:04X} TSID=0x{:04X} not found in any group driver", 
+                        self.id, entry.nid, entry.tsid);
                     return self.send_message(ServerMessage::SetChannelSpaceAck {
                         success: false,
                         error_code: ErrorCode::InvalidParameter.into(),
@@ -1928,7 +1852,7 @@ impl Session {
         } else {
             // Single tuner mode
             match &self.current_tuner_path {
-                Some(p) => p.clone(),
+                Some(p) => (p.clone(), actual_space, entry.bon_channel),
                 None => {
                     error!("[Session {}] SetChannelSpace: current_tuner_path is None", self.id);
                     return self.send_message(ServerMessage::SetChannelSpaceAck {
@@ -1939,11 +1863,9 @@ impl Session {
             }
         };
 
-        let actual_bon_channel = entry.bon_channel;
-
         info!(
-            "[Session {}] SetChannelSpace: space_idx={}, actual_space={}, idx={} -> bon_channel={} on {} (priority={}, exclusive={})",
-            self.id, space, actual_space, channel, actual_bon_channel, tuner_path, priority, exclusive
+            "[Session {}] SetChannelSpace: space_idx={}, actual_space={}, idx={} -> bon_channel={} (NID=0x{:04X} TSID=0x{:04X}) on {} (priority={}, exclusive={})",
+            self.id, space, actual_space, channel, actual_bon_channel, entry.nid, entry.tsid, tuner_path, priority, exclusive
         );
 
         // ★ Use client-provided priority, or database default if priority <= 0
@@ -2402,7 +2324,7 @@ impl Session {
             return self.send_message(ServerMessage::EnumTuningSpaceAck { name: None }).await;
         }
 
-        let (actual_space, name) = &space_list[space as usize];
+        let (actual_space, name, _region_key) = &space_list[space as usize];
 
         debug!("[Session {}] EnumTuningSpace: space_idx={} actual_space={} name={:?}",
             self.id, space, actual_space, name);
