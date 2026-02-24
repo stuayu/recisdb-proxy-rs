@@ -1793,8 +1793,14 @@ impl Session {
         // channel switch, so it should NOT count against driver capacity.
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
         let old_tuner_will_free_slot = self.current_tuner.as_ref()
-            .map(|t| t.subscriber_count() == 1)
-            .unwrap_or(false) && self.ts_receiver.is_some();
+            .map(|t| {
+                let sub_count = t.subscriber_count();
+                // Streaming: sole broadcast subscriber → slot freed after unsubscribe
+                (sub_count == 1 && self.ts_receiver.is_some()) ||
+                // TunerOpen: no broadcast subscription yet → slot freed immediately
+                (sub_count == 0 && self.ts_receiver.is_none())
+            })
+            .unwrap_or(false);
 
         let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty() {
             // Group mode: find the driver that has this NID+TSID AND has available capacity
@@ -1987,6 +1993,13 @@ impl Session {
             let keys = self.tuner_pool.keys().await;
             for existing_key in keys.iter() {
                 if existing_key.tuner_path == tuner_path {
+                    // Skip our own old tuner — it will be unsubscribed and cleaned up
+                    // in the channel-switch path below. Stopping it here would cause a
+                    // double stop_reader() call and could race with the cleanup logic.
+                    if Some(existing_key) == old_tuner_key.as_ref() {
+                        debug!("[Session {}] Exclusive: skipping own old tuner {:?}", self.id, existing_key);
+                        continue;
+                    }
                     if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
                         if existing_tuner.is_running() {
                             info!("[Session {}] Stopping existing tuner {:?} for exclusive access", self.id, existing_key);
@@ -2045,9 +2058,12 @@ impl Session {
                                 // Same tuner re-tune: keep subscription as-is, just refresh ts_receiver
                                 debug!("[Session {}] Re-tune to same channel, keeping existing subscription", self.id);
                                 if self.state == SessionState::Streaming {
-                                    // Drop and re-create a fresh receiver to discard stale buffered data
+                                    // Re-subscribe FIRST (count N→N+1), then unsubscribe old (count N+1→N).
+                                    // This order avoids a transient subscriber_count==0 which would
+                                    // erroneously trigger idle close on this still-active tuner.
+                                    let new_rx = existing_tuner.subscribe();
+                                    self.ts_receiver = Some(new_rx);
                                     old.unsubscribe();
-                                    self.ts_receiver = Some(existing_tuner.subscribe());
                                 }
                                 self.current_tuner = Some(existing_tuner.clone());
                             } else {
@@ -2378,6 +2394,12 @@ impl Session {
                         );
                     }
                     if conflict_found {
+                        // The tuner entry was just created by get_or_create but will not be
+                        // started (conflict). Remove it from the pool to prevent accumulation
+                        // of orphaned (not-running, no-subscriber) entries.
+                        if !tuner.is_running() && !tuner.has_subscribers() {
+                            self.tuner_pool.remove(&key).await;
+                        }
                         // Primary driver has a conflict — try fallback candidates
                         warn!("[Session {}] Primary driver {} has conflict, trying fallback candidates", self.id, actual_tuner_path);
                         if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&actual_tuner_path]).await {
@@ -2438,6 +2460,25 @@ impl Session {
                     info!("[Session {}] BonDriver reader already running, reusing", self.id);
                 }
 
+                // ★ Exclusive post-start re-check: stop any sessions that started on this
+                // DLL during the reader initialization window (up to ~10 s).  The pre-start
+                // stop-loop ran before our reader was up, so there is a race where another
+                // session slipped in.  Now that our reader is confirmed running we can safely
+                // evict any interlopers.
+                if exclusive {
+                    let recheck_keys = self.tuner_pool.keys().await;
+                    for rk in recheck_keys.iter() {
+                        if rk.tuner_path == tuner_path && *rk != key {
+                            if let Some(interloper) = self.tuner_pool.get(rk).await {
+                                if interloper.is_running() {
+                                    info!("[Session {}] Exclusive post-start: evicting interloper {:?}", self.id, rk);
+                                    interloper.stop_reader().await;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.current_tuner = Some(tuner.clone());
 
                 // Notify B25 decoder about channel change
@@ -2468,16 +2509,9 @@ impl Session {
                 self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
                 self.current_channel_name = channel_name;
 
-                // Wait for first TS data to arrive (indicates driver is ready)
-                // Timeout after 30 seconds to avoid hanging indefinitely
-                info!("[Session {}] Waiting for first TS data (timeout: 30s)...", self.id);
-                let data_ready = tuner.wait_first_data(30000).await;
-                
-                if data_ready {
-                    info!("[Session {}] First TS data received! Channel is ready.", self.id);
-                } else {
-                    warn!("[Session {}] Timeout waiting for TS data, but proceeding anyway", self.id);
-                }
+                // BonDriver reader is confirmed ready by start_reader_with_warm (via ready_rx, up to 10s timeout).
+                // The run() loop's select! will forward TS data as soon as this function returns.
+                // Do NOT call wait_first_data here — it stalls the select! loop and causes TVTest disconnection.
 
                 info!("[Session {}] Successfully set channel, sending SetChannelSpaceAck success=true", self.id);
                 self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await
@@ -2600,17 +2634,22 @@ impl Session {
     async fn handle_stop_stream(&mut self) -> std::io::Result<()> {
         info!("[Session {}] Stopping stream", self.id);
 
-        // Unsubscribe from the broadcast
-        if let Some(tuner) = &self.current_tuner {
-            tuner.unsubscribe();
+        // Unsubscribe from the broadcast — only if we actually have an active subscription.
+        // Without this guard, a redundant StopStream (or StopStream in TunerOpen state) would
+        // call unsubscribe() with no matching subscribe(), causing AtomicU32 to wrap to u32::MAX
+        // and permanently disabling idle-close detection.
+        if self.ts_receiver.is_some() {
+            if let Some(tuner) = &self.current_tuner {
+                tuner.unsubscribe();
 
-            // ★ Check if this was the last subscriber
-            // If so, automatically stop the reader
-            if tuner.subscriber_count() == 0 {
-                info!("[Session {}] No more subscribers after StopStream, scheduling keep-alive close for {:?}", self.id, tuner.key);
-                self.tuner_pool
-                    .schedule_idle_close(tuner.key.clone(), Arc::clone(tuner))
-                    .await;
+                // ★ Check if this was the last subscriber
+                // If so, automatically stop the reader
+                if tuner.subscriber_count() == 0 {
+                    info!("[Session {}] No more subscribers after StopStream, scheduling keep-alive close for {:?}", self.id, tuner.key);
+                    self.tuner_pool
+                        .schedule_idle_close(tuner.key.clone(), Arc::clone(tuner))
+                        .await;
+                }
             }
         }
         self.ts_receiver = None;
