@@ -316,10 +316,168 @@ fn extract_logo_from_cdt_section(section: &PsiSection<'_>) -> Option<CdtLogoData
         return None;
     }
 
+    // Convert ARIB PNG (missing PLTE/tRNS) to standard PNG so regular viewers
+    // can open it.
+    let standard_png = convert_arib_png_to_standard(png_data);
+
     Some(CdtLogoData {
         network_id: original_network_id,
         logo_id,
         logo_type,
-        png: png_data.to_vec(),
+        png: standard_png,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ARIB STD-B24 default CLUT (128 entries).
+// Each entry is [R, G, B, A].  This table is taken from TVTest's
+// `DefaultPalette` in Codec_PNG.cpp.
+// ---------------------------------------------------------------------------
+#[rustfmt::skip]
+const ARIB_CLUT: [[u8; 4]; 128] = [
+    [  0,   0,   0, 255], [255,   0,   0, 255], [  0, 255,   0, 255], [255, 255,   0, 255],
+    [  0,   0, 255, 255], [255,   0, 255, 255], [  0, 255, 255, 255], [255, 255, 255, 255],
+    [  0,   0,   0,   0], [170,   0,   0, 255], [  0, 170,   0, 255], [170, 170,   0, 255],
+    [  0,   0, 170, 255], [170,   0, 170, 255], [  0, 170, 170, 255], [170, 170, 170, 255],
+    [  0,   0,  85, 255], [  0,  85,   0, 255], [  0,  85,  85, 255], [  0,  85, 170, 255],
+    [  0,  85, 255, 255], [  0, 170,  85, 255], [  0, 170, 255, 255], [  0, 255,  85, 255],
+    [  0, 255, 170, 255], [ 85,   0,   0, 255], [ 85,   0,  85, 255], [ 85,   0, 170, 255],
+    [ 85,   0, 255, 255], [ 85,  85,   0, 255], [ 85,  85,  85, 255], [ 85,  85, 170, 255],
+    [ 85,  85, 255, 255], [ 85, 170,   0, 255], [ 85, 170,  85, 255], [ 85, 170, 170, 255],
+    [ 85, 170, 255, 255], [ 85, 255,   0, 255], [ 85, 255,  85, 255], [ 85, 255, 170, 255],
+    [ 85, 255, 255, 255], [170,   0,  85, 255], [170,   0, 255, 255], [170,  85,   0, 255],
+    [170,  85,  85, 255], [170,  85, 170, 255], [170,  85, 255, 255], [170, 170,  85, 255],
+    [170, 170, 255, 255], [170, 255,   0, 255], [170, 255,  85, 255], [170, 255, 170, 255],
+    [170, 255, 255, 255], [255,   0,  85, 255], [255,   0, 170, 255], [255,  85,   0, 255],
+    [255,  85,  85, 255], [255,  85, 170, 255], [255,  85, 255, 255], [255, 170,   0, 255],
+    [255, 170,  85, 255], [255, 170, 170, 255], [255, 170, 255, 255], [255, 255,  85, 255],
+    [255, 255, 170, 255], [  0,   0,   0, 128], [255,   0,   0, 128], [  0, 255,   0, 128],
+    [255, 255,   0, 128], [  0,   0, 255, 128], [255,   0, 255, 128], [  0, 255, 255, 128],
+    [255, 255, 255, 128], [170,   0,   0, 128], [  0, 170,   0, 128], [170, 170,   0, 128],
+    [  0,   0, 170, 128], [170,   0, 170, 128], [  0, 170, 170, 128], [170, 170, 170, 128],
+    [  0,   0,  85, 128], [  0,  85,   0, 128], [  0,  85,  85, 128], [  0,  85, 170, 128],
+    [  0,  85, 255, 128], [  0, 170,  85, 128], [  0, 170, 255, 128], [  0, 255,  85, 128],
+    [  0, 255, 170, 128], [ 85,   0,   0, 128], [ 85,   0,  85, 128], [ 85,   0, 170, 128],
+    [ 85,   0, 255, 128], [ 85,  85,   0, 128], [ 85,  85,  85, 128], [ 85,  85, 170, 128],
+    [ 85,  85, 255, 128], [ 85, 170,   0, 128], [ 85, 170,  85, 128], [ 85, 170, 170, 128],
+    [ 85, 170, 255, 128], [ 85, 255,   0, 128], [ 85, 255,  85, 128], [ 85, 255, 170, 128],
+    [ 85, 255, 255, 128], [170,   0,  85, 128], [170,   0, 255, 128], [170,  85,   0, 128],
+    [170,  85,  85, 128], [170,  85, 170, 128], [170,  85, 255, 128], [170, 170,  85, 128],
+    [170, 170, 255, 128], [170, 255,   0, 128], [170, 255,  85, 128], [170, 255, 170, 128],
+    [170, 255, 255, 128], [255,   0,  85, 128], [255,   0, 170, 128], [255,  85,   0, 128],
+    [255,  85,  85, 128], [255,  85, 170, 128], [255,  85, 255, 128], [255, 170,   0, 128],
+    [255, 170,  85, 128], [255, 170, 170, 128], [255, 170, 255, 128], [255, 255,  85, 128],
+];
+
+/// Convert an ARIB PNG (color type 3 without PLTE chunk) to a standard PNG by
+/// injecting PLTE and tRNS chunks derived from the ARIB STD-B24 default CLUT.
+///
+/// If the PNG already contains a PLTE chunk or uses a different color type,
+/// the data is returned as-is.
+fn convert_arib_png_to_standard(data: &[u8]) -> Vec<u8> {
+    // Minimum: 8 (sig) + 25 (IHDR chunk) = 33
+    if data.len() < 33 || !data.starts_with(&PNG_SIGNATURE) {
+        return data.to_vec();
+    }
+
+    // --- Parse IHDR ---
+    // chunk at offset 8: length(4) + "IHDR"(4) + 13 bytes data + CRC(4)
+    let ihdr_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    if ihdr_len != 13 || &data[12..16] != b"IHDR" {
+        return data.to_vec();
+    }
+    let color_type = data[8 + 4 + 4 + 9]; // offset 25: color_type in IHDR data
+
+    // Only inject palette for indexed-color images (color_type == 3)
+    if color_type != 3 {
+        return data.to_vec();
+    }
+
+    // --- Scan chunks to see if PLTE already exists ---
+    let ihdr_chunk_end = 8 + 4 + 4 + ihdr_len + 4; // 33
+    let mut pos = ihdr_chunk_end;
+    let mut has_plte = false;
+    while pos + 8 <= data.len() {
+        let chunk_len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let chunk_type = &data[pos + 4..pos + 8];
+        if chunk_type == b"PLTE" {
+            has_plte = true;
+            break;
+        }
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            break;
+        }
+        let next = pos + 12 + chunk_len;
+        if next > data.len() {
+            break;
+        }
+        pos = next;
+    }
+
+    if has_plte {
+        return data.to_vec();
+    }
+
+    // --- Build PLTE chunk (256 entries × 3 = 768 bytes) ---
+    // Indices 0..127 from ARIB_CLUT, indices 128..255 = CLUT[8] (transparent).
+    let mut plte_data = Vec::with_capacity(4 + 4 + 768 + 4);
+    plte_data.extend_from_slice(&(768u32).to_be_bytes()); // length
+    plte_data.extend_from_slice(b"PLTE");
+    for i in 0..256u16 {
+        let c = if i < 128 { &ARIB_CLUT[i as usize] } else { &ARIB_CLUT[8] };
+        plte_data.push(c[0]); // R
+        plte_data.push(c[1]); // G
+        plte_data.push(c[2]); // B
+    }
+    let crc = png_crc32(&plte_data[4..]); // CRC over type + data
+    plte_data.extend_from_slice(&crc.to_be_bytes());
+
+    // --- Build tRNS chunk (256 alpha values) ---
+    let mut trns_data = Vec::with_capacity(4 + 4 + 256 + 4);
+    trns_data.extend_from_slice(&(256u32).to_be_bytes()); // length
+    trns_data.extend_from_slice(b"tRNS");
+    for i in 0..256u16 {
+        let c = if i < 128 { &ARIB_CLUT[i as usize] } else { &ARIB_CLUT[8] };
+        trns_data.push(c[3]); // Alpha
+    }
+    let crc = png_crc32(&trns_data[4..]);
+    trns_data.extend_from_slice(&crc.to_be_bytes());
+
+    // --- Reassemble: signature + IHDR + PLTE + tRNS + rest ---
+    let insert_pos = ihdr_chunk_end; // right after IHDR chunk
+    let mut out = Vec::with_capacity(data.len() + plte_data.len() + trns_data.len());
+    out.extend_from_slice(&data[..insert_pos]);
+    out.extend_from_slice(&plte_data);
+    out.extend_from_slice(&trns_data);
+    out.extend_from_slice(&data[insert_pos..]);
+    out
+}
+
+/// Standard CRC-32 (ISO 3309) used by PNG chunks.
+fn png_crc32(data: &[u8]) -> u32 {
+    static CRC_TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut n = 0usize;
+        while n < 256 {
+            let mut c = n as u32;
+            let mut k = 0;
+            while k < 8 {
+                if c & 1 != 0 {
+                    c = 0xEDB88320 ^ (c >> 1);
+                } else {
+                    c >>= 1;
+                }
+                k += 1;
+            }
+            table[n] = c;
+            n += 1;
+        }
+        table
+    };
+
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
 }
