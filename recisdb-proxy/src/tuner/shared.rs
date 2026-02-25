@@ -185,13 +185,27 @@ impl SharedTuner {
     }
 
     /// Unsubscribe from the TS data stream.
+    ///
+    /// Uses `fetch_update` so the decrement is skipped atomically when the count
+    /// is already 0, preventing an `AtomicU32` wraparound to `u32::MAX` which would
+    /// permanently disable idle-close detection.
     pub fn unsubscribe(&self) {
-        let prev = self.subscriber_count.fetch_sub(1, Ordering::SeqCst);
-        debug!(
-            "Subscriber removed from {:?}, remaining: {}",
-            self.key,
-            prev - 1
-        );
+        match self.subscriber_count.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |n| if n > 0 { Some(n - 1) } else { None },
+        ) {
+            Ok(prev) => debug!(
+                "Subscriber removed from {:?}, remaining: {}",
+                self.key,
+                prev - 1
+            ),
+            Err(0) => warn!(
+                "unsubscribe() called when subscriber_count is already 0 for {:?}; ignoring",
+                self.key
+            ),
+            Err(_) => unreachable!(),
+        }
     }
 
     /// Get the number of active subscribers.

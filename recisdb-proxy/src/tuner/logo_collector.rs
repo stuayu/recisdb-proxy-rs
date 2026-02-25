@@ -212,24 +212,25 @@ fn extract_logo_id_from_sdt_descriptors(descriptors: &[u8]) -> Option<u16> {
 }
 
 fn extract_logo_png_from_cdt_section(section: &PsiSection<'_>) -> Option<(Option<u16>, Vec<u8>)> {
-    // ARIB CDT(0xC8): data_type + descriptor_loop + data_module_byte
-    // Mirakurun同様、CDTのデータモジュールからロゴを取り出す方針。
+    // ARIB CDT(0xC8): original_network_id(2) + data_type(1) + descriptor_loop_length(2) + descriptor_loop + data_module_byte
+    // section.data は PSI ヘッダ (8バイト) の後から始まるため、先頭 2 バイトは original_network_id。
     let d = section.data;
-    if d.len() < 3 {
+    if d.len() < 5 {
         return None;
     }
 
-    let data_type = d[0];
+    // d[0..2] = original_network_id — skip
+    let data_type = d[2];
     if data_type != 0x01 {
         return None;
     }
 
-    let desc_len = (((d[1] & 0x0F) as usize) << 8) | d[2] as usize;
-    if d.len() < 3 + desc_len {
+    let desc_len = (((d[3] & 0x0F) as usize) << 8) | d[4] as usize;
+    if d.len() < 5 + desc_len {
         return None;
     }
 
-    let module = &d[3 + desc_len..];
+    let module = &d[5 + desc_len..];
 
     // best-effort logo_id parse (logo data module先頭)
     let logo_id = if module.len() >= 3 {

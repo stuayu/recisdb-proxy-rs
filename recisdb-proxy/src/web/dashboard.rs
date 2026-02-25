@@ -1155,12 +1155,12 @@ const HTML_CONTENT: &str = r#"
                         <td data-sort-value="${c.is_streaming ? '1' : '0'}"><span class="badge ${c.is_streaming ? 'badge-success' : 'badge-warning'}">${c.is_streaming ? 'ストリーミング中' : '待機中'}</span></td>
                         <td data-sort-value="${escapeHtml(c.tuner_path || '-')}"><code>${escapeHtml(c.tuner_path || '-')}</code></td>
                         <td data-sort-value="${escapeHtml(c.channel_name || c.channel_info || '-')}">${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
-                        <td data-sort-value="${c.signal_level || 0}">${c.signal_level || '-'} dB</td>
+                        <td data-sort-value="${c.signal_level != null ? c.signal_level : 0}">${c.signal_level != null ? c.signal_level.toFixed(1) : '-'} dB</td>
                         <td data-sort-value="${c.packets_sent || 0}">${formatPackets(c.packets_sent)}</td>
                         <td data-sort-value="${c.packets_dropped || 0}">${formatPackets(c.packets_dropped)}</td>
                         <td data-sort-value="${c.packets_scrambled || 0}">${formatPackets(c.packets_scrambled)}</td>
                         <td data-sort-value="${c.packets_error || 0}">${formatPackets(c.packets_error)}</td>
-                        <td data-sort-value="${c.current_bitrate_mbps || 0}">${c.current_bitrate_mbps || '-'} Mbps</td>
+                        <td data-sort-value="${c.current_bitrate_mbps != null ? c.current_bitrate_mbps : 0}">${c.current_bitrate_mbps != null ? c.current_bitrate_mbps.toFixed(2) : '-'} Mbps</td>
                         <td data-sort-value="${c.effective_priority !== null && c.effective_priority !== undefined ? c.effective_priority : -99999}">${c.effective_priority !== null && c.effective_priority !== undefined ? c.effective_priority : '-'}</td>
                         <td data-sort-value="${c.effective_exclusive ? '1' : '0'}"><span class="badge ${c.effective_exclusive ? 'badge-danger' : 'badge-success'}">${c.effective_exclusive ? 'ON' : 'OFF'}</span></td>
                         <td data-sort-value="${(c.override_priority !== null && c.override_priority !== undefined) || (c.override_exclusive !== null && c.override_exclusive !== undefined) ? '1' : '0'}">
@@ -1722,7 +1722,7 @@ const HTML_CONTENT: &str = r#"
 
                 let url = '/api/channels?';
                 if (bondriverId) url += `bondriver_id=${bondriverId}&`;
-                if (groupLogical && !bondriverId) url += 'group_logical=true&';
+                if (!bondriverId || groupLogical) url += 'group_logical=true&';
                 if (enabledOnly) url += 'enabled_only=true';
 
                 const res = await fetch(url);

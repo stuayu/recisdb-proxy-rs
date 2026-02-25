@@ -432,6 +432,33 @@ impl Session {
         self.warm_tuner = Some(warm);
     }
 
+    /// After a channel switch failure, attempt to restore the previous channel so the
+    /// client (TVTest, etc.) keeps receiving TS data instead of being cut off.
+    ///
+    /// The old tuner may still be alive in the pool when `keep_alive_secs > 0` (default 60 s).
+    /// If it is still running we cancel the idle-close timer and re-subscribe.
+    async fn try_restore_previous_channel(&mut self, old_tuner_key: &Option<ChannelKey>) {
+        let Some(ref old_key) = old_tuner_key else { return };
+        let Some(old_tuner) = self.tuner_pool.get(old_key).await else {
+            warn!("[Session {}] Channel switch failed but old tuner {:?} is no longer in pool; cannot restore",
+                  self.id, old_key);
+            return;
+        };
+        if !old_tuner.is_running() {
+            warn!("[Session {}] Channel switch failed but old tuner {:?} has already stopped; cannot restore",
+                  self.id, old_key);
+            return;
+        }
+        info!("[Session {}] Channel switch failed — restoring previous channel {:?}", self.id, old_key);
+        // Cancel any pending idle-close so the tuner stays alive.
+        self.tuner_pool.cancel_idle_close(old_key).await;
+        self.current_tuner = Some(old_tuner.clone());
+        // If we were (or are still) streaming, re-subscribe so TS data flows again.
+        if self.state == SessionState::Streaming && self.ts_receiver.is_none() {
+            self.ts_receiver = Some(old_tuner.subscribe());
+        }
+    }
+
     /// Try fallback drivers when the primary driver fails.
     /// `skip_paths` contains driver paths that have already been tried and should be skipped.
     /// Returns `Some((tuner, path))` on success, `None` if all fallback candidates fail.
@@ -491,6 +518,12 @@ impl Session {
                         }
                         Err(e) => {
                             warn!("[Session {}] Fallback driver {} reader start failed: {}", self.id, fallback_path, e);
+                            // ★ Bug G fix: get_or_create inserted this tuner into the pool.
+                            // Remove the orphaned (not-running, no-subscriber) entry so it
+                            // doesn't persist indefinitely.
+                            if !fb_tuner.is_running() && !fb_tuner.has_subscribers() {
+                                self.tuner_pool.remove(&fallback_key).await;
+                            }
                             continue;
                         }
                     }
@@ -2261,6 +2294,17 @@ impl Session {
             // Each driver has its own max_instances limit
             for existing_key in keys.iter() {
                 if existing_key.tuner_path == tuner_path {
+                    // ★ Bug B fix: skip channels with active subscribers — stopping them
+                    // would cut off clients that are already streaming on that channel.
+                    // Only TunerOpen-state (subscriber-less) channels are eligible for eviction.
+                    if let Some(candidate) = self.tuner_pool.get(existing_key).await {
+                        if candidate.has_subscribers() {
+                            debug!("[Session {}] Skipping {:?} for priority eviction: has {} active subscriber(s)",
+                                   self.id, existing_key, candidate.subscriber_count());
+                            continue;
+                        }
+                    }
+
                     let (existing_space, existing_channel) = match &existing_key.channel {
                         ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
                         ChannelKeySpec::Simple(ch) => (0, *ch as u32),
@@ -2319,6 +2363,7 @@ impl Session {
                 }
                 error!("[Session {}] Cannot switch: all drivers at capacity and priority insufficient",
                        self.id);
+                self.try_restore_previous_channel(&old_tuner_key).await;
                 return self.send_message(ServerMessage::SetChannelSpaceAck {
                     success: false,
                     error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2417,6 +2462,7 @@ impl Session {
                             self.current_channel_info = Some(channel_info);
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
+                        self.try_restore_previous_channel(&old_tuner_key).await;
                         return self.send_message(ServerMessage::SetChannelSpaceAck {
                             success: false,
                             error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2451,6 +2497,14 @@ impl Session {
                             self.current_channel_info = Some(channel_info);
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
+                        // ★ Bug D fix: get_or_create inserted this tuner into the pool but
+                        // start_reader failed and all fallbacks are exhausted.  Remove the
+                        // orphaned (not-running, no-subscriber) entry so it doesn't persist
+                        // indefinitely and confuse future capacity/reuse checks.
+                        if !tuner.is_running() && !tuner.has_subscribers() {
+                            self.tuner_pool.remove(&key).await;
+                        }
+                        self.try_restore_previous_channel(&old_tuner_key).await;
                         return self.send_message(ServerMessage::SetChannelSpaceAck {
                             success: false,
                             error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2518,6 +2572,7 @@ impl Session {
             }
             Err(e) => {
                 error!("[Session {}] Failed to set channel: {}", self.id, e);
+                self.try_restore_previous_channel(&old_tuner_key).await;
                 self.send_message(ServerMessage::SetChannelSpaceAck {
                     success: false,
                     error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2597,11 +2652,17 @@ impl Session {
 
         info!("[Session {}] Starting stream", self.id);
 
+        // ★ Cancel idle-close BEFORE subscribing.
+        // If the idle-close timer fires between cancel and subscribe, the task will see
+        // has_subscribers()==0 and might stop the reader.  Canceling first minimises
+        // that window; the has_subscribers() double-check inside the idle-close task
+        // (Bug F fix) provides the final backstop.
+        self.tuner_pool.cancel_idle_close(&tuner.key).await;
+
         // Subscribe to the tuner's broadcast channel
         let rx = tuner.subscribe();
         self.ts_receiver = Some(rx);
         self.state = SessionState::Streaming;
-        self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
         if let Err(e) = self.start_tsreplace_pipeline().await {
             if self.tsreplace_passthrough_on_error {
@@ -2763,10 +2824,15 @@ impl Session {
 
         match self
             .tuner_pool
-            .get_or_create(key, 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, || async { Ok(()) })
             .await
         {
             Ok(tuner) => {
+                // ★ Bug H fix: cancel any pending idle-close before using this tuner.
+                // Without this, a timer scheduled by a previous session could fire and stop
+                // the reader while this session holds it in TunerOpen state.
+                self.tuner_pool.cancel_idle_close(&key).await;
+
                 // Start the BonDriver reader if not already running
                 if !tuner.is_running() {
                     if let Err(e) = self.start_reader_with_warm(
@@ -2779,6 +2845,10 @@ impl Session {
                             warn!("[Session {}] Channel unavailable: {}", self.id, e);
                         } else {
                             error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+                        }
+                        // Clean up the orphaned pool entry on failure
+                        if !tuner.is_running() && !tuner.has_subscribers() {
+                            self.tuner_pool.remove(&key).await;
                         }
                         return self.send_message(ServerMessage::SelectLogicalChannelAck {
                             success: false,

@@ -200,10 +200,21 @@ impl TunerPool {
                         if !tuner.has_subscribers() {
                             info!("Keep-alive timeout reached, stopping reader for {:?}", key);
                             tuner.stop_reader().await;
-                            let mut tuners = pool.tuners.write().await;
-                            if let Some(current) = tuners.get(&key) {
-                                if Arc::ptr_eq(current, &tuner) {
-                                    tuners.remove(&key);
+                            // ★ Bug F fix: double-check subscriber count AFTER stop_reader().
+                            // stop_reader() is async and yields; a concurrent subscribe() + cancel_idle_close()
+                            // may have run during that await window.  If subscribers are now present,
+                            // skip removing the pool entry so the next SetChannelSpace can restart
+                            // the reader and recover gracefully.
+                            if tuner.has_subscribers() {
+                                warn!("Keep-alive: subscriber appeared during stop_reader for {:?}; \
+                                       leaving pool entry intact (reader stopped — client will reconnect)",
+                                      key);
+                            } else {
+                                let mut tuners = pool.tuners.write().await;
+                                if let Some(current) = tuners.get(&key) {
+                                    if Arc::ptr_eq(current, &tuner) {
+                                        tuners.remove(&key);
+                                    }
                                 }
                             }
                         } else {
