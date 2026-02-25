@@ -13,10 +13,27 @@ const SDT_PID: u16 = 0x0011;
 const CDT_PID: u16 = 0x0029;
 const CDT_TABLE_ID: u8 = 0xC8;
 
+/// PNG file signature (8 bytes).
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Minimum PNG data size below which the logo is considered transparent/empty.
+/// This threshold comes from TVTest/LibISDB which skips logos with DataSize <= 93.
+const MIN_LOGO_DATA_SIZE: usize = 94;
+
+/// Logo data extracted from a CDT section.
+struct CdtLogoData {
+    network_id: u16,
+    logo_id: u16,
+    logo_type: u8,
+    png: Vec<u8>,
+}
+
 /// Lightweight logo collector.
 ///
 /// It listens SDT/CDT sections from live TS and saves discovered PNG logo bytes
-/// to logos/{nid}_{sid}.png. This is a best-effort implementation.
+/// to logos/{nid}_{sid}.png.  The CDT data-module header is parsed according to
+/// ARIB STD-B21 (same logic as TVTest / LibISDB) so that the PNG payload is
+/// extracted using the explicit `data_size` field rather than heuristic scanning.
 pub struct ChannelLogoCollector {
     sdt_collector: SectionCollector,
     cdt_collector: SectionCollector,
@@ -131,11 +148,23 @@ impl ChannelLogoCollector {
             return;
         }
 
-        let Some((logo_id, png)) = extract_logo_png_from_cdt_section(&section) else {
+        // Verify section CRC32 to reject corrupted data (TVTest/LibISDB does
+        // this inside PSIStreamTable before calling OnTableUpdate).
+        if !section.verify_crc(section_data) {
+            debug!("[LogoCollector] CDT section CRC error, skipping");
+            return;
+        }
+
+        let Some(logo) = extract_logo_from_cdt_section(&section) else {
             return;
         };
 
-        let Some(nid) = self.current_nid else {
+        // Prefer original_network_id from CDT; fall back to SDT NID.
+        let nid = if logo.network_id != 0 {
+            logo.network_id
+        } else if let Some(sdt_nid) = self.current_nid {
+            sdt_nid
+        } else {
             return;
         };
 
@@ -143,11 +172,11 @@ impl ChannelLogoCollector {
             return;
         }
 
-        let target_sids: Vec<u16> = if let Some(logo_id) = logo_id {
+        let target_sids: Vec<u16> = if logo.logo_id > 0 {
             let matched: Vec<u16> = self
                 .current_service_logo_ids
                 .iter()
-                .filter_map(|(sid, lid)| if *lid == logo_id { Some(*sid) } else { None })
+                .filter_map(|(sid, lid)| if *lid == logo.logo_id { Some(*sid) } else { None })
                 .collect();
 
             if matched.is_empty() {
@@ -171,10 +200,13 @@ impl ChannelLogoCollector {
                 continue;
             }
 
-            match fs::write(&path, &png) {
+            match fs::write(&path, &logo.png) {
                 Ok(_) => {
                     self.saved_keys.insert(key);
-                    debug!("[LogoCollector] Saved logo {:?}", path);
+                    debug!(
+                        "[LogoCollector] Saved logo type={} id={} nid={} as {:?}",
+                        logo.logo_type, logo.logo_id, nid, path
+                    );
                 }
                 Err(e) => {
                     warn!("[LogoCollector] Failed to save logo {:?}: {}", path, e);
@@ -211,96 +243,83 @@ fn extract_logo_id_from_sdt_descriptors(descriptors: &[u8]) -> Option<u16> {
     None
 }
 
-fn extract_logo_png_from_cdt_section(section: &PsiSection<'_>) -> Option<(Option<u16>, Vec<u8>)> {
-    // ARIB CDT(0xC8): original_network_id(2) + data_type(1) + descriptor_loop_length(2) + descriptor_loop + data_module_byte
-    // section.data は PSI ヘッダ (8バイト) の後から始まるため、先頭 2 バイトは original_network_id。
+/// Extract logo PNG data from a CDT section following the ARIB STD-B21 data
+/// module format.  This mirrors the logic in TVTest / LibISDB
+/// (`LogoDownloaderFilter::OnCDTSection`).
+///
+/// CDT data-module for logo (`data_type == 0x01`):
+/// ```text
+///   logo_type:             8 bits  [0]
+///   reserved_future_use:   7 bits  [1] upper 7
+///   logo_id:               9 bits  [1] bit0 + [2]
+///   reserved_future_use:   4 bits  [3] upper 4
+///   logo_version:         12 bits  [3] lower 4 + [4]
+///   data_size:            16 bits  [5..7]  (big-endian)
+///   data_byte:     data_size bytes [7..]   <- PNG payload
+/// ```
+fn extract_logo_from_cdt_section(section: &PsiSection<'_>) -> Option<CdtLogoData> {
     let d = section.data;
     if d.len() < 5 {
         return None;
     }
 
-    // d[0..2] = original_network_id — skip
+    // section.data layout (after 8-byte PSI extended header):
+    //   [0..2] original_network_id
+    //   [2]    data_type
+    //   [3..5] reserved(4) + descriptor_loop_length(12)
+    //   descriptors …
+    //   data_module_byte …
+    let original_network_id = ((d[0] as u16) << 8) | d[1] as u16;
+
     let data_type = d[2];
     if data_type != 0x01 {
+        // Not logo data
         return None;
     }
 
     let desc_len = (((d[3] & 0x0F) as usize) << 8) | d[4] as usize;
-    if d.len() < 5 + desc_len {
+    let module_start = 5 + desc_len;
+
+    // Need at least 7 bytes for data-module header
+    if d.len() < module_start + 7 {
         return None;
     }
 
-    let module = &d[5 + desc_len..];
+    let module = &d[module_start..];
+    let module_len = module.len();
 
-    // best-effort logo_id parse (logo data module先頭)
-    let logo_id = if module.len() >= 3 {
-        let lid = (((module[1] & 0x01) as u16) << 8) | module[2] as u16;
-        if lid > 0 { Some(lid) } else { None }
-    } else {
-        None
-    };
-
-    // Prefer module scan, then whole data scan as fallback.
-    let png = extract_png(module).or_else(|| extract_png(d))?;
-    Some((logo_id, png))
-}
-
-fn extract_png(data: &[u8]) -> Option<Vec<u8>> {
-    // Mirakurun では CDT のロゴデータをデコードして PNG 化している。
-    // 本実装では外部デコーダ非依存のため、少なくとも PNG チャンク境界を厳密に検証し、
-    // 途中切れや誤検出（IDAT内の偶然の IEND パターン）を回避する。
-    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-
-    let mut sig_pos = 0usize;
-    while let Some(rel) = data[sig_pos..].windows(SIG.len()).position(|w| w == SIG) {
-        let start = sig_pos + rel;
-        let mut p = start + SIG.len();
-        let mut seen_ihdr = false;
-
-        loop {
-            // chunk: length(4) + type(4) + data(length) + crc(4)
-            if p + 12 > data.len() {
-                break;
-            }
-
-            let len = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
-            let ctype = &data[p + 4..p + 8];
-
-            // PNG chunk type must be alphabetic ASCII letters
-            if !ctype.iter().all(|b| b.is_ascii_alphabetic()) {
-                break;
-            }
-
-            let chunk_end = p + 12 + len;
-            if chunk_end > data.len() {
-                break;
-            }
-
-            if ctype == b"IHDR" {
-                // IHDR must be the first chunk and length must be 13
-                if seen_ihdr || len != 13 {
-                    break;
-                }
-                seen_ihdr = true;
-            }
-
-            if ctype == b"IEND" {
-                // IEND must have zero-length payload
-                if !seen_ihdr || len != 0 {
-                    break;
-                }
-                return Some(data[start..chunk_end].to_vec());
-            }
-
-            p = chunk_end;
-        }
-
-        // Continue scanning after this signature position
-        sig_pos = start + 1;
-        if sig_pos >= data.len() {
-            break;
-        }
+    let logo_type = module[0];
+    if logo_type > 0x05 {
+        return None;
     }
 
-    None
+    let logo_id = (((module[1] as u16) & 0x01) << 8) | module[2] as u16;
+    // logo_version (unused but parsed for correctness):
+    // let _logo_version = (((module[3] as u16) & 0x0F) << 8) | module[4] as u16;
+    let data_size = ((module[5] as usize) << 8) | module[6] as usize;
+
+    // Validate: data fits within the module, and within the CDT section
+    if data_size == 0 || 7 + data_size > module_len {
+        return None;
+    }
+
+    // Skip transparent / very-small logos (TVTest: DataSize <= 93)
+    if data_size < MIN_LOGO_DATA_SIZE {
+        return None;
+    }
+
+    let png_data = &module[7..7 + data_size];
+
+    // Verify PNG signature
+    if data_size < PNG_SIGNATURE.len() || !png_data.starts_with(&PNG_SIGNATURE) {
+        debug!("[LogoCollector] CDT data-module does not start with PNG signature");
+        return None;
+    }
+
+    Some(CdtLogoData {
+        network_id: original_network_id,
+        logo_id,
+        logo_type,
+        png: png_data.to_vec(),
+    })
 }
