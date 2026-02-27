@@ -19,11 +19,11 @@ pub async fn get_logo(
     Path(file): Path<String>,
 ) -> impl IntoResponse {
     // Accept only safe filename patterns: <nid>_<sid>.png
-    if !file
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
-        || !file.ends_with(".png")
-    {
+    if !file.ends_with(".png") {
+        return (StatusCode::BAD_REQUEST, "invalid logo file").into_response();
+    }
+    let stem = &file[..file.len() - 4];
+    if stem.is_empty() || !stem.chars().all(|c| c.is_ascii_digit() || c == '_') {
         return (StatusCode::BAD_REQUEST, "invalid logo file").into_response();
     }
 
@@ -172,6 +172,8 @@ pub async fn get_clients(
                 "tuner_path": s.tuner_path,
                 "channel_info": s.channel_info,
                 "channel_name": s.channel_name,
+                "nid": s.channel_nid,
+                "sid": s.channel_sid,
                 "is_streaming": s.is_streaming,
                 "connected_seconds": s.connected_seconds(),
                 "signal_level": (s.signal_level * 10.0).round() / 10.0,

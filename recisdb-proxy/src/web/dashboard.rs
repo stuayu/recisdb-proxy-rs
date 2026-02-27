@@ -1154,7 +1154,7 @@ const HTML_CONTENT: &str = r#"
                         <td data-sort-value="${escapeHtml(c.host || '-')}">${escapeHtml(c.host || '-')}</td>
                         <td data-sort-value="${c.is_streaming ? '1' : '0'}"><span class="badge ${c.is_streaming ? 'badge-success' : 'badge-warning'}">${c.is_streaming ? 'ストリーミング中' : '待機中'}</span></td>
                         <td data-sort-value="${escapeHtml(c.tuner_path || '-')}"><code>${escapeHtml(c.tuner_path || '-')}</code></td>
-                        <td data-sort-value="${escapeHtml(c.channel_name || c.channel_info || '-')}">${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
+                        <td data-sort-value="${escapeHtml(c.channel_name || c.channel_info || '-')}">${getChannelLogoHtml(c)}${escapeHtml(c.channel_name || c.channel_info || '-')}</td>
                         <td data-sort-value="${c.signal_level != null ? c.signal_level : 0}">${c.signal_level != null ? c.signal_level.toFixed(1) : '-'} dB</td>
                         <td data-sort-value="${c.packets_sent || 0}">${formatPackets(c.packets_sent)}</td>
                         <td data-sort-value="${c.packets_dropped || 0}">${formatPackets(c.packets_dropped)}</td>

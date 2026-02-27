@@ -491,9 +491,32 @@ impl Session {
             }
             // +1 because we would start a new instance on this DLL
             if (fb_running + 1) > fb_max_instances {
-                debug!("[Session {}] Fallback {} skipped: at capacity ({}/{})",
-                       self.id, fallback_path, fb_running, fb_max_instances);
-                continue;
+                // ★ Before giving up, try to evict subscriberless (idle) tuners
+                // on this DLL.  These may be left by idle-close timers or from
+                // sessions that switched away but whose old reader has not yet
+                // timed out.  Freeing one slot lets us proceed.
+                let mut freed = false;
+                for gk in &guard_keys {
+                    if gk.tuner_path == *fallback_path && *gk != fallback_key {
+                        if let Some(other) = self.tuner_pool.get(gk).await {
+                            if other.is_running() && !other.has_subscribers() {
+                                info!("[Session {}] Evicting idle tuner {:?} to make room for fallback driver {}",
+                                      self.id, gk, fallback_path);
+                                self.tuner_pool.cancel_idle_close(gk).await;
+                                other.stop_reader().await;
+                                self.tuner_pool.remove(gk).await;
+                                freed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !freed {
+                    debug!("[Session {}] Fallback {} skipped: at capacity ({}/{}), no idle instances to evict",
+                           self.id, fallback_path, fb_running, fb_max_instances);
+                    continue;
+                }
+                // Slot freed — proceed with this candidate
             }
 
             info!("[Session {}] Trying fallback driver: {} (space {}, ch {})", self.id, fallback_path, fallback_space, fallback_bon_channel);
@@ -2129,16 +2152,20 @@ impl Session {
                         self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                         self.current_channel_info = Some(channel_info);
 
-                        // Try to get channel name from database
-                        let channel_name = {
+                        // Try to get channel name and NID/SID from database
+                        let (channel_name, ch_nid, ch_sid) = {
                             let db = self.database.lock().await;
-                            if let Ok(Some(driver)) = db.get_bon_driver_by_path(&existing_key.tuner_path) {
-                                db.get_channel_name(driver.id, actual_space, actual_bon_channel).unwrap_or(None)
-                            } else {
-                                None
+                            match db.get_channel_by_physical(&existing_key.tuner_path, actual_space, actual_bon_channel) {
+                                Ok(Some(rec)) => (
+                                    rec.channel_name.or(rec.raw_name),
+                                    Some(rec.nid),
+                                    Some(rec.sid),
+                                ),
+                                _ => (None, None, None),
                             }
                         };
                         self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+                        self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
                         self.current_channel_name = channel_name;
 
                         return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
@@ -2195,10 +2222,38 @@ impl Session {
                             self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
                         }
                     } else {
-                        // Different DLL: non-blocking idle close so we don't block
-                        // the channel-switch path for 1+ seconds.
-                        info!("[Session {}] Different DLL switch, scheduling idle close for {:?}", self.id, tuner.key);
-                        self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
+                        // Different DLL switch.  Check whether the old DLL is at
+                        // capacity.  If so, stop synchronously to free the slot —
+                        // some hardware (e.g. multi-tuner USB cards) cannot have
+                        // multiple group DLLs open simultaneously beyond their
+                        // max_instances, and the new DLL's OpenTuner would fail
+                        // if the old one is still held.
+                        let old_dll_max = {
+                            let db = self.database.lock().await;
+                            db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
+                        };
+                        let old_dll_running = {
+                            let ks = self.tuner_pool.keys().await;
+                            let mut n = 0i32;
+                            for k in &ks {
+                                if k.tuner_path == tuner.key.tuner_path {
+                                    if let Some(t) = self.tuner_pool.get(k).await {
+                                        if t.is_running() { n += 1; }
+                                    }
+                                }
+                            }
+                            n
+                        };
+                        if old_dll_running >= old_dll_max {
+                            info!("[Session {}] Different DLL switch (old DLL at capacity {}/{}), stopping old reader for {:?}",
+                                  self.id, old_dll_running, old_dll_max, tuner.key);
+                            tuner.stop_reader().await;
+                            self.tuner_pool.remove(&tuner.key).await;
+                        } else {
+                            info!("[Session {}] Different DLL switch (old DLL has spare capacity {}/{}), scheduling idle close for {:?}",
+                                  self.id, old_dll_running, old_dll_max, tuner.key);
+                            self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
+                        }
                     }
                 }
             }
@@ -2349,7 +2404,7 @@ impl Session {
                 if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&tuner_path]).await {
                     self.current_tuner_path = Some(fb_path.clone());
                     self.refresh_current_bon_driver_id().await;
-                    self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                    self.session_registry.update_tuner(self.id, Some(fb_path.clone())).await;
                     self.current_tuner = Some(fb_tuner.clone());
                     if self.state == SessionState::Streaming {
                         self.ts_receiver = Some(fb_tuner.subscribe());
@@ -2359,6 +2414,16 @@ impl Session {
                     let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                     self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                     self.current_channel_info = Some(channel_info);
+                    let (fb_ch_name, fb_nid, fb_sid) = {
+                        let db = self.database.lock().await;
+                        match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
+                            Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
+                            _ => (None, None, None),
+                        }
+                    };
+                    self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
+                    self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                    self.current_channel_name = fb_ch_name;
                     return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                 }
                 error!("[Session {}] Cannot switch: all drivers at capacity and priority insufficient",
@@ -2450,7 +2515,7 @@ impl Session {
                         if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&actual_tuner_path]).await {
                             self.current_tuner_path = Some(fb_path.clone());
                             self.refresh_current_bon_driver_id().await;
-                            self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                            self.session_registry.update_tuner(self.id, Some(fb_path.clone())).await;
                             self.current_tuner = Some(fb_tuner.clone());
                             if self.state == SessionState::Streaming {
                                 self.ts_receiver = Some(fb_tuner.subscribe());
@@ -2460,6 +2525,16 @@ impl Session {
                             let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                             self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                             self.current_channel_info = Some(channel_info);
+                            let (fb_ch_name, fb_nid, fb_sid) = {
+                                let db = self.database.lock().await;
+                                match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
+                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
+                                    _ => (None, None, None),
+                                }
+                            };
+                            self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
+                            self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                            self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
                         self.try_restore_previous_channel(&old_tuner_key).await;
@@ -2485,7 +2560,7 @@ impl Session {
                         if let Some((fb_tuner, fb_path)) = self.try_fallback_drivers(&fallback_candidates, &[&actual_tuner_path]).await {
                             self.current_tuner_path = Some(fb_path.clone());
                             self.refresh_current_bon_driver_id().await;
-                            self.session_registry.update_tuner(self.id, Some(fb_path)).await;
+                            self.session_registry.update_tuner(self.id, Some(fb_path.clone())).await;
                             self.current_tuner = Some(fb_tuner.clone());
                             if self.state == SessionState::Streaming {
                                 self.ts_receiver = Some(fb_tuner.subscribe());
@@ -2495,6 +2570,16 @@ impl Session {
                             let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                             self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                             self.current_channel_info = Some(channel_info);
+                            let (fb_ch_name, fb_nid, fb_sid) = {
+                                let db = self.database.lock().await;
+                                match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
+                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
+                                    _ => (None, None, None),
+                                }
+                            };
+                            self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
+                            self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                            self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
                         // ★ Bug D fix: get_or_create inserted this tuner into the pool but
@@ -2551,16 +2636,20 @@ impl Session {
                 self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                 self.current_channel_info = Some(channel_info);
 
-                // Try to get channel name from database
-                let channel_name = {
+                // Try to get channel name and NID/SID from database
+                let (channel_name, ch_nid, ch_sid) = {
                     let db = self.database.lock().await;
-                    if let Ok(Some(driver)) = db.get_bon_driver_by_path(&tuner_path) {
-                        db.get_channel_name(driver.id, actual_space, actual_bon_channel).unwrap_or(None)
-                    } else {
-                        None
+                    match db.get_channel_by_physical(&tuner_path, actual_space, actual_bon_channel) {
+                        Ok(Some(rec)) => (
+                            rec.channel_name.or(rec.raw_name),
+                            Some(rec.nid),
+                            Some(rec.sid),
+                        ),
+                        _ => (None, None, None),
                     }
                 };
                 self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+                self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
                 self.current_channel_name = channel_name;
 
                 // BonDriver reader is confirmed ready by start_reader_with_warm (via ready_rx, up to 10s timeout).
@@ -2807,98 +2896,255 @@ impl Session {
                 .await;
         }
 
-        // Use the first matching channel (highest priority due to ordering)
-        let channel_with_driver = &channels[0];
-        let channel_record = &channel_with_driver.channel;
+        // ★ Iterate through all candidate channels (sorted by priority) and try
+        // each one until we find a tuner that can be opened successfully.
+        // This provides automatic fallback when the highest-priority driver is
+        // busy, at capacity, or experiencing a hardware error.
+        let pool_keys = self.tuner_pool.keys().await;
 
-        let tuner_id = channel_with_driver.bon_driver_path.clone();
-        let space = channel_record.bon_space.unwrap_or(0);
-        let channel = channel_record.bon_channel.unwrap_or(0);
+        // ★ Capture the current session's tuner info BEFORE the loop.
+        // If this session is the sole subscriber, its slot will be freed during
+        // channel switch, so it should NOT count against driver capacity.
+        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
+        let old_tuner_will_free_slot = self.current_tuner.as_ref()
+            .map(|t| {
+                let sub_count = t.subscriber_count();
+                // Streaming: sole broadcast subscriber → slot freed after unsubscribe
+                (sub_count == 1 && self.ts_receiver.is_some()) ||
+                // TunerOpen: no broadcast subscription yet → slot freed immediately
+                (sub_count == 0 && self.ts_receiver.is_none())
+            })
+            .unwrap_or(false);
 
-        // Set current tuner path
-        self.current_tuner_path = Some(tuner_id.clone());
-        self.refresh_current_bon_driver_id().await;
+        for (candidate_idx, channel_with_driver) in channels.iter().enumerate() {
+            let channel_record = &channel_with_driver.channel;
+            let tuner_id = channel_with_driver.bon_driver_path.clone();
+            let space = channel_record.bon_space.unwrap_or(0);
+            let channel = channel_record.bon_channel.unwrap_or(0);
 
-        // Create channel key and tune
-        let key = ChannelKey::space_channel(&tuner_id, space, channel);
+            // ★ Capacity check: skip drivers that are already at max_instances.
+            let max_instances = {
+                let db = self.database.lock().await;
+                db.get_max_instances_for_path(&tuner_id).unwrap_or(1)
+            };
 
-        match self
-            .tuner_pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
-            .await
-        {
-            Ok(tuner) => {
-                // ★ Bug H fix: cancel any pending idle-close before using this tuner.
-                // Without this, a timer scheduled by a previous session could fire and stop
-                // the reader while this session holds it in TunerOpen state.
-                self.tuner_pool.cancel_idle_close(&key).await;
+            let key = ChannelKey::space_channel(&tuner_id, space, channel);
 
-                // Start the BonDriver reader if not already running
-                if !tuner.is_running() {
-                    if let Err(e) = self.start_reader_with_warm(
-                        Arc::clone(&tuner),
-                        tuner_id.clone(),
-                        space,
-                        channel,
-                    ).await {
-                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                            warn!("[Session {}] Channel unavailable: {}", self.id, e);
-                        } else {
-                            error!("[Session {}] Failed to start BonDriver reader: {}", self.id, e);
+            // Count how many instances of this driver are already running
+            // (excluding an entry for the exact same channel key we're about
+            // to create, since get_or_create would reuse it).
+            let mut running_instances = 0i32;
+            for gk in &pool_keys {
+                if gk.tuner_path == tuner_id && *gk != key {
+                    // Skip the current session's own tuner if it will be freed
+                    // during channel switch (sole subscriber → slot released).
+                    if old_tuner_will_free_slot && old_tuner_key.as_ref() == Some(gk) {
+                        continue;
+                    }
+                    if let Some(existing) = self.tuner_pool.get(gk).await {
+                        if existing.is_running() {
+                            running_instances += 1;
                         }
-                        // Clean up the orphaned pool entry on failure
-                        if !tuner.is_running() && !tuner.has_subscribers() {
-                            self.tuner_pool.remove(&key).await;
-                        }
-                        return self.send_message(ServerMessage::SelectLogicalChannelAck {
-                            success: false,
-                            error_code: ErrorCode::ChannelSetFailed.into(),
-                            tuner_id: None,
-                            space: None,
-                            channel: None,
-                        }).await;
                     }
                 }
+            }
 
-                self.current_tuner = Some(tuner);
+            // Check if an exact-key tuner is already in the pool and running;
+            // if so it doesn't count as a "new" instance.
+            let existing_for_key = self.tuner_pool.get(&key).await;
+            let reuse_existing = existing_for_key
+                .as_ref()
+                .map_or(false, |t| t.is_running());
 
-                // Notify B25 decoder about channel change
-                if let Some(tuner) = &self.current_tuner {
-                    tuner.notify_channel_change();
-                }
-
-                self.restart_tsreplace_pipeline_if_streaming().await;
-
-                if self.state == SessionState::Ready {
-                    self.state = SessionState::TunerOpen;
-                }
-
+            if !reuse_existing && (running_instances + 1) > max_instances {
                 info!(
-                    "[Session {}] Logical channel selected: tuner={}, space={}, channel={}",
-                    self.id, tuner_id, space, channel
+                    "[Session {}] SelectLogicalChannel: skipping candidate {} '{}' — at capacity ({}/{} instances)",
+                    self.id, candidate_idx, tuner_id, running_instances, max_instances
                 );
+                continue;
+            }
 
-                self.send_message(ServerMessage::SelectLogicalChannelAck {
-                    success: true,
-                    error_code: 0,
-                    tuner_id: Some(tuner_id),
-                    space: Some(space),
-                    channel: Some(channel),
-                })
+            // Set current tuner path (will be overwritten if this attempt fails and
+            // we move on to the next candidate).
+            self.current_tuner_path = Some(tuner_id.clone());
+            self.refresh_current_bon_driver_id().await;
+
+            // Try to obtain or create the tuner entry in the pool
+            let tuner = match self
+                .tuner_pool
+                .get_or_create(key.clone(), 2, || async { Ok(()) })
                 .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        "[Session {}] SelectLogicalChannel: candidate {} '{}' pool creation failed: {}",
+                        self.id, candidate_idx, tuner_id, e
+                    );
+                    continue;
+                }
+            };
+
+            // ★ Bug H fix: cancel any pending idle-close before using this tuner.
+            self.tuner_pool.cancel_idle_close(&key).await;
+
+            // Start the BonDriver reader if not already running
+            if !tuner.is_running() {
+                if let Err(e) = self.start_reader_with_warm(
+                    Arc::clone(&tuner),
+                    tuner_id.clone(),
+                    space,
+                    channel,
+                ).await {
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        warn!(
+                            "[Session {}] SelectLogicalChannel: candidate {} '{}' channel unavailable: {}",
+                            self.id, candidate_idx, tuner_id, e
+                        );
+                    } else {
+                        error!(
+                            "[Session {}] SelectLogicalChannel: candidate {} '{}' failed to start reader: {}",
+                            self.id, candidate_idx, tuner_id, e
+                        );
+                    }
+                    // Clean up the orphaned pool entry
+                    if !tuner.is_running() && !tuner.has_subscribers() {
+                        self.tuner_pool.remove(&key).await;
+                    }
+                    // Try the next candidate
+                    continue;
+                }
             }
-            Err(e) => {
-                error!("[Session {}] Failed to tune: {}", self.id, e);
-                self.send_message(ServerMessage::SelectLogicalChannelAck {
-                    success: false,
-                    error_code: ErrorCode::ChannelSetFailed.into(),
-                    tuner_id: None,
-                    space: None,
-                    channel: None,
-                })
-                .await
+
+            // ★ Success — this candidate works.
+            // Properly unsubscribe from the old tuner before switching.
+            let old_tuner = self.current_tuner.take();
+            if let Some(old) = old_tuner {
+                let same_tuner_reuse = Arc::ptr_eq(&old, &tuner);
+                if same_tuner_reuse {
+                    // Same SharedTuner (same channel key) — keep subscription.
+                    debug!("[Session {}] SelectLogicalChannel: reusing same tuner", self.id);
+                    if self.state == SessionState::Streaming {
+                        let new_rx = tuner.subscribe();
+                        self.ts_receiver = Some(new_rx);
+                        old.unsubscribe();
+                    }
+                } else {
+                    // Different tuner — unsubscribe from old and subscribe to new.
+                    if self.ts_receiver.is_some() {
+                        old.unsubscribe();
+                        self.ts_receiver = None;
+                        debug!("[Session {}] SelectLogicalChannel: unsubscribed from old tuner, remaining subscribers: {}",
+                               self.id, old.subscriber_count());
+                        if old.subscriber_count() == 0 {
+                            // Stop the old tuner synchronously.  This is critical when
+                            // the hardware (e.g. multi-tuner USB card) cannot have
+                            // multiple DLLs open simultaneously within a group.
+                            let old_max = {
+                                let db = self.database.lock().await;
+                                db.get_max_instances_for_path(&old.key.tuner_path).unwrap_or(1)
+                            };
+                            let old_running = {
+                                let ks = self.tuner_pool.keys().await;
+                                let mut n = 0i32;
+                                for k in &ks {
+                                    if k.tuner_path == old.key.tuner_path {
+                                        if let Some(t) = self.tuner_pool.get(k).await {
+                                            if t.is_running() { n += 1; }
+                                        }
+                                    }
+                                }
+                                n
+                            };
+                            if old.key.tuner_path == tuner_id || old_running >= old_max {
+                                // Same DLL switch or at capacity — stop synchronously.
+                                info!("[Session {}] SelectLogicalChannel: stopping old reader for {:?}",
+                                      self.id, old.key);
+                                self.tuner_pool.cancel_idle_close(&old.key).await;
+                                old.stop_reader().await;
+                                self.tuner_pool.remove(&old.key).await;
+                            } else {
+                                // Different DLL with spare capacity — schedule idle close.
+                                info!("[Session {}] SelectLogicalChannel: scheduling idle close for {:?}",
+                                      self.id, old.key);
+                                self.tuner_pool.schedule_idle_close(old.key.clone(), old).await;
+                            }
+                        }
+                    }
+                    if self.state == SessionState::Streaming {
+                        self.ts_receiver = Some(tuner.subscribe());
+                    }
+                }
+            } else if self.state == SessionState::Streaming {
+                self.ts_receiver = Some(tuner.subscribe());
             }
+
+            self.current_tuner = Some(tuner);
+
+            // Notify B25 decoder about channel change
+            if let Some(tuner) = &self.current_tuner {
+                tuner.notify_channel_change();
+            }
+
+            self.restart_tsreplace_pipeline_if_streaming().await;
+
+            if self.state == SessionState::Ready {
+                self.state = SessionState::TunerOpen;
+            }
+
+            info!(
+                "[Session {}] Logical channel selected (candidate {}): tuner={}, space={}, channel={}",
+                self.id, candidate_idx, tuner_id, space, channel
+            );
+
+            // Update session registry
+            self.session_registry
+                .update_tuner(self.id, Some(tuner_id.clone()))
+                .await;
+
+            // Update channel info, name, and NID/SID for dashboard logo
+            let channel_info = format!("Space {}, Ch {}", space, channel);
+            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+            self.current_channel_info = Some(channel_info);
+
+            let (channel_name, ch_nid, ch_sid) = {
+                let db = self.database.lock().await;
+                match db.get_channel_by_physical(&tuner_id, space, channel) {
+                    Ok(Some(rec)) => (
+                        rec.channel_name.or(rec.raw_name),
+                        Some(rec.nid),
+                        Some(rec.sid),
+                    ),
+                    _ => (None, None, None),
+                }
+            };
+            self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+            self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
+            self.current_channel_name = channel_name;
+
+            return self.send_message(ServerMessage::SelectLogicalChannelAck {
+                success: true,
+                error_code: 0,
+                tuner_id: Some(tuner_id),
+                space: Some(space),
+                channel: Some(channel),
+            })
+            .await;
         }
+
+        // All candidates exhausted
+        error!(
+            "[Session {}] SelectLogicalChannel: all {} candidate drivers failed for nid={}, tsid={}, sid={:?}",
+            self.id, channels.len(), nid, tsid, sid
+        );
+        self.send_message(ServerMessage::SelectLogicalChannelAck {
+            success: false,
+            error_code: ErrorCode::ChannelSetFailed.into(),
+            tuner_id: None,
+            space: None,
+            channel: None,
+        })
+        .await
     }
 
     /// Handle GetChannelList message.

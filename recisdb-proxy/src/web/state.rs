@@ -53,6 +53,10 @@ pub struct SessionInfo {
     pub channel_info: Option<String>,
     /// Channel name from database.
     pub channel_name: Option<String>,
+    /// Current channel NID (for logo display).
+    pub channel_nid: Option<u16>,
+    /// Current channel SID (for logo display).
+    pub channel_sid: Option<u16>,
     /// Whether the session is streaming.
     pub is_streaming: bool,
     /// Connection time (seconds since connection).
@@ -151,6 +155,8 @@ impl SessionRegistry {
             tuner_path: None,
             channel_info: None,
             channel_name: None,
+            channel_nid: None,
+            channel_sid: None,
             is_streaming: false,
             connected_at: Instant::now(),
             signal_level: 0.0,
@@ -201,6 +207,14 @@ impl SessionRegistry {
     pub async fn update_channel_name(&self, id: u64, channel_name: Option<String>) {
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
             info.channel_name = channel_name;
+        }
+    }
+
+    /// Update session channel NID/SID (for logo display on dashboard).
+    pub async fn update_channel_ids(&self, id: u64, nid: Option<u16>, sid: Option<u16>) {
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.channel_nid = nid;
+            info.channel_sid = sid;
         }
     }
 
