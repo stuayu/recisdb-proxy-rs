@@ -5,12 +5,37 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use once_cell::sync::OnceCell;
 
 /// Global log file handle.
 static LOG_FILE: OnceCell<Mutex<File>> = OnceCell::new();
+
+/// Global file log level filter.
+/// Encoded as: Off=0, Error=1, Warn=2, Info=3, Debug=4, Trace=5.
+static FILE_LOG_LEVEL: AtomicU8 = AtomicU8::new(2); // default: Warn
+
+/// Set the file log level.
+pub fn set_file_log_level(level: log::LevelFilter) {
+    let n = match level {
+        log::LevelFilter::Off   => 0,
+        log::LevelFilter::Error => 1,
+        log::LevelFilter::Warn  => 2,
+        log::LevelFilter::Info  => 3,
+        log::LevelFilter::Debug => 4,
+        log::LevelFilter::Trace => 5,
+    };
+    FILE_LOG_LEVEL.store(n, Ordering::Relaxed);
+}
+
+/// Returns true if the given level should be written to the log file.
+pub fn file_level_enabled(level: log::Level) -> bool {
+    let filter = FILE_LOG_LEVEL.load(Ordering::Relaxed);
+    if filter == 0 { return false; }
+    (level as u8) <= filter
+}
 
 /// Get the path to the DLL itself.
 #[cfg(windows)]
@@ -118,23 +143,33 @@ pub fn log_message(msg: &str) {
     }
 }
 
-/// Log with level prefix.
+/// Log with level prefix (respects the configured file log level).
 #[macro_export]
 macro_rules! file_log {
     (trace, $($arg:tt)*) => {
-        $crate::logging::log_message(&format!("[TRACE] {}", format!($($arg)*)));
+        if $crate::logging::file_level_enabled(log::Level::Trace) {
+            $crate::logging::log_message(&format!("[TRACE] {}", format!($($arg)*)));
+        }
     };
     (debug, $($arg:tt)*) => {
-        $crate::logging::log_message(&format!("[DEBUG] {}", format!($($arg)*)));
+        if $crate::logging::file_level_enabled(log::Level::Debug) {
+            $crate::logging::log_message(&format!("[DEBUG] {}", format!($($arg)*)));
+        }
     };
     (info, $($arg:tt)*) => {
-        $crate::logging::log_message(&format!("[INFO ] {}", format!($($arg)*)));
+        if $crate::logging::file_level_enabled(log::Level::Info) {
+            $crate::logging::log_message(&format!("[INFO ] {}", format!($($arg)*)));
+        }
     };
     (warn, $($arg:tt)*) => {
-        $crate::logging::log_message(&format!("[WARN ] {}", format!($($arg)*)));
+        if $crate::logging::file_level_enabled(log::Level::Warn) {
+            $crate::logging::log_message(&format!("[WARN ] {}", format!($($arg)*)));
+        }
     };
     (error, $($arg:tt)*) => {
-        $crate::logging::log_message(&format!("[ERROR] {}", format!($($arg)*)));
+        if $crate::logging::file_level_enabled(log::Level::Error) {
+            $crate::logging::log_message(&format!("[ERROR] {}", format!($($arg)*)));
+        }
     };
 }
 

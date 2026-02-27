@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use recisdb_protocol::{
     decode_header, decode_server_message, encode_client_message, ClientMessage,
-    ServerMessage, HEADER_SIZE, PROTOCOL_VERSION,
+    MessageType, ServerMessage, HEADER_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::client::buffer::TsRingBuffer;
@@ -84,16 +84,20 @@ pub struct Connection {
     state: Mutex<ConnectionState>,
     /// Ring buffer for TS data.
     buffer: Arc<TsRingBuffer>,
-    /// Channel for sending requests.
+    /// Channel for sending requests (tokio mpsc — async sender from sync caller).
     request_tx: Mutex<Option<mpsc::Sender<ClientMessage>>>,
-    /// Channel for receiving responses.
-    response_rx: Mutex<Option<mpsc::Receiver<ServerMessage>>>,
+    /// Channel for receiving responses (std::sync::mpsc for blocking recv_timeout).
+    /// Using std mpsc instead of tokio mpsc avoids the 1 ms poll loop in
+    /// send_request_with_timeout, matching the per-command Win32 auto-reset
+    /// events used by BonDriverProxy(Ex).
+    response_rx: Mutex<Option<std::sync::mpsc::Receiver<ServerMessage>>>,
     /// Tokio runtime handle.
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     /// BonDriver version reported by server.
     bondriver_version: Mutex<u8>,
-    /// Last signal level.
-    signal_level: Mutex<f32>,
+    /// Cached signal level and the time it was last fetched.
+    /// TTL = 2 s — avoids a network round-trip on every TVTest poll.
+    signal_level: Mutex<(f32, Option<std::time::Instant>)>,
 }
 
 impl Connection {
@@ -107,7 +111,7 @@ impl Connection {
             response_rx: Mutex::new(None),
             runtime: Mutex::new(None),
             bondriver_version: Mutex::new(0),
-            signal_level: Mutex::new(0.0),
+            signal_level: Mutex::new((0.0, None)),
         })
     }
 
@@ -122,10 +126,10 @@ impl Connection {
         *self.bondriver_version.lock()
     }
 
-    /// Get the signal level.
+    /// Get the cached signal level (no network round-trip).
     #[allow(dead_code)]
     pub fn signal_level(&self) -> f32 {
-        *self.signal_level.lock()
+        self.signal_level.lock().0
     }
 
     /// Get default client priority from configuration.
@@ -177,7 +181,9 @@ impl Connection {
 
         file_log!(debug, "connect: Creating channels...");
         let (req_tx, req_rx) = mpsc::channel::<ClientMessage>(32);
-        let (resp_tx, resp_rx) = mpsc::channel::<ServerMessage>(32);
+        // Use std::sync::mpsc for responses so the sync caller can use
+        // recv_timeout() instead of spinning with sleep().
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<ServerMessage>();
 
         *self.request_tx.lock() = Some(req_tx);
         *self.response_rx.lock() = Some(resp_rx);
@@ -198,12 +204,11 @@ impl Connection {
 
         *self.runtime.lock() = Some(runtime);
 
-        // Wait for connection task to establish TCP connection
-        // Use a reasonable fixed wait time based on connect_timeout
-        let wait_time = self.config.connect_timeout.min(Duration::from_secs(5));
-        let sleep_time = wait_time.min(Duration::from_millis(500));
-        file_log!(debug, "connect: Waiting {:?} for connection...", sleep_time);
-        std::thread::sleep(sleep_time);
+        // The Hello message is queued via blocking_send into the mpsc channel immediately.
+        // The connection_task will dequeue and send it once the TCP connection is established.
+        // send_hello() polls for the HelloAck response, so no fixed sleep is needed here.
+        // A small yield gives the runtime time to schedule the connection_task.
+        std::thread::sleep(Duration::from_millis(10));
 
         // Perform handshake with timeout
         file_log!(info, "connect: Sending hello...");
@@ -235,55 +240,45 @@ impl Connection {
     }
 
     /// Send a message and wait for response with timeout.
+    ///
+    /// Uses `std::sync::mpsc::Receiver::recv_timeout()` for a true blocking
+    /// wait — no spin loop, no sleep().  This mirrors the per-command
+    /// `WaitForMultipleObjects` + auto-reset event pattern in BonDriverProxy(Ex).
     fn send_request_with_timeout(&self, msg: ClientMessage, timeout: Duration) -> Option<ServerMessage> {
-        let tx = self.request_tx.lock();
-        let tx = tx.as_ref()?;
-
-        // Send request
-        debug!("[Connection] Sending message: {:?}", std::mem::discriminant(&msg));
-        if tx.blocking_send(msg).is_err() {
-            error!("[Connection] Failed to send request to server");
-            return None;
-        }
-        debug!("[Connection] Message sent successfully, waiting for response (timeout: {:?})", timeout);
-
-        // Wait for response with timeout using polling
-        let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(5);
-        let mut poll_count = 0;
-
-        loop {
-            {
-                let mut rx = self.response_rx.lock();
-                if let Some(rx) = rx.as_mut() {
-                    // Try non-blocking receive
-                    match rx.try_recv() {
-                        Ok(resp) => {
-                            debug!("[Connection] Received response after {} polls", poll_count);
-                            return Some(resp);
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => {
-                            // No message yet, continue polling
-                        }
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            error!("[Connection] Response channel closed");
-                            return None;
-                        }
-                    }
-                } else {
-                    error!("[Connection] Response channel not initialized");
-                    return None;
-                }
-            }
-
-            // Check timeout
-            if start.elapsed() >= timeout {
-                warn!("[Connection] Request timed out after {:?} ({} polls)", timeout, poll_count);
+        // Send the request first (briefly holds request_tx lock).
+        {
+            let tx = self.request_tx.lock();
+            let tx = tx.as_ref()?;
+            debug!("[Connection] Sending message: {:?}", std::mem::discriminant(&msg));
+            if tx.blocking_send(msg).is_err() {
+                error!("[Connection] Failed to send request to server");
                 return None;
             }
+        }
 
-            poll_count += 1;
-            std::thread::sleep(poll_interval);
+        // Block until a response arrives or timeout expires.
+        // Holding response_rx lock for the full duration is intentional:
+        // disconnect() drops request_tx first, which causes connection_loop to
+        // drop resp_tx, making recv_timeout return Disconnected immediately.
+        let rx = self.response_rx.lock();
+        if let Some(rx) = rx.as_ref() {
+            match rx.recv_timeout(timeout) {
+                Ok(resp) => {
+                    debug!("[Connection] Received response");
+                    Some(resp)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    warn!("[Connection] Request timed out after {:?}", timeout);
+                    None
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    error!("[Connection] Response channel closed");
+                    None
+                }
+            }
+        } else {
+            error!("[Connection] Response channel not initialized");
+            None
         }
     }
 
@@ -321,9 +316,11 @@ impl Connection {
 
     /// Send hello message.
     fn send_hello(&self) -> bool {
-        let resp = self.send_request(ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-        });
+        // Use connect_timeout (not read_timeout) for the initial handshake.
+        let resp = self.send_request_with_timeout(
+            ClientMessage::Hello { version: PROTOCOL_VERSION },
+            self.config.connect_timeout,
+        );
 
         match resp {
             Some(ServerMessage::HelloAck { version, success }) => {
@@ -406,16 +403,33 @@ impl Connection {
         }
     }
 
-    /// Get signal level.
+    /// Get signal level with a 2-second TTL cache.
+    ///
+    /// BonDriverProxy(Ex) updates signal level once per second inside the
+    /// TsReader thread; clients read it locally with no network cost.
+    /// We approximate this by caching the value for 2 s and only making a
+    /// network round-trip when the cache expires.
     pub fn get_signal_level(&self) -> f32 {
-        let resp = self.send_request(ClientMessage::GetSignalLevel);
+        const TTL: Duration = Duration::from_secs(2);
 
+        // Return cached value if still fresh.
+        {
+            let cache = self.signal_level.lock();
+            if let Some(fetched_at) = cache.1 {
+                if fetched_at.elapsed() < TTL {
+                    return cache.0;
+                }
+            }
+        }
+
+        // Cache expired — fetch from server.
+        let resp = self.send_request(ClientMessage::GetSignalLevel);
         match resp {
             Some(ServerMessage::GetSignalLevelAck { signal_level }) => {
-                *self.signal_level.lock() = signal_level;
+                *self.signal_level.lock() = (signal_level, Some(std::time::Instant::now()));
                 signal_level
             }
-            _ => *self.signal_level.lock(),
+            _ => self.signal_level.lock().0,
         }
     }
 
@@ -490,7 +504,7 @@ async fn connection_task(
     conn: Arc<Connection>,
     config: ConnectionConfig,
     req_rx: mpsc::Receiver<ClientMessage>,
-    resp_tx: mpsc::Sender<ServerMessage>,
+    resp_tx: std::sync::mpsc::Sender<ServerMessage>,
     buffer: Arc<TsRingBuffer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     file_log!(info, "connection_task: Starting, connecting to {}...", config.server_addr);
@@ -546,7 +560,7 @@ async fn connection_task(
 async fn connection_loop<R, W>(
     conn: Arc<Connection>,
     mut req_rx: mpsc::Receiver<ClientMessage>,
-    resp_tx: mpsc::Sender<ServerMessage>,
+    resp_tx: std::sync::mpsc::Sender<ServerMessage>,
     buffer: Arc<TsRingBuffer>,
     mut reader: R,
     mut writer: W,
@@ -555,7 +569,12 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut read_buf = BytesMut::with_capacity(65536);
+    // Use a larger read buffer (256 KB) to reduce the number of syscalls for
+    // high-bitrate streams, similar to TsPacketBufSize in BonDriverProxy(Ex).
+    let mut read_buf = BytesMut::with_capacity(262144);
+
+    static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     loop {
         tokio::select! {
@@ -575,46 +594,53 @@ where
                     break;
                 }
 
-                // Process complete frames
+                // Process all complete frames currently in read_buf.
                 while read_buf.len() >= HEADER_SIZE {
                     match decode_header(&read_buf)? {
                         Some(header) => {
                             let total_len = HEADER_SIZE + header.payload_len as usize;
-                            if read_buf.len() >= total_len {
-                                let _ = read_buf.split_to(HEADER_SIZE);
-                                let payload = read_buf.split_to(header.payload_len as usize);
-                                let payload = Bytes::from(payload.to_vec());
-
-                                let msg = decode_server_message(header.message_type, payload)?;
-
-                                // Handle TS data specially
-                                if let ServerMessage::TsData { data } = &msg {
-                                    static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                    static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-                                    let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    TS_BYTES.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                    let written = buffer.write(data);
-
-                                    // Log every 100 messages
-                                    if count % 100 == 0 {
-                                        let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-                                        crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
-                                               count, data.len(), written, buffer.available(), total_bytes);
-                                    }
-
-                                    if written < data.len() {
-                                        crate::file_log!(warn, "Buffer full, dropped {} bytes", data.len() - written);
-                                    }
-                                } else {
-                                    // Send response to waiting request
-                                    if resp_tx.send(msg).await.is_err() {
-                                        debug!("Response channel closed");
-                                    }
-                                }
-                            } else {
+                            if read_buf.len() < total_len {
                                 break; // Need more data
+                            }
+
+                            // Consume header bytes.
+                            let _ = read_buf.split_to(HEADER_SIZE);
+
+                            // --- TsData fast path ---
+                            // Handle TS data directly without going through
+                            // decode_server_message() to avoid an extra Vec
+                            // allocation + memcpy (the payload.to_vec() inside
+                            // the decoder).  The payload is written straight
+                            // from read_buf into the ring buffer (single copy).
+                            if header.message_type == MessageType::TsData {
+                                let ts_payload = read_buf.split_to(header.payload_len as usize);
+
+                                let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                                let written = buffer.write(&ts_payload);
+
+                                if count % 100 == 0 {
+                                    let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                                    crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
+                                           count, ts_payload.len(), written, buffer.available(), total_bytes);
+                                }
+
+                                if written < ts_payload.len() {
+                                    crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
+                                }
+
+                                continue;
+                            }
+
+                            // --- Non-TS messages ---
+                            // freeze() is zero-copy (BytesMut → Bytes without cloning).
+                            let payload = read_buf.split_to(header.payload_len as usize).freeze();
+                            let msg = decode_server_message(header.message_type, payload)?;
+
+                            // std::sync::mpsc::Sender::send() is non-blocking.
+                            if resp_tx.send(msg).is_err() {
+                                debug!("Response channel closed");
                             }
                         }
                         None => break, // Need more data

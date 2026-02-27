@@ -1,7 +1,9 @@
 //! Lock-free ring buffer for TS data.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::ptr;
+use std::time::Duration;
 
 /// TS packet size.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -13,6 +15,10 @@ pub const RING_BUFFER_SIZE: usize = TS_PACKET_SIZE * 1024 * 100;
 ///
 /// This buffer is designed for a single-producer, single-consumer scenario
 /// where the network receiver writes data and the BonDriver GetTsStream reads it.
+///
+/// Data arrival is signaled via a Condvar so that WaitTsStream can block
+/// efficiently instead of spinning with sleep() — mirroring the Win32 event
+/// used in BonDriverProxy(Ex).
 pub struct TsRingBuffer {
     /// The underlying buffer (heap-allocated).
     buffer: Box<[u8]>,
@@ -20,6 +26,11 @@ pub struct TsRingBuffer {
     write_pos: AtomicUsize,
     /// Read position (updated by GetTsStream).
     read_pos: AtomicUsize,
+    /// Condvar for notifying waiting threads when data is available.
+    /// Mirrors the manual-reset Win32 event in BonDriverProxy(Ex).
+    data_available: Condvar,
+    /// Mutex paired with data_available (holds no meaningful state).
+    data_mutex: Mutex<()>,
 }
 
 #[allow(dead_code)]
@@ -32,6 +43,8 @@ impl TsRingBuffer {
             buffer,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
+            data_available: Condvar::new(),
+            data_mutex: Mutex::new(()),
         }
     }
 
@@ -82,7 +95,55 @@ impl TsRingBuffer {
 
         write = (write + to_write) % RING_BUFFER_SIZE;
         self.write_pos.store(write, Ordering::Release);
+
+        // Notify any thread blocked in wait_data().
+        // We briefly acquire the mutex before notify_all() to avoid the
+        // lost-wakeup race: the waiter holds the mutex between its condition
+        // check and calling wait(), so our notify must happen while the mutex
+        // is acquirable (i.e. after the waiter has entered wait()).
+        {
+            let _guard = self.data_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            self.data_available.notify_all();
+        }
+
         to_write
+    }
+
+    /// Block until at least one TS packet is available or the timeout expires.
+    ///
+    /// This replaces the 2 ms sleep-poll loop in WaitTsStream, mirroring
+    /// `WaitForMultipleObjects` on the Win32 event used by BonDriverProxy(Ex).
+    ///
+    /// Returns `true` if data is available, `false` on timeout.
+    pub fn wait_data(&self, timeout: Duration) -> bool {
+        // Fast path: data already waiting.
+        if self.available() >= TS_PACKET_SIZE {
+            return true;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.data_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+        loop {
+            if self.available() >= TS_PACKET_SIZE {
+                return true;
+            }
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+
+            let remaining = deadline - now;
+            let result = self
+                .data_available
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = result.0;
+            if result.1.timed_out() {
+                return false;
+            }
+        }
     }
 
     /// Read data from the buffer.
@@ -168,7 +229,9 @@ impl Default for TsRingBuffer {
     }
 }
 
-// Safety: The buffer uses atomic operations for synchronization
+// Safety: The buffer uses atomic operations for write/read positions.
+// The Condvar/Mutex fields are already Send+Sync; the raw pointer access
+// in write() is guarded by single-producer invariant documented above.
 unsafe impl Send for TsRingBuffer {}
 unsafe impl Sync for TsRingBuffer {}
 

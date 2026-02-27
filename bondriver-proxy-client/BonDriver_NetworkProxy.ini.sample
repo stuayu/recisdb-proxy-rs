@@ -46,3 +46,14 @@ Exclusive = 0
 ; Path to CA certificate for TLS verification (PEM format)
 ; If not specified, system root certificates will be used
 ; TLSCACert = ca.pem
+
+; =====================
+; Logging Configuration
+; =====================
+[Logging]
+; Log level for both the log file and env_logger output.
+; Accepted values (case-insensitive): off, error, warn, info, debug, trace
+; Default: warn  (only warnings and errors are written)
+; Use "info" for connection/channel diagnostics.
+; Use "debug" or "trace" for detailed troubleshooting (produces large log files).
+LogLevel = warn

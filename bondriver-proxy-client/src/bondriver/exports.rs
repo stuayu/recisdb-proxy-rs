@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use log::{debug, error, info, trace};
 use once_cell::sync::OnceCell;
@@ -58,10 +58,18 @@ static INSTANCE: OnceCell<Mutex<BonDriverState>> = OnceCell::new();
 /// Get or create the global instance.
 fn get_instance() -> &'static Mutex<BonDriverState> {
     INSTANCE.get_or_init(|| {
-        file_log!(info, "get_instance: Initializing global state...");
+        // Load log level first (before any logging calls)
+        let log_level = crate::config::load_log_level();
 
-        // Initialize logging
-        let _ = env_logger::try_init();
+        // Apply log level to the file logger
+        crate::logging::set_file_log_level(log_level);
+
+        // Initialize env_logger with the configured level
+        let _ = env_logger::Builder::new()
+            .filter_level(log_level)
+            .try_init();
+
+        file_log!(info, "get_instance: Initializing global state (log_level={:?})...", log_level);
 
         // Load configuration from INI file
         file_log!(info, "get_instance: Loading configuration...");
@@ -152,6 +160,10 @@ pub unsafe extern "system" fn get_signal_level(_this: *mut c_void) -> f32 {
 }
 
 /// Wait for TS stream to become available.
+///
+/// Mirrors the `WaitForMultipleObjects` call in BonDriverProxy(Ex):
+/// instead of spinning with `Sleep(2)`, we block on the ring buffer's
+/// Condvar and are woken immediately when the network receiver writes data.
 pub unsafe extern "system" fn wait_ts_stream(_this: *mut c_void, timeout_ms: DWORD) -> DWORD {
     file_log!(debug, "WaitTsStream called: timeout={}ms", timeout_ms);
 
@@ -177,23 +189,13 @@ pub unsafe extern "system" fn wait_ts_stream(_this: *mut c_void, timeout_ms: DWO
         return ready.min(DWORD::MAX as usize) as DWORD;
     }
 
-    // 通常待機
+    // Block until data arrives or timeout — no spin loop, no sleep().
     let timeout = Duration::from_millis(timeout_ms as u64);
-    let start = Instant::now();
-
-    loop {
-        let avail = buffer.available();
-        if avail >= TS_PACKET_SIZE {
-            let ready = avail / TS_PACKET_SIZE;
-            return ready.min(DWORD::MAX as usize) as DWORD; // 0でない＝準備OK
-        }
-
-        if start.elapsed() >= timeout {
-            return 0; // timeout
-        }
-
-        // 応答性優先（10msだとTVTestのポーリングに負けることがある）
-        std::thread::sleep(Duration::from_millis(2));
+    if buffer.wait_data(timeout) {
+        let ready = buffer.available() / TS_PACKET_SIZE;
+        ready.min(DWORD::MAX as usize) as DWORD
+    } else {
+        0 // timeout
     }
 }
 
@@ -369,21 +371,21 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
     const DEFAULT_CHUNK: usize = 0x10000; // 64KB
     let max_len = DEFAULT_CHUNK.min(MAX_TS_BUFFER_SIZE);
 
-    // ===== まず connection を clone（ロック時間短縮） =====
-    let connection = {
-        let state = get_instance().lock();
-        state.connection.clone()
-    };
-    let buffer = connection.buffer();
-
-    let avail = buffer.available();
-
     // ===== ログ間引き用カウンタ =====
     static LOG_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let count = LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // たまに呼び出し状況を出す（重いので間引き）
+    // Single lock for the entire function.
+    // Previously this function took the lock twice (once to clone the
+    // connection, then again to access ts_out), causing two lock/unlock
+    // round-trips per GetTsStream call.  Now we hold it once and access both
+    // the ring buffer (via the Arc inside state) and ts_out together.
+    let mut state = get_instance().lock();
+    let buffer = Arc::clone(state.connection.buffer());
+
+    let avail = buffer.available();
+
     if count % 200 == 0 {
         crate::file_log!(
             debug,
@@ -391,7 +393,7 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
             count,
             *size,
             avail,
-            connection.state()
+            state.connection.state()
         );
     }
 
@@ -432,8 +434,6 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
         return TRUE;
     }
 
-    // ===== state.ts_out を使うのでここでロック =====
-    let mut state = get_instance().lock();
     state.ts_out.resize(to_read, 0);
 
     // バッファからコピー
@@ -446,8 +446,7 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
         *size = read_count as DWORD;
         *remain = (remaining.min(u32::MAX as usize)) as DWORD;
 
-        // 先頭バイト確認（TS同期なら 0x47 が見えることが多い）
-        let first = state.ts_out.get(0).copied().unwrap_or(0);
+        let first = state.ts_out.first().copied().unwrap_or(0);
 
         if count % 200 == 0 {
             crate::file_log!(

@@ -13,6 +13,41 @@ use log::{debug, error, info, warn};
 
 use crate::client::ConnectionConfig;
 
+/// Load log level from INI file or environment.
+///
+/// Reads `LogLevel` from the `[Logging]` section of the INI file.
+/// Accepted values (case-insensitive): `off`, `error`, `warn`, `info`, `debug`, `trace`.
+/// Default: `warn`.
+pub fn load_log_level() -> log::LevelFilter {
+    let level_str = if let Some(ini_path) = find_ini_file() {
+        if let Ok(content) = std::fs::read_to_string(&ini_path) {
+            let sections = parse_ini(&content);
+            sections
+                .get("Logging")
+                .and_then(|s| s.get("LogLevel").cloned())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Fall back to environment variable
+    let level_str = level_str
+        .or_else(|| std::env::var("BONDRIVER_LOG_LEVEL").ok())
+        .unwrap_or_else(|| "warn".to_string());
+
+    match level_str.to_lowercase().as_str() {
+        "off"   => log::LevelFilter::Off,
+        "error" => log::LevelFilter::Error,
+        "warn"  => log::LevelFilter::Warn,
+        "info"  => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Warn,
+    }
+}
+
 /// Load configuration from INI file.
 ///
 /// Searches for configuration in the following order:

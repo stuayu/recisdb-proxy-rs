@@ -109,22 +109,24 @@ impl SharedTuner {
 
     /// Check if TS packets have been received.
     pub fn has_received_packets(&self) -> bool {
-        self.packets_received.load(Ordering::SeqCst) > 0
+        // Acquire so the caller sees all writes that preceded the increment.
+        self.packets_received.load(Ordering::Acquire) > 0
     }
 
     /// Increment the packet counter.
     pub fn increment_packet_count(&self, count: u64) {
-        self.packets_received.fetch_add(count, Ordering::SeqCst);
+        // Release pairs with the Acquire in has_received_packets / packet_count.
+        self.packets_received.fetch_add(count, Ordering::Release);
     }
 
     /// Reset the packet counter.
     pub fn reset_packet_count(&self) {
-        self.packets_received.store(0, Ordering::SeqCst);
+        self.packets_received.store(0, Ordering::Release);
     }
 
     /// Get the total number of packets received.
     pub fn packet_count(&self) -> u64 {
-        self.packets_received.load(Ordering::SeqCst)
+        self.packets_received.load(Ordering::Acquire)
     }
 
     /// Get a snapshot of TS stream quality stats.
@@ -236,7 +238,7 @@ impl SharedTuner {
     where
         R: AsyncBufRead + Unpin + Send + 'static,
     {
-        if self.is_running.swap(true, Ordering::SeqCst) {
+        if self.is_running.swap(true, Ordering::AcqRel) {
             // Already running
             return;
         }
@@ -275,9 +277,11 @@ impl SharedTuner {
                             shared.increment_packet_count(packet_count);
                         }
 
-                        // Update TS quality analyzer
-                        {
-                            let mut analyzer = shared.quality_analyzer.lock().await;
+                        // Update TS quality analyzer.
+                        // try_lock() avoids blocking the hot broadcast path
+                        // when the web API is reading a snapshot concurrently.
+                        // Missed chunks only affect statistics, not the stream.
+                        if let Ok(mut analyzer) = shared.quality_analyzer.try_lock() {
                             analyzer.analyze(&buf[..n]);
                         }
 
@@ -301,7 +305,7 @@ impl SharedTuner {
                 }
             }
 
-            shared.is_running.store(false, Ordering::SeqCst);
+            shared.is_running.store(false, Ordering::Release);
             info!("Tuner reader stopped for {:?}", shared.key);
         });
 
@@ -313,7 +317,7 @@ impl SharedTuner {
         info!("[SharedTuner] Stopping reader for {:?}...", self.key);
         
         // Signal the reader task to stop
-        self.is_running.store(false, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::Release);
 
         // Wait for the reader task to finish (with timeout)
         if let Ok(mut guard) = tokio::time::timeout(
@@ -338,7 +342,7 @@ impl SharedTuner {
         }
         
         // Final ensure: mark as not running
-        self.is_running.store(false, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::Release);
         
         info!("[SharedTuner] Reader stopped for {:?}", self.key);
     }
@@ -357,7 +361,7 @@ impl SharedTuner {
         startup_config: ReaderStartupConfig,
         ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
-        shared.is_running.store(true, Ordering::SeqCst);
+        shared.is_running.store(true, Ordering::Release);
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
         // Set channel with retry for network-latency environments
@@ -403,7 +407,7 @@ impl SharedTuner {
                         error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
                                space, channel, e, e.kind());
                     }
-                    shared.is_running.store(false, Ordering::SeqCst);
+                    shared.is_running.store(false, Ordering::Release);
 
                     let err_msg = match e.kind() {
                         std::io::ErrorKind::AddrNotAvailable =>
@@ -418,7 +422,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::SeqCst);
+                    shared.is_running.store(false, Ordering::Release);
                     let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
                     return;
                 }
@@ -495,7 +499,7 @@ impl SharedTuner {
 
         loop {
             // Check if we should stop due to explicit stop signal
-            if !shared.is_running.load(Ordering::SeqCst) {
+            if !shared.is_running.load(Ordering::Acquire) {
                 info!("[SharedTuner] BREAK: Stop signal received for {:?}", shared.key);
                 break;
             }
@@ -504,7 +508,7 @@ impl SharedTuner {
             if last_status_log.elapsed().as_secs() >= 5 {
                 let level = tuner.get_signal_level();
                 info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, is_running={}, elapsed={}s",
-                      total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.is_running.load(Ordering::SeqCst), reader_start_time.elapsed().as_secs());
+                      total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.is_running.load(Ordering::Acquire), reader_start_time.elapsed().as_secs());
                 last_status_log = std::time::Instant::now();
             }
 
@@ -711,13 +715,13 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::SeqCst);
+                    shared.is_running.store(false, Ordering::Release);
                     break;
                 }
             }
         }
 
-        shared.is_running.store(false, Ordering::SeqCst);
+        shared.is_running.store(false, Ordering::Release);
         info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
     }
 
@@ -736,7 +740,7 @@ impl SharedTuner {
         // Check if reader is already running and stop it properly
         if self.is_running() {
             info!("[SharedTuner] Stopping existing reader for {:?} before restart", self.key);
-            self.is_running.store(false, Ordering::SeqCst);
+            self.is_running.store(false, Ordering::Release);
             
             // Wait for the reader task to fully complete
             // This is critical to ensure BonDriver is fully closed before opening a new one
@@ -809,7 +813,7 @@ impl SharedTuner {
                     Err(e) => {
                         error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})", 
                                tuner_path, e, e.kind());
-                        shared.is_running.store(false, Ordering::SeqCst);
+                        shared.is_running.store(false, Ordering::Release);
                         let err_msg = match e.kind() {
                             std::io::ErrorKind::NotFound => 
                                 format!("BonDriver not found or cannot load: {}", e),
@@ -839,7 +843,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] CRITICAL PANIC in reader task: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::SeqCst);
+                    shared.is_running.store(false, Ordering::Release);
                 }
             }
         });
@@ -881,7 +885,7 @@ impl SharedTuner {
 
     /// Check if the reader is running.
     pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::SeqCst)
+        self.is_running.load(Ordering::Acquire)
     }
 }
 
