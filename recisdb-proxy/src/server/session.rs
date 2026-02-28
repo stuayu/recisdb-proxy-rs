@@ -1828,12 +1828,41 @@ impl Session {
                 old_tuner.unsubscribe();
                 self.ts_receiver = None;
             }
+            // ★ Capacity-aware cleanup (same logic as v2 old-tuner-cleanup).
+            // Only stop the old reader if the DLL is at capacity; otherwise
+            // schedule idle-close so other subscribers can keep streaming.
             if old_tuner.subscriber_count() == 0 {
-                info!("[Session {}] Stopping old reader for {:?} before v1 channel switch",
-                      self.id, old_tuner.key);
-                self.tuner_pool.cancel_idle_close(&old_tuner.key).await;
-                old_tuner.stop_reader().await;
-                self.tuner_pool.remove(&old_tuner.key).await;
+                if !old_tuner.is_running() {
+                    self.tuner_pool.remove(&old_tuner.key).await;
+                } else {
+                    let old_dll_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&old_tuner.key.tuner_path).unwrap_or(1)
+                    };
+                    let old_dll_running = {
+                        let ks = self.tuner_pool.keys().await;
+                        let mut n = 0i32;
+                        for k in &ks {
+                            if k.tuner_path == old_tuner.key.tuner_path {
+                                if let Some(t) = self.tuner_pool.get(k).await {
+                                    if t.is_running() { n += 1; }
+                                }
+                            }
+                        }
+                        n
+                    };
+                    if old_dll_running >= old_dll_max {
+                        info!("[Session {}] v1: old DLL at capacity ({}/{}), stopping old reader for {:?}",
+                              self.id, old_dll_running, old_dll_max, old_tuner.key);
+                        self.tuner_pool.cancel_idle_close(&old_tuner.key).await;
+                        old_tuner.stop_reader().await;
+                        self.tuner_pool.remove(&old_tuner.key).await;
+                    } else {
+                        info!("[Session {}] v1: old DLL has spare capacity ({}/{}), scheduling idle close for {:?}",
+                              self.id, old_dll_running, old_dll_max, old_tuner.key);
+                        self.tuner_pool.schedule_idle_close(old_tuner.key.clone(), old_tuner).await;
+                    }
+                }
             }
         }
 
@@ -1844,29 +1873,65 @@ impl Session {
             .await
         {
             Ok(tuner) => {
+                if !tuner.is_running() {
+                    // ★ Capacity guard (same as v2): verify the DLL is not already
+                    // at max_instances before starting a new reader.
+                    let guard_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&tuner_path).unwrap_or(1)
+                    };
+                    let guard_keys = self.tuner_pool.keys().await;
+                    let mut same_dll_running = 0i32;
+                    for gk in &guard_keys {
+                        if gk.tuner_path == tuner_path && *gk != key {
+                            if let Some(other) = self.tuner_pool.get(gk).await {
+                                if other.is_running() {
+                                    same_dll_running += 1;
+                                }
+                            }
+                        }
+                    }
+                    if (same_dll_running + 1) > guard_max {
+                        warn!("[Session {}] v1: CONFLICT: driver {} already has {}/{} instances running",
+                              self.id, tuner_path, same_dll_running, guard_max);
+                        if !tuner.is_running() && !tuner.has_subscribers() {
+                            self.tuner_pool.remove(&key).await;
+                        }
+                        self.try_restore_previous_channel(&old_tuner_key).await;
+                        return self.send_message(ServerMessage::SetChannelAck {
+                            success: false,
+                            error_code: ErrorCode::ChannelSetFailed.into(),
+                        }).await;
+                    }
+                }
+
                 // Start the BonDriver reader
-                if let Err(e) = self.start_reader_with_warm(
-                    Arc::clone(&tuner),
-                    tuner_path.clone(),
-                    0,  // v1 style uses space=0
-                    channel as u32,
-                ).await {
-                    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                        warn!("[Session {}] Channel unavailable on {}: {}", self.id, tuner_path, e);
-                    } else {
-                        error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})", 
-                               self.id, tuner_path, e, e.kind());
+                if !tuner.is_running() {
+                    if let Err(e) = self.start_reader_with_warm(
+                        Arc::clone(&tuner),
+                        tuner_path.clone(),
+                        0,  // v1 style uses space=0
+                        channel as u32,
+                    ).await {
+                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                            warn!("[Session {}] Channel unavailable on {}: {}", self.id, tuner_path, e);
+                        } else {
+                            error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})", 
+                                   self.id, tuner_path, e, e.kind());
+                        }
+                        // ★ Clean up orphaned pool entry
+                        if !tuner.is_running() && !tuner.has_subscribers() {
+                            self.tuner_pool.remove(&key).await;
+                        }
+                        // ★ Try to restore previous channel
+                        self.try_restore_previous_channel(&old_tuner_key).await;
+                        return self.send_message(ServerMessage::SetChannelAck {
+                            success: false,
+                            error_code: ErrorCode::ChannelSetFailed.into(),
+                        }).await;
                     }
-                    // ★ Clean up orphaned pool entry
-                    if !tuner.is_running() && !tuner.has_subscribers() {
-                        self.tuner_pool.remove(&key).await;
-                    }
-                    // ★ Try to restore previous channel
-                    self.try_restore_previous_channel(&old_tuner_key).await;
-                    return self.send_message(ServerMessage::SetChannelAck {
-                        success: false,
-                        error_code: ErrorCode::ChannelSetFailed.into(),
-                    }).await;
+                } else {
+                    info!("[Session {}] v1: BonDriver reader already running, reusing", self.id);
                 }
 
                 self.current_tuner = Some(tuner.clone());
@@ -2147,40 +2212,88 @@ impl Session {
             }
         };
 
-        // ★ If exclusive is requested, kick off all other tuners on this BonDriver
+        // ★ If exclusive is requested, only evict when the DLL is at capacity.
+        // Multi-instance DLLs (max_instances > 1) can serve multiple channels
+        // simultaneously — each instance is independent.  When spare slots are
+        // available we simply create a new instance without disrupting existing
+        // sessions.
         if exclusive {
-            info!("[Session {}] Exclusive access requested - forcing all other tuners off", self.id);
+            let dll_max = {
+                let db = self.database.lock().await;
+                db.get_max_instances_for_path(&tuner_path).unwrap_or(1)
+            };
             let keys = self.tuner_pool.keys().await;
-            for existing_key in keys.iter() {
-                if existing_key.tuner_path == tuner_path {
-                    // NOTE: We intentionally do NOT skip our own old tuner here.
-                    // On a max_instances=1 DLL where another session shares the same
-                    // SharedTuner (subscriber_count > 1), skipping would leave the
-                    // tuner running.  The old-tuner-cleanup below can only unsubscribe;
-                    // it cannot stop a tuner that still has other subscribers.  The
-                    // capacity check would then find the DLL at capacity and fail —
-                    // despite exclusive being requested.
-                    // stop_reader() is idempotent (second call is a no-op), so the
-                    // old-tuner-cleanup section safely handles the already-stopped
-                    // tuner via the !is_running() guard.
-                    if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
-                        if existing_tuner.is_running() {
-                            let subs = existing_tuner.subscriber_count();
-                            if subs > 0 {
-                                warn!("[Session {}] Exclusive: stopping tuner {:?} that still has {} active subscriber(s) — those sessions will lose data",
-                                      self.id, existing_key, subs);
-                            }
-                            info!("[Session {}] Stopping existing tuner {:?} for exclusive access", self.id, existing_key);
-                            self.tuner_pool.cancel_idle_close(existing_key).await;
-                            existing_tuner.stop_reader().await;
-                            // ★ Remove the stopped entry from the pool so it doesn't
-                            // linger as a ghost (is_running=false). Other sessions'
-                            // event loops will detect the reader stoppage via the
-                            // periodic is_running check and disconnect cleanly.
-                            self.tuner_pool.remove(existing_key).await;
+            let mut running_on_dll = 0i32;
+            for k in keys.iter() {
+                if k.tuner_path == tuner_path {
+                    // Don't count our own tuner if it will be freed during channel switch
+                    if old_tuner_will_free_slot && old_tuner_key.as_ref() == Some(k) {
+                        continue;
+                    }
+                    if let Some(t) = self.tuner_pool.get(k).await {
+                        if t.is_running() {
+                            running_on_dll += 1;
                         }
                     }
                 }
+            }
+
+            if running_on_dll >= dll_max {
+                // At capacity — must evict ONE tuner to make room.
+                // Prefer subscriber-less (idle) tuners; fall back to subscriber-
+                // bearing ones only if all slots are actively subscribed.
+                info!("[Session {}] Exclusive access at capacity ({}/{}), evicting to make room",
+                      self.id, running_on_dll, dll_max);
+
+                let mut best_idle: Option<(ChannelKey, i32)> = None;   // subscriber_count == 0
+                let mut best_any: Option<(ChannelKey, i32)> = None;    // any tuner
+
+                let keys = self.tuner_pool.keys().await;
+                for existing_key in keys.iter() {
+                    if existing_key.tuner_path != tuner_path { continue; }
+                    let Some(existing_tuner) = self.tuner_pool.get(existing_key).await else { continue; };
+                    if !existing_tuner.is_running() { continue; }
+
+                    let (es, ec) = match &existing_key.channel {
+                        ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
+                        ChannelKeySpec::Simple(ch) => (0, *ch as u32),
+                    };
+                    let ep = {
+                        let db = self.database.lock().await;
+                        db.get_channel_priority(&existing_key.tuner_path, es, ec)
+                            .unwrap_or(Some(0)).unwrap_or(0)
+                    };
+
+                    if !existing_tuner.has_subscribers() {
+                        if best_idle.as_ref().map_or(true, |(_, p)| ep < *p) {
+                            best_idle = Some((existing_key.clone(), ep));
+                        }
+                    }
+                    if best_any.as_ref().map_or(true, |(_, p)| ep < *p) {
+                        best_any = Some((existing_key.clone(), ep));
+                    }
+                }
+
+                // Prefer idle tuners to minimize disruption
+                let eviction_target = best_idle.or(best_any);
+                if let Some((target_key, target_priority)) = eviction_target {
+                    if let Some(target_tuner) = self.tuner_pool.get(&target_key).await {
+                        let subs = target_tuner.subscriber_count();
+                        if subs > 0 {
+                            warn!("[Session {}] Exclusive: evicting tuner {:?} (priority {}) with {} active subscriber(s)",
+                                  self.id, target_key, target_priority, subs);
+                        } else {
+                            info!("[Session {}] Exclusive: evicting idle tuner {:?} (priority {})",
+                                  self.id, target_key, target_priority);
+                        }
+                        self.tuner_pool.cancel_idle_close(&target_key).await;
+                        target_tuner.stop_reader().await;
+                        self.tuner_pool.remove(&target_key).await;
+                    }
+                }
+            } else {
+                info!("[Session {}] Exclusive access requested but capacity available ({}/{}), proceeding normally",
+                      self.id, running_on_dll, dll_max);
             }
         }
 
@@ -2760,29 +2873,76 @@ impl Session {
                     info!("[Session {}] BonDriver reader already running, reusing", self.id);
                 }
 
-                // ★ Exclusive post-start re-check: stop any sessions that started on this
-                // DLL during the reader initialization window (up to ~10 s).  The pre-start
-                // stop-loop ran before our reader was up, so there is a race where another
-                // session slipped in.  Now that our reader is confirmed running we can safely
-                // evict any interlopers.
+                // ★ Exclusive post-start re-check: during the reader initialization
+                // window (up to ~10 s) another session may have started a new reader
+                // on the same DLL, pushing over max_instances.  Only evict if we are
+                // actually over capacity — spare slots should be left alone.
                 if exclusive {
+                    let post_dll_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&tuner_path).unwrap_or(1)
+                    };
                     let recheck_keys = self.tuner_pool.keys().await;
+                    let mut post_running = 0i32;
                     for rk in recheck_keys.iter() {
-                        if rk.tuner_path == tuner_path && *rk != key {
-                            if let Some(interloper) = self.tuner_pool.get(rk).await {
-                                if interloper.is_running() {
-                                    let subs = interloper.subscriber_count();
-                                    if subs > 0 {
-                                        warn!("[Session {}] Exclusive post-start: evicting interloper {:?} with {} active subscriber(s)",
-                                              self.id, rk, subs);
-                                    }
-                                    info!("[Session {}] Exclusive post-start: evicting interloper {:?}", self.id, rk);
-                                    self.tuner_pool.cancel_idle_close(rk).await;
-                                    interloper.stop_reader().await;
-                                    self.tuner_pool.remove(rk).await;
+                        if rk.tuner_path == tuner_path {
+                            if let Some(t) = self.tuner_pool.get(rk).await {
+                                if t.is_running() {
+                                    post_running += 1;
                                 }
                             }
                         }
+                    }
+
+                    if post_running > post_dll_max {
+                        info!("[Session {}] Exclusive post-start: over capacity ({}/{}), evicting interlopers",
+                              self.id, post_running, post_dll_max);
+                        // Evict lowest-priority OTHER tuners until we are at capacity.
+                        // Collect candidates (exclude our own key).
+                        let mut candidates: Vec<(ChannelKey, i32, bool)> = Vec::new(); // (key, priority, has_subs)
+                        for rk in recheck_keys.iter() {
+                            if rk.tuner_path == tuner_path && *rk != key {
+                                if let Some(interloper) = self.tuner_pool.get(rk).await {
+                                    if interloper.is_running() {
+                                        let (es, ec) = match &rk.channel {
+                                            ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
+                                            ChannelKeySpec::Simple(ch) => (0, *ch as u32),
+                                        };
+                                        let ep = {
+                                            let db = self.database.lock().await;
+                                            db.get_channel_priority(&rk.tuner_path, es, ec)
+                                                .unwrap_or(Some(0)).unwrap_or(0)
+                                        };
+                                        candidates.push((rk.clone(), ep, interloper.has_subscribers()));
+                                    }
+                                }
+                            }
+                        }
+                        // Sort: subscriber-less first, then by priority ascending
+                        candidates.sort_by(|a, b| {
+                            a.2.cmp(&b.2).then(a.1.cmp(&b.1))
+                        });
+                        let mut to_evict = post_running - post_dll_max;
+                        for (rk, _ep, has_subs) in &candidates {
+                            if to_evict <= 0 { break; }
+                            if let Some(interloper) = self.tuner_pool.get(rk).await {
+                                if interloper.is_running() {
+                                    if *has_subs {
+                                        warn!("[Session {}] Exclusive post-start: evicting interloper {:?} with active subscriber(s)",
+                                              self.id, rk);
+                                    } else {
+                                        info!("[Session {}] Exclusive post-start: evicting idle interloper {:?}", self.id, rk);
+                                    }
+                                    self.tuner_pool.cancel_idle_close(rk).await;
+                                    interloper.stop_reader().await;
+                                    self.tuner_pool.remove(rk).await;
+                                    to_evict -= 1;
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("[Session {}] Exclusive post-start: within capacity ({}/{}), no eviction needed",
+                               self.id, post_running, post_dll_max);
                     }
                 }
 
