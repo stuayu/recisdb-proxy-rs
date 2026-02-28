@@ -1173,6 +1173,17 @@ impl Session {
             warn!("[Session {}] Failed to insert session history start", self.id);
         }
 
+        // Periodic timer to detect when the tuner reader stops externally
+        // (exclusive eviction, DLL crash, hardware error, etc.).
+        // Without this, broadcast::Receiver::recv() blocks forever when the
+        // reader dies but the SharedTuner Arc is still alive, leaving the
+        // session hanging with no data and no error.
+        let mut reader_alive_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+        );
+        reader_alive_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             // Process any complete messages in the buffer first
             if let Some(msg) = self.try_decode_message()? {
@@ -1195,6 +1206,20 @@ impl Session {
                     _ = self.shutdown_rx.recv() => {
                         self.disconnect_reason = Some("remote_shutdown".to_string());
                         break;
+                    }
+
+                    // Periodic check: is the tuner reader still alive?
+                    // This catches cases where another session's exclusive eviction,
+                    // a BonDriver crash, or hardware failure stopped our reader.
+                    _ = reader_alive_check.tick() => {
+                        if let Some(tuner) = &self.current_tuner {
+                            if !tuner.is_running() {
+                                warn!("[Session {}] Tuner reader for {:?} stopped externally (is_running=false), disconnecting",
+                                      self.id, tuner.key);
+                                self.disconnect_reason = Some("reader_stopped".to_string());
+                                break;
+                            }
+                        }
                     }
 
                     // Encoded output from tsreplace
@@ -2117,17 +2142,31 @@ impl Session {
             let keys = self.tuner_pool.keys().await;
             for existing_key in keys.iter() {
                 if existing_key.tuner_path == tuner_path {
-                    // Skip our own old tuner — it will be unsubscribed and cleaned up
-                    // in the channel-switch path below. Stopping it here would cause a
-                    // double stop_reader() call and could race with the cleanup logic.
-                    if Some(existing_key) == old_tuner_key.as_ref() {
-                        debug!("[Session {}] Exclusive: skipping own old tuner {:?}", self.id, existing_key);
-                        continue;
-                    }
+                    // NOTE: We intentionally do NOT skip our own old tuner here.
+                    // On a max_instances=1 DLL where another session shares the same
+                    // SharedTuner (subscriber_count > 1), skipping would leave the
+                    // tuner running.  The old-tuner-cleanup below can only unsubscribe;
+                    // it cannot stop a tuner that still has other subscribers.  The
+                    // capacity check would then find the DLL at capacity and fail —
+                    // despite exclusive being requested.
+                    // stop_reader() is idempotent (second call is a no-op), so the
+                    // old-tuner-cleanup section safely handles the already-stopped
+                    // tuner via the !is_running() guard.
                     if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
                         if existing_tuner.is_running() {
+                            let subs = existing_tuner.subscriber_count();
+                            if subs > 0 {
+                                warn!("[Session {}] Exclusive: stopping tuner {:?} that still has {} active subscriber(s) — those sessions will lose data",
+                                      self.id, existing_key, subs);
+                            }
                             info!("[Session {}] Stopping existing tuner {:?} for exclusive access", self.id, existing_key);
+                            self.tuner_pool.cancel_idle_close(existing_key).await;
                             existing_tuner.stop_reader().await;
+                            // ★ Remove the stopped entry from the pool so it doesn't
+                            // linger as a ghost (is_running=false). Other sessions'
+                            // event loops will detect the reader stoppage via the
+                            // periodic is_running check and disconnect cleanly.
+                            self.tuner_pool.remove(existing_key).await;
                         }
                     }
                 }
@@ -2270,7 +2309,16 @@ impl Session {
                 
                 // If no more subscribers, handle cleanup.
                 if tuner.subscriber_count() == 0 {
-                    if tuner.key.tuner_path == tuner_path {
+                    if !tuner.is_running() {
+                        // Already stopped (e.g. by exclusive pre-start, another
+                        // session's eviction, or hardware failure).  Just make sure
+                        // the pool entry is removed (no-op if already gone).
+                        // Do NOT call schedule_idle_close — it would pointlessly
+                        // spawn a timer task for a dead tuner.
+                        debug!("[Session {}] Old tuner {:?} already stopped, ensuring pool cleanup",
+                               self.id, tuner.key);
+                        self.tuner_pool.remove(&tuner.key).await;
+                    } else if tuner.key.tuner_path == tuner_path {
                         // Same DLL channel switch.  Whether we must stop the old
                         // reader depends on whether the DLL supports multiple
                         // concurrent instances.
@@ -2468,6 +2516,7 @@ impl Session {
                     if let Some(lowest_tuner) = self.tuner_pool.get(&lowest_key).await {
                         info!("[Session {}] Forcing lower priority channel (priority {}) to make room for new channel (priority {})",
                               self.id, lowest_priority_value, channel_priority);
+                        self.tuner_pool.cancel_idle_close(&lowest_key).await;
                         lowest_tuner.stop_reader().await;
                         
                         // Wait for reader to stop
@@ -2476,6 +2525,14 @@ impl Session {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             wait_attempts += 1;
                         }
+
+                        // ★ Remove the stopped entry from the pool so it doesn't
+                        // linger as a ghost (is_running=false). Without this, the
+                        // stale entry inflates the capacity count and blocks future
+                        // channel selections on this DLL. The evicted session's
+                        // event loop will detect the reader stoppage via the
+                        // periodic reader_alive_check and disconnect cleanly.
+                        self.tuner_pool.remove(&lowest_key).await;
                     }
                 }
             } else {
@@ -2692,8 +2749,15 @@ impl Session {
                         if rk.tuner_path == tuner_path && *rk != key {
                             if let Some(interloper) = self.tuner_pool.get(rk).await {
                                 if interloper.is_running() {
+                                    let subs = interloper.subscriber_count();
+                                    if subs > 0 {
+                                        warn!("[Session {}] Exclusive post-start: evicting interloper {:?} with {} active subscriber(s)",
+                                              self.id, rk, subs);
+                                    }
                                     info!("[Session {}] Exclusive post-start: evicting interloper {:?}", self.id, rk);
+                                    self.tuner_pool.cancel_idle_close(rk).await;
                                     interloper.stop_reader().await;
+                                    self.tuner_pool.remove(rk).await;
                                 }
                             }
                         }
