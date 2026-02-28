@@ -91,6 +91,15 @@ pub struct TunerPool {
     max_tuners: usize,
     /// Tuner optimization configuration.
     config: RwLock<TunerPoolConfig>,
+    /// Per-DLL initialization locks.
+    ///
+    /// Serializes `CreateBonDriver + OpenTuner + SetChannel` sequences on the
+    /// same DLL path.  Many BonDriver DLLs use global/static state internally
+    /// (singleton `IBonDriver*`); concurrent initialization from multiple
+    /// `spawn_blocking` threads can corrupt that state and cause one reader to
+    /// "steal" another's channel.  The lock is held only during the init phase
+    /// (up to ~10 s); the reader loop runs without it.
+    dll_init_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 struct IdleHandle {
@@ -110,6 +119,7 @@ impl TunerPool {
             idle_tasks: Mutex::new(HashMap::new()),
             max_tuners,
             config: RwLock::new(config),
+            dll_init_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,6 +153,24 @@ impl TunerPool {
     /// Get current tuner optimization configuration.
     pub async fn config(&self) -> TunerPoolConfig {
         self.config.read().await.clone()
+    }
+
+    /// Acquire a per-DLL initialization lock.
+    ///
+    /// Returns an `OwnedMutexGuard` that serializes BonDriver DLL operations
+    /// (CreateBonDriver + OpenTuner + SetChannel) for the given DLL path.
+    /// The guard should be held during `start_bondriver_reader` or
+    /// `WarmTunerHandle::activate` and dropped once the reader is confirmed
+    /// ready, so that subsequent initializations on the same DLL do not
+    /// overlap.
+    pub async fn acquire_dll_init_lock(&self, dll_path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut locks = self.dll_init_locks.lock().await;
+            locks.entry(dll_path.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        mutex.lock_owned().await
     }
 
     /// Cancel an idle-close timer if it exists.

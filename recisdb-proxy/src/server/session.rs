@@ -596,6 +596,17 @@ impl Session {
     ) -> std::io::Result<()> {
         let config = self.tuner_pool.config().await;
         let startup_config = crate::tuner::shared::ReaderStartupConfig::from(&config);
+
+        // ★ Acquire per-DLL initialization lock.
+        // Many BonDriver DLLs use global/static state (singleton IBonDriver*)
+        // inside CreateBonDriver().  Concurrent LoadLibrary + CreateBonDriver +
+        // OpenTuner + SetChannel from two spawn_blocking threads can corrupt
+        // that state, causing the second instance to "steal" the first one's
+        // channel.  Serializing the init phase per DLL path prevents this.
+        // The guard is held until the reader signals ready (channel set, TS
+        // data flowing), then dropped — the reader loop runs without it.
+        let _dll_guard = self.tuner_pool.acquire_dll_init_lock(&tuner_path).await;
+
         if !config.prewarm_enabled {
             self.stop_warm_tuner().await;
             return tuner
@@ -2300,90 +2311,95 @@ impl Session {
         let old_tuner = self.current_tuner.take();
         
         if let Some(tuner) = old_tuner {
+            // Unsubscribe if we had an active subscription.
             if self.ts_receiver.is_some() {
-                // Unsubscribe from the old tuner
                 tuner.unsubscribe();
                 self.ts_receiver = None;
                 debug!("[Session {}] Unsubscribed from old tuner, remaining subscribers: {}", 
                        self.id, tuner.subscriber_count());
-                
-                // If no more subscribers, handle cleanup.
-                if tuner.subscriber_count() == 0 {
-                    if !tuner.is_running() {
-                        // Already stopped (e.g. by exclusive pre-start, another
-                        // session's eviction, or hardware failure).  Just make sure
-                        // the pool entry is removed (no-op if already gone).
-                        // Do NOT call schedule_idle_close — it would pointlessly
-                        // spawn a timer task for a dead tuner.
-                        debug!("[Session {}] Old tuner {:?} already stopped, ensuring pool cleanup",
-                               self.id, tuner.key);
+            }
+
+            // ★ Cleanup for tuners with no remaining subscribers.
+            // This handles BOTH scenarios:
+            //   (a) We just unsubscribed above and were the last subscriber.
+            //   (b) We never subscribed (SetChannelSpace was called but StartStream
+            //       wasn't — e.g. rapid channel switches before stream start).
+            // Without handling (b), the tuner would remain in the pool as a
+            // "zombie": is_running=true, subscriber_count=0, no idle-close timer,
+            // permanently consuming a DLL instance slot.
+            if tuner.subscriber_count() == 0 {
+                if !tuner.is_running() {
+                    // Already stopped (e.g. by exclusive pre-start, another
+                    // session's eviction, or hardware failure).  Just make sure
+                    // the pool entry is removed (no-op if already gone).
+                    debug!("[Session {}] Old tuner {:?} already stopped, ensuring pool cleanup",
+                           self.id, tuner.key);
+                    self.tuner_pool.remove(&tuner.key).await;
+                } else if tuner.key.tuner_path == tuner_path {
+                    // Same DLL channel switch.  Whether we must stop the old
+                    // reader depends on whether the DLL supports multiple
+                    // concurrent instances.
+                    let old_dll_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
+                    };
+                    // Count how many tuners are currently running on this DLL
+                    let old_dll_running = {
+                        let ks = self.tuner_pool.keys().await;
+                        let mut n = 0i32;
+                        for k in &ks {
+                            if k.tuner_path == tuner.key.tuner_path {
+                                if let Some(t) = self.tuner_pool.get(k).await {
+                                    if t.is_running() { n += 1; }
+                                }
+                            }
+                        }
+                        n
+                    };
+                    if old_dll_running >= old_dll_max {
+                        // At or over capacity — must stop one to make room.
+                        info!("[Session {}] Same DLL switch (max_instances={}), stopping old reader for {:?}",
+                              self.id, old_dll_max, tuner.key);
+                        tuner.stop_reader().await;
                         self.tuner_pool.remove(&tuner.key).await;
-                    } else if tuner.key.tuner_path == tuner_path {
-                        // Same DLL channel switch.  Whether we must stop the old
-                        // reader depends on whether the DLL supports multiple
-                        // concurrent instances.
-                        let old_dll_max = {
-                            let db = self.database.lock().await;
-                            db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
-                        };
-                        // Count how many tuners are currently running on this DLL
-                        let old_dll_running = {
-                            let ks = self.tuner_pool.keys().await;
-                            let mut n = 0i32;
-                            for k in &ks {
-                                if k.tuner_path == tuner.key.tuner_path {
-                                    if let Some(t) = self.tuner_pool.get(k).await {
-                                        if t.is_running() { n += 1; }
-                                    }
-                                }
-                            }
-                            n
-                        };
-                        if old_dll_running >= old_dll_max {
-                            // At or over capacity — must stop one to make room.
-                            info!("[Session {}] Same DLL switch (max_instances={}), stopping old reader for {:?}",
-                                  self.id, old_dll_max, tuner.key);
-                            tuner.stop_reader().await;
-                            self.tuner_pool.remove(&tuner.key).await;
-                        } else {
-                            // DLL has spare capacity — old tuner can idle-close later.
-                            info!("[Session {}] Same DLL switch (max_instances={}, running={}), scheduling idle close for {:?}",
-                                  self.id, old_dll_max, old_dll_running, tuner.key);
-                            self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
-                        }
                     } else {
-                        // Different DLL switch.  Check whether the old DLL is at
-                        // capacity.  If so, stop synchronously to free the slot —
-                        // some hardware (e.g. multi-tuner USB cards) cannot have
-                        // multiple group DLLs open simultaneously beyond their
-                        // max_instances, and the new DLL's OpenTuner would fail
-                        // if the old one is still held.
-                        let old_dll_max = {
-                            let db = self.database.lock().await;
-                            db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
-                        };
-                        let old_dll_running = {
-                            let ks = self.tuner_pool.keys().await;
-                            let mut n = 0i32;
-                            for k in &ks {
-                                if k.tuner_path == tuner.key.tuner_path {
-                                    if let Some(t) = self.tuner_pool.get(k).await {
-                                        if t.is_running() { n += 1; }
-                                    }
+                        // DLL has spare capacity — old tuner can idle-close later.
+                        info!("[Session {}] Same DLL switch (max_instances={}, running={}), scheduling idle close for {:?}",
+                              self.id, old_dll_max, old_dll_running, tuner.key);
+                        self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
+                    }
+                } else {
+                    // Different DLL switch.  Check whether the old DLL is at
+                    // capacity.  If so, stop synchronously to free the slot —
+                    // some hardware (e.g. multi-tuner USB cards) cannot have
+                    // multiple group DLLs open simultaneously beyond their
+                    // max_instances, and the new DLL's OpenTuner would fail
+                    // if the old one is still held.
+                    let old_dll_max = {
+                        let db = self.database.lock().await;
+                        db.get_max_instances_for_path(&tuner.key.tuner_path).unwrap_or(1)
+                    };
+                    let old_dll_running = {
+                        let ks = self.tuner_pool.keys().await;
+                        let mut n = 0i32;
+                        for k in &ks {
+                            if k.tuner_path == tuner.key.tuner_path {
+                                if let Some(t) = self.tuner_pool.get(k).await {
+                                    if t.is_running() { n += 1; }
                                 }
                             }
-                            n
-                        };
-                        if old_dll_running >= old_dll_max {
-                            info!("[Session {}] Different DLL switch (old DLL at capacity {}/{}), stopping old reader for {:?}",
-                                  self.id, old_dll_running, old_dll_max, tuner.key);
-                            tuner.stop_reader().await;
-                            self.tuner_pool.remove(&tuner.key).await;
-                        } else {
-                            info!("[Session {}] Different DLL switch (old DLL has spare capacity {}/{}), scheduling idle close for {:?}",
-                                  self.id, old_dll_running, old_dll_max, tuner.key);
-                            self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
                         }
+                        n
+                    };
+                    if old_dll_running >= old_dll_max {
+                        info!("[Session {}] Different DLL switch (old DLL at capacity {}/{}), stopping old reader for {:?}",
+                              self.id, old_dll_running, old_dll_max, tuner.key);
+                        tuner.stop_reader().await;
+                        self.tuner_pool.remove(&tuner.key).await;
+                    } else {
+                        info!("[Session {}] Different DLL switch (old DLL has spare capacity {}/{}), scheduling idle close for {:?}",
+                              self.id, old_dll_running, old_dll_max, tuner.key);
+                        self.tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
                     }
                 }
             }
@@ -2510,8 +2526,14 @@ impl Session {
                 }
             }
 
-            // If new priority is higher than the lowest, force the change
-            if channel_priority > lowest_priority_value {
+            // If new priority is equal or higher than the lowest, force the change.
+            // We use >= (not >) because all eviction candidates have zero
+            // subscribers — they are not serving any client.  A subscriber-less
+            // tuner occupying a slot should always yield to a new request at
+            // the same or higher priority; otherwise "zombie" tuners (orphaned
+            // by channel switches without StartStream) would permanently block
+            // capacity even though nobody is watching them.
+            if channel_priority >= lowest_priority_value {
                 if let Some(lowest_key) = lowest_priority_key {
                     if let Some(lowest_tuner) = self.tuner_pool.get(&lowest_key).await {
                         info!("[Session {}] Forcing lower priority channel (priority {}) to make room for new channel (priority {})",
