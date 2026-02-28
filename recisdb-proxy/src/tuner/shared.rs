@@ -319,14 +319,16 @@ impl SharedTuner {
         // Signal the reader task to stop
         self.is_running.store(false, Ordering::Release);
 
-        // Wait for the reader task to finish (with timeout)
+        // Wait for the reader task to finish (with timeout).
+        // wait_ts_stream() is now 100 ms, so the blocking task exits within
+        // ~200 ms of is_running becoming false.  1 s is a generous upper bound.
         if let Ok(mut guard) = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(1000),
             self.reader_handle.lock()
         ).await {
             if let Some(handle) = guard.take() {
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_millis(1000),
                     handle
                 ).await {
                     Ok(_) => {
@@ -429,22 +431,6 @@ impl SharedTuner {
             }
         }
 
-        // Wait for signal to become observable (network/driver latency can be several seconds)
-        info!("[SharedTuner] Waiting for tuner signal lock...");
-        let signal_start = std::time::Instant::now();
-        let mut initial_signal = tuner.get_signal_level();
-
-        while initial_signal <= 0.0 && signal_start.elapsed().as_millis() < startup_config.signal_wait_timeout_ms as u128 {
-            std::thread::sleep(std::time::Duration::from_millis(startup_config.signal_poll_interval_ms));
-            initial_signal = tuner.get_signal_level();
-        }
-
-        info!(
-            "[SharedTuner] Initial signal level: {:.1}dB (elapsed {}ms)",
-            initial_signal,
-            signal_start.elapsed().as_millis()
-        );
-
         // Purge any stale data from the buffer
         tuner.purge_ts_stream();
 
@@ -479,11 +465,22 @@ impl SharedTuner {
         // Reset packet counter for the new channel
         shared.reset_packet_count();
 
-        // Signal that we're ready
+        // Signal ready BEFORE the optional signal-level wait.
+        // BonDriverProxy(Ex) returns from SetChannel as soon as the DLL
+        // accepts it; signal acquisition is not checked.  Waiting here
+        // blocked the session loop and caused consecutive channel-switch
+        // failures because each switch had to wait up to 10 s.
         info!("[SharedTuner] BonDriver ready, signaling...");
         let _ = ready_tx.send(Ok(()));
 
         info!("[SharedTuner] Reader task started for {:?}", shared.key);
+
+        // Log initial signal level (informational only; does not block the caller).
+        // The read loop updates signal every 5 s during streaming.
+        {
+            let initial_signal = tuner.get_signal_level();
+            info!("[SharedTuner] Initial signal level: {:.1}dB", initial_signal);
+        }
 
         // Use a larger initial buffer, and expand dynamically if needed
         let mut buf = vec![0u8; TS_CHUNK_SIZE];
@@ -512,8 +509,11 @@ impl SharedTuner {
                 last_status_log = std::time::Instant::now();
             }
 
-            // Wait for TS data to be available
-            let wait_result = tuner.wait_ts_stream(1000);
+            // Wait for TS data to be available.
+            // 100 ms instead of 1000 ms so the is_running stop-check at the
+            // top of the loop is reached at most ~100 ms after stop_reader()
+            // sets is_running = false.  This makes channel switches faster.
+            let wait_result = tuner.wait_ts_stream(100);
             if !wait_result {
                 consecutive_empty = consecutive_empty.saturating_add(1);
                 if consecutive_empty % 50 == 1 {
@@ -742,48 +742,19 @@ impl SharedTuner {
             info!("[SharedTuner] Stopping existing reader for {:?} before restart", self.key);
             self.is_running.store(false, Ordering::Release);
             
-            // Wait for the reader task to fully complete
-            // This is critical to ensure BonDriver is fully closed before opening a new one
-            let mut wait_attempts = 0;
-            const MAX_WAIT_ATTEMPTS: u32 = 150;  // 15 seconds (150 * 100ms)
-            
-            loop {
-                // Try to take the handle and wait for it to finish
-                {
-                    let mut handle_lock = self.reader_handle.lock().await;
-                    if let Some(handle) = handle_lock.take() {
-                        // We have the handle - wait for it to complete
-                        drop(handle_lock);  // Release lock before awaiting
-                        
-                        debug!("[SharedTuner] Waiting for reader task to finish (attempt {}/{})", 
-                               wait_attempts + 1, MAX_WAIT_ATTEMPTS);
-                        
-                        // Wait with a short timeout so we can log progress
-                        match tokio::time::timeout(Duration::from_millis(500), handle).await {
-                            Ok(_) => {
-                                info!("[SharedTuner] Reader task finished cleanly");
-                                break;
-                            }
-                            Err(_) => {
-                                // Timeout - task might still be running
-                                warn!("[SharedTuner] Reader task still running after 500ms");
-                                wait_attempts += 5;  // Count as multiple attempts
-                                if wait_attempts >= MAX_WAIT_ATTEMPTS {
-                                    error!("[SharedTuner] Giving up on waiting for reader task");
-                                    break;
-                                }
-                                continue;
-                            }
-                        }
-                    } else {
-                        // No handle in the lock - task already finished
-                        break;
+            // Wait for the reader task to fully complete.
+            // wait_ts_stream() is now 100 ms so the blocking task exits within
+            // ~200 ms.  300 ms is sufficient; give 500 ms as a safety margin.
+            {
+                let mut handle_lock = self.reader_handle.lock().await;
+                if let Some(handle) = handle_lock.take() {
+                    drop(handle_lock);
+                    match tokio::time::timeout(Duration::from_millis(500), handle).await {
+                        Ok(_) => info!("[SharedTuner] Reader task finished cleanly"),
+                        Err(_) => warn!("[SharedTuner] Reader task still running after 500ms, proceeding"),
                     }
                 }
             }
-            
-            // Extra safety: wait a bit for any cleanup
-            tokio::time::sleep(Duration::from_millis(200)).await;
             
             info!("[SharedTuner] Old reader fully stopped, starting new reader for {:?}", self.key);
         }
