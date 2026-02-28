@@ -425,6 +425,33 @@ impl Session {
             return;
         }
 
+        // ★ Don't open the driver a second time if it is already being used by
+        // an active reader.  Some BonDriver DLLs maintain shared global state
+        // (e.g. a singleton IBonDriver pointer set by CreateBonDriver()), so a
+        // second OpenTuner() call from the warm-tuner thread can overwrite that
+        // pointer and destroy the first reader's IBonDriver, causing the running
+        // stream to cut out immediately.
+        let already_running = {
+            let keys = self.tuner_pool.keys().await;
+            let mut found = false;
+            for k in &keys {
+                if k.tuner_path == tuner_path {
+                    if let Some(t) = self.tuner_pool.get(k).await {
+                        if t.is_running() {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+        if already_running {
+            debug!("[Session {}] Skipping warm tuner for {} – driver already has a running reader",
+                   self.id, tuner_path);
+            return;
+        }
+
         self.stop_warm_tuner().await;
 
         let warm = WarmTunerHandle::spawn(tuner_path.to_string(), config.prewarm_timeout_secs);
@@ -2096,6 +2123,13 @@ impl Session {
                         // This prevents a race where the idle timer fires between
                         // SetChannelSpaceAck and the subsequent StartStream subscribe.
                         self.tuner_pool.cancel_idle_close(&existing_key).await;
+
+                        // ★ Shut down the warm tuner opened during handle_open_tuner.
+                        // We are reusing an existing reader, so the warm tuner will
+                        // never be activated.  Keeping it open holds an extra DLL
+                        // handle that can interfere with the running stream on some
+                        // BonDriver implementations.
+                        self.stop_warm_tuner().await;
 
                         // Track the actual physical tuner path currently used.
                         self.current_tuner_path = Some(existing_key.tuner_path.clone());
