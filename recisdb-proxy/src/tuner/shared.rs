@@ -586,12 +586,6 @@ impl SharedTuner {
                     consecutive_empty = 0;
                     total_bytes_read += n as u64;
 
-                    // Increment packet count
-                    let packet_count = (n / 188) as u64;
-                    if packet_count > 0 {
-                        shared.increment_packet_count(packet_count);
-                    }
-
                     // Broadcast to all subscribers
                     let raw = &buf[..n];
 
@@ -651,6 +645,10 @@ impl SharedTuner {
                                         b25_needs_reset = true;
                                     }
 
+                                    let packet_count = (n / 188) as u64;
+                                    if packet_count > 0 {
+                                        shared.increment_packet_count(packet_count);
+                                    }
                                     let data = Bytes::copy_from_slice(raw);
                                     let _ = shared.tx.send(data);
                                 }
@@ -659,17 +657,29 @@ impl SharedTuner {
                                     b25_needs_reset = true;
 
                                     // Fall back to raw TS
+                                    let packet_count = (n / 188) as u64;
+                                    if packet_count > 0 {
+                                        shared.increment_packet_count(packet_count);
+                                    }
                                     let data = Bytes::copy_from_slice(raw);
                                     let _ = shared.tx.send(data);
                                 }
                             }
                         } else {
                             // B25 decoder in error state, skip decode and use raw TS
+                            let packet_count = (n / 188) as u64;
+                            if packet_count > 0 {
+                                shared.increment_packet_count(packet_count);
+                            }
                             let data = Bytes::copy_from_slice(raw);
                             let _ = shared.tx.send(data);
                         }
                     } else {
                         // No B25 decoder, use raw TS
+                        let packet_count = (n / 188) as u64;
+                        if packet_count > 0 {
+                            shared.increment_packet_count(packet_count);
+                        }
                         let data = Bytes::copy_from_slice(raw);
                         let _ = shared.tx.send(data);
                     }

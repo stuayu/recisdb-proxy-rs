@@ -1727,38 +1727,88 @@ impl Session {
             self.id, channel, tuner_path
         );
 
-        // ★ Check if this BonDriver is already being used by another tuner
-        // Get all tuner keys to check if the same BonDriver is already running
-        let keys = self.tuner_pool.keys().await;
-        for existing_key in keys {
-            if existing_key.tuner_path == tuner_path {
-                // Check if this tuner is running (BonDriver is already open)
-                if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
-                    if existing_tuner.is_running() {
-                        error!(
-                            "[Session {}] BonDriver {} is already in use by tuner {:?}, cannot open again",
-                            self.id, tuner_path, existing_key
-                        );
-                        return self.send_message(ServerMessage::SetChannelAck {
-                            success: false,
-                            error_code: ErrorCode::ChannelSetFailed.into(),
-                        }).await;
+        // Create channel key
+        let key = ChannelKey::simple(&tuner_path, channel);
+
+        // ★ Same-channel reuse: if we already have a running tuner for this
+        // exact key, just refresh the subscription without restarting.
+        if let Some(ref existing) = self.current_tuner {
+            if existing.key == key && existing.is_running() {
+                self.tuner_pool.cancel_idle_close(&key).await;
+                if self.state == SessionState::Streaming {
+                    let new_rx = existing.subscribe();
+                    if self.ts_receiver.is_some() {
+                        existing.unsubscribe();
                     }
+                    self.ts_receiver = Some(new_rx);
                 }
+                existing.notify_channel_change();
+                self.restart_tsreplace_pipeline_if_streaming().await;
+                return self.send_message(ServerMessage::SetChannelAck {
+                    success: true,
+                    error_code: 0,
+                }).await;
             }
         }
 
-        // Create channel key
-        let key = ChannelKey::simple(&tuner_path, channel);
+        // ★ Check if another session already has this channel running in the pool.
+        if let Some(pool_tuner) = self.tuner_pool.get(&key).await {
+            if pool_tuner.is_running() {
+                self.tuner_pool.cancel_idle_close(&key).await;
+                self.stop_warm_tuner().await;
+                let old_tuner = self.current_tuner.take();
+                if let Some(old) = old_tuner {
+                    if self.ts_receiver.is_some() {
+                        old.unsubscribe();
+                        self.ts_receiver = None;
+                        if old.subscriber_count() == 0 {
+                            self.tuner_pool.schedule_idle_close(old.key.clone(), old).await;
+                        }
+                    }
+                }
+                self.current_tuner = Some(pool_tuner.clone());
+                if self.state == SessionState::Streaming {
+                    self.ts_receiver = Some(pool_tuner.subscribe());
+                }
+                pool_tuner.notify_channel_change();
+                self.restart_tsreplace_pipeline_if_streaming().await;
+                return self.send_message(ServerMessage::SetChannelAck {
+                    success: true,
+                    error_code: 0,
+                }).await;
+            } else if !pool_tuner.has_subscribers() {
+                // Stale entry — remove so get_or_create below creates a fresh one
+                warn!("[Session {}] Found stale (not running) v1 tuner for {:?}, removing from pool",
+                      self.id, key);
+                self.tuner_pool.remove(&key).await;
+            }
+        }
+
+        // ★ Clean up old tuner BEFORE creating new one (same order as v2).
+        // This frees the DLL slot so the new reader can open it.
+        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
+        if let Some(old_tuner) = self.current_tuner.take() {
+            if self.ts_receiver.is_some() {
+                old_tuner.unsubscribe();
+                self.ts_receiver = None;
+            }
+            if old_tuner.subscriber_count() == 0 {
+                info!("[Session {}] Stopping old reader for {:?} before v1 channel switch",
+                      self.id, old_tuner.key);
+                self.tuner_pool.cancel_idle_close(&old_tuner.key).await;
+                old_tuner.stop_reader().await;
+                self.tuner_pool.remove(&old_tuner.key).await;
+            }
+        }
 
         // Get or create shared tuner
         match self
             .tuner_pool
-            .get_or_create(key, 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, || async { Ok(()) })
             .await
         {
             Ok(tuner) => {
-                // Start the BonDriver reader (will restart if already running)
+                // Start the BonDriver reader
                 if let Err(e) = self.start_reader_with_warm(
                     Arc::clone(&tuner),
                     tuner_path.clone(),
@@ -1771,35 +1821,25 @@ impl Session {
                         error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})", 
                                self.id, tuner_path, e, e.kind());
                     }
-                    
-                    // Provide more specific error messages based on error kind
-                    let error_msg = match e.kind() {
-                        std::io::ErrorKind::ConnectionRefused => {
-                            "BonDriver did not respond - check if driver is installed and working"
-                        },
-                        std::io::ErrorKind::AddrNotAvailable => {
-                            "Channel not available on this tuner - invalid channel number"
-                        },
-                        std::io::ErrorKind::TimedOut => {
-                            "Timeout waiting for BonDriver - driver may be hung or not responding"
-                        },
-                        _ => "BonDriver error - check driver logs"
-                    };
-                    
-                    warn!("[Session {}] BonDriver error details: {}", self.id, error_msg);
-                    
+                    // ★ Clean up orphaned pool entry
+                    if !tuner.is_running() && !tuner.has_subscribers() {
+                        self.tuner_pool.remove(&key).await;
+                    }
+                    // ★ Try to restore previous channel
+                    self.try_restore_previous_channel(&old_tuner_key).await;
                     return self.send_message(ServerMessage::SetChannelAck {
                         success: false,
                         error_code: ErrorCode::ChannelSetFailed.into(),
                     }).await;
                 }
 
-                self.current_tuner = Some(tuner);
-                
-                // Notify B25 decoder about channel change
-                if let Some(tuner) = &self.current_tuner {
-                    tuner.notify_channel_change();
+                self.current_tuner = Some(tuner.clone());
+                if self.state == SessionState::Streaming {
+                    self.ts_receiver = Some(tuner.subscribe());
                 }
+
+                // Notify B25 decoder about channel change
+                tuner.notify_channel_change();
 
                 self.restart_tsreplace_pipeline_if_streaming().await;
                 
@@ -1811,6 +1851,7 @@ impl Session {
             }
             Err(e) => {
                 error!("[Session {}] Failed to set channel: {}", self.id, e);
+                self.try_restore_previous_channel(&old_tuner_key).await;
                 self.send_message(ServerMessage::SetChannelAck {
                     success: false,
                     error_code: ErrorCode::ChannelSetFailed.into(),
@@ -2115,7 +2156,14 @@ impl Session {
 
             if is_same_channel {
                 if let Some(existing_tuner) = self.tuner_pool.get(&existing_key).await {
-                    if existing_tuner.is_running() {
+                    if !existing_tuner.is_running() {
+                        // ★ Stale entry: reader stopped (e.g. by idle-close race).
+                        // Remove it so get_or_create below will create a fresh SharedTuner
+                        // with a new reader instead of returning this dead entry.
+                        warn!("[Session {}] Found stale (not running) tuner for {:?}, removing from pool",
+                              self.id, existing_key);
+                        self.tuner_pool.remove(&existing_key).await;
+                    } else {
                         info!("[Session {}] Same channel already running on driver {}, reusing existing tuner", 
                               self.id, existing_key.tuner_path);
 
@@ -2203,7 +2251,7 @@ impl Session {
                         self.current_channel_name = channel_name;
 
                         return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
-                    }
+                    } // end else (is_running)
                 }
             }
         }

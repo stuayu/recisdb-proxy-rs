@@ -200,16 +200,22 @@ impl TunerPool {
                         if !tuner.has_subscribers() {
                             info!("Keep-alive timeout reached, stopping reader for {:?}", key);
                             tuner.stop_reader().await;
-                            // ★ Bug F fix: double-check subscriber count AFTER stop_reader().
-                            // stop_reader() is async and yields; a concurrent subscribe() + cancel_idle_close()
-                            // may have run during that await window.  If subscribers are now present,
-                            // skip removing the pool entry so the next SetChannelSpace can restart
-                            // the reader and recover gracefully.
+                            // ★ Bug F revised fix: Always remove the pool entry after stop_reader().
+                            // stop_reader() is async and yields; a concurrent subscribe() +
+                            // cancel_idle_close() may have run during that await window.
+                            // The reader is now dead regardless.  Leaving a stopped entry in
+                            // the pool would cause the reuse path in SetChannelSpace to find
+                            // an is_running()==false SharedTuner, and get_or_create() would
+                            // return it without restarting the reader — resulting in subscribers
+                            // that never receive data.
+                            // By removing the entry, the next SetChannelSpace will create a
+                            // fresh SharedTuner and start a new reader via get_or_create().
                             if tuner.has_subscribers() {
                                 warn!("Keep-alive: subscriber appeared during stop_reader for {:?}; \
-                                       leaving pool entry intact (reader stopped — client will reconnect)",
+                                       removing stale pool entry (reader is stopped, new reader will be created on next access)",
                                       key);
-                            } else {
+                            }
+                            {
                                 let mut tuners = pool.tuners.write().await;
                                 if let Some(current) = tuners.get(&key) {
                                     if Arc::ptr_eq(current, &tuner) {
@@ -258,9 +264,26 @@ impl TunerPool {
         {
             let tuners = self.tuners.read().await;
             if let Some(tuner) = tuners.get(&key) {
-                self.cancel_idle_close(&key).await;
-                debug!("Reusing existing tuner for {:?}", key);
-                return Ok(Arc::clone(tuner));
+                // ★ Evict stale entries: if the reader has stopped and there are
+                //   no subscribers, this entry was left over from an idle-close
+                //   race.  Drop the read lock and remove it so we create a fresh one.
+                if !tuner.is_running() && !tuner.has_subscribers() {
+                    drop(tuners);
+                    warn!("get_or_create: evicting stale tuner for {:?}", key);
+                    self.cancel_idle_close(&key).await;
+                    let mut w = self.tuners.write().await;
+                    if let Some(current) = w.get(&key) {
+                        if !current.is_running() && !current.has_subscribers() {
+                            w.remove(&key);
+                        }
+                    }
+                    drop(w);
+                    // fall through to slow-path creation below
+                } else {
+                    self.cancel_idle_close(&key).await;
+                    debug!("Reusing existing tuner for {:?}", key);
+                    return Ok(Arc::clone(tuner));
+                }
             }
         }
 
@@ -269,9 +292,16 @@ impl TunerPool {
 
         // Double-check after acquiring write lock
         if let Some(tuner) = tuners.get(&key) {
-            self.cancel_idle_close(&key).await;
-            debug!("Reusing existing tuner for {:?} (after lock)", key);
-            return Ok(Arc::clone(tuner));
+            // Same stale check under write lock
+            if !tuner.is_running() && !tuner.has_subscribers() {
+                warn!("get_or_create: evicting stale tuner for {:?} (under write lock)", key);
+                self.cancel_idle_close(&key).await;
+                tuners.remove(&key);
+            } else {
+                self.cancel_idle_close(&key).await;
+                debug!("Reusing existing tuner for {:?} (after lock)", key);
+                return Ok(Arc::clone(tuner));
+            }
         }
 
         // Check capacity
