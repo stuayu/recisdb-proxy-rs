@@ -2239,56 +2239,92 @@ impl Session {
             }
 
             if running_on_dll >= dll_max {
-                // At capacity — must evict ONE tuner to make room.
-                // Prefer subscriber-less (idle) tuners; fall back to subscriber-
-                // bearing ones only if all slots are actively subscribed.
-                info!("[Session {}] Exclusive access at capacity ({}/{}), evicting to make room",
-                      self.id, running_on_dll, dll_max);
-
-                let mut best_idle: Option<(ChannelKey, i32)> = None;   // subscriber_count == 0
-                let mut best_any: Option<(ChannelKey, i32)> = None;    // any tuner
-
-                let keys = self.tuner_pool.keys().await;
-                for existing_key in keys.iter() {
-                    if existing_key.tuner_path != tuner_path { continue; }
-                    let Some(existing_tuner) = self.tuner_pool.get(existing_key).await else { continue; };
-                    if !existing_tuner.is_running() { continue; }
-
-                    let (es, ec) = match &existing_key.channel {
-                        ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
-                        ChannelKeySpec::Simple(ch) => (0, *ch as u32),
-                    };
-                    let ep = {
-                        let db = self.database.lock().await;
-                        db.get_channel_priority(&existing_key.tuner_path, es, ec)
-                            .unwrap_or(Some(0)).unwrap_or(0)
-                    };
-
-                    if !existing_tuner.has_subscribers() {
-                        if best_idle.as_ref().map_or(true, |(_, p)| ep < *p) {
-                            best_idle = Some((existing_key.clone(), ep));
-                        }
-                    }
-                    if best_any.as_ref().map_or(true, |(_, p)| ep < *p) {
-                        best_any = Some((existing_key.clone(), ep));
-                    }
-                }
-
-                // Prefer idle tuners to minimize disruption
-                let eviction_target = best_idle.or(best_any);
-                if let Some((target_key, target_priority)) = eviction_target {
-                    if let Some(target_tuner) = self.tuner_pool.get(&target_key).await {
-                        let subs = target_tuner.subscriber_count();
-                        if subs > 0 {
-                            warn!("[Session {}] Exclusive: evicting tuner {:?} (priority {}) with {} active subscriber(s)",
-                                  self.id, target_key, target_priority, subs);
+                // ★ Before evicting, check if the requested channel is ALREADY running
+                // in the pool.  If so, no new DLL slot needs to be freed — the
+                // same-channel reuse path below will subscribe to the existing reader
+                // directly without starting a new one.
+                // Evicting here would kill an active stream the moment before the reuse
+                // check could catch it (Bug: exclusive pre-eviction vs. same-channel reuse ordering).
+                let req_spec = ChannelKeySpec::SpaceChannel { space: actual_space, channel: actual_bon_channel };
+                let requested_already_running = {
+                    let mut found = false;
+                    for k in keys.iter() {
+                        let is_match = if !nid_tsid_channel_keys.is_empty() {
+                            // Group mode: check by NID+TSID across all candidate drivers
+                            nid_tsid_channel_keys.iter().any(|(p, s)| k.tuner_path == *p && k.channel == *s)
                         } else {
-                            info!("[Session {}] Exclusive: evicting idle tuner {:?} (priority {})",
-                                  self.id, target_key, target_priority);
+                            // Single tuner mode: exact key match
+                            k.tuner_path == tuner_path && k.channel == req_spec
+                        };
+                        if is_match {
+                            if let Some(t) = self.tuner_pool.get(k).await {
+                                if t.is_running() {
+                                    found = true;
+                                    break;
+                                }
+                            }
                         }
-                        self.tuner_pool.cancel_idle_close(&target_key).await;
-                        target_tuner.stop_reader().await;
-                        self.tuner_pool.remove(&target_key).await;
+                    }
+                    found
+                };
+
+                if requested_already_running {
+                    // The requested channel is already running — the same-channel reuse
+                    // path below will handle subscription without a new reader.
+                    info!("[Session {}] Exclusive access at capacity ({}/{}), but requested channel already running — skipping eviction",
+                          self.id, running_on_dll, dll_max);
+                } else {
+                    // At capacity and requested channel not yet running — must evict ONE
+                    // tuner to make room.  Prefer subscriber-less (idle) tuners; fall back
+                    // to subscriber-bearing ones only if all slots are actively subscribed.
+                    info!("[Session {}] Exclusive access at capacity ({}/{}), evicting to make room",
+                          self.id, running_on_dll, dll_max);
+
+                    let mut best_idle: Option<(ChannelKey, i32)> = None;   // subscriber_count == 0
+                    let mut best_any: Option<(ChannelKey, i32)> = None;    // any tuner
+
+                    let keys = self.tuner_pool.keys().await;
+                    for existing_key in keys.iter() {
+                        if existing_key.tuner_path != tuner_path { continue; }
+                        let Some(existing_tuner) = self.tuner_pool.get(existing_key).await else { continue; };
+                        if !existing_tuner.is_running() { continue; }
+
+                        let (es, ec) = match &existing_key.channel {
+                            ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
+                            ChannelKeySpec::Simple(ch) => (0, *ch as u32),
+                        };
+                        let ep = {
+                            let db = self.database.lock().await;
+                            db.get_channel_priority(&existing_key.tuner_path, es, ec)
+                                .unwrap_or(Some(0)).unwrap_or(0)
+                        };
+
+                        if !existing_tuner.has_subscribers() {
+                            if best_idle.as_ref().map_or(true, |(_, p)| ep < *p) {
+                                best_idle = Some((existing_key.clone(), ep));
+                            }
+                        }
+                        if best_any.as_ref().map_or(true, |(_, p)| ep < *p) {
+                            best_any = Some((existing_key.clone(), ep));
+                        }
+                    }
+
+                    // Prefer idle tuners to minimize disruption
+                    let eviction_target = best_idle.or(best_any);
+                    if let Some((target_key, target_priority)) = eviction_target {
+                        if let Some(target_tuner) = self.tuner_pool.get(&target_key).await {
+                            let subs = target_tuner.subscriber_count();
+                            if subs > 0 {
+                                warn!("[Session {}] Exclusive: evicting tuner {:?} (priority {}) with {} active subscriber(s)",
+                                      self.id, target_key, target_priority, subs);
+                            } else {
+                                info!("[Session {}] Exclusive: evicting idle tuner {:?} (priority {})",
+                                      self.id, target_key, target_priority);
+                            }
+                            self.tuner_pool.cancel_idle_close(&target_key).await;
+                            target_tuner.stop_reader().await;
+                            self.tuner_pool.remove(&target_key).await;
+                        }
                     }
                 }
             } else {
