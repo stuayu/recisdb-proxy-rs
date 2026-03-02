@@ -1,0 +1,141 @@
+name: Build and Upload Artifacts
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64-pc-windows-msvc
+            label: win-x64
+          - arch: i686-pc-windows-msvc
+            label: win-x86
+
+    steps:
+      - name: Install or Update Clang and LLVM for bindgen
+        run: choco install llvm -y --force
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup Windows SDK
+        uses: fbactions/setup-winsdk@v2
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.arch }}
+
+      - name: Build (Release)
+        run: |
+          $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"
+          cargo build --workspace --verbose --release --target ${{ matrix.arch }}
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          $targetDir = "target/${{ matrix.arch }}/release"
+          $outDir = "artifacts-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path $outDir
+
+          # Copy executables
+          if (Test-Path "$targetDir/recisdb.exe") {
+            Copy-Item "$targetDir/recisdb.exe" "$outDir/"
+          }
+          if (Test-Path "$targetDir/recisdb-proxy.exe") {
+            Copy-Item "$targetDir/recisdb-proxy.exe" "$outDir/"
+          }
+
+          # Copy DLLs (BonDriver_NetworkProxy)
+          if (Test-Path "$targetDir/BonDriver_NetworkProxy.dll") {
+            Copy-Item "$targetDir/BonDriver_NetworkProxy.dll" "$outDir/"
+          }
+
+          # Copy sample config if exists
+          if (Test-Path "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample") {
+            Copy-Item "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$outDir/"
+          }
+          if (Test-Path "recisdb-proxy/recisdb-proxy.toml.example") {
+            Copy-Item "recisdb-proxy/recisdb-proxy.toml.example" "$outDir/"
+          }
+
+          Get-ChildItem $outDir
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recisdb-${{ matrix.label }}
+          path: artifacts-${{ matrix.label }}/
+
+  build-linux:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64-unknown-linux-gnu
+            label: linux-amd64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-unknown-linux-gnu
+            label: linux-arm64
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang pkg-config \
+            libpcsclite-dev libudev-dev libdvbv5-dev
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Build (Release)
+        run: cargo build --workspace --verbose --release -F dvb
+
+      - name: Prepare artifacts
+        run: |
+          TARGET_DIR="target/release"
+          OUT_DIR="artifacts-${{ matrix.label }}"
+          mkdir -p "$OUT_DIR"
+
+          # Copy executables
+          [ -f "$TARGET_DIR/recisdb" ] && cp "$TARGET_DIR/recisdb" "$OUT_DIR/"
+          [ -f "$TARGET_DIR/recisdb-proxy" ] && cp "$TARGET_DIR/recisdb-proxy" "$OUT_DIR/"
+
+          # Copy sample configs
+          [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
+
+          ls -la "$OUT_DIR"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recisdb-${{ matrix.label }}
+          path: artifacts-${{ matrix.label }}/
+          retention-days: 30
