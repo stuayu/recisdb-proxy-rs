@@ -66,9 +66,17 @@ impl TsRingBuffer {
 
     /// Write data to the buffer.
     ///
-    /// Returns the number of bytes written (may be less than data.len() if buffer is full).
+    /// If the buffer has enough free space, the data is written normally.
+    /// If the buffer is full, the **oldest** data is discarded to make room
+    /// for new data (overwrite strategy).  This keeps the stream as close to
+    /// real-time as possible and avoids the silent data loss that occurred
+    /// when multi-hop proxy chains produced bursts faster than the consumer
+    /// could drain.
+    ///
+    /// Returns the number of bytes written (always == data.len() unless
+    /// data.len() >= RING_BUFFER_SIZE - 1, in which case it is capped).
     pub fn write(&self, data: &[u8]) -> usize {
-        let mut write = self.write_pos.load(Ordering::Acquire);
+        let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
 
         let free = if write >= read {
@@ -77,9 +85,20 @@ impl TsRingBuffer {
             read - write - 1
         };
 
-        let to_write = data.len().min(free);
+        // Cap to maximum writable size (buffer size - 1).
+        let to_write = data.len().min(RING_BUFFER_SIZE - 1);
         if to_write == 0 {
             return 0;
+        }
+
+        // If not enough space, advance the read pointer to discard oldest data.
+        // Round up to a TS packet boundary (188 bytes) so the consumer never
+        // sees a partial TS packet after the discard.
+        if to_write > free {
+            let advance = to_write - free;
+            let advance = ((advance + TS_PACKET_SIZE - 1) / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+            let new_read = (read + advance) % RING_BUFFER_SIZE;
+            self.read_pos.store(new_read, Ordering::Release);
         }
 
         let dst = self.buffer.as_ptr() as *mut u8; // 生ポインタ（&mut を作らない）
@@ -93,8 +112,8 @@ impl TsRingBuffer {
             }
         }
 
-        write = (write + to_write) % RING_BUFFER_SIZE;
-        self.write_pos.store(write, Ordering::Release);
+        let new_write = (write + to_write) % RING_BUFFER_SIZE;
+        self.write_pos.store(new_write, Ordering::Release);
 
         // Notify any thread blocked in wait_data().
         // We briefly acquire the mutex before notify_all() to avoid the

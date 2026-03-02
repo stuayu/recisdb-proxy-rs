@@ -557,6 +557,11 @@ async fn connection_task(
 }
 
 /// Main connection loop handling reads and writes.
+///
+/// Reader and writer are split into independent tasks so that an outgoing
+/// `write_all()` that blocks on TCP backpressure never stalls incoming TS
+/// data reception.  This is critical for multi-hop proxy chains where each
+/// hop adds latency and the downstream TCP send buffer can fill up.
 async fn connection_loop<R, W>(
     conn: Arc<Connection>,
     mut req_rx: mpsc::Receiver<ClientMessage>,
@@ -566,9 +571,35 @@ async fn connection_loop<R, W>(
     mut writer: W,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
+    // --- Writer task (independent) ---
+    // Runs in its own tokio task so that write_all() blocking on TCP
+    // backpressure does not stall the reader.
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = req_rx.recv().await {
+            trace!("Sending request: {:?}", msg);
+            let encoded = match encode_client_message(&msg) {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("Failed to encode client message: {}", e);
+                    break;
+                }
+            };
+            if let Err(e) = writer.write_all(&encoded).await {
+                error!("Write error: {}", e);
+                break;
+            }
+            // Flush after every command to ensure it reaches the server promptly.
+            if let Err(e) = writer.flush().await {
+                error!("Flush error: {}", e);
+                break;
+            }
+        }
+    });
+
+    // --- Reader loop (main) ---
     // Use a larger read buffer (256 KB) to reduce the number of syscalls for
     // high-bitrate streams, similar to TsPacketBufSize in BonDriverProxy(Ex).
     let mut read_buf = BytesMut::with_capacity(262144);
@@ -576,81 +607,76 @@ where
     static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    loop {
-        tokio::select! {
-            // Handle outgoing requests
-            Some(msg) = req_rx.recv() => {
-                trace!("Sending request: {:?}", msg);
-                let encoded = encode_client_message(&msg)?;
-                writer.write_all(&encoded).await?;
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        loop {
+            let n = reader.read_buf(&mut read_buf).await?;
+            if n == 0 {
+                info!("Connection closed by server");
+                *conn.state.lock() = ConnectionState::Disconnected;
+                break;
             }
 
-            // Handle incoming data
-            result = reader.read_buf(&mut read_buf) => {
-                let n = result?;
-                if n == 0 {
-                    info!("Connection closed by server");
-                    *conn.state.lock() = ConnectionState::Disconnected;
-                    break;
-                }
-
-                // Process all complete frames currently in read_buf.
-                while read_buf.len() >= HEADER_SIZE {
-                    match decode_header(&read_buf)? {
-                        Some(header) => {
-                            let total_len = HEADER_SIZE + header.payload_len as usize;
-                            if read_buf.len() < total_len {
-                                break; // Need more data
-                            }
-
-                            // Consume header bytes.
-                            let _ = read_buf.split_to(HEADER_SIZE);
-
-                            // --- TsData fast path ---
-                            // Handle TS data directly without going through
-                            // decode_server_message() to avoid an extra Vec
-                            // allocation + memcpy (the payload.to_vec() inside
-                            // the decoder).  The payload is written straight
-                            // from read_buf into the ring buffer (single copy).
-                            if header.message_type == MessageType::TsData {
-                                let ts_payload = read_buf.split_to(header.payload_len as usize);
-
-                                let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                let written = buffer.write(&ts_payload);
-
-                                if count % 100 == 0 {
-                                    let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-                                    crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
-                                           count, ts_payload.len(), written, buffer.available(), total_bytes);
-                                }
-
-                                if written < ts_payload.len() {
-                                    crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
-                                }
-
-                                continue;
-                            }
-
-                            // --- Non-TS messages ---
-                            // freeze() is zero-copy (BytesMut → Bytes without cloning).
-                            let payload = read_buf.split_to(header.payload_len as usize).freeze();
-                            let msg = decode_server_message(header.message_type, payload)?;
-
-                            // std::sync::mpsc::Sender::send() is non-blocking.
-                            if resp_tx.send(msg).is_err() {
-                                debug!("Response channel closed");
-                            }
+            // Process all complete frames currently in read_buf.
+            while read_buf.len() >= HEADER_SIZE {
+                match decode_header(&read_buf)? {
+                    Some(header) => {
+                        let total_len = HEADER_SIZE + header.payload_len as usize;
+                        if read_buf.len() < total_len {
+                            break; // Need more data
                         }
-                        None => break, // Need more data
+
+                        // Consume header bytes.
+                        let _ = read_buf.split_to(HEADER_SIZE);
+
+                        // --- TsData fast path ---
+                        // Handle TS data directly without going through
+                        // decode_server_message() to avoid an extra Vec
+                        // allocation + memcpy (the payload.to_vec() inside
+                        // the decoder).  The payload is written straight
+                        // from read_buf into the ring buffer (single copy).
+                        if header.message_type == MessageType::TsData {
+                            let ts_payload = read_buf.split_to(header.payload_len as usize);
+
+                            let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                            let written = buffer.write(&ts_payload);
+
+                            if count % 100 == 0 {
+                                let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                                crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
+                                       count, ts_payload.len(), written, buffer.available(), total_bytes);
+                            }
+
+                            if written < ts_payload.len() {
+                                crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
+                            }
+
+                            continue;
+                        }
+
+                        // --- Non-TS messages ---
+                        // freeze() is zero-copy (BytesMut → Bytes without cloning).
+                        let payload = read_buf.split_to(header.payload_len as usize).freeze();
+                        let msg = decode_server_message(header.message_type, payload)?;
+
+                        // std::sync::mpsc::Sender::send() is non-blocking.
+                        if resp_tx.send(msg).is_err() {
+                            debug!("Response channel closed");
+                        }
                     }
+                    None => break, // Need more data
                 }
             }
         }
-    }
+        Ok(())
+    }.await;
 
-    Ok(())
+    // Abort writer task when reader finishes (connection closed or error).
+    writer_handle.abort();
+    let _ = writer_handle.await;
+
+    result
 }
 
 impl Drop for Connection {

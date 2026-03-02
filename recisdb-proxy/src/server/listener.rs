@@ -3,8 +3,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{error, info};
+use log::{error, info, warn};
+use tokio::io::{AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use bytes::Bytes;
 
 use crate::database::Database;
 use crate::server::session::Session;
@@ -121,13 +124,36 @@ async fn handle_connection(
     // Disable Nagle's algorithm for lower latency
     socket.set_nodelay(true)?;
 
+    // Split the socket into independent read/write halves.
+    // The write half moves to a dedicated writer task so that socket writes
+    // (which may block on TCP backpressure) never stall the main select loop.
+    let (reader, writer) = socket.into_split();
+
+    // Per-session write channels.
+    // TS data  :  bounded, uses try_send (no blocking), drops oldest on full.
+    // Control  :  bounded but generous, uses send().await (low volume).
+    let (ts_write_tx, ts_write_rx) = mpsc::channel::<Bytes>(
+        Session::TS_WRITE_BUFFER_CAPACITY,
+    );
+    let (ctrl_write_tx, ctrl_write_rx) = mpsc::channel::<Bytes>(
+        Session::CTRL_WRITE_BUFFER_CAPACITY,
+    );
+
+    // Spawn the writer task – it owns the write-half of the socket.
+    let writer_handle = tokio::spawn(
+        session_writer(session_id, writer, ts_write_rx, ctrl_write_rx),
+    );
+
     // Register the session
     let shutdown_rx = session_registry.register(session_id, addr).await;
 
     let mut session = Session::new(
         session_id,
         addr,
-        socket,
+        reader,
+        ts_write_tx,
+        ctrl_write_tx,
+        writer_handle,
         tuner_pool,
         database,
         default_tuner,
@@ -140,4 +166,99 @@ async fn handle_connection(
     session_registry.unregister(session_id).await;
 
     result
+}
+
+/// Dedicated per-session writer task.
+///
+/// Drains two channels (control messages with priority, TS data) and writes
+/// the pre-encoded frames to the socket.  By running in its own task the
+/// socket write calls — which may block for an extended period during
+/// network congestion — never stall the session's broadcast receiver or
+/// command handler.
+///
+/// The function exits when both channels are closed (session drop) or when a
+/// socket write error occurs.
+async fn session_writer(
+    session_id: u64,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut ts_rx: mpsc::Receiver<Bytes>,
+    mut ctrl_rx: mpsc::Receiver<Bytes>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+
+            // --- Priority: control messages first ---
+            msg = ctrl_rx.recv() => {
+                match msg {
+                    Some(data) => {
+                        if let Err(e) = writer.write_all(&data).await {
+                            warn!("[Session {} writer] Control write error: {}", session_id, e);
+                            return;
+                        }
+                        if let Err(e) = writer.flush().await {
+                            warn!("[Session {} writer] Flush error after ctrl: {}", session_id, e);
+                            return;
+                        }
+                    }
+                    None => {
+                        // ctrl channel closed – session is shutting down.
+                        // Drain remaining TS frames before exiting.
+                        while let Ok(data) = ts_rx.try_recv() {
+                            if writer.write_all(&data).await.is_err() { return; }
+                        }
+                        let _ = writer.flush().await;
+                        return;
+                    }
+                }
+            }
+
+            // --- Bulk: TS data (batch-drain for throughput) ---
+            msg = ts_rx.recv() => {
+                match msg {
+                    Some(data) => {
+                        if let Err(e) = writer.write_all(&data).await {
+                            warn!("[Session {} writer] TS write error: {}", session_id, e);
+                            return;
+                        }
+                        // Drain all immediately-available TS frames in one
+                        // batch before flushing – this reduces the number of
+                        // syscalls under high throughput.
+                        loop {
+                            // Always check ctrl first inside the drain loop
+                            // so that interleaved control messages are not
+                            // delayed until the TS batch ends.
+                            match ctrl_rx.try_recv() {
+                                Ok(ctrl_data) => {
+                                    if let Err(e) = writer.write_all(&ctrl_data).await {
+                                        warn!("[Session {} writer] Control write error: {}", session_id, e);
+                                        return;
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                            match ts_rx.try_recv() {
+                                Ok(ts_data) => {
+                                    if let Err(e) = writer.write_all(&ts_data).await {
+                                        warn!("[Session {} writer] TS write error: {}", session_id, e);
+                                        return;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if let Err(e) = writer.flush().await {
+                            warn!("[Session {} writer] Flush error after TS: {}", session_id, e);
+                            return;
+                        }
+                    }
+                    None => {
+                        // TS channel closed.
+                        let _ = writer.flush().await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }

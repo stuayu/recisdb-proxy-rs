@@ -10,6 +10,7 @@ use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc};
 
@@ -78,6 +79,19 @@ struct VirtualChannelMapping {
 }
 
 
+/// Capacity of the per-session TS write buffer.
+///
+/// Each slot contains one pre-encoded TS frame (~188 KB–256 KB).
+/// 256 slots ≈ 48–64 MB ≈ 15–25 seconds of buffering at 25 Mbps.
+/// This absorbs short network congestion without dropping data.
+const TS_WRITE_BUFFER_CAPACITY: usize = 256;
+
+/// Capacity of the per-session control message write buffer.
+///
+/// Control messages (SetChannelAck, HelloAck, etc.) are small and
+/// infrequent. 64 slots is more than sufficient.
+const CTRL_WRITE_BUFFER_CAPACITY: usize = 64;
+
 /// A client session.
 pub struct Session {
     /// Unique session ID.
@@ -85,8 +99,17 @@ pub struct Session {
     /// Client address.
     #[allow(dead_code)]
     addr: SocketAddr,
-    /// TCP socket.
-    socket: TcpStream,
+    /// Read half of the TCP socket (write half is in the writer task).
+    socket_reader: OwnedReadHalf,
+    /// Sender for TS data frames (pre-encoded wire bytes) to the writer task.
+    /// `try_send` is used to avoid blocking the select loop; when the buffer
+    /// is full, oldest entries are drained to stay close to real-time.
+    ts_write_tx: mpsc::Sender<Bytes>,
+    /// Sender for control messages (pre-encoded wire bytes) to the writer task.
+    /// Control messages have priority in the writer task.
+    ctrl_write_tx: mpsc::Sender<Bytes>,
+    /// Handle to the writer task for clean shutdown.
+    writer_handle: Option<tokio::task::JoinHandle<()>>,
     /// Read buffer.
     read_buf: BytesMut,
     /// Current session state.
@@ -177,11 +200,18 @@ pub struct Session {
 }
 
 impl Session {
+    /// Capacity constants exposed for `handle_connection` in listener.rs.
+    pub const TS_WRITE_BUFFER_CAPACITY: usize = TS_WRITE_BUFFER_CAPACITY;
+    pub const CTRL_WRITE_BUFFER_CAPACITY: usize = CTRL_WRITE_BUFFER_CAPACITY;
+
     /// Create a new session.
     pub fn new(
         id: u64,
         addr: SocketAddr,
-        socket: TcpStream,
+        socket_reader: OwnedReadHalf,
+        ts_write_tx: mpsc::Sender<Bytes>,
+        ctrl_write_tx: mpsc::Sender<Bytes>,
+        writer_handle: tokio::task::JoinHandle<()>,
         tuner_pool: Arc<TunerPool>,
         database: DatabaseHandle,
         default_tuner: Option<String>,
@@ -191,7 +221,10 @@ impl Session {
         Self {
             id,
             addr,
-            socket,
+            socket_reader,
+            ts_write_tx,
+            ctrl_write_tx,
+            writer_handle: Some(writer_handle),
             read_buf: BytesMut::with_capacity(65536),
             state: SessionState::Initial,
             tuner_pool,
@@ -1211,7 +1244,12 @@ impl Session {
                 let mut tmp_buf = [0u8; 4096];
 
                 tokio::select! {
-                    biased;
+                    // NOTE: `biased` is intentionally NOT used here.
+                    // In multi-hop proxy chains, biased polling caused TS data
+                    // and socket reads to be starved by higher-priority branches,
+                    // leading to command processing delays and cascading
+                    // backpressure.  Fair (random) polling ensures all branches
+                    // make progress.
 
                     // Remote shutdown request
                     _ = self.shutdown_rx.recv() => {
@@ -1231,6 +1269,18 @@ impl Session {
                                 break;
                             }
                         }
+                    }
+
+                    // Check for incoming socket data (client commands).
+                    // Prioritized above tsreplace/TS data so that StopStream,
+                    // SetChannel etc. are handled promptly even under load.
+                    result = self.socket_reader.read(&mut tmp_buf) => {
+                        let n = result?;
+                        if n == 0 {
+                            self.disconnect_reason = Some("client_disconnect".to_string());
+                            break; // Connection closed
+                        }
+                        self.read_buf.extend_from_slice(&tmp_buf[..n]);
                     }
 
                     // Encoded output from tsreplace
@@ -1310,8 +1360,13 @@ impl Session {
                                 }
                             }
                             Some(Err(broadcast::error::RecvError::Lagged(count))) => {
-                                warn!("[Session {}] Broadcast receiver lagged, skipped {} messages", self.id, count);
+                                warn!("[Session {}] Broadcast receiver lagged, skipped {} messages — recovering", self.id, count);
                                 self.packets_dropped += count;
+                                // Recovery: clear the TS carry buffers so we don't
+                                // send partial/stale packets after the gap.  The
+                                // next received chunk will start a fresh alignment.
+                                self.ts_send_carry.clear();
+                                self.ts_quality_carry.clear();
                             }
                             Some(Err(broadcast::error::RecvError::Closed)) => {
                                 info!("[Session {}] Broadcast channel closed", self.id);
@@ -1321,20 +1376,10 @@ impl Session {
                             None => {}
                         }
                     }
-
-                    // Check for incoming socket data
-                    result = self.socket.read(&mut tmp_buf) => {
-                        let n = result?;
-                        if n == 0 {
-                            self.disconnect_reason = Some("client_disconnect".to_string());
-                            break; // Connection closed
-                        }
-                        self.read_buf.extend_from_slice(&tmp_buf[..n]);
-                    }
                 }
             } else {
                 // Not streaming, just wait for messages or shutdown
-                let socket = &mut self.socket;
+                let socket = &mut self.socket_reader;
                 let read_buf = &mut self.read_buf;
                 let shutdown_rx = &mut self.shutdown_rx;
 
@@ -1406,7 +1451,7 @@ impl Session {
 
     /// Read and decode a client message (borrowed socket/buffer).
     async fn read_message_with(
-        socket: &mut TcpStream,
+        socket: &mut OwnedReadHalf,
         read_buf: &mut BytesMut,
         session_id: u64,
     ) -> std::io::Result<Option<ClientMessage>> {
@@ -3746,11 +3791,78 @@ impl Session {
             }
         }
 
-        self.send_message(ServerMessage::TsData { data: send_data.to_vec() }).await
+        self.send_ts_data_raw(send_data).await
+    }
+
+    /// Send raw TS data directly to the client via the writer task.
+    ///
+    /// The frame is built in-place using the same wire format (BNDP header +
+    /// payload) so the client's fast-path TsData decoder works unchanged.
+    ///
+    /// Uses `try_send` on the write channel so the select loop is never
+    /// blocked by network backpressure.  When the channel is full (sustained
+    /// congestion), the frame is dropped so the select loop stays responsive.
+    /// The 256-slot buffer holds ~15–25 seconds of TS data at typical bitrates,
+    /// so only prolonged outages cause drops.
+    async fn send_ts_data_raw(&mut self, data: Bytes) -> std::io::Result<()> {
+        use bytes::BufMut;
+        use recisdb_protocol::{MessageType, MAGIC};
+
+        let payload_len = data.len() as u32;
+        let mut frame = BytesMut::with_capacity(10 + data.len());
+        frame.put_slice(&MAGIC);
+        frame.put_u32_le(payload_len);
+        frame.put_u16_le(MessageType::TsData.into());
+        frame.put_slice(&data);
+
+        let frame = frame.freeze();
+
+        match self.ts_write_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // The write buffer is full — the writer task can't keep up
+                // with the network.  Drop this frame to keep the select
+                // loop responsive.  The buffer holds ~15–25 s of data, so
+                // reaching this point implies prolonged network congestion.
+                //
+                // Clear carry buffers so the next frame starts with a clean
+                // 188-byte alignment (same recovery as broadcast Lagged).
+                self.ts_send_carry.clear();
+                self.ts_quality_carry.clear();
+                self.packets_dropped += 1;
+
+                // Log once per second to avoid flooding.
+                static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let prev = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+                if now_ms.saturating_sub(prev) >= 1000 {
+                    LAST_WARN.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        "[Session {}] Write buffer full, dropped TS frame ({} bytes). \
+                         Total dropped: {}",
+                        self.id, data.len(), self.packets_dropped
+                    );
+                }
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Writer task died — signal disconnect.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer task closed",
+                ))
+            }
+        }
     }
 
 
-    /// Send a server message to the client.
+    /// Send a server message to the client via the writer task.
+    ///
+    /// Control messages are sent on a separate priority channel so they
+    /// are not delayed behind a large queue of TS data frames.
     async fn send_message(&mut self, msg: ServerMessage) -> std::io::Result<()> {
         trace!("[Session {}] Sending: {:?}", self.id, msg);
 
@@ -3758,7 +3870,9 @@ impl Session {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
 
-        self.socket.write_all(&encoded).await
+        self.ctrl_write_tx.send(encoded).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer task closed")
+        })
     }
 
     /// Send an error message to the client.
@@ -3843,6 +3957,20 @@ impl Session {
 
     /// Clean up session resources.
     async fn cleanup(&mut self) {
+        // Shut down the writer task:  dropping the senders signals the writer
+        // to drain remaining data and exit.  We then wait for it to finish so
+        // that the client receives any final control messages (e.g. error).
+        // Use a bounded clone so we can explicitly drop and await.
+        drop(std::mem::replace(&mut self.ts_write_tx, mpsc::channel(1).0));
+        drop(std::mem::replace(&mut self.ctrl_write_tx, mpsc::channel(1).0));
+        if let Some(handle) = self.writer_handle.take() {
+            // Give the writer a few seconds to flush remaining data.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                handle,
+            ).await;
+        }
+
         self.stop_warm_tuner().await;
         // Unsubscribe from tuner and check if we should stop reader
         if let Some(tuner) = self.current_tuner.take() {
