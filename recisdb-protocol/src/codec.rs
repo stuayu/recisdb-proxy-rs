@@ -107,6 +107,9 @@ pub fn encode_client_message(msg: &ClientMessage) -> Result<Bytes, ProtocolError
                 }
             }
         }
+        ClientMessage::SetServiceFilter { single_service } => {
+            payload.put_u8(if *single_service { 1 } else { 0 });
+        }
     }
 
     encode_frame(msg.message_type(), payload.freeze())
@@ -195,6 +198,9 @@ pub fn encode_server_message(msg: &ServerMessage) -> Result<Bytes, ProtocolError
             for ch in channels {
                 encode_client_channel_info(&mut payload, ch);
             }
+        }
+        ServerMessage::SetServiceFilterAck { success } => {
+            payload.put_u8(if *success { 1 } else { 0 });
         }
     }
 
@@ -671,6 +677,16 @@ pub fn decode_client_message(
             };
             Ok(ClientMessage::GetChannelList { filter })
         }
+        MessageType::SetServiceFilter => {
+            if payload.remaining() < 1 {
+                return Err(ProtocolError::IncompleteFrame {
+                    expected: 1,
+                    actual: payload.remaining(),
+                });
+            }
+            let single_service = payload.get_u8() != 0;
+            Ok(ClientMessage::SetServiceFilter { single_service })
+        }
         _ => Err(ProtocolError::UnknownMessageType(msg_type as u16)),
     }
 }
@@ -840,6 +856,16 @@ pub fn decode_server_message(
                 channels.push(decode_client_channel_info(&mut payload)?);
             }
             Ok(ServerMessage::GetChannelListAck { channels, timestamp })
+        }
+        MessageType::SetServiceFilterAck => {
+            if payload.remaining() < 1 {
+                return Err(ProtocolError::IncompleteFrame {
+                    expected: 1,
+                    actual: payload.remaining(),
+                });
+            }
+            let success = payload.get_u8() != 0;
+            Ok(ServerMessage::SetServiceFilterAck { success })
         }
         MessageType::Error => {
             if payload.remaining() < 4 {

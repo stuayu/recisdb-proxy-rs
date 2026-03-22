@@ -29,6 +29,7 @@ mod nit;
 mod sdt;
 mod analyzer;
 mod descriptors;
+pub mod service_filter;
 
 pub use packet::{TsPacket, TsHeader, AdaptationField, TS_PACKET_SIZE, SYNC_BYTE};
 pub use psi::{PsiSection, PsiHeader, SectionCollector};

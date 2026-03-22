@@ -1,59 +1,96 @@
-; BonDriver_NetworkProxy Configuration
-; Place this file in the same directory as the DLL
-; and rename it to BonDriver_NetworkProxy.ini
+; =====================================================
+; BonDriver_NetworkProxy 設定ファイル
+; =====================================================
+; このファイルを BonDriver_NetworkProxy.ini にリネームし、
+; DLLと同じディレクトリに配置してください。
+;
+; 環境変数でも設定可能です (BONDRIVER_PROXY_* プレフィックス):
+;   BONDRIVER_PROXY_SERVER     → Address
+;   BONDRIVER_PROXY_TUNER      → Tuner
+;   BONDRIVER_PROXY_PRIORITY   → Priority
+;   BONDRIVER_PROXY_EXCLUSIVE  → Exclusive
+;   BONDRIVER_PROXY_TLS        → TLS
+;   BONDRIVER_PROXY_CA_CERT    → TLSCACert
+;   BONDRIVER_PROXY_SERVICE_FILTER → ServiceFilter
+;   BONDRIVER_LOG_LEVEL        → LogLevel
 
+; =====================================================
+; サーバー接続設定
+; =====================================================
 [Server]
-; Proxy server address (IP:Port)
+; プロキシサーバーのアドレス (IP:ポート)
+; recisdb-proxy サーバーのアドレスを指定してください
 Address = 127.0.0.1:12345
 
-; Default tuner path or group name (optional)
-; You can specify one of the following:
-;   - Full DLL path: C:\BonDriver\BonDriver_PX-MLT1.dll
-;   - Tuner group name: PX-MLT (will auto-select from MLT1, MLT2, etc.)
-; Leave empty to use server's default tuner selection
+; =====================================================
+; チューナー選択
+; =====================================================
+; 接続先のチューナーパスまたはグループ名 (省略可)
+; 以下のいずれかの形式で指定できます:
+;   - フルパス指定: C:\BonDriver\BonDriver_PX-MLT1.dll
+;   - グループ名指定: PX-MLT (MLT1, MLT2 等から自動選択)
+; 空欄の場合、サーバー側のデフォルトチューナーが使用されます
 Tuner =
 
-; Connection timeout in milliseconds (default: 5000)
+; =====================================================
+; 接続タイムアウト設定
+; =====================================================
+; 接続タイムアウト (ミリ秒, デフォルト: 5000)
+; サーバーへの初回接続が完了するまでの待ち時間
 ConnectTimeout = 5000
 
-; Read timeout in milliseconds (default: 30000)
+; 受信タイムアウト (ミリ秒, デフォルト: 30000)
+; データ受信が途絶えた場合に切断と判定するまでの時間
 ReadTimeout = 30000
 
-; =====================
-; Tuner Group Selection
-; =====================
-; When using group names (e.g., PX-MLT), the proxy server automatically
-; selects the best available driver from the group based on:
-; - Current load on each tuner
-; - Priority level of the client
-; - Exclusive lock requirements
-; The selection strategy is determined by the server configuration.
+; =====================================================
+; チューナーグループ選択
+; =====================================================
+; グループ名 (例: PX-MLT) を指定した場合、サーバーは以下の条件で
+; グループ内から最適なドライバーを自動選択します:
+;   - 各チューナーの現在の負荷状況
+;   - クライアントの優先度レベル
+;   - 排他ロックの要求状況
+
+; クライアント優先度 (デフォルト: 0)
+; 数値が大きいほど優先的にチューナーが割り当てられます
 Priority = 0
 
-; Exclusive lock mode (default: 0)
-; Set to 1 or true to request exclusive access to the tuner
-; When enabled, this client gets highest priority and other clients are disconnected
-; Set to 0 or false to allow shared access
+; 排他ロックモード (デフォルト: 0)
+; 1 または true: チューナーを排他的に使用 (他のクライアントは切断されます)
+; 0 または false: 共有アクセスを許可 (同一チャンネルの場合TSストリームを共有)
 Exclusive = 0
 
-; =====================
-; TLS Configuration (requires tls feature enabled at compile time)
-; =====================
-; Enable TLS encryption
-; Set to 1 or true to enable TLS
+; =====================================================
+; サービスフィルタモード
+; =====================================================
+; TSストリーム (トランスポートストリーム) の配信方式を制御します。
+;   all    — 全サービス (NID+TSID上の全番組) を受信します。
+;            録画用途やマルチサービス受信に使用。(デフォルト)
+;   single — 選択したサービス (SID) のみを受信します。
+;            不要な番組のパケットをフィルタし帯域を削減します。
+;            PATは対象サービスのみに書き換えられます。
+;            単一チャンネルの視聴・デコードに最適。
+ServiceFilter = all
+
+; =====================================================
+; TLS設定 (tls フィーチャーが有効な場合のみ)
+; =====================================================
+; TLS暗号化を有効にする
+; 1 または true で有効化
 ; TLS = 0
 
-; Path to CA certificate for TLS verification (PEM format)
-; If not specified, system root certificates will be used
+; CA証明書のパス (PEM形式)
+; 省略した場合、システムのルート証明書が使用されます
 ; TLSCACert = ca.pem
 
-; =====================
-; Logging Configuration
-; =====================
+; =====================================================
+; ログ設定
+; =====================================================
 [Logging]
-; Log level for both the log file and env_logger output.
-; Accepted values (case-insensitive): off, error, warn, info, debug, trace
-; Default: warn  (only warnings and errors are written)
-; Use "info" for connection/channel diagnostics.
-; Use "debug" or "trace" for detailed troubleshooting (produces large log files).
+; ログレベル (ログファイルおよび env_logger の出力レベル)
+; 指定可能な値 (大文字小文字不問): off, error, warn, info, debug, trace
+; デフォルト: warn (警告とエラーのみ出力)
+; 接続やチャンネルの診断には info を推奨
+; 詳細なトラブルシューティングには debug または trace (ログが大量になります)
 LogLevel = warn

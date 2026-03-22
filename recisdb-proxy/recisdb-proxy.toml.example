@@ -1,29 +1,73 @@
-# recisdb-proxy Configuration File
-# Copy this file to recisdb-proxy.toml and modify as needed.
+# =====================================================
+# recisdb-proxy 設定ファイル
+# =====================================================
+# このファイルを recisdb-proxy.toml にコピーして編集してください。
+# コマンドライン引数が指定された場合、そちらが優先されます。
 
+# =====================================================
+# サーバー設定
+# =====================================================
 [server]
-# Address to listen on (default: 0.0.0.0:12345)
+# プロキシサーバーの待ち受けアドレス (デフォルト: 0.0.0.0:12345)
+# クライアント (TVTest等) はこのアドレスに接続します
 listen = "0.0.0.0:12345"
 
-# Web dashboard listen address (default: 0.0.0.0:8080)
+# Webダッシュボードの待ち受けアドレス (デフォルト: 0.0.0.0:8080)
+# ブラウザで http://localhost:8080 にアクセスすると管理画面が表示されます
 web_listen = "0.0.0.0:8080"
 
-# Default tuner device path (optional)
-# Linux: /dev/pt3video0 or 0|0 for DVB /dev/dvb/adapter0/frontend0
-# Windows: path to BonDriver DLL
+# デフォルトのチューナーデバイスパス (省略可)
+# Linux: /dev/pt3video0 または DVBデバイスの場合 0|0 → /dev/dvb/adapter0/frontend0
+# Windows: BonDriver DLLのフルパス
+# 複数チューナーはWebダッシュボードまたはDBで管理します
 # tuner = "/dev/pt3video0"
+# tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
 
-# Maximum concurrent connections (default: 64)
+# 最大同時接続数 (デフォルト: 64)
+# 同時に接続できるクライアント数の上限
 max_connections = 64
 
+# =====================================================
+# データベース設定
+# =====================================================
 [database]
-# Path to the database file (default: recisdb-proxy.db)
+# SQLiteデータベースファイルのパス (デフォルト: recisdb-proxy.db)
+# 初回起動時に自動作成されます
 path = "recisdb-proxy.db"
 
+# =====================================================
+# ログ設定
+# =====================================================
 [logging]
-# Directory where log files are stored (default: logs)
+# ログファイルの保存ディレクトリ (デフォルト: logs)
 log_dir = "logs"
 
-# Number of days to keep log files (default: 7)
+# ログファイルの保持日数 (デフォルト: 7)
+# この日数を超えた古いログは自動的に削除されます
 retention_days = 7
+
+# ログレベル (デフォルト: warn)
+# 指定可能な値: off, error, warn, info, debug, trace
+# 通常運用は warn、接続やチャンネル診断は info、詳細調査は debug/trace
+# level = "warn"
+
+# =====================================================
+# TLS設定 (tls フィーチャーが有効な場合のみ)
+# =====================================================
+# [tls]
+# TLS暗号化を有効にする (デフォルト: false)
+# enabled = false
+#
+# CA証明書のパス (PEM形式)
+# ca_cert = "ca.pem"
+#
+# サーバー証明書のパス (PEM形式)
+# server_cert = "server.pem"
+#
+# サーバー秘密鍵のパス (PEM形式)
+# server_key = "server-key.pem"
+#
+# クライアント証明書の要求 (デフォルト: false)
+# true にするとクライアント証明書がない接続は拒否されます
+# require_client_cert = false
 

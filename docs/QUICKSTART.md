@@ -94,21 +94,13 @@ web_listen = "0.0.0.0:8080"
 max_connections = 64
 EOF
 
-# SQLiteで事前設定
-sqlite3 recisdb-proxy.db << 'EOF'
--- PX-MLT1: 最大4チャンネル
-UPDATE bon_drivers 
-SET max_instances = 4 
-WHERE dll_path LIKE '%PX-MLT1%';
-
--- PX-S: 最大1チャンネル（衛星波は1つのみ）
-UPDATE bon_drivers 
-SET max_instances = 1 
-WHERE dll_path LIKE '%PX-S%';
-EOF
-
 # サーバー起動
 recisdb-proxy
+
+# ブラウザで http://localhost:8080 を開き、
+# Webダッシュボードの「チューナー設定」から以下を設定:
+#   PX-MLT1: max_instances = 4（4チャンネル同時使用）
+#   PX-S:    max_instances = 1（衛星波は1つのみ）
 ```
 
 ### シナリオ3: 優先度付きアクセス制御
@@ -226,8 +218,4 @@ recisdb-proxy --help
 
 1. サーバーログを確認（`--verbose` で詳細化）
 2. Webダッシュボードの状態を確認
-3. データベースの内容を確認
-   ```bash
-   sqlite3 recisdb-proxy.db "SELECT * FROM bon_drivers;"
-   ```
-4. GitHubのIssueを確認・報告
+3. GitHubのIssueを確認・報告

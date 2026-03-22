@@ -24,6 +24,7 @@ use crate::server::listener::DatabaseHandle;
 use crate::tuner::{ChannelKey, SharedTuner, TunerPool, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
 use crate::tuner::quality_scorer::QualityScorer;
 use crate::tuner::channel_key::ChannelKeySpec;
+use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::web::SessionRegistry;
 
 /// Session state machine.
@@ -197,6 +198,19 @@ pub struct Session {
     tsreplace_passthrough_on_error: bool,
     /// Last time encoded output was received.
     tsreplace_last_output_at: std::time::Instant,
+    /// Whether this session uses single-service TS filtering.
+    single_service_filter_enabled: bool,
+    /// Per-session TS service filter (active when single_service_filter_enabled
+    /// is true and a channel is tuned).
+    ts_service_filter: Option<TsServiceFilter>,
+    /// Current NID (set after channel selection).
+    current_nid: Option<u16>,
+    /// Current TSID (set after channel selection).
+    current_tsid: Option<u16>,
+    /// Current SID (set after channel selection).
+    current_sid: Option<u16>,
+    /// Additional tsreplace child processes (for chained multi-SID encoding).
+    tsreplace_extra_children: Vec<Child>,
 }
 
 impl Session {
@@ -273,6 +287,12 @@ impl Session {
             tsreplace_read_timeout: std::time::Duration::from_millis(10_000),
             tsreplace_passthrough_on_error: true,
             tsreplace_last_output_at: std::time::Instant::now(),
+            single_service_filter_enabled: false,
+            ts_service_filter: None,
+            current_nid: None,
+            current_tsid: None,
+            current_sid: None,
+            tsreplace_extra_children: Vec::new(),
         }
     }
 
@@ -303,12 +323,132 @@ impl Session {
         self.tsreplace_input_tx = None;
         self.tsreplace_output_rx = None;
 
+        // Kill all chained tsreplace processes (in reverse order)
+        for mut child in self.tsreplace_extra_children.drain(..).rev() {
+            if let Err(e) = child.start_kill() {
+                debug!("[Session {}] tsreplace chain kill skipped: {}", self.id, e);
+            }
+            let _ = child.wait().await;
+        }
+
         if let Some(mut child) = self.tsreplace_child.take() {
             if let Err(e) = child.start_kill() {
                 debug!("[Session {}] tsreplace kill skipped: {}", self.id, e);
             }
             let _ = child.wait().await;
         }
+    }
+
+    /// Resolve which SIDs to encode for the current channel.
+    ///
+    /// - single-service mode: encode only the current SID.
+    /// - full-TS mode: encode all SIDs in the NID+TSID group.
+    /// - If NID/TSID are unknown: returns empty (no --service injection).
+    async fn resolve_encode_sids(&self) -> Vec<u16> {
+        if self.single_service_filter_enabled {
+            // Single-service mode: encode only the requested SID
+            return self.current_sid.into_iter().collect();
+        }
+
+        // Full-TS mode: encode all SIDs in the NID+TSID group
+        if let (Some(nid), Some(tsid)) = (self.current_nid, self.current_tsid) {
+            let db = self.database.lock().await;
+            match db.get_sids_for_nid_tsid(nid, tsid) {
+                Ok(sids) if !sids.is_empty() => return sids,
+                Ok(_) => {
+                    debug!(
+                        "[Session {}] No SIDs found for NID=0x{:04X} TSID=0x{:04X}",
+                        self.id, nid, tsid
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[Session {}] Failed to query SIDs for NID=0x{:04X} TSID=0x{:04X}: {}",
+                        self.id, nid, tsid, e
+                    );
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Check if `--service` or `-s` is already present in arguments.
+    fn args_contain_service_option(arguments: &str) -> bool {
+        let tokens: Vec<&str> = arguments.split_whitespace().collect();
+        tokens.iter().any(|t| *t == "--service" || *t == "-s")
+    }
+
+    /// Build command arguments with `--service <SID>` auto-injected.
+    ///
+    /// Inserts `--service <SID>` and `--preserve-other-services` before
+    /// the `-e`/`--encoder` option (if present), or at the end.
+    fn build_tsreplace_args(base_arguments: &str, sid: u16) -> Vec<String> {
+        let tokens: Vec<&str> = base_arguments.split_whitespace().collect();
+        let mut args = Vec::with_capacity(tokens.len() + 4);
+
+        // Find position of -e/--encoder to insert --service before it
+        let encoder_pos = tokens.iter().position(|t| *t == "-e" || *t == "--encoder");
+
+        let has_preserve = tokens.iter().any(|t| *t == "--preserve-other-services");
+
+        for (i, token) in tokens.iter().enumerate() {
+            if encoder_pos == Some(i) {
+                // Insert --service and --preserve-other-services before encoder
+                args.push("--service".to_string());
+                args.push(sid.to_string());
+                if !has_preserve {
+                    args.push("--preserve-other-services".to_string());
+                }
+            }
+            args.push(token.to_string());
+        }
+
+        // If no -e/--encoder found, append at end
+        if encoder_pos.is_none() {
+            args.push("--service".to_string());
+            args.push(sid.to_string());
+            if !has_preserve {
+                args.push("--preserve-other-services".to_string());
+            }
+        }
+
+        args
+    }
+
+    /// Spawn a single tsreplace process with the given arguments.
+    fn spawn_tsreplace(
+        command_path: &str,
+        args: &[String],
+        stdin_cfg: std::process::Stdio,
+        stdout_cfg: std::process::Stdio,
+    ) -> std::io::Result<Child> {
+        let mut cmd = Command::new(command_path);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.stdin(stdin_cfg)
+            .stdout(stdout_cfg)
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        cmd.spawn()
+    }
+
+    /// Spawn a background task to forward stderr lines to the log.
+    fn spawn_stderr_logger(id: u64, sid: u16, stderr: tokio::process::ChildStderr) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => debug!("[tsreplace SID={}][Session {}] {}", sid, id, line),
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("[tsreplace SID={}][Session {}] stderr read failed: {}", sid, id, e);
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     async fn start_tsreplace_pipeline(&mut self) -> std::io::Result<()> {
@@ -322,19 +462,178 @@ impl Session {
             return Ok(());
         }
 
-        let mut cmd = Command::new(&cfg.command_path);
-        for arg in cfg.arguments.split_whitespace() {
-            cmd.arg(arg);
-        }
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+        // Determine which SIDs to encode
+        let sids = self.resolve_encode_sids().await;
 
-        let mut child = cmd.spawn().map_err(|e| {
+        // If --service is already manually specified in the config, or no SIDs resolved,
+        // fall back to the original single-process behavior (no auto-injection)
+        let user_specified_service = Self::args_contain_service_option(&cfg.arguments);
+
+        if user_specified_service || sids.is_empty() {
+            // Original behavior: single tsreplace process with user's arguments
+            return self.start_tsreplace_pipeline_single(
+                &cfg.command_path,
+                &cfg.arguments.split_whitespace().map(String::from).collect::<Vec<_>>(),
+            ).await;
+        }
+
+        if sids.len() == 1 {
+            // Single SID: one tsreplace with auto-injected --service
+            let args = Self::build_tsreplace_args(&cfg.arguments, sids[0]);
+            info!(
+                "[Session {}] tsreplace pipeline started (SID={}): command='{}' args='{}'",
+                self.id, sids[0], cfg.command_path, args.join(" ")
+            );
+            return self.start_tsreplace_pipeline_single(&cfg.command_path, &args).await;
+        }
+
+        // Multiple SIDs: chain tsreplace instances via OS-level pipes
+        // stdin → tsreplace(SID1) →(pipe)→ tsreplace(SID2) →(pipe)→ ... → tsreplace(SIDn) → stdout
+        // Each process encodes its target SID while passing all other packets through
+        // immediately, so all SIDs encode in parallel with ~zero inter-process overhead.
+        info!(
+            "[Session {}] tsreplace chained pipeline for {} SIDs: {:?}",
+            self.id,
+            sids.len(),
+            sids.iter().map(|s| format!("0x{:04X}", s)).collect::<Vec<_>>()
+        );
+
+        let mut children: Vec<Child> = Vec::with_capacity(sids.len());
+
+        // Spawn first process: stdin = piped (our feeder), stdout = piped (to next)
+        let args_first = Self::build_tsreplace_args(&cfg.arguments, sids[0]);
+        let mut first_child = Self::spawn_tsreplace(
+            &cfg.command_path,
+            &args_first,
+            std::process::Stdio::piped(),
+            std::process::Stdio::piped(),
+        ).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("failed to spawn tsreplace '{}': {}", cfg.command_path, e),
+                format!("failed to spawn tsreplace for SID {}: {}", sids[0], e),
+            )
+        })?;
+
+        let pipeline_stdin = first_child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace chain: stdin not available")
+        })?;
+        if let Some(stderr) = first_child.stderr.take() {
+            Self::spawn_stderr_logger(self.id, sids[0], stderr);
+        }
+
+        children.push(first_child);
+
+        // Spawn subsequent processes: connect via OS-level pipes (zero-copy).
+        // TryInto<Stdio> transfers the fd/handle ownership directly to the next
+        // process, so the kernel moves data between pipe buffers without any
+        // userspace copying or async-task scheduling overhead.
+        for (idx, &sid) in sids[1..].iter().enumerate() {
+            let args = Self::build_tsreplace_args(&cfg.arguments, sid);
+
+            let prev_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("tsreplace chain: stdout not available for SID {}", sids[idx]),
+                )
+            })?;
+
+            let prev_stdio: std::process::Stdio = prev_stdout.try_into().map_err(|e: std::io::Error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("tsreplace chain: failed to convert stdout to Stdio: {}", e),
+                )
+            })?;
+
+            let mut child = Self::spawn_tsreplace(
+                &cfg.command_path,
+                &args,
+                prev_stdio,
+                std::process::Stdio::piped(),
+            ).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to spawn tsreplace for SID {}: {}", sid, e),
+                )
+            })?;
+
+            if let Some(stderr) = child.stderr.take() {
+                Self::spawn_stderr_logger(self.id, sid, stderr);
+            }
+
+            children.push(child);
+        }
+
+        // Wire up: feeder → first.stdin, last.stdout → collector
+        let final_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace chain: final stdout not available")
+        })?;
+
+        let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(64);
+        let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
+
+        // Feeder task: channel → first process stdin
+        tokio::spawn(async move {
+            let mut stdin = pipeline_stdin;
+            while let Some(chunk) = in_rx.recv().await {
+                if let Err(e) = stdin.write_all(&chunk).await {
+                    warn!("[tsreplace chain] stdin write failed: {}", e);
+                    break;
+                }
+            }
+            let _ = stdin.shutdown().await;
+        });
+
+        // Collector task: last process stdout → channel
+        tokio::spawn(async move {
+            let mut stdout = final_stdout;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if out_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[tsreplace chain] stdout read failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Store the first child as primary, rest as extra
+        self.tsreplace_child = Some(children.remove(0));
+        self.tsreplace_extra_children = children;
+        self.tsreplace_input_tx = Some(in_tx);
+        self.tsreplace_output_rx = Some(out_rx);
+        self.tsreplace_last_output_at = std::time::Instant::now();
+
+        info!(
+            "[Session {}] tsreplace chained pipeline started: {} processes (OS-level pipe)",
+            self.id,
+            sids.len()
+        );
+
+        Ok(())
+    }
+
+    /// Start a single-process tsreplace pipeline (original behavior or single-SID).
+    async fn start_tsreplace_pipeline_single(
+        &mut self,
+        command_path: &str,
+        args: &[String],
+    ) -> std::io::Result<()> {
+        let mut child = Self::spawn_tsreplace(
+            command_path,
+            args,
+            std::process::Stdio::piped(),
+            std::process::Stdio::piped(),
+        ).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn tsreplace '{}': {}", command_path, e),
             )
         })?;
 
@@ -345,7 +644,22 @@ impl Session {
             std::io::Error::new(std::io::ErrorKind::Other, "tsreplace stdout not available")
         })?;
 
-        let stderr = child.stderr.take();
+        if let Some(stderr) = child.stderr.take() {
+            let id = self.id;
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => debug!("[tsreplace][Session {}] {}", id, line),
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!("[tsreplace][Session {}] stderr read failed: {}", id, e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(64);
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
@@ -380,22 +694,6 @@ impl Session {
             }
         });
 
-        if let Some(stderr) = stderr {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => debug!("[tsreplace] {}", line),
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!("[tsreplace] stderr read failed: {}", e);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
         self.tsreplace_input_tx = Some(in_tx);
         self.tsreplace_output_rx = Some(out_rx);
         self.tsreplace_child = Some(child);
@@ -403,7 +701,7 @@ impl Session {
 
         info!(
             "[Session {}] tsreplace pipeline started: command='{}' args='{}'",
-            self.id, cfg.command_path, cfg.arguments
+            self.id, command_path, args.join(" ")
         );
 
         Ok(())
@@ -1561,6 +1859,9 @@ impl Session {
             ClientMessage::GetChannelList { filter } => {
                 self.handle_get_channel_list(filter).await?;
             }
+            ClientMessage::SetServiceFilter { single_service } => {
+                self.handle_set_service_filter(single_service).await?;
+            }
         }
         Ok(true)
     }
@@ -2479,19 +2780,21 @@ impl Session {
                         self.current_channel_info = Some(channel_info);
 
                         // Try to get channel name and NID/SID from database
-                        let (channel_name, ch_nid, ch_sid) = {
+                        let (channel_name, ch_nid, ch_tsid, ch_sid) = {
                             let db = self.database.lock().await;
                             match db.get_channel_by_physical(&existing_key.tuner_path, actual_space, actual_bon_channel) {
                                 Ok(Some(rec)) => (
                                     rec.channel_name.or(rec.raw_name),
                                     Some(rec.nid),
+                                    Some(rec.tsid),
                                     Some(rec.sid),
                                 ),
-                                _ => (None, None, None),
+                                _ => (None, None, None, None),
                             }
                         };
                         self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
                         self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
+                        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
                         self.current_channel_name = channel_name;
 
                         return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
@@ -2769,15 +3072,16 @@ impl Session {
                     let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                     self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                     self.current_channel_info = Some(channel_info);
-                    let (fb_ch_name, fb_nid, fb_sid) = {
+                    let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
                         let db = self.database.lock().await;
                         match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                            Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
-                            _ => (None, None, None),
+                            Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
+                            _ => (None, None, None, None),
                         }
                     };
                     self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                     self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                    self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
                     self.current_channel_name = fb_ch_name;
                     return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                 }
@@ -2880,15 +3184,16 @@ impl Session {
                             let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                             self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                             self.current_channel_info = Some(channel_info);
-                            let (fb_ch_name, fb_nid, fb_sid) = {
+                            let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
                                 let db = self.database.lock().await;
                                 match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
-                                    _ => (None, None, None),
+                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
+                                    _ => (None, None, None, None),
                                 }
                             };
                             self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                             self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
                             self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
@@ -2925,15 +3230,16 @@ impl Session {
                             let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
                             self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
                             self.current_channel_info = Some(channel_info);
-                            let (fb_ch_name, fb_nid, fb_sid) = {
+                            let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
                                 let db = self.database.lock().await;
                                 match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.sid)),
-                                    _ => (None, None, None),
+                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
+                                    _ => (None, None, None, None),
                                 }
                             };
                             self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                             self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
+                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
                             self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
@@ -3046,19 +3352,21 @@ impl Session {
                 self.current_channel_info = Some(channel_info);
 
                 // Try to get channel name and NID/SID from database
-                let (channel_name, ch_nid, ch_sid) = {
+                let (channel_name, ch_nid, ch_tsid, ch_sid) = {
                     let db = self.database.lock().await;
                     match db.get_channel_by_physical(&tuner_path, actual_space, actual_bon_channel) {
                         Ok(Some(rec)) => (
                             rec.channel_name.or(rec.raw_name),
                             Some(rec.nid),
+                            Some(rec.tsid),
                             Some(rec.sid),
                         ),
-                        _ => (None, None, None),
+                        _ => (None, None, None, None),
                     }
                 };
                 self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
                 self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
+                self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
                 self.current_channel_name = channel_name;
 
                 // BonDriver reader is confirmed ready by start_reader_with_warm (via ready_rx, up to 10s timeout).
@@ -3245,6 +3553,70 @@ impl Session {
             error_code: 0,
         })
         .await
+    }
+
+    /// Handle SetServiceFilter message.
+    async fn handle_set_service_filter(&mut self, single_service: bool) -> std::io::Result<()> {
+        info!(
+            "[Session {}] SetServiceFilter: single_service={}",
+            self.id, single_service
+        );
+        self.single_service_filter_enabled = single_service;
+        if !single_service {
+            // Disable filtering
+            self.ts_service_filter = None;
+        }
+        self.send_message(ServerMessage::SetServiceFilterAck { success: true })
+            .await
+    }
+
+    /// Update the per-session TS service filter based on the resolved SID.
+    ///
+    /// Called after channel selection resolves the target SID from the database.
+    /// If single-service filtering is enabled, creates or updates the filter;
+    /// otherwise this is a no-op for the filter.
+    /// Always updates current NID/TSID/SID tracking for tsreplace SID injection.
+    fn update_service_filter_for_sid(&mut self, nid: Option<u16>, tsid: Option<u16>, sid: Option<u16>) {
+        // Always update NID/TSID/SID tracking (used by tsreplace pipeline)
+        self.current_nid = nid;
+        self.current_tsid = tsid;
+        self.current_sid = sid;
+
+        if !self.single_service_filter_enabled {
+            return;
+        }
+
+        match sid {
+            Some(sid_val) => {
+                if let Some(ref mut filter) = self.ts_service_filter {
+                    if filter.target_sid() != sid_val {
+                        debug!(
+                            "[Session {}] Service filter: SID changed 0x{:04X} -> 0x{:04X}",
+                            self.id,
+                            filter.target_sid(),
+                            sid_val
+                        );
+                        filter.set_target_sid(sid_val);
+                    } else {
+                        // Same SID but channel re-selected, reset to re-acquire PAT/PMT
+                        filter.reset();
+                    }
+                } else {
+                    debug!(
+                        "[Session {}] Service filter: creating filter for SID 0x{:04X}",
+                        self.id, sid_val
+                    );
+                    self.ts_service_filter = Some(TsServiceFilter::new(sid_val));
+                }
+            }
+            None => {
+                warn!(
+                    "[Session {}] Service filter: SID not found in DB, disabling filter for this channel",
+                    self.id
+                );
+                self.ts_service_filter = None;
+            }
+        }
     }
 
     /// Handle SelectLogicalChannel message.
@@ -3516,19 +3888,21 @@ impl Session {
             self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
             self.current_channel_info = Some(channel_info);
 
-            let (channel_name, ch_nid, ch_sid) = {
+            let (channel_name, ch_nid, ch_tsid, ch_sid) = {
                 let db = self.database.lock().await;
                 match db.get_channel_by_physical(&tuner_id, space, channel) {
                     Ok(Some(rec)) => (
                         rec.channel_name.or(rec.raw_name),
                         Some(rec.nid),
+                        Some(rec.tsid),
                         Some(rec.sid),
                     ),
-                    _ => (None, None, None),
+                    _ => (None, None, None, None),
                 }
             };
             self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
             self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
+            self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
             self.current_channel_name = channel_name;
 
             return self.send_message(ServerMessage::SelectLogicalChannelAck {
@@ -3686,9 +4060,20 @@ impl Session {
         let send_data = Bytes::copy_from_slice(&self.ts_send_carry[..send_len]);
         self.ts_send_carry.drain(0..send_len);
 
+        // ---- 2) Apply single-service filter if enabled ----
+        let send_data = if let Some(ref mut filter) = self.ts_service_filter {
+            let filtered = filter.filter(&send_data);
+            if filtered.is_empty() {
+                return Ok(());
+            }
+            Bytes::from(filtered)
+        } else {
+            send_data
+        };
+
         self.ts_msgs_sent += 1;
-        self.ts_bytes_sent += send_len as u64;
-        self.bytes_since_last += send_len as u64;
+        self.ts_bytes_sent += send_data.len() as u64;
+        self.bytes_since_last += send_data.len() as u64;
 
         // Analyze TS quality for this session.
         // Encoder/pipe output chunks are not guaranteed to be aligned on 188-byte TS boundaries,

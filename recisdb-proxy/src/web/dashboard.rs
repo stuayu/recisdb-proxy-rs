@@ -247,6 +247,26 @@ const HTML_CONTENT: &str = r#"
         .sort-bar label { color: #666; font-size: 12px; }
         .mobile-only { display: none; }
 
+        /* Channel inline edit mode */
+        .channel-edit-controls { display: none; gap: 8px; align-items: center; }
+        .channel-edit-controls.active { display: flex; }
+        .channel-view-controls { display: flex; gap: 8px; align-items: center; }
+        .channel-view-controls.hidden { display: none; }
+        tr.ch-edit-row td input[type="text"],
+        tr.ch-edit-row td input[type="number"] {
+            width: 100%; padding: 3px 6px; border: 1px solid #ccc; border-radius: 3px;
+            font-size: 12px; font-family: inherit; box-sizing: border-box;
+        }
+        tr.ch-edit-row td input[type="number"].priority-input { width: 60px; }
+        tr.ch-edit-row.ch-new-row { background: #f0f8ff !important; }
+        tr.ch-edit-row.ch-modified-row { background: #fffbea !important; }
+        tr.ch-edit-row.ch-deleted-row { opacity: 0.45; }
+        tr.ch-edit-row.ch-deleted-row td { text-decoration: line-through; }
+        .ch-new-ids { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+        .ch-new-ids input { width: 64px !important; }
+        .ch-new-ids label { font-size: 11px; color: #666; }
+        #ch-edit-save-msg { font-size: 12px; }
+
         @media (max-width: 768px) {
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .tabs { flex-wrap: wrap; }
@@ -398,19 +418,35 @@ const HTML_CONTENT: &str = r#"
         <div id="channels" class="tab-content">
             <div class="section-header">
                 <h3>チャンネル一覧</h3>
-                <div style="display: flex; gap: 10px;">
-                    <select id="channel-bondriver-filter" onchange="refreshChannels()">
-                        <option value="">すべてのBonDriver</option>
-                    </select>
-                    <label class="form-check" style="font-size: 13px;">
-                        <input type="checkbox" id="channel-group-filter" onchange="refreshChannels()" checked>
-                        論理チャンネル
-                    </label>
-                    <label class="form-check" style="font-size: 13px;">
-                        <input type="checkbox" id="channel-enabled-filter" onchange="refreshChannels()">
-                        有効のみ
-                    </label>
-                    <button class="btn btn-secondary btn-sm" onclick="refreshChannels()">更新</button>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                    <!-- 通常モードのコントロール -->
+                    <div class="channel-view-controls" id="channel-view-controls">
+                        <select id="channel-bondriver-filter" onchange="refreshChannels()">
+                            <option value="">すべてのBonDriver</option>
+                        </select>
+                        <label class="form-check" style="font-size: 13px;">
+                            <input type="checkbox" id="channel-group-filter" onchange="refreshChannels()" checked>
+                            論理チャンネル
+                        </label>
+                        <label class="form-check" style="font-size: 13px;">
+                            <input type="checkbox" id="channel-enabled-filter" onchange="refreshChannels()">
+                            有効のみ
+                        </label>
+                        <button class="btn btn-secondary btn-sm" onclick="refreshChannels()">更新</button>
+                        <button class="btn btn-warning btn-sm" onclick="enterChannelEditMode()">編集モード</button>
+                        <a id="channel-export-btn" class="btn btn-secondary btn-sm" href="/api/channels/export" download="channels.csv">CSVエクスポート</a>
+                        <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin:0;">
+                            CSVインポート
+                            <input type="file" id="channel-import-input" accept=".csv,text/csv" style="display:none" onchange="onChannelImport(this)">
+                        </label>
+                    </div>
+                    <!-- 編集モードのコントロール -->
+                    <div class="channel-edit-controls" id="channel-edit-controls">
+                        <span id="ch-edit-save-msg"></span>
+                        <button class="btn btn-success btn-sm" onclick="addChannelRow()">＋ 行を追加</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveChannelEdits()">保存</button>
+                        <button class="btn btn-secondary btn-sm" onclick="exitChannelEditMode()">キャンセル</button>
+                    </div>
                 </div>
             </div>
             <div class="sort-bar mobile-only">
@@ -835,6 +871,17 @@ const HTML_CONTENT: &str = r#"
                 </form>
             </div>
         </div>
+
+    <!-- Channel CSV Import Result Modal -->
+    <div class="modal" id="channel-import-modal">
+        <div class="modal-content" style="max-width:420px;">
+            <h3>CSVインポート結果</h3>
+            <div id="channel-import-result" style="margin-bottom:15px;"></div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-primary" onclick="closeModal('channel-import-modal')">閉じる</button>
+            </div>
+        </div>
+    </div>
 
     <!-- Channel Edit Modal -->
     <div class="modal" id="channel-modal">
@@ -1424,6 +1471,16 @@ const HTML_CONTENT: &str = r#"
             { key: 'tsid', asc: true },
         ];
 
+        // Channel edit mode state
+        let channelEditMode = false;
+        // {id: {channel_name, priority, is_enabled, deleted}}
+        let channelEdits = {};
+        // [{_tempId, bon_driver_id, nid, sid, tsid, channel_name, priority, is_enabled, bon_space, bon_channel}]
+        let channelNewRows = [];
+        let channelNewRowCounter = 0;
+        // List of BonDrivers for new row selector
+        let bondriverList = [];
+
         // Clients table column visibility
         let clientsColumnVisibility = {};
 
@@ -1573,47 +1630,138 @@ const HTML_CONTENT: &str = r#"
 
         function renderChannels() {
             const tbody = document.getElementById('channels-body');
-            if (channelData.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません</td></tr>';
-                applyResponsiveLabels('channels-table');
-                return;
-            }
 
-            // Sort the data (multi-key)
-            const rules = normalizeChannelSortRules(channelSortRules);
-            const sorted = [...channelData].sort((a, b) => {
-                for (const rule of rules) {
-                    const va = getChannelSortValue(a, rule.key);
-                    const vb = getChannelSortValue(b, rule.key);
-                    const cmp = compareChannelValues(va, vb);
-                    if (cmp !== 0) return rule.asc ? cmp : -cmp;
+            if (!channelEditMode) {
+                // ---- 通常表示モード ----
+                if (channelData.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません</td></tr>';
+                    applyResponsiveLabels('channels-table');
+                    return;
                 }
-                return 0;
-            });
 
-            tbody.innerHTML = sorted.map(c => `
-                <tr>
-                    <td>
-                        <label class="toggle">
-                            <input type="checkbox" ${c.is_enabled ? 'checked' : ''} onchange="toggleChannel(${c.id}, this.checked)">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </td>
-                    <td>${getChannelLogoHtml(c)}${escapeHtml(c.channel_name || c.raw_name || '-')}</td>
-                    <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
-                    <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
-                    <td>${escapeHtml(c.terrestrial_region || '-')}</td>
-                    <td>${escapeHtml(c.network_name || '-')}</td>
-                    <td>${c.tuner_count ? `<span class="badge badge-info" title="${escapeHtml((c.tuner_names || []).join(', '))}">${c.tuner_count}台</span>` : '-'}</td>
-                    <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
-                    <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
-                    <td>${c.priority}</td>
-                    <td>
-                        <button class="btn btn-primary btn-sm" onclick='editChannel(${JSON.stringify(c)})'>編集</button>
-                    </td>
-                </tr>
-            `).join('');
-            applyResponsiveLabels('channels-table');
+                // Sort the data (multi-key)
+                const rules = normalizeChannelSortRules(channelSortRules);
+                const sorted = [...channelData].sort((a, b) => {
+                    for (const rule of rules) {
+                        const va = getChannelSortValue(a, rule.key);
+                        const vb = getChannelSortValue(b, rule.key);
+                        const cmp = compareChannelValues(va, vb);
+                        if (cmp !== 0) return rule.asc ? cmp : -cmp;
+                    }
+                    return 0;
+                });
+
+                tbody.innerHTML = sorted.map(c => `
+                    <tr ondblclick='enterChannelEditMode()'>
+                        <td>
+                            <label class="toggle">
+                                <input type="checkbox" ${c.is_enabled ? 'checked' : ''} onchange="toggleChannel(${c.id}, this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </td>
+                        <td>${getChannelLogoHtml(c)}${escapeHtml(c.channel_name || c.raw_name || '-')}</td>
+                        <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
+                        <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
+                        <td>${escapeHtml(c.terrestrial_region || '-')}</td>
+                        <td>${escapeHtml(c.network_name || '-')}</td>
+                        <td>${c.tuner_count ? `<span class="badge badge-info" title="${escapeHtml((c.tuner_names || []).join(', '))}">${c.tuner_count}台</span>` : '-'}</td>
+                        <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
+                        <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
+                        <td>${c.priority}</td>
+                        <td>
+                            <button class="btn btn-primary btn-sm" onclick='editChannel(${JSON.stringify(c)})'>編集</button>
+                        </td>
+                    </tr>
+                `).join('');
+                applyResponsiveLabels('channels-table');
+            } else {
+                // ---- インライン編集モード ----
+                const rules = normalizeChannelSortRules(channelSortRules);
+                const sorted = [...channelData].sort((a, b) => {
+                    for (const rule of rules) {
+                        const va = getChannelSortValue(a, rule.key);
+                        const vb = getChannelSortValue(b, rule.key);
+                        const cmp = compareChannelValues(va, vb);
+                        if (cmp !== 0) return rule.asc ? cmp : -cmp;
+                    }
+                    return 0;
+                });
+
+                const existingRows = sorted.map(c => {
+                    const edit = channelEdits[c.id] || {};
+                    const isDeleted = edit.deleted === true;
+                    const isModified = !isDeleted && Object.keys(edit).length > 0;
+                    const curName = edit.channel_name !== undefined ? edit.channel_name : (c.channel_name || c.raw_name || '');
+                    const curPriority = edit.priority !== undefined ? edit.priority : c.priority;
+                    const curEnabled = edit.is_enabled !== undefined ? edit.is_enabled : c.is_enabled;
+                    const rowClass = isDeleted ? 'ch-edit-row ch-deleted-row' : isModified ? 'ch-edit-row ch-modified-row' : 'ch-edit-row';
+                    return `
+                        <tr class="${rowClass}" data-ch-id="${c.id}">
+                            <td>
+                                <label class="toggle">
+                                    <input type="checkbox" ${curEnabled ? 'checked' : ''} onchange="onChEditEnabled(${c.id}, this.checked)" ${isDeleted ? 'disabled' : ''}>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </td>
+                            <td><input type="text" value="${escapeHtml(curName)}" placeholder="${escapeHtml(c.raw_name || '')}" oninput="onChEditName(${c.id}, this.value)" ${isDeleted ? 'disabled' : ''}></td>
+                            <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
+                            <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
+                            <td>${escapeHtml(c.terrestrial_region || '-')}</td>
+                            <td>${escapeHtml(c.network_name || '-')}</td>
+                            <td>${c.tuner_count ? `<span class="badge badge-info">${c.tuner_count}台</span>` : '-'}</td>
+                            <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
+                            <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
+                            <td><input type="number" class="priority-input" value="${curPriority}" min="-100" max="100" oninput="onChEditPriority(${c.id}, this.value)" ${isDeleted ? 'disabled' : ''}></td>
+                            <td>
+                                ${isDeleted
+                                    ? `<button class="btn btn-secondary btn-sm" onclick="onChUndoDelete(${c.id})">取消</button>`
+                                    : `<button class="btn btn-danger btn-sm" onclick="onChMarkDelete(${c.id})">削除</button>`
+                                }
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+
+                const bdOptions = bondriverList.map(bd =>
+                    `<option value="${bd.id}">${escapeHtml(bd.driver_name || bd.dll_path)}</option>`
+                ).join('');
+
+                const newRows = channelNewRows.map(row => `
+                    <tr class="ch-edit-row ch-new-row" data-ch-temp="${row._tempId}">
+                        <td>
+                            <label class="toggle">
+                                <input type="checkbox" checked onchange="onChNewEnabled(${row._tempId}, this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </td>
+                        <td><input type="text" placeholder="チャンネル名" value="${escapeHtml(row.channel_name || '')}" oninput="onChNewField(${row._tempId}, 'channel_name', this.value)"></td>
+                        <td>
+                            <div class="ch-new-ids">
+                                <label>NID</label><input type="number" min="0" max="65535" value="${row.nid || ''}" placeholder="NID" oninput="onChNewField(${row._tempId}, 'nid', this.value)">
+                                <label>SID</label><input type="number" min="0" max="65535" value="${row.sid || ''}" placeholder="SID" oninput="onChNewField(${row._tempId}, 'sid', this.value)">
+                                <label>TSID</label><input type="number" min="0" max="65535" value="${row.tsid || ''}" placeholder="TSID" oninput="onChNewField(${row._tempId}, 'tsid', this.value)">
+                            </div>
+                        </td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td><input type="number" min="0" value="${row.bon_space !== undefined ? row.bon_space : ''}" placeholder="Space" oninput="onChNewField(${row._tempId}, 'bon_space', this.value)" style="width:60px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></td>
+                        <td><input type="number" min="0" value="${row.bon_channel !== undefined ? row.bon_channel : ''}" placeholder="Ch" oninput="onChNewField(${row._tempId}, 'bon_channel', this.value)" style="width:60px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></td>
+                        <td><input type="number" class="priority-input" value="${row.priority || 0}" min="-100" max="100" oninput="onChNewField(${row._tempId}, 'priority', this.value)"></td>
+                        <td>
+                            <select onchange="onChNewField(${row._tempId}, 'bon_driver_id', this.value)" style="font-size:11px;padding:3px 4px;max-width:120px;">${bdOptions}</select>
+                            <button class="btn btn-danger btn-sm" style="margin-top:2px;" onclick="removeChannelNewRow(${row._tempId})">削除</button>
+                        </td>
+                    </tr>
+                `).join('');
+
+                tbody.innerHTML = existingRows + newRows;
+                if (tbody.innerHTML.trim() === '') {
+                    tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません。「行を追加」で新規追加できます。</td></tr>';
+                }
+                applyResponsiveLabels('channels-table');
+            }
         }
 
         function sortChannels(key) {
@@ -1749,6 +1897,258 @@ const HTML_CONTENT: &str = r#"
                 const data = await res.json();
                 if (!data.success) alert('エラー: ' + data.error);
             } catch (e) { alert('更新に失敗しました: ' + e.message); }
+        }
+
+        // ============================================================
+        // チャンネル インライン編集モード
+        // ============================================================
+
+        async function enterChannelEditMode() {
+            if (channelEditMode) return;
+            channelEditMode = true;
+            channelEdits = {};
+            channelNewRows = [];
+
+            // BonDriverリストを取得（新規行のセレクタ用）
+            try {
+                const res = await fetch('/api/bondrivers');
+                const data = await res.json();
+                bondriverList = data.success ? (data.bondrivers || []) : [];
+            } catch (_) { bondriverList = []; }
+
+            document.getElementById('channel-view-controls').classList.add('hidden');
+            document.getElementById('channel-edit-controls').classList.add('active');
+            document.getElementById('ch-edit-save-msg').textContent = '';
+            renderChannels();
+        }
+
+        function exitChannelEditMode() {
+            channelEditMode = false;
+            channelEdits = {};
+            channelNewRows = [];
+            document.getElementById('channel-edit-controls').classList.remove('active');
+            document.getElementById('channel-view-controls').classList.remove('hidden');
+            renderChannels();
+        }
+
+        function onChEditName(id, value) {
+            if (!channelEdits[id]) channelEdits[id] = {};
+            channelEdits[id].channel_name = value;
+            markChRowModified(id);
+        }
+
+        function onChEditPriority(id, value) {
+            if (!channelEdits[id]) channelEdits[id] = {};
+            channelEdits[id].priority = parseInt(value, 10) || 0;
+            markChRowModified(id);
+        }
+
+        function onChEditEnabled(id, value) {
+            if (!channelEdits[id]) channelEdits[id] = {};
+            channelEdits[id].is_enabled = value;
+            markChRowModified(id);
+        }
+
+        function onChMarkDelete(id) {
+            if (!channelEdits[id]) channelEdits[id] = {};
+            channelEdits[id].deleted = true;
+            const row = document.querySelector(`tr[data-ch-id="${id}"]`);
+            if (row) {
+                row.classList.remove('ch-modified-row');
+                row.classList.add('ch-deleted-row');
+                row.querySelectorAll('input').forEach(el => el.disabled = true);
+                const btn = row.querySelector('td:last-child button');
+                if (btn) { btn.className = 'btn btn-secondary btn-sm'; btn.textContent = '取消'; btn.onclick = () => onChUndoDelete(id); }
+            }
+        }
+
+        function onChUndoDelete(id) {
+            if (channelEdits[id]) delete channelEdits[id].deleted;
+            if (channelEdits[id] && Object.keys(channelEdits[id]).length === 0) delete channelEdits[id];
+            const row = document.querySelector(`tr[data-ch-id="${id}"]`);
+            if (row) {
+                row.classList.remove('ch-deleted-row');
+                row.querySelectorAll('input').forEach(el => el.disabled = false);
+                const edit = channelEdits[id];
+                row.classList.toggle('ch-modified-row', edit && Object.keys(edit).length > 0);
+                const btn = row.querySelector('td:last-child button');
+                if (btn) { btn.className = 'btn btn-danger btn-sm'; btn.textContent = '削除'; btn.onclick = () => onChMarkDelete(id); }
+            }
+        }
+
+        function markChRowModified(id) {
+            const row = document.querySelector(`tr[data-ch-id="${id}"]`);
+            if (row && !row.classList.contains('ch-deleted-row')) {
+                row.classList.add('ch-modified-row');
+            }
+        }
+
+        function addChannelRow() {
+            const tempId = ++channelNewRowCounter;
+            const defaultBdId = bondriverList.length > 0 ? bondriverList[0].id : null;
+            channelNewRows.push({
+                _tempId: tempId,
+                bon_driver_id: defaultBdId,
+                nid: '', sid: '', tsid: '',
+                channel_name: '',
+                bon_space: '', bon_channel: '',
+                priority: 0,
+                is_enabled: true,
+            });
+            renderChannels();
+            // 最後の行の最初のinputにフォーカス
+            const rows = document.querySelectorAll('tr[data-ch-temp]');
+            if (rows.length > 0) {
+                const lastRow = rows[rows.length - 1];
+                const inp = lastRow.querySelector('input[type="text"]');
+                if (inp) inp.focus();
+            }
+        }
+
+        function removeChannelNewRow(tempId) {
+            channelNewRows = channelNewRows.filter(r => r._tempId !== tempId);
+            renderChannels();
+        }
+
+        function onChNewField(tempId, field, value) {
+            const row = channelNewRows.find(r => r._tempId === tempId);
+            if (!row) return;
+            if (field === 'bon_driver_id' || field === 'nid' || field === 'sid' || field === 'tsid' || field === 'bon_space' || field === 'bon_channel' || field === 'priority') {
+                row[field] = value === '' ? '' : (parseInt(value, 10) || 0);
+            } else {
+                row[field] = value;
+            }
+        }
+
+        function onChNewEnabled(tempId, value) {
+            const row = channelNewRows.find(r => r._tempId === tempId);
+            if (row) row.is_enabled = value;
+        }
+
+        async function saveChannelEdits() {
+            const msgEl = document.getElementById('ch-edit-save-msg');
+            msgEl.textContent = '保存中...';
+            msgEl.style.color = '#666';
+
+            // 1. 既存チャンネルの一括更新
+            const batchItems = Object.entries(channelEdits).map(([id, edit]) => ({
+                id: parseInt(id, 10),
+                channel_name: edit.channel_name,
+                priority: edit.priority,
+                is_enabled: edit.is_enabled,
+                deleted: edit.deleted,
+            }));
+
+            let batchOk = true;
+            if (batchItems.length > 0) {
+                try {
+                    const res = await fetch('/api/channels/batch', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(batchItems),
+                    });
+                    const data = await res.json();
+                    if (!data.success) {
+                        batchOk = false;
+                        msgEl.textContent = 'エラー: ' + data.error;
+                        msgEl.style.color = '#dc3545';
+                        return;
+                    }
+                } catch (e) {
+                    batchOk = false;
+                    msgEl.textContent = '保存に失敗しました: ' + e.message;
+                    msgEl.style.color = '#dc3545';
+                    return;
+                }
+            }
+
+            // 2. 新規チャンネルの作成
+            let newErrors = [];
+            for (const row of channelNewRows) {
+                if (!row.bon_driver_id || row.nid === '' || row.sid === '' || row.tsid === '') {
+                    newErrors.push('新規行: BonDriver・NID・SID・TSIDは必須です');
+                    continue;
+                }
+                try {
+                    const res = await fetch('/api/channel', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            bon_driver_id: parseInt(row.bon_driver_id, 10),
+                            nid: parseInt(row.nid, 10),
+                            sid: parseInt(row.sid, 10),
+                            tsid: parseInt(row.tsid, 10),
+                            channel_name: row.channel_name || null,
+                            bon_space: row.bon_space !== '' ? parseInt(row.bon_space, 10) : null,
+                            bon_channel: row.bon_channel !== '' ? parseInt(row.bon_channel, 10) : null,
+                            priority: parseInt(row.priority, 10) || 0,
+                            is_enabled: row.is_enabled !== false,
+                        }),
+                    });
+                    const data = await res.json();
+                    if (!data.success) newErrors.push(data.error);
+                } catch (e) {
+                    newErrors.push(e.message);
+                }
+            }
+
+            if (newErrors.length > 0) {
+                msgEl.textContent = newErrors.join(' / ');
+                msgEl.style.color = '#dc3545';
+                return;
+            }
+
+            msgEl.textContent = '保存しました';
+            msgEl.style.color = '#28a745';
+            setTimeout(() => exitChannelEditMode(), 600);
+            await refreshChannels();
+        }
+
+        // ============================================================
+        // CSV エクスポート / インポート
+        // ============================================================
+
+        async function onChannelImport(input) {
+            const file = input.files[0];
+            if (!file) return;
+            input.value = ''; // 同じファイルを再選択できるようリセット
+
+            const text = await file.text();
+            const resultEl = document.getElementById('channel-import-result');
+            resultEl.innerHTML = '<p style="color:#666;">インポート中...</p>';
+            openModal('channel-import-modal');
+
+            try {
+                const res = await fetch('/api/channels/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/csv; charset=utf-8' },
+                    body: text,
+                });
+                const data = await res.json();
+
+                let html = '';
+                if (data.inserted !== undefined || data.updated !== undefined) {
+                    html += `<p style="margin-bottom:8px;">`;
+                    html += `<span style="color:#28a745;font-weight:600;">新規登録: ${data.inserted ?? 0} 件</span>　`;
+                    html += `<span style="color:#667eea;font-weight:600;">更新: ${data.updated ?? 0} 件</span>`;
+                    html += `</p>`;
+                }
+                if (data.errors && data.errors.length > 0) {
+                    html += `<p style="color:#dc3545;font-weight:600;margin-bottom:4px;">エラー (${data.errors.length} 件):</p>`;
+                    html += `<ul style="margin:0;padding-left:18px;font-size:12px;color:#dc3545;">`;
+                    data.errors.forEach(e => { html += `<li>${escapeHtml(e)}</li>`; });
+                    html += `</ul>`;
+                } else if (!data.success) {
+                    html += `<p style="color:#dc3545;">${escapeHtml(data.error || 'エラーが発生しました')}</p>`;
+                }
+                resultEl.innerHTML = html || '<p style="color:#28a745;">完了しました</p>';
+
+                if ((data.inserted ?? 0) + (data.updated ?? 0) > 0) {
+                    await refreshChannels();
+                }
+            } catch (e) {
+                resultEl.innerHTML = `<p style="color:#dc3545;">通信エラー: ${escapeHtml(e.message)}</p>`;
+            }
         }
 
         function editChannel(c) {

@@ -54,6 +54,34 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Get channel by primary key (id).
+    pub fn get_channel_by_id(&self, id: i64) -> Result<Option<ChannelRecord>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM channels WHERE id = ?1")?;
+        match stmt.query_row([id], Self::row_to_channel_record) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get all channels with BonDriver path (for export).
+    pub fn get_all_channels_for_export(&self) -> Result<Vec<(ChannelRecord, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.*, bd.dll_path
+             FROM channels c
+             LEFT JOIN bon_drivers bd ON c.bon_driver_id = bd.id
+             ORDER BY c.bon_driver_id, c.nid, c.tsid, c.sid",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let ch = Self::row_to_channel_record(row)?;
+                let dll: Option<String> = row.get("dll_path").ok();
+                Ok((ch, dll))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Get channel by unique key (bon_driver_id, nid, sid, tsid, manual_sheet).
     pub fn get_channel_by_key(
         &self,
@@ -158,6 +186,21 @@ impl Database {
         };
 
         Ok(records)
+    }
+
+    /// Get all distinct SIDs for a given NID+TSID combination.
+    pub fn get_sids_for_nid_tsid(&self, nid: u16, tsid: u16) -> Result<Vec<u16>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT sid FROM channels
+             WHERE nid = ?1 AND tsid = ?2 AND is_enabled = 1
+             ORDER BY sid ASC",
+        )?;
+        let rows = stmt.query_map(params![nid as i32, tsid as i32], |row| {
+            let sid: i32 = row.get(0)?;
+            Ok(sid as u16)
+        })?;
+        let sids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(sids)
     }
 
     /// Get channel by physical specification (tuner + space + channel).

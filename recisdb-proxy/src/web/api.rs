@@ -854,6 +854,403 @@ pub async fn delete_channel(
 }
 
 // ============================================================================
+// CSV helpers
+// ============================================================================
+
+/// RFC 4180 準拠の単純なCSVフィールドエスケープ。
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// RFC 4180 CSVを行・フィールドのVec<Vec<String>>に変換する。
+fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    loop {
+        let mut row = Vec::new();
+        loop {
+            // フィールド開始
+            if chars.peek() == Some(&'"') {
+                // quoted field
+                chars.next(); // consume opening quote
+                let mut field = String::new();
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('"') => {
+                            if chars.peek() == Some(&'"') {
+                                chars.next();
+                                field.push('"');
+                            } else {
+                                break; // closing quote
+                            }
+                        }
+                        Some(c) => field.push(c),
+                    }
+                }
+                row.push(field);
+            } else {
+                // unquoted field
+                let mut field = String::new();
+                loop {
+                    match chars.peek() {
+                        None | Some(&',') | Some(&'\n') | Some(&'\r') => break,
+                        Some(_) => field.push(chars.next().unwrap()),
+                    }
+                }
+                row.push(field);
+            }
+            // セパレータ or 行末
+            match chars.peek() {
+                Some(&',') => { chars.next(); }
+                Some(&'\r') => {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') { chars.next(); }
+                    break;
+                }
+                Some(&'\n') => { chars.next(); break; }
+                None => break,
+                _ => break,
+            }
+        }
+        if row.iter().all(|f| f.is_empty()) && chars.peek().is_none() {
+            break;
+        }
+        rows.push(row);
+        if chars.peek().is_none() { break; }
+    }
+    rows
+}
+
+/// Export channels as CSV.
+pub async fn export_channels(
+    State(web_state): State<Arc<WebState>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    let rows = match db.get_all_channels_for_export() {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(CONTENT_TYPE, "text/plain")],
+                format!("error: {}", e),
+            ).into_response();
+        }
+    };
+
+    let header = "id,bon_driver_id,nid,sid,tsid,channel_name,network_name,bon_space,bon_channel,band_type,terrestrial_region,priority,is_enabled\r\n";
+    let mut csv = header.to_string();
+
+    for (ch, _dll) in &rows {
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
+            ch.id,
+            ch.bon_driver_id,
+            ch.nid,
+            ch.sid,
+            ch.tsid,
+            csv_field(ch.channel_name.as_deref().unwrap_or("")),
+            csv_field(ch.network_name.as_deref().unwrap_or("")),
+            ch.bon_space.map_or(String::new(), |v| v.to_string()),
+            ch.bon_channel.map_or(String::new(), |v| v.to_string()),
+            ch.band_type.map_or(String::new(), |v| v.to_string()),
+            csv_field(ch.terrestrial_region.as_deref().unwrap_or("")),
+            ch.priority,
+            if ch.is_enabled { "true" } else { "false" },
+        );
+        csv.push_str(&line);
+    }
+
+    use axum::http::header::{CONTENT_DISPOSITION, HeaderValue};
+    let mut resp = axum::response::Response::new(axum::body::Body::from(csv));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
+    resp.headers_mut().insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"channels.csv\""));
+    resp.into_response()
+}
+
+/// Import result summary.
+#[derive(Debug, Serialize)]
+pub struct ImportResult {
+    pub inserted: usize,
+    pub updated: usize,
+    pub errors: Vec<String>,
+}
+
+/// Import channels from CSV body (text/csv).
+pub async fn import_channels(
+    State(web_state): State<Arc<WebState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use recisdb_protocol::ChannelInfo;
+
+    let text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            return Json(json!({
+                "success": false,
+                "error": "invalid UTF-8"
+            }));
+        }
+    };
+
+    let all_rows = parse_csv_rows(text);
+    if all_rows.is_empty() {
+        return Json(json!({ "success": false, "error": "empty CSV" }));
+    }
+
+    // ヘッダー行からカラムインデックスを取得
+    let headers: Vec<String> = all_rows[0].iter().map(|s| s.trim().to_lowercase()).collect();
+    let col = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
+
+    let col_id            = col("id");
+    let col_bon_driver_id = col("bon_driver_id");
+    let col_nid           = col("nid");
+    let col_sid           = col("sid");
+    let col_tsid          = col("tsid");
+    let col_channel_name  = col("channel_name");
+    let col_bon_space     = col("bon_space");
+    let col_bon_channel   = col("bon_channel");
+    let col_priority      = col("priority");
+    let col_is_enabled    = col("is_enabled");
+
+    // nid/sid/tsid は必須
+    let (col_nid, col_sid, col_tsid) = match (col_nid, col_sid, col_tsid) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return Json(json!({ "success": false, "error": "CSVにnid/sid/tsidカラムが必要です" })),
+    };
+
+    let db = web_state.database.lock().await;
+
+    let mut inserted = 0usize;
+    let mut updated  = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    let get_field = |row: &Vec<String>, idx: Option<usize>| -> Option<String> {
+        idx.and_then(|i| row.get(i)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+
+    for (line_no, row) in all_rows.iter().skip(1).enumerate() {
+        let line_no = line_no + 2; // 1-indexed, skip header
+
+        // nid / sid / tsid をパース
+        let nid = match get_field(row, Some(col_nid)).and_then(|s| s.parse::<u16>().ok()) {
+            Some(v) => v,
+            None => { errors.push(format!("行{}: nidが不正", line_no)); continue; }
+        };
+        let sid = match get_field(row, Some(col_sid)).and_then(|s| s.parse::<u16>().ok()) {
+            Some(v) => v,
+            None => { errors.push(format!("行{}: sidが不正", line_no)); continue; }
+        };
+        let tsid = match get_field(row, Some(col_tsid)).and_then(|s| s.parse::<u16>().ok()) {
+            Some(v) => v,
+            None => { errors.push(format!("行{}: tsidが不正", line_no)); continue; }
+        };
+
+        let channel_name = get_field(row, col_channel_name);
+        let bon_space    = get_field(row, col_bon_space).and_then(|s| s.parse::<u32>().ok());
+        let bon_channel  = get_field(row, col_bon_channel).and_then(|s| s.parse::<u32>().ok());
+        let priority     = get_field(row, col_priority).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        let is_enabled   = get_field(row, col_is_enabled)
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(true);
+
+        // キー照合: まず id で検索、次に (bon_driver_id, nid, sid, tsid) で検索
+        let existing_id: Option<i64> = {
+            let id_val = get_field(row, col_id).and_then(|s| s.parse::<i64>().ok());
+            if let Some(id) = id_val {
+                match db.get_channel_by_id(id) {
+                    Ok(Some(ch)) => Some(ch.id),
+                    Ok(None) => {
+                        // IDが指定されているが存在しない → 自然キーで再検索
+                        let bon_drv = get_field(row, col_bon_driver_id)
+                            .and_then(|s| s.parse::<i64>().ok());
+                        if let Some(bd_id) = bon_drv {
+                            db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
+                        } else { None }
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                // id 未指定 → 自然キーで検索
+                let bon_drv = get_field(row, col_bon_driver_id)
+                    .and_then(|s| s.parse::<i64>().ok());
+                if let Some(bd_id) = bon_drv {
+                    db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
+                } else { None }
+            }
+        };
+
+        if let Some(ch_id) = existing_id {
+            // Update
+            if let Err(e) = db.update_channel_fields(
+                ch_id,
+                channel_name.as_deref(),
+                Some(priority),
+                Some(is_enabled),
+            ) {
+                errors.push(format!("行{}: 更新失敗 ({})", line_no, e));
+            } else {
+                updated += 1;
+            }
+        } else {
+            // Insert — bon_driver_id 必須
+            let bon_drv = match get_field(row, col_bon_driver_id)
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(v) => v,
+                None => {
+                    errors.push(format!("行{}: 新規登録にはbon_driver_idが必要です", line_no));
+                    continue;
+                }
+            };
+            let info = ChannelInfo {
+                nid, sid, tsid,
+                manual_sheet: None,
+                raw_name: None,
+                channel_name: channel_name.clone(),
+                physical_ch: None,
+                remote_control_key: None,
+                service_type: None,
+                network_name: None,
+                bon_space,
+                bon_channel,
+                band_type: None,
+                terrestrial_region: None,
+            };
+            match db.insert_channel(bon_drv, &info) {
+                Ok(new_id) => {
+                    let _ = db.update_channel_fields(new_id, None, Some(priority), Some(is_enabled));
+                    inserted += 1;
+                }
+                Err(e) => errors.push(format!("行{}: 挿入失敗 ({})", line_no, e)),
+            }
+        }
+    }
+
+    Json(json!({
+        "success": errors.is_empty() || inserted + updated > 0,
+        "inserted": inserted,
+        "updated": updated,
+        "errors": errors
+    }))
+}
+
+/// Create channel request.
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    pub bon_driver_id: i64,
+    pub nid: u16,
+    pub sid: u16,
+    pub tsid: u16,
+    pub channel_name: Option<String>,
+    pub bon_space: Option<u32>,
+    pub bon_channel: Option<u32>,
+    pub priority: Option<i32>,
+    pub is_enabled: Option<bool>,
+}
+
+/// Create a new channel manually.
+pub async fn create_channel(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<CreateChannelRequest>,
+) -> impl IntoResponse {
+    use recisdb_protocol::ChannelInfo;
+
+    let db = web_state.database.lock().await;
+
+    let info = ChannelInfo {
+        nid: payload.nid,
+        sid: payload.sid,
+        tsid: payload.tsid,
+        manual_sheet: None,
+        raw_name: None,
+        channel_name: payload.channel_name,
+        physical_ch: None,
+        remote_control_key: None,
+        service_type: None,
+        network_name: None,
+        bon_space: payload.bon_space,
+        bon_channel: payload.bon_channel,
+        band_type: None,
+        terrestrial_region: None,
+    };
+
+    match db.insert_channel(payload.bon_driver_id, &info) {
+        Ok(id) => {
+            let priority = payload.priority.unwrap_or(0);
+            let is_enabled = payload.is_enabled.unwrap_or(true);
+            let _ = db.update_channel_fields(id, None, Some(priority), Some(is_enabled));
+            Json(json!({
+                "success": true,
+                "id": id,
+                "message": "Channel created successfully"
+            }))
+        }
+        Err(e) => {
+            Json(json!({
+                "success": false,
+                "error": e.to_string()
+            }))
+        }
+    }
+}
+
+/// Batch update item.
+#[derive(Debug, Deserialize)]
+pub struct BatchUpdateItem {
+    pub id: i64,
+    pub channel_name: Option<String>,
+    pub priority: Option<i32>,
+    pub is_enabled: Option<bool>,
+    pub deleted: Option<bool>,
+}
+
+/// Batch update channels (update multiple channels at once).
+pub async fn batch_update_channels(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<Vec<BatchUpdateItem>>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    let mut errors = Vec::new();
+
+    for item in &payload {
+        if item.deleted.unwrap_or(false) {
+            if let Err(e) = db.delete_channel(item.id) {
+                errors.push(format!("id={}: {}", item.id, e));
+            }
+        } else if item.channel_name.is_some() || item.priority.is_some() || item.is_enabled.is_some() {
+            if let Err(e) = db.update_channel_fields(
+                item.id,
+                item.channel_name.as_deref(),
+                item.priority,
+                item.is_enabled,
+            ) {
+                errors.push(format!("id={}: {}", item.id, e));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Json(json!({
+            "success": true,
+            "message": format!("{} 件を更新しました", payload.len())
+        }))
+    } else {
+        Json(json!({
+            "success": false,
+            "error": errors.join("; ")
+        }))
+    }
+}
+
+// ============================================================================
 // Scan history endpoints
 // ============================================================================
 

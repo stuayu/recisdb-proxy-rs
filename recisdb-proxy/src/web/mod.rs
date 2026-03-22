@@ -60,6 +60,10 @@ pub async fn start_web_server(
         .route("/api/bondrivers/ranking", get(api::get_bondrivers_ranking))
         // Channel API
         .route("/api/channels", get(api::get_channels))
+        .route("/api/channels/export", get(api::export_channels))
+        .route("/api/channels/import", post(api::import_channels))
+        .route("/api/channels/batch", post(api::batch_update_channels))
+        .route("/api/channel", post(api::create_channel))
         .route("/api/channel/:id", post(api::update_channel))
         .route("/api/channel/:id/toggle", post(api::toggle_channel))
         .route("/api/channel/:id", delete(api::delete_channel))

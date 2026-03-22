@@ -226,6 +226,11 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .or_else(|| section.get("CACertPath"))
         .cloned();
 
+    let single_service = section
+        .get("ServiceFilter")
+        .map(|s| s.to_lowercase() == "single")
+        .unwrap_or(false);
+
     debug!("Configuration loaded: server={}, tuner={}", server_addr, tuner_path);
 
     Some(ConnectionConfig {
@@ -239,6 +244,7 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         tls_enabled,
         #[cfg(feature = "tls")]
         tls_ca_cert,
+        single_service,
     })
 }
 
@@ -289,6 +295,9 @@ fn load_from_env() -> ConnectionConfig {
             .unwrap_or(false),
         #[cfg(feature = "tls")]
         tls_ca_cert: std::env::var("BONDRIVER_PROXY_CA_CERT").ok(),
+        single_service: std::env::var("BONDRIVER_PROXY_SERVICE_FILTER")
+            .map(|s| s.to_lowercase() == "single")
+            .unwrap_or(false),
     }
 }
 

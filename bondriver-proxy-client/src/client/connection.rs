@@ -57,6 +57,10 @@ pub struct ConnectionConfig {
     /// Path to CA certificate for TLS verification.
     #[cfg(feature = "tls")]
     pub tls_ca_cert: Option<String>,
+    /// Single-service filter mode.
+    /// When true, the server sends only the selected service's TS packets
+    /// instead of the entire transport stream.
+    pub single_service: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -72,6 +76,7 @@ impl Default for ConnectionConfig {
             tls_enabled: false,
             #[cfg(feature = "tls")]
             tls_ca_cert: None,
+            single_service: false,
         }
     }
 }
@@ -217,6 +222,21 @@ impl Connection {
             error!("Handshake failed");
             *self.state.lock() = ConnectionState::Error;
             return false;
+        }
+
+        // Send service filter preference if single-service mode is enabled
+        if self.config.single_service {
+            file_log!(info, "connect: Sending SetServiceFilter (single_service=true)");
+            let resp = self.send_request(ClientMessage::SetServiceFilter { single_service: true });
+            match resp {
+                Some(ServerMessage::SetServiceFilterAck { success }) if success => {
+                    file_log!(info, "connect: Service filter set to single-service mode");
+                }
+                _ => {
+                    file_log!(warn, "connect: Server did not accept SetServiceFilter, continuing with all-service mode");
+                    warn!("Server did not accept SetServiceFilter, continuing with all-service mode");
+                }
+            }
         }
 
         file_log!(info, "connect: Connected successfully");

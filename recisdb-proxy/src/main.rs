@@ -10,17 +10,13 @@ use clap::Parser;
 use std::sync::Arc;
 use log::{info, warn, error};
 
-mod bondriver;
-mod database;
-mod logging;
-mod metrics;
-mod alert;
-mod scheduler;
-mod server;
-mod ts_analyzer;
-mod tuner;
-mod aribb24;
-mod web;
+use recisdb_proxy::database;
+use recisdb_proxy::logging;
+use recisdb_proxy::alert;
+use recisdb_proxy::scheduler;
+use recisdb_proxy::server;
+use recisdb_proxy::tuner;
+use recisdb_proxy::web;
 
 use scheduler::{ScanScheduler, scan_scheduler::ScanSchedulerConfig};
 

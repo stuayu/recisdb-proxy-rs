@@ -193,6 +193,10 @@ pub enum MessageType {
     GetChannelList = 0x0502,
     /// Get channel list response.
     GetChannelListAck = 0x0503,
+    /// Set service filter mode.
+    SetServiceFilter = 0x0504,
+    /// Set service filter mode response.
+    SetServiceFilterAck = 0x0505,
 
     // Misc (0xFFxx)
     /// Error response.
@@ -237,6 +241,8 @@ impl TryFrom<u16> for MessageType {
             0x0501 => Ok(MessageType::SelectLogicalChannelAck),
             0x0502 => Ok(MessageType::GetChannelList),
             0x0503 => Ok(MessageType::GetChannelListAck),
+            0x0504 => Ok(MessageType::SetServiceFilter),
+            0x0505 => Ok(MessageType::SetServiceFilterAck),
             0xFF00 => Ok(MessageType::Error),
             0xFF01 => Ok(MessageType::Ping),
             0xFF02 => Ok(MessageType::Pong),
@@ -304,6 +310,12 @@ pub enum ClientMessage {
     GetChannelList {
         filter: Option<ChannelFilter>,
     },
+    /// Set service filter mode.
+    /// When single_service is true, the server will filter TS packets to only
+    /// include the selected service's SID (determined from the tuned channel).
+    SetServiceFilter {
+        single_service: bool,
+    },
 }
 
 /// Messages sent from server to client.
@@ -357,6 +369,8 @@ pub enum ServerMessage {
         /// Timestamp for incremental sync.
         timestamp: i64,
     },
+    /// Set service filter mode response.
+    SetServiceFilterAck { success: bool },
     /// Error response.
     Error { error_code: u16, message: String },
 }
@@ -382,6 +396,7 @@ impl ClientMessage {
             ClientMessage::SetLnbPower { .. } => MessageType::SetLnbPower,
             ClientMessage::SelectLogicalChannel { .. } => MessageType::SelectLogicalChannel,
             ClientMessage::GetChannelList { .. } => MessageType::GetChannelList,
+            ClientMessage::SetServiceFilter { .. } => MessageType::SetServiceFilter,
         }
     }
 }
@@ -406,6 +421,7 @@ impl ServerMessage {
             ServerMessage::SetLnbPowerAck { .. } => MessageType::SetLnbPowerAck,
             ServerMessage::SelectLogicalChannelAck { .. } => MessageType::SelectLogicalChannelAck,
             ServerMessage::GetChannelListAck { .. } => MessageType::GetChannelListAck,
+            ServerMessage::SetServiceFilterAck { .. } => MessageType::SetServiceFilterAck,
             ServerMessage::Error { .. } => MessageType::Error,
         }
     }
