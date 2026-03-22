@@ -760,6 +760,14 @@ pub struct UpdateChannelRequest {
     pub channel_name: Option<String>,
     pub priority: Option<i32>,
     pub is_enabled: Option<bool>,
+    // Extended fields
+    pub bon_driver_id: Option<i64>,
+    pub nid: Option<u16>,
+    pub sid: Option<u16>,
+    pub tsid: Option<u16>,
+    /// null = clear, number = set
+    pub bon_space: Option<Option<u32>>,
+    pub bon_channel: Option<Option<u32>>,
 }
 
 /// Update channel.
@@ -770,31 +778,34 @@ pub async fn update_channel(
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    if payload.channel_name.is_none() && payload.priority.is_none() && payload.is_enabled.is_none() {
-        return Json(json!({
-            "success": false,
-            "error": "No fields to update"
-        }));
+    let has_any = payload.channel_name.is_some()
+        || payload.priority.is_some()
+        || payload.is_enabled.is_some()
+        || payload.bon_driver_id.is_some()
+        || payload.nid.is_some()
+        || payload.sid.is_some()
+        || payload.tsid.is_some()
+        || payload.bon_space.is_some()
+        || payload.bon_channel.is_some();
+
+    if !has_any {
+        return Json(json!({ "success": false, "error": "No fields to update" }));
     }
 
-    match db.update_channel_fields(
+    match db.update_channel_full(
         id,
         payload.channel_name.as_deref(),
         payload.priority,
         payload.is_enabled,
+        payload.bon_driver_id,
+        payload.nid,
+        payload.sid,
+        payload.tsid,
+        payload.bon_space,
+        payload.bon_channel,
     ) {
-        Ok(_) => {
-            Json(json!({
-                "success": true,
-                "message": "Channel updated successfully"
-            }))
-        }
-        Err(e) => {
-            Json(json!({
-                "success": false,
-                "error": e.to_string()
-            }))
-        }
+        Ok(_) => Json(json!({ "success": true, "message": "Channel updated successfully" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
     }
 }
 
@@ -1210,6 +1221,13 @@ pub struct BatchUpdateItem {
     pub priority: Option<i32>,
     pub is_enabled: Option<bool>,
     pub deleted: Option<bool>,
+    // Extended fields
+    pub bon_driver_id: Option<i64>,
+    pub nid: Option<u16>,
+    pub sid: Option<u16>,
+    pub tsid: Option<u16>,
+    pub bon_space: Option<Option<u32>>,
+    pub bon_channel: Option<Option<u32>>,
 }
 
 /// Batch update channels (update multiple channels at once).
@@ -1225,14 +1243,31 @@ pub async fn batch_update_channels(
             if let Err(e) = db.delete_channel(item.id) {
                 errors.push(format!("id={}: {}", item.id, e));
             }
-        } else if item.channel_name.is_some() || item.priority.is_some() || item.is_enabled.is_some() {
-            if let Err(e) = db.update_channel_fields(
-                item.id,
-                item.channel_name.as_deref(),
-                item.priority,
-                item.is_enabled,
-            ) {
-                errors.push(format!("id={}: {}", item.id, e));
+        } else {
+            let has_any = item.channel_name.is_some()
+                || item.priority.is_some()
+                || item.is_enabled.is_some()
+                || item.bon_driver_id.is_some()
+                || item.nid.is_some()
+                || item.sid.is_some()
+                || item.tsid.is_some()
+                || item.bon_space.is_some()
+                || item.bon_channel.is_some();
+            if has_any {
+                if let Err(e) = db.update_channel_full(
+                    item.id,
+                    item.channel_name.as_deref(),
+                    item.priority,
+                    item.is_enabled,
+                    item.bon_driver_id,
+                    item.nid,
+                    item.sid,
+                    item.tsid,
+                    item.bon_space,
+                    item.bon_channel,
+                ) {
+                    errors.push(format!("id={}: {}", item.id, e));
+                }
             }
         }
     }

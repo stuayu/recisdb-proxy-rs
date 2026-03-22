@@ -416,6 +416,24 @@ impl Database {
         priority: Option<i32>,
         is_enabled: Option<bool>,
     ) -> Result<()> {
+        self.update_channel_full(channel_id, channel_name, priority, is_enabled, None, None, None, None, None, None)
+    }
+
+    /// Update all editable channel fields (full update used by GUI).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_channel_full(
+        &self,
+        channel_id: i64,
+        channel_name: Option<&str>,
+        priority: Option<i32>,
+        is_enabled: Option<bool>,
+        bon_driver_id: Option<i64>,
+        nid: Option<u16>,
+        sid: Option<u16>,
+        tsid: Option<u16>,
+        bon_space: Option<Option<u32>>,
+        bon_channel: Option<Option<u32>>,
+    ) -> Result<()> {
         let mut updates = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -430,6 +448,30 @@ impl Database {
         if let Some(e) = is_enabled {
             updates.push("is_enabled = ?");
             values.push(Box::new(if e { 1 } else { 0 }));
+        }
+        if let Some(bd) = bon_driver_id {
+            updates.push("bon_driver_id = ?");
+            values.push(Box::new(bd));
+        }
+        if let Some(v) = nid {
+            updates.push("nid = ?");
+            values.push(Box::new(v as i32));
+        }
+        if let Some(v) = sid {
+            updates.push("sid = ?");
+            values.push(Box::new(v as i32));
+        }
+        if let Some(v) = tsid {
+            updates.push("tsid = ?");
+            values.push(Box::new(v as i32));
+        }
+        if let Some(v) = bon_space {
+            updates.push("bon_space = ?");
+            values.push(Box::new(v.map(|x| x as i32)));
+        }
+        if let Some(v) = bon_channel {
+            updates.push("bon_channel = ?");
+            values.push(Box::new(v.map(|x| x as i32)));
         }
 
         if updates.is_empty() {

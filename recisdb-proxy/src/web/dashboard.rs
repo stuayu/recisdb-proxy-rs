@@ -1691,27 +1691,50 @@ const HTML_CONTENT: &str = r#"
                     const edit = channelEdits[c.id] || {};
                     const isDeleted = edit.deleted === true;
                     const isModified = !isDeleted && Object.keys(edit).length > 0;
-                    const curName = edit.channel_name !== undefined ? edit.channel_name : (c.channel_name || c.raw_name || '');
-                    const curPriority = edit.priority !== undefined ? edit.priority : c.priority;
-                    const curEnabled = edit.is_enabled !== undefined ? edit.is_enabled : c.is_enabled;
+                    const dis = isDeleted ? 'disabled' : '';
+                    const curName     = edit.channel_name  !== undefined ? edit.channel_name  : (c.channel_name || c.raw_name || '');
+                    const curPriority = edit.priority       !== undefined ? edit.priority       : c.priority;
+                    const curEnabled  = edit.is_enabled     !== undefined ? edit.is_enabled     : c.is_enabled;
+                    const curNid      = edit.nid            !== undefined ? edit.nid            : c.nid;
+                    const curSid      = edit.sid            !== undefined ? edit.sid            : c.sid;
+                    const curTsid     = edit.tsid           !== undefined ? edit.tsid           : c.tsid;
+                    const curBdId     = edit.bon_driver_id  !== undefined ? edit.bon_driver_id  : c.bon_driver_id;
+                    const curSpace    = edit.bon_space      !== undefined ? edit.bon_space      : (c.bon_space  ?? '');
+                    const curCh       = edit.bon_channel    !== undefined ? edit.bon_channel    : (c.bon_channel ?? '');
                     const rowClass = isDeleted ? 'ch-edit-row ch-deleted-row' : isModified ? 'ch-edit-row ch-modified-row' : 'ch-edit-row';
+
+                    const bdOpts = bondriverList.map(bd =>
+                        `<option value="${bd.id}" ${bd.id == curBdId ? 'selected' : ''}>${escapeHtml(bd.driver_name || bd.dll_path)}</option>`
+                    ).join('');
+
                     return `
                         <tr class="${rowClass}" data-ch-id="${c.id}">
                             <td>
                                 <label class="toggle">
-                                    <input type="checkbox" ${curEnabled ? 'checked' : ''} onchange="onChEditEnabled(${c.id}, this.checked)" ${isDeleted ? 'disabled' : ''}>
+                                    <input type="checkbox" ${curEnabled ? 'checked' : ''} onchange="onChEditField(${c.id},'is_enabled',this.checked)" ${dis}>
                                     <span class="toggle-slider"></span>
                                 </label>
                             </td>
-                            <td><input type="text" value="${escapeHtml(curName)}" placeholder="${escapeHtml(c.raw_name || '')}" oninput="onChEditName(${c.id}, this.value)" ${isDeleted ? 'disabled' : ''}></td>
-                            <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
+                            <td><input type="text" value="${escapeHtml(curName)}" placeholder="${escapeHtml(c.raw_name || '')}" oninput="onChEditField(${c.id},'channel_name',this.value)" ${dis}></td>
+                            <td>
+                                <div class="ch-new-ids">
+                                    <label>NID</label><input type="number" min="0" max="65535" value="${curNid}" oninput="onChEditField(${c.id},'nid',+this.value)" ${dis}>
+                                    <label>SID</label><input type="number" min="0" max="65535" value="${curSid}" oninput="onChEditField(${c.id},'sid',+this.value)" ${dis}>
+                                    <label>TSID</label><input type="number" min="0" max="65535" value="${curTsid}" oninput="onChEditField(${c.id},'tsid',+this.value)" ${dis}>
+                                </div>
+                            </td>
                             <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
                             <td>${escapeHtml(c.terrestrial_region || '-')}</td>
                             <td>${escapeHtml(c.network_name || '-')}</td>
-                            <td>${c.tuner_count ? `<span class="badge badge-info">${c.tuner_count}台</span>` : '-'}</td>
-                            <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
-                            <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
-                            <td><input type="number" class="priority-input" value="${curPriority}" min="-100" max="100" oninput="onChEditPriority(${c.id}, this.value)" ${isDeleted ? 'disabled' : ''}></td>
+                            <td>
+                                ${bondriverList.length > 0
+                                    ? `<select onchange="onChEditField(${c.id},'bon_driver_id',+this.value)" ${dis} style="font-size:11px;padding:3px 4px;max-width:130px;">${bdOpts}</select>`
+                                    : (c.tuner_count ? `<span class="badge badge-info">${c.tuner_count}台</span>` : '-')
+                                }
+                            </td>
+                            <td><input type="number" min="0" value="${curSpace}" placeholder="-" oninput="onChEditField(${c.id},'bon_space',this.value===''?null:+this.value)" ${dis} style="width:60px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></td>
+                            <td><input type="number" min="0" value="${curCh}" placeholder="-" oninput="onChEditField(${c.id},'bon_channel',this.value===''?null:+this.value)" ${dis} style="width:60px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></td>
+                            <td><input type="number" class="priority-input" value="${curPriority}" min="-100" max="100" oninput="onChEditField(${c.id},'priority',+this.value)" ${dis}></td>
                             <td>
                                 ${isDeleted
                                     ? `<button class="btn btn-secondary btn-sm" onclick="onChUndoDelete(${c.id})">取消</button>`
@@ -1931,21 +1954,9 @@ const HTML_CONTENT: &str = r#"
             renderChannels();
         }
 
-        function onChEditName(id, value) {
+        function onChEditField(id, field, value) {
             if (!channelEdits[id]) channelEdits[id] = {};
-            channelEdits[id].channel_name = value;
-            markChRowModified(id);
-        }
-
-        function onChEditPriority(id, value) {
-            if (!channelEdits[id]) channelEdits[id] = {};
-            channelEdits[id].priority = parseInt(value, 10) || 0;
-            markChRowModified(id);
-        }
-
-        function onChEditEnabled(id, value) {
-            if (!channelEdits[id]) channelEdits[id] = {};
-            channelEdits[id].is_enabled = value;
+            channelEdits[id][field] = value;
             markChRowModified(id);
         }
 
@@ -2037,6 +2048,12 @@ const HTML_CONTENT: &str = r#"
                 priority: edit.priority,
                 is_enabled: edit.is_enabled,
                 deleted: edit.deleted,
+                bon_driver_id: edit.bon_driver_id,
+                nid: edit.nid,
+                sid: edit.sid,
+                tsid: edit.tsid,
+                bon_space: edit.bon_space,
+                bon_channel: edit.bon_channel,
             }));
 
             let batchOk = true;
