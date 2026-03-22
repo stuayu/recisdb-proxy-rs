@@ -4,7 +4,7 @@
 //! PCに接続されているチューナーを自動検出し、BonDriverの設定を行います。
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use recisdb_proxy::database::Database;
 
