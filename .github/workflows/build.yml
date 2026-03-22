@@ -27,13 +27,13 @@ jobs:
         run: choco install llvm -y --force
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Setup Windows SDK
         uses: fbactions/setup-winsdk@v2
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -79,7 +79,7 @@ jobs:
           Get-ChildItem $outDir
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: recisdb-${{ matrix.label }}
           path: artifacts-${{ matrix.label }}/
@@ -106,7 +106,7 @@ jobs:
             libpcsclite-dev libudev-dev libdvbv5-dev
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -134,7 +134,7 @@ jobs:
           ls -la "$OUT_DIR"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: recisdb-${{ matrix.label }}
           path: artifacts-${{ matrix.label }}/
