@@ -150,15 +150,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-26-intel
             label: macos-amd64
-          - runner: macos-latest
+          - runner: macos-26
             label: macos-arm64
 
     steps:
       - name: Install dependencies
         run: |
-          brew install pcsclite pkg-config cmake ninja
+          brew install pcsc-lite pkg-config cmake ninja
 
       - name: Checkout repository
         uses: actions/checkout@v6
