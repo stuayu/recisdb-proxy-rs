@@ -55,18 +55,8 @@ jobs:
           $outDir = "artifacts-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path $outDir
 
-          # Copy executables
-          if (Test-Path "$targetDir/recisdb.exe") {
-            Copy-Item "$targetDir/recisdb.exe" "$outDir/"
-          }
-          if (Test-Path "$targetDir/recisdb-proxy.exe") {
-            Copy-Item "$targetDir/recisdb-proxy.exe" "$outDir/"
-          }
-
-          # Copy DLLs (BonDriver_NetworkProxy)
-          if (Test-Path "$targetDir/BonDriver_NetworkProxy.dll") {
-            Copy-Item "$targetDir/BonDriver_NetworkProxy.dll" "$outDir/"
-          }
+          # Copy ALL
+          Copy-Item -Recurse "$targetDir/" "$outDir/"
 
           # Copy sample config if exists
           if (Test-Path "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample") {
@@ -124,16 +114,13 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy executables
-          [ -f "$TARGET_DIR/recisdb" ] && cp "$TARGET_DIR/recisdb" "$OUT_DIR/"
-          [ -f "$TARGET_DIR/recisdb-proxy" ] && cp "$TARGET_DIR/recisdb-proxy" "$OUT_DIR/"
-
-          # Copy shared library (BonDriver_NetworkProxy client .so)
-          [ -f "$TARGET_DIR/libBonDriver_NetworkProxy.so" ] && cp "$TARGET_DIR/libBonDriver_NetworkProxy.so" "$OUT_DIR/BonDriver_NetworkProxy.so"
+          # Copy ALL
+          cp -r "$TARGET_DIR/." "$OUT_DIR/"
 
           # Copy sample configs
           [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
           [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
+          [ -f "recisdb-proxy/recisdb-proxy-rs.service" ] && cp "recisdb-proxy/recisdb-proxy-rs.service" "$OUT_DIR/"
 
           ls -la "$OUT_DIR"
 
@@ -179,12 +166,8 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy executables
-          [ -f "$TARGET_DIR/recisdb" ] && cp "$TARGET_DIR/recisdb" "$OUT_DIR/"
-          [ -f "$TARGET_DIR/recisdb-proxy" ] && cp "$TARGET_DIR/recisdb-proxy" "$OUT_DIR/"
-
-          # Copy dylib (BonDriver_NetworkProxy client)
-          [ -f "$TARGET_DIR/libBonDriver_NetworkProxy.dylib" ] && cp "$TARGET_DIR/libBonDriver_NetworkProxy.dylib" "$OUT_DIR/BonDriver_NetworkProxy.dylib"
+          # Copy ALL
+          cp -r "$TARGET_DIR/." "$OUT_DIR/"
 
           # Copy sample configs
           [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"

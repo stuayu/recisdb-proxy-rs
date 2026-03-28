@@ -1,0 +1,12 @@
+[Unit]
+Description = recisdb-proxy-rs
+After = network-online.target
+
+[Service]
+ExecStart = /home/XXXXXX/DTV/recisdb-proxy/recisdb-proxy
+WorkingDirectory = /home/XXXXXX/DTV/recisdb-proxy/
+Restart = always
+Type = simple
+
+[Install]
+WantedBy = multi-user.target
