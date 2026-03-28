@@ -33,19 +33,23 @@ nix::ioctl_write_int!(ptx_set_sys_mode, 0x8d, 0x0b);
 /// - space=2 (CS): channel 0..11 → CS ch 2,4,...,24 → ioctl ch = cs_ch / 2 + 11, slot = 0
 ///
 /// These formulas match `channels.rs` in recisdb-rs (IoctlFreq::from(ChannelType)).
+/// Reference test: T18 → ch=68 (= 18 + 50), confirmed in recisdb-rs/src/channels.rs.
 fn space_channel_to_ioctl_freq(space: u32, channel: u32) -> Result<IoctlFreq, io::Error> {
     match space {
         0 => {
-            // Terrestrial (GR): BonDriver channel index → UHF ch 13-62
-            let uhf_ch = (channel as i32) + 13;
-            if !(13..=62).contains(&uhf_ch) {
+            // Terrestrial (GR): BonDriver channel index 0..49 → UHF ch 13..62
+            // px4-drv PTX_SET_CHANNEL expects: ch = uhf_channel_number + 50
+            //   channel=0 → UHF 13 → ch=63, channel=49 → UHF 62 → ch=112
+            // (confirmed by recisdb-rs channels.rs test: T18 → ch=68 = 18+50)
+            if channel > 49 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("GR channel {} out of range (0-49)", channel),
                 ));
             }
+            let uhf_ch = (channel + 13) as i32; // UHF channel number 13..62
             Ok(IoctlFreq {
-                ch: uhf_ch + 50, // px4-drv: ch_num + 50
+                ch: uhf_ch + 50, // px4-drv formula: uhf_ch + 50
                 slot: 0,
             })
         }
@@ -126,21 +130,36 @@ impl BonDriverTuner {
 
         let freq = space_channel_to_ioctl_freq(space, channel)?;
 
-        // Order matches recisdb-rs character_device.rs: set_ch → LNB → start_rec
-        unsafe {
-            set_ch(self.ioctl_file.as_raw_fd(), &freq).map_err(io::Error::from)?;
+        // Select system mode before set_ch.
+        // Some px4-drv devices require explicit ISDB-T(0)/ISDB-S(1) selection.
+        // Ignore errors — older drivers that don't support this ioctl return EINVAL.
+        match space {
+            0 => {
+                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 0) }; // ISDB-T
+            }
+            _ => {
+                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 1) }; // ISDB-S
+            }
         }
 
-        // Control LNB voltage for satellite bands
+        // LNB must be powered BEFORE set_ch for satellite bands.
+        // px4-drv's PTX_SET_CHANNEL blocks internally waiting for PLL lock (~5s).
+        // If LNB is not yet powered when set_ch starts that wait, the dish has no
+        // power and the lock fails with EAGAIN.  Powering LNB first gives the
+        // satellite LNB time to stabilize before the driver starts scanning.
         match space {
             1 | 2 => {
-                // BS/CS: enable LNB voltage (11V)
+                // BS/CS: enable LNB voltage (11V) before set_ch
                 let _ = unsafe { ptx_enable_lnb(self.ioctl_file.as_raw_fd(), 1) };
             }
             _ => {
                 // Terrestrial: disable LNB
                 let _ = unsafe { ptx_disable_lnb(self.ioctl_file.as_raw_fd()) };
             }
+        }
+
+        unsafe {
+            set_ch(self.ioctl_file.as_raw_fd(), &freq).map_err(io::Error::from)?;
         }
 
         unsafe {

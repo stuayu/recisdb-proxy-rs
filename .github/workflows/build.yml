@@ -158,7 +158,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          brew install pcsc-lite pkg-config cmake ninja
+          brew install cmake ninja
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -171,9 +171,7 @@ jobs:
           toolchain: stable
 
       - name: Build (Release)
-        run: |
-          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH}"
-          cargo build --workspace --verbose --release
+        run: cargo build --workspace --verbose --release
 
       - name: Prepare artifacts
         run: |

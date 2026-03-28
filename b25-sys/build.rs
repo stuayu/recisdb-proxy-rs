@@ -98,8 +98,17 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib", res.display());
         println!("cargo:rustc-link-search=native={}/lib64", res.display());
         println!("cargo:rustc-link-lib=dylib=winscard");
+    } else if cx.os.clone().unwrap_or_default().contains("macos") {
+        // macOS: use the built-in PCSC.framework (no libpcsclite pkg-config needed).
+        // cmake's find_package(PCSC REQUIRED) in libaribb25 automatically finds
+        // /System/Library/Frameworks/PCSC.framework, so no extra cmake flags are needed.
+        println!("cargo:rustc-link-lib=framework=PCSC");
+        let res = prep_cmake(cx).build();
+        println!("cargo:rustc-link-search=native={}/lib", res.display());
+        println!("cargo:rustc-link-search=native={}/lib64", res.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
     } else {
-        // Linux, macOS, and other Unix platforms
+        // Linux and other Unix platforms: use libpcsclite via pkg-config
         if pc.probe("libpcsclite").is_err() {
             panic!("libpcsclite not found.")
         }
@@ -108,12 +117,8 @@ fn main() {
             println!("cargo:rustc-link-search=native={}/lib", res.display());
             println!("cargo:rustc-link-search=native={}/lib64", res.display());
         }
-        // Embed RPATH=$ORIGIN so a local pcsclite library placed next to the
+        // Embed RPATH=$ORIGIN so a local libpcsclite.so placed next to the
         // binary is preferred over the system library
-        if cx.os.clone().unwrap_or_default().contains("linux") {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-        } else if cx.os.clone().unwrap_or_default().contains("macos") {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
-        }
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     }
 }

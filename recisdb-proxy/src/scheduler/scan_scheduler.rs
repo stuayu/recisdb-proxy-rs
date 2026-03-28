@@ -181,9 +181,22 @@ impl ScanScheduler {
         let database = self.database.clone();
         let tuner_pool = self.tuner_pool.clone();
         let active_scans = self.active_scans.clone();
-        let timeout_secs = self.config.scan_timeout_secs;
-        let signal_lock_wait_ms = self.config.signal_lock_wait_ms;
-        let ts_read_timeout_ms = self.config.ts_read_timeout_ms;
+
+        // Read timing config fresh from DB each time so that changes made
+        // through the web dashboard take effect without restarting the process.
+        let (timeout_secs, signal_lock_wait_ms, ts_read_timeout_ms) = {
+            let db = self.database.lock().await;
+            match db.get_scan_scheduler_config() {
+                Ok((_, _, timeout, signal_lock_wait, ts_timeout)) => {
+                    (timeout, signal_lock_wait, ts_timeout)
+                }
+                Err(_) => (
+                    self.config.scan_timeout_secs,
+                    self.config.signal_lock_wait_ms,
+                    self.config.ts_read_timeout_ms,
+                ),
+            }
+        };
 
         // Increment active scan count
         active_scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -431,9 +444,13 @@ fn scan_space_blocking(
 
     let mut results = Vec::new();
     let mut consecutive_set_channel_failures: u32 = 0;
+    let mut consecutive_eagain: u32 = 0;
     let mut total_set_channel_failures: u32 = 0;
     const MAX_CONSECUTIVE_SET_CHANNEL_FAILURES: u32 = 8;
     const MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS: u32 = 16;
+    // After this many consecutive EAGAIN (PLL lock failures, ~5s each), assume
+    // the satellite link is fully unavailable and skip remaining channels.
+    const MAX_CONSECUTIVE_EAGAIN: u32 = 3;
 
     for (channel, channel_name) in channels {
         let channel = *channel;
@@ -446,6 +463,36 @@ fn scan_space_blocking(
                 "scan_space_blocking: SetChannel(space={}, ch={} \"{}\") failed: {} (os error: {:?})",
                 space, channel, channel_name, e, e.raw_os_error()
             );
+
+            // EINVAL (InvalidInput) means the tuner hardware does not support this
+            // band at all (e.g. a satellite-only tuner receiving a terrestrial request).
+            // No point scanning more channels in this space.
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                warn!(
+                    "scan_space_blocking: EINVAL on space {} — tuner does not support this band, skipping space",
+                    space
+                );
+                break;
+            }
+
+            // EAGAIN (WouldBlock) means the tuner accepted the channel parameters
+            // but couldn't achieve PLL lock within the driver timeout (~5s).
+            // This is caused by: no satellite dish, cable/LNB failure, or
+            // antenna not pointed at the satellite.
+            // If it occurs consecutively, all channels in this space will fail
+            // the same way — skip the rest to avoid 5s × N channel delays.
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                consecutive_eagain += 1;
+                if consecutive_eagain >= MAX_CONSECUTIVE_EAGAIN {
+                    warn!(
+                        "scan_space_blocking: {} consecutive EAGAIN on space {} — satellite signal unavailable (no dish/LNB?), skipping space",
+                        consecutive_eagain, space
+                    );
+                    break;
+                }
+            } else {
+                consecutive_eagain = 0;
+            }
 
             consecutive_set_channel_failures += 1;
             total_set_channel_failures += 1;
@@ -472,6 +519,7 @@ fn scan_space_blocking(
         }
 
         consecutive_set_channel_failures = 0;
+        consecutive_eagain = 0;
 
         // Purge any old data
         tuner.purge_ts_stream();

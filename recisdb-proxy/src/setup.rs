@@ -576,7 +576,7 @@ fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- ステップ 1/4: 基本設定 ---\n");
 
     let listen_addr = prompt("プロキシサーバーの待ち受けアドレス", "0.0.0.0:12345");
-    let web_listen_addr = prompt("Webダッシュボードの待ち受けアドレス", "0.0.0.0:8080");
+    let web_listen_addr = prompt("Webダッシュボードの待ち受けアドレス", "0.0.0.0:40080");
     let db_path = prompt("データベースファイルのパス", "recisdb-proxy.db");
     let config_path = prompt("設定ファイルの保存先", "recisdb-proxy.toml");
 
@@ -703,7 +703,7 @@ fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
         println!("    - PLEX社チューナー用: (後から設定されます)");
         println!("    - PT3用: (後から設定されます)");
         println!();
-        println!("  ダウンロード後、Webダッシュボード (http://localhost:8080) から");
+        println!("  ダウンロード後、Webダッシュボード (http://localhost:40080) から");
         println!("  チューナーパスを更新できます。");
     }
 

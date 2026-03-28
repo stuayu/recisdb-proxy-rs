@@ -32,7 +32,7 @@ struct Args {
     listen: SocketAddr,
 
     /// Address for web dashboard to listen on
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    #[arg(long, default_value = "0.0.0.0:40080")]
     web_listen: SocketAddr,
 
     /// Path to the default tuner device
@@ -202,10 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get database path and other settings from config
     let listen_addr = args.listen;
-    let web_listen_addr = if let Ok(addr) = file_config.server.web_listen.as_ref().unwrap_or(&"0.0.0.0:8080".to_string()).parse::<SocketAddr>() {
+    let web_listen_addr = if let Ok(addr) = file_config.server.web_listen.as_ref().unwrap_or(&"0.0.0.0:40080".to_string()).parse::<SocketAddr>() {
         addr
     } else {
-        "0.0.0.0:8080".parse::<SocketAddr>()?
+        "0.0.0.0:40080".parse::<SocketAddr>()?
     };
     let default_tuner = args.tuner.or(file_config.server.tuner);
     let max_connections = file_config
