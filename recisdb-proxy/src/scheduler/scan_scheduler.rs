@@ -442,7 +442,10 @@ fn scan_space_blocking(
 
         // Set channel
         if let Err(e) = tuner.set_channel(space, channel) {
-            debug!("scan_space_blocking: SetChannel failed: {}", e);
+            warn!(
+                "scan_space_blocking: SetChannel(space={}, ch={} \"{}\") failed: {} (os error: {:?})",
+                space, channel, channel_name, e, e.raw_os_error()
+            );
 
             consecutive_set_channel_failures += 1;
             total_set_channel_failures += 1;
