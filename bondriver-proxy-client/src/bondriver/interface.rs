@@ -19,6 +19,7 @@ pub type LPCTSTR = *const u16;
 
 /// MSVC RTTI Complete Object Locator structure (x64 version).
 /// This is placed before the vtable and pointed to by vtable[-1].
+#[cfg(windows)]
 #[repr(C)]
 pub struct RTTICompleteObjectLocator {
     /// Signature: 0 for x86, 1 for x64
@@ -37,6 +38,7 @@ pub struct RTTICompleteObjectLocator {
 
 /// MSVC RTTI Type Descriptor (type_info structure).
 /// Contains the mangled type name.
+#[cfg(windows)]
 #[repr(C)]
 pub struct RTTITypeDescriptor {
     /// Pointer to type_info vftable (we set to null as we don't need RTTI methods)
@@ -48,10 +50,12 @@ pub struct RTTITypeDescriptor {
 }
 
 // Safety: The vftable pointer is either null or points to static memory
+#[cfg(windows)]
 unsafe impl Sync for RTTITypeDescriptor {}
 
 /// MSVC RTTI Class Hierarchy Descriptor.
 /// Describes the inheritance hierarchy of a class.
+#[cfg(windows)]
 #[repr(C)]
 pub struct RTTIClassHierarchyDescriptor {
     /// Signature: 0 for x86, 1 for x64
@@ -65,6 +69,7 @@ pub struct RTTIClassHierarchyDescriptor {
 }
 
 /// PMD - Pointer-to-Member Displacement for RTTI.
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PMD {
@@ -78,6 +83,7 @@ pub struct PMD {
 
 /// MSVC RTTI Base Class Descriptor.
 /// Describes one class in the inheritance hierarchy.
+#[cfg(windows)]
 #[repr(C)]
 pub struct RTTIBaseClassDescriptor {
     /// RVA to type descriptor
@@ -94,6 +100,7 @@ pub struct RTTIBaseClassDescriptor {
 
 /// Array of base class descriptor RVAs.
 /// For IBonDriver3: [IBonDriver3, IBonDriver2, IBonDriver]
+#[cfg(windows)]
 #[repr(C)]
 pub struct RTTIBaseClassArray3 {
     pub entries: [i32; 3],
@@ -101,6 +108,7 @@ pub struct RTTIBaseClassArray3 {
 
 /// Complete RTTI structure for IBonDriver3 with single inheritance chain.
 /// All structures are laid out contiguously so we can calculate RVAs easily.
+#[cfg(windows)]
 #[repr(C)]
 pub struct IBonDriver3RTTI {
     // Type descriptors
@@ -126,6 +134,7 @@ pub struct IBonDriver3RTTI {
 /// Vtable with RTTI header.
 /// The object's vfptr points to `vtable` (not to `rtti_locator`).
 /// This allows TVTest to access vtable[-1] to find the RTTI locator.
+#[cfg(windows)]
 #[repr(C)]
 pub struct IBonDriver3VtblWithRTTI {
     /// Pointer to Complete Object Locator (at offset -8 from vtable pointer)
@@ -135,6 +144,7 @@ pub struct IBonDriver3VtblWithRTTI {
 }
 
 // Safety: The RTTI locator pointer points to a static constant, safe to share across threads.
+#[cfg(windows)]
 unsafe impl Sync for IBonDriver3VtblWithRTTI {}
 
 /// IBonDriver vtable.

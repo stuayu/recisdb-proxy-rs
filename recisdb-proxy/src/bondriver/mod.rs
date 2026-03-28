@@ -1,6 +1,7 @@
-//! BonDriver wrapper module for direct tuner access on Windows.
+//! BonDriver wrapper module.
 //!
-//! This module provides direct access to BonDriver DLLs for channel scanning.
+//! On Windows: wraps BonDriver DLLs via FFI.
+//! On Linux: wraps character devices (/dev/px4video*, etc.) via ioctl.
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -8,9 +9,15 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::*;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::*;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod stub {
-    //! Stub implementation for non-Windows platforms.
+    //! Stub implementation for unsupported platforms.
 
     use std::io;
 
@@ -20,14 +27,14 @@ mod stub {
         pub fn new(_path: &str) -> Result<Self, io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "BonDriver is only supported on Windows",
+                "BonDriver/chardev tuner is only supported on Windows and Linux",
             ))
         }
 
         pub fn set_channel(&self, _space: u32, _channel: u32) -> Result<(), io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "BonDriver is only supported on Windows",
+                "BonDriver/chardev tuner is only supported on Windows and Linux",
             ))
         }
 
@@ -42,7 +49,7 @@ mod stub {
         pub fn get_ts_stream(&self, _buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "BonDriver is only supported on Windows",
+                "BonDriver/chardev tuner is only supported on Windows and Linux",
             ))
         }
 
@@ -62,5 +69,5 @@ mod stub {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub use stub::*;

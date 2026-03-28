@@ -107,5 +107,8 @@ fn main() {
             println!("cargo:rustc-link-search=native={}/lib", res.display());
             println!("cargo:rustc-link-search=native={}/lib64", res.display());
         }
+        // Embed RPATH=$ORIGIN so a local libpcsclite.so.1 placed next to the
+        // binary is preferred over the system library
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     }
 }

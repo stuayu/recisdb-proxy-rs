@@ -6,7 +6,9 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use std::sync::Once;
 use std::time::Duration;
 
@@ -742,6 +744,7 @@ pub static IBONDRIVER3_VTBL: IBonDriver3Vtbl = IBonDriver3Vtbl {
 
 /// Helper to create a mangled type name array.
 /// MSVC mangled names look like: .?AVIBonDriver@@
+#[cfg(windows)]
 fn make_type_name(name: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
     let len = name.len().min(31);
@@ -750,6 +753,7 @@ fn make_type_name(name: &[u8]) -> [u8; 32] {
 }
 
 /// PMD for simple single inheritance (no vbtable).
+#[cfg(windows)]
 const PMD_SIMPLE: PMD = PMD {
     mdisp: 0,
     pdisp: -1,  // -1 means no vbtable
@@ -758,6 +762,7 @@ const PMD_SIMPLE: PMD = PMD {
 
 /// Static RTTI data - RVAs will be fixed up at runtime.
 /// We use a mutable static because RVAs depend on module base address.
+#[cfg(windows)]
 static mut RTTI_DATA: IBonDriver3RTTI = IBonDriver3RTTI {
     // Type descriptors with mangled names
     type_desc_ibondriver: RTTITypeDescriptor {
@@ -836,16 +841,20 @@ static mut RTTI_DATA: IBonDriver3RTTI = IBonDriver3RTTI {
 };
 
 /// Flag to track if RTTI has been initialized.
+#[cfg(windows)]
 static RTTI_INITIALIZED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
 static RTTI_INIT: Once = Once::new();
 
 /// Calculate RVA from a pointer given the image base.
+#[cfg(windows)]
 fn calc_rva(ptr: *const u8, image_base: usize) -> i32 {
     (ptr as usize - image_base) as i32
 }
 
 /// Initialize RTTI data with correct RVAs.
 /// Must be called before the vtable is used.
+#[cfg(windows)]
 fn init_rtti() {
     RTTI_INIT.call_once(|| {
         unsafe {
@@ -973,12 +982,8 @@ fn get_module_base() -> usize {
     }
 }
 
-#[cfg(not(windows))]
-fn get_module_base() -> usize {
-    0
-}
-
 /// Get pointer to the Complete Object Locator.
+#[cfg(windows)]
 pub fn get_rtti_locator_ptr() -> *const RTTICompleteObjectLocator {
     init_rtti();
     unsafe { &RTTI_DATA.complete_object_locator }
@@ -986,6 +991,7 @@ pub fn get_rtti_locator_ptr() -> *const RTTICompleteObjectLocator {
 
 /// Mutable vtable with RTTI header - the RTTI pointer will be fixed up at runtime.
 /// Initialized with null RTTI pointer, fixed up in init_rtti().
+#[cfg(windows)]
 static mut IBONDRIVER3_VTBL_WITH_RTTI: IBonDriver3VtblWithRTTI = IBonDriver3VtblWithRTTI {
     rtti_locator_ptr: std::ptr::null(),  // Will be fixed up at runtime
     vtable: IBonDriver3Vtbl {
@@ -1017,10 +1023,11 @@ static mut IBONDRIVER3_VTBL_WITH_RTTI: IBonDriver3VtblWithRTTI = IBonDriver3Vtbl
 };
 
 /// Flag to track if vtable RTTI pointer has been fixed up.
+#[cfg(windows)]
 static VTABLE_RTTI_INIT: Once = Once::new();
 
-/// Get a pointer to the vtable portion of IBONDRIVER3_VTBL_WITH_RTTI.
-/// This is what the object's vfptr should point to - it allows vtable[-1] to access RTTI.
+/// Get a pointer to the vtable for use as the object's vfptr.
+#[cfg(windows)]
 pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
     // Initialize RTTI data first (calculates RVAs)
     init_rtti();
@@ -1031,7 +1038,6 @@ pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
             let rtti_ptr = &RTTI_DATA.complete_object_locator as *const RTTICompleteObjectLocator;
             file_log!(info, "get_vtable_ptr: Fixing up RTTI locator pointer to {:p}", rtti_ptr);
 
-            // We need to cast away the const-ness to fix up the pointer
             let vtbl_ptr = &mut IBONDRIVER3_VTBL_WITH_RTTI as *mut IBonDriver3VtblWithRTTI;
             (*vtbl_ptr).rtti_locator_ptr = rtti_ptr;
 
@@ -1040,4 +1046,11 @@ pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
     });
 
     unsafe { &IBONDRIVER3_VTBL_WITH_RTTI.vtable }
+}
+
+/// Get a pointer to the vtable for use as the object's vfptr.
+/// On Linux, no RTTI overhead is needed — return the static vtable directly.
+#[cfg(not(windows))]
+pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
+    &IBONDRIVER3_VTBL as *const _
 }

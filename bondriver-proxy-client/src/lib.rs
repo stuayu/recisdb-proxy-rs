@@ -105,7 +105,8 @@ fn create_bondriver_impl() -> *mut IBonDriver {
         file_log!(info, "CreateBonDriver: Returning existing instance at {:p}", instance_ptr);
     }
 
-    // Debug: log vtable information and sizes
+    // Debug: log vtable information and sizes (Windows-only: uses RTTI vtable[-1] layout)
+    #[cfg(windows)]
     unsafe {
         let instance = &*instance_ptr;
         file_log!(info, "sizeof(BonDriverInstance): {} bytes", std::mem::size_of::<BonDriverInstance>());
