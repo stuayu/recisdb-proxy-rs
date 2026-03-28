@@ -7,8 +7,9 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" {
         build_bondriver_wrapper();
-        build_aribb24_wrapper();
     }
+    // aribb24 wrapper is built on all platforms
+    build_aribb24_wrapper(&target_os);
 }
 
 fn build_bondriver_wrapper() {
@@ -70,7 +71,7 @@ fn build_bondriver_wrapper() {
 }
 
 
-fn build_aribb24_wrapper() {
+fn build_aribb24_wrapper(target_os: &str) {
     use std::env;
     use std::path::PathBuf;
 
@@ -87,31 +88,32 @@ fn build_aribb24_wrapper() {
     println!("cargo:rerun-if-changed={}", aribb24_src.join("parser.c").display());
     println!("cargo:rerun-if-changed={}", aribb24_src.join("drcs.c").display());
     println!("cargo:rerun-if-changed={}", aribb24_src.join("md5.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("win_compat_asprintf.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("unistd.h").display());
 
     let mut b = cc::Build::new();
     b.warnings(false);
-    b.flag_if_supported("/utf-8");
 
     // include ルート：<aribb24/...> が見えるように
     b.include(&aribb24_src);
 
-    // asprintf/vasprintf を有効化（aribb24.c のログ等にも効く場合あり）[4](https://github.com/nkoriyama/aribb24/blob/master/src/drcs.c)
-    b.define("HAVE_VASPRINTF", Some("1"));
-    b.define("_GNU_SOURCE", Some("1"));
-    b.define("__USE_MINGW_ANSI_STDIO", Some("1"));
+    if target_os == "windows" {
+        b.flag_if_supported("/utf-8");
+        b.define("__USE_MINGW_ANSI_STDIO", Some("1"));
+        // Windows では asprintf/vasprintf が標準ではないため互換実装を使う
+        println!("cargo:rerun-if-changed={}", aribb24_src.join("win_compat_asprintf.c").display());
+        b.file(aribb24_src.join("win_compat_asprintf.c"));
+    } else {
+        // Linux/macOS では asprintf が POSIX 標準で利用可能
+        b.define("_GNU_SOURCE", Some("1"));
+        b.define("HAVE_VASPRINTF", Some("1"));
+    }
 
-    // 本体 + 依存
+    // 本体
     b.file(wrap_c);
     b.file(aribb24_src.join("aribb24.c"));
     b.file(aribb24_src.join("decoder.c"));
     b.file(aribb24_src.join("parser.c"));
     b.file(aribb24_src.join("drcs.c"));
     b.file(aribb24_src.join("md5.c"));
-
-    // Windows 互換（asprintf/vasprintf）
-    b.file(aribb24_src.join("win_compat_asprintf.c"));
 
     b.compile("aribb24_wrap");
 }
