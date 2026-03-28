@@ -128,7 +128,11 @@ jobs:
           [ -f "$TARGET_DIR/recisdb" ] && cp "$TARGET_DIR/recisdb" "$OUT_DIR/"
           [ -f "$TARGET_DIR/recisdb-proxy" ] && cp "$TARGET_DIR/recisdb-proxy" "$OUT_DIR/"
 
+          # Copy shared library (BonDriver_NetworkProxy client .so)
+          [ -f "$TARGET_DIR/libBonDriver_NetworkProxy.so" ] && cp "$TARGET_DIR/libBonDriver_NetworkProxy.so" "$OUT_DIR/BonDriver_NetworkProxy.so"
+
           # Copy sample configs
+          [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
           [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
 
           ls -la "$OUT_DIR"

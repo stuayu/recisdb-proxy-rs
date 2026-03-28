@@ -192,7 +192,7 @@ impl BonDriverTuner {
         let fd = self.file.as_raw_fd();
         // SAFETY: fd is valid for the lifetime of self.
         let mut fds = [PollFd::new(unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN)];
-        match poll(&mut fds, timeout_ms as i32) {
+        match poll(&mut fds, timeout_ms.min(u16::MAX as u32) as u16) {
             Ok(n) if n > 0 => fds[0]
                 .revents()
                 .map(|r| r.contains(PollFlags::POLLIN))
@@ -219,7 +219,7 @@ impl BonDriverTuner {
                 unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) },
                 PollFlags::POLLIN,
             )];
-            match poll(&mut fds, 0) {
+            match poll(&mut fds, 0u16) {
                 Ok(n) if n > 0 => {
                     let has_data = fds[0]
                         .revents()
