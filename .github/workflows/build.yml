@@ -143,3 +143,60 @@ jobs:
           name: recisdb-${{ matrix.label }}
           path: artifacts-${{ matrix.label }}/
           retention-days: 30
+
+  build-macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            label: macos-amd64
+          - runner: macos-latest
+            label: macos-arm64
+
+    steps:
+      - name: Install dependencies
+        run: |
+          brew install pcsclite pkg-config cmake ninja
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Build (Release)
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH}"
+          cargo build --workspace --verbose --release
+
+      - name: Prepare artifacts
+        run: |
+          TARGET_DIR="target/release"
+          OUT_DIR="artifacts-${{ matrix.label }}"
+          mkdir -p "$OUT_DIR"
+
+          # Copy executables
+          [ -f "$TARGET_DIR/recisdb" ] && cp "$TARGET_DIR/recisdb" "$OUT_DIR/"
+          [ -f "$TARGET_DIR/recisdb-proxy" ] && cp "$TARGET_DIR/recisdb-proxy" "$OUT_DIR/"
+
+          # Copy dylib (BonDriver_NetworkProxy client)
+          [ -f "$TARGET_DIR/libBonDriver_NetworkProxy.dylib" ] && cp "$TARGET_DIR/libBonDriver_NetworkProxy.dylib" "$OUT_DIR/BonDriver_NetworkProxy.dylib"
+
+          # Copy sample configs
+          [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
+          [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
+
+          ls -la "$OUT_DIR"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: recisdb-${{ matrix.label }}
+          path: artifacts-${{ matrix.label }}/
+          retention-days: 30

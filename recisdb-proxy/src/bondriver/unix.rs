@@ -1,4 +1,4 @@
-//! Linux character device implementation of BonDriverTuner.
+//! Unix character device implementation of BonDriverTuner.
 //!
 //! Supports physical tuners at /dev/px4video*, /dev/pt3video*, etc.
 //! Uses ioctl interface compatible with px4-drv and pt3-drv kernel drivers.

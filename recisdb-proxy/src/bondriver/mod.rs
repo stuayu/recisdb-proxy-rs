@@ -9,13 +9,13 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::*;
 
-#[cfg(target_os = "linux")]
-mod linux;
+#[cfg(unix)]
+mod unix;
 
-#[cfg(target_os = "linux")]
-pub use linux::*;
+#[cfg(unix)]
+pub use unix::*;
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", unix)))]
 mod stub {
     //! Stub implementation for unsupported platforms.
 
@@ -69,5 +69,5 @@ mod stub {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", unix)))]
 pub use stub::*;

@@ -98,17 +98,22 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib", res.display());
         println!("cargo:rustc-link-search=native={}/lib64", res.display());
         println!("cargo:rustc-link-lib=dylib=winscard");
-    } else if cx.os.clone().unwrap_or_default().contains("linux") {
+    } else {
+        // Linux, macOS, and other Unix platforms
         if pc.probe("libpcsclite").is_err() {
             panic!("libpcsclite not found.")
         }
         if pc.probe("libaribb25").is_err() || cfg!(feature = "prioritized_card_reader") {
-            let res = prep_cmake(cx).build();
+            let res = prep_cmake(cx.clone()).build();
             println!("cargo:rustc-link-search=native={}/lib", res.display());
             println!("cargo:rustc-link-search=native={}/lib64", res.display());
         }
-        // Embed RPATH=$ORIGIN so a local libpcsclite.so.1 placed next to the
+        // Embed RPATH=$ORIGIN so a local pcsclite library placed next to the
         // binary is preferred over the system library
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        if cx.os.clone().unwrap_or_default().contains("linux") {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        } else if cx.os.clone().unwrap_or_default().contains("macos") {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+        }
     }
 }
