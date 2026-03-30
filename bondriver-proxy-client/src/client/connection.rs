@@ -66,7 +66,7 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            server_addr: "127.0.0.1:12345".to_string(),
+            server_addr: "127.0.0.1:40070".to_string(),
             tuner_path: String::new(),
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(5),

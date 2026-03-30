@@ -575,7 +575,7 @@ fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     // ----- ステップ 1: 基本設定 -----
     println!("--- ステップ 1/4: 基本設定 ---\n");
 
-    let listen_addr = prompt("プロキシサーバーの待ち受けアドレス", "0.0.0.0:12345");
+    let listen_addr = prompt("プロキシサーバーの待ち受けアドレス", "0.0.0.0:40070");
     let web_listen_addr = prompt("Webダッシュボードの待ち受けアドレス", "0.0.0.0:40080");
     let db_path = prompt("データベースファイルのパス", "recisdb-proxy.db");
     let config_path = prompt("設定ファイルの保存先", "recisdb-proxy.toml");

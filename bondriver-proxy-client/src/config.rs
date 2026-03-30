@@ -179,7 +179,7 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .get("Address")
         .or_else(|| section.get("Server"))
         .cloned()
-        .unwrap_or_else(|| "127.0.0.1:12345".to_string());
+        .unwrap_or_else(|| "127.0.0.1:40070".to_string());
 
     let tuner_path = section
         .get("Tuner")
@@ -251,7 +251,7 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
 /// Load configuration from environment variables.
 fn load_from_env() -> ConnectionConfig {
     let server_addr = std::env::var("BONDRIVER_PROXY_SERVER")
-        .unwrap_or_else(|_| "127.0.0.1:12345".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:40070".to_string());
 
     let tuner_path = std::env::var("BONDRIVER_PROXY_TUNER")
         .unwrap_or_default();

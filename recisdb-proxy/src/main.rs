@@ -28,7 +28,7 @@ use tuner::TunerPoolConfig;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Address to listen on
-    #[arg(short, long, default_value = "0.0.0.0:12345")]
+    #[arg(short, long, default_value = "0.0.0.0:40070")]
     listen: SocketAddr,
 
     /// Address for web dashboard to listen on
@@ -201,11 +201,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use log::{error, info};
 
     // Get database path and other settings from config
-    let listen_addr = args.listen;
-    let web_listen_addr = if let Ok(addr) = file_config.server.web_listen.as_ref().unwrap_or(&"0.0.0.0:40080".to_string()).parse::<SocketAddr>() {
-        addr
+    let listen_addr = if let Some(addr_str) = &file_config.server.listen {
+        addr_str.parse::<SocketAddr>().unwrap_or(args.listen)
     } else {
-        "0.0.0.0:40080".parse::<SocketAddr>()?
+        args.listen
+    };
+    let web_listen_addr = if let Some(addr_str) = &file_config.server.web_listen {
+        addr_str.parse::<SocketAddr>().unwrap_or(args.web_listen)
+    } else {
+        args.web_listen
     };
     let default_tuner = args.tuner.or(file_config.server.tuner);
     let max_connections = file_config
