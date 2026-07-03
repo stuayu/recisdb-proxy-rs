@@ -66,4 +66,8 @@
   #ifndef S_IRWXO
     #define S_IRWXO (S_IROTH | S_IWOTH | S_IXOTH)
   #endif
+#else
+  // 非Windowsではこのスタブがシステムの <unistd.h> をシャドウしてしまうため、
+  // 本物のヘッダへ委譲する (close/read/write等の宣言が必要)
+  #include_next <unistd.h>
 #endif
