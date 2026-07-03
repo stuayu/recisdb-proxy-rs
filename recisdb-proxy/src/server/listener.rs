@@ -11,7 +11,7 @@ use bytes::Bytes;
 
 use crate::database::Database;
 use crate::server::session::Session;
-use crate::tuner::{TunerPool, TunerPoolConfig};
+use crate::tuner::{EncoderPool, TunerPool, TunerPoolConfig};
 use crate::web::SessionRegistry;
 
 /// Database handle type.
@@ -49,6 +49,7 @@ pub struct TlsConfig {
 pub struct Server {
     config: ServerConfig,
     tuner_pool: Arc<TunerPool>,
+    encoder_pool: Arc<EncoderPool>,
     database: DatabaseHandle,
     session_registry: Arc<SessionRegistry>,
 }
@@ -61,6 +62,11 @@ impl Server {
         Self {
             config,
             tuner_pool: Arc::new(TunerPool::new_with_config(16, tuner_config)),
+            // Shared tsreplace encoder pool (STREAMING_DESIGN.md §5 P4).
+            // The concurrency cap is re-synced from tsreplace_config each time
+            // a session starts an encoder, so the initial value here only
+            // covers the window before the first DB read.
+            encoder_pool: Arc::new(EncoderPool::default()),
             database,
             session_registry,
         }
@@ -82,12 +88,13 @@ impl Server {
                     info!("[Session {}] New connection from {}", session_id, addr);
 
                     let pool = Arc::clone(&self.tuner_pool);
+                    let encoder_pool = Arc::clone(&self.encoder_pool);
                     let database = Arc::clone(&self.database);
                     let default_tuner = self.config.default_tuner.clone();
                     let session_registry = Arc::clone(&self.session_registry);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(socket, addr, session_id, pool, database, default_tuner, session_registry).await {
+                        if let Err(e) = handle_connection(socket, addr, session_id, pool, encoder_pool, database, default_tuner, session_registry).await {
                             error!("[Session {}] Connection error: {}", session_id, e);
                         }
                         info!("[Session {}] Connection closed", session_id);
@@ -105,6 +112,12 @@ impl Server {
         &self.tuner_pool
     }
 
+    /// Get a reference to the shared encoder pool.
+    #[allow(dead_code)]
+    pub fn encoder_pool(&self) -> &Arc<EncoderPool> {
+        &self.encoder_pool
+    }
+
     /// Get a reference to the database.
     pub fn database(&self) -> &DatabaseHandle {
         &self.database
@@ -117,6 +130,7 @@ async fn handle_connection(
     addr: SocketAddr,
     session_id: u64,
     tuner_pool: Arc<TunerPool>,
+    encoder_pool: Arc<EncoderPool>,
     database: DatabaseHandle,
     default_tuner: Option<String>,
     session_registry: Arc<SessionRegistry>,
@@ -155,6 +169,7 @@ async fn handle_connection(
         ctrl_write_tx,
         writer_handle,
         tuner_pool,
+        encoder_pool,
         database,
         default_tuner,
         Arc::clone(&session_registry),

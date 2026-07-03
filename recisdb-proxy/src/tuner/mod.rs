@@ -10,6 +10,7 @@
 //! - [`group_space`]: Group-based aggregation and driver selection
 
 pub mod channel_key;
+pub mod encoder_pool;
 pub mod lock;
 pub mod passive_scanner;
 pub mod pool;
@@ -25,6 +26,7 @@ pub mod warm;
 pub mod logo_collector;
 
 pub use channel_key::ChannelKey;
+pub use encoder_pool::{EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 #[allow(unused_imports)]
 pub use lock::{ExclusiveLockGuard, LockError, SharedLockGuard, TunerLock};
 pub use pool::{TunerPool, TunerPoolConfig};

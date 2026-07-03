@@ -291,8 +291,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
     };
 
-    // Load tuner optimization config from database
-    let tuner_config = {
+    // Load tuner optimization config (incl. STREAMING_DESIGN.md §4/§9 P3
+    // prefill/jitter settings) from database.
+    //
+    // `TunerPoolConfig` only carries the tuner-lifecycle fields (it is all
+    // `TunerPool` itself uses); the prefill/jitter fields are surfaced via
+    // `web::state::TunerConfigInfo` (dashboard display) and are otherwise
+    // read directly from the DB per-session at StartStream time
+    // (`Session::load_prefill_runtime_config`), not threaded through
+    // `TunerPoolConfig`.
+    let (tuner_config, prefill_config_for_web) = {
         let db_lock = db.lock().await;
         match db_lock.get_tuner_config() {
             Ok((
@@ -303,6 +311,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set_channel_retry_timeout_ms,
                 signal_poll_interval_ms,
                 signal_wait_timeout_ms,
+                prefill_view_ms,
+                prefill_preview_ms,
+                prefill_record_ms,
+                jitter_safety_factor,
             )) => {
                 info!(
                     "Loaded tuner config from database: keep_alive={}s, prewarm_enabled={}, prewarm_timeout={}s, set_retry_interval={}ms, set_retry_timeout={}ms, signal_poll={}ms, signal_wait_timeout={}ms",
@@ -314,19 +326,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     signal_poll_interval_ms,
                     signal_wait_timeout_ms
                 );
-                TunerPoolConfig {
-                    keep_alive_secs,
-                    prewarm_enabled,
-                    prewarm_timeout_secs,
-                    set_channel_retry_interval_ms,
-                    set_channel_retry_timeout_ms,
-                    signal_poll_interval_ms,
-                    signal_wait_timeout_ms,
-                }
+                info!(
+                    "Loaded prefill config from database: view={}ms, preview={}ms, record={}ms, safety_factor={}",
+                    prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor
+                );
+                (
+                    TunerPoolConfig {
+                        keep_alive_secs,
+                        prewarm_enabled,
+                        prewarm_timeout_secs,
+                        set_channel_retry_interval_ms,
+                        set_channel_retry_timeout_ms,
+                        signal_poll_interval_ms,
+                        signal_wait_timeout_ms,
+                    },
+                    (prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor),
+                )
             }
             Err(e) => {
                 warn!("Failed to load tuner config from database: {}", e);
-                TunerPoolConfig::default()
+                (TunerPoolConfig::default(), (1000, 2000, 6000, 1.5))
             }
         }
     };
@@ -399,6 +418,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let (prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor) =
+        prefill_config_for_web;
     let tuner_config_for_web = Some(web::state::TunerConfigInfo {
         keep_alive_secs: tuner_config.keep_alive_secs,
         prewarm_enabled: tuner_config.prewarm_enabled,
@@ -407,6 +428,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         set_channel_retry_timeout_ms: tuner_config.set_channel_retry_timeout_ms,
         signal_poll_interval_ms: tuner_config.signal_poll_interval_ms,
         signal_wait_timeout_ms: tuner_config.signal_wait_timeout_ms,
+        prefill_view_ms,
+        prefill_preview_ms,
+        prefill_record_ms,
+        jitter_safety_factor,
     });
 
     // Start web dashboard server

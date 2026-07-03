@@ -1,6 +1,7 @@
 //! Server implementation for the proxy.
 
 pub mod listener;
+pub mod prefill;
 pub mod session;
 
 pub use listener::{Server, ServerConfig};

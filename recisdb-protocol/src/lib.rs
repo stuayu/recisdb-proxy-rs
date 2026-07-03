@@ -16,11 +16,11 @@
 //! # Example
 //!
 //! ```rust
-//! use recisdb_protocol::{ClientMessage, encode_client_message, decode_header, decode_client_message};
+//! use recisdb_protocol::{ClientMessage, StreamClass, encode_client_message, decode_header, decode_client_message};
 //! use bytes::Bytes;
 //!
 //! // Encode a message
-//! let msg = ClientMessage::Hello { version: 1 };
+//! let msg = ClientMessage::Hello { version: 1, stream_class: StreamClass::View };
 //! let encoded = encode_client_message(&msg).unwrap();
 //!
 //! // Decode the header
@@ -70,8 +70,8 @@ pub use codec::{
 pub use error::{ClientError, ErrorCode, ProtocolError, ServerError};
 pub use types::{
     // Existing types
-    ChannelSpec, ClientMessage, MessageType, ServerMessage, MAGIC, MAX_FRAME_SIZE, MAX_TS_CHUNK_SIZE,
-    PROTOCOL_VERSION, BandType,
+    ChannelSpec, ClientMessage, MessageType, ServerMessage, StreamClass, MAGIC, MAX_FRAME_SIZE,
+    MAX_TS_CHUNK_SIZE, PROTOCOL_VERSION, BandType,
     // New channel management types
     BroadcastType, ChannelFilter, ChannelInfo, ChannelKey, ChannelListMessage, ChannelSelector,
     ClientChannelInfo,

@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS tuner_config (
     set_channel_retry_timeout_ms INTEGER DEFAULT 10000,
     signal_poll_interval_ms INTEGER DEFAULT 500,
     signal_wait_timeout_ms INTEGER DEFAULT 10000,
+    -- Fixed-duration prefill / jitter buffer (STREAMING_DESIGN.md §4/§9 P3):
+    -- per-class prefill duration and shared safety margin used to size the
+    -- per-session prefill buffer in bytes (bitrate_bps/8 * ms/1000 * factor).
+    prefill_view_ms INTEGER DEFAULT 1000,
+    prefill_preview_ms INTEGER DEFAULT 2000,
+    prefill_record_ms INTEGER DEFAULT 6000,
+    jitter_safety_factor REAL DEFAULT 1.5,
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
@@ -105,6 +112,11 @@ CREATE TABLE IF NOT EXISTS tsreplace_config (
     arguments TEXT DEFAULT '-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -',
     read_timeout_ms INTEGER DEFAULT 10000,
     passthrough_on_error INTEGER DEFAULT 1,
+    -- Shared encoder pool (STREAMING_DESIGN.md §5 / P4): maximum number of
+    -- concurrently-running encoder chains across all sessions. Sessions that
+    -- share the same channel + SID set + config generation join a single
+    -- running encoder instead of consuming a slot.
+    max_concurrent_encoders INTEGER DEFAULT 2,
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
@@ -127,6 +139,8 @@ CREATE TABLE IF NOT EXISTS session_history (
     average_bitrate_mbps REAL,
     average_signal_level REAL,
     disconnect_reason TEXT,
+    loss_summary TEXT,                    -- JSON: loss-source breakdown + top-loss PIDs (P1)
+    stream_class TEXT,                    -- 'view'/'record'/'preview' at session end (P2, STREAMING_DESIGN.md §2)
     created_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 

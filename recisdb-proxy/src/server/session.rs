@@ -8,20 +8,22 @@ use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::process::{Child, Command};
+use tokio::io::AsyncReadExt;
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
     broadcast_region::{classify_nid, TerrestrialRegion},
-    decode_client_message, decode_header, encode_server_message, ClientChannelInfo,
-    ClientMessage, ErrorCode, ServerMessage, HEADER_SIZE, PROTOCOL_VERSION,
+    decode_client_message, decode_header, encode_server_message, BandType, ClientChannelInfo,
+    ClientMessage, ErrorCode, ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::server::listener::DatabaseHandle;
+use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
 use crate::tuner::{ChannelKey, SharedTuner, TunerPool, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
+use crate::tuner::encoder_pool::{
+    self, EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
+};
 use crate::tuner::quality_scorer::QualityScorer;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::ts_analyzer::service_filter::TsServiceFilter;
@@ -49,6 +51,28 @@ struct TsreplaceRuntimeConfig {
     arguments: String,
     read_timeout_ms: u64,
     passthrough_on_error: bool,
+    max_concurrent_encoders: i64,
+}
+
+/// Fixed-duration prefill/jitter buffer settings loaded from `tuner_config`
+/// (STREAMING_DESIGN.md §4.4/§9 P3).
+#[derive(Debug, Clone, Copy)]
+struct PrefillRuntimeConfig {
+    view_ms: u64,
+    preview_ms: u64,
+    record_ms: u64,
+    safety_factor: f64,
+}
+
+impl Default for PrefillRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            view_ms: 1000,
+            preview_ms: 2000,
+            record_ms: 6000,
+            safety_factor: 1.5,
+        }
+    }
 }
 
 fn fallback_space_label(actual_space: u32) -> String {
@@ -92,6 +116,80 @@ const TS_WRITE_BUFFER_CAPACITY: usize = 256;
 /// Control messages (SetChannelAck, HelloAck, etc.) are small and
 /// infrequent. 64 slots is more than sufficient.
 const CTRL_WRITE_BUFFER_CAPACITY: usize = 64;
+
+/// STREAMING_DESIGN.md §2 / docs/DESIGN.md §4.4: effective channel priority
+/// at or above this value ("録画(通常)"; 目安 録画(排他)=255 / 録画=200 /
+/// 視聴=10 / スキャン=0) auto-promotes a VIEW/PREVIEW session to RECORD.
+/// This only ever upgrades — an explicit RECORD from `Hello.stream_class`
+/// is never downgraded by this check.
+const RECORD_PRIORITY_THRESHOLD: i32 = 200;
+
+/// STREAMING_DESIGN.md §3.2 / §12-1: how long a RECORD session's TS write
+/// blocks (instead of dropping) when the per-session write buffer is full,
+/// before giving up and disconnecting. RECORD must never silently drop
+/// data; if the client/network can't drain the buffer within this window
+/// the "no loss" guarantee can no longer be honored, so the session is
+/// terminated with a recorded reason rather than violating it silently.
+const RECORD_OVERFLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Returns true if `effective_priority` is high enough to auto-promote a
+/// session to `StreamClass::Record` (STREAMING_DESIGN.md §2). Pure function
+/// so the threshold behavior can be unit tested without a full `Session`.
+fn should_auto_promote_to_record(effective_priority: i32) -> bool {
+    effective_priority >= RECORD_PRIORITY_THRESHOLD
+}
+
+/// Outcome of attempting to hand one pre-encoded TS wire-frame to the
+/// per-session writer task, after applying the class-specific backpressure
+/// policy (STREAMING_DESIGN.md §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsFrameSendOutcome {
+    /// Frame handed to the writer task (queued or, for RECORD, actually
+    /// accepted after blocking).
+    Sent,
+    /// VIEW/PREVIEW only: the write buffer was full, so the frame was
+    /// dropped rather than blocking the select loop.
+    DroppedFull,
+    /// RECORD only: the write buffer stayed full for the entire
+    /// `RECORD_OVERFLOW_TIMEOUT` window. The caller must disconnect the
+    /// session rather than drop data (STREAMING_DESIGN.md §12-1).
+    RecordOverflowTimeout,
+    /// The writer task's receiver was dropped (session already tearing down).
+    WriterClosed,
+}
+
+/// Enqueue one TS wire-frame for delivery, applying the per-class
+/// backpressure policy from STREAMING_DESIGN.md §3.2.
+///
+/// `record_overflow_timeout` is a parameter (rather than reading the
+/// `RECORD_OVERFLOW_TIMEOUT` constant directly) so unit tests can exercise
+/// the RECORD timeout path quickly instead of waiting out the real 10 s
+/// production value.
+///
+/// A free function (not a `Session` method) so the class-specific policy can
+/// be unit tested directly against a plain `mpsc::Sender`/`Receiver` pair
+/// without needing to construct a full `Session`.
+async fn send_ts_frame(
+    ts_write_tx: &mpsc::Sender<Bytes>,
+    frame: Bytes,
+    stream_class: StreamClass,
+    record_overflow_timeout: std::time::Duration,
+) -> TsFrameSendOutcome {
+    match stream_class {
+        StreamClass::View | StreamClass::Preview => match ts_write_tx.try_send(frame) {
+            Ok(()) => TsFrameSendOutcome::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => TsFrameSendOutcome::DroppedFull,
+            Err(mpsc::error::TrySendError::Closed(_)) => TsFrameSendOutcome::WriterClosed,
+        },
+        StreamClass::Record => {
+            match tokio::time::timeout(record_overflow_timeout, ts_write_tx.send(frame)).await {
+                Ok(Ok(())) => TsFrameSendOutcome::Sent,
+                Ok(Err(_)) => TsFrameSendOutcome::WriterClosed,
+                Err(_) => TsFrameSendOutcome::RecordOverflowTimeout,
+            }
+        }
+    }
+}
 
 /// A client session.
 pub struct Session {
@@ -168,6 +266,16 @@ pub struct Session {
     bytes_since_last: u64,
     interval_packets_total: u64,
     interval_packets_dropped: u64,
+    /// Loss-source breakdown (STREAMING_DESIGN.md §3.1 / §8).
+    /// Chunks skipped due to broadcast::Receiver lag. Unit is broadcast
+    /// chunks (≤256KB each, ~1394 TS packets), NOT TS packets — do not
+    /// add this into `packets_dropped`.
+    loss_broadcast_lag_chunks: u64,
+    /// Frames dropped because the per-session TS write mpsc buffer
+    /// (`TS_WRITE_BUFFER_CAPACITY`) was full.
+    loss_ts_queue_chunks: u64,
+    /// tsreplace input-queue stall events (Full or Closed).
+    loss_encoder_stall_events: u64,
     /// Session start time.
     session_started_at: std::time::Instant,
     /// Signal sampling for average.
@@ -186,18 +294,15 @@ pub struct Session {
     flushed_dropped: u64,
     flushed_scrambled: u64,
     flushed_error: u64,
-    /// tsreplace stdin input channel.
-    tsreplace_input_tx: Option<mpsc::Sender<Bytes>>,
-    /// tsreplace stdout output channel.
-    tsreplace_output_rx: Option<mpsc::Receiver<Bytes>>,
-    /// tsreplace process handle.
-    tsreplace_child: Option<Child>,
-    /// tsreplace output stall timeout.
-    tsreplace_read_timeout: std::time::Duration,
-    /// Fallback to raw TS when tsreplace fails/stalls.
+    /// Shared encoder pool (tsreplace) reference.
+    encoder_pool: Arc<EncoderPool>,
+    /// Currently joined shared encoder (tsreplace enabled and running).
+    /// The encoder process chain is owned by the pool, not the session.
+    current_encoder: Option<Arc<SharedEncoder>>,
+    /// Receiver of the shared encoder's output broadcast.
+    encoder_output_rx: Option<broadcast::Receiver<Bytes>>,
+    /// Fallback to raw TS when the shared encoder fails/stalls/saturates.
     tsreplace_passthrough_on_error: bool,
-    /// Last time encoded output was received.
-    tsreplace_last_output_at: std::time::Instant,
     /// Whether this session uses single-service TS filtering.
     single_service_filter_enabled: bool,
     /// Per-session TS service filter (active when single_service_filter_enabled
@@ -209,8 +314,15 @@ pub struct Session {
     current_tsid: Option<u16>,
     /// Current SID (set after channel selection).
     current_sid: Option<u16>,
-    /// Additional tsreplace child processes (for chained multi-SID encoding).
-    tsreplace_extra_children: Vec<Child>,
+    /// Stream reliability class (STREAMING_DESIGN.md §2). Set from
+    /// `Hello.stream_class`, defaults to `View`; may be auto-promoted to
+    /// `Record` by `maybe_promote_stream_class` based on effective priority.
+    stream_class: StreamClass,
+    /// Fixed-duration prefill / jitter buffer (STREAMING_DESIGN.md §4 P3).
+    /// Sits between `send_ts_data`'s 188-byte alignment and `send_ts_frame`'s
+    /// class-specific backpressure policy: while filling, wire frames are
+    /// queued here instead of being handed to the writer task.
+    prefill_buffer: PrefillBuffer,
 }
 
 impl Session {
@@ -227,6 +339,7 @@ impl Session {
         ctrl_write_tx: mpsc::Sender<Bytes>,
         writer_handle: tokio::task::JoinHandle<()>,
         tuner_pool: Arc<TunerPool>,
+        encoder_pool: Arc<EncoderPool>,
         database: DatabaseHandle,
         default_tuner: Option<String>,
         session_registry: Arc<SessionRegistry>,
@@ -270,6 +383,9 @@ impl Session {
             bytes_since_last: 0,
             interval_packets_total: 0,
             interval_packets_dropped: 0,
+            loss_broadcast_lag_chunks: 0,
+            loss_ts_queue_chunks: 0,
+            loss_encoder_stall_events: 0,
             session_started_at: std::time::Instant::now(),
             signal_samples: 0,
             signal_level_sum: 0.0,
@@ -281,30 +397,48 @@ impl Session {
             flushed_dropped: 0,
             flushed_scrambled: 0,
             flushed_error: 0,
-            tsreplace_input_tx: None,
-            tsreplace_output_rx: None,
-            tsreplace_child: None,
-            tsreplace_read_timeout: std::time::Duration::from_millis(10_000),
+            encoder_pool,
+            current_encoder: None,
+            encoder_output_rx: None,
             tsreplace_passthrough_on_error: true,
-            tsreplace_last_output_at: std::time::Instant::now(),
             single_service_filter_enabled: false,
             ts_service_filter: None,
             current_nid: None,
             current_tsid: None,
             current_sid: None,
-            tsreplace_extra_children: Vec::new(),
+            stream_class: StreamClass::View,
+            prefill_buffer: PrefillBuffer::new(),
+        }
+    }
+
+    /// Promote this session to `StreamClass::Record` if `effective_priority`
+    /// crosses the recording threshold (STREAMING_DESIGN.md §2). Never
+    /// downgrades — an explicit RECORD from `Hello.stream_class` sticks.
+    async fn maybe_promote_stream_class(&mut self, effective_priority: i32) {
+        if self.stream_class != StreamClass::Record
+            && should_auto_promote_to_record(effective_priority)
+        {
+            info!(
+                "[Session {}] Auto-promoting stream class to RECORD (effective priority {} >= {})",
+                self.id, effective_priority, RECORD_PRIORITY_THRESHOLD
+            );
+            self.stream_class = StreamClass::Record;
+            self.session_registry
+                .update_stream_class(self.id, self.stream_class)
+                .await;
         }
     }
 
     async fn load_tsreplace_runtime_config(&self) -> TsreplaceRuntimeConfig {
         let db = self.database.lock().await;
         match db.get_tsreplace_config() {
-            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => TsreplaceRuntimeConfig {
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => TsreplaceRuntimeConfig {
                 enabled,
                 command_path,
                 arguments,
                 read_timeout_ms,
                 passthrough_on_error,
+                max_concurrent_encoders,
             },
             Err(e) => {
                 warn!("[Session {}] Failed to load tsreplace config: {}", self.id, e);
@@ -314,28 +448,87 @@ impl Session {
                     arguments: String::new(),
                     read_timeout_ms: 10_000,
                     passthrough_on_error: true,
+                    max_concurrent_encoders: 2,
                 }
             }
         }
     }
 
-    async fn stop_tsreplace_pipeline(&mut self) {
-        self.tsreplace_input_tx = None;
-        self.tsreplace_output_rx = None;
-
-        // Kill all chained tsreplace processes (in reverse order)
-        for mut child in self.tsreplace_extra_children.drain(..).rev() {
-            if let Err(e) = child.start_kill() {
-                debug!("[Session {}] tsreplace chain kill skipped: {}", self.id, e);
+    /// Load the fixed-duration prefill/jitter buffer settings from
+    /// `tuner_config` (STREAMING_DESIGN.md §4.4 P3). Read directly from the
+    /// DB on each call (same pattern as `load_tsreplace_runtime_config`)
+    /// rather than cached, so dashboard changes take effect on the next
+    /// `StartStream`/channel switch without a server restart.
+    async fn load_prefill_runtime_config(&self) -> PrefillRuntimeConfig {
+        let db = self.database.lock().await;
+        match db.get_tuner_config() {
+            Ok((
+                _keep_alive_secs,
+                _prewarm_enabled,
+                _prewarm_timeout_secs,
+                _set_channel_retry_interval_ms,
+                _set_channel_retry_timeout_ms,
+                _signal_poll_interval_ms,
+                _signal_wait_timeout_ms,
+                prefill_view_ms,
+                prefill_preview_ms,
+                prefill_record_ms,
+                jitter_safety_factor,
+            )) => PrefillRuntimeConfig {
+                view_ms: prefill_view_ms,
+                preview_ms: prefill_preview_ms,
+                record_ms: prefill_record_ms,
+                safety_factor: jitter_safety_factor,
+            },
+            Err(e) => {
+                warn!("[Session {}] Failed to load prefill config: {}", self.id, e);
+                PrefillRuntimeConfig::default()
             }
-            let _ = child.wait().await;
         }
+    }
 
-        if let Some(mut child) = self.tsreplace_child.take() {
-            if let Err(e) = child.start_kill() {
-                debug!("[Session {}] tsreplace kill skipped: {}", self.id, e);
-            }
-            let _ = child.wait().await;
+    /// (Re)start the prefill/jitter buffer for the current channel and
+    /// stream class (STREAMING_DESIGN.md §4.3). Called on successful
+    /// `StartStream` and on completion of a channel switch while already
+    /// streaming.
+    ///
+    /// Sizing (§4.2): `target_bytes = bitrate_bps/8 * prefill_ms/1000 *
+    /// safety_factor`, where `bitrate_bps` is a per-band static default
+    /// (`current_nid` is classified via `BandType::from_nid`; unresolved NID
+    /// — e.g. legacy v1 `SetChannel` clients — falls back to the "unknown"
+    /// default). `prefill_ms == 0` fully bypasses prefill for this
+    /// class/config (STREAMING_DESIGN.md §4.3).
+    async fn reset_prefill_buffer(&mut self) {
+        let cfg = self.load_prefill_runtime_config().await;
+        let prefill_ms = match self.stream_class {
+            StreamClass::View => cfg.view_ms,
+            StreamClass::Preview => cfg.preview_ms,
+            StreamClass::Record => cfg.record_ms,
+        };
+        let band = self.current_nid.map(BandType::from_nid);
+        let bitrate_bps = default_bitrate_bps(band);
+        let target_bytes = prefill_target_bytes(bitrate_bps, prefill_ms, cfg.safety_factor);
+
+        debug!(
+            "[Session {}] Prefill buffer reset: class={:?} band={:?} bitrate_bps={} prefill_ms={} safety_factor={} target_bytes={}",
+            self.id, self.stream_class, band, bitrate_bps, prefill_ms, cfg.safety_factor, target_bytes
+        );
+
+        self.prefill_buffer.reset(target_bytes);
+    }
+
+    /// Detach from the shared encoder (if any).
+    ///
+    /// The encoder chain itself is owned by the [`EncoderPool`]; releasing
+    /// only drops this session's subscription. When the last subscriber
+    /// leaves, the pool stops the chain after a short idle grace period, so
+    /// zapping back re-joins the still-warm encoder instead of paying the
+    /// QSV init cost again (STREAMING_DESIGN.md §5.2 (C)).
+    async fn stop_tsreplace_pipeline(&mut self) {
+        self.encoder_output_rx = None;
+        if let Some(encoder) = self.current_encoder.take() {
+            let key = encoder.key.clone();
+            self.encoder_pool.release(&key, &encoder).await;
         }
     }
 
@@ -373,338 +566,90 @@ impl Session {
         Vec::new()
     }
 
-    /// Check if `--service` or `-s` is already present in arguments.
-    fn args_contain_service_option(arguments: &str) -> bool {
-        let tokens: Vec<&str> = arguments.split_whitespace().collect();
-        tokens.iter().any(|t| *t == "--service" || *t == "-s")
-    }
-
-    /// Build command arguments with `--service <SID>` auto-injected.
+    /// Attach this session to a shared encoder (tsreplace) for the current
+    /// channel, creating one via the [`EncoderPool`] if needed.
     ///
-    /// Inserts `--service <SID>` and `--preserve-other-services` before
-    /// the `-e`/`--encoder` option (if present), or at the end.
-    fn build_tsreplace_args(base_arguments: &str, sid: u16) -> Vec<String> {
-        let tokens: Vec<&str> = base_arguments.split_whitespace().collect();
-        let mut args = Vec::with_capacity(tokens.len() + 4);
-
-        // Find position of -e/--encoder to insert --service before it
-        let encoder_pos = tokens.iter().position(|t| *t == "-e" || *t == "--encoder");
-
-        let has_preserve = tokens.iter().any(|t| *t == "--preserve-other-services");
-
-        for (i, token) in tokens.iter().enumerate() {
-            if encoder_pos == Some(i) {
-                // Insert --service and --preserve-other-services before encoder
-                args.push("--service".to_string());
-                args.push(sid.to_string());
-                if !has_preserve {
-                    args.push("--preserve-other-services".to_string());
-                }
-            }
-            args.push(token.to_string());
-        }
-
-        // If no -e/--encoder found, append at end
-        if encoder_pos.is_none() {
-            args.push("--service".to_string());
-            args.push(sid.to_string());
-            if !has_preserve {
-                args.push("--preserve-other-services".to_string());
-            }
-        }
-
-        args
-    }
-
-    /// Spawn a single tsreplace process with the given arguments.
-    fn spawn_tsreplace(
-        command_path: &str,
-        args: &[String],
-        stdin_cfg: std::process::Stdio,
-        stdout_cfg: std::process::Stdio,
-    ) -> std::io::Result<Child> {
-        let mut cmd = Command::new(command_path);
-        for arg in args {
-            cmd.arg(arg);
-        }
-        cmd.stdin(stdin_cfg)
-            .stdout(stdout_cfg)
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        cmd.spawn()
-    }
-
-    /// Spawn a background task to forward stderr lines to the log.
-    fn spawn_stderr_logger(id: u64, sid: u16, stderr: tokio::process::ChildStderr) {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => debug!("[tsreplace SID={}][Session {}] {}", sid, id, line),
-                    Ok(None) => break,
-                    Err(e) => {
-                        warn!("[tsreplace SID={}][Session {}] stderr read failed: {}", sid, id, e);
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
+    /// The per-session process pipeline that used to live here (single
+    /// process + multi-SID OS-pipe chain) has moved to
+    /// `crate::tuner::encoder_pool`; sessions now only subscribe to the
+    /// shared encoder's output broadcast (STREAMING_DESIGN.md §5 P4).
+    ///
+    /// Returns `Ok(())` on success, on tsreplace-disabled, and on pool
+    /// saturation (the latter falls back to raw TS passthrough with an info
+    /// log — saturation is an expected admission-control outcome, not an
+    /// error). Returns `Err` only when spawning a new encoder chain failed;
+    /// callers then apply the `passthrough_on_error` policy.
     async fn start_tsreplace_pipeline(&mut self) -> std::io::Result<()> {
         self.stop_tsreplace_pipeline().await;
 
         let cfg = self.load_tsreplace_runtime_config().await;
         self.tsreplace_passthrough_on_error = cfg.passthrough_on_error;
-        self.tsreplace_read_timeout = std::time::Duration::from_millis(cfg.read_timeout_ms.max(1));
 
         if !cfg.enabled {
             return Ok(());
         }
 
-        // Determine which SIDs to encode
-        let sids = self.resolve_encode_sids().await;
+        let Some(tuner) = self.current_tuner.clone() else {
+            // No tuner yet — nothing to encode; raw path handles it.
+            return Ok(());
+        };
 
-        // If --service is already manually specified in the config, or no SIDs resolved,
-        // fall back to the original single-process behavior (no auto-injection)
-        let user_specified_service = Self::args_contain_service_option(&cfg.arguments);
+        // Apply the configured concurrency cap. Affects this and subsequent
+        // encoder creations only; already-running encoders keep their slots.
+        self.encoder_pool
+            .set_max_concurrent(cfg.max_concurrent_encoders.max(1) as usize)
+            .await;
 
-        if user_specified_service || sids.is_empty() {
-            // Original behavior: single tsreplace process with user's arguments
-            return self.start_tsreplace_pipeline_single(
-                &cfg.command_path,
-                &cfg.arguments.split_whitespace().map(String::from).collect::<Vec<_>>(),
-            ).await;
-        }
+        // If the user's argument template already carries --service, no
+        // per-SID auto-injection happens; normalize the SID set to empty so
+        // every such session on this channel shares a single encoder.
+        let sids = if encoder_pool::args_contain_service_option(&cfg.arguments) {
+            Vec::new()
+        } else {
+            self.resolve_encode_sids().await
+        };
 
-        if sids.len() == 1 {
-            // Single SID: one tsreplace with auto-injected --service
-            let args = Self::build_tsreplace_args(&cfg.arguments, sids[0]);
-            info!(
-                "[Session {}] tsreplace pipeline started (SID={}): command='{}' args='{}'",
-                self.id, sids[0], cfg.command_path, args.join(" ")
-            );
-            return self.start_tsreplace_pipeline_single(&cfg.command_path, &args).await;
-        }
-
-        // Multiple SIDs: chain tsreplace instances via OS-level pipes
-        // stdin → tsreplace(SID1) →(pipe)→ tsreplace(SID2) →(pipe)→ ... → tsreplace(SIDn) → stdout
-        // Each process encodes its target SID while passing all other packets through
-        // immediately, so all SIDs encode in parallel with ~zero inter-process overhead.
-        info!(
-            "[Session {}] tsreplace chained pipeline for {} SIDs: {:?}",
-            self.id,
-            sids.len(),
-            sids.iter().map(|s| format!("0x{:04X}", s)).collect::<Vec<_>>()
-        );
-
-        let mut children: Vec<Child> = Vec::with_capacity(sids.len());
-
-        // Spawn first process: stdin = piped (our feeder), stdout = piped (to next)
-        let args_first = Self::build_tsreplace_args(&cfg.arguments, sids[0]);
-        let mut first_child = Self::spawn_tsreplace(
+        let generation = encoder_pool::config_generation(
             &cfg.command_path,
-            &args_first,
-            std::process::Stdio::piped(),
-            std::process::Stdio::piped(),
-        ).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to spawn tsreplace for SID {}: {}", sids[0], e),
-            )
-        })?;
-
-        let pipeline_stdin = first_child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace chain: stdin not available")
-        })?;
-        if let Some(stderr) = first_child.stderr.take() {
-            Self::spawn_stderr_logger(self.id, sids[0], stderr);
-        }
-
-        children.push(first_child);
-
-        // Spawn subsequent processes: connect via OS-level pipes (zero-copy).
-        // TryInto<Stdio> transfers the fd/handle ownership directly to the next
-        // process, so the kernel moves data between pipe buffers without any
-        // userspace copying or async-task scheduling overhead.
-        for (idx, &sid) in sids[1..].iter().enumerate() {
-            let args = Self::build_tsreplace_args(&cfg.arguments, sid);
-
-            let prev_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("tsreplace chain: stdout not available for SID {}", sids[idx]),
-                )
-            })?;
-
-            let prev_stdio: std::process::Stdio = prev_stdout.try_into().map_err(|e: std::io::Error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("tsreplace chain: failed to convert stdout to Stdio: {}", e),
-                )
-            })?;
-
-            let mut child = Self::spawn_tsreplace(
-                &cfg.command_path,
-                &args,
-                prev_stdio,
-                std::process::Stdio::piped(),
-            ).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to spawn tsreplace for SID {}: {}", sid, e),
-                )
-            })?;
-
-            if let Some(stderr) = child.stderr.take() {
-                Self::spawn_stderr_logger(self.id, sid, stderr);
-            }
-
-            children.push(child);
-        }
-
-        // Wire up: feeder → first.stdin, last.stdout → collector
-        let final_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace chain: final stdout not available")
-        })?;
-
-        let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(64);
-        let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
-
-        // Feeder task: channel → first process stdin
-        tokio::spawn(async move {
-            let mut stdin = pipeline_stdin;
-            while let Some(chunk) = in_rx.recv().await {
-                if let Err(e) = stdin.write_all(&chunk).await {
-                    warn!("[tsreplace chain] stdin write failed: {}", e);
-                    break;
-                }
-            }
-            let _ = stdin.shutdown().await;
-        });
-
-        // Collector task: last process stdout → channel
-        tokio::spawn(async move {
-            let mut stdout = final_stdout;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if out_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("[tsreplace chain] stdout read failed: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Store the first child as primary, rest as extra
-        self.tsreplace_child = Some(children.remove(0));
-        self.tsreplace_extra_children = children;
-        self.tsreplace_input_tx = Some(in_tx);
-        self.tsreplace_output_rx = Some(out_rx);
-        self.tsreplace_last_output_at = std::time::Instant::now();
-
-        info!(
-            "[Session {}] tsreplace chained pipeline started: {} processes (OS-level pipe)",
-            self.id,
-            sids.len()
+            &cfg.arguments,
+            cfg.read_timeout_ms,
         );
+        let key = EncodeKey::new(tuner.key.clone(), sids, generation);
 
-        Ok(())
-    }
+        let runtime = EncoderRuntimeConfig {
+            command_path: cfg.command_path,
+            arguments: cfg.arguments,
+            read_timeout_ms: cfg.read_timeout_ms,
+        };
 
-    /// Start a single-process tsreplace pipeline (original behavior or single-SID).
-    async fn start_tsreplace_pipeline_single(
-        &mut self,
-        command_path: &str,
-        args: &[String],
-    ) -> std::io::Result<()> {
-        let mut child = Self::spawn_tsreplace(
-            command_path,
-            args,
-            std::process::Stdio::piped(),
-            std::process::Stdio::piped(),
-        ).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to spawn tsreplace '{}': {}", command_path, e),
-            )
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace stdin not available")
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "tsreplace stdout not available")
-        })?;
-
-        if let Some(stderr) = child.stderr.take() {
-            let id = self.id;
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => debug!("[tsreplace][Session {}] {}", id, line),
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!("[tsreplace][Session {}] stderr read failed: {}", id, e);
-                            break;
-                        }
-                    }
-                }
-            });
+        match self.encoder_pool.get_or_create(key, tuner, runtime).await {
+            Ok(encoder) => {
+                self.encoder_output_rx = Some(encoder.subscribe());
+                info!(
+                    "[Session {}] joined shared encoder for {:?} (sids={:?}, subscribers={})",
+                    self.id,
+                    encoder.key.channel_key,
+                    encoder.key.sids,
+                    encoder.subscriber_count()
+                );
+                self.current_encoder = Some(encoder);
+                Ok(())
+            }
+            Err(EncoderPoolError::Saturated) => {
+                // Admission control: no encoder slot free and no running
+                // encoder to join. Fall back to raw TS passthrough
+                // (STREAMING_DESIGN.md §5.2 (B)).
+                info!(
+                    "[Session {}] encoder pool saturated ({} rejections total), falling back to raw TS passthrough",
+                    self.id,
+                    self.encoder_pool.saturated_count()
+                );
+                Ok(())
+            }
+            Err(EncoderPoolError::SpawnFailed(e)) => {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
         }
-
-        let (in_tx, mut in_rx) = mpsc::channel::<Bytes>(64);
-        let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
-
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(chunk) = in_rx.recv().await {
-                if let Err(e) = stdin.write_all(&chunk).await {
-                    warn!("[tsreplace] stdin write failed: {}", e);
-                    break;
-                }
-            }
-            let _ = stdin.shutdown().await;
-        });
-
-        tokio::spawn(async move {
-            let mut stdout = stdout;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if out_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("[tsreplace] stdout read failed: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        self.tsreplace_input_tx = Some(in_tx);
-        self.tsreplace_output_rx = Some(out_rx);
-        self.tsreplace_child = Some(child);
-        self.tsreplace_last_output_at = std::time::Instant::now();
-
-        info!(
-            "[Session {}] tsreplace pipeline started: command='{}' args='{}'",
-            self.id, command_path, args.join(" ")
-        );
-
-        Ok(())
     }
 
     async fn restart_tsreplace_pipeline_if_streaming(&mut self) {
@@ -1581,25 +1526,58 @@ impl Session {
                         self.read_buf.extend_from_slice(&tmp_buf[..n]);
                     }
 
-                    // Encoded output from tsreplace
+                    // Encoded output from the shared encoder (tsreplace).
+                    // The encoder chain is fed by the EncoderPool's own task
+                    // from the tuner broadcast; this session only consumes
+                    // the encoder's output broadcast.
                     encoded_result = async {
-                        if let Some(rx) = &mut self.tsreplace_output_rx {
-                            rx.recv().await
+                        if let Some(rx) = &mut self.encoder_output_rx {
+                            Some(rx.recv().await)
                         } else {
-                            std::future::pending::<Option<Bytes>>().await
+                            std::future::pending::<Option<Result<Bytes, broadcast::error::RecvError>>>().await
                         }
                     } => {
-                        if let Some(data) = encoded_result {
-                            self.tsreplace_last_output_at = std::time::Instant::now();
-                            self.send_ts_data(data).await?;
-                        } else if self.tsreplace_output_rx.is_some() {
-                            warn!("[Session {}] tsreplace output channel closed", self.id);
-                            if self.tsreplace_passthrough_on_error {
-                                self.stop_tsreplace_pipeline().await;
-                            } else {
-                                self.disconnect_reason = Some("tsreplace_output_closed".to_string());
-                                break;
+                        match encoded_result {
+                            Some(Ok(data)) => {
+                                if self.send_ts_data(data).await? {
+                                    break;
+                                }
                             }
+                            Some(Err(broadcast::error::RecvError::Lagged(count))) => {
+                                // STREAMING_DESIGN.md §3.2 / §12-1: a RECORD
+                                // session must not silently lose data. Falling
+                                // behind a broadcast channel (even the encoder
+                                // output one) means it can't keep up at all —
+                                // disconnect instead of resyncing and
+                                // continuing (the VIEW/PREVIEW recovery path).
+                                if self.stream_class == StreamClass::Record {
+                                    error!("[Session {}] RECORD session lagged on encoder output ({} chunks skipped), disconnecting", self.id, count);
+                                    self.disconnect_reason = Some("record_broadcast_lag".to_string());
+                                    break;
+                                }
+                                warn!("[Session {}] Encoder output receiver lagged, skipped {} chunks — recovering", self.id, count);
+                                self.loss_broadcast_lag_chunks += count;
+                                // Same recovery as tuner-broadcast lag: clear
+                                // carry buffers so the next chunk re-aligns.
+                                self.ts_send_carry.clear();
+                                self.ts_quality_carry.clear();
+                            }
+                            Some(Err(broadcast::error::RecvError::Closed)) => {
+                                // The shared encoder stopped: watchdog stall,
+                                // chain EOF/crash, or pool idle-close raced
+                                // with us. Counted as an encoder stall event
+                                // (P1 loss-source counter — previously wired
+                                // to the input-queue Full/Closed cases).
+                                warn!("[Session {}] Shared encoder output closed", self.id);
+                                self.loss_encoder_stall_events += 1;
+                                if self.tsreplace_passthrough_on_error {
+                                    self.stop_tsreplace_pipeline().await;
+                                } else {
+                                    self.disconnect_reason = Some("tsreplace_output_closed".to_string());
+                                    break;
+                                }
+                            }
+                            None => {}
                         }
                     }
 
@@ -1614,52 +1592,35 @@ impl Session {
                     } => {
                         match ts_result {
                             Some(Ok(data)) => {
-                                if let Some(tx) = &self.tsreplace_input_tx {
-                                    match tx.try_send(data.clone()) {
-                                        Ok(()) => {
-                                            if self.tsreplace_passthrough_on_error
-                                                && self.tsreplace_last_output_at.elapsed() > self.tsreplace_read_timeout
-                                            {
-                                                warn!(
-                                                    "[Session {}] tsreplace stalled for {:?}, fallback to raw TS",
-                                                    self.id,
-                                                    self.tsreplace_last_output_at.elapsed()
-                                                );
-                                                self.stop_tsreplace_pipeline().await;
-                                                self.send_ts_data(data).await?;
-                                            }
-                                        }
-                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                            warn!(
-                                                "[Session {}] tsreplace input queue full; treating as stall",
-                                                self.id
-                                            );
-                                            if self.tsreplace_passthrough_on_error {
-                                                self.stop_tsreplace_pipeline().await;
-                                                self.send_ts_data(data).await?;
-                                            } else {
-                                                self.disconnect_reason = Some("tsreplace_input_backpressure".to_string());
-                                                break;
-                                            }
-                                        }
-                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                            warn!("[Session {}] tsreplace input channel closed", self.id);
-                                            if self.tsreplace_passthrough_on_error {
-                                                self.stop_tsreplace_pipeline().await;
-                                                self.send_ts_data(data).await?;
-                                            } else {
-                                                self.disconnect_reason = Some("tsreplace_input_closed".to_string());
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    self.send_ts_data(data).await?;
+                                if self.current_encoder.is_some() {
+                                    // A shared encoder is active: it consumes
+                                    // the tuner broadcast itself, so the raw
+                                    // copy is dropped here. We stay subscribed
+                                    // so the tuner's keep-alive / idle-close
+                                    // accounting remains session-driven.
+                                    let _ = data;
+                                } else if self.send_ts_data(data).await? {
+                                    break;
                                 }
                             }
                             Some(Err(broadcast::error::RecvError::Lagged(count))) => {
-                                warn!("[Session {}] Broadcast receiver lagged, skipped {} messages — recovering", self.id, count);
-                                self.packets_dropped += count;
+                                // STREAMING_DESIGN.md §3.2 / §12-1: RECORD must
+                                // not silently lose data. Lagging behind the
+                                // tuner's own broadcast is worse than a full
+                                // write-queue — it means the session can't
+                                // keep up with the source at all — so
+                                // disconnect rather than resync-and-continue.
+                                if self.stream_class == StreamClass::Record {
+                                    error!("[Session {}] RECORD session lagged on tuner broadcast ({} chunks skipped), disconnecting", self.id, count);
+                                    self.disconnect_reason = Some("record_broadcast_lag".to_string());
+                                    break;
+                                }
+                                warn!("[Session {}] Broadcast receiver lagged, skipped {} chunks — recovering", self.id, count);
+                                // `count` is a number of broadcast chunks (each up to
+                                // 256KB / ~1394 TS packets), NOT a TS packet count.
+                                // Track it separately rather than folding it into
+                                // `packets_dropped` (see STREAMING_DESIGN.md §3.1).
+                                self.loss_broadcast_lag_chunks += count;
                                 // Recovery: clear the TS carry buffers so we don't
                                 // send partial/stale packets after the gap.  The
                                 // next received chunk will start a fresh alignment.
@@ -1802,8 +1763,8 @@ impl Session {
     /// Handle a client message. Returns false to close the session.
     async fn handle_message(&mut self, msg: ClientMessage) -> std::io::Result<bool> {
         match msg {
-            ClientMessage::Hello { version } => {
-                self.handle_hello(version).await?;
+            ClientMessage::Hello { version, stream_class } => {
+                self.handle_hello(version, stream_class).await?;
             }
             ClientMessage::Ping => {
                 self.send_message(ServerMessage::Pong).await?;
@@ -1867,15 +1828,25 @@ impl Session {
     }
 
     /// Handle Hello message.
-    async fn handle_hello(&mut self, version: u16) -> std::io::Result<()> {
+    ///
+    /// docs/DESIGN.md §3 compat policy: `MessageType` values never change and
+    /// payload growth happens via `Hello.version` negotiation. Protocol v2
+    /// added `stream_class`; older (v1) clients simply never send it (the
+    /// codec defaults them to `StreamClass::View`), so a v1 client is still
+    /// accepted here — only truly unknown/future versions are rejected.
+    async fn handle_hello(&mut self, version: u16, stream_class: StreamClass) -> std::io::Result<()> {
         info!(
-            "[Session {}] Client hello, version {}",
-            self.id, version
+            "[Session {}] Client hello, version {}, stream_class {:?}",
+            self.id, version, stream_class
         );
 
-        let success = version == PROTOCOL_VERSION;
+        let success = version >= 1 && version <= PROTOCOL_VERSION;
         if success {
             self.state = SessionState::Ready;
+            self.stream_class = stream_class;
+            self.session_registry
+                .update_stream_class(self.id, self.stream_class)
+                .await;
         }
 
         self.send_message(ServerMessage::HelloAck {
@@ -2089,8 +2060,7 @@ impl Session {
             .get_effective_controls(self.id)
             .await
             .unwrap_or((Some(priority), exclusive));
-        let _priority = effective_priority_opt.unwrap_or(priority);
-        let _exclusive = effective_exclusive;
+        let effective_priority = effective_priority_opt.unwrap_or(priority);
 
         let tuner_path = match &self.current_tuner_path {
             Some(p) => p.clone(),
@@ -2108,6 +2078,21 @@ impl Session {
             "[Session {}] SetChannel: {} on {}",
             self.id, channel, tuner_path
         );
+
+        // STREAMING_DESIGN.md §2: mirror the v2 SetChannelSpace priority
+        // resolution (client priority > exclusive-max > DB default) so v1
+        // SetChannel sessions get the same auto-promotion behavior.
+        let channel_priority_for_class = if effective_priority > 0 {
+            effective_priority
+        } else if effective_exclusive {
+            i32::MAX
+        } else {
+            let db = self.database.lock().await;
+            db.get_channel_priority(&tuner_path, 0, channel as u32)
+                .unwrap_or(Some(0))
+                .unwrap_or(0)
+        };
+        self.maybe_promote_stream_class(channel_priority_for_class).await;
 
         // Create channel key
         let key = ChannelKey::simple(&tuner_path, channel);
@@ -2558,6 +2543,11 @@ impl Session {
             }
         };
 
+        // STREAMING_DESIGN.md §2: high-priority (recording-grade) selection
+        // auto-promotes this session to RECORD, regardless of what the
+        // client declared in Hello.
+        self.maybe_promote_stream_class(channel_priority).await;
+
         // ★ If exclusive is requested, only evict when the DLL is at capacity.
         // Multi-instance DLLs (max_instances > 1) can serve multiple channels
         // simultaneously — each instance is independent.  When spare slots are
@@ -2794,7 +2784,7 @@ impl Session {
                         };
                         self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
                         self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-                        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
+                        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
                         self.current_channel_name = channel_name;
 
                         return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
@@ -3081,7 +3071,7 @@ impl Session {
                     };
                     self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                     self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                    self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
+                    self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
                     self.current_channel_name = fb_ch_name;
                     return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                 }
@@ -3193,7 +3183,7 @@ impl Session {
                             };
                             self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                             self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
+                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
                             self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
@@ -3239,7 +3229,7 @@ impl Session {
                             };
                             self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
                             self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid);
+                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
                             self.current_channel_name = fb_ch_name;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
@@ -3366,7 +3356,7 @@ impl Session {
                 };
                 self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
                 self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-                self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
+                self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
                 self.current_channel_name = channel_name;
 
                 // BonDriver reader is confirmed ready by start_reader_with_warm (via ready_rx, up to 10s timeout).
@@ -3487,6 +3477,10 @@ impl Session {
             }
         }
 
+        // STREAMING_DESIGN.md §4.3: start the prefill/jitter buffer now that
+        // streaming has actually begun.
+        self.reset_prefill_buffer().await;
+
         // Update session registry
         self.session_registry.update_streaming(self.id, true).await;
 
@@ -3523,6 +3517,12 @@ impl Session {
         self.stop_tsreplace_pipeline().await;
         self.state = SessionState::TunerOpen;
 
+        // STREAMING_DESIGN.md §4.3: discard the prefill/jitter buffer state.
+        // `StartStream` performs its own `reset()` when streaming resumes, so
+        // it does not matter whether this leaves `PrefillBuffer` filling or
+        // passthrough — only the queued frames need to go.
+        self.prefill_buffer.clear();
+
         // Update session registry
         self.session_registry.update_streaming(self.id, false).await;
 
@@ -3538,6 +3538,10 @@ impl Session {
         if let Some(rx) = &mut self.ts_receiver {
             while rx.try_recv().is_ok() {}
         }
+
+        // STREAMING_DESIGN.md §4.3: also drop any frames queued in the
+        // prefill/jitter buffer without changing its filling/passthrough state.
+        self.prefill_buffer.clear();
 
         self.send_message(ServerMessage::PurgeStreamAck { success: true })
             .await
@@ -3576,11 +3580,22 @@ impl Session {
     /// If single-service filtering is enabled, creates or updates the filter;
     /// otherwise this is a no-op for the filter.
     /// Always updates current NID/TSID/SID tracking for tsreplace SID injection.
-    fn update_service_filter_for_sid(&mut self, nid: Option<u16>, tsid: Option<u16>, sid: Option<u16>) {
+    ///
+    /// Also the STREAMING_DESIGN.md §4.3 hook for "channel switch completed
+    /// while streaming": every caller reaches this function exactly when the
+    /// session's notion of "current channel" changes, so it resets the
+    /// prefill/jitter buffer for the new channel's band-based bitrate
+    /// default (no-op if not currently `Streaming` — `StartStream` performs
+    /// its own reset when the stream actually begins).
+    async fn update_service_filter_for_sid(&mut self, nid: Option<u16>, tsid: Option<u16>, sid: Option<u16>) {
         // Always update NID/TSID/SID tracking (used by tsreplace pipeline)
         self.current_nid = nid;
         self.current_tsid = tsid;
         self.current_sid = sid;
+
+        if self.state == SessionState::Streaming {
+            self.reset_prefill_buffer().await;
+        }
 
         if !self.single_service_filter_enabled {
             return;
@@ -3902,7 +3917,7 @@ impl Session {
             };
             self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
             self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-            self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid);
+            self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
             self.current_channel_name = channel_name;
 
             return self.send_message(ServerMessage::SelectLogicalChannelAck {
@@ -4019,7 +4034,12 @@ impl Session {
     }
 
     /// Send TS data to the client.
-    async fn send_ts_data(&mut self, data: Bytes) -> std::io::Result<()> {
+    ///
+    /// Returns `Ok(true)` if the caller must disconnect the session (RECORD
+    /// write-queue overflow, STREAMING_DESIGN.md §3.2/§12-1) — the run()
+    /// select loop is expected to `break` in that case so `cleanup()` still
+    /// runs and the reason is recorded in `session_history`.
+    async fn send_ts_data(&mut self, data: Bytes) -> std::io::Result<bool> {
         // ---- 1) Align outgoing TS to 188-byte packets ----
         self.ts_send_carry.extend_from_slice(&data);
 
@@ -4054,7 +4074,7 @@ impl Session {
         let send_len = self.ts_send_carry.len() - (self.ts_send_carry.len() % 188);
         if send_len < 188 {
             // wait for enough bytes to form at least one TS packet
-            return Ok(());
+            return Ok(false);
         }
 
         let send_data = Bytes::copy_from_slice(&self.ts_send_carry[..send_len]);
@@ -4064,7 +4084,7 @@ impl Session {
         let send_data = if let Some(ref mut filter) = self.ts_service_filter {
             let filtered = filter.filter(&send_data);
             if filtered.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             Bytes::from(filtered)
         } else {
@@ -4142,6 +4162,8 @@ impl Session {
                     0.0
                 };
 
+                let top_loss_pids = self.ts_quality_analyzer.top_loss_pids(10);
+
                 self.session_registry.update_stats(
                     self.id,
                     signal_level,
@@ -4150,7 +4172,17 @@ impl Session {
                     self.packets_scrambled,
                     self.packets_error,
                     bitrate_mbps,
+                    self.loss_broadcast_lag_chunks,
+                    self.loss_ts_queue_chunks,
+                    self.loss_encoder_stall_events,
+                    top_loss_pids,
                 ).await;
+
+                // STREAMING_DESIGN.md §4 P3: surface prefill/jitter buffer
+                // status on the same 1-second cadence as the other stats.
+                self.session_registry
+                    .update_prefilling(self.id, self.prefill_buffer.is_filling())
+                    .await;
 
                 let timestamp_ms = chrono::Utc::now().timestamp_millis();
                 self.session_registry.push_metrics_sample(
@@ -4184,12 +4216,31 @@ impl Session {
     /// The frame is built in-place using the same wire format (BNDP header +
     /// payload) so the client's fast-path TsData decoder works unchanged.
     ///
-    /// Uses `try_send` on the write channel so the select loop is never
-    /// blocked by network backpressure.  When the channel is full (sustained
-    /// congestion), the frame is dropped so the select loop stays responsive.
-    /// The 256-slot buffer holds ~15–25 seconds of TS data at typical bitrates,
-    /// so only prolonged outages cause drops.
-    async fn send_ts_data_raw(&mut self, data: Bytes) -> std::io::Result<()> {
+    /// STREAMING_DESIGN.md §4.3: the wire frame is first routed through the
+    /// prefill/jitter buffer. While it is filling, the frame is queued here
+    /// and never reaches `send_ts_frame` below — it does not go through the
+    /// class-specific backpressure policy at all (a RECORD session's
+    /// no-loss overflow timer, in particular, only starts counting once
+    /// prefill has released, since nothing has actually been asked to leave
+    /// the queue yet). Once the target is reached, the whole queue flushes
+    /// through the loop below in one shot.
+    ///
+    /// Applies the class-specific backpressure policy from
+    /// `send_ts_frame` (STREAMING_DESIGN.md §3.2):
+    /// - VIEW/PREVIEW: `try_send`, drop the frame on Full so the select loop
+    ///   is never blocked by network backpressure. The 256-slot buffer holds
+    ///   ~15–25 s of TS data at typical bitrates, so only prolonged network
+    ///   congestion causes drops.
+    /// - RECORD: blocking `send` bounded by `RECORD_OVERFLOW_TIMEOUT`. This
+    ///   deliberately stalls the select loop (so control-message handling is
+    ///   delayed too) for as long as `RECORD_OVERFLOW_TIMEOUT` — accepted
+    ///   because a RECORD client that cannot drain 10 s of buffered data is
+    ///   already beyond saving; disconnecting is the correct outcome
+    ///   (STREAMING_DESIGN.md §12-1).
+    ///
+    /// Returns `Ok(true)` when the caller should disconnect the session
+    /// (RECORD overflow timeout).
+    async fn send_ts_data_raw(&mut self, data: Bytes) -> std::io::Result<bool> {
         use bytes::BufMut;
         use recisdb_protocol::{MessageType, MAGIC};
 
@@ -4202,45 +4253,70 @@ impl Session {
 
         let frame = frame.freeze();
 
-        match self.ts_write_tx.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // The write buffer is full — the writer task can't keep up
-                // with the network.  Drop this frame to keep the select
-                // loop responsive.  The buffer holds ~15–25 s of data, so
-                // reaching this point implies prolonged network congestion.
-                //
-                // Clear carry buffers so the next frame starts with a clean
-                // 188-byte alignment (same recovery as broadcast Lagged).
-                self.ts_send_carry.clear();
-                self.ts_quality_carry.clear();
-                self.packets_dropped += 1;
+        let frames = match self.prefill_buffer.push(frame) {
+            Some(frames) => frames,
+            // Still filling: queued, nothing to send yet.
+            None => return Ok(false),
+        };
 
-                // Log once per second to avoid flooding.
-                static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let prev = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
-                if now_ms.saturating_sub(prev) >= 1000 {
-                    LAST_WARN.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                    warn!(
-                        "[Session {}] Write buffer full, dropped TS frame ({} bytes). \
-                         Total dropped: {}",
-                        self.id, data.len(), self.packets_dropped
-                    );
+        for frame in frames {
+            let data_len = frame.len();
+
+            match send_ts_frame(&self.ts_write_tx, frame, self.stream_class, RECORD_OVERFLOW_TIMEOUT).await {
+                TsFrameSendOutcome::Sent => {}
+                TsFrameSendOutcome::DroppedFull => {
+                    // The write buffer is full — the writer task can't keep up
+                    // with the network.  Drop this frame to keep the select
+                    // loop responsive.  The buffer holds ~15–25 s of data, so
+                    // reaching this point implies prolonged network congestion.
+                    //
+                    // Clear carry buffers so the next frame starts with a clean
+                    // 188-byte alignment (same recovery as broadcast Lagged).
+                    self.ts_send_carry.clear();
+                    self.ts_quality_carry.clear();
+                    self.packets_dropped += 1;
+                    self.loss_ts_queue_chunks += 1;
+
+                    // Log once per second to avoid flooding.
+                    static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let prev = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms.saturating_sub(prev) >= 1000 {
+                        LAST_WARN.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        warn!(
+                            "[Session {}] Write buffer full, dropped TS frame ({} bytes). \
+                             Total dropped: {} (loss_ts_queue_chunks={})",
+                            self.id, data_len, self.packets_dropped, self.loss_ts_queue_chunks
+                        );
+                    }
                 }
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Writer task died — signal disconnect.
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "writer task closed",
-                ))
+                TsFrameSendOutcome::RecordOverflowTimeout => {
+                    // STREAMING_DESIGN.md §12-1: RECORD never silently drops.
+                    // The write buffer stayed full for the entire overflow
+                    // timeout — the client/network cannot keep up, so the "no
+                    // loss" guarantee can no longer be honored. Disconnect with
+                    // a recorded reason instead of violating it silently.
+                    error!(
+                        "[Session {}] RECORD write buffer overflow (stalled >{:?}), disconnecting",
+                        self.id, RECORD_OVERFLOW_TIMEOUT
+                    );
+                    self.disconnect_reason = Some("record_queue_overflow".to_string());
+                    return Ok(true);
+                }
+                TsFrameSendOutcome::WriterClosed => {
+                    // Writer task died — signal disconnect.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "writer task closed",
+                    ));
+                }
             }
         }
+
+        Ok(false)
     }
 
 
@@ -4399,6 +4475,14 @@ impl Session {
 
         if let Some(history_id) = self.session_history_id {
             let ended_at = chrono::Utc::now().timestamp();
+            let top_loss_pids = self.ts_quality_analyzer.top_loss_pids(10);
+            let loss_summary = serde_json::json!({
+                "broadcast_lag_chunks": self.loss_broadcast_lag_chunks,
+                "ts_queue_chunks": self.loss_ts_queue_chunks,
+                "encoder_stall_events": self.loss_encoder_stall_events,
+                "top_pids": top_loss_pids,
+            })
+            .to_string();
             let db = self.database.lock().await;
             if let Err(e) = db.update_session_end(
                 history_id,
@@ -4415,6 +4499,8 @@ impl Session {
                 final_tuner_path.as_deref(),
                 self.current_channel_info.as_deref(),
                 self.current_channel_name.as_deref(),
+                Some(&loss_summary),
+                Some(self.stream_class.as_str()),
             ) {
                 warn!("[Session {}] Failed to update session history: {}", self.id, e);
             }
@@ -4502,5 +4588,86 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         debug!("[Session {}] Session dropped", self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- STREAMING_DESIGN.md §2: auto-promotion threshold ----
+
+    #[test]
+    fn record_priority_threshold_promotes_only_at_or_above_200() {
+        assert!(!should_auto_promote_to_record(0));
+        assert!(!should_auto_promote_to_record(10)); // 視聴 目安
+        assert!(!should_auto_promote_to_record(199));
+        assert!(should_auto_promote_to_record(200)); // 録画(通常) 目安
+        assert!(should_auto_promote_to_record(255)); // 録画(排他) 目安
+        assert!(should_auto_promote_to_record(i32::MAX));
+    }
+
+    // ---- STREAMING_DESIGN.md §3.2: class-specific TS send backpressure ----
+
+    /// Not the production `RECORD_OVERFLOW_TIMEOUT` (10 s) — short enough to
+    /// keep the timeout test fast while still exercising the real code path.
+    const TEST_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn view_class_drops_frame_when_write_buffer_full() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
+        tx.try_send(Bytes::from_static(b"first")).unwrap(); // fill the buffer
+
+        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::View, TEST_RECORD_TIMEOUT).await;
+        assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
+
+        // Only the original frame is queued; the second was dropped, not enqueued.
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_class_drops_frame_when_write_buffer_full() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
+        tx.try_send(Bytes::from_static(b"first")).unwrap();
+
+        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
+        assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn record_class_times_out_when_buffer_stays_full() {
+        let (tx, _rx) = mpsc::channel::<Bytes>(1);
+        tx.try_send(Bytes::from_static(b"first")).unwrap(); // fill the buffer, never drained
+
+        // RECORD must never drop — it blocks up to the timeout, then
+        // reports the overflow instead of silently losing data
+        // (STREAMING_DESIGN.md §12-1).
+        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        assert_eq!(outcome, TsFrameSendOutcome::RecordOverflowTimeout);
+    }
+
+    #[tokio::test]
+    async fn record_class_sends_once_buffer_has_room() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
+        let outcome = send_ts_frame(&tx, Bytes::from_static(b"data"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        assert_eq!(outcome, TsFrameSendOutcome::Sent);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn writer_closed_is_detected_for_view_and_record() {
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        drop(rx);
+        assert_eq!(
+            send_ts_frame(&tx, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            TsFrameSendOutcome::WriterClosed
+        );
+        assert_eq!(
+            send_ts_frame(&tx, Bytes::from_static(b"y"), StreamClass::Record, TEST_RECORD_TIMEOUT).await,
+            TsFrameSendOutcome::WriterClosed
+        );
     }
 }

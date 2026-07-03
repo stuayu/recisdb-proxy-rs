@@ -12,6 +12,7 @@
 ;   BONDRIVER_PROXY_TLS        → TLS
 ;   BONDRIVER_PROXY_CA_CERT    → TLSCACert
 ;   BONDRIVER_PROXY_SERVICE_FILTER → ServiceFilter
+;   BONDRIVER_PROXY_STREAM_CLASS → StreamClass
 ;   BONDRIVER_LOG_LEVEL        → LogLevel
 
 ; =====================================================
@@ -72,6 +73,18 @@ Exclusive = 0
 ;            PATは対象サービスのみに書き換えられます。
 ;            単一チャンネルの視聴・デコードに最適。
 ServiceFilter = all
+
+; =====================================================
+; ストリームクラス（信頼性モデル）
+; =====================================================
+; このセッションの配信信頼性クラスを指定します (STREAMING_DESIGN.md §2)。
+; サーバー側の SetChannel 実効優先度が高い場合 (録画相当) は、
+; view/preview を指定していても自動的に record へ昇格します。
+;   view    (0) — 視聴用途。輻輳時は最古データを破棄して低遅延を優先。(デフォルト)
+;   record  (1) — 録画用途。パケロスを許容せず、詰まった場合は切断してエラーを記録。
+;   preview (2) — ブラウザプレビュー等。視聴同様に許容するが再同期を行う。
+; 数値 (0/1/2) でも指定可能です。
+StreamClass = view
 
 ; =====================================================
 ; TLS設定 (tls フィーチャーが有効な場合のみ)

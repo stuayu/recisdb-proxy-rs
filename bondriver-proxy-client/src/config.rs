@@ -11,7 +11,32 @@ use std::time::Duration;
 
 use log::{debug, error, info, warn};
 
+use recisdb_protocol::StreamClass;
+
 use crate::client::ConnectionConfig;
+
+/// Parse the `StreamClass` INI/env value.
+///
+/// Accepts both the numeric protocol value (0/1/2) and the human-readable
+/// name (`view`/`record`/`preview`, case-insensitive). Unrecognized values
+/// fall back to `View` with a warning rather than failing config load
+/// (STREAMING_DESIGN.md §2).
+fn parse_stream_class(raw: &str) -> StreamClass {
+    let trimmed = raw.trim();
+    match trimmed.to_lowercase().as_str() {
+        "view" => return StreamClass::View,
+        "record" => return StreamClass::Record,
+        "preview" => return StreamClass::Preview,
+        _ => {}
+    }
+    match trimmed.parse::<u8>().ok().and_then(|v| StreamClass::try_from(v).ok()) {
+        Some(class) => class,
+        None => {
+            warn!("Unknown StreamClass value '{}', defaulting to View", raw);
+            StreamClass::View
+        }
+    }
+}
 
 /// Load log level from INI file or environment.
 ///
@@ -231,6 +256,11 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .map(|s| s.to_lowercase() == "single")
         .unwrap_or(false);
 
+    let stream_class = section
+        .get("StreamClass")
+        .map(|s| parse_stream_class(s))
+        .unwrap_or(StreamClass::View);
+
     debug!("Configuration loaded: server={}, tuner={}", server_addr, tuner_path);
 
     Some(ConnectionConfig {
@@ -245,6 +275,7 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         #[cfg(feature = "tls")]
         tls_ca_cert,
         single_service,
+        stream_class,
     })
 }
 
@@ -298,6 +329,10 @@ fn load_from_env() -> ConnectionConfig {
         single_service: std::env::var("BONDRIVER_PROXY_SERVICE_FILTER")
             .map(|s| s.to_lowercase() == "single")
             .unwrap_or(false),
+        stream_class: std::env::var("BONDRIVER_PROXY_STREAM_CLASS")
+            .ok()
+            .map(|s| parse_stream_class(&s))
+            .unwrap_or(StreamClass::View),
     }
 }
 

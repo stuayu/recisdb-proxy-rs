@@ -3,7 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 adds `StreamClass` to `Hello` (STREAMING_DESIGN.md §10, BNDP v2).
+/// The server accepts both v1 and v2 `Hello` payloads (see
+/// `decode_client_message`/`handle_hello`) so older clients are not broken;
+/// `Hello.version` remains the negotiation point per docs/DESIGN.md §3.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Magic bytes for frame header: "BNDP" (BonDriver Network Protocol).
 pub const MAGIC: [u8; 4] = *b"BNDP";
@@ -117,6 +122,63 @@ impl BandType {
             BandType::SKY => "SKY",
             BandType::Other => "Other",
         }
+    }
+}
+
+/// Reliability class of a streaming session (STREAMING_DESIGN.md §2).
+///
+/// Determines the backpressure policy applied to outgoing TS data
+/// (see §3.2): VIEW/PREVIEW drop the oldest data under congestion to stay
+/// close to real-time, while RECORD never drops data — it blocks (with a
+/// bounded timeout) and disconnects rather than silently lose packets.
+///
+/// Sent by the client in `Hello.stream_class` (protocol v2). Older (v1)
+/// clients omit this field entirely; the server defaults them to `View`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum StreamClass {
+    /// Live viewing (TVTest etc.): minimal latency, loss tolerated (drop-oldest).
+    View = 0,
+    /// Recording: loss is not tolerated. Backpressure instead of drop; the
+    /// session is disconnected if it cannot keep up (STREAMING_DESIGN.md §12-1).
+    Record = 1,
+    /// Browser preview (mpegts.js etc.): loss tolerated, resynced on keyframes.
+    Preview = 2,
+}
+
+impl Default for StreamClass {
+    fn default() -> Self {
+        StreamClass::View
+    }
+}
+
+impl StreamClass {
+    /// Lowercase identifier used in the web dashboard/API and session_history.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamClass::View => "view",
+            StreamClass::Record => "record",
+            StreamClass::Preview => "preview",
+        }
+    }
+}
+
+impl TryFrom<u8> for StreamClass {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, u8> {
+        match value {
+            0 => Ok(StreamClass::View),
+            1 => Ok(StreamClass::Record),
+            2 => Ok(StreamClass::Preview),
+            _ => Err(value),
+        }
+    }
+}
+
+impl From<StreamClass> for u8 {
+    fn from(value: StreamClass) -> Self {
+        value as u8
     }
 }
 
@@ -270,7 +332,11 @@ pub enum ChannelSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMessage {
     /// Client hello with protocol version.
-    Hello { version: u16 },
+    ///
+    /// `stream_class` is a protocol v2 addition (STREAMING_DESIGN.md §10).
+    /// v1 clients never set this explicitly; the codec fills in
+    /// `StreamClass::View` when decoding a 2-byte (v1) payload.
+    Hello { version: u16, stream_class: StreamClass },
     /// Ping for keep-alive.
     Ping,
     /// Open a tuner by path.

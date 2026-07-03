@@ -187,7 +187,9 @@ pub async fn get_clients(
                 "override_priority": s.override_priority,
                 "override_exclusive": s.override_exclusive,
                 "effective_priority": effective_priority,
-                "effective_exclusive": effective_exclusive
+                "effective_exclusive": effective_exclusive,
+                "stream_class": s.stream_class,
+                "prefilling": s.prefilling
             })
         })
         .collect();
@@ -1455,6 +1457,10 @@ pub async fn get_tuner_config(
             set_channel_retry_timeout_ms,
             signal_poll_interval_ms,
             signal_wait_timeout_ms,
+            prefill_view_ms,
+            prefill_preview_ms,
+            prefill_record_ms,
+            jitter_safety_factor,
         )) => Json(json!({
             "success": true,
             "config": {
@@ -1465,6 +1471,10 @@ pub async fn get_tuner_config(
                 "set_channel_retry_timeout_ms": set_channel_retry_timeout_ms,
                 "signal_poll_interval_ms": signal_poll_interval_ms,
                 "signal_wait_timeout_ms": signal_wait_timeout_ms,
+                "prefill_view_ms": prefill_view_ms,
+                "prefill_preview_ms": prefill_preview_ms,
+                "prefill_record_ms": prefill_record_ms,
+                "jitter_safety_factor": jitter_safety_factor,
             }
         })),
         Err(e) => Json(json!({
@@ -1484,6 +1494,11 @@ pub struct UpdateTunerConfigRequest {
     pub set_channel_retry_timeout_ms: Option<u64>,
     pub signal_poll_interval_ms: Option<u64>,
     pub signal_wait_timeout_ms: Option<u64>,
+    /// STREAMING_DESIGN.md §4/§9 P3: fixed-duration prefill/jitter buffer.
+    pub prefill_view_ms: Option<u64>,
+    pub prefill_preview_ms: Option<u64>,
+    pub prefill_record_ms: Option<u64>,
+    pub jitter_safety_factor: Option<f64>,
 }
 
 /// Update tuner optimization configuration.
@@ -1499,6 +1514,10 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        prefill_view_ms,
+        prefill_preview_ms,
+        prefill_record_ms,
+        jitter_safety_factor,
     ) = {
         let db = web_state.database.lock().await;
 
@@ -1510,10 +1529,14 @@ pub async fn update_tuner_config(
             mut set_channel_retry_timeout_ms,
             mut signal_poll_interval_ms,
             mut signal_wait_timeout_ms,
+            mut prefill_view_ms,
+            mut prefill_preview_ms,
+            mut prefill_record_ms,
+            mut jitter_safety_factor,
         ) =
             match db.get_tuner_config() {
                 Ok(config) => config,
-                Err(_) => (60, true, 30, 500, 10_000, 500, 10_000),
+                Err(_) => (60, true, 30, 500, 10_000, 500, 10_000, 1000, 2000, 6000, 1.5),
             };
 
         if let Some(val) = payload.keep_alive_secs {
@@ -1550,6 +1573,20 @@ pub async fn update_tuner_config(
                 signal_wait_timeout_ms = val;
             }
         }
+        if let Some(val) = payload.prefill_view_ms {
+            prefill_view_ms = val;
+        }
+        if let Some(val) = payload.prefill_preview_ms {
+            prefill_preview_ms = val;
+        }
+        if let Some(val) = payload.prefill_record_ms {
+            prefill_record_ms = val;
+        }
+        if let Some(val) = payload.jitter_safety_factor {
+            if val > 0.0 {
+                jitter_safety_factor = val;
+            }
+        }
 
         if let Err(e) = db.update_tuner_config(
             keep_alive,
@@ -1559,6 +1596,10 @@ pub async fn update_tuner_config(
             set_channel_retry_timeout_ms,
             signal_poll_interval_ms,
             signal_wait_timeout_ms,
+            prefill_view_ms,
+            prefill_preview_ms,
+            prefill_record_ms,
+            jitter_safety_factor,
         ) {
             return Json(json!({
                 "success": false,
@@ -1574,6 +1615,10 @@ pub async fn update_tuner_config(
             set_channel_retry_timeout_ms,
             signal_poll_interval_ms,
             signal_wait_timeout_ms,
+            prefill_view_ms,
+            prefill_preview_ms,
+            prefill_record_ms,
+            jitter_safety_factor,
         )
     };
 
@@ -1585,9 +1630,18 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        prefill_view_ms,
+        prefill_preview_ms,
+        prefill_record_ms,
+        jitter_safety_factor,
     };
     web_state.update_tuner_config(config.clone()).await;
 
+    // NOTE: prefill/jitter settings are intentionally not forwarded to
+    // `TunerPoolConfig` — they configure per-session output buffering
+    // (`Session::load_prefill_runtime_config` reads the DB directly at
+    // StartStream time), not tuner lifecycle, which is all `TunerPool`
+    // uses its config for (STREAMING_DESIGN.md §4/§9 P3).
     let pool_config = TunerPoolConfig {
         keep_alive_secs: keep_alive,
         prewarm_enabled,
@@ -1610,6 +1664,10 @@ pub async fn update_tuner_config(
             "set_channel_retry_timeout_ms": config.set_channel_retry_timeout_ms,
             "signal_poll_interval_ms": config.signal_poll_interval_ms,
             "signal_wait_timeout_ms": config.signal_wait_timeout_ms,
+            "prefill_view_ms": config.prefill_view_ms,
+            "prefill_preview_ms": config.prefill_preview_ms,
+            "prefill_record_ms": config.prefill_record_ms,
+            "jitter_safety_factor": config.jitter_safety_factor,
         }
     }))
 }
@@ -1621,7 +1679,7 @@ pub async fn get_tsreplace_config(
     let db = web_state.database.lock().await;
 
     match db.get_tsreplace_config() {
-        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => {
+        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => {
             Json(json!({
                 "success": true,
                 "config": {
@@ -1630,6 +1688,7 @@ pub async fn get_tsreplace_config(
                     "arguments": arguments,
                     "read_timeout_ms": read_timeout_ms,
                     "passthrough_on_error": passthrough_on_error,
+                    "max_concurrent_encoders": max_concurrent_encoders,
                 }
             }))
         }
@@ -1648,6 +1707,7 @@ pub struct UpdateTsreplaceConfigRequest {
     pub arguments: Option<String>,
     pub read_timeout_ms: Option<u64>,
     pub passthrough_on_error: Option<bool>,
+    pub max_concurrent_encoders: Option<i64>,
 }
 
 /// Update external encoder (tsreplace) configuration.
@@ -1657,10 +1717,10 @@ pub async fn update_tsreplace_config(
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, mut command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error) =
+    let (mut enabled, mut command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders) =
         match db.get_tsreplace_config() {
             Ok(config) => config,
-            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true),
+            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2),
         };
 
     if let Some(val) = payload.enabled {
@@ -1683,6 +1743,11 @@ pub async fn update_tsreplace_config(
     if let Some(val) = payload.passthrough_on_error {
         passthrough_on_error = val;
     }
+    if let Some(val) = payload.max_concurrent_encoders {
+        if val > 0 {
+            max_concurrent_encoders = val;
+        }
+    }
 
     if let Err(e) = db.update_tsreplace_config(
         enabled,
@@ -1690,6 +1755,7 @@ pub async fn update_tsreplace_config(
         &arguments,
         read_timeout_ms,
         passthrough_on_error,
+        max_concurrent_encoders,
     ) {
         return Json(json!({
             "success": false,
@@ -1706,6 +1772,7 @@ pub async fn update_tsreplace_config(
             "arguments": arguments,
             "read_timeout_ms": read_timeout_ms,
             "passthrough_on_error": passthrough_on_error,
+            "max_concurrent_encoders": max_concurrent_encoders,
         }
     }))
 }
@@ -1868,6 +1935,11 @@ pub async fn get_client_quality(
             "success": true,
             "bitrate": bitrate,
             "packet_loss": packet_loss,
+            // Loss-source breakdown (STREAMING_DESIGN.md §3.1 / §8, P1).
+            "loss_broadcast_lag_chunks": session.loss_broadcast_lag_chunks,
+            "loss_ts_queue_chunks": session.loss_ts_queue_chunks,
+            "loss_encoder_stall_events": session.loss_encoder_stall_events,
+            "top_loss_pids": session.top_loss_pids,
         }));
     }
 

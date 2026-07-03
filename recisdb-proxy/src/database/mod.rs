@@ -23,6 +23,7 @@ const DEFAULT_TSREPLACE_COMMAND_PATH: &str = "tsreplace";
 const DEFAULT_TSREPLACE_ARGUMENTS: &str = "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -";
 const DEFAULT_TSREPLACE_READ_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR: bool = true;
+const DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS: i64 = 2;
 
 /// Database error types.
 #[derive(Error, Debug)]
@@ -126,6 +127,27 @@ impl Database {
         self.add_column_if_not_exists("tuner_config", "set_channel_retry_timeout_ms", "INTEGER DEFAULT 10000")?;
         self.add_column_if_not_exists("tuner_config", "signal_poll_interval_ms", "INTEGER DEFAULT 500")?;
         self.add_column_if_not_exists("tuner_config", "signal_wait_timeout_ms", "INTEGER DEFAULT 10000")?;
+
+        // Migration 006: Add loss_summary column to session_history if it doesn't exist
+        // (STREAMING_DESIGN.md P1: per-loss-source counters + top-loss PIDs, JSON encoded)
+        self.add_column_if_not_exists("session_history", "loss_summary", "TEXT")?;
+
+        // Migration 007: Add max_concurrent_encoders column to tsreplace_config if it
+        // doesn't exist (STREAMING_DESIGN.md §5/§9 P4: shared encoder pool).
+        self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
+
+        // Migration 008: Add stream_class column to session_history if it doesn't
+        // exist (STREAMING_DESIGN.md §2 P2: stream reliability class, recorded at
+        // session end).
+        self.add_column_if_not_exists("session_history", "stream_class", "TEXT")?;
+
+        // Migration 009: Add prefill/jitter buffer columns to tuner_config if
+        // they don't exist (STREAMING_DESIGN.md §4/§9 P3: fixed-duration
+        // prefill/jitter buffer, sized per stream class).
+        self.add_column_if_not_exists("tuner_config", "prefill_view_ms", "INTEGER DEFAULT 1000")?;
+        self.add_column_if_not_exists("tuner_config", "prefill_preview_ms", "INTEGER DEFAULT 2000")?;
+        self.add_column_if_not_exists("tuner_config", "prefill_record_ms", "INTEGER DEFAULT 6000")?;
+        self.add_column_if_not_exists("tuner_config", "jitter_safety_factor", "REAL DEFAULT 1.5")?;
 
         // Migration 002: Fill band_type and terrestrial_region for existing channels
         // This updates all NULL values in these columns based on NID
@@ -286,11 +308,18 @@ impl Database {
 /// Tuner optimization configuration storage.
 impl Database {
     /// Get tuner optimization configuration from database.
-    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64, u64, u64, u64, u64)> {
+    ///
+    /// The last four fields are the fixed-duration prefill/jitter buffer
+    /// settings (STREAMING_DESIGN.md §4/§9 P3): `prefill_view_ms`,
+    /// `prefill_preview_ms`, `prefill_record_ms`, `jitter_safety_factor`.
+    #[allow(clippy::type_complexity)]
+    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64, u64, u64, u64, u64, u64, u64, u64, f64)> {
         let mut stmt = self.conn.prepare(
             "SELECT keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
                     set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
-                    signal_poll_interval_ms, signal_wait_timeout_ms
+                    signal_poll_interval_ms, signal_wait_timeout_ms,
+                    prefill_view_ms, prefill_preview_ms, prefill_record_ms,
+                    jitter_safety_factor
              FROM tuner_config WHERE id = 1"
         )?;
 
@@ -303,45 +332,37 @@ impl Database {
                 row.get::<_, u64>(4)?,
                 row.get::<_, u64>(5)?,
                 row.get::<_, u64>(6)?,
+                row.get::<_, u64>(7)?,
+                row.get::<_, u64>(8)?,
+                row.get::<_, u64>(9)?,
+                row.get::<_, f64>(10)?,
             ))
         });
 
         match result {
-            Ok((
-                keep_alive,
-                prewarm_enabled,
-                prewarm_timeout,
-                set_channel_retry_interval_ms,
-                set_channel_retry_timeout_ms,
-                signal_poll_interval_ms,
-                signal_wait_timeout_ms,
-            )) => {
-                Ok((
-                    keep_alive,
-                    prewarm_enabled,
-                    prewarm_timeout,
-                    set_channel_retry_interval_ms,
-                    set_channel_retry_timeout_ms,
-                    signal_poll_interval_ms,
-                    signal_wait_timeout_ms,
-                ))
-            }
+            Ok(config) => Ok(config),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO tuner_config
                      (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
                       set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
-                      signal_poll_interval_ms, signal_wait_timeout_ms)
-                     VALUES (1, 60, 1, 30, 500, 10000, 500, 10000)",
+                      signal_poll_interval_ms, signal_wait_timeout_ms,
+                      prefill_view_ms, prefill_preview_ms, prefill_record_ms,
+                      jitter_safety_factor)
+                     VALUES (1, 60, 1, 30, 500, 10000, 500, 10000, 1000, 2000, 6000, 1.5)",
                     [],
                 )?;
-                Ok((60, true, 30, 500, 10000, 500, 10000))
+                Ok((60, true, 30, 500, 10000, 500, 10000, 1000, 2000, 6000, 1.5))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
         }
     }
 
     /// Update tuner optimization configuration.
+    ///
+    /// See [`Database::get_tuner_config`] for the meaning of the last four
+    /// (prefill/jitter) parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_tuner_config(
         &self,
         keep_alive_secs: u64,
@@ -351,14 +372,20 @@ impl Database {
         set_channel_retry_timeout_ms: u64,
         signal_poll_interval_ms: u64,
         signal_wait_timeout_ms: u64,
+        prefill_view_ms: u64,
+        prefill_preview_ms: u64,
+        prefill_record_ms: u64,
+        jitter_safety_factor: f64,
     ) -> Result<()> {
         let prewarm_enabled = if prewarm_enabled { 1 } else { 0 };
         self.conn.execute(
             "INSERT OR REPLACE INTO tuner_config
              (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
               set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
-              signal_poll_interval_ms, signal_wait_timeout_ms, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s', 'now'))",
+              signal_poll_interval_ms, signal_wait_timeout_ms,
+              prefill_view_ms, prefill_preview_ms, prefill_record_ms,
+              jitter_safety_factor, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s', 'now'))",
             rusqlite::params![
                 keep_alive_secs,
                 prewarm_enabled,
@@ -366,7 +393,11 @@ impl Database {
                 set_channel_retry_interval_ms,
                 set_channel_retry_timeout_ms,
                 signal_poll_interval_ms,
-                signal_wait_timeout_ms
+                signal_wait_timeout_ms,
+                prefill_view_ms,
+                prefill_preview_ms,
+                prefill_record_ms,
+                jitter_safety_factor,
             ],
         )?;
         Ok(())
@@ -384,6 +415,7 @@ impl Database {
                 arguments TEXT DEFAULT '',
                 read_timeout_ms INTEGER DEFAULT 10000,
                 passthrough_on_error INTEGER DEFAULT 1,
+                max_concurrent_encoders INTEGER DEFAULT 2,
                 updated_at INTEGER DEFAULT (strftime('%s', 'now'))
             );",
         )?;
@@ -393,6 +425,7 @@ impl Database {
         self.add_column_if_not_exists("tsreplace_config", "arguments", "TEXT DEFAULT ''")?;
         self.add_column_if_not_exists("tsreplace_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
         self.add_column_if_not_exists("tsreplace_config", "passthrough_on_error", "INTEGER DEFAULT 1")?;
+        self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
         self.add_column_if_not_exists(
             "tsreplace_config",
             "updated_at",
@@ -401,13 +434,14 @@ impl Database {
 
         self.conn.execute(
             "INSERT OR IGNORE INTO tsreplace_config
-             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, updated_at)
-             VALUES (1, 0, ?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, updated_at)
+             VALUES (1, 0, ?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
             rusqlite::params![
                 DEFAULT_TSREPLACE_COMMAND_PATH,
                 DEFAULT_TSREPLACE_ARGUMENTS,
                 DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
-                if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 }
+                if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 },
+                DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS
             ],
         )?;
 
@@ -433,16 +467,29 @@ impl Database {
              WHERE id = 1 AND (read_timeout_ms IS NULL OR read_timeout_ms <= 0)",
             rusqlite::params![DEFAULT_TSREPLACE_READ_TIMEOUT_MS],
         )?;
+        self.conn.execute(
+            "UPDATE tsreplace_config
+             SET max_concurrent_encoders = ?1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1 AND (max_concurrent_encoders IS NULL OR max_concurrent_encoders <= 0)",
+            rusqlite::params![DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS],
+        )?;
 
         Ok(())
     }
 
     /// Get tsreplace configuration from database.
-    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool)> {
+    ///
+    /// Returns `(enabled, command_path, arguments, read_timeout_ms, passthrough_on_error,
+    /// max_concurrent_encoders)`. The last field caps the number of concurrently-running
+    /// shared encoder chains (STREAMING_DESIGN.md §5 P4); sessions sharing the same
+    /// channel/SID-set/config generation join a single running encoder instead of
+    /// consuming a slot.
+    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64)> {
         self.ensure_tsreplace_config_compat()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error
+            "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders
              FROM tsreplace_config WHERE id = 1"
         )?;
 
@@ -453,23 +500,25 @@ impl Database {
                 row.get::<_, String>(2)?,
                 row.get::<_, u64>(3)?,
                 row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)?,
             ))
         });
 
         match result {
-            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)) => {
-                Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error))
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => {
+                Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO tsreplace_config
-                     (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error)
-                     VALUES (1, 0, ?1, ?2, ?3, ?4)",
+                     (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)
+                     VALUES (1, 0, ?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![
                         DEFAULT_TSREPLACE_COMMAND_PATH,
                         DEFAULT_TSREPLACE_ARGUMENTS,
                         DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
-                        if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 }
+                        if DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR { 1 } else { 0 },
+                        DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS
                     ],
                 )?;
                 Ok((
@@ -478,6 +527,7 @@ impl Database {
                     DEFAULT_TSREPLACE_ARGUMENTS.to_string(),
                     DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
                     DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR,
+                    DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS,
                 ))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
@@ -492,17 +542,19 @@ impl Database {
         arguments: &str,
         read_timeout_ms: u64,
         passthrough_on_error: bool,
+        max_concurrent_encoders: i64,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO tsreplace_config
-             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
+             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))",
             rusqlite::params![
                 if enabled { 1 } else { 0 },
                 command_path,
                 arguments,
                 read_timeout_ms,
-                if passthrough_on_error { 1 } else { 0 }
+                if passthrough_on_error { 1 } else { 0 },
+                max_concurrent_encoders
             ],
         )?;
         Ok(())

@@ -489,11 +489,13 @@ const HTML_CONTENT: &str = r#"
                         <th class="sortable" data-sort-type="number">優先度</th>
                         <th class="sortable" data-sort-type="text">排他</th>
                         <th class="sortable" data-sort-type="text">上書き</th>
+                        <th class="sortable" data-sort-type="text">クラス</th>
+                        <th class="sortable" data-sort-type="text">プリフィル</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="clients-body">
-                    <tr><td colspan="16" class="empty-state">接続中のクライアントはありません</td></tr>
+                    <tr><td colspan="18" class="empty-state">接続中のクライアントはありません</td></tr>
                 </tbody>
             </table>
             <div id="client-metrics-panel" style="margin-top: 16px; display: none;">
@@ -513,6 +515,25 @@ const HTML_CONTENT: &str = r#"
                     <div class="graph-container">
                         <h4>信号レベル (dB)</h4>
                         <svg id="signal-graph" class="sparkline"></svg>
+                    </div>
+                </div>
+                <div class="performance-graphs" style="margin-top: 10px;">
+                    <div class="graph-container" style="min-width: 260px;">
+                        <h4>損失内訳</h4>
+                        <table style="font-size:12px;">
+                            <tbody>
+                                <tr><td>broadcast lag (chunks)</td><td id="loss-broadcast-lag-chunks" style="text-align:right;">-</td></tr>
+                                <tr><td>TS queue drop (chunks)</td><td id="loss-ts-queue-chunks" style="text-align:right;">-</td></tr>
+                                <tr><td>encoder stall (events)</td><td id="loss-encoder-stall-events" style="text-align:right;">-</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="graph-container" style="min-width: 260px;">
+                        <h4>ロス上位 PID (CC error)</h4>
+                        <table style="font-size:12px;">
+                            <thead><tr><th>PID</th><th>CC errors</th></tr></thead>
+                            <tbody id="top-loss-pids-body"><tr><td colspan="2" class="empty-state">データなし</td></tr></tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -745,6 +766,30 @@ const HTML_CONTENT: &str = r#"
                     <small>信号値が返るまで待つ最大時間</small>
                 </div>
 
+                <div class="form-group">
+                    <label for="tuner-prefill-view-ms">プリフィル時間・視聴（ms）</label>
+                    <input type="number" id="tuner-prefill-view-ms" min="0" value="1000">
+                    <small>視聴クラスのストリーム開始時に事前に貯めるバッファ時間（0でバイパス）</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-prefill-preview-ms">プリフィル時間・プレビュー（ms）</label>
+                    <input type="number" id="tuner-prefill-preview-ms" min="0" value="2000">
+                    <small>プレビュークラスのストリーム開始時に事前に貯めるバッファ時間（0でバイパス）</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-prefill-record-ms">プリフィル時間・録画（ms）</label>
+                    <input type="number" id="tuner-prefill-record-ms" min="0" value="6000">
+                    <small>録画クラスのストリーム開始時に事前に貯めるバッファ時間（0でバイパス）</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tuner-jitter-safety-factor">ジッタ安全係数</label>
+                    <input type="number" id="tuner-jitter-safety-factor" min="0.1" step="0.1" value="1.5">
+                    <small>プリフィルバッファサイズ = ビットレート × プリフィル時間 × この係数</small>
+                </div>
+
                 <div style="margin-top: 20px; display: flex; gap: 10px;">
                     <button class="btn btn-primary" onclick="saveTunerConfig()">保存</button>
                     <button class="btn btn-secondary" onclick="loadTunerConfig()">リセット</button>
@@ -778,6 +823,12 @@ const HTML_CONTENT: &str = r#"
                     <label for="tsreplace-read-timeout">読み取りタイムアウト（ms）</label>
                     <input type="number" id="tsreplace-read-timeout" min="1" value="10000">
                     <small>外部プロセス出力を待つ最大時間</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-max-encoders">同時エンコード数の上限</label>
+                    <input type="number" id="tsreplace-max-encoders" min="1" value="2">
+                    <small>共有エンコーダの同時起動数（HWエンコードの同時セッション数目安）。上限到達時は非エンコードTSで配信</small>
                 </div>
 
                 <div class="form-group">
@@ -1285,6 +1336,21 @@ const HTML_CONTENT: &str = r#"
             return `<span class="badge badge-warning">${parts.join(' ')}</span> `;
         }
 
+        // Stream reliability class (STREAMING_DESIGN.md §2): view/record/preview
+        function renderStreamClassBadge(streamClass) {
+            const cls = streamClass || 'view';
+            const labels = { view: '視聴', record: '録画', preview: 'プレビュー' };
+            const badgeClass = cls === 'record' ? 'badge-danger' : (cls === 'preview' ? 'badge-warning' : 'badge-success');
+            return `<span class="badge ${badgeClass}">${escapeHtml(labels[cls] || cls)}</span>`;
+        }
+
+        // Prefill/jitter buffer status (STREAMING_DESIGN.md §4 P3)
+        function renderPrefillingBadge(prefilling) {
+            return prefilling
+                ? '<span class="badge badge-warning">バッファ中</span>'
+                : '<span class="badge badge-success">配信中</span>';
+        }
+
         // BandType: 0=Terrestrial, 1=BS, 2=CS, 3=4K, 4=Other, 5=CATV, 6=SKY
         function getBandTypeName(bandType) {
             const names = ['地デジ', 'BS', 'CS', 'BS4K', 'その他', 'CATV', 'SKY'];
@@ -1340,7 +1406,7 @@ const HTML_CONTENT: &str = r#"
                 document.getElementById('stat-clients').textContent = data.count || 0;
 
                 if (!data.clients || data.clients.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="16" class="empty-state">接続中のクライアントはありません</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="18" class="empty-state">接続中のクライアントはありません</td></tr>';
                     applyResponsiveLabels('clients-table');
                     applyClientColumnVisibility();
                     return;
@@ -1367,6 +1433,8 @@ const HTML_CONTENT: &str = r#"
                             <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); openOverrideModal(${c.session_id}, ${c.override_priority !== null && c.override_priority !== undefined ? c.override_priority : 'null'}, ${c.override_exclusive !== null && c.override_exclusive !== undefined ? c.override_exclusive : 'null'});">設定</button>
                             <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); clearOverride(${c.session_id});">解除</button>
                         </td>
+                        <td data-sort-value="${escapeHtml(c.stream_class || 'view')}">${renderStreamClassBadge(c.stream_class)}</td>
+                        <td data-sort-value="${c.prefilling ? '1' : '0'}">${renderPrefillingBadge(c.prefilling)}</td>
                         <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); disconnectClient(${c.session_id});">切断</button></td>
                     </tr>
                 `).join('');
@@ -1430,6 +1498,23 @@ const HTML_CONTENT: &str = r#"
                 drawSparkline('packet-loss-graph', data.packet_loss, '#FF5722', 0, null);
                 drawSparkline('signal-graph', data.signal_level, '#2196F3', 0, null);
             } catch (e) { console.error('Failed to update metrics:', e); }
+
+            try {
+                const qres = await fetch(`/api/client/${activeClientId}/quality`);
+                const qdata = await qres.json();
+                if (!qdata.success) return;
+                document.getElementById('loss-broadcast-lag-chunks').textContent = formatPackets(qdata.loss_broadcast_lag_chunks);
+                document.getElementById('loss-ts-queue-chunks').textContent = formatPackets(qdata.loss_ts_queue_chunks);
+                document.getElementById('loss-encoder-stall-events').textContent = formatPackets(qdata.loss_encoder_stall_events);
+
+                const pids = qdata.top_loss_pids || [];
+                const pidsBody = document.getElementById('top-loss-pids-body');
+                pidsBody.innerHTML = pids.length === 0
+                    ? '<tr><td colspan="2" class="empty-state">データなし</td></tr>'
+                    : pids.map(p => `
+                        <tr><td>0x${p[0].toString(16).toUpperCase().padStart(4, '0')}</td><td style="text-align:right;">${formatPackets(p[1])}</td></tr>
+                    `).join('');
+            } catch (e) { console.error('Failed to update loss breakdown:', e); }
         }
 
         function openOverrideModal(sessionId, overridePriority, overrideExclusive) {
@@ -2655,6 +2740,10 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tuner-setch-retry-timeout').value = data.config.set_channel_retry_timeout_ms ?? 10000;
                     document.getElementById('tuner-signal-poll-interval').value = data.config.signal_poll_interval_ms ?? 500;
                     document.getElementById('tuner-signal-wait-timeout').value = data.config.signal_wait_timeout_ms ?? 10000;
+                    document.getElementById('tuner-prefill-view-ms').value = data.config.prefill_view_ms ?? 1000;
+                    document.getElementById('tuner-prefill-preview-ms').value = data.config.prefill_preview_ms ?? 2000;
+                    document.getElementById('tuner-prefill-record-ms').value = data.config.prefill_record_ms ?? 6000;
+                    document.getElementById('tuner-jitter-safety-factor').value = data.config.jitter_safety_factor ?? 1.5;
                     hideTunerConfigMessage();
                 }
             } catch (e) { console.error('Failed to load tuner config:', e); }
@@ -2668,7 +2757,11 @@ const HTML_CONTENT: &str = r#"
                 set_channel_retry_interval_ms: parseInt(document.getElementById('tuner-setch-retry-interval').value),
                 set_channel_retry_timeout_ms: parseInt(document.getElementById('tuner-setch-retry-timeout').value),
                 signal_poll_interval_ms: parseInt(document.getElementById('tuner-signal-poll-interval').value),
-                signal_wait_timeout_ms: parseInt(document.getElementById('tuner-signal-wait-timeout').value)
+                signal_wait_timeout_ms: parseInt(document.getElementById('tuner-signal-wait-timeout').value),
+                prefill_view_ms: parseInt(document.getElementById('tuner-prefill-view-ms').value),
+                prefill_preview_ms: parseInt(document.getElementById('tuner-prefill-preview-ms').value),
+                prefill_record_ms: parseInt(document.getElementById('tuner-prefill-record-ms').value),
+                jitter_safety_factor: parseFloat(document.getElementById('tuner-jitter-safety-factor').value)
             };
 
             if (
@@ -2677,7 +2770,11 @@ const HTML_CONTENT: &str = r#"
                 config.set_channel_retry_interval_ms <= 0 ||
                 config.set_channel_retry_timeout_ms <= 0 ||
                 config.signal_poll_interval_ms <= 0 ||
-                config.signal_wait_timeout_ms <= 0
+                config.signal_wait_timeout_ms <= 0 ||
+                config.prefill_view_ms < 0 ||
+                config.prefill_preview_ms < 0 ||
+                config.prefill_record_ms < 0 ||
+                config.jitter_safety_factor <= 0
             ) {
                 showTunerConfigMessage('入力値を確認してください', 'error');
                 return;
@@ -2731,6 +2828,7 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tsreplace-command-path').value = data.config.command_path || 'tsreplace';
                     document.getElementById('tsreplace-arguments').value = data.config.arguments || '';
                     document.getElementById('tsreplace-read-timeout').value = data.config.read_timeout_ms ?? 10000;
+                    document.getElementById('tsreplace-max-encoders').value = data.config.max_concurrent_encoders ?? 2;
                     document.getElementById('tsreplace-passthrough-on-error').checked = !!data.config.passthrough_on_error;
                     hideTsreplaceConfigMessage();
                 }
@@ -2742,6 +2840,7 @@ const HTML_CONTENT: &str = r#"
         async function saveTsreplaceConfig() {
             const commandPath = document.getElementById('tsreplace-command-path').value.trim();
             const readTimeoutMs = parseInt(document.getElementById('tsreplace-read-timeout').value, 10);
+            const maxEncoders = parseInt(document.getElementById('tsreplace-max-encoders').value, 10);
 
             if (!commandPath) {
                 showTsreplaceConfigMessage('実行コマンドは必須です', 'error');
@@ -2751,6 +2850,10 @@ const HTML_CONTENT: &str = r#"
                 showTsreplaceConfigMessage('読み取りタイムアウトは正の数値を入力してください', 'error');
                 return;
             }
+            if (!Number.isFinite(maxEncoders) || maxEncoders <= 0) {
+                showTsreplaceConfigMessage('同時エンコード数の上限は正の数値を入力してください', 'error');
+                return;
+            }
 
             const payload = {
                 enabled: document.getElementById('tsreplace-enabled').checked,
@@ -2758,6 +2861,7 @@ const HTML_CONTENT: &str = r#"
                 arguments: document.getElementById('tsreplace-arguments').value,
                 read_timeout_ms: readTimeoutMs,
                 passthrough_on_error: document.getElementById('tsreplace-passthrough-on-error').checked,
+                max_concurrent_encoders: maxEncoders,
             };
 
             try {

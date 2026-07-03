@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, RwLock};
 use serde::Serialize;
 use dns_lookup::lookup_addr;
 
+use recisdb_protocol::StreamClass;
+
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::TunerPool;
 
@@ -36,6 +38,12 @@ pub struct TunerConfigInfo {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    /// Fixed-duration prefill/jitter buffer settings (STREAMING_DESIGN.md
+    /// §4/§9 P3), per stream class plus a shared safety margin.
+    pub prefill_view_ms: u64,
+    pub prefill_preview_ms: u64,
+    pub prefill_record_ms: u64,
+    pub jitter_safety_factor: f64,
 }
 
 /// Information about an active session.
@@ -84,6 +92,23 @@ pub struct SessionInfo {
     pub override_exclusive: Option<bool>,
     /// Metrics history (last 60 seconds).
     pub metrics_history: SessionMetricsHistory,
+    /// Chunks skipped due to broadcast::Receiver lag (unit: broadcast
+    /// chunks, NOT TS packets — see STREAMING_DESIGN.md §3.1).
+    pub loss_broadcast_lag_chunks: u64,
+    /// Frames dropped because the per-session TS write mpsc buffer was full.
+    pub loss_ts_queue_chunks: u64,
+    /// tsreplace input-queue stall events (Full or Closed).
+    pub loss_encoder_stall_events: u64,
+    /// Top PIDs by continuity-counter error count, descending (max 10).
+    pub top_loss_pids: Vec<(u16, u64)>,
+    /// Stream reliability class (STREAMING_DESIGN.md §2): "view"/"record"/"preview".
+    /// Set from `Hello.stream_class`, may be auto-promoted to "record" by the
+    /// session based on effective priority.
+    pub stream_class: String,
+    /// Whether the session's prefill/jitter buffer (STREAMING_DESIGN.md §4
+    /// P3) is currently filling (true) or has released and is passing TS
+    /// straight through (false).
+    pub prefilling: bool,
 }
 
 impl SessionInfo {
@@ -170,6 +195,12 @@ impl SessionRegistry {
             override_priority: None,
             override_exclusive: None,
             metrics_history: SessionMetricsHistory::default(),
+            loss_broadcast_lag_chunks: 0,
+            loss_ts_queue_chunks: 0,
+            loss_encoder_stall_events: 0,
+            top_loss_pids: Vec::new(),
+            stream_class: StreamClass::View.as_str().to_string(),
+            prefilling: false,
         };
         self.sessions.write().await.insert(id, info);
         self.shutdown_txs.write().await.insert(id, shutdown_tx);
@@ -210,6 +241,20 @@ impl SessionRegistry {
         }
     }
 
+    /// Update session stream reliability class (STREAMING_DESIGN.md §2).
+    pub async fn update_stream_class(&self, id: u64, stream_class: StreamClass) {
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.stream_class = stream_class.as_str().to_string();
+        }
+    }
+
+    /// Update session prefill/jitter buffer status (STREAMING_DESIGN.md §4 P3).
+    pub async fn update_prefilling(&self, id: u64, prefilling: bool) {
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.prefilling = prefilling;
+        }
+    }
+
     /// Update session channel NID/SID (for logo display on dashboard).
     pub async fn update_channel_ids(&self, id: u64, nid: Option<u16>, sid: Option<u16>) {
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
@@ -219,6 +264,7 @@ impl SessionRegistry {
     }
 
     /// Update session signal and packet stats.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_stats(
         &self,
         id: u64,
@@ -228,6 +274,10 @@ impl SessionRegistry {
         packets_scrambled: u64,
         packets_error: u64,
         current_bitrate_mbps: f64,
+        loss_broadcast_lag_chunks: u64,
+        loss_ts_queue_chunks: u64,
+        loss_encoder_stall_events: u64,
+        top_loss_pids: Vec<(u16, u64)>,
     ) {
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
             info.signal_level = signal_level;
@@ -236,6 +286,10 @@ impl SessionRegistry {
             info.packets_scrambled = packets_scrambled;
             info.packets_error = packets_error;
             info.current_bitrate_mbps = current_bitrate_mbps;
+            info.loss_broadcast_lag_chunks = loss_broadcast_lag_chunks;
+            info.loss_ts_queue_chunks = loss_ts_queue_chunks;
+            info.loss_encoder_stall_events = loss_encoder_stall_events;
+            info.top_loss_pids = top_loss_pids;
         }
     }
 
@@ -352,6 +406,10 @@ impl WebState {
                 set_channel_retry_timeout_ms: 10_000,
                 signal_poll_interval_ms: 500,
                 signal_wait_timeout_ms: 10_000,
+                prefill_view_ms: 1000,
+                prefill_preview_ms: 2000,
+                prefill_record_ms: 6000,
+                jitter_safety_factor: 1.5,
             }),
         }
     }
@@ -364,5 +422,82 @@ impl WebState {
     /// Update tuner optimization configuration.
     pub async fn update_tuner_config(&self, config: TunerConfigInfo) {
         *self.tuner_config.write().await = config;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn update_stats_propagates_loss_breakdown() {
+        let registry = SessionRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let _shutdown_rx = registry.register(1, addr).await;
+
+        registry
+            .update_stats(
+                1,
+                -5.0,
+                1000,
+                10,
+                2,
+                1,
+                18.5,
+                7,   // loss_broadcast_lag_chunks
+                3,   // loss_ts_queue_chunks
+                2,   // loss_encoder_stall_events
+                vec![(0x0100, 5), (0x0200, 2)],
+            )
+            .await;
+
+        let sessions = registry.get_all().await;
+        let info = sessions.into_iter().find(|s| s.id == 1).expect("session present");
+        assert_eq!(info.loss_broadcast_lag_chunks, 7);
+        assert_eq!(info.loss_ts_queue_chunks, 3);
+        assert_eq!(info.loss_encoder_stall_events, 2);
+        assert_eq!(info.top_loss_pids, vec![(0x0100, 5), (0x0200, 2)]);
+    }
+
+    #[test]
+    fn session_info_loss_fields_serialize_to_json() {
+        let info = SessionInfo {
+            id: 42,
+            addr: "127.0.0.1:1".to_string(),
+            host: None,
+            tuner_path: None,
+            channel_info: None,
+            channel_name: None,
+            channel_nid: None,
+            channel_sid: None,
+            is_streaming: true,
+            connected_at: Instant::now(),
+            signal_level: 10.0,
+            packets_sent: 100,
+            packets_dropped: 5,
+            packets_scrambled: 0,
+            packets_error: 0,
+            current_bitrate_mbps: 18.0,
+            client_priority: None,
+            client_exclusive: false,
+            override_priority: None,
+            override_exclusive: None,
+            metrics_history: SessionMetricsHistory::default(),
+            loss_broadcast_lag_chunks: 4,
+            loss_ts_queue_chunks: 1,
+            loss_encoder_stall_events: 9,
+            top_loss_pids: vec![(0x0100, 3), (0x0200, 1)],
+            stream_class: "view".to_string(),
+            prefilling: false,
+        };
+
+        let value = serde_json::to_value(&info).expect("serialize SessionInfo");
+        assert_eq!(value["loss_broadcast_lag_chunks"], 4);
+        assert_eq!(value["loss_ts_queue_chunks"], 1);
+        assert_eq!(value["loss_encoder_stall_events"], 9);
+        assert_eq!(
+            value["top_loss_pids"],
+            serde_json::json!([[0x0100, 3], [0x0200, 1]])
+        );
     }
 }

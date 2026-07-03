@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use recisdb_protocol::{
     decode_header, decode_server_message, encode_client_message, ClientMessage,
-    MessageType, ServerMessage, HEADER_SIZE, PROTOCOL_VERSION,
+    MessageType, ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::client::buffer::TsRingBuffer;
@@ -61,6 +61,11 @@ pub struct ConnectionConfig {
     /// When true, the server sends only the selected service's TS packets
     /// instead of the entire transport stream.
     pub single_service: bool,
+    /// Stream reliability class sent in `Hello` (STREAMING_DESIGN.md §2/§10).
+    /// Sent as part of the protocol v2 `Hello` payload; a v2 server also
+    /// auto-promotes VIEW/PREVIEW sessions to RECORD when the effective
+    /// channel priority is high enough, so this is a hint, not the only path.
+    pub stream_class: StreamClass,
 }
 
 impl Default for ConnectionConfig {
@@ -77,6 +82,7 @@ impl Default for ConnectionConfig {
             #[cfg(feature = "tls")]
             tls_ca_cert: None,
             single_service: false,
+            stream_class: StreamClass::View,
         }
     }
 }
@@ -313,6 +319,7 @@ impl Connection {
         let resp = self.send_request_with_timeout(
             ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
+                stream_class: self.config.stream_class,
             },
             timeout,
         );
@@ -338,7 +345,10 @@ impl Connection {
     fn send_hello(&self) -> bool {
         // Use connect_timeout (not read_timeout) for the initial handshake.
         let resp = self.send_request_with_timeout(
-            ClientMessage::Hello { version: PROTOCOL_VERSION },
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                stream_class: self.config.stream_class,
+            },
             self.config.connect_timeout,
         );
 

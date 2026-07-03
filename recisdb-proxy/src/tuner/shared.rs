@@ -24,7 +24,10 @@ use crate::tuner::pool::TunerPoolConfig;
 /// Increased to 4096 (256MB of 64KB chunks) to support multiple simultaneous subscribers
 /// without buffer overflow when subscriber read speeds vary significantly.
 /// Each slot holds a 64KB chunk, so 4096 slots = ~256MB of buffering capacity.
-const BROADCAST_CAPACITY: usize = 4096;
+///
+/// `pub(crate)` so [`crate::tuner::encoder_pool::SharedEncoder`] can size its own
+/// output broadcast channel identically (STREAMING_DESIGN.md §5 P4).
+pub(crate) const BROADCAST_CAPACITY: usize = 4096;
 
 /// Size of each TS data chunk to read from the tuner.
 /// Increased to 256KB to handle BonDrivers (like FukuDLL) that may return
@@ -172,6 +175,17 @@ impl SharedTuner {
             self.key,
             self.subscriber_count.load(Ordering::SeqCst)
         );
+        self.tx.subscribe()
+    }
+
+    /// Subscribe to the TS data stream WITHOUT incrementing the subscriber
+    /// reference count.
+    ///
+    /// Used by the shared encoder pool (`crate::tuner::encoder_pool`): the
+    /// encoder is a parasitic consumer whose own lifetime is governed by its
+    /// session subscribers, so it must not keep the tuner alive by itself or
+    /// perturb the session-driven keep-alive / idle-close accounting.
+    pub(crate) fn subscribe_untracked(&self) -> broadcast::Receiver<Bytes> {
         self.tx.subscribe()
     }
 
@@ -882,6 +896,17 @@ where
 impl Drop for SharedTuner {
     fn drop(&mut self) {
         debug!("SharedTuner dropped for {:?}", self.key);
+    }
+}
+
+#[cfg(test)]
+impl SharedTuner {
+    /// Test-only helper: inject data directly into the broadcast channel,
+    /// bypassing the BonDriver reader loop. Used by
+    /// `crate::tuner::encoder_pool` tests to simulate TS chunks flowing
+    /// from a tuner into a `SharedEncoder`'s feeder task.
+    pub(crate) fn test_broadcast(&self, data: Bytes) {
+        let _ = self.tx.send(data);
     }
 }
 

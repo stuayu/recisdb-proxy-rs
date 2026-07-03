@@ -141,6 +141,11 @@ pub struct SessionHistoryRecord {
     pub average_signal_level: Option<f64>,
     pub disconnect_reason: Option<String>,
     pub created_at: i64,
+    /// JSON: loss-source breakdown + top-loss PIDs (P1, see STREAMING_DESIGN.md §3.1).
+    pub loss_summary: Option<String>,
+    /// Stream reliability class at session end: "view"/"record"/"preview"
+    /// (P2, see STREAMING_DESIGN.md §2). `None` for rows predating P2.
+    pub stream_class: Option<String>,
 }
 
 /// Alert rule record.

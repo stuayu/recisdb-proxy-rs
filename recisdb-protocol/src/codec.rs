@@ -22,8 +22,9 @@ pub fn encode_client_message(msg: &ClientMessage) -> Result<Bytes, ProtocolError
     let mut payload = BytesMut::new();
 
     match msg {
-        ClientMessage::Hello { version } => {
+        ClientMessage::Hello { version, stream_class } => {
             payload.put_u16_le(*version);
+            payload.put_u8((*stream_class).into());
         }
         ClientMessage::Ping => {
             // Empty payload
@@ -549,7 +550,24 @@ pub fn decode_client_message(
                 });
             }
             let version = payload.get_u16_le();
-            Ok(ClientMessage::Hello { version })
+            // v1 clients send a 2-byte payload (version only); v2 clients
+            // append a 1-byte StreamClass. Accept both so a v2 server does
+            // not break older clients (docs/DESIGN.md §3 compat policy).
+            let stream_class = if payload.remaining() >= 1 {
+                let raw = payload.get_u8();
+                StreamClass::try_from(raw).unwrap_or_else(|unknown| {
+                    // Don't fail decoding for a forward-compat/garbage value —
+                    // fall back to the safest (loss-tolerant) class and warn.
+                    eprintln!(
+                        "[recisdb-protocol] Hello: unknown stream_class value {}, defaulting to View",
+                        unknown
+                    );
+                    StreamClass::View
+                })
+            } else {
+                StreamClass::View
+            };
+            Ok(ClientMessage::Hello { version, stream_class })
         }
         MessageType::Ping => Ok(ClientMessage::Ping),
         MessageType::OpenTuner => {
@@ -897,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_hello() {
-        let msg = ClientMessage::Hello { version: 1 };
+        let msg = ClientMessage::Hello { version: 2, stream_class: StreamClass::Record };
         let encoded = encode_client_message(&msg).unwrap();
 
         // Verify header
@@ -909,6 +927,60 @@ mod tests {
         let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
         let decoded = decode_client_message(header.message_type, payload).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// A v1 client sends only `version` (2-byte payload, no StreamClass
+    /// byte). The server must still decode it successfully, defaulting to
+    /// `StreamClass::View` (STREAMING_DESIGN.md §10 / docs/DESIGN.md §3).
+    #[test]
+    fn test_decode_hello_v1_payload_defaults_to_view() {
+        let mut payload = BytesMut::new();
+        payload.put_u16_le(1); // version only, no stream_class byte
+        let payload = payload.freeze();
+
+        let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
+        assert_eq!(
+            decoded,
+            ClientMessage::Hello { version: 1, stream_class: StreamClass::View }
+        );
+    }
+
+    /// A v2 client sends `version` + `stream_class`. All three class values
+    /// must round-trip.
+    #[test]
+    fn test_decode_hello_v2_payload_all_classes() {
+        for (raw, expected) in [
+            (0u8, StreamClass::View),
+            (1u8, StreamClass::Record),
+            (2u8, StreamClass::Preview),
+        ] {
+            let mut payload = BytesMut::new();
+            payload.put_u16_le(2);
+            payload.put_u8(raw);
+            let payload = payload.freeze();
+
+            let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
+            assert_eq!(
+                decoded,
+                ClientMessage::Hello { version: 2, stream_class: expected }
+            );
+        }
+    }
+
+    /// An unknown stream_class byte must not fail decoding — it should be
+    /// rounded down to the loss-tolerant `View` class (STREAMING_DESIGN.md §10).
+    #[test]
+    fn test_decode_hello_unknown_stream_class_defaults_to_view() {
+        let mut payload = BytesMut::new();
+        payload.put_u16_le(2);
+        payload.put_u8(0xEE); // not a valid StreamClass value
+        let payload = payload.freeze();
+
+        let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
+        assert_eq!(
+            decoded,
+            ClientMessage::Hello { version: 2, stream_class: StreamClass::View }
+        );
     }
 
     #[test]

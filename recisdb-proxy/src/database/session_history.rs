@@ -40,9 +40,11 @@ impl Database {
         tuner_path: Option<&str>,
         channel_info: Option<&str>,
         channel_name: Option<&str>,
+        loss_summary: Option<&str>,
+        stream_class: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE session_history SET ended_at = ?2, duration_secs = ?3, packets_sent = ?4, packets_dropped = ?5, packets_scrambled = ?6, packets_error = ?7, bytes_sent = ?8, average_bitrate_mbps = ?9, average_signal_level = ?10, disconnect_reason = ?11, tuner_path = ?12, channel_info = ?13, channel_name = ?14 WHERE id = ?1",
+            "UPDATE session_history SET ended_at = ?2, duration_secs = ?3, packets_sent = ?4, packets_dropped = ?5, packets_scrambled = ?6, packets_error = ?7, bytes_sent = ?8, average_bitrate_mbps = ?9, average_signal_level = ?10, disconnect_reason = ?11, tuner_path = ?12, channel_info = ?13, channel_name = ?14, loss_summary = ?15, stream_class = ?16 WHERE id = ?1",
             params![
                 id,
                 ended_at,
@@ -58,6 +60,8 @@ impl Database {
                 tuner_path,
                 channel_info,
                 channel_name,
+                loss_summary,
+                stream_class,
             ],
         )?;
         Ok(())
@@ -125,13 +129,13 @@ impl Database {
                 let like = format!("%{}%", addr);
                 (
                     "SELECT COUNT(*) FROM session_history WHERE client_address LIKE ?1".to_string(),
-                    "SELECT id, session_id, client_address, tuner_path, channel_info, channel_name, started_at, ended_at, duration_secs, packets_sent, packets_dropped, packets_scrambled, packets_error, bytes_sent, average_bitrate_mbps, average_signal_level, disconnect_reason, created_at FROM session_history WHERE client_address LIKE ?1 ORDER BY started_at DESC LIMIT ?2 OFFSET ?3".to_string(),
+                    "SELECT id, session_id, client_address, tuner_path, channel_info, channel_name, started_at, ended_at, duration_secs, packets_sent, packets_dropped, packets_scrambled, packets_error, bytes_sent, average_bitrate_mbps, average_signal_level, disconnect_reason, created_at, loss_summary, stream_class FROM session_history WHERE client_address LIKE ?1 ORDER BY started_at DESC LIMIT ?2 OFFSET ?3".to_string(),
                     vec![like.into(), limit.into(), offset.into()],
                 )
             } else {
                 (
                     "SELECT COUNT(*) FROM session_history".to_string(),
-                    "SELECT id, session_id, client_address, tuner_path, channel_info, channel_name, started_at, ended_at, duration_secs, packets_sent, packets_dropped, packets_scrambled, packets_error, bytes_sent, average_bitrate_mbps, average_signal_level, disconnect_reason, created_at FROM session_history ORDER BY started_at DESC LIMIT ?1 OFFSET ?2".to_string(),
+                    "SELECT id, session_id, client_address, tuner_path, channel_info, channel_name, started_at, ended_at, duration_secs, packets_sent, packets_dropped, packets_scrambled, packets_error, bytes_sent, average_bitrate_mbps, average_signal_level, disconnect_reason, created_at, loss_summary, stream_class FROM session_history ORDER BY started_at DESC LIMIT ?1 OFFSET ?2".to_string(),
                     vec![limit.into(), offset.into()],
                 )
             };
@@ -165,6 +169,8 @@ impl Database {
                     average_signal_level: row.get(15)?,
                     disconnect_reason: row.get(16)?,
                     created_at: row.get(17)?,
+                    loss_summary: row.get(18)?,
+                    stream_class: row.get(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
