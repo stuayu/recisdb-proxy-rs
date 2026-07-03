@@ -1700,10 +1700,17 @@ pub async fn get_tsreplace_config(
 }
 
 /// Update external encoder (tsreplace) configuration request.
+///
+/// `command_path` is intentionally **not** a field here (REVIEW_2026-07.md
+/// S1): it is the program the server executes (`Command::new(command_path)`),
+/// so it must only be changeable via the TOML config file
+/// (`Database::set_tsreplace_command_path`, called once at startup from
+/// `main.rs`). If a client sends `command_path` in the request body it is
+/// silently ignored by serde (unknown field) and the stored value is left
+/// untouched below.
 #[derive(Debug, Deserialize)]
 pub struct UpdateTsreplaceConfigRequest {
     pub enabled: Option<bool>,
-    pub command_path: Option<String>,
     pub arguments: Option<String>,
     pub read_timeout_ms: Option<u64>,
     pub passthrough_on_error: Option<bool>,
@@ -1711,13 +1718,17 @@ pub struct UpdateTsreplaceConfigRequest {
 }
 
 /// Update external encoder (tsreplace) configuration.
+///
+/// # Security (REVIEW_2026-07.md S1)
+/// `command_path` cannot be changed through this endpoint by design — see
+/// [`UpdateTsreplaceConfigRequest`]. The existing DB value is always kept.
 pub async fn update_tsreplace_config(
     State(web_state): State<Arc<WebState>>,
     Json(payload): Json<UpdateTsreplaceConfigRequest>,
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, mut command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders) =
+    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders) =
         match db.get_tsreplace_config() {
             Ok(config) => config,
             Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2),
@@ -1725,12 +1736,6 @@ pub async fn update_tsreplace_config(
 
     if let Some(val) = payload.enabled {
         enabled = val;
-    }
-    if let Some(val) = payload.command_path {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            command_path = trimmed.to_string();
-        }
     }
     if let Some(val) = payload.arguments {
         arguments = val;

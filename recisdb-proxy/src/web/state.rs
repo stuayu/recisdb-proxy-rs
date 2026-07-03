@@ -12,6 +12,7 @@ use recisdb_protocol::StreamClass;
 
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::TunerPool;
+use crate::web::auth::AuthConfig;
 
 /// Scan scheduler configuration (for Web API).
 #[derive(Debug, Clone, Serialize)]
@@ -382,15 +383,23 @@ pub struct WebState {
     pub scan_config: RwLock<ScanSchedulerInfo>,
     /// Tuner optimization configuration.
     pub tuner_config: RwLock<TunerConfigInfo>,
+    /// Web API authentication (REVIEW_2026-07.md S2).
+    pub auth: AuthConfig,
 }
 
 impl WebState {
     /// Create a new web state.
-    pub fn new(database: DatabaseHandle, tuner_pool: Arc<TunerPool>, session_registry: Arc<SessionRegistry>) -> Self {
+    pub fn new(
+        database: DatabaseHandle,
+        tuner_pool: Arc<TunerPool>,
+        session_registry: Arc<SessionRegistry>,
+        auth: AuthConfig,
+    ) -> Self {
         Self {
             database,
             tuner_pool,
             session_registry,
+            auth,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

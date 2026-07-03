@@ -120,6 +120,17 @@ CREATE TABLE IF NOT EXISTS tsreplace_config (
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
+-- Web API authentication configuration (REVIEW_2026-07.md S2).
+-- Stores the generated/persisted bearer token so it survives restarts.
+-- `[web] auth_token` in the TOML config file, if set, always overrides this
+-- at startup (see main.rs), and the override is written back here too so a
+-- single source of truth is visible via the DB as well.
+CREATE TABLE IF NOT EXISTS web_auth_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    auth_token TEXT,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 -- Session history table
 CREATE TABLE IF NOT EXISTS session_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

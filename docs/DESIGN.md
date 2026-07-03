@@ -183,7 +183,16 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - axum。`/` にインライン HTML ダッシュボード (5 秒ポーリング)、`/api/*` に JSON API。
 - 主なリソース: tuners / bondrivers (CRUD+scan+品質) / channels (CRUD+import/export+batch) /
   clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config。
-- **現状は無認証 + `CorsLayer::permissive()` + 既定 bind 0.0.0.0 (REVIEW S1/S2 参照。認証導入予定)。**
+- **認証 (実装済み・2026-07-04, REVIEW S2)**: `/api/*` は `Authorization: Bearer <token>` 必須
+  (`web/auth.rs::require_auth`、`axum::middleware::from_fn_with_state` で `/api` 配下のみに適用)。
+  `GET /` (ダッシュボード HTML 本体) と `/logos/:file` は無認証のまま (トークン入力 UI を表示するため)。
+  トークンは起動時に TOML `[web] auth_token` > DB (`web_auth_config` テーブル、単一行) > 新規生成 の順で解決し、
+  新規生成時のみ起動ログに一度だけ表示する。`[web] auth_enabled = false` で無効化可能 (無効時は起動時に WARN)。
+  ブラウザ側は初回アクセス時に `prompt()` でトークン入力 → `localStorage` に保存 → `window.fetch` を
+  ラップして全 `/api/*` 呼び出しに自動付与 (`dashboard.rs`)。401 応答時は再入力を促す。
+- **CORS**: `CorsLayer::permissive()` は廃止し、CORS レイヤー自体を外した (ダッシュボードは同一オリジン配信のため
+  ブラウザの同一オリジンポリシーで十分。他オリジンからの `fetch` はブラウザ側で拒否される)。
+- **既定 bind**: `web_listen` の既定は `127.0.0.1:40080` (REVIEW P0)。LAN 公開は `--web-listen 0.0.0.0:40080` などで明示オプトイン。
 - `SessionRegistry` (web/state.rs) がセッションのライブメトリクス
   (signal/drop/scramble/bitrate、5 分の履歴リングバッファ) を保持。セッション終了時に `session_history` へ永続化。
 
@@ -191,7 +200,13 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 
 - `tsreplace_config` の設定でセッションの TS を外部コマンド (既定: tsreplace + QSVEncC) に通してから配信できる。
 - stdin/stdout パイプ、stderr はログへ。エラー時 passthrough 可 (`passthrough_on_error`)。
-- **コマンドパスが無認証 API から変更可能な点は P0 で封じる (REVIEW S1)。**
+- **`command_path` は API/DB から変更不可 (実装済み・2026-07-04, REVIEW S1)**: `command_path` は
+  `Command::new(command_path)` で直接実行されるため信頼境界そのもの。`POST /api/tsreplace-config`
+  (`UpdateTsreplaceConfigRequest`) にはフィールド自体が存在せず、送っても無視され既存値が維持される。
+  変更できるのは起動時の TOML `[tsreplace] command_path` のみ (`Database::set_tsreplace_command_path`、
+  main.rs から一度だけ呼ばれる)。`arguments`/`enabled`/`read_timeout_ms`/`passthrough_on_error`/
+  `max_concurrent_encoders` は従来どおり API から変更可能。ダッシュボードのフォームも実行コマンド欄を
+  読み取り専用表示に変更済み。
 
 ### 4.9 アラート
 
@@ -251,8 +266,8 @@ src/
 
 | 層 | 内容 |
 |---|---|
-| CLI / TOML | `listen` (既定 **0.0.0.0:40070**), `web_listen` (既定 **0.0.0.0:40080**), `tuner`, `database`, `max_connections` (64), ログ設定, TLS パス |
-| DB (Web API から変更) | `tuner_config` (keep_alive=60s, prewarm, SetChannel リトライ, signal 待ち), `scan_scheduler_config`, `tsreplace_config` |
+| CLI / TOML | `listen` (既定 **0.0.0.0:40070**), `web_listen` (既定 **127.0.0.1:40080**、2026-07-04 変更。REVIEW P0), `tuner`, `database`, `max_connections` (64), ログ設定, TLS パス, `[web] auth_enabled`/`auth_token`, `[tsreplace] command_path` |
+| DB (Web API から変更) | `tuner_config` (keep_alive=60s, prewarm, SetChannel リトライ, signal 待ち), `scan_scheduler_config`, `tsreplace_config` (`command_path` を除く — API からは変更不可), `web_auth_config` (トークン永続化、API からは変更不可・main.rs のみが書き込む) |
 
 TLS 設定 (`[tls]`) は **現状サーバー側で機能しない** (パースのみ、accept 経路未結線)。実装完了までは使用しない。
 
@@ -273,8 +288,8 @@ TLS 設定 (`[tls]`) は **現状サーバー側で機能しない** (パース�
 | 項目 | 状態 |
 |---|---|
 | サーバー側 TLS | 設定パースのみ。accept 経路に TlsAcceptor 未結線 |
-| プロトコル認証 | なし (Hello はバージョンのみ) |
-| Web API 認証 | なし + permissive CORS |
+| プロトコル認証 | なし (Hello はバージョンのみ、REVIEW S3 未着手) |
+| Web API 認証 | **実装済み (2026-07-04)**: `/api/*` に Bearer トークン認証、CORS はレイヤー自体を撤去、`web_listen` 既定 `127.0.0.1` (REVIEW S2/P0)。プロトコル認証 (S3) は別課題として未着手 |
 | 容量制御の場所 | session.rs にアドホック実装 (pool.rs の Semaphore 計画は未着手、MuxKey は未使用) |
 | metrics.rs | デッドコード (実体は web/state.rs) |
 | 統合テスト | なし (単体テストは protocol/db/ts_analyzer/space_generator 等に散在) |

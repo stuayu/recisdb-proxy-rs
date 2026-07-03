@@ -31,8 +31,14 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:40070")]
     listen: SocketAddr,
 
-    /// Address for web dashboard to listen on
-    #[arg(long, default_value = "0.0.0.0:40080")]
+    /// Address for web dashboard to listen on.
+    ///
+    /// Defaults to loopback-only (REVIEW_2026-07.md P0): the dashboard/API
+    /// carries an auth token but is otherwise unencrypted (plain HTTP), so
+    /// LAN exposure is opt-in. Pass `--web-listen 0.0.0.0:40080` (or set
+    /// `[server] web_listen` in the TOML config) to expose it beyond
+    /// localhost.
+    #[arg(long, default_value = "127.0.0.1:40080")]
     web_listen: SocketAddr,
 
     /// Path to the default tuner device
@@ -109,9 +115,38 @@ struct ConfigFile {
     database: DatabaseSection,
     #[serde(default)]
     logging: LoggingSection,
+    #[serde(default)]
+    web: WebSection,
+    #[serde(default)]
+    tsreplace: TsreplaceSection,
     #[cfg(feature = "tls")]
     #[serde(default)]
     tls: TlsSection,
+}
+
+/// Web dashboard/API configuration (REVIEW_2026-07.md S2).
+#[derive(Debug, serde::Deserialize, Default)]
+struct WebSection {
+    /// Require `Authorization: Bearer <token>` on all `/api/*` requests.
+    /// Defaults to `true`; set to `false` only for isolated LAN testing.
+    auth_enabled: Option<bool>,
+    /// Explicit bearer token. If unset, a token is generated once and
+    /// persisted to the database (and shown in the startup log exactly
+    /// once).
+    auth_token: Option<String>,
+}
+
+/// tsreplace (external encoder) configuration that must only be settable via
+/// the config file (REVIEW_2026-07.md S1 — see
+/// `Database::set_tsreplace_command_path` for why).
+#[derive(Debug, serde::Deserialize, Default)]
+struct TsreplaceSection {
+    /// Path to the tsreplace (or compatible) executable. This is
+    /// intentionally not exposed via the Web API: the server executes this
+    /// path directly (`Command::new(command_path)`), so allowing it to be
+    /// changed by anyone who can reach the dashboard would be a remote code
+    /// execution vector.
+    command_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -232,6 +267,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let db = std::sync::Arc::new(tokio::sync::Mutex::new(db));
+
+    // tsreplace `command_path` is a trust boundary (REVIEW_2026-07.md S1):
+    // the server executes it directly, so it can only be set here, from the
+    // TOML config file, never from the Web API. If unset, whatever is
+    // already in the DB (or the built-in default) is left untouched.
+    if let Some(command_path) = &file_config.tsreplace.command_path {
+        let db_guard = db.lock().await;
+        match db_guard.set_tsreplace_command_path(command_path) {
+            Ok(()) => info!("tsreplace command_path set from config file: {}", command_path),
+            Err(e) => error!("Failed to set tsreplace command_path from config file: {}", e),
+        }
+    }
+
+    // Web API authentication (REVIEW_2026-07.md S2). Resolution order:
+    // 1. TOML `[web] auth_token` (explicit override, persisted to DB too so
+    //    the DB stays a consistent record of "what's currently valid").
+    // 2. Token already persisted in the DB from a previous run.
+    // 3. Newly generated token, persisted to the DB and shown in the log
+    //    exactly once (it will not be printed again on subsequent restarts;
+    //    retrieve it from the TOML file or the DB `web_auth_config` table).
+    let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
+    let web_auth_token = {
+        let db_guard = db.lock().await;
+        if let Some(token) = &file_config.web.auth_token {
+            if let Err(e) = db_guard.set_web_auth_token(token) {
+                warn!("Failed to persist web auth token override to database: {}", e);
+            }
+            token.clone()
+        } else {
+            match db_guard.get_web_auth_token() {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    let generated = web::auth::generate_token();
+                    if let Err(e) = db_guard.set_web_auth_token(&generated) {
+                        warn!("Failed to persist generated web auth token to database: {}", e);
+                    }
+                    info!("Generated a new Web API auth token (shown once below).");
+                    info!("Web API auth token: {}", generated);
+                    info!("Enter this token in the dashboard when prompted. It is stored in the database and will NOT be printed again on restart.");
+                    generated
+                }
+                Err(e) => {
+                    warn!("Failed to load web auth token from database: {}", e);
+                    web::auth::generate_token()
+                }
+            }
+        }
+    };
+    if !web_auth_enabled {
+        warn!("Web API authentication is DISABLED ([web] auth_enabled = false). Anyone who can reach the dashboard/API has full control. Use only on an isolated/trusted LAN.");
+    }
 
     // Build TLS config if enabled
     #[cfg(feature = "tls")]
@@ -438,6 +524,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let web_db = db.clone();
     let web_tuner_pool = Arc::clone(server.tuner_pool());
     let web_session_registry = Arc::clone(&session_registry);
+    let web_auth_config = web::auth::AuthConfig {
+        enabled: web_auth_enabled,
+        token: web_auth_token,
+    };
     tokio::spawn(async move {
         match web::start_web_server(
             web_listen_addr,
@@ -446,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             web_session_registry,
             scan_config_for_web,
             tuner_config_for_web,
+            web_auth_config,
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

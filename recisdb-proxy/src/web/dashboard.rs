@@ -809,8 +809,8 @@ const HTML_CONTENT: &str = r#"
 
                 <div class="form-group">
                     <label for="tsreplace-command-path">実行コマンド</label>
-                    <input type="text" id="tsreplace-command-path" placeholder="例: tsreplace または /usr/local/bin/tsreplace">
-                    <small>PATH解決されるコマンド名、または絶対パス</small>
+                    <input type="text" id="tsreplace-command-path" readonly disabled placeholder="例: tsreplace または /usr/local/bin/tsreplace">
+                    <small>設定ファイル (recisdb-proxy.toml の [tsreplace] command_path) でのみ変更可能。セキュリティ上の理由により、この画面やAPIからは変更できません。</small>
                 </div>
 
                 <div class="form-group">
@@ -1132,6 +1132,84 @@ const HTML_CONTENT: &str = r#"
     </div>
 
     <script>
+        // ---------------------------------------------------------------
+        // Web API auth token handling (REVIEW_2026-07.md S2).
+        //
+        // The dashboard shell (this HTML) is served without authentication,
+        // but every /api/* route requires `Authorization: Bearer <token>`.
+        // The token is generated once on the server at startup and printed
+        // to the server log; the user pastes it in here once, and it is
+        // cached in localStorage so it survives page reloads. `window.fetch`
+        // is wrapped (once, below) so every existing `fetch('/api/...')`
+        // call site in this file gets the header automatically — no need to
+        // touch each call individually.
+        // ---------------------------------------------------------------
+        const AUTH_TOKEN_STORAGE_KEY = 'recisdbProxyAuthToken';
+
+        function getStoredAuthToken() {
+            return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+        }
+
+        function setStoredAuthToken(token) {
+            if (token) {
+                localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+            } else {
+                localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+            }
+        }
+
+        // Guards against multiple concurrent fetches each popping their own
+        // prompt() on first load (several /api/* calls fire in parallel).
+        let _authPromptInFlight = null;
+
+        function requestAuthTokenFromUser(message) {
+            if (_authPromptInFlight) return _authPromptInFlight;
+            _authPromptInFlight = Promise.resolve().then(() => {
+                const input = window.prompt(message);
+                const token = (input || '').trim();
+                if (token) setStoredAuthToken(token);
+                _authPromptInFlight = null;
+                return token;
+            });
+            return _authPromptInFlight;
+        }
+
+        const _nativeFetch = window.fetch.bind(window);
+        window.fetch = async function authenticatedFetch(input, init) {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const isApiCall = url.startsWith('/api/');
+            init = init || {};
+
+            if (isApiCall) {
+                let token = getStoredAuthToken();
+                if (!token) {
+                    token = await requestAuthTokenFromUser(
+                        'recisdb-proxy: APIトークンを入力してください\n(サーバー起動時のログに一度だけ表示されます)'
+                    );
+                }
+                init = Object.assign({}, init, {
+                    headers: Object.assign({}, init.headers, token ? { 'Authorization': 'Bearer ' + token } : {}),
+                });
+            }
+
+            let res = await _nativeFetch(input, init);
+
+            if (isApiCall && res.status === 401) {
+                setStoredAuthToken(''); // stale/wrong token, drop it
+                const token = await requestAuthTokenFromUser(
+                    '認証エラー: APIトークンが正しくありません。再入力してください。'
+                );
+                if (token) {
+                    init = Object.assign({}, init, {
+                        headers: Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + token }),
+                    });
+                    res = await _nativeFetch(input, init);
+                }
+            }
+
+            return res;
+        };
+
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
@@ -2838,14 +2916,14 @@ const HTML_CONTENT: &str = r#"
         }
 
         async function saveTsreplaceConfig() {
-            const commandPath = document.getElementById('tsreplace-command-path').value.trim();
+            // Note: command_path is read-only in this UI and is not sent —
+            // it can only be changed via recisdb-proxy.toml [tsreplace]
+            // command_path (REVIEW_2026-07.md S1). The server ignores this
+            // field even if present, but we avoid sending it at all so the
+            // intent is unambiguous.
             const readTimeoutMs = parseInt(document.getElementById('tsreplace-read-timeout').value, 10);
             const maxEncoders = parseInt(document.getElementById('tsreplace-max-encoders').value, 10);
 
-            if (!commandPath) {
-                showTsreplaceConfigMessage('実行コマンドは必須です', 'error');
-                return;
-            }
             if (!Number.isFinite(readTimeoutMs) || readTimeoutMs <= 0) {
                 showTsreplaceConfigMessage('読み取りタイムアウトは正の数値を入力してください', 'error');
                 return;
@@ -2857,7 +2935,6 @@ const HTML_CONTENT: &str = r#"
 
             const payload = {
                 enabled: document.getElementById('tsreplace-enabled').checked,
-                command_path: commandPath,
                 arguments: document.getElementById('tsreplace-arguments').value,
                 read_timeout_ms: readTimeoutMs,
                 passthrough_on_error: document.getElementById('tsreplace-passthrough-on-error').checked,

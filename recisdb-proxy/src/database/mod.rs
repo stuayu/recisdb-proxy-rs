@@ -559,6 +559,74 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Set the tsreplace external-command path.
+    ///
+    /// # Security (trust boundary — REVIEW_2026-07.md S1)
+    ///
+    /// `command_path` is the program the server executes via
+    /// `Command::new(command_path)` to pipe TS through an external encoder.
+    /// It **must only ever be set from the TOML config file** (see
+    /// `main.rs`, which calls this once at startup from `[tsreplace]
+    /// command_path`). It must never be reachable from a Web API handler:
+    /// the API is accessible to anyone who can reach the dashboard (LAN, or
+    /// a CSRF'd browser request), and allowing `command_path` to be changed
+    /// there would be a straightforward path to remote code execution.
+    /// `arguments` (also user-influenced) stays API-editable because it is
+    /// passed as an argument vector, not resolved as a program to execute.
+    pub fn set_tsreplace_command_path(&self, command_path: &str) -> Result<()> {
+        self.ensure_tsreplace_config_compat()?;
+        self.conn.execute(
+            "UPDATE tsreplace_config SET command_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
+            rusqlite::params![command_path],
+        )?;
+        Ok(())
+    }
+}
+
+/// Web API authentication token storage (REVIEW_2026-07.md S2).
+impl Database {
+    fn ensure_web_auth_config_compat(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS web_auth_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                auth_token TEXT,
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Get the persisted Web API bearer token, if one has been generated or
+    /// configured before.
+    pub fn get_web_auth_token(&self) -> Result<Option<String>> {
+        self.ensure_web_auth_config_compat()?;
+
+        let result = self.conn.query_row(
+            "SELECT auth_token FROM web_auth_config WHERE id = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        );
+
+        match result {
+            Ok(token) => Ok(token.filter(|t| !t.trim().is_empty())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DatabaseError::Sqlite(e)),
+        }
+    }
+
+    /// Persist the Web API bearer token (generated once at first startup, or
+    /// set explicitly via TOML `[web] auth_token`).
+    pub fn set_web_auth_token(&self, token: &str) -> Result<()> {
+        self.ensure_web_auth_config_compat()?;
+        self.conn.execute(
+            "INSERT INTO web_auth_config (id, auth_token, updated_at)
+             VALUES (1, ?1, strftime('%s', 'now'))
+             ON CONFLICT(id) DO UPDATE SET auth_token = excluded.auth_token, updated_at = excluded.updated_at",
+            rusqlite::params![token],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -586,5 +654,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn web_auth_token_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.get_web_auth_token().unwrap(), None);
+
+        db.set_web_auth_token("abc123").unwrap();
+        assert_eq!(db.get_web_auth_token().unwrap(), Some("abc123".to_string()));
+
+        // Overwriting replaces the stored token rather than erroring.
+        db.set_web_auth_token("def456").unwrap();
+        assert_eq!(db.get_web_auth_token().unwrap(), Some("def456".to_string()));
+    }
+
+    #[test]
+    fn set_tsreplace_command_path_only_changes_command_path() {
+        let db = Database::open_in_memory().unwrap();
+        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3)
+            .unwrap();
+
+        db.set_tsreplace_command_path("/usr/local/bin/tsreplace").unwrap();
+
+        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders) =
+            db.get_tsreplace_config().unwrap();
+        assert_eq!(command_path, "/usr/local/bin/tsreplace");
+        // Everything else must be preserved.
+        assert!(enabled);
+        assert_eq!(arguments, "--foo");
+        assert_eq!(read_timeout_ms, 5000);
+        assert!(!passthrough_on_error);
+        assert_eq!(max_concurrent_encoders, 3);
     }
 }
