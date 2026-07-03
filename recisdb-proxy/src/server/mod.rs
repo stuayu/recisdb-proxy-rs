@@ -1,5 +1,6 @@
 //! Server implementation for the proxy.
 
+pub mod channel_resolve;
 pub mod listener;
 pub mod prefill;
 pub mod session;

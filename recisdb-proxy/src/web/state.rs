@@ -11,7 +11,7 @@ use dns_lookup::lookup_addr;
 use recisdb_protocol::StreamClass;
 
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::TunerPool;
+use crate::tuner::{EncoderPool, TunerPool};
 use crate::web::auth::AuthConfig;
 
 /// Scan scheduler configuration (for Web API).
@@ -377,6 +377,11 @@ pub struct WebState {
     pub database: DatabaseHandle,
     /// Tuner pool reference.
     pub tuner_pool: Arc<TunerPool>,
+    /// Shared tsreplace encoder pool (STREAMING_DESIGN.md §5/§6 P4/P5): the
+    /// same pool `server::listener::Server` hands to every BNDP session, so
+    /// an HTTP `?profile=preview` request and a TVTest session watching the
+    /// same channel join the same running encoder chain.
+    pub encoder_pool: Arc<EncoderPool>,
     /// Session registry.
     pub session_registry: Arc<SessionRegistry>,
     /// Scan scheduler configuration.
@@ -392,12 +397,14 @@ impl WebState {
     pub fn new(
         database: DatabaseHandle,
         tuner_pool: Arc<TunerPool>,
+        encoder_pool: Arc<EncoderPool>,
         session_registry: Arc<SessionRegistry>,
         auth: AuthConfig,
     ) -> Self {
         Self {
             database,
             tuner_pool,
+            encoder_pool,
             session_registry,
             auth,
             scan_config: RwLock::new(ScanSchedulerInfo {

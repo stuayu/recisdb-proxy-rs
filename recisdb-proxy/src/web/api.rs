@@ -43,6 +43,36 @@ pub async fn get_logo(
     }
 }
 
+/// Serve a small allow-listed static asset (currently only `mpegts.js`) from
+/// the `static/` directory next to the working directory, mirroring
+/// [`get_logo`]'s pattern.
+///
+/// STREAMING_DESIGN.md §6.4: the dashboard's preview player wants a local
+/// copy of mpegts.js so the page doesn't depend on a CDN, but this
+/// environment cannot fetch/vendor a ~200KB minified JS file. Rather than
+/// fabricate one, this endpoint just serves whatever the operator drops at
+/// `recisdb-proxy/static/mpegts.js`; if absent, `dashboard.rs`'s `<script>`
+/// tag falls back to a CDN URL (see its `onerror` handler). Unauthenticated
+/// like `/logos/:file` — it can only ever return the exact allow-listed
+/// filename (no path traversal surface) and there is no confidentiality
+/// concern in serving a JS library.
+pub async fn get_static_asset(Path(file): Path<String>) -> impl IntoResponse {
+    const ALLOWED: &[&str] = &["mpegts.js"];
+    if !ALLOWED.contains(&file.as_str()) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    let path = std::path::PathBuf::from("static").join(&file);
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (StatusCode::OK, [(CONTENT_TYPE, "application/javascript")], bytes).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read static asset").into_response(),
+    }
+}
+
 // ============================================================================
 // Data structures
 // ============================================================================
@@ -1780,6 +1810,128 @@ pub async fn update_tsreplace_config(
             "max_concurrent_encoders": max_concurrent_encoders,
         }
     }))
+}
+
+// ============================================================================
+// Encode profile endpoints (STREAMING_DESIGN.md §5.3/§9 P5)
+//
+// `command_path` (the executable actually run) is never a field on any of
+// these request/response types — it stays governed solely by
+// `tsreplace_config.command_path` (TOML-only, REVIEW S1). A profile only
+// ever supplies codec/container/bitrate/extra arguments, mirroring how
+// `update_tsreplace_config` above omits `command_path`.
+// ============================================================================
+
+/// Get all encode profiles.
+pub async fn get_encode_profiles(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.get_all_encode_profiles() {
+        Ok(profiles) => Json(json!({
+            "success": true,
+            "profiles": profiles,
+            "count": profiles.len(),
+        })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// Request body for `POST /api/encode-profiles`.
+#[derive(Debug, Deserialize)]
+pub struct CreateEncodeProfileRequest {
+    pub name: String,
+    pub purpose: String,
+    pub codec: String,
+    pub container: Option<String>,
+    pub target_bitrate: Option<i64>,
+    pub extra_args: Option<String>,
+    pub is_enabled: Option<bool>,
+}
+
+/// Create a new encode profile.
+pub async fn create_encode_profile(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<CreateEncodeProfileRequest>,
+) -> impl IntoResponse {
+    if payload.name.trim().is_empty() || payload.purpose.trim().is_empty() || payload.codec.trim().is_empty() {
+        return Json(json!({
+            "success": false,
+            "error": "name, purpose, and codec are required"
+        }));
+    }
+
+    let db = web_state.database.lock().await;
+    match db.insert_encode_profile(
+        &payload.name,
+        &payload.purpose,
+        &payload.codec,
+        payload.container.as_deref().unwrap_or("mpegts"),
+        payload.target_bitrate,
+        payload.extra_args.as_deref(),
+        payload.is_enabled.unwrap_or(true),
+    ) {
+        Ok(id) => Json(json!({ "success": true, "id": id })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// Request body for `POST /api/encode-profiles/:id`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateEncodeProfileRequest {
+    pub name: Option<String>,
+    pub purpose: Option<String>,
+    pub codec: Option<String>,
+    pub container: Option<String>,
+    /// `null` = clear to NULL, number = set, field omitted = leave alone.
+    pub target_bitrate: Option<Option<i64>>,
+    /// `null` = clear to NULL, string = set, field omitted = leave alone.
+    pub extra_args: Option<Option<String>>,
+    pub is_enabled: Option<bool>,
+}
+
+/// Update an existing encode profile.
+pub async fn update_encode_profile(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateEncodeProfileRequest>,
+) -> impl IntoResponse {
+    let has_any = payload.name.is_some()
+        || payload.purpose.is_some()
+        || payload.codec.is_some()
+        || payload.container.is_some()
+        || payload.target_bitrate.is_some()
+        || payload.extra_args.is_some()
+        || payload.is_enabled.is_some();
+
+    if !has_any {
+        return Json(json!({ "success": false, "error": "No fields to update" }));
+    }
+
+    let db = web_state.database.lock().await;
+    match db.update_encode_profile(
+        id,
+        payload.name.as_deref(),
+        payload.purpose.as_deref(),
+        payload.codec.as_deref(),
+        payload.container.as_deref(),
+        payload.target_bitrate,
+        payload.extra_args.as_ref().map(|v| v.as_deref()),
+        payload.is_enabled,
+    ) {
+        Ok(_) => Json(json!({ "success": true, "message": "Encode profile updated successfully" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// Delete an encode profile.
+pub async fn delete_encode_profile(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+    match db.delete_encode_profile(id) {
+        Ok(_) => Json(json!({ "success": true, "message": "Encode profile deleted" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
 }
 
 /// Get scan scheduler configuration.

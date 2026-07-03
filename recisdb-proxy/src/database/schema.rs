@@ -182,6 +182,25 @@ CREATE TABLE IF NOT EXISTS alert_history (
     FOREIGN KEY(rule_id) REFERENCES alert_rules(id) ON DELETE CASCADE
 );
 
+-- Encode profile catalogue (STREAMING_DESIGN.md §5.3/§9 P5).
+-- `purpose` selects which pipeline picks it up: 'record' (high-quality,
+-- typically HEVC), 'preview' (browser mpegts.js playback, H.264 fixed for
+-- compatibility per §6.2/§12-2), or 'view' (reserved for future use).
+-- `command_path` is intentionally NOT stored here: the executable itself
+-- stays governed by `tsreplace_config.command_path` (TOML-only, REVIEW S1);
+-- a profile only supplies codec/bitrate/extra arguments.
+CREATE TABLE IF NOT EXISTS encode_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    purpose TEXT NOT NULL,          -- 'record' | 'preview' | 'view'
+    codec TEXT NOT NULL,            -- 'h264' | 'hevc'
+    container TEXT DEFAULT 'mpegts',
+    target_bitrate INTEGER,
+    extra_args TEXT,
+    is_enabled INTEGER DEFAULT 1,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 -- Driver quality stats table
 CREATE TABLE IF NOT EXISTS driver_quality_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +235,7 @@ CREATE INDEX IF NOT EXISTS idx_session_history_created_at ON session_history(cre
 CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(is_enabled);
 CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history(rule_id);
 CREATE INDEX IF NOT EXISTS idx_driver_quality_stats_driver ON driver_quality_stats(bon_driver_id);
+CREATE INDEX IF NOT EXISTS idx_encode_profiles_purpose ON encode_profiles(purpose, is_enabled);
 
 -- Trigger to update updated_at on bon_drivers
 CREATE TRIGGER IF NOT EXISTS bon_drivers_updated_at
@@ -259,5 +279,6 @@ mod tests {
         assert!(tables.contains(&"alert_history".to_string()));
         assert!(tables.contains(&"driver_quality_stats".to_string()));
         assert!(tables.contains(&"tuner_config".to_string()));
+        assert!(tables.contains(&"encode_profiles".to_string()));
     }
 }

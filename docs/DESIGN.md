@@ -182,7 +182,22 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 
 - axum。`/` にインライン HTML ダッシュボード (5 秒ポーリング)、`/api/*` に JSON API。
 - 主なリソース: tuners / bondrivers (CRUD+scan+品質) / channels (CRUD+import/export+batch) /
-  clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config。
+  clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config /
+  encode-profiles (CRUD、STREAMING_DESIGN.md §5.3 P5) / stream (HTTP-TS 配信、§6.3 P5)。
+- **HTTP-TS ストリーミング (実装済み・2026-07-04, STREAMING_DESIGN.md §6.3/§7.2 P5)**:
+  `GET /api/stream/service/:sid` (生 TS passthrough) / `GET /api/stream/service/:sid?profile=preview`
+  (`encode_profiles` の `purpose='preview'` 行 + 共有エンコーダプール (§4.8/P4) で H.264 変換した TS)。
+  `:sid` は `channels.id` (既存 `/api/channel/:id` 系と同じ主キー)。選局は `server/channel_resolve.rs`
+  (session.rs の単一チューナーモード相当を切り出した専用ヘルパー。グループ選局・排他退避・容量フォールバックは
+  意図的に含まない — 詳細と理由はそのモジュールの doc comment) で解決し、`TunerPool`/`SharedTuner`/
+  `EncoderPool` は session.rs と共有・合流する。クライアント切断時は `axum::body::Body::from_stream` の
+  ドロップを契機にチューナー購読解除 (`SharedTuner::unsubscribe` + `TunerPool::schedule_idle_close`) と
+  エンコーダ購読解除 (`EncoderPool::release`) を行う (`web/stream.rs::StreamCleanup`)。
+  `/api/*` と同じ Bearer 認証下 (§6.5)。
+- **エンコードプロファイル (実装済み・2026-07-04, STREAMING_DESIGN.md §5.3/§9 P5)**: `encode_profiles` テーブル
+  (`purpose`: record/preview/view、`codec`/`container`/`target_bitrate`/`extra_args`)。起動時に
+  `preview-h264` (H.264, ~2Mbps) を未存在なら自動シード。`command_path` はこのテーブルにもリクエスト型にも
+  存在しない — 引き続き `tsreplace_config.command_path` (TOML専用、REVIEW S1) のみが実行コマンドを決める。
 - **認証 (実装済み・2026-07-04, REVIEW S2)**: `/api/*` は `Authorization: Bearer <token>` 必須
   (`web/auth.rs::require_auth`、`axum::middleware::from_fn_with_state` で `/api` 配下のみに適用)。
   `GET /` (ダッシュボード HTML 本体) と `/logos/:file` は無認証のまま (トークン入力 UI を表示するため)。

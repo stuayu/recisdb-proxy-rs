@@ -9,6 +9,7 @@ mod bon_driver;
 mod channel;
 mod driver_quality;
 mod alert;
+mod encode_profile;
 mod session_history;
 mod models;
 mod schema;
@@ -80,6 +81,10 @@ impl Database {
     fn initialize_schema(&self) -> Result<()> {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.apply_migrations()?;
+        // STREAMING_DESIGN.md §5.3/§9 P5: seed the default 'preview' encode
+        // profile. Idempotent (checks for an existing row by name), so it is
+        // safe to call unconditionally on every open().
+        self.seed_default_encode_profiles()?;
         Ok(())
     }
 
@@ -148,6 +153,15 @@ impl Database {
         self.add_column_if_not_exists("tuner_config", "prefill_preview_ms", "INTEGER DEFAULT 2000")?;
         self.add_column_if_not_exists("tuner_config", "prefill_record_ms", "INTEGER DEFAULT 6000")?;
         self.add_column_if_not_exists("tuner_config", "jitter_safety_factor", "REAL DEFAULT 1.5")?;
+
+        // Migration 010: encode_profiles is a brand-new table (STREAMING_DESIGN.md
+        // §5.3/§9 P5), so `CREATE TABLE IF NOT EXISTS` in schema.rs already
+        // creates it for both fresh and pre-existing databases — no
+        // add_column_if_not_exists step is needed here (that mechanism is only
+        // for adding columns to tables that already exist). Default-row
+        // seeding happens separately in `initialize_schema` via
+        // `seed_default_encode_profiles`, since schema DDL can't express data
+        // seeding.
 
         // Migration 002: Fill band_type and terrestrial_region for existing channels
         // This updates all NULL values in these columns based on NID

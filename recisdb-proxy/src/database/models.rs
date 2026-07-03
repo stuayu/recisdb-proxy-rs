@@ -176,6 +176,24 @@ pub struct AlertHistoryRecord {
     pub acknowledged: bool,
 }
 
+/// Encode profile record (STREAMING_DESIGN.md §5.3/§9 P5).
+///
+/// `purpose` is a free-form string in practice (`'record'` / `'preview'` /
+/// `'view'`) but kept as `String` rather than an enum since it is stored
+/// verbatim in SQLite and new purposes may be added without a migration.
+#[derive(Debug, Clone, Serialize)]
+pub struct EncodeProfileRecord {
+    pub id: i64,
+    pub name: String,
+    pub purpose: String,
+    pub codec: String,
+    pub container: String,
+    pub target_bitrate: Option<i64>,
+    pub extra_args: Option<String>,
+    pub is_enabled: bool,
+    pub created_at: i64,
+}
+
 /// Driver quality stats record.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriverQualityStats {

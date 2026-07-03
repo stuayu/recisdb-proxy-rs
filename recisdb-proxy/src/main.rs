@@ -523,6 +523,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start web dashboard server
     let web_db = db.clone();
     let web_tuner_pool = Arc::clone(server.tuner_pool());
+    // Same shared encoder pool every BNDP session uses (STREAMING_DESIGN.md
+    // §5/§6 P4/P5), so an HTTP `?profile=preview` request and a TVTest
+    // session watching the same channel join one running encoder chain.
+    let web_encoder_pool = Arc::clone(server.encoder_pool());
     let web_session_registry = Arc::clone(&session_registry);
     let web_auth_config = web::auth::AuthConfig {
         enabled: web_auth_enabled,
@@ -533,6 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             web_listen_addr,
             web_db,
             web_tuner_pool,
+            web_encoder_pool,
             web_session_registry,
             scan_config_for_web,
             tuner_config_for_web,

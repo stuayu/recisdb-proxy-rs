@@ -357,7 +357,7 @@ CREATE TABLE encode_profiles(
 | **P2** | ストリームクラス導入 + RECORD の無損失キュー/エラー化 | P1 | 「パケロス NG」を録画で担保 | ✅ 実装済 (2026-07-03)。BNDP v2 (Hello に StreamClass、v1 クライアントは View 扱いで互換)。RECORD は broadcast Lagged / 送出キュー 10s 超過で `record_broadcast_lag` / `record_queue_overflow` として切断・記録 |
 | **P3** | 固定秒数プリフィル/ジッタバッファ (ビットレート連動) | P2 | 安定化・アンダーラン抑止 | ✅ 実装済 (2026-07-03) |
 | **P4** | 共有エンコーダ(EncodePool) + 同時数セマフォ | なし(並行可) | tsreplace 複数ストリーム高速化 | ✅ 実装済 (2026-07-03)。プロファイル表は P5 に繰り延べ |
-| **P5** | エンコードプロファイル表 + HTTP-TS エンドポイント + ダッシュボード mpegts.js プレビュー | P4 | ブラウザプレビュー | 未着手 |
+| **P5** | エンコードプロファイル表 + HTTP-TS エンドポイント + ダッシュボード mpegts.js プレビュー | P4 | ブラウザプレビュー | ✅ 実装済 (2026-07-04) |
 | **P6** | Mirakurun 互換 API サブセット + WebSocket ダッシュボード | P5 | エコシステム連携 | 未着手 |
 
 実装メモ (P1/P4):
@@ -372,6 +372,56 @@ CREATE TABLE encode_profiles(
 - `tuner_config` に `prefill_view_ms`/`prefill_preview_ms`/`prefill_record_ms`/`jitter_safety_factor` を追加 (migration 009)。`TunerPoolConfig` には追加せず (チューナーのライフサイクル設定であり、プリフィルはセッション単位の出力バッファリングで無関係なため) — セッションは `load_tsreplace_runtime_config` と同様に `StartStream` 時に DB を直接読む。`SessionInfo.prefilling` を `/api/clients` とダッシュボードのクライアント一覧に追加。
 
 ※ P4 は他と独立に着手可能。プレビュー(P5)は P4 の H.264 プロファイルに乗るため P4 → P5 の順。
+
+実装メモ (P5):
+- `database/encode_profile.rs` 新設。`encode_profiles` テーブル (§5.3/§9) は `schema.rs` に
+  `CREATE TABLE IF NOT EXISTS` で追加 (新規テーブルなので `add_column_if_not_exists` 型のマイグレーションは不要 —
+  既存 DB でも `IF NOT EXISTS` がそのまま効く)。`Database::open()`/`open_in_memory()` 内で
+  `seed_default_encode_profiles()` を毎回呼び、`name='preview-h264'` の行が無ければ
+  H.264/~2Mbps/QSVEncC 引数テンプレートの行を1件 INSERT (べき等)。CRUD は
+  `get_all/get/get_by_purpose/insert/update/delete`。API: `GET/POST /api/encode-profiles`,
+  `POST/DELETE /api/encode-profiles/:id` (`web/api.rs`)。**`command_path` はテーブルにもリクエスト型にも存在しない**
+  — 実行コマンドは引き続き `tsreplace_config.command_path` (TOML専用) のみ。
+- **選局ロジックの共有 (§6.3)**: `handle_set_channel_space` (session.rs、~450行) はセッション状態
+  (`current_tuner_path`/`group_driver_paths`/warm tuner 等) に強く依存し、仮想space変換・グループ選局の
+  ドライバー横断探索・排他退避・容量フォールバックまで含む。これを丸ごと切り出すのはハイリスク
+  (この環境では実機/実バイナリでの回帰確認ができない) と判断し、**`server/channel_resolve.rs` を新設して
+  「`channels.id` (sid) → 自分自身の driver/space/channel を直接引く」経路のみを実装**した
+  (`resolve_service` / `start_tuner_for_service`)。`channels` テーブルは各行が既に具体的な
+  `(bon_driver_id, bon_space, bon_channel)` を持つため、HTTPの「特定サービスを1本再生したい」要求には
+  仮想space変換もグループ横断探索も不要 — それらはセッションが「抽象インデックスで、複数ドライバーの
+  どれか」を選ぶための機構であり、sid直指定には無関係。`ChannelKey`/`TunerPool::get_or_create`
+  (factoryは no-op) → 未起動なら `SharedTuner::start_bondriver_reader` という**session.rs の
+  単一チューナーモード分岐と全く同じ呼び出し列**を使うため、二重実装ではなく「同じ土台の上の専用経路」。
+  グループ選局・排他退避・容量フォールバックは意図的に非対応 (詳細はモジュール doc comment)。
+- **切断時のリーク防止**: `web/stream.rs::StreamCleanup` が RAII ガード。レスポンスボディ
+  (`axum::body::Body::from_stream` + `futures::stream::unfold`) の state に埋め込み、
+  ストリームが (正常終了・クライアント切断どちらでも) drop されたら `Drop` 内で `tokio::spawn` して
+  非同期クリーンアップ (`SharedTuner::unsubscribe` → 購読者0なら `TunerPool::schedule_idle_close`、
+  `profile=preview` なら追加で `EncoderPool::release`) を行う。`Drop::drop` は同期関数なので await できず、
+  detached task に逃がす形。**この切断シナリオ自体は実機ブラウザ/クライアントでの実行時検証ができていない**
+  (b25-sys リンク不可のためフルバイナリが動かせない) — 単体テストでは `StreamCleanup` を直接 drop して
+  `SharedTuner::subscriber_count` が減ることのみ確認 (`web/stream.rs` の
+  `dropping_stream_cleanup_releases_tuner_subscription`)。
+- **broadcast Lagged の扱い**: HTTP ストリームは PREVIEW 相当のポリシーで、`Lagged` はログのみで継続
+  (§3.2/§3.3 の VIEW/PREVIEW 方針を踏襲)。RECORD 相当の「溢れたら切断」は HTTP エンドポイントには適用していない
+  (Mirakurun 風 HTTP 配信は §2 の意味では PREVIEW/VIEW 用途を想定)。
+- **profile=preview の SID 選択**: `/api/stream/service/:sid` は1サービス指定なので、
+  `encoder_pool::args_contain_service_option` が偽なら常に `sids=[その1 SID]` でエンコード
+  (session.rs の single-service モードと同じ規約)。`tsreplace_config.enabled=false` の場合は
+  503 で明示エラーを返す (実行コマンド自体を無効化している設定なので、preview だけ黙って動かすのは矛盾するため)。
+- **生 passthrough の範囲**: `profile` 未指定時はチューナーの生 TS (物理チャンネルのフル multiplex) を
+  そのまま流す。session.rs のようなサービスPIDフィルタ (`ts_analyzer::service_filter`) は適用していない
+  — 実装コスト・回帰リスクに対して仕様上の要求 (§6.3 は「生 TS」としか書いていない) を超えないための意図的な
+  簡略化。地上波 (MPEG-2) は主要ブラウザで再生できない制約 (§6.2) は passthrough 経路にも変わらず適用される。
+- **mpegts.js の同梱**: この環境では ~200KB の minified JS を新規取得できないため、実ファイルは同梱していない。
+  `dashboard.rs` は `<script src="/static/mpegts.js" onerror="...CDNへフォールバック...">` を出力し、
+  `web/api.rs::get_static_asset` が `static/mpegts.js` を配信できれば使う (`/logos/:file` と同じ
+  allow-list パターンの無認証エンドポイント。JSライブラリなので機密性の問題はない)。運用者は
+  `recisdb-proxy/static/mpegts.js` に本体を配置するか、CDN (`https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js`)
+  読み込みのままにする。認証ヘッダは mpegts.js の `config.headers`(fetch/xhr loader が対応するバージョン)
+  経由で `Authorization: Bearer <token>` を付与 (`dashboard.rs` の `getStoredAuthToken()` を再利用)。
+  **ブラウザでの動作確認はできていない** (mpegts.js 自体を実行できる環境がない)。
 
 ---
 

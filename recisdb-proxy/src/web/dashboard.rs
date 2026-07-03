@@ -28,6 +28,24 @@ const HTML_CONTENT: &str = r#"
     <script>
         (function() { var t = localStorage.getItem('dashboardTheme'); if (t === 'modern') document.documentElement.classList.add('theme-modern'); })();
     </script>
+    <!--
+        mpegts.js (STREAMING_DESIGN.md §6.4): prefer a local copy so the
+        preview player has no CDN dependency. Operators should place the
+        library at recisdb-proxy/static/mpegts.js (served by GET /static/mpegts.js,
+        unauthenticated like /logos/:file — see web/api.rs::get_static_asset).
+        If that 404s, fall back to a CDN build so preview still works out of
+        the box. This environment could not fetch/vendor the ~200KB minified
+        file itself, so only this loader shim is shipped, not the library.
+    -->
+    <script src="/static/mpegts.js" onerror="
+        (function() {
+            console.warn('recisdb-proxy: /static/mpegts.js not found locally, falling back to CDN. ' +
+                         'Place a local copy at recisdb-proxy/static/mpegts.js to avoid this.');
+            var s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js';
+            document.head.appendChild(s);
+        })();
+    "></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -845,6 +863,38 @@ const HTML_CONTENT: &str = r#"
 
                 <div id="tsreplace-config-message" style="margin-top: 15px; display: none;"></div>
             </div>
+
+            <h3 style="margin-top: 30px;">エンコードプロファイル (STREAMING_DESIGN.md §5.3)</h3>
+            <p style="font-size:12px;color:#666;">
+                録画・プレビュー用途ごとのコーデック/ビットレート/追加引数の組み合わせ。
+                実行コマンド本体は上の「外部エンコード（tsreplace）設定」の実行コマンド欄
+                (TOML設定でのみ変更可)がそのまま使われます。ブラウザプレビューは
+                <code>purpose=preview</code> の最初の有効な行を使用します。
+            </p>
+            <div class="section-header">
+                <span></span>
+                <button class="btn btn-secondary btn-sm" onclick="refreshEncodeProfiles()">更新</button>
+            </div>
+            <table id="encode-profiles-table" class="responsive-table">
+                <thead>
+                    <tr>
+                        <th>有効</th>
+                        <th>名前</th>
+                        <th>用途</th>
+                        <th>コーデック</th>
+                        <th>コンテナ</th>
+                        <th>ビットレート</th>
+                        <th>追加引数</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="encode-profiles-body">
+                    <tr><td colspan="8" class="loading">読み込み中...</td></tr>
+                </tbody>
+            </table>
+            <div style="margin-top:10px;">
+                <button class="btn btn-primary btn-sm" onclick="openCreateEncodeProfile()">プロファイル追加</button>
+            </div>
         </div>
 
         <!-- History Tab -->
@@ -1094,6 +1144,77 @@ const HTML_CONTENT: &str = r#"
                 <div class="form-actions">
                     <button type="button" class="btn btn-danger" onclick="deleteChannel()" style="margin-right: auto;">削除</button>
                     <button type="button" class="btn btn-secondary" onclick="closeModal('channel-modal')">キャンセル</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Channel Preview Modal (STREAMING_DESIGN.md §6.3/§6.4) -->
+    <div class="modal" id="channel-preview-modal">
+        <div class="modal-content" style="max-width:720px;">
+            <h3 id="preview-title">プレビュー</h3>
+            <p style="font-size:12px;color:#666;margin-top:-8px;">
+                地上波などMPEG-2の放送はブラウザで直接再生できないため、常に「preview」プロファイル
+                (共有エンコーダによるH.264変換、STREAMING_DESIGN.md §6.2) 経由で再生します。
+                エンコーダが未設定/無効/上限到達の場合は再生できません（設定タブの外部エンコード設定を確認してください）。
+            </p>
+            <video id="preview-video" controls autoplay muted style="width:100%;background:#000;max-height:405px;"></video>
+            <div id="preview-status" style="margin-top:10px;font-size:12px;color:#666;"></div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeChannelPreview()">閉じる</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Encode Profile Edit Modal (STREAMING_DESIGN.md §5.3) -->
+    <div class="modal" id="encode-profile-modal">
+        <div class="modal-content">
+            <h3 id="encode-profile-modal-title">エンコードプロファイル</h3>
+            <form id="encode-profile-form">
+                <input type="hidden" id="ep-id">
+                <div class="form-group">
+                    <label>名前</label>
+                    <input type="text" id="ep-name" placeholder="例: preview-h264" required>
+                </div>
+                <div class="form-group">
+                    <label>用途 (purpose)</label>
+                    <select id="ep-purpose">
+                        <option value="preview">preview（ブラウザプレビュー）</option>
+                        <option value="record">record（録画）</option>
+                        <option value="view">view（視聴・予約）</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>コーデック</label>
+                    <select id="ep-codec">
+                        <option value="h264">h264</option>
+                        <option value="hevc">hevc</option>
+                    </select>
+                    <small>preview用途はブラウザ互換性のためH.264を推奨します (STREAMING_DESIGN.md §6.2)</small>
+                </div>
+                <div class="form-group">
+                    <label>コンテナ</label>
+                    <input type="text" id="ep-container" value="mpegts">
+                </div>
+                <div class="form-group">
+                    <label>目標ビットレート (bps、空欄可)</label>
+                    <input type="number" id="ep-bitrate" min="0" placeholder="例: 2000000">
+                </div>
+                <div class="form-group">
+                    <label>追加引数</label>
+                    <input type="text" id="ep-extra-args" placeholder="tsreplace/QSVEncCへ渡す引数">
+                    <small>実行コマンド本体（command_path）は外部エンコード設定側のみで変更可能です</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="ep-enabled" checked>
+                        有効にする
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-danger" id="ep-delete-btn" onclick="deleteEncodeProfile()" style="margin-right: auto; display:none;">削除</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('encode-profile-modal')">キャンセル</button>
                     <button type="submit" class="btn btn-primary">保存</button>
                 </div>
             </form>
@@ -2005,6 +2126,7 @@ const HTML_CONTENT: &str = r#"
                         <td>${c.priority}</td>
                         <td>
                             <button class="btn btn-primary btn-sm" onclick='editChannel(${JSON.stringify(c)})'>編集</button>
+                            <button class="btn btn-secondary btn-sm" onclick='openChannelPreview(${c.id}, ${JSON.stringify(c.channel_name || c.raw_name || ("CH" + c.id))})'>プレビュー</button>
                         </td>
                     </tr>
                 `).join('');
@@ -2512,6 +2634,74 @@ const HTML_CONTENT: &str = r#"
             openModal('channel-modal');
         }
 
+        // ---- Browser preview (STREAMING_DESIGN.md §6.3/§6.4) ----
+        // mpegts.js loads a converted (H.264) TS via `?profile=preview`,
+        // sharing the same encoder pool as any BNDP session watching the
+        // same channel (STREAMING_DESIGN.md §5 P4). Requires the
+        // Authorization header, so the fetch/xhr loader is configured with
+        // the same token `window.fetch` already injects for /api/* calls.
+        let _previewPlayer = null;
+
+        function openChannelPreview(sid, name) {
+            document.getElementById('preview-title').textContent = 'プレビュー: ' + name;
+            const statusEl = document.getElementById('preview-status');
+            statusEl.textContent = '';
+            openModal('channel-preview-modal');
+
+            if (typeof mpegts === 'undefined' || !mpegts.isSupported()) {
+                statusEl.textContent = 'mpegts.js が読み込めていないか、このブラウザでは再生できません。' +
+                    'recisdb-proxy/static/mpegts.js を配置するか、ネットワーク接続（CDN）を確認してください。';
+                return;
+            }
+
+            closeChannelPreview(/* keepModalOpen */ true);
+
+            const token = getStoredAuthToken();
+            const url = `/api/stream/service/${sid}?profile=preview`;
+            try {
+                _previewPlayer = mpegts.createPlayer(
+                    { type: 'mpegts', isLive: true, url: url },
+                    {
+                        enableWorker: false,
+                        liveBufferLatencyChasing: true,
+                        // mpegts.js's fetch/xhr stream loader forwards this
+                        // to every request it makes for `url` above — this
+                        // is how the bearer token reaches an endpoint that
+                        // sits behind the same auth as every other /api/*
+                        // route (STREAMING_DESIGN.md §6.5). NOTE: not
+                        // verified against a real mpegts.js build in this
+                        // environment — if a future mpegts.js version drops
+                        // `headers` support, fall back to `xhrSetup`.
+                        headers: token ? { 'Authorization': 'Bearer ' + token } : {},
+                    }
+                );
+                const video = document.getElementById('preview-video');
+                _previewPlayer.attachMediaElement(video);
+                _previewPlayer.load();
+                _previewPlayer.play().catch(err => {
+                    statusEl.textContent = '再生開始に失敗しました: ' + err.message;
+                });
+                _previewPlayer.on(mpegts.Events.ERROR, (type, detail) => {
+                    statusEl.textContent = `再生エラー (${type}): ${JSON.stringify(detail)}`;
+                });
+            } catch (e) {
+                statusEl.textContent = 'プレイヤーの初期化に失敗しました: ' + e.message;
+            }
+        }
+
+        function closeChannelPreview(keepModalOpen) {
+            if (_previewPlayer) {
+                try { _previewPlayer.pause(); } catch (e) {}
+                try { _previewPlayer.unload(); } catch (e) {}
+                try { _previewPlayer.detachMediaElement(); } catch (e) {}
+                try { _previewPlayer.destroy(); } catch (e) {}
+                _previewPlayer = null;
+            }
+            const video = document.getElementById('preview-video');
+            if (video) { video.removeAttribute('src'); video.load(); }
+            if (!keepModalOpen) closeModal('channel-preview-modal');
+        }
+
         document.getElementById('channel-form').onsubmit = async (e) => {
             e.preventDefault();
             const id = document.getElementById('ch-id').value;
@@ -2979,6 +3169,138 @@ const HTML_CONTENT: &str = r#"
             document.getElementById('tsreplace-config-message').style.display = 'none';
         }
 
+        // ---- Encode profiles (STREAMING_DESIGN.md §5.3/§9 P5) ----
+        let encodeProfileData = [];
+
+        async function refreshEncodeProfiles() {
+            try {
+                const res = await fetch('/api/encode-profiles');
+                const data = await res.json();
+                if (data.success) {
+                    encodeProfileData = data.profiles || [];
+                    renderEncodeProfiles();
+                }
+            } catch (e) {
+                console.error('Failed to load encode profiles:', e);
+            }
+        }
+
+        function renderEncodeProfiles() {
+            const tbody = document.getElementById('encode-profiles-body');
+            if (!tbody) return;
+            if (encodeProfileData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="empty-state">プロファイルがありません</td></tr>';
+                return;
+            }
+            tbody.innerHTML = encodeProfileData.map(p => `
+                <tr>
+                    <td>
+                        <label class="toggle">
+                            <input type="checkbox" ${p.is_enabled ? 'checked' : ''} onchange="toggleEncodeProfile(${p.id}, this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </td>
+                    <td>${escapeHtml(p.name)}</td>
+                    <td>${escapeHtml(p.purpose)}</td>
+                    <td>${escapeHtml(p.codec)}</td>
+                    <td>${escapeHtml(p.container || 'mpegts')}</td>
+                    <td>${p.target_bitrate ? Math.round(p.target_bitrate / 1000) + ' kbps' : '-'}</td>
+                    <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(p.extra_args || '')}">${escapeHtml(p.extra_args || '-')}</td>
+                    <td>
+                        <button class="btn btn-primary btn-sm" onclick='openEditEncodeProfile(${JSON.stringify(p)})'>編集</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function openCreateEncodeProfile() {
+            document.getElementById('encode-profile-modal-title').textContent = 'エンコードプロファイル追加';
+            document.getElementById('ep-id').value = '';
+            document.getElementById('ep-name').value = '';
+            document.getElementById('ep-purpose').value = 'preview';
+            document.getElementById('ep-codec').value = 'h264';
+            document.getElementById('ep-container').value = 'mpegts';
+            document.getElementById('ep-bitrate').value = '';
+            document.getElementById('ep-extra-args').value = '';
+            document.getElementById('ep-enabled').checked = true;
+            document.getElementById('ep-delete-btn').style.display = 'none';
+            openModal('encode-profile-modal');
+        }
+
+        function openEditEncodeProfile(p) {
+            document.getElementById('encode-profile-modal-title').textContent = 'エンコードプロファイル編集';
+            document.getElementById('ep-id').value = p.id;
+            document.getElementById('ep-name').value = p.name;
+            document.getElementById('ep-purpose').value = p.purpose;
+            document.getElementById('ep-codec').value = p.codec;
+            document.getElementById('ep-container').value = p.container || 'mpegts';
+            document.getElementById('ep-bitrate').value = p.target_bitrate ?? '';
+            document.getElementById('ep-extra-args').value = p.extra_args || '';
+            document.getElementById('ep-enabled').checked = !!p.is_enabled;
+            document.getElementById('ep-delete-btn').style.display = '';
+            openModal('encode-profile-modal');
+        }
+
+        async function toggleEncodeProfile(id, enabled) {
+            try {
+                const res = await fetch(`/api/encode-profiles/${id}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ is_enabled: enabled })
+                });
+                const data = await res.json();
+                if (!data.success) alert('エラー: ' + data.error);
+                refreshEncodeProfiles();
+            } catch (e) { alert('更新に失敗しました: ' + e.message); }
+        }
+
+        async function deleteEncodeProfile() {
+            const id = document.getElementById('ep-id').value;
+            if (!id) return;
+            if (!confirm('このプロファイルを削除しますか？')) return;
+            try {
+                const res = await fetch(`/api/encode-profiles/${id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    closeModal('encode-profile-modal');
+                    refreshEncodeProfiles();
+                } else {
+                    alert('エラー: ' + data.error);
+                }
+            } catch (e) { alert('削除に失敗しました: ' + e.message); }
+        }
+
+        document.getElementById('encode-profile-form').onsubmit = async (e) => {
+            e.preventDefault();
+            const id = document.getElementById('ep-id').value;
+            const bitrateRaw = document.getElementById('ep-bitrate').value;
+            const argsRaw = document.getElementById('ep-extra-args').value;
+            const payload = {
+                name: document.getElementById('ep-name').value,
+                purpose: document.getElementById('ep-purpose').value,
+                codec: document.getElementById('ep-codec').value,
+                container: document.getElementById('ep-container').value || 'mpegts',
+                target_bitrate: bitrateRaw === '' ? null : parseInt(bitrateRaw, 10),
+                extra_args: argsRaw === '' ? null : argsRaw,
+                is_enabled: document.getElementById('ep-enabled').checked,
+            };
+            try {
+                const url = id ? `/api/encode-profiles/${id}` : '/api/encode-profiles';
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    closeModal('encode-profile-modal');
+                    refreshEncodeProfiles();
+                } else {
+                    alert('エラー: ' + data.error);
+                }
+            } catch (e) { alert('保存に失敗しました: ' + e.message); }
+        };
+
         // Initialize
         window.addEventListener('load', () => {
             updateThemeButton();
@@ -2988,6 +3310,7 @@ const HTML_CONTENT: &str = r#"
             loadScanConfig();
             loadTunerConfig();
             loadTsreplaceConfig();
+            refreshEncodeProfiles();
             enableTableSorting('clients-table');
             enableTableSorting('bondrivers-table');
             enableTableSorting('history-table');

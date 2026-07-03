@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth;
 pub mod dashboard;
 pub mod state;
+pub mod stream;
 
 use axum::{
     Router,
@@ -13,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::TunerPool;
+use crate::tuner::{EncoderPool, TunerPool};
 use auth::AuthConfig;
 use state::WebState;
 
@@ -72,6 +73,15 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // External encoder (tsreplace) configuration API
         .route("/tsreplace-config", get(api::get_tsreplace_config))
         .route("/tsreplace-config", post(api::update_tsreplace_config))
+        // Encode profile catalogue API (STREAMING_DESIGN.md §5.3/§9 P5)
+        .route("/encode-profiles", get(api::get_encode_profiles))
+        .route("/encode-profiles", post(api::create_encode_profile))
+        .route("/encode-profiles/:id", post(api::update_encode_profile))
+        .route("/encode-profiles/:id", delete(api::delete_encode_profile))
+        // HTTP-TS streaming endpoints (STREAMING_DESIGN.md §6.3/§7.2).
+        // Auth is applied the same way as every other route here (see
+        // `build_app`'s `route_layer(...require_auth)`) — §6.5.
+        .route("/stream/service/:sid", get(stream::stream_service))
 }
 
 /// Build the full application router bound to `web_state`.
@@ -96,6 +106,10 @@ fn build_app(web_state: Arc<WebState>) -> Router {
         // Dashboard route (unauthenticated: serves the token-entry UI)
         .route("/", get(dashboard::index))
         .route("/logos/:file", get(api::get_logo))
+        // Static assets (currently just an optional local mpegts.js — see
+        // STREAMING_DESIGN.md §6.4). Unauthenticated like /logos/:file: a
+        // fixed allow-list, no path traversal, no confidential content.
+        .route("/static/:file", get(api::get_static_asset))
         .with_state(web_state)
 }
 
@@ -105,12 +119,13 @@ pub async fn start_web_server(
     listen_addr: SocketAddr,
     database: DatabaseHandle,
     tuner_pool: Arc<TunerPool>,
+    encoder_pool: Arc<EncoderPool>,
     session_registry: Arc<SessionRegistry>,
     scan_config: Option<state::ScanSchedulerInfo>,
     tuner_config: Option<state::TunerConfigInfo>,
     auth: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut web_state = WebState::new(database, tuner_pool, session_registry, auth);
+    let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth);
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
     }
@@ -141,8 +156,9 @@ mod tests {
             crate::database::Database::open_in_memory().expect("open in-memory db"),
         ));
         let tuner_pool = Arc::new(TunerPool::new(4));
+        let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(SessionRegistry::new());
-        Arc::new(WebState::new(database, tuner_pool, session_registry, auth))
+        Arc::new(WebState::new(database, tuner_pool, encoder_pool, session_registry, auth))
     }
 
     #[tokio::test]
@@ -207,6 +223,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stream_endpoint_requires_auth_like_every_other_api_route() {
+        // STREAMING_DESIGN.md §6.5: the streaming endpoint must sit behind
+        // the exact same auth gate as the rest of `/api/*`.
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/service/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

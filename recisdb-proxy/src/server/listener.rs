@@ -113,7 +113,10 @@ impl Server {
     }
 
     /// Get a reference to the shared encoder pool.
-    #[allow(dead_code)]
+    ///
+    /// Also handed to the web server (`main.rs`) so HTTP `?profile=preview`
+    /// requests (STREAMING_DESIGN.md §6.3 P5) join the same encoder chains as
+    /// BNDP sessions instead of spawning their own.
     pub fn encoder_pool(&self) -> &Arc<EncoderPool> {
         &self.encoder_pool
     }
