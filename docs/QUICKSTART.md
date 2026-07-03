@@ -23,8 +23,8 @@ recisdb-proxy
 ```
 
 デフォルト設定で起動します：
-- **プロキシサーバー**: `0.0.0.0:12345`
-- **Webダッシュボード**: `http://0.0.0.0:8080`
+- **プロキシサーバー**: `0.0.0.0:40070`
+- **Webダッシュボード**: `http://0.0.0.0:40080`
 - **DB**: `./recisdb-proxy.db`
 
 ### 2. BonDriverを指定して起動
@@ -36,7 +36,7 @@ recisdb-proxy --tuner "C:\BonDriver\BonDriver_PX-MLT1.dll"
 ### 3. カスタムポートで起動
 
 ```bash
-recisdb-proxy --listen 0.0.0.0:12346 --web-listen 0.0.0.0:8081
+recisdb-proxy --listen 0.0.0.0:40071 --web-listen 0.0.0.0:40081
 ```
 
 ### 4. 設定ファイルを使用
@@ -47,7 +47,7 @@ recisdb-proxy --config recisdb-proxy.toml
 
 ## Webダッシュボードへのアクセス
 
-サーバー起動後、ブラウザで `http://localhost:8080` を開くと以下の画面が表示されます：
+サーバー起動後、ブラウザで `http://localhost:40080` を開くと以下の画面が表示されます：
 
 ### ダッシュボード機能
 
@@ -76,7 +76,7 @@ recisdb-proxy --config recisdb-proxy.toml
 # サーバー起動
 recisdb-proxy --tuner "C:\BonDriver\BonDriver_PX-MLT1.dll"
 
-# ブラウザで http://localhost:8080 を開く
+# ブラウザで http://localhost:40080 を開く
 # 「チューナー設定」セクションで max_instances = 4 に設定
 # （初期値は1なので、必ず4に変更してください）
 
@@ -89,15 +89,15 @@ recisdb-proxy --tuner "C:\BonDriver\BonDriver_PX-MLT1.dll"
 # recisdb-proxy.toml を作成
 cat > recisdb-proxy.toml << 'EOF'
 [server]
-listen = "0.0.0.0:12345"
-web_listen = "0.0.0.0:8080"
+listen = "0.0.0.0:40070"
+web_listen = "0.0.0.0:40080"
 max_connections = 64
 EOF
 
 # サーバー起動
 recisdb-proxy
 
-# ブラウザで http://localhost:8080 を開き、
+# ブラウザで http://localhost:40080 を開き、
 # Webダッシュボードの「チューナー設定」から以下を設定:
 #   PX-MLT1: max_instances = 4（4チャンネル同時使用）
 #   PX-S:    max_instances = 1（衛星波は1つのみ）
@@ -122,10 +122,10 @@ TVTest等のクライアント側で優先度を指定して接続：
 ```bash
 # ポートが開いているか確認
 # Windows
-netstat -ano | findstr :8080
+netstat -ano | findstr :40080
 
 # Linux
-netstat -tlnp | grep 8080
+netstat -tlnp | grep 40080
 ```
 
 ### 接続したクライアントが見えない
@@ -162,10 +162,10 @@ RUST_LOG=debug recisdb-proxy
 # recisdb-proxy.toml
 [server]
 # プロキシサーバーのリッスンアドレス
-listen = "0.0.0.0:12345"
+listen = "0.0.0.0:40070"
 
 # Webダッシュボードのリッスンアドレス
-web_listen = "0.0.0.0:8080"
+web_listen = "0.0.0.0:40080"
 
 # デフォルトチューナー（複数登録可能。DBに登録される）
 tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
@@ -177,13 +177,9 @@ max_connections = 64
 # SQLiteデータベースファイルのパス
 path = "./recisdb-proxy.db"
 
-# TLS設定（オプション）
-# [tls]
-# enabled = true
-# ca_cert = "./certs/ca.crt"
-# server_cert = "./certs/server.crt"
-# server_key = "./certs/server.key"
-# require_client_cert = false
+# TLS設定
+# 注意: サーバー側TLSは現在未実装です（設定を書いても暗号化されません）。
+# 対応状況は docs/DESIGN.md §9 / docs/REVIEW_2026-07.md S4 を参照してください。
 ```
 
 ## コマンドラインオプション一覧
@@ -196,8 +192,8 @@ recisdb-proxy --help
 
 | オプション | 説明 | デフォルト |
 |-----------|------|---------|
-| `--listen ADDR` | プロキシサーバーのリッスンアドレス | 0.0.0.0:12345 |
-| `--web-listen ADDR` | Webダッシュボードのリッスンアドレス | 0.0.0.0:8080 |
+| `--listen ADDR` | プロキシサーバーのリッスンアドレス | 0.0.0.0:40070 |
+| `--web-listen ADDR` | Webダッシュボードのリッスンアドレス | 0.0.0.0:40080 |
 | `--tuner PATH` | デフォルトチューナーパス | （指定なし） |
 | `--database PATH` | SQLiteデータベースファイル | recisdb-proxy.db |
 | `--max-connections N` | 最大同時接続数 | 64 |
@@ -209,8 +205,7 @@ recisdb-proxy --help
 ## 次のステップ
 
 1. [Webダッシュボード詳細ガイド](WEB_DASHBOARD.md) - API仕様やダッシュボード機能の詳細
-2. [プライオリティチャンネル選択](PriorityChannelSelection.md) - 優先度制御の詳細
-3. [BonDriver容量制御](BonDriverCapacityControl.md) - インスタンス制限の設計
+2. [設計マスタ](DESIGN.md) - 優先度・排他制御やインスタンス制限を含む全体設計
 
 ## 技術サポート
 
