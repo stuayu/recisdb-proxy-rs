@@ -44,7 +44,11 @@ fn prep_cmake(cx: TargetVar) -> cmake::Config {
             cx.m_system,
         ) {
             (false, _) => {
-                cm.generator("Visual Studio 17 2022");
+                // Let CMake auto-detect the newest installed Visual Studio.
+                // Users can still override via the CMAKE_GENERATOR env var.
+                if let Ok(generator) = var("CMAKE_GENERATOR") {
+                    cm.generator(generator);
+                }
 
                 if cx.feat.clone().unwrap_or_default().contains("crt-static") {
                     cm.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded");
