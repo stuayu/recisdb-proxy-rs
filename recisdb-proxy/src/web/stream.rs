@@ -283,6 +283,7 @@ pub async fn stream_service(
             Ok(v) => v,
             Err(msg) => {
                 release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+                warn!("[HTTP stream] service {} preview unavailable: {}", sid, msg);
                 return error_response(StatusCode::SERVICE_UNAVAILABLE, msg);
             }
         }
@@ -322,6 +323,11 @@ pub async fn stream_service(
         }
         Err(EncoderPoolError::Saturated) => {
             release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+            warn!(
+                "[HTTP stream] service {} preview unavailable: encoder pool saturated \
+                 (max_concurrent_encoders reached)",
+                sid
+            );
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "shared encoder pool saturated (max_concurrent_encoders reached); try again later",
@@ -329,6 +335,7 @@ pub async fn stream_service(
         }
         Err(EncoderPoolError::SpawnFailed(e)) => {
             release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+            warn!("[HTTP stream] service {} preview encoder spawn failed: {}", sid, e);
             error_response(StatusCode::SERVICE_UNAVAILABLE, e)
         }
     }
