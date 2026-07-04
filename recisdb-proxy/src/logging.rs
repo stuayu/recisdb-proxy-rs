@@ -6,10 +6,10 @@
 
 use std::io;
 use std::path::Path;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use chrono::Local;
 use std::fs;
-use std::sync::Arc;
 
 /// Initialize the logging system with both console and file output.
 ///
@@ -18,24 +18,32 @@ use std::sync::Arc;
 /// * `retention_days` - Number of days to keep log files
 /// * `verbose` - Whether to enable debug-level logging
 /// * `level` - Log level override from config file (e.g. "warn", "info", "error")
+///
+/// # Returns
+/// The [`WorkerGuard`] of the non-blocking file writer. The caller MUST keep
+/// it alive for the whole program lifetime (e.g. `let _log_guard = ...` in
+/// `main`): dropping it shuts the background writer thread down, and its
+/// `Drop` is also what flushes any still-buffered lines on graceful exit.
+/// (Previously the guard was `Box::leak`ed here, which kept the writer alive
+/// but skipped the final flush-on-drop.)
 pub fn init_logging(
     log_dir: &Path,
     retention_days: u64,
     verbose: bool,
     level: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
 
     // Clean up old log files
     clean_old_logs(log_dir, retention_days)?;
 
-    // Create a file appender for daily rotation
+    // Create a file appender for daily rotation.
+    // NOTE: rotation happens on the UTC date boundary (tracing-appender 0.2),
+    // so file `recisdb-proxy.log.YYYY-MM-DD` covers 09:00 JST of that day
+    // through 08:59 JST of the next.
     let file_appender = tracing_appender::rolling::daily(log_dir, "recisdb-proxy.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    // Wrap the guard in an Arc and leak it to keep it alive for the program lifetime
-    let _ = Box::leak(Box::new(Arc::new(guard)));
 
     // Priority: RUST_LOG env > --verbose flag > config file level > default "info"
     let default_level = if verbose {
@@ -72,15 +80,16 @@ pub fn init_logging(
                 .with_timer(LocalTimeTimer)
         );
 
-    // Initialize with tracing and tracing-log to bridge log:: macros
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| format!("Failed to set default subscriber: {}", e))?;
-
-    // Initialize tracing-log to bridge log:: macros to tracing
+    // Initialize tracing-log FIRST so `log::` macro records are bridged to
+    // tracing from the very first event; this is also the order recommended
+    // by tracing-log (set the LogTracer before the global subscriber).
     tracing_log::LogTracer::init()
         .map_err(|e| format!("Failed to initialize LogTracer: {}", e))?;
 
-    Ok(())
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| format!("Failed to set default subscriber: {}", e))?;
+
+    Ok(guard)
 }
 
 /// Clean up log files older than the specified number of days.

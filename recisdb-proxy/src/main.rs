@@ -133,8 +133,8 @@ struct WebSection {
     /// Defaults to `true`; set to `false` only for isolated LAN testing.
     auth_enabled: Option<bool>,
     /// Explicit bearer token. If unset, a token is generated once and
-    /// persisted to the database (and shown in the startup log exactly
-    /// once).
+    /// persisted to the database. Whatever token is in effect is printed
+    /// to the startup log on every start (when auth is enabled).
     auth_token: Option<String>,
 }
 
@@ -243,7 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logging with file output and rotation
     let log_level = file_config.logging.level.as_deref();
-    logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level)
+    // Keep the returned guard alive for the whole program: dropping it stops
+    // the background file-writer thread and flushes buffered log lines.
+    let _log_guard = logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level)
         .expect("Failed to initialize logging");
 
     // Use log macros which are now bridged to tracing
@@ -298,9 +300,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. TOML `[web] auth_token` (explicit override, persisted to DB too so
     //    the DB stays a consistent record of "what's currently valid").
     // 2. Token already persisted in the DB from a previous run.
-    // 3. Newly generated token, persisted to the DB and shown in the log
-    //    exactly once (it will not be printed again on subsequent restarts;
-    //    retrieve it from the TOML file or the DB `web_auth_config` table).
+    // 3. Newly generated token, persisted to the DB.
+    // Whichever branch resolved it, the token is printed to the startup log
+    // on every start (see below) so it can always be recovered from the
+    // console/log file.
     let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
     let web_auth_token = {
         let db_guard = db.lock().await;
@@ -317,9 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(e) = db_guard.set_web_auth_token(&generated) {
                         warn!("Failed to persist generated web auth token to database: {}", e);
                     }
-                    info!("Generated a new Web API auth token (shown once below).");
-                    info!("Web API auth token: {}", generated);
-                    info!("Enter this token in the dashboard when prompted. It is stored in the database and will NOT be printed again on restart.");
+                    info!("Generated a new Web API auth token (persisted to the database).");
                     generated
                 }
                 Err(e) => {
@@ -329,7 +330,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    if !web_auth_enabled {
+    if web_auth_enabled {
+        // Printed on EVERY start (not just when first generated) so users can
+        // always recover the token from the startup log.
+        info!("Web API auth token: {}", web_auth_token);
+        info!("Enter this token in the dashboard (or send it as `Authorization: Bearer <token>`) to use the Web API.");
+    } else {
         warn!("Web API authentication is DISABLED ([web] auth_enabled = false). Anyone who can reach the dashboard/API has full control. Use only on an isolated/trusted LAN.");
     }
 

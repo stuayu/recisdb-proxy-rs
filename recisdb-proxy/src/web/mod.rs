@@ -9,10 +9,14 @@ pub mod stream;
 
 use axum::{
     Router,
+    extract::{ConnectInfo, Request},
+    middleware::Next,
+    response::Response,
     routing::{delete, get, post},
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
@@ -101,6 +105,51 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
         .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
 }
 
+/// HTTP access-log middleware, layered over the whole router in
+/// [`build_app`].
+///
+/// Emits exactly one `INFO` line per request *after* the handler produced a
+/// response: remote address, method, path (including the query string),
+/// status code, and elapsed time in milliseconds.
+///
+/// Notes:
+/// - The remote address comes from [`ConnectInfo`], which is only present
+///   when the app is served via `into_make_service_with_connect_info` (see
+///   [`start_web_server`]). In `oneshot` tests it is absent, so it is read
+///   as an `Option` and logged as `-`.
+/// - For streaming endpoints (`/api/stream/service/:sid` etc.)
+///   `next.run(req)` returns as soon as the response *headers* are ready,
+///   so this logs the moment the stream was accepted, not its total
+///   duration — the middleware never blocks on the body.
+/// - Header values are deliberately NOT logged: `Authorization` carries the
+///   API bearer token. The query string is safe to log — auth is
+///   header-only (see `web/auth.rs`), no token ever travels in the URL.
+async fn access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.to_string());
+    let start = Instant::now();
+
+    let response = next.run(request).await;
+
+    log::info!(
+        "{} \"{} {}\" {} {}ms",
+        remote.as_deref().unwrap_or("-"),
+        method,
+        path_and_query,
+        response.status().as_u16(),
+        start.elapsed().as_millis(),
+    );
+    response
+}
+
 /// Build the full application router bound to `web_state`.
 ///
 /// # Security (REVIEW_2026-07.md S2)
@@ -137,7 +186,11 @@ fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
         router = router.nest("/mirakurun/api", build_mirakurun_router());
     }
 
-    router.with_state(web_state)
+    router
+        .with_state(web_state)
+        // Access log covers every route above (dashboard, /api/*, and the
+        // Mirakurun router when enabled).
+        .layer(axum::middleware::from_fn(access_log))
 }
 
 /// Start the web dashboard server.
@@ -182,7 +235,9 @@ pub async fn start_web_server(
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     log::info!("Web dashboard listening on http://{}", listen_addr);
 
-    axum::serve(listener, app).await?;
+    // `with_connect_info` makes the client's SocketAddr available to the
+    // access-log middleware (see `access_log`) via `ConnectInfo`.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }
