@@ -119,6 +119,8 @@ struct ConfigFile {
     web: WebSection,
     #[serde(default)]
     tsreplace: TsreplaceSection,
+    #[serde(default)]
+    mirakurun: MirakurunSection,
     #[cfg(feature = "tls")]
     #[serde(default)]
     tls: TlsSection,
@@ -134,6 +136,18 @@ struct WebSection {
     /// persisted to the database (and shown in the startup log exactly
     /// once).
     auth_token: Option<String>,
+}
+
+/// Mirakurun-compatible API subset configuration
+/// (STREAMING_DESIGN.md §7.1, P6).
+#[derive(Debug, serde::Deserialize, Default)]
+struct MirakurunSection {
+    /// Mount the unauthenticated `/mirakurun/api/*` router
+    /// (`web/mirakurun.rs`). Defaults to `false`: this endpoint carries no
+    /// bearer-token auth at all (real Mirakurun clients — EPGStation/mirakc/
+    /// KonomiTV — send none), so it is opt-in even though `web_listen`
+    /// already defaults to loopback-only.
+    enabled: Option<bool>,
 }
 
 /// tsreplace (external encoder) configuration that must only be settable via
@@ -318,6 +332,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !web_auth_enabled {
         warn!("Web API authentication is DISABLED ([web] auth_enabled = false). Anyone who can reach the dashboard/API has full control. Use only on an isolated/trusted LAN.");
     }
+
+    // Mirakurun-compatible API subset (STREAMING_DESIGN.md §7.1, P6):
+    // opt-in, default disabled. The startup WARN for the unauthenticated
+    // surface itself is logged from `web::start_web_server` once the router
+    // is actually about to be nested in.
+    let mirakurun_enabled = file_config.mirakurun.enabled.unwrap_or(false);
 
     // Build TLS config if enabled
     #[cfg(feature = "tls")]
@@ -542,6 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_config_for_web,
             tuner_config_for_web,
             web_auth_config,
+            mirakurun_enabled,
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

@@ -358,7 +358,7 @@ CREATE TABLE encode_profiles(
 | **P3** | 固定秒数プリフィル/ジッタバッファ (ビットレート連動) | P2 | 安定化・アンダーラン抑止 | ✅ 実装済 (2026-07-03) |
 | **P4** | 共有エンコーダ(EncodePool) + 同時数セマフォ | なし(並行可) | tsreplace 複数ストリーム高速化 | ✅ 実装済 (2026-07-03)。プロファイル表は P5 に繰り延べ |
 | **P5** | エンコードプロファイル表 + HTTP-TS エンドポイント + ダッシュボード mpegts.js プレビュー | P4 | ブラウザプレビュー | ✅ 実装済 (2026-07-04) |
-| **P6** | Mirakurun 互換 API サブセット + WebSocket ダッシュボード | P5 | エコシステム連携 | 未着手 |
+| **P6** | Mirakurun 互換 API サブセット + WebSocket ダッシュボード | P5 | エコシステム連携 | Mirakurun 互換 API サブセットのみ ✅ 実装済 (2026-07-04)。WebSocket ダッシュボードは未着手 |
 
 実装メモ (P1/P4):
 - P1: 既存 `TsPacketAnalyzer` を per-PID 化 (上限 256 PID + overflow 集約)。CC 判定に duplicate 許容・discontinuity_indicator 抑止を追加。broadcast `Lagged(count)` の count はチャンク数であり `packets_dropped` に混ぜる従来動作は単位バグとして分離 (`loss_broadcast_lag_chunks`)。損失源別カウンタ + top PID を `/api/client/:id/quality`・ダッシュボード・`session_history.loss_summary`(JSON) に公開。
@@ -422,6 +422,49 @@ CREATE TABLE encode_profiles(
   読み込みのままにする。認証ヘッダは mpegts.js の `config.headers`(fetch/xhr loader が対応するバージョン)
   経由で `Authorization: Bearer <token>` を付与 (`dashboard.rs` の `getStoredAuthToken()` を再利用)。
   **ブラウザでの動作確認はできていない** (mpegts.js 自体を実行できる環境がない)。
+
+実装メモ (P6):
+- `web/mirakurun.rs` 新設。`/mirakurun/api/*` に `GET version/status/channels/services`,
+  `GET services/:id/stream`, `GET channels/:type/:channel/stream` を実装 (`web/mod.rs::build_mirakurun_router`)。
+- **マウント先・認証・opt-in**: `/api/*` とは別ルータとして `/mirakurun/api` にマウントし、
+  `require_auth` を掛けない。理由は実 Mirakurun クライアント (EPGStation/mirakc/KonomiTV) が
+  `Authorization` ヘッダを送らないこと、かつ Mirakurun の実パス (`/api/services` 等) がこのプロジェクト
+  自身のダッシュボード API (`/api/channels` 等) と衝突すること。**既定 disabled** の opt-in
+  (`[mirakurun] enabled = false`、`main.rs::MirakurunSection`)。`build_app`/`start_web_server` は
+  `mirakurun_enabled: bool` を受け取り、`true` の時だけ `.nest("/mirakurun/api", ...)` する
+  (`false` なら 404 — ルータに存在しない)。有効化時は `start_web_server` が起動時に一度だけ
+  「無認証で配信される、信頼ネットワーク/localhost のみで公開せよ」という WARN を出す。`web_listen` の
+  既定 `127.0.0.1` と合わせ、二重に既定安全。
+- **P5 配信ロジックの再利用**: `web/stream.rs` の `StreamCleanup`(RAII、`tuner_only` コンストラクタを追加)・
+  `broadcast_to_body_stream`・`respond_with_stream`・`error_response`・`channel_resolve_error_response`
+  (`NotFoundNidSid` variant 追加に伴い引数を `sid: i64` から `context: impl Display` に一般化) を
+  `pub(crate)` 化し、`web/mirakurun.rs` から直接呼び出す形で再利用した(二重実装なし)。
+  `server/channel_resolve.rs` は `resolve_channel_record` という共通の検証本体を切り出し、
+  既存の `resolve_service(db, channels.id)` と新設の `resolve_service_by_nid_sid(db, nid, sid)`
+  (Mirakurun の `id = nid*100000+sid` を分解した後の解決に使用) の双方から呼ぶ形にリファクタ。
+  `database/channel.rs` に `get_channel_by_nid_sid` を新設 (`tsid` 抜きで `(nid, sid)` のみで引く。
+  複数一致時は `is_enabled DESC, priority DESC, id ASC` で決定的に1件選ぶ)。
+  Mirakurun 側のストリームは **passthrough 固定** (生 TS、`?profile=` 等の変換クエリは実装しない —
+  §7.1 の「passthrough が既定」の通り)。
+- **データマッピング**: サービス id は `mirakurun_service_id(nid, sid) = nid as u64 * 100000 + sid as u64`
+  とその逆変換 `split_mirakurun_service_id`(範囲外は `None`)。`band_type → Mirakurun type` は
+  `Terrestrial→"GR"`, `BS→"BS"`, `CS→"CS"`, `FourK→"BS"`(4K相当の型が本サブセットに無いための簡略化),
+  `CATV→"GR"`, `SKY`/`Other→"SKY"`(いずれも本来の Mirakurun 型に忠実な対応が無いための便宜的バケツ)。
+  `GET /channels/:type/:channel/stream` 用の逆引き (`mirakurun_type_to_band_candidates`) は必然的に
+  一対多 (`type=BS` は `BandType::BS`/`FourK` の両方にマッチ)。`channel` 文字列は地上波は `physical_ch`
+  優先(無ければ `bon_channel`)、それ以外は `bon_channel` をそのまま10進文字列化 — 実 Mirakurun の
+  衛星チャンネル表記 (`"BS15_0"` 等のトランスポンダ+スロット形式) は再現していない
+  (EPGStation/KonomiTV は主に `id`/`serviceId` で参照するため、視聴が通ることを優先した簡略化)。
+  `/channels`・`/services` は `is_enabled` かつ `bon_channel` が設定済み (スキャン済み) の行のみ列挙。
+  ロゴ (`logoId`/`hasLogoData`) は常に「無し」を返す (`hasLogoData: false`) — 未実装。
+  EPG (`/api/programs` 等) はスコープ外のまま。
+- **実行時未検証**: この環境では実機 BonDriver・実 Mirakurun クライアント (EPGStation/mirakc/KonomiTV) の
+  いずれも動かせない (b25-sys の C++ リンク不可)。カバレッジは in-memory DB に対するユニット/統合テスト
+  (`cargo test`、`tower::ServiceExt::oneshot`) のみ — サービス id 往復、`BandType` 正引き/逆引きの
+  一対多整合性、`channel` 文字列導出、`/mirakurun/api/version` が無認証で 200 を返すこと、
+  `enabled=false` 時に `/mirakurun/api/*` が 404 になること、`/services`/`/channels` が
+  in-memory DB のシードデータから妥当な JSON を返すことを確認。EPGStation のサービス検出・KonomiTV の
+  ライブ視聴が実際に通るかどうかは未検証。
 
 ---
 

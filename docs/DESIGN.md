@@ -211,6 +211,27 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - `SessionRegistry` (web/state.rs) がセッションのライブメトリクス
   (signal/drop/scramble/bitrate、5 分の履歴リングバッファ) を保持。セッション終了時に `session_history` へ永続化。
 
+- **Mirakurun 互換 API サブセット (実装済み・2026-07-04, STREAMING_DESIGN.md §7.1 P6)**:
+  `web/mirakurun.rs`。`GET /version` / `GET /status` / `GET /channels` / `GET /services` /
+  `GET /services/:id/stream` / `GET /channels/:type/:channel/stream` を **`/mirakurun/api/*`**
+  という別ルータにマウント (`web/mod.rs::build_mirakurun_router`)。**`/api/*` の `require_auth` は掛からない**
+  (実 Mirakurun クライアント — EPGStation/mirakc/KonomiTV — は `Authorization` ヘッダを送らないため、
+  既存の認証必須 `/api/*` 配下に置くと利用できない)。そのため **既定 disabled の opt-in**
+  (`[mirakurun] enabled = false`、`main.rs::MirakurunSection`)。有効化時は
+  `web::start_web_server` が起動時に一度 WARN ログを出す (「無認証で配信される、信頼ネットワーク/
+  localhost のみで公開せよ」)。`web_listen` の既定 `127.0.0.1` と合わせて二重に既定安全。
+  EPG (`/api/programs` 等) は対象外 (視聴系のサブセットのみ)。
+  サービス id は Mirakurun 慣例 `networkId * 100000 + serviceId`
+  (`mirakurun_service_id`/`split_mirakurun_service_id`、往復をユニットテスト)。
+  `band_type` → Mirakurun `type` は `Terrestrial→GR / BS→BS / CS→CS / FourK→BS(4K相当の型がないため) /
+  CATV→GR / SKY・Other→SKY` という簡略化 (`band_type_to_mirakurun`)。
+  ストリーム系ハンドラは `server/channel_resolve.rs`(新設 `resolve_service_by_nid_sid`)で
+  `(nid, sid)` → `channels` 行を解決し、`web/stream.rs` の P5 配信基盤
+  (`StreamCleanup`/`broadcast_to_body_stream`/`respond_with_stream`。これらは `pub(crate)` 化して共有)
+  をそのまま再利用した生 TS passthrough (`?profile=` 等の変換は非対応)。
+  **実機 BonDriver・実 Mirakurun クライアントでの動作検証はできていない** (この環境の制約、
+  STREAMING_DESIGN.md §11 P6 実装メモ参照)。
+
 ### 4.8 tsreplace (外部エンコーダ) パイプ
 
 - `tsreplace_config` の設定でセッションの TS を外部コマンド (既定: tsreplace + QSVEncC) に通してから配信できる。

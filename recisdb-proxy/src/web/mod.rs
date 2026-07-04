@@ -3,6 +3,7 @@
 pub mod api;
 pub mod auth;
 pub mod dashboard;
+pub mod mirakurun;
 pub mod state;
 pub mod stream;
 
@@ -84,6 +85,22 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/stream/service/:sid", get(stream::stream_service))
 }
 
+/// Build the `/mirakurun/api/*` router (STREAMING_DESIGN.md §7.1, P6).
+///
+/// **No auth middleware is applied here** — see `web/mirakurun.rs`'s module
+/// doc comment for why (real Mirakurun clients never send an Authorization
+/// header). Only nested into the app when `[mirakurun] enabled = true`
+/// (`main.rs`, default `false`).
+fn build_mirakurun_router() -> Router<Arc<WebState>> {
+    Router::new()
+        .route("/version", get(mirakurun::get_version))
+        .route("/status", get(mirakurun::get_status))
+        .route("/channels", get(mirakurun::get_channels))
+        .route("/services", get(mirakurun::get_services))
+        .route("/services/:id/stream", get(mirakurun::stream_service_by_mirakurun_id))
+        .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
+}
+
 /// Build the full application router bound to `web_state`.
 ///
 /// # Security (REVIEW_2026-07.md S2)
@@ -97,11 +114,16 @@ fn build_api_router() -> Router<Arc<WebState>> {
 ///   `fetch()` calls (e.g. a malicious third-party page, or CSRF-style
 ///   browser requests) are refused by the browser itself. Previously this
 ///   used `CorsLayer::permissive()`, which defeated that protection.
-fn build_app(web_state: Arc<WebState>) -> Router {
+/// - `/mirakurun/api/*` (STREAMING_DESIGN.md §7.1, P6) is a *separate*,
+///   unauthenticated router, only nested in when `mirakurun_enabled` is
+///   true. It is its own namespace precisely so it never shares a path with
+///   (and is never accidentally covered by the auth `route_layer` bound to)
+///   `/api/*` — see `build_mirakurun_router` and `web/mirakurun.rs`.
+fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
     let api_router = build_api_router()
         .route_layer(axum::middleware::from_fn_with_state(web_state.clone(), auth::require_auth));
 
-    Router::new()
+    let mut router = Router::new()
         .nest("/api", api_router)
         // Dashboard route (unauthenticated: serves the token-entry UI)
         .route("/", get(dashboard::index))
@@ -109,11 +131,23 @@ fn build_app(web_state: Arc<WebState>) -> Router {
         // Static assets (currently just an optional local mpegts.js — see
         // STREAMING_DESIGN.md §6.4). Unauthenticated like /logos/:file: a
         // fixed allow-list, no path traversal, no confidential content.
-        .route("/static/:file", get(api::get_static_asset))
-        .with_state(web_state)
+        .route("/static/:file", get(api::get_static_asset));
+
+    if mirakurun_enabled {
+        router = router.nest("/mirakurun/api", build_mirakurun_router());
+    }
+
+    router.with_state(web_state)
 }
 
 /// Start the web dashboard server.
+///
+/// `mirakurun_enabled` gates the entire `/mirakurun/api/*` router
+/// (STREAMING_DESIGN.md §7.1, P6): when `false` (the default — see
+/// `[mirakurun] enabled` in `main.rs`), that path prefix is not registered at
+/// all and returns 404, same as any other unmapped path. When `true`, a WARN
+/// is logged once at startup: unlike `/api/*`, that router carries no
+/// authentication (see `web/mirakurun.rs`'s module doc comment for why).
 #[allow(clippy::too_many_arguments)]
 pub async fn start_web_server(
     listen_addr: SocketAddr,
@@ -124,6 +158,7 @@ pub async fn start_web_server(
     scan_config: Option<state::ScanSchedulerInfo>,
     tuner_config: Option<state::TunerConfigInfo>,
     auth: AuthConfig,
+    mirakurun_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth);
     if let Some(config) = scan_config {
@@ -134,7 +169,15 @@ pub async fn start_web_server(
     }
     let web_state = Arc::new(web_state);
 
-    let app = build_app(web_state);
+    if mirakurun_enabled {
+        log::warn!(
+            "Mirakurun-compatible API is ENABLED at /mirakurun/api/* ([mirakurun] enabled = true). \
+             This endpoint is UNAUTHENTICATED by design (real Mirakurun clients send no Authorization \
+             header) — expose it only on a trusted network/localhost."
+        );
+    }
+
+    let app = build_app(web_state, mirakurun_enabled);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     log::info!("Web dashboard listening on http://{}", listen_addr);
@@ -164,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn api_request_without_token_is_rejected() {
         let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
@@ -177,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn api_request_with_wrong_token_is_rejected() {
         let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(
@@ -196,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn api_request_with_correct_token_is_accepted() {
         let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(
@@ -215,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn auth_disabled_bypasses_token_check() {
         let state = test_web_state(AuthConfig { enabled: false, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
@@ -230,7 +273,7 @@ mod tests {
         // STREAMING_DESIGN.md §6.5: the streaming endpoint must sit behind
         // the exact same auth gate as the rest of `/api/*`.
         let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(
@@ -248,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_root_is_reachable_without_token() {
         let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
-        let app = build_app(state);
+        let app = build_app(state, false);
 
         let res = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -256,5 +299,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mirakurun_router_is_not_mounted_when_disabled() {
+        // STREAMING_DESIGN.md §7.1 (P6): opt-in, default disabled — the
+        // whole `/mirakurun/api/*` prefix must be unreachable (404, not
+        // "reachable but empty") when the router was never nested in.
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, false);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mirakurun/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mirakurun_version_is_reachable_without_auth_when_enabled() {
+        // Auth is enabled for `/api/*` here specifically to prove this test
+        // isn't just exercising a globally-disabled auth config — the
+        // `/mirakurun/api/*` router must bypass auth on its own.
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, true);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mirakurun/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("current").is_some(), "expected a `current` field: {:?}", json);
+    }
+
+    #[tokio::test]
+    async fn mirakurun_services_and_channels_are_reachable_without_auth_when_enabled() {
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, true);
+
+        for path in ["/mirakurun/api/services", "/mirakurun/api/channels", "/mirakurun/api/status"] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "GET {} should be 200", path);
+        }
     }
 }

@@ -188,6 +188,29 @@ impl Database {
         Ok(records)
     }
 
+    /// Look up a channel by `(nid, sid)` alone, ignoring `tsid`.
+    ///
+    /// Used by the Mirakurun-compatible API (STREAMING_DESIGN.md §7.1),
+    /// whose service-id convention (`networkId * 100000 + serviceId`) does
+    /// not carry `tsid`. If more than one row shares the same `(nid, sid)`
+    /// (e.g. the same service scanned via more than one BonDriver, or the
+    /// rare case of a network id spanning multiple transport streams), the
+    /// enabled row with the highest `priority` wins; ties are broken by the
+    /// lowest `id` for determinism. A disabled row is still returned when no
+    /// enabled row matches, so callers get a `Disabled` error instead of a
+    /// misleading `NotFound`.
+    pub fn get_channel_by_nid_sid(&self, nid: u16, sid: u16) -> Result<Option<ChannelRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM channels WHERE nid = ?1 AND sid = ?2
+             ORDER BY is_enabled DESC, priority DESC, id ASC LIMIT 1",
+        )?;
+        match stmt.query_row(params![nid as i32, sid as i32], Self::row_to_channel_record) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Get all distinct SIDs for a given NID+TSID combination.
     pub fn get_sids_for_nid_tsid(&self, nid: u16, tsid: u16) -> Result<Vec<u16>> {
         let mut stmt = self.conn.prepare(

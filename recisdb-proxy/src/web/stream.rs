@@ -16,6 +16,12 @@
 //! `TunerPool`/`SharedTuner` calls `server::session` uses — see that
 //! module's doc comment for why a full extraction of `handle_set_channel_space`
 //! itself was not attempted).
+//!
+//! `StreamCleanup`, `broadcast_to_body_stream`, `respond_with_stream`,
+//! `error_response`/`channel_resolve_error_response` and
+//! `release_tuner_subscription` are `pub(crate)` so `web/mirakurun.rs` (P6,
+//! STREAMING_DESIGN.md §7.1) can build its own passthrough streams on top of
+//! the exact same response-body machinery instead of re-implementing it.
 
 use std::sync::Arc;
 
@@ -73,10 +79,20 @@ struct EncoderCleanup {
 /// client to disconnect mid-stream); see the unit test below for the
 /// closest available proxy: dropping the guard decrements
 /// `SharedTuner`'s subscriber_count.
-struct StreamCleanup {
+pub(crate) struct StreamCleanup {
     tuner: Arc<SharedTuner>,
     tuner_pool: Arc<TunerPool>,
     encoder: Option<EncoderCleanup>,
+}
+
+impl StreamCleanup {
+    /// Build a cleanup guard for a plain tuner subscription with no shared
+    /// encoder involved — what every Mirakurun-compatible passthrough stream
+    /// uses (`web/mirakurun.rs`, STREAMING_DESIGN.md §7.1: "passthrough
+    /// (無変換) が既定").
+    pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
+        Self { tuner, tuner_pool, encoder: None }
+    }
 }
 
 impl Drop for StreamCleanup {
@@ -116,7 +132,7 @@ struct StreamState {
 /// edge rather than being disconnected. `Closed` (source tuner reader
 /// stopped, or shared encoder chain stopped) ends the HTTP response body
 /// normally, which the browser/mpegts.js/ffmpeg observes as EOF.
-fn broadcast_to_body_stream(
+pub(crate) fn broadcast_to_body_stream(
     rx: broadcast::Receiver<Bytes>,
     cleanup: StreamCleanup,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
@@ -134,27 +150,35 @@ fn broadcast_to_body_stream(
     })
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "success": false, "error": message.into() }))).into_response()
 }
 
-fn channel_resolve_error_response(sid: i64, e: &ChannelResolveError) -> Response {
+/// `context` is only used for the log line (e.g. the `channels.id` or the
+/// Mirakurun service id being resolved) — the message sent to the client
+/// always comes from `e`'s own `Display` impl, which already names whichever
+/// key (`channels.id` or `(nid, sid)`) the caller resolved by.
+pub(crate) fn channel_resolve_error_response(
+    context: impl std::fmt::Display,
+    e: &ChannelResolveError,
+) -> Response {
     let status = match e {
         ChannelResolveError::NotFound(_)
+        | ChannelResolveError::NotFoundNidSid(_, _)
         | ChannelResolveError::Disabled(_)
         | ChannelResolveError::NoDriver(_)
         | ChannelResolveError::NoPhysicalChannel(_) => StatusCode::NOT_FOUND,
         ChannelResolveError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ChannelResolveError::Pool(_) | ChannelResolveError::ReaderStart(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
-    warn!("[HTTP stream] service {} unavailable: {}", sid, e);
+    warn!("[HTTP stream] service {} unavailable: {}", context, e);
     error_response(status, e.to_string())
 }
 
 /// Release a tracked tuner subscription taken speculatively, before any
 /// response stream was built (i.e. on an error path after `subscribe()` but
 /// before handing the receiver to [`broadcast_to_body_stream`]).
-async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tuner: &Arc<SharedTuner>) {
+pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tuner: &Arc<SharedTuner>) {
     tuner.unsubscribe();
     if !tuner.has_subscribers() {
         tuner_pool
@@ -310,7 +334,7 @@ pub async fn stream_service(
     }
 }
 
-fn respond_with_stream<S>(body_stream: S) -> Response
+pub(crate) fn respond_with_stream<S>(body_stream: S) -> Response
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {

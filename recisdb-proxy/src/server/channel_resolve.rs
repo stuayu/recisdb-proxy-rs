@@ -55,6 +55,10 @@ const HTTP_BONDRIVER_VERSION: u8 = 2;
 pub enum ChannelResolveError {
     #[error("service {0} not found")]
     NotFound(i64),
+    /// Mirakurun-compatible lookup (`web/mirakurun.rs`) by `(nid, sid)`
+    /// instead of `channels.id`.
+    #[error("service (nid={0}, sid={1}) not found")]
+    NotFoundNidSid(u16, u16),
     #[error("service {0} is disabled")]
     Disabled(i64),
     #[error("service {0} has no assigned BonDriver")]
@@ -86,18 +90,47 @@ pub fn resolve_service(db: &Database, sid: i64) -> Result<ResolvedService, Chann
     let channel = db
         .get_channel_by_id(sid)?
         .ok_or(ChannelResolveError::NotFound(sid))?;
+    resolve_channel_record(db, channel)
+}
+
+/// Same as [`resolve_service`] but looks the channel up by `(nid, sid)`
+/// instead of `channels.id` — the identity the Mirakurun-compatible API
+/// (`web/mirakurun.rs`, STREAMING_DESIGN.md §7.1) uses, since Mirakurun's
+/// service id (`networkId * 100000 + serviceId`) decodes to `(nid, sid)`,
+/// not a `channels` primary key.
+pub fn resolve_service_by_nid_sid(
+    db: &Database,
+    nid: u16,
+    sid: u16,
+) -> Result<ResolvedService, ChannelResolveError> {
+    let channel = db
+        .get_channel_by_nid_sid(nid, sid)?
+        .ok_or(ChannelResolveError::NotFoundNidSid(nid, sid))?;
+    resolve_channel_record(db, channel)
+}
+
+/// Shared validation/resolution body for [`resolve_service`] and
+/// [`resolve_service_by_nid_sid`], once a candidate `ChannelRecord` has been
+/// fetched by whichever key. Errors reference the row's own `channels.id`
+/// (not the lookup key), matching what `web/stream.rs`'s existing
+/// `channels.id`-keyed error messages already convey.
+fn resolve_channel_record(
+    db: &Database,
+    channel: ChannelRecord,
+) -> Result<ResolvedService, ChannelResolveError> {
+    let id = channel.id;
 
     if !channel.is_enabled {
-        return Err(ChannelResolveError::Disabled(sid));
+        return Err(ChannelResolveError::Disabled(id));
     }
 
     let driver = db
         .get_bon_driver(channel.bon_driver_id)?
-        .ok_or(ChannelResolveError::NoDriver(sid))?;
+        .ok_or(ChannelResolveError::NoDriver(id))?;
 
     let (space, bon_channel) = match (channel.bon_space, channel.bon_channel) {
         (Some(s), Some(c)) => (s, c),
-        _ => return Err(ChannelResolveError::NoPhysicalChannel(sid)),
+        _ => return Err(ChannelResolveError::NoPhysicalChannel(id)),
     };
 
     let channel_key = ChannelKey::space_channel(&driver.dll_path, space, bon_channel);
@@ -228,6 +261,29 @@ mod tests {
         let (db, ch_id) = setup_db_with_channel(None, None, true);
         let err = resolve_service(&db, ch_id).unwrap_err();
         assert!(matches!(err, ChannelResolveError::NoPhysicalChannel(_)));
+    }
+
+    #[test]
+    fn resolves_by_nid_sid_same_as_by_id() {
+        let (db, ch_id) = setup_db_with_channel(Some(0), Some(13), true);
+        let by_id = resolve_service(&db, ch_id).expect("should resolve by id");
+        let by_nid_sid = resolve_service_by_nid_sid(&db, 1, 100).expect("should resolve by (nid, sid)");
+        assert_eq!(by_id.channel_key, by_nid_sid.channel_key);
+        assert_eq!(by_id.channel.id, by_nid_sid.channel.id);
+    }
+
+    #[test]
+    fn unknown_nid_sid_is_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        let err = resolve_service_by_nid_sid(&db, 1, 999).unwrap_err();
+        assert!(matches!(err, ChannelResolveError::NotFoundNidSid(1, 999)));
+    }
+
+    #[test]
+    fn disabled_service_is_rejected_via_nid_sid_lookup_too() {
+        let (db, _ch_id) = setup_db_with_channel(Some(0), Some(13), false);
+        let err = resolve_service_by_nid_sid(&db, 1, 100).unwrap_err();
+        assert!(matches!(err, ChannelResolveError::Disabled(_)));
     }
 
     #[tokio::test]
