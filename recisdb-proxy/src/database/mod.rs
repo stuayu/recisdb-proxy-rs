@@ -141,6 +141,15 @@ impl Database {
         // doesn't exist (STREAMING_DESIGN.md §5/§9 P4: shared encoder pool).
         self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
 
+        // Migration 011: Add optional preprocessor (stage-1 command, e.g.
+        // tsreadex) columns to tsreplace_config. Empty string = no
+        // preprocessor (legacy single-stage behavior), so existing rows keep
+        // working unchanged. `preprocessor_path` is TOML-only like
+        // `command_path` (REVIEW S1); `preprocessor_arguments` is
+        // API-editable like `arguments`.
+        self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
+
         // Migration 008: Add stream_class column to session_history if it doesn't
         // exist (STREAMING_DESIGN.md §2 P2: stream reliability class, recorded at
         // session end).
@@ -430,6 +439,8 @@ impl Database {
                 read_timeout_ms INTEGER DEFAULT 10000,
                 passthrough_on_error INTEGER DEFAULT 1,
                 max_concurrent_encoders INTEGER DEFAULT 2,
+                preprocessor_path TEXT DEFAULT '',
+                preprocessor_arguments TEXT DEFAULT '',
                 updated_at INTEGER DEFAULT (strftime('%s', 'now'))
             );",
         )?;
@@ -440,6 +451,8 @@ impl Database {
         self.add_column_if_not_exists("tsreplace_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
         self.add_column_if_not_exists("tsreplace_config", "passthrough_on_error", "INTEGER DEFAULT 1")?;
         self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
+        self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
         self.add_column_if_not_exists(
             "tsreplace_config",
             "updated_at",
@@ -495,15 +508,20 @@ impl Database {
     /// Get tsreplace configuration from database.
     ///
     /// Returns `(enabled, command_path, arguments, read_timeout_ms, passthrough_on_error,
-    /// max_concurrent_encoders)`. The last field caps the number of concurrently-running
+    /// max_concurrent_encoders, preprocessor_path, preprocessor_arguments)`.
+    /// `max_concurrent_encoders` caps the number of concurrently-running
     /// shared encoder chains (STREAMING_DESIGN.md §5 P4); sessions sharing the same
     /// channel/SID-set/config generation join a single running encoder instead of
-    /// consuming a slot.
-    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64)> {
+    /// consuming a slot. `preprocessor_path` (empty = none) is an optional
+    /// stage-1 command (e.g. tsreadex) piped before `command_path`; like
+    /// `command_path` it is TOML-only (REVIEW S1).
+    #[allow(clippy::type_complexity)]
+    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64, String, String)> {
         self.ensure_tsreplace_config_compat()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders
+            "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders,
+                    preprocessor_path, preprocessor_arguments
              FROM tsreplace_config WHERE id = 1"
         )?;
 
@@ -515,13 +533,13 @@ impl Database {
                 row.get::<_, u64>(3)?,
                 row.get::<_, i64>(4)? != 0,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(7)?.unwrap_or_default(),
             ))
         });
 
         match result {
-            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => {
-                Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders))
-            }
+            Ok(config) => Ok(config),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO tsreplace_config
@@ -542,6 +560,8 @@ impl Database {
                     DEFAULT_TSREPLACE_READ_TIMEOUT_MS,
                     DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR,
                     DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS,
+                    String::new(),
+                    String::new(),
                 ))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
@@ -549,6 +569,11 @@ impl Database {
     }
 
     /// Update tsreplace configuration.
+    ///
+    /// `preprocessor_path` is included so `INSERT OR REPLACE` never clobbers
+    /// it — API callers must pass back the value they read (same convention
+    /// as `command_path`; both are TOML-only, REVIEW S1).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_tsreplace_config(
         &self,
         enabled: bool,
@@ -557,18 +582,23 @@ impl Database {
         read_timeout_ms: u64,
         passthrough_on_error: bool,
         max_concurrent_encoders: i64,
+        preprocessor_path: &str,
+        preprocessor_arguments: &str,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO tsreplace_config
-             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))",
+             (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders,
+              preprocessor_path, preprocessor_arguments, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s', 'now'))",
             rusqlite::params![
                 if enabled { 1 } else { 0 },
                 command_path,
                 arguments,
                 read_timeout_ms,
                 if passthrough_on_error { 1 } else { 0 },
-                max_concurrent_encoders
+                max_concurrent_encoders,
+                preprocessor_path,
+                preprocessor_arguments
             ],
         )?;
         Ok(())
@@ -593,6 +623,24 @@ impl Database {
         self.conn.execute(
             "UPDATE tsreplace_config SET command_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
             rusqlite::params![command_path],
+        )?;
+        Ok(())
+    }
+
+    /// Set the optional preprocessor (stage-1) command path.
+    ///
+    /// # Security (trust boundary — REVIEW_2026-07.md S1)
+    ///
+    /// Exactly like [`Self::set_tsreplace_command_path`]: this is a program
+    /// the server executes (`Command::new(preprocessor_path)`), so it **must
+    /// only ever be set from the TOML config file** (`[tsreplace]
+    /// preprocessor_path` in `main.rs`) and never from a Web API handler.
+    /// An empty string disables the preprocessor stage.
+    pub fn set_tsreplace_preprocessor_path(&self, preprocessor_path: &str) -> Result<()> {
+        self.ensure_tsreplace_config_compat()?;
+        self.conn.execute(
+            "UPDATE tsreplace_config SET preprocessor_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
+            rusqlite::params![preprocessor_path],
         )?;
         Ok(())
     }
@@ -686,12 +734,12 @@ mod tests {
     #[test]
     fn set_tsreplace_command_path_only_changes_command_path() {
         let db = Database::open_in_memory().unwrap();
-        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3)
+        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3, "pre-path", "--pre")
             .unwrap();
 
         db.set_tsreplace_command_path("/usr/local/bin/tsreplace").unwrap();
 
-        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders) =
+        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments) =
             db.get_tsreplace_config().unwrap();
         assert_eq!(command_path, "/usr/local/bin/tsreplace");
         // Everything else must be preserved.
@@ -700,5 +748,39 @@ mod tests {
         assert_eq!(read_timeout_ms, 5000);
         assert!(!passthrough_on_error);
         assert_eq!(max_concurrent_encoders, 3);
+        assert_eq!(preprocessor_path, "pre-path");
+        assert_eq!(preprocessor_arguments, "--pre");
+    }
+
+    #[test]
+    fn tsreplace_preprocessor_defaults_empty_and_roundtrips() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Fresh DB: preprocessor is absent (empty strings).
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
+        assert_eq!(pre_path, "");
+        assert_eq!(pre_args, "");
+
+        // TOML-only setter changes only the path.
+        db.set_tsreplace_preprocessor_path("C:/DTV/tsreadex/tsreadex.exe").unwrap();
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
+        assert_eq!(pre_path, "C:/DTV/tsreadex/tsreadex.exe");
+        assert_eq!(pre_args, "");
+
+        // update_tsreplace_config persists preprocessor_arguments.
+        db.update_tsreplace_config(
+            true,
+            "QSVEncC",
+            "-i - -o -",
+            5000,
+            true,
+            2,
+            "C:/DTV/tsreadex/tsreadex.exe",
+            "-x 18 -n {SID} -",
+        )
+        .unwrap();
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
+        assert_eq!(pre_path, "C:/DTV/tsreadex/tsreadex.exe");
+        assert_eq!(pre_args, "-x 18 -n {SID} -");
     }
 }

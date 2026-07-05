@@ -94,25 +94,53 @@ impl EncodeKey {
     }
 }
 
-/// Runtime tsreplace settings needed to spawn an encoder chain.
+/// Placeholder token in `preprocessor_arguments` / `arguments` that is
+/// replaced with the target service id before spawning (e.g. tsreadex's
+/// `-n {SID}`). When present in either template, the classic tsreplace-style
+/// `--service` auto-injection is disabled.
+pub const SID_PLACEHOLDER: &str = "{SID}";
+
+/// Runtime external-encoder settings needed to spawn an encoder chain.
 #[derive(Debug, Clone)]
 pub struct EncoderRuntimeConfig {
     pub command_path: String,
     pub arguments: String,
     pub read_timeout_ms: u64,
+    /// Optional stage-1 command placed *before* `command_path` in the OS
+    /// pipe chain (`TS -> preprocessor -> encoder -> stdout`), e.g. tsreadex.
+    /// Empty string means "no preprocessor" (single-stage, legacy behavior).
+    /// TOML-only, same S1 trust boundary as `command_path`.
+    pub preprocessor_path: String,
+    /// Argument template for the preprocessor. May contain [`SID_PLACEHOLDER`].
+    pub preprocessor_arguments: String,
 }
 
-/// Compute a `config_generation` value from the tsreplace settings that
-/// affect the spawned chain (command path, arguments, watchdog timeout).
-/// Content-hash based, per STREAMING_DESIGN.md §5.2's "設定ロード時に内容
-/// ハッシュか updated_at を使う".
-pub fn config_generation(command_path: &str, arguments: &str, read_timeout_ms: u64) -> u64 {
+impl EncoderRuntimeConfig {
+    /// The preprocessor command, if one is configured (non-blank path).
+    pub fn preprocessor(&self) -> Option<&str> {
+        let trimmed = self.preprocessor_path.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    }
+}
+
+/// Compute a `config_generation` value from the external-encoder settings
+/// that affect the spawned chain (command paths, argument templates,
+/// watchdog timeout). Content-hash based, per STREAMING_DESIGN.md §5.2's
+/// "設定ロード時に内容ハッシュか updated_at を使う".
+pub fn config_generation(cfg: &EncoderRuntimeConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    command_path.hash(&mut hasher);
-    arguments.hash(&mut hasher);
-    read_timeout_ms.hash(&mut hasher);
+    cfg.command_path.hash(&mut hasher);
+    cfg.arguments.hash(&mut hasher);
+    cfg.read_timeout_ms.hash(&mut hasher);
+    cfg.preprocessor_path.hash(&mut hasher);
+    cfg.preprocessor_arguments.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Replace every [`SID_PLACEHOLDER`] occurrence with the service id.
+fn substitute_sid(template: &str, sid: u16) -> String {
+    template.replace(SID_PLACEHOLDER, &sid.to_string())
 }
 
 /// Errors returned by [`EncoderPool::get_or_create`].
@@ -168,6 +196,102 @@ fn build_tsreplace_args(base_arguments: &str, sid: u16) -> Vec<String> {
     }
 
     args
+}
+
+/// How [`SharedEncoder::spawn`] will wire up the external process(es) for a
+/// given config + SID set. Computed by [`plan_spawn`] as a pure function so
+/// the branch selection and `{SID}` substitution are unit-testable without
+/// spawning real processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnPlan {
+    /// One process: `command_path` with the given argument vector.
+    Single { enc_args: Vec<String> },
+    /// Two processes connected by an OS pipe:
+    /// `stdin -> preprocessor_path(pre_args) -> command_path(enc_args) -> stdout`.
+    TwoStage { pre_args: Vec<String>, enc_args: Vec<String> },
+    /// Legacy tsreplace multi-SID chain (`spawn_chain`), one `command_path`
+    /// process per SID with `--service` auto-injection. Never used together
+    /// with a preprocessor or `{SID}` placeholder.
+    Chain,
+}
+
+/// Decide process wiring and argument vectors for `cfg` + `sids`.
+///
+/// Rules (in priority order):
+/// 1. If either argument template contains [`SID_PLACEHOLDER`], the token is
+///    substituted with the (single) target SID and no `--service` injection
+///    happens. Requires exactly one SID.
+/// 2. Otherwise, the pre-existing tsreplace behavior: `--service <SID>`
+///    auto-injection into `arguments` unless the template already carries
+///    `--service`/`-s` or `sids` is empty; 2+ SIDs use the per-SID chain.
+/// 3. A preprocessor (when configured) is prepended as stage 1 in the
+///    single-process cases; it is not supported with the multi-SID chain.
+fn plan_spawn(cfg: &EncoderRuntimeConfig, sids: &[u16]) -> std::io::Result<SpawnPlan> {
+    let split = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    let has_preprocessor = cfg.preprocessor().is_some();
+    let has_placeholder = cfg.arguments.contains(SID_PLACEHOLDER)
+        || cfg.preprocessor_arguments.contains(SID_PLACEHOLDER);
+
+    if has_placeholder {
+        let sid = match sids {
+            [sid] => *sid,
+            [] => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "argument template uses {} but no target service id was resolved",
+                        SID_PLACEHOLDER
+                    ),
+                ));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "argument template uses {} but {} SIDs were requested; \
+                         the placeholder supports exactly one service per encoder",
+                        SID_PLACEHOLDER,
+                        sids.len()
+                    ),
+                ));
+            }
+        };
+        let enc_args = split(&substitute_sid(&cfg.arguments, sid));
+        return Ok(if has_preprocessor {
+            SpawnPlan::TwoStage {
+                pre_args: split(&substitute_sid(&cfg.preprocessor_arguments, sid)),
+                enc_args,
+            }
+        } else {
+            SpawnPlan::Single { enc_args }
+        });
+    }
+
+    let user_specified_service = args_contain_service_option(&cfg.arguments);
+    let enc_args = if user_specified_service || sids.is_empty() {
+        split(&cfg.arguments)
+    } else if sids.len() == 1 {
+        build_tsreplace_args(&cfg.arguments, sids[0])
+    } else {
+        // Multi-SID chain.
+        if has_preprocessor {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "preprocessor_path is not supported with a multi-SID encoder chain; \
+                 use a {SID}-placeholder template or a single-SID stream",
+            ));
+        }
+        return Ok(SpawnPlan::Chain);
+    };
+
+    Ok(if has_preprocessor {
+        SpawnPlan::TwoStage {
+            pre_args: split(&cfg.preprocessor_arguments),
+            enc_args,
+        }
+    } else {
+        SpawnPlan::Single { enc_args }
+    })
 }
 
 /// Spawn a single process with the given stdin/stdout wiring.
@@ -239,6 +363,60 @@ fn spawn_single(
     }
 
     Ok((stdin, stdout, vec![child]))
+}
+
+/// Build a two-stage pipeline via an OS-level pipe:
+/// `stdin -> preprocessor (stage 1, e.g. tsreadex) -> encoder (stage 2,
+/// e.g. QSVEncC) -> stdout`. Both stages get their stderr forwarded to the
+/// log, and both children are returned so the watchdog/`finish()` kill path
+/// covers the whole chain.
+fn spawn_two_stage(
+    pre_path: &str,
+    pre_args: &[String],
+    enc_path: &str,
+    enc_args: &[String],
+    label: &str,
+) -> std::io::Result<(ChildStdin, ChildStdout, Vec<Child>)> {
+    let mut pre_child =
+        spawn_process(pre_path, pre_args, Stdio::piped(), Stdio::piped()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn preprocessor '{}': {}", pre_path, e),
+            )
+        })?;
+
+    let stdin = pre_child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "preprocessor stdin not available")
+    })?;
+    let pre_stdout = pre_child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "preprocessor stdout not available")
+    })?;
+    if let Some(stderr) = pre_child.stderr.take() {
+        spawn_stderr_logger(format!("{} stage1", label), None, stderr);
+    }
+
+    let pre_stdio: Stdio = pre_stdout.try_into().map_err(|e: std::io::Error| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to convert preprocessor stdout to Stdio: {}", e),
+        )
+    })?;
+
+    let mut enc_child = spawn_process(enc_path, enc_args, pre_stdio, Stdio::piped()).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to spawn encoder '{}': {}", enc_path, e),
+        )
+    })?;
+
+    let stdout = enc_child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "encoder stdout not available")
+    })?;
+    if let Some(stderr) = enc_child.stderr.take() {
+        spawn_stderr_logger(format!("{} stage2", label), None, stderr);
+    }
+
+    Ok((stdin, stdout, vec![pre_child, enc_child]))
 }
 
 /// Build a chained multi-SID process pipeline via OS-level pipes:
@@ -352,16 +530,17 @@ impl SharedEncoder {
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> std::io::Result<Arc<Self>> {
         let label = format!("{:?}", key.channel_key);
-        let user_specified_service = args_contain_service_option(&cfg.arguments);
 
-        let (stdin, stdout, children) = if user_specified_service || key.sids.is_empty() {
-            let args: Vec<String> = cfg.arguments.split_whitespace().map(String::from).collect();
-            spawn_single(&cfg.command_path, &args, &label)?
-        } else if key.sids.len() == 1 {
-            let args = build_tsreplace_args(&cfg.arguments, key.sids[0]);
-            spawn_single(&cfg.command_path, &args, &label)?
-        } else {
-            spawn_chain(&cfg.command_path, &cfg.arguments, &key.sids, &label)?
+        let (stdin, stdout, children) = match plan_spawn(&cfg, &key.sids)? {
+            SpawnPlan::Single { enc_args } => spawn_single(&cfg.command_path, &enc_args, &label)?,
+            SpawnPlan::TwoStage { pre_args, enc_args } => spawn_two_stage(
+                cfg.preprocessor().expect("TwoStage plan implies a preprocessor"),
+                &pre_args,
+                &cfg.command_path,
+                &enc_args,
+                &label,
+            )?,
+            SpawnPlan::Chain => spawn_chain(&cfg.command_path, &cfg.arguments, &key.sids, &label)?,
         };
 
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -833,14 +1012,130 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    fn runtime_config(
+        command_path: &str,
+        arguments: &str,
+        preprocessor_path: &str,
+        preprocessor_arguments: &str,
+    ) -> EncoderRuntimeConfig {
+        EncoderRuntimeConfig {
+            command_path: command_path.to_string(),
+            arguments: arguments.to_string(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: preprocessor_path.to_string(),
+            preprocessor_arguments: preprocessor_arguments.to_string(),
+        }
+    }
+
     #[test]
     fn config_generation_is_stable_and_sensitive() {
-        let g1 = config_generation("tsreplace", "-a -b", 10_000);
-        let g2 = config_generation("tsreplace", "-a -b", 10_000);
+        let g1 = config_generation(&runtime_config("tsreplace", "-a -b", "", ""));
+        let g2 = config_generation(&runtime_config("tsreplace", "-a -b", "", ""));
         assert_eq!(g1, g2);
 
-        let g3 = config_generation("tsreplace", "-a -b -c", 10_000);
+        let g3 = config_generation(&runtime_config("tsreplace", "-a -b -c", "", ""));
         assert_ne!(g1, g3);
+
+        // Preprocessor settings must also bump the generation.
+        let g4 = config_generation(&runtime_config("tsreplace", "-a -b", "tsreadex", ""));
+        assert_ne!(g1, g4);
+        let g5 = config_generation(&runtime_config("tsreplace", "-a -b", "tsreadex", "-n {SID} -"));
+        assert_ne!(g4, g5);
+    }
+
+    // ---- {SID} substitution & spawn planning (pure, no processes) ----
+
+    #[test]
+    fn substitute_sid_replaces_every_occurrence() {
+        assert_eq!(substitute_sid("-n {SID} --tag {SID} -", 1032), "-n 1032 --tag 1032 -");
+        assert_eq!(substitute_sid("no placeholder", 1), "no placeholder");
+    }
+
+    #[test]
+    fn plan_placeholder_single_sid_substitutes_and_skips_service_injection() {
+        let cfg = runtime_config("QSVEncC", "-i - --service-hint {SID} -o -", "", "");
+        let plan = plan_spawn(&cfg, &[1032]).unwrap();
+        match plan {
+            SpawnPlan::Single { enc_args } => {
+                assert_eq!(enc_args, vec!["-i", "-", "--service-hint", "1032", "-o", "-"]);
+                assert!(!enc_args.iter().any(|a| a == "--service"), "no auto-injection with {{SID}}");
+            }
+            other => panic!("expected Single, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plan_placeholder_with_preprocessor_builds_two_stage() {
+        let cfg = runtime_config(
+            "QSVEncC",
+            "--avhw -i - -o -",
+            "tsreadex",
+            "-x 18 -n {SID} -",
+        );
+        let plan = plan_spawn(&cfg, &[101]).unwrap();
+        match plan {
+            SpawnPlan::TwoStage { pre_args, enc_args } => {
+                assert_eq!(pre_args, vec!["-x", "18", "-n", "101", "-"]);
+                assert_eq!(enc_args, vec!["--avhw", "-i", "-", "-o", "-"]);
+            }
+            other => panic!("expected TwoStage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plan_placeholder_requires_exactly_one_sid() {
+        let cfg = runtime_config("enc", "-n {SID}", "", "");
+        assert!(plan_spawn(&cfg, &[]).is_err(), "no SID resolved -> error");
+        assert!(plan_spawn(&cfg, &[1, 2]).is_err(), "multiple SIDs -> error");
+    }
+
+    #[test]
+    fn plan_without_placeholder_keeps_legacy_service_injection() {
+        // Single SID, no --service in template -> auto-injected.
+        let cfg = runtime_config("tsreplace", "-i - -o -", "", "");
+        match plan_spawn(&cfg, &[500]).unwrap() {
+            SpawnPlan::Single { enc_args } => {
+                assert!(enc_args.iter().any(|a| a == "--service"));
+                assert!(enc_args.iter().any(|a| a == "500"));
+            }
+            other => panic!("expected Single, got {:?}", other),
+        }
+
+        // Template already has --service -> used verbatim.
+        let cfg = runtime_config("tsreplace", "--service 42 -i - -o -", "", "");
+        match plan_spawn(&cfg, &[500]).unwrap() {
+            SpawnPlan::Single { enc_args } => {
+                assert_eq!(enc_args, vec!["--service", "42", "-i", "-", "-o", "-"]);
+            }
+            other => panic!("expected Single, got {:?}", other),
+        }
+
+        // 2+ SIDs -> per-SID chain (unchanged legacy behavior).
+        let cfg = runtime_config("tsreplace", "-i - -o -", "", "");
+        assert_eq!(plan_spawn(&cfg, &[1, 2]).unwrap(), SpawnPlan::Chain);
+    }
+
+    #[test]
+    fn plan_preprocessor_without_placeholder_wraps_single_stage_cases() {
+        // Empty SIDs: verbatim args, two stages.
+        let cfg = runtime_config("enc", "-i - -o -", "pre", "-a -b");
+        match plan_spawn(&cfg, &[]).unwrap() {
+            SpawnPlan::TwoStage { pre_args, enc_args } => {
+                assert_eq!(pre_args, vec!["-a", "-b"]);
+                assert_eq!(enc_args, vec!["-i", "-", "-o", "-"]);
+            }
+            other => panic!("expected TwoStage, got {:?}", other),
+        }
+
+        // Multi-SID chain + preprocessor is rejected.
+        let cfg = runtime_config("enc", "-i - -o -", "pre", "-a");
+        assert!(plan_spawn(&cfg, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn plan_blank_preprocessor_path_means_single_stage() {
+        let cfg = runtime_config("enc", "-i - -o -", "   ", "-ignored");
+        assert!(matches!(plan_spawn(&cfg, &[]).unwrap(), SpawnPlan::Single { .. }));
     }
 
     // ---- EncoderPool (real `cat` subprocess: pure stdin->stdout passthrough) ----
@@ -855,6 +1150,8 @@ mod tests {
             command_path: "cat".to_string(),
             arguments: String::new(),
             read_timeout_ms: 2_000,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
         }
     }
 
@@ -936,6 +1233,97 @@ mod tests {
         encoder.finish("test cleanup").await;
     }
 
+    /// Locate a `cat.exe` for Windows plumbing tests (ships with Git for
+    /// Windows). `findstr`/`more` are unsuitable: they fully buffer their
+    /// output while stdin (a pipe) is still open, so a streaming
+    /// passthrough never emits anything.
+    #[cfg(windows)]
+    fn find_windows_cat() -> Option<String> {
+        [
+            r"C:\Program Files\Git\usr\bin\cat.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\cat.exe",
+        ]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn two_stage_cat_passthrough_broadcasts_input_unchanged_windows() {
+        // Windows equivalent of the unix cat|cat test, using Git for
+        // Windows' cat.exe (byte-for-byte, unbuffered passthrough). Skipped
+        // when no cat.exe is available on the machine.
+        let Some(cat) = find_windows_cat() else {
+            eprintln!("skipping: no cat.exe found (Git for Windows not installed)");
+            return;
+        };
+
+        let pool = EncoderPool::new(2);
+        let tuner = test_tuner(1);
+        let key = EncodeKey::new(tuner.key.clone(), vec![], 1);
+        let cfg = EncoderRuntimeConfig {
+            command_path: cat.clone(),
+            arguments: String::new(),
+            read_timeout_ms: 5_000,
+            preprocessor_path: cat,
+            preprocessor_arguments: String::new(),
+        };
+
+        let encoder = pool
+            .get_or_create(key, Arc::clone(&tuner), cfg)
+            .await
+            .expect("get_or_create should succeed");
+        let mut out_rx = encoder.subscribe();
+
+        let payload = Bytes::from_static(b"hello-two-stage-pipeline");
+        tuner.test_broadcast(payload.clone());
+
+        let received = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("timed out waiting for cat|cat to echo input")
+            .expect("broadcast recv should succeed");
+
+        assert_eq!(received, payload);
+
+        encoder.finish("test cleanup").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_stage_cat_passthrough_broadcasts_input_unchanged() {
+        // preprocessor=cat, encoder=cat: byte-for-byte passthrough through a
+        // real two-process OS pipe chain — verifies the TwoStage plumbing.
+        let pool = EncoderPool::new(2);
+        let tuner = test_tuner(1);
+        let key = EncodeKey::new(tuner.key.clone(), vec![], 1);
+        let cfg = EncoderRuntimeConfig {
+            command_path: "cat".to_string(),
+            arguments: String::new(),
+            read_timeout_ms: 2_000,
+            preprocessor_path: "cat".to_string(),
+            preprocessor_arguments: String::new(),
+        };
+
+        let encoder = pool
+            .get_or_create(key, Arc::clone(&tuner), cfg)
+            .await
+            .expect("get_or_create should succeed");
+        let mut out_rx = encoder.subscribe();
+
+        let payload = Bytes::from_static(b"hello-two-stage-pipeline");
+        tuner.test_broadcast(payload.clone());
+
+        let received = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("timed out waiting for cat|cat to echo input")
+            .expect("broadcast recv should succeed");
+
+        assert_eq!(received, payload);
+
+        encoder.finish("test cleanup").await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn idle_release_stops_encoder_after_grace_period() {
@@ -1003,6 +1391,8 @@ mod tests {
             command_path: "sleep".to_string(),
             arguments: "30".to_string(),
             read_timeout_ms: 100,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
         };
 
         let encoder = pool

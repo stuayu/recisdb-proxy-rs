@@ -52,6 +52,10 @@ struct TsreplaceRuntimeConfig {
     read_timeout_ms: u64,
     passthrough_on_error: bool,
     max_concurrent_encoders: i64,
+    /// Optional stage-1 command (e.g. tsreadex) piped before `command_path`.
+    /// Empty = no preprocessor (legacy single-stage behavior).
+    preprocessor_path: String,
+    preprocessor_arguments: String,
 }
 
 /// Fixed-duration prefill/jitter buffer settings loaded from `tuner_config`
@@ -432,13 +436,15 @@ impl Session {
     async fn load_tsreplace_runtime_config(&self) -> TsreplaceRuntimeConfig {
         let db = self.database.lock().await;
         match db.get_tsreplace_config() {
-            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => TsreplaceRuntimeConfig {
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => TsreplaceRuntimeConfig {
                 enabled,
                 command_path,
                 arguments,
                 read_timeout_ms,
                 passthrough_on_error,
                 max_concurrent_encoders,
+                preprocessor_path,
+                preprocessor_arguments,
             },
             Err(e) => {
                 warn!("[Session {}] Failed to load tsreplace config: {}", self.id, e);
@@ -449,6 +455,8 @@ impl Session {
                     read_timeout_ms: 10_000,
                     passthrough_on_error: true,
                     max_concurrent_encoders: 2,
+                    preprocessor_path: String::new(),
+                    preprocessor_arguments: String::new(),
                 }
             }
         }
@@ -609,18 +617,15 @@ impl Session {
             self.resolve_encode_sids().await
         };
 
-        let generation = encoder_pool::config_generation(
-            &cfg.command_path,
-            &cfg.arguments,
-            cfg.read_timeout_ms,
-        );
-        let key = EncodeKey::new(tuner.key.clone(), sids, generation);
-
         let runtime = EncoderRuntimeConfig {
             command_path: cfg.command_path,
             arguments: cfg.arguments,
             read_timeout_ms: cfg.read_timeout_ms,
+            preprocessor_path: cfg.preprocessor_path,
+            preprocessor_arguments: cfg.preprocessor_arguments,
         };
+        let generation = encoder_pool::config_generation(&runtime);
+        let key = EncodeKey::new(tuner.key.clone(), sids, generation);
 
         match self.encoder_pool.get_or_create(key, tuner, runtime).await {
             Ok(encoder) => {

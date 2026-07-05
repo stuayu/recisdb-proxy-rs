@@ -1709,7 +1709,7 @@ pub async fn get_tsreplace_config(
     let db = web_state.database.lock().await;
 
     match db.get_tsreplace_config() {
-        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders)) => {
+        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => {
             Json(json!({
                 "success": true,
                 "config": {
@@ -1719,6 +1719,10 @@ pub async fn get_tsreplace_config(
                     "read_timeout_ms": read_timeout_ms,
                     "passthrough_on_error": passthrough_on_error,
                     "max_concurrent_encoders": max_concurrent_encoders,
+                    // Read-only in the API (TOML-only, REVIEW S1), exposed
+                    // for display just like `command_path`.
+                    "preprocessor_path": preprocessor_path,
+                    "preprocessor_arguments": preprocessor_arguments,
                 }
             }))
         }
@@ -1731,13 +1735,16 @@ pub async fn get_tsreplace_config(
 
 /// Update external encoder (tsreplace) configuration request.
 ///
-/// `command_path` is intentionally **not** a field here (REVIEW_2026-07.md
-/// S1): it is the program the server executes (`Command::new(command_path)`),
-/// so it must only be changeable via the TOML config file
-/// (`Database::set_tsreplace_command_path`, called once at startup from
-/// `main.rs`). If a client sends `command_path` in the request body it is
-/// silently ignored by serde (unknown field) and the stored value is left
-/// untouched below.
+/// `command_path` and `preprocessor_path` are intentionally **not** fields
+/// here (REVIEW_2026-07.md S1): they are the programs the server executes
+/// (`Command::new(...)`), so they must only be changeable via the TOML
+/// config file (`Database::set_tsreplace_command_path` /
+/// `set_tsreplace_preprocessor_path`, called once at startup from
+/// `main.rs`). If a client sends either in the request body it is silently
+/// ignored by serde (unknown field) and the stored value is left untouched
+/// below. `preprocessor_arguments` stays API-editable for the same reason
+/// `arguments` is: it is passed as an argument vector, never resolved as a
+/// program to execute.
 #[derive(Debug, Deserialize)]
 pub struct UpdateTsreplaceConfigRequest {
     pub enabled: Option<bool>,
@@ -1745,6 +1752,7 @@ pub struct UpdateTsreplaceConfigRequest {
     pub read_timeout_ms: Option<u64>,
     pub passthrough_on_error: Option<bool>,
     pub max_concurrent_encoders: Option<i64>,
+    pub preprocessor_arguments: Option<String>,
 }
 
 /// Update external encoder (tsreplace) configuration.
@@ -1758,10 +1766,10 @@ pub async fn update_tsreplace_config(
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders) =
+    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments) =
         match db.get_tsreplace_config() {
             Ok(config) => config,
-            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2),
+            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string()),
         };
 
     if let Some(val) = payload.enabled {
@@ -1783,6 +1791,9 @@ pub async fn update_tsreplace_config(
             max_concurrent_encoders = val;
         }
     }
+    if let Some(val) = payload.preprocessor_arguments {
+        preprocessor_arguments = val;
+    }
 
     if let Err(e) = db.update_tsreplace_config(
         enabled,
@@ -1791,6 +1802,9 @@ pub async fn update_tsreplace_config(
         read_timeout_ms,
         passthrough_on_error,
         max_concurrent_encoders,
+        // TOML-only (REVIEW S1): always written back exactly as read above.
+        &preprocessor_path,
+        &preprocessor_arguments,
     ) {
         return Json(json!({
             "success": false,
@@ -1808,6 +1822,8 @@ pub async fn update_tsreplace_config(
             "read_timeout_ms": read_timeout_ms,
             "passthrough_on_error": passthrough_on_error,
             "max_concurrent_encoders": max_concurrent_encoders,
+            "preprocessor_path": preprocessor_path,
+            "preprocessor_arguments": preprocessor_arguments,
         }
     }))
 }

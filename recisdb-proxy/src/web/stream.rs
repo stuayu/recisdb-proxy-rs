@@ -198,7 +198,7 @@ fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no enabled encode profile with purpose='preview' is configured".to_string())?;
 
-    let (enabled, command_path, _default_arguments, read_timeout_ms, _passthrough_on_error, _max_concurrent) =
+    let (enabled, command_path, _default_arguments, read_timeout_ms, _passthrough_on_error, _max_concurrent, preprocessor_path, preprocessor_arguments) =
         db.get_tsreplace_config().map_err(|e| e.to_string())?;
 
     if !enabled {
@@ -210,16 +210,16 @@ fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u
     }
 
     let arguments = profile.extra_args.clone().unwrap_or_default();
-    let generation = encoder_pool::config_generation(&command_path, &arguments, read_timeout_ms);
+    let cfg = EncoderRuntimeConfig {
+        command_path,
+        arguments,
+        read_timeout_ms,
+        preprocessor_path,
+        preprocessor_arguments,
+    };
+    let generation = encoder_pool::config_generation(&cfg);
 
-    Ok((
-        EncoderRuntimeConfig {
-            command_path,
-            arguments,
-            read_timeout_ms,
-        },
-        generation,
-    ))
+    Ok((cfg, generation))
 }
 
 /// `GET /api/stream/service/:sid[?profile=preview]`.

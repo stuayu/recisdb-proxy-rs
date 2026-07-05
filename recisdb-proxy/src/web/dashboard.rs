@@ -834,7 +834,19 @@ const HTML_CONTENT: &str = r#"
                 <div class="form-group">
                     <label for="tsreplace-arguments">引数テンプレート</label>
                     <input type="text" id="tsreplace-arguments" placeholder="例: --preset fast --output -">
-                    <small>起動時に付与する引数（空欄可）</small>
+                    <small>起動時に付与する引数（空欄可）。<code>{SID}</code> は対象サービスIDに置換されます</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-preprocessor-path">前段コマンド（プリプロセッサ）</label>
+                    <input type="text" id="tsreplace-preprocessor-path" readonly disabled placeholder="例: C:\DTV\tsreadex\tsreadex.exe（未設定なら単段）">
+                    <small>TS → 前段 → エンコーダ の2段パイプの前段（例: tsreadex）。設定ファイル (recisdb-proxy.toml の [tsreplace] preprocessor_path) でのみ変更可能。空欄なら従来どおり単段動作</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="tsreplace-preprocessor-arguments">前段コマンドの引数テンプレート</label>
+                    <input type="text" id="tsreplace-preprocessor-arguments" placeholder="例: -x 18 -n {SID} -">
+                    <small>前段コマンドに付与する引数。<code>{SID}</code> は対象サービスIDに置換されます</small>
                 </div>
 
                 <div class="form-group">
@@ -3098,6 +3110,8 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tsreplace-read-timeout').value = data.config.read_timeout_ms ?? 10000;
                     document.getElementById('tsreplace-max-encoders').value = data.config.max_concurrent_encoders ?? 2;
                     document.getElementById('tsreplace-passthrough-on-error').checked = !!data.config.passthrough_on_error;
+                    document.getElementById('tsreplace-preprocessor-path').value = data.config.preprocessor_path || '';
+                    document.getElementById('tsreplace-preprocessor-arguments').value = data.config.preprocessor_arguments || '';
                     hideTsreplaceConfigMessage();
                 }
             } catch (e) {
@@ -3129,6 +3143,9 @@ const HTML_CONTENT: &str = r#"
                 read_timeout_ms: readTimeoutMs,
                 passthrough_on_error: document.getElementById('tsreplace-passthrough-on-error').checked,
                 max_concurrent_encoders: maxEncoders,
+                // preprocessor_path is read-only here (TOML-only, like
+                // command_path); only its arguments are editable.
+                preprocessor_arguments: document.getElementById('tsreplace-preprocessor-arguments').value,
             };
 
             try {

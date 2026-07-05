@@ -161,6 +161,11 @@ struct TsreplaceSection {
     /// changed by anyone who can reach the dashboard would be a remote code
     /// execution vector.
     command_path: Option<String>,
+    /// Optional stage-1 (preprocessor) executable, e.g. tsreadex, piped in
+    /// front of `command_path`: `TS -> preprocessor -> encoder -> stdout`.
+    /// Same trust boundary as `command_path` (TOML-only, never via the Web
+    /// API). Set to an empty string to clear an already-persisted value.
+    preprocessor_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -293,6 +298,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match db_guard.set_tsreplace_command_path(command_path) {
             Ok(()) => info!("tsreplace command_path set from config file: {}", command_path),
             Err(e) => error!("Failed to set tsreplace command_path from config file: {}", e),
+        }
+    }
+    // Same trust boundary as command_path (REVIEW S1): the optional stage-1
+    // preprocessor executable is TOML-only too.
+    if let Some(preprocessor_path) = &file_config.tsreplace.preprocessor_path {
+        let db_guard = db.lock().await;
+        match db_guard.set_tsreplace_preprocessor_path(preprocessor_path) {
+            Ok(()) => info!("tsreplace preprocessor_path set from config file: {}", preprocessor_path),
+            Err(e) => error!("Failed to set tsreplace preprocessor_path from config file: {}", e),
         }
     }
 
