@@ -1365,16 +1365,17 @@ const HTML_CONTENT: &str = r#"
             const isApiCall = url.startsWith('/api/');
             init = init || {};
 
+            // No preemptive prompt here: the client cannot know whether the
+            // server has auth enabled ([web] auth_enabled = false skips the
+            // check entirely), so a stored token is attached if present and
+            // the user is only asked after the server actually answers 401.
             if (isApiCall) {
-                let token = getStoredAuthToken();
-                if (!token) {
-                    token = await requestAuthTokenFromUser(
-                        'recisdb-proxy: APIトークンを入力してください\n(サーバー起動時のログに一度だけ表示されます)'
-                    );
+                const token = getStoredAuthToken();
+                if (token) {
+                    init = Object.assign({}, init, {
+                        headers: Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + token }),
+                    });
                 }
-                init = Object.assign({}, init, {
-                    headers: Object.assign({}, init.headers, token ? { 'Authorization': 'Bearer ' + token } : {}),
-                });
             }
 
             let res = await _nativeFetch(input, init);
@@ -1382,7 +1383,7 @@ const HTML_CONTENT: &str = r#"
             if (isApiCall && res.status === 401) {
                 setStoredAuthToken(''); // stale/wrong token, drop it
                 const token = await requestAuthTokenFromUser(
-                    '認証エラー: APIトークンが正しくありません。再入力してください。'
+                    'recisdb-proxy: APIトークンを入力してください\n(サーバー起動時のログに表示されます)'
                 );
                 if (token) {
                     init = Object.assign({}, init, {
