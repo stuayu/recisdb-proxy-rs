@@ -1702,14 +1702,16 @@ pub async fn update_tuner_config(
     }))
 }
 
-/// Get external encoder (tsreplace) configuration.
+/// Get external encoder (tsreplace) configuration — BNDP (TVTest) session
+/// pipeline ONLY. The browser-preview pipeline has its own settings at
+/// `GET /api/preview-config`.
 pub async fn get_tsreplace_config(
     State(web_state): State<Arc<WebState>>,
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
     match db.get_tsreplace_config() {
-        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments, preview_enabled)) => {
+        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => {
             Json(json!({
                 "success": true,
                 "config": {
@@ -1723,9 +1725,6 @@ pub async fn get_tsreplace_config(
                     // for display just like `command_path`.
                     "preprocessor_path": preprocessor_path,
                     "preprocessor_arguments": preprocessor_arguments,
-                    // Gates only the HTTP ?profile=preview path; `enabled`
-                    // above gates only the BNDP session pipeline.
-                    "preview_enabled": preview_enabled,
                 }
             }))
         }
@@ -1750,16 +1749,14 @@ pub async fn get_tsreplace_config(
 /// program to execute.
 #[derive(Debug, Deserialize)]
 pub struct UpdateTsreplaceConfigRequest {
-    /// Gates only the BNDP (TVTest) session encode pipeline.
+    /// Gates only the BNDP (TVTest) session encode pipeline. The browser
+    /// preview pipeline is configured via `POST /api/preview-config`.
     pub enabled: Option<bool>,
     pub arguments: Option<String>,
     pub read_timeout_ms: Option<u64>,
     pub passthrough_on_error: Option<bool>,
     pub max_concurrent_encoders: Option<i64>,
     pub preprocessor_arguments: Option<String>,
-    /// Gates only the HTTP `?profile=preview` streaming path; fully
-    /// independent from `enabled`.
-    pub preview_enabled: Option<bool>,
 }
 
 /// Update external encoder (tsreplace) configuration.
@@ -1773,10 +1770,10 @@ pub async fn update_tsreplace_config(
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments, mut preview_enabled) =
+    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments) =
         match db.get_tsreplace_config() {
             Ok(config) => config,
-            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string(), false),
+            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string()),
         };
 
     if let Some(val) = payload.enabled {
@@ -1801,9 +1798,6 @@ pub async fn update_tsreplace_config(
     if let Some(val) = payload.preprocessor_arguments {
         preprocessor_arguments = val;
     }
-    if let Some(val) = payload.preview_enabled {
-        preview_enabled = val;
-    }
 
     if let Err(e) = db.update_tsreplace_config(
         enabled,
@@ -1815,7 +1809,6 @@ pub async fn update_tsreplace_config(
         // TOML-only (REVIEW S1): always written back exactly as read above.
         &preprocessor_path,
         &preprocessor_arguments,
-        preview_enabled,
     ) {
         return Json(json!({
             "success": false,
@@ -1835,7 +1828,102 @@ pub async fn update_tsreplace_config(
             "max_concurrent_encoders": max_concurrent_encoders,
             "preprocessor_path": preprocessor_path,
             "preprocessor_arguments": preprocessor_arguments,
-            "preview_enabled": preview_enabled,
+        }
+    }))
+}
+
+// ============================================================================
+// Browser preview encoder configuration (`preview_encoder_config`)
+//
+// Fully separate from the BNDP tsreplace endpoints above: gates and
+// configures ONLY the HTTP `?profile=preview` streaming path
+// (`web/stream.rs::load_preview_encoder_config`).
+// ============================================================================
+
+/// Get browser-preview encoder configuration (`GET /api/preview-config`).
+pub async fn get_preview_config(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    match db.get_preview_encoder_config() {
+        Ok((enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms)) => {
+            Json(json!({
+                "success": true,
+                "config": {
+                    "enabled": enabled,
+                    // Both paths are read-only in the API (TOML-only,
+                    // REVIEW S1: `[preview]` section), exposed for display.
+                    "command_path": command_path,
+                    "preprocessor_path": preprocessor_path,
+                    "preprocessor_arguments": preprocessor_arguments,
+                    "read_timeout_ms": read_timeout_ms,
+                }
+            }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// Update request for the browser-preview encoder configuration.
+///
+/// `command_path` and `preprocessor_path` are intentionally **not** fields
+/// here (REVIEW_2026-07.md S1): they are programs the server executes, so
+/// they are only changeable via the TOML `[preview]` section
+/// (`Database::set_preview_command_path` / `set_preview_preprocessor_path`,
+/// applied once at startup in `main.rs`). If a client sends either, serde
+/// silently drops the unknown field and the stored value stays untouched.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePreviewConfigRequest {
+    /// Gates only the HTTP `?profile=preview` streaming path.
+    pub enabled: Option<bool>,
+    pub preprocessor_arguments: Option<String>,
+    pub read_timeout_ms: Option<u64>,
+}
+
+/// Update browser-preview encoder configuration (`POST /api/preview-config`).
+///
+/// # Security (REVIEW_2026-07.md S1)
+/// Neither executable path can be changed through this endpoint by design —
+/// see [`UpdatePreviewConfigRequest`].
+pub async fn update_preview_config(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdatePreviewConfigRequest>,
+) -> impl IntoResponse {
+    let db = web_state.database.lock().await;
+
+    let (mut enabled, command_path, preprocessor_path, mut preprocessor_arguments, mut read_timeout_ms) =
+        match db.get_preview_encoder_config() {
+            Ok(config) => config,
+            Err(e) => return Json(json!({ "success": false, "error": e.to_string() })),
+        };
+
+    if let Some(val) = payload.enabled {
+        enabled = val;
+    }
+    if let Some(val) = payload.preprocessor_arguments {
+        preprocessor_arguments = val;
+    }
+    if let Some(val) = payload.read_timeout_ms {
+        if val > 0 {
+            read_timeout_ms = val;
+        }
+    }
+
+    if let Err(e) = db.update_preview_encoder_config(enabled, &preprocessor_arguments, read_timeout_ms) {
+        return Json(json!({
+            "success": false,
+            "error": format!("Failed to save configuration: {}", e)
+        }));
+    }
+
+    Json(json!({
+        "success": true,
+        "message": "preview configuration saved successfully",
+        "config": {
+            "enabled": enabled,
+            "command_path": command_path,
+            "preprocessor_path": preprocessor_path,
+            "preprocessor_arguments": preprocessor_arguments,
+            "read_timeout_ms": read_timeout_ms,
         }
     }))
 }

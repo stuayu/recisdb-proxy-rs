@@ -75,9 +75,13 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Tuner optimization configuration API
         .route("/tuner-config", get(api::get_tuner_config))
         .route("/tuner-config", post(api::update_tuner_config))
-        // External encoder (tsreplace) configuration API
+        // External encoder (tsreplace) configuration API — BNDP sessions only
         .route("/tsreplace-config", get(api::get_tsreplace_config))
         .route("/tsreplace-config", post(api::update_tsreplace_config))
+        // Browser-preview encoder configuration API (`preview_encoder_config`,
+        // fully separate from tsreplace-config)
+        .route("/preview-config", get(api::get_preview_config))
+        .route("/preview-config", post(api::update_preview_config))
         // Encode profile catalogue API (STREAMING_DESIGN.md §5.3/§9 P5)
         .route("/encode-profiles", get(api::get_encode_profiles))
         .route("/encode-profiles", post(api::create_encode_profile))
@@ -257,6 +261,58 @@ mod tests {
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(SessionRegistry::new());
         Arc::new(WebState::new(database, tuner_pool, encoder_pool, session_registry, auth))
+    }
+
+    /// REVIEW S1 for `/api/preview-config`: the two executable paths are
+    /// TOML-only. Sending them in the POST body must be silently ignored
+    /// (serde drops unknown fields), while the legitimate fields
+    /// (`enabled` / `preprocessor_arguments` / `read_timeout_ms`) apply.
+    #[tokio::test]
+    async fn preview_config_api_ignores_executable_paths() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        {
+            // Paths arrive via the TOML-only setters (main.rs `[preview]`).
+            let db = state.database.lock().await;
+            db.set_preview_command_path("C:/toml/enc.exe").unwrap();
+            db.set_preview_preprocessor_path("C:/toml/pre.exe").unwrap();
+        }
+        let app = build_app(Arc::clone(&state), false);
+
+        let body = serde_json::json!({
+            "enabled": true,
+            "preprocessor_arguments": "-x 18 -n {SID} -",
+            "read_timeout_ms": 5000,
+            // Injection attempts — must be ignored:
+            "command_path": "C:/evil/enc.exe",
+            "preprocessor_path": "C:/evil/pre.exe",
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preview-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(Request::builder().uri("/api/preview-config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cfg = &json["config"];
+        assert_eq!(cfg["command_path"], "C:/toml/enc.exe", "TOML-only path must be untouched");
+        assert_eq!(cfg["preprocessor_path"], "C:/toml/pre.exe", "TOML-only path must be untouched");
+        assert_eq!(cfg["enabled"], true);
+        assert_eq!(cfg["preprocessor_arguments"], "-x 18 -n {SID} -");
+        assert_eq!(cfg["read_timeout_ms"], 5000);
     }
 
     #[tokio::test]

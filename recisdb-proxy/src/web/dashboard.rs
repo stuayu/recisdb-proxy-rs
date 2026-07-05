@@ -816,22 +816,18 @@ const HTML_CONTENT: &str = r#"
                 <div id="tuner-config-message" style="margin-top: 15px; display: none;"></div>
             </div>
 
-            <h3 style="margin-top: 30px;">外部エンコード（tsreplace）設定</h3>
+            <h3 style="margin-top: 30px;">外部エンコード（BNDPセッション用 / tsreplace）設定</h3>
+            <p style="font-size:12px;color:#666;">
+                BonDriver経由（TVTest等）の視聴/録画セッション専用の設定です。
+                ブラウザプレビューには一切影響しません（プレビューは下の
+                「ブラウザプレビュー」セクションで設定します）。
+            </p>
             <div class="settings-form">
                 <div class="form-group">
                     <label class="form-check">
                         <input type="checkbox" id="tsreplace-enabled">
                         BNDPセッション（TVTest等）のエンコードを有効にする
                     </label>
-                    <small>BonDriver経由の視聴/録画セッションに外部エンコードを適用します。ブラウザプレビューには影響しません</small>
-                </div>
-
-                <div class="form-group">
-                    <label class="form-check">
-                        <input type="checkbox" id="tsreplace-preview-enabled">
-                        ブラウザプレビュー（?profile=preview）のエンコードを有効にする
-                    </label>
-                    <small>ダッシュボードのプレビュー再生用。上のBNDP側設定とは独立して動作します</small>
                 </div>
 
                 <div class="form-group">
@@ -867,7 +863,7 @@ const HTML_CONTENT: &str = r#"
                 <div class="form-group">
                     <label for="tsreplace-max-encoders">同時エンコード数の上限</label>
                     <input type="number" id="tsreplace-max-encoders" min="1" value="2">
-                    <small>共有エンコーダの同時起動数（HWエンコードの同時セッション数目安）。上限到達時は非エンコードTSで配信</small>
+                    <small>共有エンコーダの同時起動数（HWエンコードの同時セッション数目安、BNDP/ブラウザプレビュー共通のプール上限）。上限到達時は非エンコードTSで配信</small>
                 </div>
 
                 <div class="form-group">
@@ -885,12 +881,59 @@ const HTML_CONTENT: &str = r#"
                 <div id="tsreplace-config-message" style="margin-top: 15px; display: none;"></div>
             </div>
 
+            <h3 style="margin-top: 30px;">ブラウザプレビュー（?profile=preview）設定</h3>
+            <p style="font-size:12px;color:#666;">
+                ダッシュボードのプレビュー再生専用の設定です。上のBNDP用（tsreplace）
+                設定とは完全に独立しています。エンコード引数自体は下の
+                エンコードプロファイル（purpose=preview）から取られます。
+            </p>
+            <div class="settings-form">
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="preview-enabled">
+                        ブラウザプレビューのエンコードを有効にする
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label for="preview-command-path">エンコーダ実行コマンド</label>
+                    <input type="text" id="preview-command-path" readonly disabled placeholder="例: C:\DTV\KonomiTV\server\thirdparty\QSVEncC\QSVEncC.exe">
+                    <small>設定ファイル (recisdb-proxy.toml の [preview] command_path) でのみ変更可能。セキュリティ上の理由により、この画面やAPIからは変更できません</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="preview-preprocessor-path">前段コマンド（プリプロセッサ）</label>
+                    <input type="text" id="preview-preprocessor-path" readonly disabled placeholder="例: C:\DTV\KonomiTV\server\thirdparty\tsreadex\tsreadex.exe（未設定なら単段）">
+                    <small>TS → 前段 → エンコーダ の2段パイプの前段（例: tsreadex）。設定ファイル (recisdb-proxy.toml の [preview] preprocessor_path) でのみ変更可能</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="preview-preprocessor-arguments">前段コマンドの引数テンプレート</label>
+                    <input type="text" id="preview-preprocessor-arguments" placeholder="例: -x 18 -n {SID} -">
+                    <small>前段コマンドに付与する引数。<code>{SID}</code> は対象サービスIDに置換されます</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="preview-read-timeout">読み取りタイムアウト（ms）</label>
+                    <input type="number" id="preview-read-timeout" min="1" value="10000">
+                    <small>エンコーダ出力を待つ最大時間（超過でチェーンを強制終了）</small>
+                </div>
+
+                <div style="margin-top: 20px; display: flex; gap: 10px;">
+                    <button class="btn btn-primary" onclick="savePreviewConfig()">保存</button>
+                    <button class="btn btn-secondary" onclick="loadPreviewConfig()">リセット</button>
+                </div>
+
+                <div id="preview-config-message" style="margin-top: 15px; display: none;"></div>
+            </div>
+
             <h3 style="margin-top: 30px;">エンコードプロファイル (STREAMING_DESIGN.md §5.3)</h3>
             <p style="font-size:12px;color:#666;">
                 録画・プレビュー用途ごとのコーデック/ビットレート/追加引数の組み合わせ。
-                実行コマンド本体は上の「外部エンコード（tsreplace）設定」の実行コマンド欄
-                (TOML設定でのみ変更可)がそのまま使われます。ブラウザプレビューは
-                <code>purpose=preview</code> の最初の有効な行を使用します。
+                実行コマンド本体はTOML設定でのみ変更可能で、BNDPセッションは
+                [tsreplace] command_path、ブラウザプレビューは [preview] command_path
+                が使われます。ブラウザプレビューは <code>purpose=preview</code> の
+                最初の有効な行の追加引数を使用します。
             </p>
             <div class="section-header">
                 <span></span>
@@ -3121,7 +3164,6 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tsreplace-passthrough-on-error').checked = !!data.config.passthrough_on_error;
                     document.getElementById('tsreplace-preprocessor-path').value = data.config.preprocessor_path || '';
                     document.getElementById('tsreplace-preprocessor-arguments').value = data.config.preprocessor_arguments || '';
-                    document.getElementById('tsreplace-preview-enabled').checked = !!data.config.preview_enabled;
                     hideTsreplaceConfigMessage();
                 }
             } catch (e) {
@@ -3156,7 +3198,6 @@ const HTML_CONTENT: &str = r#"
                 // preprocessor_path is read-only here (TOML-only, like
                 // command_path); only its arguments are editable.
                 preprocessor_arguments: document.getElementById('tsreplace-preprocessor-arguments').value,
-                preview_enabled: document.getElementById('tsreplace-preview-enabled').checked,
             };
 
             try {
@@ -3195,6 +3236,78 @@ const HTML_CONTENT: &str = r#"
 
         function hideTsreplaceConfigMessage() {
             document.getElementById('tsreplace-config-message').style.display = 'none';
+        }
+
+        // Browser preview (?profile=preview) Config Functions — fully
+        // separate from the BNDP tsreplace config above.
+        async function loadPreviewConfig() {
+            try {
+                const response = await fetch('/api/preview-config');
+                const data = await response.json();
+                if (data.success && data.config) {
+                    document.getElementById('preview-enabled').checked = !!data.config.enabled;
+                    document.getElementById('preview-command-path').value = data.config.command_path || '';
+                    document.getElementById('preview-preprocessor-path').value = data.config.preprocessor_path || '';
+                    document.getElementById('preview-preprocessor-arguments').value = data.config.preprocessor_arguments || '';
+                    document.getElementById('preview-read-timeout').value = data.config.read_timeout_ms ?? 10000;
+                    hidePreviewConfigMessage();
+                }
+            } catch (e) {
+                console.error('Failed to load preview config:', e);
+            }
+        }
+
+        async function savePreviewConfig() {
+            // command_path / preprocessor_path are read-only here (TOML-only,
+            // recisdb-proxy.toml [preview], REVIEW S1) and are not sent.
+            const readTimeoutMs = parseInt(document.getElementById('preview-read-timeout').value, 10);
+            if (!Number.isFinite(readTimeoutMs) || readTimeoutMs <= 0) {
+                showPreviewConfigMessage('読み取りタイムアウトは正の数値を入力してください', 'error');
+                return;
+            }
+
+            const payload = {
+                enabled: document.getElementById('preview-enabled').checked,
+                preprocessor_arguments: document.getElementById('preview-preprocessor-arguments').value,
+                read_timeout_ms: readTimeoutMs,
+            };
+
+            try {
+                const response = await fetch('/api/preview-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showPreviewConfigMessage('設定を保存しました', 'success');
+                } else {
+                    showPreviewConfigMessage('設定の保存に失敗しました: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                showPreviewConfigMessage('設定の保存に失敗しました: ' + e.message, 'error');
+            }
+        }
+
+        function showPreviewConfigMessage(message, type) {
+            const msgEl = document.getElementById('preview-config-message');
+            msgEl.textContent = message;
+            msgEl.style.display = 'block';
+            msgEl.style.padding = '10px 12px';
+            msgEl.style.borderRadius = '4px';
+            msgEl.style.fontSize = '13px';
+            if (type === 'success') {
+                msgEl.style.background = '#d4edda';
+                msgEl.style.color = '#155724';
+            } else {
+                msgEl.style.background = '#f8d7da';
+                msgEl.style.color = '#721c24';
+            }
+            setTimeout(hidePreviewConfigMessage, 5000);
+        }
+
+        function hidePreviewConfigMessage() {
+            document.getElementById('preview-config-message').style.display = 'none';
         }
 
         // ---- Encode profiles (STREAMING_DESIGN.md §5.3/§9 P5) ----
@@ -3338,6 +3451,7 @@ const HTML_CONTENT: &str = r#"
             loadScanConfig();
             loadTunerConfig();
             loadTsreplaceConfig();
+            loadPreviewConfig();
             refreshEncodeProfiles();
             enableTableSorting('clients-table');
             enableTableSorting('bondrivers-table');

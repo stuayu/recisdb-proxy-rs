@@ -150,13 +150,18 @@ impl Database {
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
 
-        // Migration 012: Add preview_enabled to tsreplace_config. Gates ONLY
-        // the HTTP `?profile=preview` streaming path; the pre-existing
-        // `enabled` column keeps gating ONLY the BNDP (TVTest) session
-        // encode pipeline. The two flags are fully independent, so browser
-        // preview can be enabled without BNDP sessions ever attempting to
-        // spawn an encoder (and vice versa).
+        // Migration 012 (legacy): `tsreplace_config.preview_enabled` briefly
+        // gated the HTTP `?profile=preview` path. Superseded by Migration
+        // 013's dedicated `preview_encoder_config` table. The column is kept
+        // (never dropped) but is NO LONGER REFERENCED anywhere except the
+        // one-time carry-over in `ensure_preview_encoder_config_compat`.
         self.add_column_if_not_exists("tsreplace_config", "preview_enabled", "INTEGER DEFAULT 0")?;
+
+        // Migration 013: dedicated browser-preview encoder settings table,
+        // fully separated from the BNDP (TVTest) `tsreplace_config`. Created
+        // (and seeded, carrying `tsreplace_config.preview_enabled` over into
+        // its `enabled`) by `ensure_preview_encoder_config_compat`.
+        self.ensure_preview_encoder_config_compat()?;
 
         // Migration 008: Add stream_class column to session_history if it doesn't
         // exist (STREAMING_DESIGN.md §2 P2: stream reliability class, recorded at
@@ -515,10 +520,10 @@ impl Database {
         Ok(())
     }
 
-    /// Get tsreplace configuration from database.
+    /// Get tsreplace (BNDP/TVTest session encode pipeline) configuration.
     ///
     /// Returns `(enabled, command_path, arguments, read_timeout_ms, passthrough_on_error,
-    /// max_concurrent_encoders, preprocessor_path, preprocessor_arguments, preview_enabled)`.
+    /// max_concurrent_encoders, preprocessor_path, preprocessor_arguments)`.
     /// `max_concurrent_encoders` caps the number of concurrently-running
     /// shared encoder chains (STREAMING_DESIGN.md §5 P4); sessions sharing the same
     /// channel/SID-set/config generation join a single running encoder instead of
@@ -526,16 +531,17 @@ impl Database {
     /// stage-1 command (e.g. tsreadex) piped before `command_path`; like
     /// `command_path` it is TOML-only (REVIEW S1).
     ///
-    /// The two enable flags are fully independent: `enabled` gates only the
-    /// BNDP (TVTest) session encode pipeline, `preview_enabled` gates only
-    /// the HTTP `?profile=preview` streaming path.
+    /// This table gates ONLY the BNDP (TVTest) session pipeline. The HTTP
+    /// `?profile=preview` path has its own fully separate settings — see
+    /// [`Self::get_preview_encoder_config`]. (The legacy `preview_enabled`
+    /// column still physically exists but is deliberately not returned.)
     #[allow(clippy::type_complexity)]
-    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64, String, String, bool)> {
+    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64, String, String)> {
         self.ensure_tsreplace_config_compat()?;
 
         let mut stmt = self.conn.prepare(
             "SELECT enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders,
-                    preprocessor_path, preprocessor_arguments, preview_enabled
+                    preprocessor_path, preprocessor_arguments
              FROM tsreplace_config WHERE id = 1"
         )?;
 
@@ -549,7 +555,6 @@ impl Database {
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
             ))
         });
 
@@ -577,7 +582,6 @@ impl Database {
                     DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS,
                     String::new(),
                     String::new(),
-                    false,
                 ))
             }
             Err(e) => Err(DatabaseError::Sqlite(e)),
@@ -600,13 +604,12 @@ impl Database {
         max_concurrent_encoders: i64,
         preprocessor_path: &str,
         preprocessor_arguments: &str,
-        preview_enabled: bool,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO tsreplace_config
              (id, enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders,
-              preprocessor_path, preprocessor_arguments, preview_enabled, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s', 'now'))",
+              preprocessor_path, preprocessor_arguments, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s', 'now'))",
             rusqlite::params![
                 if enabled { 1 } else { 0 },
                 command_path,
@@ -615,8 +618,7 @@ impl Database {
                 if passthrough_on_error { 1 } else { 0 },
                 max_concurrent_encoders,
                 preprocessor_path,
-                preprocessor_arguments,
-                if preview_enabled { 1 } else { 0 }
+                preprocessor_arguments
             ],
         )?;
         Ok(())
@@ -658,6 +660,140 @@ impl Database {
         self.ensure_tsreplace_config_compat()?;
         self.conn.execute(
             "UPDATE tsreplace_config SET preprocessor_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
+            rusqlite::params![preprocessor_path],
+        )?;
+        Ok(())
+    }
+}
+
+/// Browser-preview encoder configuration storage (Migration 013).
+///
+/// Fully separate from `tsreplace_config`: this table gates and configures
+/// ONLY the HTTP `?profile=preview` streaming path (`web/stream.rs`), while
+/// `tsreplace_config` gates and configures ONLY the BNDP (TVTest) session
+/// pipeline (`server/session.rs`). The two pipelines share nothing but the
+/// `EncoderPool` itself (and thus `tsreplace_config.max_concurrent_encoders`,
+/// which caps the pool's total concurrently-running chains as a hardware
+/// resource limit, not a per-pipeline setting).
+impl Database {
+    fn ensure_preview_encoder_config_compat(&self) -> Result<()> {
+        // The seed below carries the legacy `tsreplace_config.preview_enabled`
+        // over, so make sure that table/column exists first.
+        self.ensure_tsreplace_config_compat()?;
+
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS preview_encoder_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER DEFAULT 0,
+                command_path TEXT DEFAULT '',
+                preprocessor_path TEXT DEFAULT '',
+                preprocessor_arguments TEXT DEFAULT '',
+                read_timeout_ms INTEGER DEFAULT 10000,
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            );",
+        )?;
+
+        self.add_column_if_not_exists("preview_encoder_config", "enabled", "INTEGER DEFAULT 0")?;
+        self.add_column_if_not_exists("preview_encoder_config", "command_path", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("preview_encoder_config", "preprocessor_path", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("preview_encoder_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists("preview_encoder_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
+        self.add_column_if_not_exists(
+            "preview_encoder_config",
+            "updated_at",
+            "INTEGER DEFAULT (strftime('%s', 'now'))",
+        )?;
+
+        // One-time seed. `enabled` carries over the short-lived legacy
+        // `tsreplace_config.preview_enabled` flag (Migration 012) so anyone
+        // who already turned browser preview on does not silently lose it.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO preview_encoder_config
+             (id, enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms, updated_at)
+             SELECT 1,
+                    COALESCE((SELECT preview_enabled FROM tsreplace_config WHERE id = 1), 0),
+                    '', '', '', 10000, strftime('%s', 'now')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get the browser-preview encoder configuration.
+    ///
+    /// Returns `(enabled, command_path, preprocessor_path,
+    /// preprocessor_arguments, read_timeout_ms)`. `command_path` and
+    /// `preprocessor_path` are TOML-only (`[preview]` section, REVIEW S1);
+    /// empty `command_path` means "not configured yet" and the preview path
+    /// refuses to start. The encode arguments themselves come from the
+    /// `encode_profiles` row with `purpose='preview'`, not from here.
+    pub fn get_preview_encoder_config(&self) -> Result<(bool, String, String, String, u64)> {
+        self.ensure_preview_encoder_config_compat()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms
+             FROM preview_encoder_config WHERE id = 1",
+        )?;
+
+        stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? != 0,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                row.get::<_, Option<u64>>(4)?.unwrap_or(10_000),
+            ))
+        })
+        .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Update the API-editable browser-preview settings: `enabled`,
+    /// `preprocessor_arguments`, `read_timeout_ms`. The two executable paths
+    /// are deliberately NOT parameters here — they stay TOML-only (REVIEW
+    /// S1, see [`Self::set_preview_command_path`]).
+    pub fn update_preview_encoder_config(
+        &self,
+        enabled: bool,
+        preprocessor_arguments: &str,
+        read_timeout_ms: u64,
+    ) -> Result<()> {
+        self.ensure_preview_encoder_config_compat()?;
+        self.conn.execute(
+            "UPDATE preview_encoder_config
+             SET enabled = ?1, preprocessor_arguments = ?2, read_timeout_ms = ?3,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1",
+            rusqlite::params![if enabled { 1 } else { 0 }, preprocessor_arguments, read_timeout_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Set the preview encoder executable path.
+    ///
+    /// # Security (trust boundary — REVIEW_2026-07.md S1)
+    /// Same rule as [`Self::set_tsreplace_command_path`]: this is a program
+    /// the server executes, so it must only ever be set from the TOML config
+    /// file (`[preview] command_path` in `main.rs`), never from a Web API
+    /// handler.
+    pub fn set_preview_command_path(&self, command_path: &str) -> Result<()> {
+        self.ensure_preview_encoder_config_compat()?;
+        self.conn.execute(
+            "UPDATE preview_encoder_config SET command_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
+            rusqlite::params![command_path],
+        )?;
+        Ok(())
+    }
+
+    /// Set the preview preprocessor (stage-1, e.g. tsreadex) executable path.
+    ///
+    /// # Security (trust boundary — REVIEW_2026-07.md S1)
+    /// TOML-only (`[preview] preprocessor_path`), same as
+    /// [`Self::set_preview_command_path`]. Empty string disables the
+    /// preprocessor stage.
+    pub fn set_preview_preprocessor_path(&self, preprocessor_path: &str) -> Result<()> {
+        self.ensure_preview_encoder_config_compat()?;
+        self.conn.execute(
+            "UPDATE preview_encoder_config SET preprocessor_path = ?1, updated_at = strftime('%s', 'now') WHERE id = 1",
             rusqlite::params![preprocessor_path],
         )?;
         Ok(())
@@ -752,12 +888,12 @@ mod tests {
     #[test]
     fn set_tsreplace_command_path_only_changes_command_path() {
         let db = Database::open_in_memory().unwrap();
-        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3, "pre-path", "--pre", true)
+        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3, "pre-path", "--pre")
             .unwrap();
 
         db.set_tsreplace_command_path("/usr/local/bin/tsreplace").unwrap();
 
-        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments, preview_enabled) =
+        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments) =
             db.get_tsreplace_config().unwrap();
         assert_eq!(command_path, "/usr/local/bin/tsreplace");
         // Everything else must be preserved.
@@ -768,29 +904,6 @@ mod tests {
         assert_eq!(max_concurrent_encoders, 3);
         assert_eq!(preprocessor_path, "pre-path");
         assert_eq!(preprocessor_arguments, "--pre");
-        assert!(preview_enabled);
-    }
-
-    #[test]
-    fn tsreplace_preview_enabled_defaults_false_and_is_independent() {
-        let db = Database::open_in_memory().unwrap();
-
-        // Fresh DB: both flags default to false.
-        let (enabled, .., preview_enabled) = db.get_tsreplace_config().unwrap();
-        assert!(!enabled);
-        assert!(!preview_enabled);
-
-        // preview_enabled=true with enabled=false roundtrips independently.
-        db.update_tsreplace_config(false, "enc", "", 1000, true, 2, "", "", true).unwrap();
-        let (enabled, .., preview_enabled) = db.get_tsreplace_config().unwrap();
-        assert!(!enabled);
-        assert!(preview_enabled);
-
-        // And the reverse.
-        db.update_tsreplace_config(true, "enc", "", 1000, true, 2, "", "", false).unwrap();
-        let (enabled, .., preview_enabled) = db.get_tsreplace_config().unwrap();
-        assert!(enabled);
-        assert!(!preview_enabled);
     }
 
     #[test]
@@ -798,13 +911,13 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         // Fresh DB: preprocessor is absent (empty strings).
-        let (_, _, _, _, _, _, pre_path, pre_args, _) = db.get_tsreplace_config().unwrap();
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
         assert_eq!(pre_path, "");
         assert_eq!(pre_args, "");
 
         // TOML-only setter changes only the path.
         db.set_tsreplace_preprocessor_path("C:/DTV/tsreadex/tsreadex.exe").unwrap();
-        let (_, _, _, _, _, _, pre_path, pre_args, _) = db.get_tsreplace_config().unwrap();
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
         assert_eq!(pre_path, "C:/DTV/tsreadex/tsreadex.exe");
         assert_eq!(pre_args, "");
 
@@ -818,11 +931,75 @@ mod tests {
             2,
             "C:/DTV/tsreadex/tsreadex.exe",
             "-x 18 -n {SID} -",
-            false,
         )
         .unwrap();
-        let (_, _, _, _, _, _, pre_path, pre_args, _) = db.get_tsreplace_config().unwrap();
+        let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
         assert_eq!(pre_path, "C:/DTV/tsreadex/tsreadex.exe");
         assert_eq!(pre_args, "-x 18 -n {SID} -");
+    }
+
+    #[test]
+    fn preview_encoder_config_defaults_and_roundtrips() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Fresh DB: disabled, no paths, default timeout.
+        let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
+        assert!(!enabled);
+        assert_eq!(cmd, "");
+        assert_eq!(pre_path, "");
+        assert_eq!(pre_args, "");
+        assert_eq!(timeout, 10_000);
+
+        // TOML-only setters change only their own column.
+        db.set_preview_command_path("C:/enc/QSVEncC64.exe").unwrap();
+        db.set_preview_preprocessor_path("C:/pre/tsreadex.exe").unwrap();
+        // API-editable trio roundtrips.
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 20_000).unwrap();
+
+        let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
+        assert!(enabled);
+        assert_eq!(cmd, "C:/enc/QSVEncC64.exe");
+        assert_eq!(pre_path, "C:/pre/tsreadex.exe");
+        assert_eq!(pre_args, "-x 18 -n {SID} -");
+        assert_eq!(timeout, 20_000);
+    }
+
+    #[test]
+    fn preview_encoder_config_is_independent_from_tsreplace_config() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Scribble all over the BNDP-side config...
+        db.update_tsreplace_config(true, "garbage-cmd", "--garbage", 1, false, 1, "garbage-pre", "--garbage-pre")
+            .unwrap();
+        // ...and the preview side must be completely unaffected.
+        let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
+        assert!(!enabled);
+        assert_eq!(cmd, "");
+        assert_eq!(pre_path, "");
+        assert_eq!(pre_args, "");
+        assert_eq!(timeout, 10_000);
+
+        // And the reverse: preview updates never leak into tsreplace_config.
+        db.set_preview_command_path("C:/enc/QSVEncC64.exe").unwrap();
+        db.update_preview_encoder_config(true, "-n {SID} -", 5_000).unwrap();
+        let (enabled, command_path, arguments, ..) = db.get_tsreplace_config().unwrap();
+        assert!(enabled);
+        assert_eq!(command_path, "garbage-cmd");
+        assert_eq!(arguments, "--garbage");
+    }
+
+    #[test]
+    fn preview_encoder_config_carries_over_legacy_preview_enabled() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Simulate a DB from the short-lived Migration-012 era: legacy flag
+        // set to 1 and no preview_encoder_config row yet.
+        db.conn
+            .execute("UPDATE tsreplace_config SET preview_enabled = 1 WHERE id = 1", [])
+            .unwrap();
+        db.conn.execute("DELETE FROM preview_encoder_config", []).unwrap();
+
+        let (enabled, ..) = db.get_preview_encoder_config().unwrap();
+        assert!(enabled, "legacy tsreplace_config.preview_enabled=1 must carry over");
     }
 }

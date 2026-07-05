@@ -435,10 +435,10 @@ impl Session {
 
     async fn load_tsreplace_runtime_config(&self) -> TsreplaceRuntimeConfig {
         let db = self.database.lock().await;
+        // BNDP sessions read `tsreplace_config` ONLY; the browser-preview
+        // pipeline has its own `preview_encoder_config` (web/stream.rs).
         match db.get_tsreplace_config() {
-            // `_preview_enabled` gates only the HTTP `?profile=preview` path
-            // (web/stream.rs); BNDP sessions here follow `enabled` alone.
-            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments, _preview_enabled)) => TsreplaceRuntimeConfig {
+            Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => TsreplaceRuntimeConfig {
                 enabled,
                 command_path,
                 arguments,

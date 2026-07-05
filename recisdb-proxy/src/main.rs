@@ -120,6 +120,8 @@ struct ConfigFile {
     #[serde(default)]
     tsreplace: TsreplaceSection,
     #[serde(default)]
+    preview: PreviewSection,
+    #[serde(default)]
     mirakurun: MirakurunSection,
     #[cfg(feature = "tls")]
     #[serde(default)]
@@ -165,6 +167,19 @@ struct TsreplaceSection {
     /// front of `command_path`: `TS -> preprocessor -> encoder -> stdout`.
     /// Same trust boundary as `command_path` (TOML-only, never via the Web
     /// API). Set to an empty string to clear an already-persisted value.
+    preprocessor_path: Option<String>,
+}
+
+/// Browser-preview (`?profile=preview`) encoder configuration that must only
+/// be settable via the config file (REVIEW_2026-07.md S1). Fully separate
+/// from `[tsreplace]`, which configures the BNDP (TVTest) session pipeline.
+#[derive(Debug, serde::Deserialize, Default)]
+struct PreviewSection {
+    /// Path to the preview encoder executable (e.g. QSVEncC). TOML-only for
+    /// the same RCE-prevention reason as `[tsreplace] command_path`.
+    command_path: Option<String>,
+    /// Optional stage-1 (preprocessor) executable, e.g. tsreadex. TOML-only.
+    /// Set to an empty string to clear an already-persisted value.
     preprocessor_path: Option<String>,
 }
 
@@ -307,6 +322,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match db_guard.set_tsreplace_preprocessor_path(preprocessor_path) {
             Ok(()) => info!("tsreplace preprocessor_path set from config file: {}", preprocessor_path),
             Err(e) => error!("Failed to set tsreplace preprocessor_path from config file: {}", e),
+        }
+    }
+
+    // Browser-preview pipeline executable paths ([preview] section): same S1
+    // trust boundary — TOML-only, never via the Web API.
+    if let Some(command_path) = &file_config.preview.command_path {
+        let db_guard = db.lock().await;
+        match db_guard.set_preview_command_path(command_path) {
+            Ok(()) => info!("preview command_path set from config file: {}", command_path),
+            Err(e) => error!("Failed to set preview command_path from config file: {}", e),
+        }
+    }
+    if let Some(preprocessor_path) = &file_config.preview.preprocessor_path {
+        let db_guard = db.lock().await;
+        match db_guard.set_preview_preprocessor_path(preprocessor_path) {
+            Ok(()) => info!("preview preprocessor_path set from config file: {}", preprocessor_path),
+            Err(e) => error!("Failed to set preview preprocessor_path from config file: {}", e),
         }
     }
 

@@ -189,26 +189,30 @@ pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tune
 
 /// Load the runtime encoder settings for `?profile=preview`: codec/bitrate/
 /// arguments from the `encode_profiles` row with `purpose='preview'`
-/// (STREAMING_DESIGN.md §5.3), and `command_path`/`read_timeout_ms` from
-/// `tsreplace_config` — `command_path` is never sourced from anywhere else
-/// (REVIEW S1: it stays TOML-only).
+/// (STREAMING_DESIGN.md §5.3), everything else from `preview_encoder_config`
+/// — the browser-preview pipeline's own table, fully separate from the BNDP
+/// (TVTest) `tsreplace_config` which is never consulted here. Both
+/// executable paths are TOML-only (`[preview]` section, REVIEW S1).
 fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u64), String> {
     let profile = db
         .get_encode_profile_by_purpose("preview")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no enabled encode profile with purpose='preview' is configured".to_string())?;
 
-    let (_bndp_enabled, command_path, _default_arguments, read_timeout_ms, _passthrough_on_error, _max_concurrent, preprocessor_path, preprocessor_arguments, preview_enabled) =
-        db.get_tsreplace_config().map_err(|e| e.to_string())?;
+    let (enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms) =
+        db.get_preview_encoder_config().map_err(|e| e.to_string())?;
 
-    // The preview path is gated by `preview_enabled` ONLY — the `enabled`
-    // flag belongs exclusively to the BNDP (TVTest) session encode pipeline
-    // (`session::start_tsreplace_pipeline`). The two are independent so
-    // browser preview can run without BNDP sessions spawning encoders.
-    if !preview_enabled {
+    if !enabled {
         return Err(
-            "tsreplace_config.preview_enabled is false; ?profile=preview requires the preview \
-             encoder pipeline to be enabled (see the dashboard's tsreplace settings)"
+            "preview_encoder_config.enabled is false; ?profile=preview requires the browser \
+             preview pipeline to be enabled (see the dashboard's browser preview settings)"
+                .to_string(),
+        );
+    }
+    if command_path.trim().is_empty() {
+        return Err(
+            "preview_encoder_config.command_path is not set; configure [preview] command_path \
+             in recisdb-proxy.toml"
                 .to_string(),
         );
     }
@@ -464,30 +468,47 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    /// The preview gate must follow `preview_enabled` ONLY, never the BNDP
-    /// `enabled` flag. Exercised directly on `load_preview_encoder_config`:
-    /// the full `stream_service` handler can't reach this gate in a unit
-    /// test because tuner startup (which needs a real BonDriver DLL) happens
-    /// first. The `preview-h264` encode profile is seeded by
-    /// `Database::open_in_memory()`, so the profile lookup preceding the
-    /// gate succeeds.
+    /// The preview path must follow `preview_encoder_config` ONLY — the BNDP
+    /// `tsreplace_config` is never consulted. Exercised directly on
+    /// `load_preview_encoder_config`: the full `stream_service` handler
+    /// can't reach this gate in a unit test because tuner startup (which
+    /// needs a real BonDriver DLL) happens first. The `preview-h264` encode
+    /// profile is seeded by `Database::open_in_memory()`, so the profile
+    /// lookup preceding the gate succeeds.
     #[test]
-    fn preview_gate_follows_preview_enabled_only() {
+    fn preview_path_reads_preview_encoder_config_only() {
         let db = Database::open_in_memory().unwrap();
 
-        // BNDP enabled=true but preview_enabled=false -> rejected, and the
-        // message names the flag that actually matters.
-        db.update_tsreplace_config(true, "enc", "", 1_000, true, 2, "", "", false).unwrap();
+        // Scribble garbage into the BNDP-side tsreplace_config (enabled=true
+        // with a bogus command) — it must have zero influence on preview.
+        db.update_tsreplace_config(true, "bndp-garbage-cmd", "--bndp", 1, true, 2, "bndp-pre", "--bndp-pre")
+            .unwrap();
+
+        // preview_encoder_config disabled (default) -> rejected, message
+        // names the actual gate.
         let err = load_preview_encoder_config(&db).unwrap_err();
         assert!(
-            err.contains("preview_enabled"),
-            "error should name preview_enabled, got: {err}"
+            err.contains("preview_encoder_config.enabled"),
+            "error should name preview_encoder_config.enabled, got: {err}"
         );
 
-        // BNDP enabled=false but preview_enabled=true -> allowed.
-        db.update_tsreplace_config(false, "enc", "", 1_000, true, 2, "", "", true).unwrap();
+        // Enabled but command_path unset -> rejected with the TOML hint.
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        let err = load_preview_encoder_config(&db).unwrap_err();
+        assert!(
+            err.contains("command_path"),
+            "error should name the missing command_path, got: {err}"
+        );
+
+        // Fully configured -> allowed, and every value comes from the
+        // preview table, none from the (garbage) tsreplace_config.
+        db.set_preview_command_path("preview-enc").unwrap();
+        db.set_preview_preprocessor_path("preview-pre").unwrap();
         let (cfg, _generation) =
-            load_preview_encoder_config(&db).expect("preview_enabled=true should pass the gate");
-        assert_eq!(cfg.command_path, "enc");
+            load_preview_encoder_config(&db).expect("configured preview should pass the gate");
+        assert_eq!(cfg.command_path, "preview-enc");
+        assert_eq!(cfg.preprocessor_path, "preview-pre");
+        assert_eq!(cfg.preprocessor_arguments, "-x 18 -n {SID} -");
+        assert_eq!(cfg.read_timeout_ms, 7_000);
     }
 }
