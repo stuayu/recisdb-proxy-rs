@@ -1709,7 +1709,7 @@ pub async fn get_tsreplace_config(
     let db = web_state.database.lock().await;
 
     match db.get_tsreplace_config() {
-        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => {
+        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments, preview_enabled)) => {
             Json(json!({
                 "success": true,
                 "config": {
@@ -1723,6 +1723,9 @@ pub async fn get_tsreplace_config(
                     // for display just like `command_path`.
                     "preprocessor_path": preprocessor_path,
                     "preprocessor_arguments": preprocessor_arguments,
+                    // Gates only the HTTP ?profile=preview path; `enabled`
+                    // above gates only the BNDP session pipeline.
+                    "preview_enabled": preview_enabled,
                 }
             }))
         }
@@ -1747,12 +1750,16 @@ pub async fn get_tsreplace_config(
 /// program to execute.
 #[derive(Debug, Deserialize)]
 pub struct UpdateTsreplaceConfigRequest {
+    /// Gates only the BNDP (TVTest) session encode pipeline.
     pub enabled: Option<bool>,
     pub arguments: Option<String>,
     pub read_timeout_ms: Option<u64>,
     pub passthrough_on_error: Option<bool>,
     pub max_concurrent_encoders: Option<i64>,
     pub preprocessor_arguments: Option<String>,
+    /// Gates only the HTTP `?profile=preview` streaming path; fully
+    /// independent from `enabled`.
+    pub preview_enabled: Option<bool>,
 }
 
 /// Update external encoder (tsreplace) configuration.
@@ -1766,10 +1773,10 @@ pub async fn update_tsreplace_config(
 ) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments) =
+    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments, mut preview_enabled) =
         match db.get_tsreplace_config() {
             Ok(config) => config,
-            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string()),
+            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string(), false),
         };
 
     if let Some(val) = payload.enabled {
@@ -1794,6 +1801,9 @@ pub async fn update_tsreplace_config(
     if let Some(val) = payload.preprocessor_arguments {
         preprocessor_arguments = val;
     }
+    if let Some(val) = payload.preview_enabled {
+        preview_enabled = val;
+    }
 
     if let Err(e) = db.update_tsreplace_config(
         enabled,
@@ -1805,6 +1815,7 @@ pub async fn update_tsreplace_config(
         // TOML-only (REVIEW S1): always written back exactly as read above.
         &preprocessor_path,
         &preprocessor_arguments,
+        preview_enabled,
     ) {
         return Json(json!({
             "success": false,
@@ -1824,6 +1835,7 @@ pub async fn update_tsreplace_config(
             "max_concurrent_encoders": max_concurrent_encoders,
             "preprocessor_path": preprocessor_path,
             "preprocessor_arguments": preprocessor_arguments,
+            "preview_enabled": preview_enabled,
         }
     }))
 }

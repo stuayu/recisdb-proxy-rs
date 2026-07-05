@@ -198,13 +198,17 @@ fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no enabled encode profile with purpose='preview' is configured".to_string())?;
 
-    let (enabled, command_path, _default_arguments, read_timeout_ms, _passthrough_on_error, _max_concurrent, preprocessor_path, preprocessor_arguments) =
+    let (_bndp_enabled, command_path, _default_arguments, read_timeout_ms, _passthrough_on_error, _max_concurrent, preprocessor_path, preprocessor_arguments, preview_enabled) =
         db.get_tsreplace_config().map_err(|e| e.to_string())?;
 
-    if !enabled {
+    // The preview path is gated by `preview_enabled` ONLY — the `enabled`
+    // flag belongs exclusively to the BNDP (TVTest) session encode pipeline
+    // (`session::start_tsreplace_pipeline`). The two are independent so
+    // browser preview can run without BNDP sessions spawning encoders.
+    if !preview_enabled {
         return Err(
-            "tsreplace_config.enabled is false; ?profile=preview requires the shared encoder \
-             pipeline to be enabled (see the dashboard's tsreplace settings)"
+            "tsreplace_config.preview_enabled is false; ?profile=preview requires the preview \
+             encoder pipeline to be enabled (see the dashboard's tsreplace settings)"
                 .to_string(),
         );
     }
@@ -458,5 +462,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The preview gate must follow `preview_enabled` ONLY, never the BNDP
+    /// `enabled` flag. Exercised directly on `load_preview_encoder_config`:
+    /// the full `stream_service` handler can't reach this gate in a unit
+    /// test because tuner startup (which needs a real BonDriver DLL) happens
+    /// first. The `preview-h264` encode profile is seeded by
+    /// `Database::open_in_memory()`, so the profile lookup preceding the
+    /// gate succeeds.
+    #[test]
+    fn preview_gate_follows_preview_enabled_only() {
+        let db = Database::open_in_memory().unwrap();
+
+        // BNDP enabled=true but preview_enabled=false -> rejected, and the
+        // message names the flag that actually matters.
+        db.update_tsreplace_config(true, "enc", "", 1_000, true, 2, "", "", false).unwrap();
+        let err = load_preview_encoder_config(&db).unwrap_err();
+        assert!(
+            err.contains("preview_enabled"),
+            "error should name preview_enabled, got: {err}"
+        );
+
+        // BNDP enabled=false but preview_enabled=true -> allowed.
+        db.update_tsreplace_config(false, "enc", "", 1_000, true, 2, "", "", true).unwrap();
+        let (cfg, _generation) =
+            load_preview_encoder_config(&db).expect("preview_enabled=true should pass the gate");
+        assert_eq!(cfg.command_path, "enc");
     }
 }

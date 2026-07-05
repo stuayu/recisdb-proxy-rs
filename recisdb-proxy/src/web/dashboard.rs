@@ -821,8 +821,17 @@ const HTML_CONTENT: &str = r#"
                 <div class="form-group">
                     <label class="form-check">
                         <input type="checkbox" id="tsreplace-enabled">
-                        tsreplace連携を有効にする
+                        BNDPセッション（TVTest等）のエンコードを有効にする
                     </label>
+                    <small>BonDriver経由の視聴/録画セッションに外部エンコードを適用します。ブラウザプレビューには影響しません</small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-check">
+                        <input type="checkbox" id="tsreplace-preview-enabled">
+                        ブラウザプレビュー（?profile=preview）のエンコードを有効にする
+                    </label>
+                    <small>ダッシュボードのプレビュー再生用。上のBNDP側設定とは独立して動作します</small>
                 </div>
 
                 <div class="form-group">
@@ -3112,6 +3121,7 @@ const HTML_CONTENT: &str = r#"
                     document.getElementById('tsreplace-passthrough-on-error').checked = !!data.config.passthrough_on_error;
                     document.getElementById('tsreplace-preprocessor-path').value = data.config.preprocessor_path || '';
                     document.getElementById('tsreplace-preprocessor-arguments').value = data.config.preprocessor_arguments || '';
+                    document.getElementById('tsreplace-preview-enabled').checked = !!data.config.preview_enabled;
                     hideTsreplaceConfigMessage();
                 }
             } catch (e) {
@@ -3146,6 +3156,7 @@ const HTML_CONTENT: &str = r#"
                 // preprocessor_path is read-only here (TOML-only, like
                 // command_path); only its arguments are editable.
                 preprocessor_arguments: document.getElementById('tsreplace-preprocessor-arguments').value,
+                preview_enabled: document.getElementById('tsreplace-preview-enabled').checked,
             };
 
             try {
