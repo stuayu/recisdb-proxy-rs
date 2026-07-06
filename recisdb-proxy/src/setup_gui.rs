@@ -198,11 +198,25 @@ impl SetupApp {
     /// ドライバ/BonDriverの配置先フォルダ。設定ファイルと同じフォルダ
     /// (相対パス指定なら実行ファイルと同じフォルダ)にまとめる。
     fn install_dir(&self) -> PathBuf {
-        Path::new(&self.config_path)
+        let dir = Path::new(&self.config_path)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // 絶対パスにしておく: px4_drv のドライバインストールは別プロセスを
+        // UAC昇格して実行するが、昇格したプロセスの作業ディレクトリは
+        // (呼び出し元と異なり) 既定で C:\Windows\System32 になる。相対パスの
+        // ままだとそこを起点に解決されてファイルが見つからなくなるため。
+        // `canonicalize` は `\\?\` UNC プレフィックス付きパスを返し一部の
+        // ツールと相性が悪いことがあるため使わない。
+        if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&dir))
+                .unwrap_or(dir)
+        }
     }
 
     /// 指定したチューナーの px4_drv ドライバ自動インストールをバックグラウンドで開始する。
@@ -798,5 +812,19 @@ mod tests {
         // カレント実行ファイル(テストバイナリ)と同じフォルダに、まず存在しないで
         // あろう名前を探す。
         assert!(sibling_exe_path("definitely-not-a-real-binary-name").is_none());
+    }
+
+    #[test]
+    fn install_dir_is_always_absolute() {
+        // 設定ファイルパスがファイル名だけ(相対パス、親ディレクトリなし)の場合でも
+        // install_dir() は絶対パスを返さなければならない。相対のままだと、
+        // ドライバインストールの昇格プロセス(既定の作業ディレクトリが
+        // C:\Windows\System32 になる)から見て解決先がずれてしまう。
+        let mut app = SetupApp::new();
+        app.config_path = "recisdb-proxy.toml".to_string();
+        assert!(app.install_dir().is_absolute());
+
+        app.config_path = "sub/dir/recisdb-proxy.toml".to_string();
+        assert!(app.install_dir().is_absolute());
     }
 }

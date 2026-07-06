@@ -389,6 +389,8 @@ mod imp {
     /// pnputilのエラー内容は末尾に出ることが多い。
     fn read_install_log_tail(log_path: &Path) -> Option<String> {
         let content = std::fs::read_to_string(log_path).ok()?;
+        // PowerShellの `Out-File -Encoding utf8` はUTF-8 BOMを付与するため除去する。
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return None;
