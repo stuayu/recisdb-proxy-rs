@@ -357,11 +357,9 @@ mod imp {
 
         // 呼び出し元プロセス自体は昇格させず、内側の powershell だけを
         // `-Verb RunAs` で昇格させる(UACの確認画面がここだけに出る)。
-        // `-Wait` と `-PassThru` を併用すると、昇格プロセス(UACのブローカー
-        // 経由で起動される)の終了コード取得が競合し、実際には正常終了して
-        // いても STILL_ACTIVE (259) が返ることがある(.NET Process クラスの
-        // 既知の挙動)。`-Wait` を使わず、`WaitForExit()` を明示的に呼んで
-        // から `ExitCode` を読むことで確実に取得する。
+        // `-PassThru` + `WaitForExit()` で確実に終了を待ってから終了コードを
+        // 読む(なお終了コード259はpnputilの正式な成功コードの1つであり、
+        // プロセス終了検知の不具合ではない。下記の判定コメント参照)。
         let elevate_cmd = format!(
             "$p = Start-Process powershell -Verb RunAs -PassThru \
              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; \
@@ -376,7 +374,7 @@ mod imp {
             .map_err(|e| e.to_string())?;
 
         match status.code() {
-            Some(0) => Ok(()),
+            Some(code) if is_pnputil_success_code(code) => Ok(()),
             Some(1223) => Err(
                 "管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string(),
             ),
@@ -389,6 +387,16 @@ mod imp {
                 Err(msg)
             }
         }
+    }
+
+    /// `pnputil /add-driver` の戻り値のうち、成功とみなせるものを判定する。
+    /// `0`(成功)に加えて、`259`(既に同等以上のドライバが入っており何も
+    /// 追加しなかった=実質成功)・`3010`/`1641`(成功、再起動要)も成功扱い。
+    /// (実際の終了コードはスクリプト全体の `exit $LASTEXITCODE` 経由で
+    /// この値がそのまま返る。)
+    /// <https://learn.microsoft.com/windows-hardware/drivers/devtest/pnputil-return-values>
+    fn is_pnputil_success_code(code: i32) -> bool {
+        matches!(code, 0 | 259 | 3010 | 1641)
     }
 
     /// インストールログの末尾を返す(長すぎる場合に備えて直近30行のみ)。
@@ -514,6 +522,27 @@ mod imp {
             assert!(root.join("BonDriver_PX4_64bit").join("BonDriver_PX4-T.dll").exists());
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pnputil_success_codes_match_official_documentation() {
+            // https://learn.microsoft.com/windows-hardware/drivers/devtest/pnputil-return-values
+            assert!(is_pnputil_success_code(0)); // ERROR_SUCCESS
+            assert!(is_pnputil_success_code(259)); // ERROR_NO_MORE_ITEMS (既に最新)
+            assert!(is_pnputil_success_code(3010)); // ERROR_SUCCESS_REBOOT_REQUIRED
+            assert!(is_pnputil_success_code(1641)); // ERROR_SUCCESS_REBOOT_INITIATED
+        }
+
+        #[test]
+        fn pnputil_failure_codes_are_not_treated_as_success() {
+            assert!(!is_pnputil_success_code(1));
+            assert!(!is_pnputil_success_code(1223)); // UACキャンセル(別枝で判定)
+            assert!(!is_pnputil_success_code(-1));
         }
     }
 }
