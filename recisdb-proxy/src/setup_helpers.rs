@@ -157,6 +157,11 @@ pub struct DetectedTuner {
     /// `device_paths` が空(=まだBonDriver/ドライバが入っていない)状態でも
     /// USBデバイスとして検出できた場合にセットされる。
     pub px4_model_pid: Option<u16>,
+    /// USBデバイス列挙で数えた、同一機種の接続台数。px4_drv for WinUSB は
+    /// 同一機種を複数台挿しても1つのBonDriverが台数ぶんの space を自動で
+    /// 公開するため、[`register_tuners_to_db`] がこの値を `max_instances` に
+    /// 反映する(`Some`の場合は `terrestrial_count + satellite_count` より優先)。
+    pub px4_device_count: Option<i32>,
 }
 
 // =============================================================================
@@ -209,6 +214,7 @@ fn detect_tuners_linux() -> Vec<DetectedTuner> {
                 satellite_count: 0,
                 bondriver_url: String::new(),
                 px4_model_pid: None,
+                px4_device_count: None,
             });
         }
     }
@@ -239,6 +245,7 @@ fn detect_tuners_linux() -> Vec<DetectedTuner> {
                     satellite_count: known.map_or(0, |k| k.satellite_count),
                     bondriver_url: known.map_or(String::new(), |k| k.bondriver_url.to_string()),
                     px4_model_pid: None,
+                    px4_device_count: None,
                 });
             }
         }
@@ -327,6 +334,7 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
                         bondriver_url: known
                             .map_or(String::new(), |k| k.bondriver_url.to_string()),
                         px4_model_pid: None,
+                        px4_device_count: None,
                     });
                 }
             }
@@ -334,22 +342,24 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
     }
 
     // USBデバイスとしての検出 (px4_drv for WinUSB 対応機種)。BonDriver DLLの
-    // 有無に関わらず、接続されているだけで検出できる。ドライバ未インストールで
-    // 上のDLL検索に引っかからなかった機種を補完する。
-    for model in crate::px4_installer::detect_connected_px4_devices() {
-        let already_covered = detected.iter().any(|d| d.group_name == model.bondriver_folder);
-        if already_covered {
+    // 有無に関わらず、接続されているだけで検出でき、接続台数も分かる。
+    // 上のDLL検索で既に見つかっている機種であれば台数情報だけ補完し、
+    // まだドライバ未インストールで見つかっていなければ新規に追加する。
+    for (model, count) in crate::px4_installer::detect_connected_px4_devices() {
+        if let Some(existing) = detected.iter_mut().find(|d| d.group_name == model.bondriver_folder) {
+            existing.px4_device_count = Some(count as i32);
             continue;
         }
 
         detected.push(DetectedTuner {
-            name: format!("{} (ドライバ未インストール)", model.label),
+            name: format!("{} x{count} (ドライバ未インストール)", model.label),
             device_paths: Vec::new(),
             group_name: model.bondriver_folder.to_string(),
             terrestrial_count: 0,
             satellite_count: 0,
             bondriver_url: String::new(),
             px4_model_pid: Some(model.usb_pid),
+            px4_device_count: Some(count as i32),
         });
     }
 
@@ -434,7 +444,12 @@ pub fn register_tuners_to_db(
 
         for path in &tuner.device_paths {
             let outcome = db.get_or_create_bon_driver(path).inspect(|&id| {
-                let total = tuner.terrestrial_count + tuner.satellite_count;
+                // px4_drv for WinUSB は同一機種を複数台挿しても1つのBonDriverが
+                // 台数ぶんの space を自動公開するため、USB列挙で数えた接続台数
+                // (px4_device_count)が分かっていればそちらを優先する。
+                let total = tuner
+                    .px4_device_count
+                    .unwrap_or(tuner.terrestrial_count + tuner.satellite_count);
                 if total > 1 {
                     let _ = db.update_max_instances(id, total);
                 }
@@ -495,11 +510,36 @@ mod tests {
             satellite_count: 0,
             bondriver_url: String::new(),
             px4_model_pid: None,
+            px4_device_count: None,
         }];
 
         let results = register_tuners_to_db(&db, &tuners, &[0]);
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.outcome.is_ok()));
+    }
+
+    #[test]
+    fn register_tuners_to_db_prefers_px4_device_count_over_band_sum() {
+        let db = Database::open_in_memory().unwrap();
+        // terrestrial_count + satellite_count が 0 のままでも、px4_device_count
+        // (実際にUSB列挙で数えた接続台数)が優先されて max_instances に反映される。
+        let tuners = vec![DetectedTuner {
+            name: "PLEX PX-W3U4 x2".to_string(),
+            device_paths: vec!["BonDriver_PX4-T.dll".to_string()],
+            group_name: "BonDriver_PX4".to_string(),
+            terrestrial_count: 0,
+            satellite_count: 0,
+            bondriver_url: String::new(),
+            px4_model_pid: Some(0x083f),
+            px4_device_count: Some(2),
+        }];
+
+        let results = register_tuners_to_db(&db, &tuners, &[0]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].outcome.is_ok());
+
+        let max_instances = db.get_max_instances_for_path("BonDriver_PX4-T.dll").unwrap();
+        assert_eq!(max_instances, 2);
     }
 
     #[test]

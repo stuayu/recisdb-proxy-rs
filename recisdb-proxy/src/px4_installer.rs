@@ -147,8 +147,16 @@ pub fn find_model(usb_pid: u16) -> Option<&'static Px4Model> {
 /// 探すことで、ドライバがまだ入っていない未認識のデバイスも検出できる。
 /// (BonDriver DLL の有無で判定する既存の検出方式と違い、こちらは
 /// 「初めて挿した直後で何も入っていない」状態でも見つけられる。)
+///
+/// 戻り値の `usize` は同一機種の接続台数(`InstanceId` の行数から算出)。
+/// px4_drv for WinUSB は同一機種を複数台挿しても1つのBonDriverが自動で
+/// 台数ぶんの space を公開する設計のため、この値をそのまま
+/// `max_instances` に反映すればよい([`crate::setup_helpers::register_tuners_to_db`] 参照)。
+/// 単純合成デバイス(1台で複数のPnPインターフェースを持つ機種)がもしあれば
+/// 過大カウントになりうるが、対応チューナーはいずれも単一インターフェースの
+/// WinUSBデバイスであるため通常は台数と一致する。
 #[cfg(target_os = "windows")]
-pub fn detect_connected_px4_devices() -> Vec<&'static Px4Model> {
+pub fn detect_connected_px4_devices() -> Vec<(&'static Px4Model, usize)> {
     let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -161,18 +169,20 @@ pub fn detect_connected_px4_devices() -> Vec<&'static Px4Model> {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    let lines: Vec<&str> = text.lines().collect();
 
     PX4_MODELS
         .iter()
-        .filter(|model| {
+        .filter_map(|model| {
             let needle = format!("VID_{:04X}&PID_{:04X}", PX4_USB_VENDOR_ID, model.usb_pid);
-            text.contains(&needle)
+            let count = lines.iter().filter(|line| line.contains(&needle)).count();
+            (count > 0).then_some((model, count))
         })
         .collect()
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn detect_connected_px4_devices() -> Vec<&'static Px4Model> {
+pub fn detect_connected_px4_devices() -> Vec<(&'static Px4Model, usize)> {
     Vec::new()
 }
 
