@@ -909,8 +909,8 @@ const HTML_CONTENT: &str = r#"
 
                 <div class="form-group">
                     <label for="preview-preprocessor-arguments">前段コマンドの引数テンプレート</label>
-                    <input type="text" id="preview-preprocessor-arguments" placeholder="例: -x 18 -n {SID} -">
-                    <small>前段コマンドに付与する引数。<code>{SID}</code> は対象サービスIDに置換されます</small>
+                    <input type="text" id="preview-preprocessor-arguments" placeholder="例: -x 18/38/39 -n {SID} -a 13 -b 5 -c 1 -u 1 -d 13 -">
+                    <small>前段コマンドに付与する引数。<code>{SID}</code> は対象サービスIDに置換されます。初期値は tsreadex の推奨設定（サービス選択・音声/字幕ストリーム補完・字幕のID3変換）です</small>
                 </div>
 
                 <div class="form-group">

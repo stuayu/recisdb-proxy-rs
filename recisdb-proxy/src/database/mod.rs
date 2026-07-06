@@ -26,6 +26,17 @@ const DEFAULT_TSREPLACE_READ_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR: bool = true;
 const DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS: i64 = 2;
 
+/// Recommended tsreadex (stage-1) arguments for the browser-preview pipeline,
+/// seeded into `preview_encoder_config.preprocessor_arguments` so the
+/// dashboard starts from a working template (KonomiTV-equivalent settings):
+/// `-x 18/38/39` drops EIT, `-n {SID}` selects the target service (the
+/// placeholder is substituted per stream, see `encoder_pool::SID_PLACEHOLDER`),
+/// `-a 13 -b 5 -c 1 -u 1` keep audio/caption/superimpose streams always
+/// present, `-d 13` converts captions to ID3 timed-metadata for aribb24.js,
+/// and the trailing `-` reads from stdin.
+pub(crate) const DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS: &str =
+    "-x 18/38/39 -n {SID} -a 13 -b 5 -c 1 -u 1 -d 13 -";
+
 /// Database error types.
 #[derive(Error, Debug)]
 pub enum DatabaseError {
@@ -707,13 +718,27 @@ impl Database {
         // One-time seed. `enabled` carries over the short-lived legacy
         // `tsreplace_config.preview_enabled` flag (Migration 012) so anyone
         // who already turned browser preview on does not silently lose it.
+        // `preprocessor_arguments` starts from the recommended tsreadex
+        // template; the executable paths stay empty (TOML-only, REVIEW S1).
         self.conn.execute(
             "INSERT OR IGNORE INTO preview_encoder_config
              (id, enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms, updated_at)
              SELECT 1,
                     COALESCE((SELECT preview_enabled FROM tsreplace_config WHERE id = 1), 0),
-                    '', '', '', 10000, strftime('%s', 'now')",
-            [],
+                    '', '', ?1, 10000, strftime('%s', 'now')",
+            rusqlite::params![DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS],
+        )?;
+
+        // Same "fill if unspecified" convention as tsreplace_config above: an
+        // empty preprocessor_arguments is never functional (tsreadex needs at
+        // least the trailing `-`), so backfill the recommended template into
+        // rows seeded before it existed.
+        self.conn.execute(
+            "UPDATE preview_encoder_config
+             SET preprocessor_arguments = ?1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1 AND (preprocessor_arguments IS NULL OR trim(preprocessor_arguments) = '')",
+            rusqlite::params![DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS],
         )?;
 
         Ok(())
@@ -942,12 +967,13 @@ mod tests {
     fn preview_encoder_config_defaults_and_roundtrips() {
         let db = Database::open_in_memory().unwrap();
 
-        // Fresh DB: disabled, no paths, default timeout.
+        // Fresh DB: disabled, no paths, recommended tsreadex arguments
+        // pre-seeded, default timeout.
         let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
         assert!(!enabled);
         assert_eq!(cmd, "");
         assert_eq!(pre_path, "");
-        assert_eq!(pre_args, "");
+        assert_eq!(pre_args, DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS);
         assert_eq!(timeout, 10_000);
 
         // TOML-only setters change only their own column.
@@ -965,18 +991,37 @@ mod tests {
     }
 
     #[test]
+    fn preview_preprocessor_arguments_backfilled_when_empty() {
+        let db = Database::open_in_memory().unwrap();
+
+        // A row left empty (pre-backfill-era DB, or cleared via the API) is
+        // refilled with the recommended tsreadex template on the next read...
+        db.conn
+            .execute("UPDATE preview_encoder_config SET preprocessor_arguments = '' WHERE id = 1", [])
+            .unwrap();
+        let (_, _, _, pre_args, _) = db.get_preview_encoder_config().unwrap();
+        assert_eq!(pre_args, DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS);
+
+        // ...while a deliberately customized value is left alone.
+        db.update_preview_encoder_config(false, "-n {SID} -", 10_000).unwrap();
+        let (_, _, _, pre_args, _) = db.get_preview_encoder_config().unwrap();
+        assert_eq!(pre_args, "-n {SID} -");
+    }
+
+    #[test]
     fn preview_encoder_config_is_independent_from_tsreplace_config() {
         let db = Database::open_in_memory().unwrap();
 
         // Scribble all over the BNDP-side config...
         db.update_tsreplace_config(true, "garbage-cmd", "--garbage", 1, false, 1, "garbage-pre", "--garbage-pre")
             .unwrap();
-        // ...and the preview side must be completely unaffected.
+        // ...and the preview side must be completely unaffected (it keeps its
+        // own seeded defaults, not the BNDP-side garbage).
         let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
         assert!(!enabled);
         assert_eq!(cmd, "");
         assert_eq!(pre_path, "");
-        assert_eq!(pre_args, "");
+        assert_eq!(pre_args, DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS);
         assert_eq!(timeout, 10_000);
 
         // And the reverse: preview updates never leak into tsreplace_config.

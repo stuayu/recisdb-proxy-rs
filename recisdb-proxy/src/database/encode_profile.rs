@@ -10,6 +10,33 @@
 use super::{Database, EncodeProfileRecord, Result};
 use rusqlite::{params, OptionalExtension};
 
+/// Recommended encoder arguments for the seeded `preview-h264` profile.
+///
+/// A direct QSVEncC invocation (the `[preview] command_path` executable runs
+/// these as-is), designed to sit behind the recommended tsreadex stage-1
+/// (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` in `database::mod`): tsreadex
+/// selects the service via `-n {SID}` and converts captions to ID3
+/// timed-metadata, so no `{SID}`/`--service` appears here and
+/// `--data-copy timed_id3` carries the caption metadata through to
+/// aribb24.js. H.264 ~2Mbps VBR, deinterlaced, AAC stereo — the
+/// KonomiTV-equivalent browser-preview baseline.
+pub(crate) const DEFAULT_PREVIEW_ENCODE_ARGS: &str =
+    "--avhw -i - --input-format mpegts --input-analyze 0.6 --input-probesize 1000K \
+     --interlace tff --vpp-deinterlace normal -c h264 --profile high \
+     --vbr 2000 --max-bitrate 3000 --gop-len 60 --dar 16:9 \
+     --audio-codec aac --audio-bitrate 192 --audio-samplerate 48000 \
+     --data-copy timed_id3 --output-format mpegts -o -";
+
+/// The template seeded before the two-stage `[preview]` pipeline existed:
+/// QSVEncC wrapped inside a tsreplace command line. Kept only so
+/// `seed_default_encode_profiles` can recognize an untouched legacy row and
+/// migrate it to `DEFAULT_PREVIEW_ENCODE_ARGS`.
+const LEGACY_PREVIEW_ENCODE_ARGS: &str =
+    "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - \
+     --input-format mpegts --tff --vpp-deinterlace normal \
+     -c h264 --vbr 2000 --max-bitrate 3000 --gop-len 60 \
+     --output-format mpegts -o -";
+
 impl Database {
     fn row_to_encode_profile_record(row: &rusqlite::Row) -> rusqlite::Result<EncodeProfileRecord> {
         Ok(EncodeProfileRecord {
@@ -157,11 +184,11 @@ impl Database {
     ///
     /// STREAMING_DESIGN.md §6.2/§12-2: preview is H.264 fixed (compatibility
     /// over quality — MSE/mpegts.js in mainstream browsers requires H.264 or
-    /// HEVC-with-limited-support; H.264 is the safe default). The bitrate and
-    /// `extra_args` below are a conservative QSVEncC template mirroring the
-    /// existing `tsreplace_config` default (same command shape, different
-    /// codec/bitrate); sites without QSVEncC will need to edit this via the
-    /// dashboard/API before `?profile=preview` produces playable output.
+    /// HEVC-with-limited-support; H.264 is the safe default). `extra_args` is
+    /// [`DEFAULT_PREVIEW_ENCODE_ARGS`], a direct QSVEncC template meant to run
+    /// behind the seeded tsreadex preprocessor; sites without QSVEncC will
+    /// need to edit this via the dashboard/API before `?profile=preview`
+    /// produces playable output.
     pub(crate) fn seed_default_encode_profiles(&self) -> Result<()> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM encode_profiles WHERE name = ?1)",
@@ -175,15 +202,27 @@ impl Database {
                 "h264",
                 "mpegts",
                 Some(2_000_000),
-                Some(
-                    "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - \
-                     --input-format mpegts --tff --vpp-deinterlace normal \
-                     -c h264 --vbr 2000 --max-bitrate 3000 --gop-len 60 \
-                     --output-format mpegts -o -",
-                ),
+                Some(DEFAULT_PREVIEW_ENCODE_ARGS),
                 true,
             )?;
             log::info!("Seeded default encode profile 'preview-h264' (H.264, ~2Mbps, purpose=preview)");
+        } else {
+            // One-time carry-over for rows still holding the pre-two-stage
+            // tsreplace-wrapped template verbatim: that shape is broken now
+            // that `[preview] command_path` points at the encoder itself, so
+            // swap in the direct-QSVEncC recommendation. Rows the admin has
+            // edited (any other value) are never touched.
+            let updated = self.conn.execute(
+                "UPDATE encode_profiles SET extra_args = ?1
+                 WHERE name = 'preview-h264' AND extra_args = ?2",
+                params![DEFAULT_PREVIEW_ENCODE_ARGS, LEGACY_PREVIEW_ENCODE_ARGS],
+            )?;
+            if updated > 0 {
+                log::info!(
+                    "Migrated encode profile 'preview-h264' from the legacy tsreplace-wrapped \
+                     template to the direct QSVEncC template"
+                );
+            }
         }
         Ok(())
     }
@@ -204,6 +243,37 @@ mod tests {
         assert_eq!(profile.codec, "h264");
         assert_eq!(profile.purpose, "preview");
         assert!(profile.is_enabled);
+        // The recommendation is a direct QSVEncC invocation (two-stage design:
+        // service selection lives in the tsreadex preprocessor arguments).
+        assert_eq!(profile.extra_args.as_deref(), Some(super::DEFAULT_PREVIEW_ENCODE_ARGS));
+        assert!(
+            !profile.extra_args.unwrap().contains("--preserve-other-services"),
+            "seed must not be tsreplace-shaped anymore"
+        );
+    }
+
+    #[test]
+    fn seed_migrates_untouched_legacy_template_but_not_edited_rows() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Simulate a DB seeded by the pre-two-stage code: the row still holds
+        // the old tsreplace-wrapped template verbatim.
+        db.connection()
+            .execute(
+                "UPDATE encode_profiles SET extra_args = ?1 WHERE name = 'preview-h264'",
+                rusqlite::params![super::LEGACY_PREVIEW_ENCODE_ARGS],
+            )
+            .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let profile = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        assert_eq!(profile.extra_args.as_deref(), Some(super::DEFAULT_PREVIEW_ENCODE_ARGS));
+
+        // An admin-edited value must survive re-seeding untouched.
+        db.update_encode_profile(profile.id, None, None, None, None, None, Some(Some("--custom")), None)
+            .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let profile = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        assert_eq!(profile.extra_args.as_deref(), Some("--custom"));
     }
 
     #[test]

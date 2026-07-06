@@ -95,11 +95,18 @@ retention_days = 7
 # [tsreplace] とは完全に独立した設定です。パスがTOML専用である理由も同じ。
 # 有効/無効・前段引数はWebダッシュボードの「ブラウザプレビュー」設定から。
 # 引数内の {SID} は対象サービスIDに置換されます。
+#
+# 引数は初回起動時に推奨値がDBへ自動登録されます (ダッシュボードから変更可):
+#   前段 (tsreadex):    -x 18/38/39 -n {SID} -a 13 -b 5 -c 1 -u 1 -d 13 -
+#   エンコーダ (QSVEncC): H.264 ~2Mbps VBR / インターレース解除 / AAC ステレオ
+#                        (encode_profiles の preview-h264 プロファイル)
+# ここでは実行ファイルのパス2つを設定するだけで動作します。
+# サービス選択は前段 tsreadex の -n {SID} が担うため、前段の設定を推奨します。
 # [preview]
 # プレビュー用エンコーダの実行ファイルパス (例: QSVEncC)
 # command_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\QSVEncC\\QSVEncC.exe"
 #
-# 前段プロセスの実行ファイルパス (省略可、例: tsreadex によるサービス選択)
+# 前段プロセスの実行ファイルパス (例: tsreadex によるサービス選択)
 # preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.exe"
 
 # =====================================================
