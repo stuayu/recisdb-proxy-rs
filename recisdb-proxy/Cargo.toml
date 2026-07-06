@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "recisdb-proxy-setup"
-path = "src/setup.rs"
+path = "src/setup_gui.rs"
 
 [features]
 default = ["webhook"]
@@ -67,6 +67,7 @@ rustls = { version = "0.22", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 encoding_rs = "0.8.35"
 b25-sys = { path = "../b25-sys", features = ["prioritized_card_reader"] }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8.0"

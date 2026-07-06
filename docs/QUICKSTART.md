@@ -4,8 +4,8 @@
 
 ### Windows
 
-1. [Releases](https://github.com/kazuki0824/recisdb-rs/releases) から最新の `recisdb-proxy.exe` をダウンロード
-2. 適当なフォルダに配置
+1. [Releases](https://github.com/kazuki0824/recisdb-rs/releases) から最新のリリースをダウンロード
+2. 適当なフォルダに `recisdb-proxy.exe` と `recisdb-proxy-setup.exe` を配置
 
 ### Linux (Ubuntu 20.04+)
 
@@ -13,6 +13,12 @@
 wget https://github.com/kazuki0824/recisdb-rs/releases/download/<VERSION>/recisdb-proxy
 chmod +x recisdb-proxy
 ```
+
+## はじめての方: かんたんセットアップ (GUI)
+
+コマンドライン操作に慣れていない場合は、`recisdb-proxy-setup.exe` をダブルクリックしてください。  
+画面の指示に従うだけで、設定ファイルの作成・チューナーの自動検出/登録・`recisdb-proxy` の起動・
+ダッシュボードのオープンまで完了します。以降の「基本的な起動方法」はコマンドラインで手動設定したい方向けです。
 
 ## 基本的な起動方法
 

@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod alert;
 pub mod scheduler;
 pub mod server;
+pub mod setup_helpers;
 pub mod ts_analyzer;
 pub mod tuner;
 pub mod aribb24;

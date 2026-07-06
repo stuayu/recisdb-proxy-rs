@@ -18,7 +18,7 @@ recisdb-proxy は、BonDriver をネットワーク経由で複数のクライ�
 - **アラート**: ドロップ率やビットレート等のメトリクスしきい値でアラート通知 (Webhook 対応)
 - **Web ダッシュボード**: ブラウザからリアルタイム監視・DB 設定編集が可能
 - **TLS 対応** (オプション): クライアント⇔サーバー間を暗号化
-- **初回セットアップツール**: 対話式でチューナーの自動検出・DB 初期化・設定ファイル生成
+- **かんたんセットアップ**: GUIウィザードでチューナーの自動検出・設定ファイル生成・起動まで、コマンド入力なしで完了
 
 ## プロジェクト構成
 
@@ -37,7 +37,18 @@ recisdb-proxy は、BonDriver をネットワーク経由で複数のクライ�
 [Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から実行ファイルを取得してください。  
 Windows では x64 向け実行ファイルが提供されています。
 
-### 起動
+### かんたんセットアップ (はじめての方はこちら)
+
+プログラムに慣れていない方は、`recisdb-proxy-setup.exe` をダブルクリックして起動してください。  
+画面の指示に従って「次へ」を押していくだけで、次の作業がすべて完了します。
+
+1. 設定ファイル (`recisdb-proxy.toml`) の作成
+2. チューナーの自動検出・登録
+3. `recisdb-proxy` 本体の起動、Web ダッシュボードのオープンまで
+
+コマンドライン入力は一切不要です。`recisdb-proxy-setup.exe` は `recisdb-proxy.exe` と同じフォルダに置いて実行してください。
+
+### 起動 (手動で設定する場合)
 同梱している`recisdb-proxy.toml.example`と`BonDriver_NetworkProxy.ini.sample`を確認します。  
 .exampleと.sampleを削除して保存します。  
 
@@ -170,7 +181,7 @@ cargo build -p recisdb-proxy
 | バイナリ | 説明 |
 | --- | --- |
 | `recisdb-proxy` | プロキシサーバー本体 |
-| `recisdb-proxy-setup` | 対話式初回セットアップツール |
+| `recisdb-proxy-setup` | かんたんセットアップツール (GUIウィザード) |
 
 ### Feature flags
 
