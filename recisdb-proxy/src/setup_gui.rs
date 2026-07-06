@@ -124,14 +124,25 @@ struct ManualEntry {
     max_instances: i32,
 }
 
+/// インストール先フォルダの既定値。
+fn default_install_location() -> String {
+    if cfg!(windows) {
+        r"C:\DTV\recisdb-proxy-rs".to_string()
+    } else {
+        ".".to_string()
+    }
+}
+
 struct SetupApp {
     step: Step,
 
     // ステップ1: 基本設定 (ほぼ既定値のまま「次へ」を押すだけで進める)
     listen_addr: String,
     web_listen_addr: String,
-    db_path: String,
-    config_path: String,
+    /// recisdb-proxy 本体・設定ファイル・データベースを配置するフォルダ。
+    /// 設定ファイル/DBのパスはここから常に導出する ([`SetupApp::config_file_path`] /
+    /// [`SetupApp::db_file_path`])。
+    install_location: String,
 
     // ステップ2: チューナー検出
     detect_rx: Option<mpsc::Receiver<Vec<DetectedTuner>>>,
@@ -165,8 +176,7 @@ impl SetupApp {
             step: Step::Welcome,
             listen_addr: "0.0.0.0:40070".to_string(),
             web_listen_addr: "0.0.0.0:40080".to_string(),
-            db_path: "recisdb-proxy.db".to_string(),
-            config_path: "recisdb-proxy.toml".to_string(),
+            install_location: default_install_location(),
             detect_rx: None,
             detected: Vec::new(),
             selected: Vec::new(),
@@ -186,30 +196,27 @@ impl SetupApp {
     }
 
     fn start_detection(&mut self) {
+        let install_dir = self.install_dir();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = setup_helpers::detect_tuners();
+            let result = setup_helpers::detect_tuners(&install_dir);
             let _ = tx.send(result);
         });
         self.detect_rx = Some(rx);
         self.step = Step::Detecting;
     }
 
-    /// ドライバ/BonDriverの配置先フォルダ。設定ファイルと同じフォルダ
-    /// (相対パス指定なら実行ファイルと同じフォルダ)にまとめる。
+    /// recisdb-proxy 本体・設定ファイル・データベースを配置するフォルダ
+    /// (絶対パス)。
+    ///
+    /// 絶対パスにしておく理由: px4_drv のドライバインストールは別プロセスを
+    /// UAC昇格して実行するが、昇格したプロセスの作業ディレクトリは
+    /// (呼び出し元と異なり) 既定で C:\Windows\System32 になる。相対パスの
+    /// ままだとそこを起点に解決されてファイルが見つからなくなるため。
+    /// `canonicalize` は `\\?\` UNC プレフィックス付きパスを返し一部の
+    /// ツールと相性が悪いことがあるため使わない。
     fn install_dir(&self) -> PathBuf {
-        let dir = Path::new(&self.config_path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        // 絶対パスにしておく: px4_drv のドライバインストールは別プロセスを
-        // UAC昇格して実行するが、昇格したプロセスの作業ディレクトリは
-        // (呼び出し元と異なり) 既定で C:\Windows\System32 になる。相対パスの
-        // ままだとそこを起点に解決されてファイルが見つからなくなるため。
-        // `canonicalize` は `\\?\` UNC プレフィックス付きパスを返し一部の
-        // ツールと相性が悪いことがあるため使わない。
+        let dir = PathBuf::from(&self.install_location);
         if dir.is_absolute() {
             dir
         } else {
@@ -217,6 +224,14 @@ impl SetupApp {
                 .map(|cwd| cwd.join(&dir))
                 .unwrap_or(dir)
         }
+    }
+
+    fn config_file_path(&self) -> PathBuf {
+        self.install_dir().join("recisdb-proxy.toml")
+    }
+
+    fn db_file_path(&self) -> PathBuf {
+        self.install_dir().join("recisdb-proxy.db")
     }
 
     /// 指定したチューナーの px4_drv ドライバ自動インストールをバックグラウンドで開始する。
@@ -281,13 +296,49 @@ impl SetupApp {
         self.log_lines.clear();
         self.setup_error = None;
 
-        let config_file_path = Path::new(&self.config_path);
-        if !config_file_path.exists() || self.overwrite_config {
-            let content = generate_config(&self.listen_addr, &self.web_listen_addr, &self.db_path);
-            match std::fs::write(config_file_path, content) {
-                Ok(()) => self
+        let install_dir = self.install_dir();
+        if let Err(e) = std::fs::create_dir_all(&install_dir) {
+            self.setup_error = Some(format!("インストール先フォルダの作成に失敗しました: {e}"));
+            return;
+        }
+
+        // recisdb-proxy 本体をインストール先に配置/更新する。既にインストール
+        // 済みで内容が同一なら何もしない(設定ファイル・DBには触れない)。
+        match setup_exe_dir() {
+            Some(source_dir) => match setup_helpers::sync_program_binary(&source_dir, &install_dir) {
+                Ok(setup_helpers::BinarySyncAction::FreshInstall) => self.log_lines.push(format!(
+                    "recisdb-proxy をインストールしました: {}",
+                    install_dir.display()
+                )),
+                Ok(setup_helpers::BinarySyncAction::Updated) => self
                     .log_lines
-                    .push(format!("設定ファイルを保存しました: {}", self.config_path)),
+                    .push("recisdb-proxy を最新版に更新しました。".to_string()),
+                Ok(setup_helpers::BinarySyncAction::AlreadyUpToDate) => self
+                    .log_lines
+                    .push("recisdb-proxy は既に最新の状態です。".to_string()),
+                Err(e) => {
+                    self.setup_error = Some(e);
+                    return;
+                }
+            },
+            None => {
+                self.setup_error = Some("実行ファイルの場所を取得できませんでした。".to_string());
+                return;
+            }
+        }
+
+        let config_file_path = self.config_file_path();
+        if !config_file_path.exists() || self.overwrite_config {
+            let content = generate_config(
+                &self.listen_addr,
+                &self.web_listen_addr,
+                &self.db_file_path().to_string_lossy(),
+            );
+            match std::fs::write(&config_file_path, content) {
+                Ok(()) => self.log_lines.push(format!(
+                    "設定ファイルを保存しました: {}",
+                    config_file_path.display()
+                )),
                 Err(e) => {
                     self.setup_error = Some(format!("設定ファイルの保存に失敗しました: {e}"));
                     return;
@@ -298,10 +349,10 @@ impl SetupApp {
                 .push("既存の設定ファイルをそのまま使用します。".to_string());
         }
 
-        let db_file_path = Path::new(&self.db_path);
+        let db_file_path = self.db_file_path();
         if db_file_path.exists() && self.recreate_db {
-            let backup_path = format!("{}.backup", self.db_path);
-            if let Err(e) = std::fs::rename(db_file_path, &backup_path) {
+            let backup_path = format!("{}.backup", db_file_path.display());
+            if let Err(e) = std::fs::rename(&db_file_path, &backup_path) {
                 self.setup_error = Some(format!("データベースのバックアップに失敗しました: {e}"));
                 return;
             }
@@ -309,7 +360,7 @@ impl SetupApp {
                 .push(format!("既存のデータベースをバックアップしました: {backup_path}"));
         }
 
-        let db = match Database::open(&self.db_path) {
+        let db = match Database::open(&db_file_path) {
             Ok(db) => db,
             Err(e) => {
                 self.setup_error = Some(format!("データベースの初期化に失敗しました: {e}"));
@@ -317,7 +368,7 @@ impl SetupApp {
             }
         };
         self.log_lines
-            .push(format!("データベースを初期化しました: {}", self.db_path));
+            .push(format!("データベースを初期化しました: {}", db_file_path.display()));
 
         let selected_indices: Vec<usize> = self
             .selected
@@ -355,56 +406,41 @@ impl SetupApp {
     }
 
     fn launch_server_and_open_dashboard(&mut self) {
-        match sibling_exe_path("recisdb-proxy") {
-            Some(exe) => {
-                let config_dir = Path::new(&self.config_path)
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(Path::to_path_buf);
+        let install_dir = self.install_dir();
+        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe = install_dir.join(exe_name);
 
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.arg("--config").arg(&self.config_path);
-                if let Some(dir) = config_dir {
-                    cmd.current_dir(dir);
-                }
+        if !exe.exists() {
+            self.launch_message = Some(format!(
+                "{} が見つかりませんでした。セットアップを実行してから、もう一度お試しください。",
+                exe.display()
+            ));
+            return;
+        }
 
-                match cmd.spawn() {
-                    Ok(_) => {
-                        self.launch_message = Some(
-                            "recisdb-proxy を起動しました。数秒後にダッシュボードを開きます…"
-                                .to_string(),
-                        );
-                        self.launch_deadline = Some(Instant::now() + Duration::from_secs(2));
-                    }
-                    Err(e) => {
-                        self.launch_message =
-                            Some(format!("recisdb-proxy の起動に失敗しました: {e}"));
-                    }
-                }
-            }
-            None => {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--config").arg(self.config_file_path());
+        cmd.current_dir(&install_dir);
+
+        match cmd.spawn() {
+            Ok(_) => {
                 self.launch_message = Some(
-                    "recisdb-proxy(本体)が同じフォルダに見つかりませんでした。\
-                     recisdb-proxy.exe をこのツールと同じフォルダに置いてから、\
-                     もう一度お試しください。"
-                        .to_string(),
+                    "recisdb-proxy を起動しました。数秒後にダッシュボードを開きます…".to_string(),
                 );
+                self.launch_deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
+            Err(e) => {
+                self.launch_message = Some(format!("recisdb-proxy の起動に失敗しました: {e}"));
             }
         }
     }
 }
 
-/// 実行中のこのツールと同じフォルダにある、指定した名前の実行ファイルを探す。
-fn sibling_exe_path(name: &str) -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let filename = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    let candidate = dir.join(filename);
-    candidate.exists().then_some(candidate)
+/// 現在実行中のこのツール自身が置かれているフォルダ。recisdb-proxy 本体を
+/// インストール先へコピーしてくる際のコピー元として使う(ダウンロードした
+/// リリースzipの展開先を想定)。
+fn setup_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
 }
 
 /// OS既定のブラウザでURLを開く。失敗しても致命的ではないので握りつぶす。
@@ -496,23 +532,36 @@ impl SetupApp {
     }
 
     fn ui_location(&mut self, ui: &mut egui::Ui) {
-        ui.heading("① 保存先の確認");
+        ui.heading("① インストール先の確認");
         ui.add_space(8.0);
-        ui.label("設定ファイルとデータベースを保存する場所です。よくわからない場合はそのままで大丈夫です。");
+        ui.label(
+            "recisdb-proxy 本体・設定ファイル・データベースを配置するフォルダです。\
+             よくわからない場合はそのままで大丈夫です。",
+        );
         ui.add_space(12.0);
 
-        egui::Grid::new("location_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("設定ファイルの保存先:");
-                ui.text_edit_singleline(&mut self.config_path);
-                ui.end_row();
-
-                ui.label("データベースファイルの保存先:");
-                ui.text_edit_singleline(&mut self.db_path);
-                ui.end_row();
-            });
+        ui.horizontal(|ui| {
+            ui.label("インストール先フォルダ:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.install_location)
+                    .desired_width(320.0),
+            );
+            #[cfg(windows)]
+            if ui.button("参照…").clicked() {
+                let start_dir = self.install_dir();
+                if let Some(dir) = rfd::FileDialog::new().set_directory(&start_dir).pick_folder() {
+                    self.install_location = dir.to_string_lossy().to_string();
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "既にインストール済みの場合は、本体プログラムだけが最新版に\
+                 更新されます(設定・データベースはそのまま残ります)。",
+            )
+            .weak()
+            .small(),
+        );
 
         ui.add_space(8.0);
         ui.collapsing("詳しい設定 (通常は変更不要)", |ui| {
@@ -699,8 +748,8 @@ impl SetupApp {
                 self.step = Step::Location;
             }
             if ui.button("次へ  ▶").clicked() {
-                self.overwrite_config = !Path::new(&self.config_path).exists();
-                self.recreate_db = !Path::new(&self.db_path).exists();
+                self.overwrite_config = !self.config_file_path().exists();
+                self.recreate_db = !self.db_file_path().exists();
                 self.step = Step::Confirm;
             }
         });
@@ -711,17 +760,23 @@ impl SetupApp {
         ui.add_space(8.0);
 
         let selected_count = self.selected.iter().filter(|&&b| b).count() + self.manual_entries.len();
+        let config_file_path = self.config_file_path();
+        let db_file_path = self.db_file_path();
 
         egui::Grid::new("confirm_grid")
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
+                ui.label("インストール先:");
+                ui.label(self.install_dir().display().to_string());
+                ui.end_row();
+
                 ui.label("設定ファイル:");
-                ui.label(&self.config_path);
+                ui.label(config_file_path.display().to_string());
                 ui.end_row();
 
                 ui.label("データベース:");
-                ui.label(&self.db_path);
+                ui.label(db_file_path.display().to_string());
                 ui.end_row();
 
                 ui.label("登録するチューナー数:");
@@ -731,13 +786,13 @@ impl SetupApp {
 
         ui.add_space(10.0);
 
-        if Path::new(&self.config_path).exists() {
+        if config_file_path.exists() {
             ui.checkbox(
                 &mut self.overwrite_config,
                 "既存の設定ファイルを上書きする(チェックしない場合は既存のまま使用)",
             );
         }
-        if Path::new(&self.db_path).exists() {
+        if db_file_path.exists() {
             ui.checkbox(
                 &mut self.recreate_db,
                 "既存のデータベースを作り直す(元のファイルは自動でバックアップされます)",
@@ -808,23 +863,45 @@ mod tests {
     }
 
     #[test]
-    fn sibling_exe_path_returns_none_when_absent() {
-        // カレント実行ファイル(テストバイナリ)と同じフォルダに、まず存在しないで
-        // あろう名前を探す。
-        assert!(sibling_exe_path("definitely-not-a-real-binary-name").is_none());
+    fn default_install_location_matches_spec() {
+        let app = SetupApp::new();
+        if cfg!(windows) {
+            assert_eq!(app.install_location, r"C:\DTV\recisdb-proxy-rs");
+        }
+    }
+
+    #[test]
+    fn setup_exe_dir_returns_a_dir_containing_the_test_binary() {
+        let dir = setup_exe_dir().expect("current test binary must have a parent dir");
+        assert!(dir.is_dir());
     }
 
     #[test]
     fn install_dir_is_always_absolute() {
-        // 設定ファイルパスがファイル名だけ(相対パス、親ディレクトリなし)の場合でも
-        // install_dir() は絶対パスを返さなければならない。相対のままだと、
-        // ドライバインストールの昇格プロセス(既定の作業ディレクトリが
-        // C:\Windows\System32 になる)から見て解決先がずれてしまう。
+        // install_location がファイル名だけ(相対パス、親ディレクトリなし)の
+        // 場合でも install_dir() は絶対パスを返さなければならない。相対の
+        // ままだと、ドライバインストールの昇格プロセス(既定の作業
+        // ディレクトリが C:\Windows\System32 になる)から見て解決先が
+        // ずれてしまう。
         let mut app = SetupApp::new();
-        app.config_path = "recisdb-proxy.toml".to_string();
+        app.install_location = "recisdb-proxy-rs".to_string();
         assert!(app.install_dir().is_absolute());
 
-        app.config_path = "sub/dir/recisdb-proxy.toml".to_string();
+        app.install_location = "sub/dir/recisdb-proxy-rs".to_string();
         assert!(app.install_dir().is_absolute());
+    }
+
+    #[test]
+    fn config_and_db_paths_are_derived_from_install_location() {
+        let mut app = SetupApp::new();
+        app.install_location = "C:\\DTV\\recisdb-proxy-rs".to_string();
+        assert_eq!(
+            app.config_file_path(),
+            PathBuf::from("C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.toml")
+        );
+        assert_eq!(
+            app.db_file_path(),
+            PathBuf::from("C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.db")
+        );
     }
 }

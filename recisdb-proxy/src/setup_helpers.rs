@@ -255,12 +255,20 @@ fn detect_tuners_linux() -> Vec<DetectedTuner> {
 }
 
 /// Windowsでのチューナーデバイス検出 (BonDriver DLLの検索)
+///
+/// `install_dir` はGUIで選択されたインストール先フォルダ(絶対パス)。
+/// px4_installer が実際にBonDriverを配置するのはここなので、検索の
+/// 最優先パスとする。カレントディレクトリ相対のパスもフォールバックとして
+/// 残してあるが、これは「セットアップウィザードを使わず手動でDLLを配置
+/// した」ような後方互換のためのもの。
 #[cfg(target_os = "windows")]
-fn detect_tuners_windows() -> Vec<DetectedTuner> {
+fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
     let mut detected = Vec::new();
 
-    // BonDriver DLLの検索パス候補
+    // BonDriver DLLの検索パス候補 (GUIで指定されたインストール先を優先)
     let search_dirs = [
+        install_dir.to_path_buf(),
+        install_dir.join("BonDriver"),
         PathBuf::from("."),
         PathBuf::from("BonDriver"),
         // カレントディレクトリの親
@@ -354,7 +362,7 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
             continue;
         }
 
-        let staged_paths = find_staged_px4_bondriver(model);
+        let staged_paths = find_staged_px4_bondriver(model, install_dir);
         let installed = !staged_paths.is_empty();
 
         detected.push(DetectedTuner {
@@ -379,10 +387,15 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
 /// [`crate::px4_installer::download_install_and_stage`] が配置した
 /// BonDriver一式が既に存在するかを、そのステージング先の規則
 /// (`<検索ルート>\BonDriver\<bondriver_folder>\<dll名>`)に従って探す。
+/// `install_dir` (GUIで指定されたインストール先) を最優先で確認し、
+/// カレントディレクトリ相対のパスは後方互換のフォールバックとする。
 /// 見つかった場合は絶対パスのリストを返す(空なら未インストール)。
 #[cfg(target_os = "windows")]
-fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model) -> Vec<String> {
-    find_staged_px4_bondriver_in(model, &[PathBuf::from("."), PathBuf::from("..")])
+fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model, install_dir: &Path) -> Vec<String> {
+    find_staged_px4_bondriver_in(
+        model,
+        &[install_dir.to_path_buf(), PathBuf::from("."), PathBuf::from("..")],
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -420,17 +433,24 @@ fn find_staged_px4_bondriver_in(
 
 /// チューナーを検出する。時間がかかることがあるため、GUIから呼ぶ場合はワーカー
 /// スレッド上で実行すること。
-pub fn detect_tuners() -> Vec<DetectedTuner> {
+///
+/// `install_dir` はGUIで指定されたインストール先フォルダ(絶対パス)。
+/// Windows版のpx4_drv対応BonDriver検索はここを優先的に見に行く
+/// (`detect_tuners_windows` 参照)。Linuxではデバイスパスのみで検出する
+/// ため使用しない。
+pub fn detect_tuners(install_dir: &Path) -> Vec<DetectedTuner> {
     #[cfg(target_os = "linux")]
     {
+        let _ = install_dir;
         detect_tuners_linux()
     }
     #[cfg(target_os = "windows")]
     {
-        detect_tuners_windows()
+        detect_tuners_windows(install_dir)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
+        let _ = install_dir;
         Vec::new()
     }
 }
@@ -551,6 +571,66 @@ retention_days = 7
 }
 
 // =============================================================================
+// 本体バイナリのインストール/更新
+// =============================================================================
+
+/// [`sync_program_binary`] が実際に行った操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinarySyncAction {
+    /// インストール先に無かったので新規にコピーした。
+    FreshInstall,
+    /// 既にあったが内容が異なっていた(=古い版だった)ため上書きした。
+    Updated,
+    /// 既に内容が同一だったため何もしなかった。
+    AlreadyUpToDate,
+}
+
+/// `source_dir`(このセットアップツール自身が置かれているフォルダ。つまり
+/// ダウンロードしたリリースzipの展開先)にある recisdb-proxy 本体を
+/// `install_dir` に配置する。バージョン比較はファイル内容そのものの一致で
+/// 判定する(実行ファイルのサイズは数MB程度でありハッシュ計算より単純・
+/// 確実なため)。設定ファイル・データベース・BonDriverなどのユーザーデータ
+/// には一切触れず、実行ファイル本体のみを対象とする。
+pub fn sync_program_binary(source_dir: &Path, install_dir: &Path) -> Result<BinarySyncAction, String> {
+    let exe_name = if cfg!(windows) {
+        "recisdb-proxy.exe"
+    } else {
+        "recisdb-proxy"
+    };
+    let source = source_dir.join(exe_name);
+    if !source.exists() {
+        return Err(format!(
+            "{exe_name} が見つかりません。recisdb-proxy-setup と {exe_name} を同じフォルダに配置してください。"
+        ));
+    }
+
+    std::fs::create_dir_all(install_dir).map_err(|e| e.to_string())?;
+    let dest = install_dir.join(exe_name);
+
+    if !dest.exists() {
+        std::fs::copy(&source, &dest)
+            .map_err(|e| format!("{exe_name} のインストールに失敗しました: {e}"))?;
+        return Ok(BinarySyncAction::FreshInstall);
+    }
+
+    let identical = match (std::fs::read(&source), std::fs::read(&dest)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if identical {
+        return Ok(BinarySyncAction::AlreadyUpToDate);
+    }
+
+    std::fs::copy(&source, &dest).map_err(|e| {
+        format!(
+            "{exe_name} の更新に失敗しました({e})。{exe_name} が起動中の場合は終了してから、\
+             もう一度お試しください。"
+        )
+    })?;
+    Ok(BinarySyncAction::Updated)
+}
+
+// =============================================================================
 // チューナーのDB登録
 // =============================================================================
 
@@ -632,6 +712,81 @@ pub fn register_manual_tuner(
 mod tests {
     use super::*;
 
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "recisdb-proxy-test-{label}-{n}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn sync_program_binary_copies_when_not_installed_yet() {
+        let source_dir = unique_temp_dir("sync-src-a");
+        let install_dir = unique_temp_dir("sync-dst-a");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        std::fs::write(source_dir.join(exe_name), b"version-1").unwrap();
+
+        let action = sync_program_binary(&source_dir, &install_dir).unwrap();
+        assert_eq!(action, BinarySyncAction::FreshInstall);
+        assert_eq!(std::fs::read(install_dir.join(exe_name)).unwrap(), b"version-1");
+
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        std::fs::remove_dir_all(&install_dir).unwrap();
+    }
+
+    #[test]
+    fn sync_program_binary_skips_when_already_up_to_date() {
+        let source_dir = unique_temp_dir("sync-src-b");
+        let install_dir = unique_temp_dir("sync-dst-b");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        std::fs::write(source_dir.join(exe_name), b"same-content").unwrap();
+        std::fs::write(install_dir.join(exe_name), b"same-content").unwrap();
+
+        let action = sync_program_binary(&source_dir, &install_dir).unwrap();
+        assert_eq!(action, BinarySyncAction::AlreadyUpToDate);
+
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        std::fs::remove_dir_all(&install_dir).unwrap();
+    }
+
+    #[test]
+    fn sync_program_binary_overwrites_stale_binary() {
+        let source_dir = unique_temp_dir("sync-src-c");
+        let install_dir = unique_temp_dir("sync-dst-c");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+
+        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        std::fs::write(source_dir.join(exe_name), b"version-2-new").unwrap();
+        std::fs::write(install_dir.join(exe_name), b"version-1-old").unwrap();
+
+        let action = sync_program_binary(&source_dir, &install_dir).unwrap();
+        assert_eq!(action, BinarySyncAction::Updated);
+        assert_eq!(
+            std::fs::read(install_dir.join(exe_name)).unwrap(),
+            b"version-2-new"
+        );
+
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        std::fs::remove_dir_all(&install_dir).unwrap();
+    }
+
+    #[test]
+    fn sync_program_binary_errors_when_source_missing() {
+        let source_dir = unique_temp_dir("sync-src-missing");
+        let install_dir = unique_temp_dir("sync-dst-missing");
+        // source_dir を作らないまま呼び出す。
+        assert!(sync_program_binary(&source_dir, &install_dir).is_err());
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn find_staged_px4_bondriver_in_finds_previously_installed_files() {
@@ -659,6 +814,31 @@ mod tests {
         assert_eq!(found.len(), model.dll_names.len());
 
         std::fs::remove_dir_all(&tmp_root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn find_staged_px4_bondriver_uses_the_given_install_dir_not_cwd() {
+        // GUIで選んだインストール先 (CWDとは無関係な場所) に配置済みの
+        // BonDriverが、カレントディレクトリ相対の既定パスしか見ない実装に
+        // 戻っていないかを確認するリグレッションテスト。
+        let install_dir = std::env::temp_dir().join(format!(
+            "recisdb-proxy-test-custom-install-dir-{}",
+            std::process::id()
+        ));
+        let model = crate::px4_installer::find_model(0x0052).expect("DTV03A-1TU must be a known model");
+
+        let staged_dir = install_dir.join("BonDriver").join(model.bondriver_folder);
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        for dll_name in model.dll_names {
+            std::fs::write(staged_dir.join(dll_name), b"dummy").unwrap();
+        }
+
+        let found = find_staged_px4_bondriver(model, &install_dir);
+        assert_eq!(found.len(), model.dll_names.len());
+        assert!(found[0].contains(install_dir.to_string_lossy().as_ref()));
+
+        std::fs::remove_dir_all(&install_dir).unwrap();
     }
 
     #[test]

@@ -42,11 +42,12 @@ Windows では x64 向け実行ファイルが提供されています。
 プログラムに慣れていない方は、`recisdb-proxy-setup.exe` をダブルクリックして起動してください。  
 画面の指示に従って「次へ」を押していくだけで、次の作業がすべて完了します。
 
-1. 設定ファイル (`recisdb-proxy.toml`) の作成
-2. チューナーの自動検出・登録
-3. `recisdb-proxy` 本体の起動、Web ダッシュボードのオープンまで
+1. インストール先フォルダの選択 (既定値: `C:\DTV\recisdb-proxy-rs`。「参照…」ボタンで変更可能)
+2. `recisdb-proxy` 本体・設定ファイル (`recisdb-proxy.toml`) の配置
+3. チューナーの自動検出・登録
+4. `recisdb-proxy` 本体の起動、Web ダッシュボードのオープンまで
 
-コマンドライン入力は一切不要です。`recisdb-proxy-setup.exe` は `recisdb-proxy.exe` と同じフォルダに置いて実行してください。
+コマンドライン入力は一切不要です。`recisdb-proxy-setup.exe` は `recisdb-proxy.exe` と同じフォルダ(ダウンロードしたzipの展開先)に置いて実行してください。既に同じフォルダにインストール済みの場合は、設定ファイルやデータベースはそのままに、本体プログラムだけが古ければ最新版に更新されます。
 
 **PLEX / e-Better 製チューナー (PX-W3U4, PX-Q3U4, PX-MLT5PE/8PE, PX-M1UR/S1UR, DTV02A/03A 等) をお使いの場合**、
 接続済みでドライバ未インストールのデバイスも自動検出し、ボタン1つで
