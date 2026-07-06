@@ -342,13 +342,19 @@ mod imp {
         let _ = std::fs::remove_file(&log_path);
 
         let script_path = std::env::temp_dir().join("recisdb-proxy-px4-install.ps1");
+        // `*>>` はネイティブのリダイレクト演算子(全ストリームを追記)であり、
+        // `| Out-File` のようにパイプライン越しにcmdletを挟まないため、直後の
+        // `$LASTEXITCODE` がpnputil.exe自身の終了コードであることを確実に
+        // 保てる。呼び出し直後に変数へ退避してから他の処理を行う。
         let script = format!(
             "$log = \"{log}\"\r\n\
-             '=== cert-install.jse ===' | Out-File -FilePath $log -Append -Encoding utf8\r\n\
-             & cscript.exe //Nologo \"{cert}\" *>&1 | Out-File -FilePath $log -Append -Encoding utf8\r\n\
-             '=== pnputil /add-driver ===' | Out-File -FilePath $log -Append -Encoding utf8\r\n\
-             & pnputil.exe /add-driver \"{inf}\" /install *>&1 | Out-File -FilePath $log -Append -Encoding utf8\r\n\
-             exit $LASTEXITCODE\r\n",
+             Add-Content -Path $log -Value '=== cert-install.jse ===' -Encoding utf8\r\n\
+             & cscript.exe //Nologo \"{cert}\" *>> $log\r\n\
+             Add-Content -Path $log -Value '=== pnputil /add-driver ===' -Encoding utf8\r\n\
+             & pnputil.exe /add-driver \"{inf}\" /install *>> $log\r\n\
+             $pnputilExitCode = $LASTEXITCODE\r\n\
+             Add-Content -Path $log -Value \"=== pnputil exit code: $pnputilExitCode ===\" -Encoding utf8\r\n\
+             exit $pnputilExitCode\r\n",
             log = log_path.display(),
             cert = cert_install.display(),
             inf = inf_path.display(),
@@ -379,6 +385,14 @@ mod imp {
                 "管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string(),
             ),
             code => {
+                // 終了コードの取得経路(PowerShellのパイプライン越し等)に
+                // 環境依存の問題があっても取りこぼさないよう、ログの内容
+                // からも成功を判定するフォールバックを持たせる。あくまで
+                // 補完であり、明確な失敗メッセージがあれば成功扱いにしない。
+                if log_indicates_pnputil_success(&log_path) {
+                    return Ok(());
+                }
+
                 let mut msg = format!("ドライバのインストールに失敗しました (終了コード: {code:?})");
                 if let Some(detail) = read_install_log_tail(&log_path) {
                     msg.push_str("\n\n--- 詳細ログ (cert-install.jse / pnputil の出力) ---\n");
@@ -397,6 +411,33 @@ mod imp {
     /// <https://learn.microsoft.com/windows-hardware/drivers/devtest/pnputil-return-values>
     fn is_pnputil_success_code(code: i32) -> bool {
         matches!(code, 0 | 259 | 3010 | 1641)
+    }
+
+    /// 終了コード判定の補完として、ログの内容から成否を推測する。pnputilの
+    /// 出力言語はOSの表示言語に依存するため、代表的な日本語・英語の
+    /// メッセージのみを見る簡易フォールバック(主判定はあくまで終了コード)。
+    fn log_indicates_pnputil_success(log_path: &Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(log_path) else {
+            return false;
+        };
+
+        const FAILURE_MARKERS: &[&str] = &["追加できませんでした", "failed to add driver package"];
+        if FAILURE_MARKERS
+            .iter()
+            .any(|m| content.to_lowercase().contains(&m.to_lowercase()))
+        {
+            return false;
+        }
+
+        const SUCCESS_MARKERS: &[&str] = &[
+            "正常に追加されました",
+            "既にシステムに存在します",
+            "successfully added",
+            "already exists",
+        ];
+        SUCCESS_MARKERS
+            .iter()
+            .any(|m| content.to_lowercase().contains(&m.to_lowercase()))
     }
 
     /// インストールログの末尾を返す(長すぎる場合に備えて直近30行のみ)。
@@ -543,6 +584,52 @@ mod imp {
             assert!(!is_pnputil_success_code(1));
             assert!(!is_pnputil_success_code(1223)); // UACキャンセル(別枝で判定)
             assert!(!is_pnputil_success_code(-1));
+        }
+
+        #[test]
+        fn log_indicates_pnputil_success_detects_real_world_already_installed_log() {
+            let log_path = std::env::temp_dir().join(format!(
+                "recisdb-proxy-test-log-{}-a.log",
+                std::process::id()
+            ));
+            std::fs::write(
+                &log_path,
+                "=== pnputil /add-driver ===\r\n\
+                 Microsoft PnP ユーティリティ\r\n\
+                 \r\n\
+                 ドライバー パッケージの追加:  PX-MLT5PE.inf\r\n\
+                 ドライバー パッケージが正常に追加されました。(既にシステムに存在します)\r\n\
+                 公開名:         oem46.inf\r\n",
+            )
+            .unwrap();
+
+            assert!(log_indicates_pnputil_success(&log_path));
+
+            std::fs::remove_file(&log_path).unwrap();
+        }
+
+        #[test]
+        fn log_indicates_pnputil_success_rejects_explicit_failure() {
+            let log_path = std::env::temp_dir().join(format!(
+                "recisdb-proxy-test-log-{}-b.log",
+                std::process::id()
+            ));
+            std::fs::write(
+                &log_path,
+                "=== pnputil /add-driver ===\r\n\
+                 ドライバー パッケージを追加できませんでした: 指定されたドライバー パッケージが見つからないか無効です。\r\n",
+            )
+            .unwrap();
+
+            assert!(!log_indicates_pnputil_success(&log_path));
+
+            std::fs::remove_file(&log_path).unwrap();
+        }
+
+        #[test]
+        fn log_indicates_pnputil_success_is_false_for_missing_file() {
+            let missing = std::env::temp_dir().join("recisdb-proxy-test-log-does-not-exist.log");
+            assert!(!log_indicates_pnputil_success(&missing));
         }
     }
 }
