@@ -23,8 +23,28 @@ pub struct Px4Model {
     pub inf_name: &'static str,
     /// 配布アーカイブ内の BonDriver フォルダ名 (`{bondriver_folder}_32bit` / `_64bit`)
     pub bondriver_folder: &'static str,
-    /// フォルダ内に含まれる BonDriver DLL のファイル名 (地上波/衛星で分かれる機種は2つ)
+    /// フォルダ内に含まれる BonDriver DLL のファイル名 (地上波/衛星で分かれる機種は2つ)。
+    /// `instances_per_unit` と同じ順序・同じ長さで対応する。
     pub dll_names: &'static [&'static str],
+    /// 本体1台あたりの同時使用可能数(`dll_names`と同順)。地上波/衛星で
+    /// チューナー数が異なる機種(例: PX-Q3U4は地デジ4+BS/CS4)向けに、
+    /// DLLファイルごとに別の値を持てるようにしている。
+    /// 各メーカー公式スペック(2026年7月時点、Web検索で確認)に基づく:
+    /// - PX-W3U4/W3PE4/W3PE5: 地デジ2ch + BS/CS2ch
+    /// - PX-Q3U4/Q3PE4/Q3PE5: 地デジ4ch + BS/CS4ch
+    /// - PX-MLT5PE: 地デジ/BS/CS合計5ch (自由配分のコンビチューナー)
+    /// - PX-MLT8PE (Rev.3/Rev.5とも): 地デジ/BS/CS合計8ch
+    /// - DTV02A-4TS-P: 地デジ/BS/CS合計4ch
+    /// - DTV02A-1T1S-U(無印/N): 1ch (地デジ・BS/CSどちらか一方のみ同時視聴可)
+    /// - DTV03A-1TU: 地デジ専用1ch
+    /// - PX-M1UR: 地デジ/BS/CSどちらか1ch (コンビチューナー)
+    /// - PX-S1UR: 地デジ専用1ch
+    ///
+    /// 注意: 配布アーカイブ同梱の `DriverHost_PX4.ini` にも機種ごとの
+    /// レシーバー定義があるが、実際の公式スペックと食い違う値が入っている
+    /// 機種があった(例: PX-Q3U4がPX-W3U4と同じ2+2になっていた)ため、
+    /// この一覧はiniを参照せず公式スペックのみから作成している。
+    pub instances_per_unit: &'static [i32],
 }
 
 /// px4_drv for WinUSB が対応する既知のチューナー一覧。
@@ -35,6 +55,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-W3U4.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[2, 2],
     },
     Px4Model {
         label: "PLEX PX-Q3U4",
@@ -42,6 +63,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-Q3U4.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[4, 4],
     },
     Px4Model {
         label: "PLEX PX-W3PE4",
@@ -49,6 +71,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-W3PE4.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[2, 2],
     },
     Px4Model {
         label: "PLEX PX-Q3PE4",
@@ -56,6 +79,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-Q3PE4.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[4, 4],
     },
     Px4Model {
         label: "PLEX PX-W3PE5",
@@ -63,6 +87,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-W3PE5.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[2, 2],
     },
     Px4Model {
         label: "PLEX PX-Q3PE5",
@@ -70,6 +95,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-Q3PE5.inf",
         bondriver_folder: "BonDriver_PX4",
         dll_names: &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"],
+        instances_per_unit: &[4, 4],
     },
     Px4Model {
         label: "PLEX PX-MLT5PE",
@@ -77,6 +103,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-MLT5PE.inf",
         bondriver_folder: "BonDriver_PX-MLT",
         dll_names: &["BonDriver_PX-MLT.dll"],
+        instances_per_unit: &[5],
     },
     Px4Model {
         label: "PLEX PX-MLT8PE (Rev.3)",
@@ -84,6 +111,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-MLT8PE3.inf",
         bondriver_folder: "BonDriver_PX-MLT",
         dll_names: &["BonDriver_PX-MLT.dll"],
+        instances_per_unit: &[8],
     },
     Px4Model {
         label: "PLEX PX-MLT8PE (Rev.5)",
@@ -91,6 +119,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-MLT8PE5.inf",
         bondriver_folder: "BonDriver_PX-MLT",
         dll_names: &["BonDriver_PX-MLT.dll"],
+        instances_per_unit: &[8],
     },
     Px4Model {
         label: "e-Better DTV02A-4TS-P",
@@ -98,6 +127,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "DTV02A-4TS-P.inf",
         bondriver_folder: "BonDriver_PX-MLT",
         dll_names: &["BonDriver_PX-MLT.dll"],
+        instances_per_unit: &[4],
     },
     Px4Model {
         label: "e-Better DTV02A-1T1S-U",
@@ -105,6 +135,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "DTV02A-1T1S-U_ISDB2056.inf",
         bondriver_folder: "BonDriver_ISDB2056",
         dll_names: &["BonDriver_ISDB2056.dll"],
+        instances_per_unit: &[1],
     },
     Px4Model {
         label: "e-Better DTV02A-1T1S-U (ロット番号2309以降)",
@@ -112,6 +143,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "DTV02A-1T1S-U_ISDB2056N.inf",
         bondriver_folder: "BonDriver_ISDB2056N",
         dll_names: &["BonDriver_ISDB2056N.dll"],
+        instances_per_unit: &[1],
     },
     Px4Model {
         label: "e-Better DTV03A-1TU",
@@ -119,6 +151,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "DTV03A-1TU_ISDBT2071.inf",
         bondriver_folder: "BonDriver_ISDBT2071",
         dll_names: &["BonDriver_ISDBT2071.dll"],
+        instances_per_unit: &[1],
     },
     Px4Model {
         label: "PLEX PX-M1UR",
@@ -126,6 +159,7 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-M1UR.inf",
         bondriver_folder: "BonDriver_PX-M1UR",
         dll_names: &["BonDriver_PX-M1UR.dll"],
+        instances_per_unit: &[1],
     },
     Px4Model {
         label: "PLEX PX-S1UR",
@@ -133,12 +167,21 @@ pub const PX4_MODELS: &[Px4Model] = &[
         inf_name: "PX-S1UR.inf",
         bondriver_folder: "BonDriver_PX-S1UR",
         dll_names: &["BonDriver_PX-S1UR.dll"],
+        instances_per_unit: &[1],
     },
 ];
 
 /// USB PID から対応する [`Px4Model`] を引く。
 pub fn find_model(usb_pid: u16) -> Option<&'static Px4Model> {
     PX4_MODELS.iter().find(|m| m.usb_pid == usb_pid)
+}
+
+/// 指定したUSB PIDのモデルにおいて、`dll_file_name`(パス無しのファイル名)に
+/// 対応する、本体1台あたりの同時使用可能数を返す。
+pub fn instances_per_unit_for(usb_pid: u16, dll_file_name: &str) -> Option<i32> {
+    let model = find_model(usb_pid)?;
+    let idx = model.dll_names.iter().position(|n| *n == dll_file_name)?;
+    model.instances_per_unit.get(idx).copied()
 }
 
 /// 現在接続されている px4_drv 対応チューナーを検出する (Windows専用)。
@@ -479,5 +522,41 @@ mod tests {
         pids.sort_unstable();
         pids.dedup();
         assert_eq!(pids.len(), len_before, "duplicate usb_pid in PX4_MODELS");
+    }
+
+    #[test]
+    fn all_models_have_matching_dll_and_capacity_lengths() {
+        for model in PX4_MODELS {
+            assert_eq!(
+                model.dll_names.len(),
+                model.instances_per_unit.len(),
+                "{} has mismatched dll_names/instances_per_unit lengths",
+                model.label
+            );
+        }
+    }
+
+    #[test]
+    fn instances_per_unit_for_differs_by_band_for_q3u4() {
+        // 地デジ・BS/CSでチューナー数が異なる実例(PX-Q3U4は両方4ch)を
+        // 明示的に固定するリグレッションテスト。
+        assert_eq!(
+            instances_per_unit_for(0x084a, "BonDriver_PX4-S.dll"),
+            Some(4)
+        );
+        assert_eq!(
+            instances_per_unit_for(0x084a, "BonDriver_PX4-T.dll"),
+            Some(4)
+        );
+        // PX-W3U4は同じDLL名だが2chになる(モデルごとに独立した値を持つ)。
+        assert_eq!(
+            instances_per_unit_for(0x083f, "BonDriver_PX4-T.dll"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn instances_per_unit_for_returns_none_for_unknown_dll() {
+        assert_eq!(instances_per_unit_for(0x083f, "BonDriver_Unknown.dll"), None);
     }
 }

@@ -429,6 +429,20 @@ pub struct RegisterResult {
     pub outcome: Result<i64, String>,
 }
 
+/// px4_drv対応チューナーについて、`path`(登録するBonDriver DLLパス)に
+/// 対応する `max_instances` を「接続台数 × 1台あたりの同時使用可能数」で
+/// 算出する。地上波/衛星でチューナー数が異なる機種(例: PX-Q3U4)でも、
+/// DLLファイルごとに正しい値を返す。px4_drv対応機種でない場合や、まだ
+/// 台数が分かっていない場合は`None`を返し、呼び出し側は従来の
+/// `terrestrial_count + satellite_count` にフォールバックする。
+fn px4_max_instances_for_path(tuner: &DetectedTuner, path: &str) -> Option<i32> {
+    let pid = tuner.px4_model_pid?;
+    let count = tuner.px4_device_count?;
+    let file_name = Path::new(path).file_name()?.to_str()?;
+    let per_unit = crate::px4_installer::instances_per_unit_for(pid, file_name)?;
+    Some(per_unit * count)
+}
+
 /// 選択されたチューナーをDBに登録する。
 pub fn register_tuners_to_db(
     db: &Database,
@@ -444,11 +458,7 @@ pub fn register_tuners_to_db(
 
         for path in &tuner.device_paths {
             let outcome = db.get_or_create_bon_driver(path).inspect(|&id| {
-                // px4_drv for WinUSB は同一機種を複数台挿しても1つのBonDriverが
-                // 台数ぶんの space を自動公開するため、USB列挙で数えた接続台数
-                // (px4_device_count)が分かっていればそちらを優先する。
-                let total = tuner
-                    .px4_device_count
+                let total = px4_max_instances_for_path(tuner, path)
                     .unwrap_or(tuner.terrestrial_count + tuner.satellite_count);
                 if total > 1 {
                     let _ = db.update_max_instances(id, total);
@@ -519,10 +529,11 @@ mod tests {
     }
 
     #[test]
-    fn register_tuners_to_db_prefers_px4_device_count_over_band_sum() {
+    fn register_tuners_to_db_scales_px4_max_instances_by_device_count() {
         let db = Database::open_in_memory().unwrap();
-        // terrestrial_count + satellite_count が 0 のままでも、px4_device_count
-        // (実際にUSB列挙で数えた接続台数)が優先されて max_instances に反映される。
+        // terrestrial_count + satellite_count が 0 のままでも、
+        // px4_device_count(実際にUSB列挙で数えた接続台数)× 1台あたりの
+        // 同時使用可能数(PX-W3U4は地デジ2ch)が max_instances に反映される。
         let tuners = vec![DetectedTuner {
             name: "PLEX PX-W3U4 x2".to_string(),
             device_paths: vec!["BonDriver_PX4-T.dll".to_string()],
@@ -539,7 +550,32 @@ mod tests {
         assert!(results[0].outcome.is_ok());
 
         let max_instances = db.get_max_instances_for_path("BonDriver_PX4-T.dll").unwrap();
-        assert_eq!(max_instances, 2);
+        assert_eq!(max_instances, 4); // 2台 x 2ch/台
+    }
+
+    #[test]
+    fn register_tuners_to_db_uses_per_band_capacity_for_q3u4() {
+        let db = Database::open_in_memory().unwrap();
+        // PX-Q3U4は地デジ・BS/CSともに1台あたり4chなので、S/Tどちらの
+        // DLLパスでも同じ倍率(台数x4)が反映される。
+        let tuners = vec![DetectedTuner {
+            name: "PLEX PX-Q3U4 x1".to_string(),
+            device_paths: vec![
+                "BonDriver_PX4-S.dll".to_string(),
+                "BonDriver_PX4-T.dll".to_string(),
+            ],
+            group_name: "BonDriver_PX4".to_string(),
+            terrestrial_count: 0,
+            satellite_count: 0,
+            bondriver_url: String::new(),
+            px4_model_pid: Some(0x084a),
+            px4_device_count: Some(1),
+        }];
+
+        register_tuners_to_db(&db, &tuners, &[0]);
+
+        assert_eq!(db.get_max_instances_for_path("BonDriver_PX4-S.dll").unwrap(), 4);
+        assert_eq!(db.get_max_instances_for_path("BonDriver_PX4-T.dll").unwrap(), 4);
     }
 
     #[test]
