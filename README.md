@@ -48,6 +48,12 @@ Windows では x64 向け実行ファイルが提供されています。
 
 コマンドライン入力は一切不要です。`recisdb-proxy-setup.exe` は `recisdb-proxy.exe` と同じフォルダに置いて実行してください。
 
+**PLEX / e-Better 製チューナー (PX-W3U4, PX-Q3U4, PX-MLT5PE/8PE, PX-M1UR/S1UR, DTV02A/03A 等) をお使いの場合**、
+接続済みでドライバ未インストールのデバイスも自動検出し、ボタン1つで
+[tsukumijima/px4_drv](https://github.com/tsukumijima/px4_drv) (WinUSB版) の最新ビルドを
+[tsukumijima/DTV-Builds](https://github.com/tsukumijima/DTV-Builds) からダウンロードして
+ドライバ・BonDriverのインストールまで行います。ドライバインストール時のみ管理者権限の確認 (UAC) が表示されます。
+
 ### 起動 (手動で設定する場合)
 同梱している`recisdb-proxy.toml.example`と`BonDriver_NetworkProxy.ini.sample`を確認します。  
 .exampleと.sampleを削除して保存します。  

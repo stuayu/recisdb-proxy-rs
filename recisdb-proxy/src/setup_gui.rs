@@ -15,9 +15,16 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use recisdb_proxy::database::Database;
+use recisdb_proxy::px4_installer;
 use recisdb_proxy::setup_helpers::{
     self, generate_config, register_manual_tuner, register_tuners_to_db, DetectedTuner,
 };
+
+/// px4_drv 自動インストールのバックグラウンドスレッドから届く通知。
+enum InstallEvent {
+    Progress(String),
+    Done(Result<Vec<String>, String>),
+}
 
 const WINDOW_TITLE: &str = "recisdb-proxy かんたんセットアップ";
 
@@ -133,6 +140,12 @@ struct SetupApp {
     manual_form: ManualEntryForm,
     manual_entries: Vec<ManualEntry>,
 
+    // px4_drv 自動インストール (対応機種がドライバ未インストールで検出された場合)
+    installing_index: Option<usize>,
+    install_rx: Option<mpsc::Receiver<InstallEvent>>,
+    install_log: Vec<String>,
+    install_error: Option<String>,
+
     // 上書き確認
     overwrite_config: bool,
     recreate_db: bool,
@@ -159,6 +172,10 @@ impl SetupApp {
             selected: Vec::new(),
             manual_form: ManualEntryForm::default(),
             manual_entries: Vec::new(),
+            installing_index: None,
+            install_rx: None,
+            install_log: Vec::new(),
+            install_error: None,
             overwrite_config: false,
             recreate_db: false,
             log_lines: Vec::new(),
@@ -176,6 +193,74 @@ impl SetupApp {
         });
         self.detect_rx = Some(rx);
         self.step = Step::Detecting;
+    }
+
+    /// ドライバ/BonDriverの配置先フォルダ。設定ファイルと同じフォルダ
+    /// (相対パス指定なら実行ファイルと同じフォルダ)にまとめる。
+    fn install_dir(&self) -> PathBuf {
+        Path::new(&self.config_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// 指定したチューナーの px4_drv ドライバ自動インストールをバックグラウンドで開始する。
+    fn start_px4_install(&mut self, index: usize) {
+        let Some(pid) = self.detected[index].px4_model_pid else {
+            return;
+        };
+        let install_dir = self.install_dir();
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let result = px4_installer::download_install_and_stage(pid, &install_dir, move |msg| {
+                let _ = progress_tx.send(InstallEvent::Progress(msg.to_string()));
+            });
+            let _ = tx.send(InstallEvent::Done(result));
+        });
+
+        self.installing_index = Some(index);
+        self.install_rx = Some(rx);
+        self.install_log.clear();
+        self.install_error = None;
+    }
+
+    /// px4_drv インストールスレッドからの通知を受け取り、状態を更新する。
+    fn poll_px4_install(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.install_rx else {
+            return;
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(InstallEvent::Progress(msg)) => self.install_log.push(msg),
+                Ok(InstallEvent::Done(result)) => {
+                    let idx = self.installing_index.take().expect("installing_index set while install_rx is Some");
+                    match result {
+                        Ok(paths) => {
+                            self.detected[idx].device_paths = paths;
+                            self.selected[idx] = true;
+                            self.install_error = None;
+                        }
+                        Err(e) => self.install_error = Some(e),
+                    }
+                    self.install_rx = None;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.installing_index = None;
+                    self.install_rx = None;
+                    self.install_error = Some("インストール処理が予期せず終了しました。".to_string());
+                    break;
+                }
+            }
+        }
     }
 
     fn run_setup(&mut self) {
@@ -357,6 +442,8 @@ impl eframe::App for SetupApp {
             }
         }
 
+        self.poll_px4_install(&ctx);
+
         // recisdb-proxy 起動後、少し待ってからダッシュボードを開く
         if let Some(deadline) = self.launch_deadline {
             if Instant::now() >= deadline {
@@ -459,13 +546,20 @@ impl SetupApp {
             ui.label("見つかったチューナーのうち、使用するものにチェックを入れてください。");
             ui.add_space(10.0);
 
+            let mut install_clicked: Option<usize> = None;
+
             egui::ScrollArea::vertical()
-                .max_height(180.0)
+                .max_height(220.0)
                 .show(ui, |ui| {
-                    for (i, tuner) in self.detected.iter().enumerate() {
+                    for i in 0..self.detected.len() {
+                        let installing_this = self.installing_index == Some(i);
+                        let needs_driver = self.detected[i].px4_model_pid.is_some()
+                            && self.detected[i].device_paths.is_empty();
+
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.selected[i], "");
                             ui.vertical(|ui| {
+                                let tuner = &self.detected[i];
                                 ui.strong(&tuner.name);
                                 if tuner.terrestrial_count > 0 || tuner.satellite_count > 0 {
                                     ui.label(format!(
@@ -476,11 +570,51 @@ impl SetupApp {
                                 for path in &tuner.device_paths {
                                     ui.label(egui::RichText::new(path).weak().small());
                                 }
+
+                                if needs_driver {
+                                    if installing_this {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            let msg = self
+                                                .install_log
+                                                .last()
+                                                .cloned()
+                                                .unwrap_or_else(|| "インストール準備中…".to_string());
+                                            ui.label(msg);
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(200, 140, 0),
+                                                "ドライバが未インストールです",
+                                            );
+                                            let enabled = self.installing_index.is_none();
+                                            if ui
+                                                .add_enabled(
+                                                    enabled,
+                                                    egui::Button::new("ドライバを自動インストール"),
+                                                )
+                                                .clicked()
+                                            {
+                                                install_clicked = Some(i);
+                                            }
+                                        });
+                                    }
+                                }
                             });
                         });
                         ui.separator();
                     }
                 });
+
+            if let Some(i) = install_clicked {
+                self.start_px4_install(i);
+            }
+
+            if let Some(err) = &self.install_error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+            }
         }
 
         ui.add_space(12.0);

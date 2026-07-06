@@ -153,6 +153,10 @@ pub struct DetectedTuner {
     pub satellite_count: i32,
     /// BonDriverのダウンロードURL
     pub bondriver_url: String,
+    /// px4_drv for WinUSB で自動インストール可能な機種の場合、その USB PID。
+    /// `device_paths` が空(=まだBonDriver/ドライバが入っていない)状態でも
+    /// USBデバイスとして検出できた場合にセットされる。
+    pub px4_model_pid: Option<u16>,
 }
 
 // =============================================================================
@@ -204,6 +208,7 @@ fn detect_tuners_linux() -> Vec<DetectedTuner> {
                 terrestrial_count: 0, // DVBでは不明
                 satellite_count: 0,
                 bondriver_url: String::new(),
+                px4_model_pid: None,
             });
         }
     }
@@ -233,6 +238,7 @@ fn detect_tuners_linux() -> Vec<DetectedTuner> {
                     terrestrial_count: known.map_or(0, |k| k.terrestrial_count),
                     satellite_count: known.map_or(0, |k| k.satellite_count),
                     bondriver_url: known.map_or(String::new(), |k| k.bondriver_url.to_string()),
+                    px4_model_pid: None,
                 });
             }
         }
@@ -320,10 +326,31 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
                         satellite_count: known.map_or(0, |k| k.satellite_count),
                         bondriver_url: known
                             .map_or(String::new(), |k| k.bondriver_url.to_string()),
+                        px4_model_pid: None,
                     });
                 }
             }
         }
+    }
+
+    // USBデバイスとしての検出 (px4_drv for WinUSB 対応機種)。BonDriver DLLの
+    // 有無に関わらず、接続されているだけで検出できる。ドライバ未インストールで
+    // 上のDLL検索に引っかからなかった機種を補完する。
+    for model in crate::px4_installer::detect_connected_px4_devices() {
+        let already_covered = detected.iter().any(|d| d.group_name == model.bondriver_folder);
+        if already_covered {
+            continue;
+        }
+
+        detected.push(DetectedTuner {
+            name: format!("{} (ドライバ未インストール)", model.label),
+            device_paths: Vec::new(),
+            group_name: model.bondriver_folder.to_string(),
+            terrestrial_count: 0,
+            satellite_count: 0,
+            bondriver_url: String::new(),
+            px4_model_pid: Some(model.usb_pid),
+        });
     }
 
     detected
@@ -467,6 +494,7 @@ mod tests {
             terrestrial_count: 2,
             satellite_count: 0,
             bondriver_url: String::new(),
+            px4_model_pid: None,
         }];
 
         let results = register_tuners_to_db(&db, &tuners, &[0]);
