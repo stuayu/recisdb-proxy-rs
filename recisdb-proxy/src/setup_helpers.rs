@@ -343,17 +343,27 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
 
     // USBデバイスとしての検出 (px4_drv for WinUSB 対応機種)。BonDriver DLLの
     // 有無に関わらず、接続されているだけで検出でき、接続台数も分かる。
-    // 上のDLL検索で既に見つかっている機種であれば台数情報だけ補完し、
-    // まだドライバ未インストールで見つかっていなければ新規に追加する。
+    // 上のDLL検索は px4_drv 系のフォルダ構成(px4_installer が配置する
+    // `BonDriver/<フォルダ名>/*.dll`)を認識しないため、既にインストール済み
+    // でも「ドライバ未インストール」と誤判定してしまう。ここで
+    // find_staged_px4_bondriver により専用の配置場所を確認し、正しい
+    // device_paths を埋める。
     for (model, count) in crate::px4_installer::detect_connected_px4_devices() {
         if let Some(existing) = detected.iter_mut().find(|d| d.group_name == model.bondriver_folder) {
             existing.px4_device_count = Some(count as i32);
             continue;
         }
 
+        let staged_paths = find_staged_px4_bondriver(model);
+        let installed = !staged_paths.is_empty();
+
         detected.push(DetectedTuner {
-            name: format!("{} x{count} (ドライバ未インストール)", model.label),
-            device_paths: Vec::new(),
+            name: if installed {
+                format!("{} x{count}", model.label)
+            } else {
+                format!("{} x{count} (ドライバ未インストール)", model.label)
+            },
+            device_paths: staged_paths,
             group_name: model.bondriver_folder.to_string(),
             terrestrial_count: 0,
             satellite_count: 0,
@@ -364,6 +374,48 @@ fn detect_tuners_windows() -> Vec<DetectedTuner> {
     }
 
     detected
+}
+
+/// [`crate::px4_installer::download_install_and_stage`] が配置した
+/// BonDriver一式が既に存在するかを、そのステージング先の規則
+/// (`<検索ルート>\BonDriver\<bondriver_folder>\<dll名>`)に従って探す。
+/// 見つかった場合は絶対パスのリストを返す(空なら未インストール)。
+#[cfg(target_os = "windows")]
+fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model) -> Vec<String> {
+    find_staged_px4_bondriver_in(model, &[PathBuf::from("."), PathBuf::from("..")])
+}
+
+#[cfg(target_os = "windows")]
+fn find_staged_px4_bondriver_in(
+    model: &crate::px4_installer::Px4Model,
+    staged_roots: &[PathBuf],
+) -> Vec<String> {
+    for root in staged_roots {
+        let candidate_dir = root.join("BonDriver").join(model.bondriver_folder);
+        if !candidate_dir.is_dir() {
+            continue;
+        }
+
+        let paths: Vec<String> = model
+            .dll_names
+            .iter()
+            .filter_map(|dll_name| {
+                let p = candidate_dir.join(dll_name);
+                p.exists().then(|| {
+                    p.canonicalize()
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+            })
+            .collect();
+
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+
+    Vec::new()
 }
 
 /// チューナーを検出する。時間がかかることがあるため、GUIから呼ぶ場合はワーカー
@@ -500,6 +552,35 @@ pub fn register_manual_tuner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn find_staged_px4_bondriver_in_finds_previously_installed_files() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_root = std::env::temp_dir()
+            .join(format!("recisdb-proxy-test-staged-px4-{n}-{}", std::process::id()));
+        // PX-MLT5PE (0x024e): 単一DLLで検証が簡単なため。
+        let model = crate::px4_installer::find_model(0x024e).expect("PX-MLT5PE must be a known model");
+
+        // まだ何もステージングされていない状態では見つからない。
+        let none_found = find_staged_px4_bondriver_in(model, &[tmp_root.clone()]);
+        assert!(none_found.is_empty());
+
+        // px4_installer::stage_bondriver と同じ配置規則でファイルを置く。
+        let staged_dir = tmp_root.join("BonDriver").join(model.bondriver_folder);
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        for dll_name in model.dll_names {
+            std::fs::write(staged_dir.join(dll_name), b"dummy").unwrap();
+        }
+
+        let found = find_staged_px4_bondriver_in(model, &[tmp_root.clone()]);
+        assert_eq!(found.len(), model.dll_names.len());
+
+        std::fs::remove_dir_all(&tmp_root).unwrap();
+    }
 
     #[test]
     fn generate_config_embeds_all_fields() {
