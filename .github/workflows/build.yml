@@ -55,8 +55,12 @@ jobs:
           $outDir = "artifacts-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path $outDir
 
-          # Copy ALL
-          Copy-Item -Recurse "$targetDir/" "$outDir/"
+          # Copy only the built binaries (exe/dll) and their debug symbols;
+          # $targetDir also holds deps/build/incremental/.fingerprint, which
+          # are compiler intermediates, not distributable artifacts.
+          Copy-Item "$targetDir/*.exe" "$outDir/" -ErrorAction SilentlyContinue
+          Copy-Item "$targetDir/*.dll" "$outDir/" -ErrorAction SilentlyContinue
+          Copy-Item "$targetDir/*.pdb" "$outDir/" -ErrorAction SilentlyContinue
 
           # Copy sample config if exists
           if (Test-Path "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample") {
@@ -114,8 +118,11 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy ALL
-          cp -r "$TARGET_DIR/." "$OUT_DIR/"
+          # Copy only the built executables and shared libraries;
+          # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
+          # are compiler intermediates, not distributable artifacts.
+          find "$TARGET_DIR" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -exec cp {} "$OUT_DIR/" \;
+          find "$TARGET_DIR" -maxdepth 1 -type f -name '*.so' -exec cp {} "$OUT_DIR/" \;
 
           # Copy sample configs
           [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
@@ -166,8 +173,11 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy ALL
-          cp -r "$TARGET_DIR/." "$OUT_DIR/"
+          # Copy only the built executables and shared libraries;
+          # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
+          # are compiler intermediates, not distributable artifacts.
+          find "$TARGET_DIR" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -exec cp {} "$OUT_DIR/" \;
+          find "$TARGET_DIR" -maxdepth 1 -type f -name '*.dylib' -exec cp {} "$OUT_DIR/" \;
 
           # Copy sample configs
           [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
