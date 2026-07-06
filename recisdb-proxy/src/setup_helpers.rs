@@ -459,7 +459,6 @@ pub fn detect_tuners(install_dir: &Path) -> Vec<DetectedTuner> {
 // 設定ファイル生成
 // =============================================================================
 
-/// recisdb-proxy.toml の設定ファイルを生成
 /// TOMLの基本文字列(ダブルクォート)にそのまま埋め込めるよう、バックスラッシュを
 /// エスケープする。Windowsの絶対パス(`C:\DTV\...`)をそのまま埋め込むと、
 /// `\D` が不正なエスケープシーケンスとして扱われて設定ファイルが壊れ、
@@ -469,115 +468,69 @@ fn escape_toml_basic_string(s: &str) -> String {
     s.replace('\\', "\\\\")
 }
 
+/// 実際に配布している `recisdb-proxy.toml.example` そのものをテンプレートとして
+/// 埋め込む(ビルド時に取り込まれるため、実行時のネットワークアクセスは不要)。
+/// コメント・セクション構成の唯一の情報源をこのファイルに一本化し、
+/// ウィザードが独自に持つ古い説明文と食い違う事態を防ぐ。
+const CONFIG_TEMPLATE: &str = include_str!("../recisdb-proxy.toml.example");
+
+/// `template` の `[section]` セクション内にある `key = "..."` の行を
+/// `key = "new_value"` に書き換える。それ以外の行(コメント・他セクション)は
+/// 一切変更しない。
+///
+/// テンプレート側の構造が変わってキーが見つからなかった場合、値が反映されない
+/// まま古い既定値が黙って使われる事故を防ぐため panic する(セットアップ時に
+/// すぐ気付けるように)。
+fn replace_scalar_in_section(template: &str, section: &str, key: &str, new_value: &str) -> String {
+    let key_prefix = format!("{key} = ");
+    let mut current_section = String::new();
+    let mut replaced = false;
+    let mut out = String::with_capacity(template.len());
+
+    for line in template.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                current_section = name.to_string();
+            }
+        }
+
+        if !replaced && current_section == section && trimmed.starts_with(&key_prefix) {
+            out.push_str(&format!("{key} = \"{new_value}\"\n"));
+            replaced = true;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    assert!(
+        replaced,
+        "generate_config: `{key}` not found in [{section}] section of recisdb-proxy.toml.example \
+         (テンプレートの構造が変わった可能性があります)"
+    );
+
+    out
+}
+
+/// recisdb-proxy.toml の設定ファイルを生成する。
+///
+/// `recisdb-proxy.toml.example` をテンプレートとしてそのまま使い、ウィザードで
+/// 決まる3つの値(listen/web_listen/データベースパス)だけを書き換える。
+/// それ以外の内容([web]/[mirakurun]/[tsreplace]/[preview]/[tls] 等)は
+/// テンプレートのままなので、そちらを更新すればウィザードの生成結果にも
+/// 自動的に反映される。
 pub fn generate_config(listen_addr: &str, web_listen_addr: &str, db_path: &str) -> String {
     let db_path = escape_toml_basic_string(db_path);
-    format!(
-        r#"# recisdb-proxy 設定ファイル (かんたんセットアップで自動生成)
-# 詳しい説明は recisdb-proxy.toml.example を参照してください。
-
-[server]
-# プロキシサーバーの待ち受けアドレス
-listen = "{listen_addr}"
-
-# Webダッシュボードの待ち受けアドレス
-web_listen = "{web_listen_addr}"
-
-# 最大同時接続数
-max_connections = 64
-
-[database]
-# SQLiteデータベースファイルのパス
-path = "{db_path}"
-
-[logging]
-# ログファイルの保存ディレクトリ
-log_dir = "logs"
-
-# ログファイルの保持日数
-retention_days = 7
-
-# ログレベル (off, error, warn, info, debug, trace)
-# level = "warn"
-
-# =====================================================
-# Webダッシュボード/API認証設定
-# =====================================================
-# [web]
-# /api/* に Authorization: Bearer <トークン> を要求する (デフォルト: true)
-# false は隔離されたLANでのテスト専用です
-# auth_enabled = true
-#
-# 認証トークンを明示指定する (省略可)
-# 未指定の場合は初回起動時に自動生成されDBに保存されます。
-# 認証有効時、実際に使われるトークンは毎回起動ログに表示されます
-# auth_token = "任意のトークン文字列"
-
-# =====================================================
-# Mirakurun互換API設定
-# =====================================================
-# [mirakurun]
-# /mirakurun/api/* を有効にする (デフォルト: false)
-# このエンドポイントは認証なしで公開されるため(実際のMirakurunクライアント
-# はAuthorizationヘッダを送らないため)、信頼できるネットワークでのみ
-# 有効にしてください
-# enabled = false
-
-# =====================================================
-# BNDPセッション (TVTest等) 用エンコーダ設定
-# =====================================================
-# 実行ファイルのパスはこの設定ファイルからのみ変更できます
-# (Web APIから変更可能にするとリモートコード実行の踏み台になるため)。
-# 有効/無効の切り替えや引数はWebダッシュボードから設定します。
-# [tsreplace]
-# エンコーダ実行ファイルのパス (例: tsreplace)
-# command_path = "C:\\DTV\\tsreplace\\tsreplace.exe"
-#
-# 前段プロセスの実行ファイルパス (省略可、例: tsreadex)
-# 設定するとパイプライン TS → 前段 → エンコーダ → 出力 で実行されます。
-# 空文字列を指定すると保存済みの値をクリアできます
-# preprocessor_path = "C:\\DTV\\tsreadex\\tsreadex.exe"
-
-# =====================================================
-# ブラウザプレビュー (?profile=preview) 用エンコーダ設定
-# =====================================================
-# [tsreplace] とは完全に独立した設定です。パスがTOML専用である理由も同じ。
-# 有効/無効・前段引数はWebダッシュボードの「ブラウザプレビュー」設定から。
-# 引数内の {{SID}} は対象サービスIDに置換されます。
-#
-# 引数は初回起動時に推奨値がDBへ自動登録されます (ダッシュボードから変更可):
-#   前段 (tsreadex):    -x 18/38/39 -n {{SID}} -a 13 -b 5 -c 1 -u 1 -d 13 -
-#   エンコーダ (QSVEncC): H.264 ~2Mbps VBR / インターレース解除 / AAC ステレオ
-#                        (encode_profiles の preview-h264 プロファイル)
-# ここでは実行ファイルのパス2つを設定するだけで動作します。
-# サービス選択は前段 tsreadex の -n {{SID}} が担うため、前段の設定を推奨します。
-# [preview]
-# プレビュー用エンコーダの実行ファイルパス (例: QSVEncC)
-# command_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\QSVEncC\\QSVEncC.exe"
-#
-# 前段プロセスの実行ファイルパス (例: tsreadex によるサービス選択)
-# preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.exe"
-
-# =====================================================
-# TLS設定 (tls フィーチャーが有効な場合のみ)
-# =====================================================
-# [tls]
-# TLS暗号化を有効にする (デフォルト: false)
-# enabled = false
-#
-# CA証明書のパス (PEM形式)
-# ca_cert = "ca.pem"
-#
-# サーバー証明書のパス (PEM形式)
-# server_cert = "server.pem"
-#
-# サーバー秘密鍵のパス (PEM形式)
-# server_key = "server-key.pem"
-#
-# クライアント証明書の要求 (デフォルト: false)
-# true にするとクライアント証明書がない接続は拒否されます
-# require_client_cert = false
-"#
-    )
+    let mut content = CONFIG_TEMPLATE.replace(
+        "# このファイルを recisdb-proxy.toml にコピーして編集してください。",
+        "# かんたんセットアップにより自動生成されました。",
+    );
+    content = replace_scalar_in_section(&content, "server", "listen", listen_addr);
+    content = replace_scalar_in_section(&content, "server", "web_listen", web_listen_addr);
+    content = replace_scalar_in_section(&content, "database", "path", &db_path);
+    content
 }
 
 // =============================================================================
@@ -887,6 +840,39 @@ mod tests {
         // 構文として壊れていないことも確認する(コメントアウトされた
         // {{SID}} 等のエスケープミスで壊れやすいため)。
         toml::from_str::<toml::Value>(&generated).expect("generated config must be valid TOML");
+    }
+
+    #[test]
+    fn generate_config_is_derived_from_the_actual_example_file() {
+        // recisdb-proxy.toml.example を直接埋め込んでおり、独自にテキストを
+        // 複製していないことを確認する(このテストは
+        // recisdb-proxy.toml.example と setup_helpers.rs の内容が食い違う
+        // 状況を根本的に防ぐためのもの)。動的に書き換える3値
+        // (listen/web_listen/database.path) 以外の行は完全に一致するはず。
+        let generated = generate_config("1.2.3.4:1", "5.6.7.8:2", "custom.db");
+        let template_lines: Vec<&str> = CONFIG_TEMPLATE.lines().collect();
+        let generated_lines: Vec<&str> = generated.lines().collect();
+        assert_eq!(
+            template_lines.len(),
+            generated_lines.len(),
+            "generated config must have the same number of lines as the template"
+        );
+
+        let mut differing_lines = 0;
+        for (t, g) in template_lines.iter().zip(generated_lines.iter()) {
+            if t != g {
+                differing_lines += 1;
+            }
+        }
+        // 冒頭の案内コメント1行 + listen / web_listen / database.path の3行、
+        // 合計4行だけが変わっているはず。
+        assert_eq!(differing_lines, 4, "only the wizard-controlled lines should differ from the template");
+    }
+
+    #[test]
+    #[should_panic(expected = "not found in [server] section")]
+    fn replace_scalar_in_section_panics_when_key_missing() {
+        replace_scalar_in_section("[server]\nfoo = \"bar\"\n", "server", "listen", "x");
     }
 
     #[test]
