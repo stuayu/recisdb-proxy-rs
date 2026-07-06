@@ -460,7 +460,17 @@ pub fn detect_tuners(install_dir: &Path) -> Vec<DetectedTuner> {
 // =============================================================================
 
 /// recisdb-proxy.toml の設定ファイルを生成
+/// TOMLの基本文字列(ダブルクォート)にそのまま埋め込めるよう、バックスラッシュを
+/// エスケープする。Windowsの絶対パス(`C:\DTV\...`)をそのまま埋め込むと、
+/// `\D` が不正なエスケープシーケンスとして扱われて設定ファイルが壊れ、
+/// recisdb-proxy本体が起動できなくなる(`\r`のように偶然有効なエスケープに
+/// 化けて経路が化けるケースもある)。
+fn escape_toml_basic_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+}
+
 pub fn generate_config(listen_addr: &str, web_listen_addr: &str, db_path: &str) -> String {
+    let db_path = escape_toml_basic_string(db_path);
     format!(
         r#"# recisdb-proxy 設定ファイル (かんたんセットアップで自動生成)
 # 詳しい説明は recisdb-proxy.toml.example を参照してください。
@@ -842,6 +852,15 @@ mod tests {
     }
 
     #[test]
+    fn escape_toml_basic_string_doubles_backslashes() {
+        assert_eq!(
+            escape_toml_basic_string(r"C:\DTV\recisdb-proxy-rs\recisdb-proxy.db"),
+            r"C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.db"
+        );
+        assert_eq!(escape_toml_basic_string("no_backslashes.db"), "no_backslashes.db");
+    }
+
+    #[test]
     fn generate_config_embeds_all_fields() {
         let toml = generate_config("0.0.0.0:40070", "0.0.0.0:40080", "recisdb-proxy.db");
         assert!(toml.contains(r#"listen = "0.0.0.0:40070""#));
@@ -868,6 +887,28 @@ mod tests {
         // 構文として壊れていないことも確認する(コメントアウトされた
         // {{SID}} 等のエスケープミスで壊れやすいため)。
         toml::from_str::<toml::Value>(&generated).expect("generated config must be valid TOML");
+    }
+
+    #[test]
+    fn generate_config_escapes_windows_style_backslash_paths() {
+        // インストール先フォルダの既定値 (C:\DTV\recisdb-proxy-rs) のような
+        // バックスラッシュ区切りのパスがdb_pathに渡ると、TOMLの文字列内で
+        // バックスラッシュがエスケープ文字として解釈されてしまい
+        // (`\D`は不正なエスケープ、`\r`は復帰文字になってしまう等)、
+        // recisdb-proxy本体がこの設定ファイルを読み込めず起動に失敗する
+        // 不具合があった。
+        let db_path = r"C:\DTV\recisdb-proxy-rs\recisdb-proxy.db";
+        let generated = generate_config("0.0.0.0:40070", "0.0.0.0:40080", db_path);
+
+        let parsed: toml::Value = toml::from_str(&generated)
+            .expect("generated config with a Windows-style path must still be valid TOML");
+
+        let roundtripped_path = parsed
+            .get("database")
+            .and_then(|d| d.get("path"))
+            .and_then(|p| p.as_str())
+            .expect("database.path must be a string");
+        assert_eq!(roundtripped_path, db_path, "path must round-trip exactly, not be mangled by escape sequences");
     }
 
     #[test]
