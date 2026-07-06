@@ -443,6 +443,7 @@ pub fn detect_tuners() -> Vec<DetectedTuner> {
 pub fn generate_config(listen_addr: &str, web_listen_addr: &str, db_path: &str) -> String {
     format!(
         r#"# recisdb-proxy 設定ファイル (かんたんセットアップで自動生成)
+# 詳しい説明は recisdb-proxy.toml.example を参照してください。
 
 [server]
 # プロキシサーバーの待ち受けアドレス
@@ -467,6 +468,84 @@ retention_days = 7
 
 # ログレベル (off, error, warn, info, debug, trace)
 # level = "warn"
+
+# =====================================================
+# Webダッシュボード/API認証設定
+# =====================================================
+# [web]
+# /api/* に Authorization: Bearer <トークン> を要求する (デフォルト: true)
+# false は隔離されたLANでのテスト専用です
+# auth_enabled = true
+#
+# 認証トークンを明示指定する (省略可)
+# 未指定の場合は初回起動時に自動生成されDBに保存されます。
+# 認証有効時、実際に使われるトークンは毎回起動ログに表示されます
+# auth_token = "任意のトークン文字列"
+
+# =====================================================
+# Mirakurun互換API設定
+# =====================================================
+# [mirakurun]
+# /mirakurun/api/* を有効にする (デフォルト: false)
+# このエンドポイントは認証なしで公開されるため(実際のMirakurunクライアント
+# はAuthorizationヘッダを送らないため)、信頼できるネットワークでのみ
+# 有効にしてください
+# enabled = false
+
+# =====================================================
+# BNDPセッション (TVTest等) 用エンコーダ設定
+# =====================================================
+# 実行ファイルのパスはこの設定ファイルからのみ変更できます
+# (Web APIから変更可能にするとリモートコード実行の踏み台になるため)。
+# 有効/無効の切り替えや引数はWebダッシュボードから設定します。
+# [tsreplace]
+# エンコーダ実行ファイルのパス (例: tsreplace)
+# command_path = "C:\\DTV\\tsreplace\\tsreplace.exe"
+#
+# 前段プロセスの実行ファイルパス (省略可、例: tsreadex)
+# 設定するとパイプライン TS → 前段 → エンコーダ → 出力 で実行されます。
+# 空文字列を指定すると保存済みの値をクリアできます
+# preprocessor_path = "C:\\DTV\\tsreadex\\tsreadex.exe"
+
+# =====================================================
+# ブラウザプレビュー (?profile=preview) 用エンコーダ設定
+# =====================================================
+# [tsreplace] とは完全に独立した設定です。パスがTOML専用である理由も同じ。
+# 有効/無効・前段引数はWebダッシュボードの「ブラウザプレビュー」設定から。
+# 引数内の {{SID}} は対象サービスIDに置換されます。
+#
+# 引数は初回起動時に推奨値がDBへ自動登録されます (ダッシュボードから変更可):
+#   前段 (tsreadex):    -x 18/38/39 -n {{SID}} -a 13 -b 5 -c 1 -u 1 -d 13 -
+#   エンコーダ (QSVEncC): H.264 ~2Mbps VBR / インターレース解除 / AAC ステレオ
+#                        (encode_profiles の preview-h264 プロファイル)
+# ここでは実行ファイルのパス2つを設定するだけで動作します。
+# サービス選択は前段 tsreadex の -n {{SID}} が担うため、前段の設定を推奨します。
+# [preview]
+# プレビュー用エンコーダの実行ファイルパス (例: QSVEncC)
+# command_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\QSVEncC\\QSVEncC.exe"
+#
+# 前段プロセスの実行ファイルパス (例: tsreadex によるサービス選択)
+# preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.exe"
+
+# =====================================================
+# TLS設定 (tls フィーチャーが有効な場合のみ)
+# =====================================================
+# [tls]
+# TLS暗号化を有効にする (デフォルト: false)
+# enabled = false
+#
+# CA証明書のパス (PEM形式)
+# ca_cert = "ca.pem"
+#
+# サーバー証明書のパス (PEM形式)
+# server_cert = "server.pem"
+#
+# サーバー秘密鍵のパス (PEM形式)
+# server_key = "server-key.pem"
+#
+# クライアント証明書の要求 (デフォルト: false)
+# true にするとクライアント証明書がない接続は拒否されます
+# require_client_cert = false
 "#
     )
 }
@@ -588,6 +667,27 @@ mod tests {
         assert!(toml.contains(r#"listen = "0.0.0.0:40070""#));
         assert!(toml.contains(r#"web_listen = "0.0.0.0:40080""#));
         assert!(toml.contains(r#"path = "recisdb-proxy.db""#));
+    }
+
+    #[test]
+    fn generate_config_is_valid_toml_and_up_to_date_with_sections() {
+        let generated = generate_config("0.0.0.0:40070", "0.0.0.0:40080", "recisdb-proxy.db");
+
+        // recisdb-proxy.toml.example に存在する全セクションを、コメントアウト
+        // 済みでもよいので案内として含んでいることを確認する
+        // (main.rs の ConfigFile が持つセクション: server/database/logging/
+        // web/mirakurun/tsreplace/preview/tls)。古いテンプレートへの
+        // 先祖返りを防ぐリグレッションテスト。
+        for section in ["[web]", "[mirakurun]", "[tsreplace]", "[preview]", "[tls]"] {
+            assert!(
+                generated.contains(section),
+                "generated config is missing a mention of {section}"
+            );
+        }
+
+        // 構文として壊れていないことも確認する(コメントアウトされた
+        // {{SID}} 等のエスケープミスで壊れやすいため)。
+        toml::from_str::<toml::Value>(&generated).expect("generated config must be valid TOML");
     }
 
     #[test]
