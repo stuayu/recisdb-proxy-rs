@@ -357,9 +357,15 @@ mod imp {
 
         // 呼び出し元プロセス自体は昇格させず、内側の powershell だけを
         // `-Verb RunAs` で昇格させる(UACの確認画面がここだけに出る)。
+        // `-Wait` と `-PassThru` を併用すると、昇格プロセス(UACのブローカー
+        // 経由で起動される)の終了コード取得が競合し、実際には正常終了して
+        // いても STILL_ACTIVE (259) が返ることがある(.NET Process クラスの
+        // 既知の挙動)。`-Wait` を使わず、`WaitForExit()` を明示的に呼んで
+        // から `ExitCode` を読むことで確実に取得する。
         let elevate_cmd = format!(
-            "$p = Start-Process powershell -Verb RunAs -Wait -PassThru \
+            "$p = Start-Process powershell -Verb RunAs -PassThru \
              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; \
+             $p.WaitForExit(); \
              exit $p.ExitCode",
             script_path.display()
         );
