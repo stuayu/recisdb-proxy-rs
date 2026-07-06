@@ -613,7 +613,22 @@ impl SetupApp {
 
             if let Some(err) = &self.install_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+                // pnputil等の詳細ログは複数行になりうるので、選択・コピーできる
+                // スクロール可能なテキストボックスで表示する(単一行ラベルだと
+                // 折り返しやコピーができず読みづらいため)。
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), "エラーが発生しました:");
+                let mut err_text = err.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .id_salt("install_error_scroll")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut err_text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .text_color(egui::Color32::from_rgb(200, 60, 60)),
+                        );
+                    });
             }
         }
 

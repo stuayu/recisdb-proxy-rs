@@ -335,12 +335,21 @@ mod imp {
             );
         }
 
+        // cert-install.jse / pnputil の出力(標準出力・標準エラー)はログファイルに
+        // 落として後で読み返す。UAC昇格した別プロセスの出力は直接キャプチャ
+        // できないため。
+        let log_path = std::env::temp_dir().join("recisdb-proxy-px4-install.log");
+        let _ = std::fs::remove_file(&log_path);
+
         let script_path = std::env::temp_dir().join("recisdb-proxy-px4-install.ps1");
         let script = format!(
-            "$ErrorActionPreference = 'Stop'\r\n\
-             & cscript.exe //Nologo \"{cert}\"\r\n\
-             & pnputil.exe /add-driver \"{inf}\" /install\r\n\
+            "$log = \"{log}\"\r\n\
+             '=== cert-install.jse ===' | Out-File -FilePath $log -Append -Encoding utf8\r\n\
+             & cscript.exe //Nologo \"{cert}\" *>&1 | Out-File -FilePath $log -Append -Encoding utf8\r\n\
+             '=== pnputil /add-driver ===' | Out-File -FilePath $log -Append -Encoding utf8\r\n\
+             & pnputil.exe /add-driver \"{inf}\" /install *>&1 | Out-File -FilePath $log -Append -Encoding utf8\r\n\
              exit $LASTEXITCODE\r\n",
+            log = log_path.display(),
             cert = cert_install.display(),
             inf = inf_path.display(),
         );
@@ -362,9 +371,31 @@ mod imp {
 
         match status.code() {
             Some(0) => Ok(()),
-            Some(1223) => Err("管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string()),
-            code => Err(format!("ドライバのインストールに失敗しました (終了コード: {code:?})")),
+            Some(1223) => Err(
+                "管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string(),
+            ),
+            code => {
+                let mut msg = format!("ドライバのインストールに失敗しました (終了コード: {code:?})");
+                if let Some(detail) = read_install_log_tail(&log_path) {
+                    msg.push_str("\n\n--- 詳細ログ (cert-install.jse / pnputil の出力) ---\n");
+                    msg.push_str(&detail);
+                }
+                Err(msg)
+            }
         }
+    }
+
+    /// インストールログの末尾を返す(長すぎる場合に備えて直近30行のみ)。
+    /// pnputilのエラー内容は末尾に出ることが多い。
+    fn read_install_log_tail(log_path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(log_path).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let start = lines.len().saturating_sub(30);
+        Some(lines[start..].join("\n"))
     }
 
     #[cfg(not(target_os = "windows"))]
