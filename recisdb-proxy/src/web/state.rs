@@ -390,6 +390,10 @@ pub struct WebState {
     pub tuner_config: RwLock<TunerConfigInfo>,
     /// Web API authentication (REVIEW_2026-07.md S2).
     pub auth: AuthConfig,
+    /// The BNDP (BonDriver protocol) listen address, shown by the
+    /// dashboard's client-setup guide so users can copy a ready-made
+    /// BonDriver_NetworkProxy.ini. `None` when unknown (e.g. tests).
+    pub proxy_listen_addr: Option<SocketAddr>,
 }
 
 impl WebState {
@@ -407,6 +411,7 @@ impl WebState {
             encoder_pool,
             session_registry,
             auth,
+            proxy_listen_addr: None,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

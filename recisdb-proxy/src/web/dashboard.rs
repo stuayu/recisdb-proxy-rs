@@ -453,6 +453,7 @@ const HTML_CONTENT: &str = r#"
             <button class="tab active" data-tab="overview">概要</button>
             <button class="tab" data-tab="bondrivers">BonDriver</button>
             <button class="tab" data-tab="channels">チャンネル</button>
+            <button class="tab" data-tab="client-guide">クライアント設定</button>
             <button class="tab" data-tab="scan-history">スキャン履歴</button>
             <button class="tab" data-tab="session-history">セッション履歴</button>
             <button class="tab" data-tab="alerts">アラート</button>
@@ -695,6 +696,72 @@ const HTML_CONTENT: &str = r#"
                     <tr><td colspan="11" class="loading">読み込み中...</td></tr>
                 </tbody>
             </table>
+        </div>
+
+        <!-- Client Setup Guide Tab -->
+        <div id="client-guide" class="tab-content">
+            <div class="section-header">
+                <h3>クライアント設定ガイド</h3>
+                <button class="btn btn-secondary btn-sm" onclick="refreshClientGuide()">更新</button>
+            </div>
+            <p style="margin: 0 0 16px; line-height: 1.7;">
+                TVTest や EDCB などのクライアントは、チャンネル一覧に表示される物理チャンネル
+                (BonSpace / BonChannel) を直接指定する必要は<b>ありません</b>。
+                クライアントの BonDriver_NetworkProxy はこのサーバーからチャンネル一覧を自動取得し、
+                チューニング空間とチャンネルを<b>名前で</b>表示します。設定が必要なのは以下の2点だけです。
+            </p>
+
+            <h4 style="margin: 20px 0 8px;">STEP 1. 接続先チューナーを選ぶ（INI の Tuner= に指定する名前）</h4>
+            <p style="margin: 0 0 10px; color: #888; font-size: 13px;">
+                「グループ」を選ぶと、グループ内の空いているチューナーをサーバーが自動で選びます（推奨）。
+            </p>
+            <table id="client-guide-targets-table" class="responsive-table">
+                <thead>
+                    <tr>
+                        <th>選択</th>
+                        <th>Tuner= に書く名前</th>
+                        <th>種類</th>
+                        <th>有効チャンネル数</th>
+                        <th>備考</th>
+                    </tr>
+                </thead>
+                <tbody id="client-guide-targets-body">
+                    <tr><td colspan="5" class="loading">読み込み中...</td></tr>
+                </tbody>
+            </table>
+
+            <h4 style="margin: 24px 0 8px;">STEP 2. BonDriver_NetworkProxy.ini を作る</h4>
+            <p style="margin: 0 0 10px; color: #888; font-size: 13px;">
+                クライアントPCの BonDriver_NetworkProxy.dll と同じフォルダに、下の内容で
+                BonDriver_NetworkProxy.ini を作成してください（そのままコピーできます）。
+            </p>
+            <pre id="client-guide-ini" style="background: rgba(128,128,128,0.12); border: 1px solid rgba(128,128,128,0.35); border-radius: 6px; padding: 12px 14px; font-size: 13px; overflow-x: auto; user-select: all;"></pre>
+            <button class="btn btn-primary btn-sm" onclick="copyClientGuideIni(this)">INIの内容をコピー</button>
+
+            <h4 style="margin: 24px 0 8px;">STEP 3. チャンネル設定ファイルをダウンロード（必要な場合のみ）</h4>
+            <p style="margin: 0 0 10px; color: #888; font-size: 13px;">
+                これらを置くと TVTest / EpgDataCap_Bon でのチャンネルスキャンを省略できます
+                （置かない場合は各ソフトで一度スキャンを実行してください）。配置先:
+                <b>.ch2</b> → BonDriver_NetworkProxy.dll と同じフォルダ /
+                <b>ChSet4.txt・ChSet5.txt</b> → EDCB の Setting フォルダ。
+                「まとめてダウンロード」には接続先入りの BonDriver_NetworkProxy.ini と手順の README も入ります。
+            </p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom: 8px;">
+                <button class="btn btn-secondary btn-sm" onclick="downloadClientFile('tvtest-ch2')">TVTest用 .ch2</button>
+                <button class="btn btn-secondary btn-sm" onclick="downloadClientFile('chset4')">EDCB用 ChSet4.txt</button>
+                <button class="btn btn-secondary btn-sm" onclick="downloadClientFile('chset5')">EDCB用 ChSet5.txt</button>
+                <button class="btn btn-primary btn-sm" onclick="downloadClientFile('bundle')">まとめてダウンロード (zip)</button>
+            </div>
+            <div id="client-guide-download-msg" style="font-size:12px; color:#888;"></div>
+
+            <h4 style="margin: 24px 0 8px;">STEP 4. クライアントに表示されるチャンネルを確認</h4>
+            <p style="margin: 0 0 10px; color: #888; font-size: 13px;">
+                選択したチューナーで接続したとき、クライアントには以下の空間・チャンネルが<b>この順番・この名前で</b>表示されます。
+                TVTest では一覧から名前で選ぶだけで選局できます。空間番号・CH番号は、番号での指定が必要なツールを使う場合の参考値です。
+            </p>
+            <div id="client-guide-view">
+                <div class="empty-state">STEP 1 でチューナーを選択すると表示されます</div>
+            </div>
         </div>
 
         <!-- Settings Tab -->
@@ -1407,6 +1474,7 @@ const HTML_CONTENT: &str = r#"
                 // Load data for the tab
                 if (tab.dataset.tab === 'bondrivers') refreshBonDrivers();
                 else if (tab.dataset.tab === 'channels') refreshChannels();
+                else if (tab.dataset.tab === 'client-guide') refreshClientGuide();
                 else if (tab.dataset.tab === 'scan-history') refreshHistory();
                 else if (tab.dataset.tab === 'session-history') refreshSessionHistory();
                 else if (tab.dataset.tab === 'alerts') { refreshAlerts(); refreshAlertRules(); }
@@ -3442,6 +3510,200 @@ const HTML_CONTENT: &str = r#"
                 }
             } catch (e) { alert('保存に失敗しました: ' + e.message); }
         };
+
+        // ============================================================
+        // クライアント設定ガイド
+        // ============================================================
+        let clientGuideProxyPort = null;
+        let clientGuideTargets = [];
+        let clientGuideSelected = null;
+
+        function basename(path) {
+            if (!path) return '';
+            const parts = String(path).split(/[\\/]/);
+            return parts[parts.length - 1] || path;
+        }
+
+        async function refreshClientGuide() {
+            const tbody = document.getElementById('client-guide-targets-body');
+            try {
+                const res = await fetch('/api/client-view/targets');
+                const data = await res.json();
+                if (!data.success) {
+                    tbody.innerHTML = `<tr><td colspan="5" class="empty-state">読み込みエラー: ${escapeHtml(data.error || '')}</td></tr>`;
+                    return;
+                }
+                clientGuideProxyPort = data.proxy_port;
+                clientGuideTargets = data.targets || [];
+
+                if (clientGuideTargets.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">BonDriverが登録されていません。先に「BonDriver」タブでチューナーを登録・スキャンしてください</td></tr>';
+                    renderClientGuideIni();
+                    return;
+                }
+
+                // 前回の選択を維持。なければ有効チャンネルを持つ最初のターゲット
+                // (グループが先頭に並ぶのでグループ優先) を自動選択。
+                if (!clientGuideSelected || !clientGuideTargets.some(t => t.name === clientGuideSelected)) {
+                    const firstUsable = clientGuideTargets.find(t => t.enabled_channels > 0) || clientGuideTargets[0];
+                    clientGuideSelected = firstUsable.name;
+                }
+
+                renderClientGuideTargets();
+                renderClientGuideIni();
+                await loadClientGuideView();
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">読み込みエラー: ${escapeHtml(e.message)}</td></tr>`;
+            }
+        }
+
+        function renderClientGuideTargets() {
+            const tbody = document.getElementById('client-guide-targets-body');
+            // Selection is index-based: tuner names are Windows DLL paths
+            // whose backslashes/quotes must never be embedded in inline JS.
+            tbody.innerHTML = clientGuideTargets.map((t, i) => {
+                const checked = t.name === clientGuideSelected ? 'checked' : '';
+                const kind = t.type === 'group'
+                    ? '<span class="badge badge-success">グループ（推奨）</span>'
+                    : 'チューナー単体';
+                let note = '';
+                if (t.type === 'group') {
+                    note = `${(t.drivers || []).map(basename).map(escapeHtml).join(', ')}`;
+                } else if (t.display_name) {
+                    note = `表示名: ${escapeHtml(t.display_name)}`;
+                }
+                if (!t.enabled_channels) {
+                    note += (note ? ' / ' : '') + '<span style="color:#e67e22;">有効チャンネルなし（スキャン未実施?）</span>';
+                }
+                return `
+                    <tr style="cursor:pointer;" onclick="selectClientGuideTarget(${i})">
+                        <td><input type="radio" name="client-guide-target" ${checked}></td>
+                        <td><code style="user-select: all;">${escapeHtml(t.name)}</code></td>
+                        <td>${kind}</td>
+                        <td>${t.enabled_channels}</td>
+                        <td>${note || '-'}</td>
+                    </tr>`;
+            }).join('');
+            applyResponsiveLabels('client-guide-targets-table');
+        }
+
+        async function selectClientGuideTarget(index) {
+            const target = clientGuideTargets[index];
+            if (!target) return;
+            clientGuideSelected = target.name;
+            renderClientGuideTargets();
+            renderClientGuideIni();
+            await loadClientGuideView();
+        }
+
+        function clientGuideIniText() {
+            const host = location.hostname || '127.0.0.1';
+            const port = clientGuideProxyPort || 40070;
+            const tuner = clientGuideSelected || '(STEP 1 でチューナーを選択)';
+            return `[Server]\n` +
+                `Address = ${host}:${port}\n` +
+                `Tuner = ${tuner}\n`;
+        }
+
+        function renderClientGuideIni() {
+            document.getElementById('client-guide-ini').textContent = clientGuideIniText();
+        }
+
+        async function copyClientGuideIni(btn) {
+            try {
+                await navigator.clipboard.writeText(clientGuideIniText());
+                const orig = btn.textContent;
+                btn.textContent = 'コピーしました！';
+                setTimeout(() => { btn.textContent = orig; }, 1500);
+            } catch (e) {
+                alert('コピーに失敗しました。表示内容を手動で選択してコピーしてください。');
+            }
+        }
+
+        // 認証ヘッダを通すため <a href> ではなく fetch + blob でダウンロードする
+        async function downloadClientFile(kind) {
+            const msg = document.getElementById('client-guide-download-msg');
+            if (!clientGuideSelected) {
+                msg.textContent = '先に STEP 1 でチューナーを選択してください';
+                return;
+            }
+            msg.textContent = '生成中...';
+            try {
+                const res = await fetch(`/api/client-view/files/${kind}?tuner=${encodeURIComponent(clientGuideSelected)}`);
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).error || ''; } catch (e2) {}
+                    msg.textContent = `ダウンロードに失敗しました (HTTP ${res.status}) ${detail}`;
+                    return;
+                }
+                const fallbackNames = {
+                    'tvtest-ch2': 'BonDriver_NetworkProxy.ch2',
+                    'chset4': 'BonDriver_NetworkProxy(BonDriver_NetworkProxy).ChSet4.txt',
+                    'chset5': 'ChSet5.txt',
+                    'bundle': 'recisdb-proxy-client-config.zip',
+                };
+                const disposition = res.headers.get('Content-Disposition') || '';
+                const m = disposition.match(/filename\*=UTF-8''([^;]+)/i) || disposition.match(/filename="?([^";]+)"?/i);
+                const filename = m ? decodeURIComponent(m[1]) : fallbackNames[kind];
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                msg.textContent = `${filename} を保存しました`;
+            } catch (e) {
+                msg.textContent = 'ダウンロードに失敗しました: ' + e.message;
+            }
+        }
+
+        async function loadClientGuideView() {
+            const view = document.getElementById('client-guide-view');
+            if (!clientGuideSelected) return;
+            view.innerHTML = '<div class="loading">読み込み中...</div>';
+            try {
+                const res = await fetch(`/api/client-view?tuner=${encodeURIComponent(clientGuideSelected)}`);
+                const data = await res.json();
+                if (!data.success) {
+                    view.innerHTML = `<div class="empty-state">${escapeHtml(data.error || '読み込みエラー')}</div>`;
+                    return;
+                }
+                if (!data.spaces || data.spaces.length === 0) {
+                    view.innerHTML = '<div class="empty-state">このチューナーには有効なチャンネルがありません。「BonDriver」タブでスキャンを実行するか、「チャンネル」タブでチャンネルを有効にしてください</div>';
+                    return;
+                }
+                view.innerHTML = data.spaces.map(space => {
+                    const rows = space.channels.map(ch => {
+                        const phys = (ch.physical || [])
+                            .map(p => `${escapeHtml(basename(p.driver))} (Space ${p.space} / Ch ${p.channel})`)
+                            .join('<br>');
+                        return `
+                            <tr>
+                                <td>${ch.index}</td>
+                                <td>${escapeHtml(ch.name)}</td>
+                                <td>${phys || '-'}</td>
+                            </tr>`;
+                    }).join('');
+                    return `
+                        <h5 style="margin: 18px 0 6px;">チューニング空間 ${space.index}: ${escapeHtml(space.name)}</h5>
+                        <table class="responsive-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 90px;">CH番号</th>
+                                    <th>チャンネル名（クライアントに表示される名前）</th>
+                                    <th>物理チューナー（参考）</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>`;
+                }).join('');
+            } catch (e) {
+                view.innerHTML = `<div class="empty-state">読み込みエラー: ${escapeHtml(e.message)}</div>`;
+            }
+        }
 
         // Initialize
         window.addEventListener('load', () => {

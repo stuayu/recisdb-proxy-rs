@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod channel_files;
 pub mod dashboard;
 pub mod mirakurun;
 pub mod state;
@@ -53,6 +54,9 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/bondriver/:id/quality", get(api::get_bondriver_quality))
         .route("/bondrivers/ranking", get(api::get_bondrivers_ranking))
         // Channel API
+        .route("/client-view/targets", get(api::get_client_view_targets))
+        .route("/client-view", get(api::get_client_view))
+        .route("/client-view/files/:kind", get(api::get_client_view_file))
         .route("/channels", get(api::get_channels))
         .route("/channels/export", get(api::export_channels))
         .route("/channels/import", post(api::import_channels))
@@ -216,8 +220,10 @@ pub async fn start_web_server(
     tuner_config: Option<state::TunerConfigInfo>,
     auth: AuthConfig,
     mirakurun_enabled: bool,
+    proxy_listen_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth);
+    web_state.proxy_listen_addr = proxy_listen_addr;
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
     }
@@ -364,6 +370,195 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// The client-setup guide must show exactly what a BonDriver client will
+    /// enumerate: group targets first, then the virtual space/channel table
+    /// with client-facing indices and physical mappings.
+    #[tokio::test]
+    async fn client_view_reports_what_a_client_will_enumerate() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        {
+            let db = state.database.lock().await;
+            let d1 = db
+                .insert_bon_driver(&crate::database::NewBonDriver::new("BonDriver_A.dll"))
+                .unwrap();
+            let d2 = db
+                .insert_bon_driver(&crate::database::NewBonDriver::new("BonDriver_B.dll"))
+                .unwrap();
+            db.set_group_name(d1, Some("PX")).unwrap();
+            db.set_group_name(d2, Some("PX")).unwrap();
+
+            let mk = |nid: u16, sid: u16, tsid: u16, name: &str, space: u32, channel: u32| {
+                recisdb_protocol::ChannelInfo {
+                    nid,
+                    sid,
+                    tsid,
+                    manual_sheet: None,
+                    raw_name: Some(name.to_string()),
+                    channel_name: Some(name.to_string()),
+                    physical_ch: None,
+                    remote_control_key: None,
+                    service_type: None,
+                    network_name: None,
+                    bon_space: Some(space),
+                    bon_channel: Some(channel),
+                    band_type: None,
+                    terrestrial_region: None,
+                }
+            };
+            // Same logical channel (NID+TSID) on both drivers with different
+            // physical bon_channel values, plus one BS channel on driver A.
+            db.insert_channel(d1, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 27)).unwrap();
+            db.insert_channel(d2, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 5)).unwrap();
+            db.insert_channel(d1, &mk(4, 101, 0x4010, "BS朝日", 1, 0)).unwrap();
+        }
+        let app = build_app(state, false);
+
+        // Targets: the group comes first (recommended), then the drivers.
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/client-view/targets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["type"], "group");
+        assert_eq!(targets[0]["name"], "PX");
+        // Distinct (NID, TSID) across the group — the shared NHK channel on
+        // both drivers counts once, matching what STEP 3 enumerates.
+        assert_eq!(targets[0]["enabled_channels"], 2);
+        assert!(targets.iter().any(|t| t["type"] == "driver" && t["name"] == "BonDriver_A.dll"));
+
+        // Client view for the group: terrestrial space first, then BS, with
+        // 0-based client-facing indices and both physical mappings for the
+        // shared logical channel.
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/client-view?tuner=PX").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true, "body: {json}");
+        assert_eq!(json["resolved_type"], "group");
+        let spaces = json["spaces"].as_array().unwrap();
+        assert_eq!(spaces.len(), 2);
+        assert_eq!(spaces[0]["index"], 0);
+        assert_eq!(spaces[0]["name"], "地デジ (関東)");
+        let channels = spaces[0]["channels"].as_array().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0]["index"], 0);
+        assert_eq!(channels[0]["name"], "NHK総合");
+        assert_eq!(channels[0]["physical"].as_array().unwrap().len(), 2);
+        assert_eq!(spaces[1]["name"], "BS");
+
+        // A single driver resolves too, but sees only its own channels.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view?tuner=BonDriver_B.dll")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["spaces"].as_array().unwrap().len(), 1, "driver B has no BS channel");
+
+        // Unknown tuner names are an explicit error, never someone else's
+        // channel list.
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/client-view?tuner=nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+
+        // Channel-file downloads: the ch2 uses the same space/channel
+        // indices as the enumeration above, encoded in Shift_JIS.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view/files/tvtest-ch2?tuner=PX")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let disposition = res
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disposition.contains("BonDriver_NetworkProxy.ch2"), "{disposition}");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(&body);
+        assert!(decoded.contains(";#SPACE(0,地デジ （関東）)"), "{decoded}");
+        // NHK on terrestrial space 0 channel 0, enabled.
+        assert!(decoded.contains("NHK総合,0,0,0,,1024,32744,32744,1"), "{decoded}");
+        // BS asahi in space 1.
+        assert!(decoded.contains(";#SPACE(1,BS)"), "{decoded}");
+
+        // The zip bundle contains INI (with Host-derived address), channel
+        // files, and README.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view/files/bundle?tuner=PX")
+                    .header(header::HOST, "192.168.10.20:40080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body.to_vec())).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        for expected in [
+            "BonDriver_NetworkProxy.ini",
+            "BonDriver_NetworkProxy.ch2",
+            "BonDriver_NetworkProxy(BonDriver_NetworkProxy).ChSet4.txt",
+            "ChSet5.txt",
+            "README.txt",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+        }
+        let mut ini = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("BonDriver_NetworkProxy.ini").unwrap(), &mut ini)
+            .unwrap();
+        assert!(ini.contains("Tuner = PX"), "{ini}");
+        // Host header host + default proxy port (proxy_listen_addr is None in tests).
+        assert!(ini.contains("Address = 192.168.10.20:40070"), "{ini}");
+
+        // Unknown kind → 404.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view/files/nonsense?tuner=PX")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

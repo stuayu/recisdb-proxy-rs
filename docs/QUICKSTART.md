@@ -74,6 +74,21 @@ recisdb-proxy --config recisdb-proxy.toml
 
 変更はリアルタイムでデータベースに反映されます。
 
+#### クライアント設定タブ
+
+TVTest / EDCB 側の設定はダッシュボードの「クライアント設定」タブで完結します:
+
+1. **STEP 1** で接続先チューナー (グループ推奨) を選ぶ
+2. **STEP 2** の `BonDriver_NetworkProxy.ini` をコピーして、クライアントPCの
+   BonDriver_NetworkProxy.dll と同じフォルダに保存
+3. **STEP 3** で TVTest 用 `.ch2` / EDCB 用 `ChSet4.txt`・`ChSet5.txt` を
+   ダウンロードして配置すると、クライアント側のチャンネルスキャンを省略できます
+   (「まとめてダウンロード」で INI・README 込みの zip も取得可能)
+4. **STEP 4** の対応表で、クライアントに表示される空間・チャンネルを確認
+
+なお、かんたんセットアップ (`recisdb-proxy-setup`) を使った場合は、インストール先の
+`client-config/` フォルダにも配布用の INI・README が自動出力されています。
+
 ## よくあるシナリオ
 
 ### シナリオ1: PX-MLT1（4チューナー）を複数クライアントで共有

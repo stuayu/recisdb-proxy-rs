@@ -402,6 +402,40 @@ impl SetupApp {
             }
         }
 
+        // クライアント (TVTest/EDCB側PC) に配布する設定一式を出力する。
+        // Tuner= は登録済みドライバーのグループ名を優先 (グループ指定なら
+        // サーバーが空きチューナーを自動選択できるため)、無ければ先頭の
+        // DLLパスを入れる。
+        {
+            let tuner_hint = db
+                .get_all_bon_drivers()
+                .ok()
+                .and_then(|drivers| {
+                    drivers
+                        .iter()
+                        .find_map(|d| d.group_name.clone().filter(|g| !g.trim().is_empty()))
+                        .or_else(|| drivers.first().map(|d| d.dll_path.clone()))
+                })
+                .unwrap_or_default();
+            let proxy_port = self.listen_addr.rsplit(':').next().unwrap_or("40070");
+            let web_port = self.web_listen_addr.rsplit(':').next().unwrap_or("40080");
+            let ip = setup_helpers::local_lan_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            match setup_helpers::write_client_config_bundle(
+                &install_dir,
+                setup_exe_dir().as_deref(),
+                &format!("{ip}:{proxy_port}"),
+                &tuner_hint,
+                &format!("http://{ip}:{web_port}"),
+            ) {
+                Ok(lines) => self.log_lines.extend(lines),
+                Err(e) => self
+                    .log_lines
+                    .push(format!("クライアント設定の出力に失敗しました: {e}")),
+            }
+        }
+
         self.step = Step::Done;
     }
 
@@ -844,11 +878,17 @@ impl SetupApp {
         ui.add_space(16.0);
         ui.separator();
         ui.label("このあと必要な作業:");
-        ui.label("  ・TVTest等の録画・視聴ソフトに BonDriver_NetworkProxy.dll を設定してください。");
         ui.label(format!(
-            "  ・Webダッシュボード ({}) からチューナーの詳細設定ができます。",
+            "  ・「{}\\{}」の中身を、TVTest/EDCB を動かすPCの BonDriver フォルダにコピーしてください。",
+            self.install_dir().display(),
+            setup_helpers::CLIENT_CONFIG_DIR
+        ));
+        ui.label("    (接続先アドレス入りの BonDriver_NetworkProxy.ini と手順の README が入っています)");
+        ui.label(format!(
+            "  ・Webダッシュボード ({}) からチューナーの詳細設定や、チャンネルスキャン後の",
             dashboard_url(&self.web_listen_addr)
         ));
+        ui.label("    TVTest用 .ch2 / EDCB用 ChSet4/ChSet5 のダウンロードができます(「クライアント設定」タブ)。");
     }
 }
 

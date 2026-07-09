@@ -534,6 +534,162 @@ pub fn generate_config(listen_addr: &str, web_listen_addr: &str, db_path: &str) 
 }
 
 // =============================================================================
+// クライアント配布用設定一式の出力
+// =============================================================================
+
+/// クライアント (TVTest/EDCB を動かすPC) に配布するファイル一式を出力する
+/// フォルダ名。インストール先直下に作られる。
+pub const CLIENT_CONFIG_DIR: &str = "client-config";
+
+/// bondriver-proxy-client に同梱している INI サンプルをそのまま埋め込み、
+/// Address/Tuner だけを実際の値に差し替えて配布用 INI を生成する
+/// (generate_config が recisdb-proxy.toml.example を埋め込むのと同じ方式)。
+const CLIENT_INI_TEMPLATE: &str =
+    include_str!("../../bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample");
+
+/// このマシンのLAN側IPアドレスを推定する。UDPソケットの接続先を
+/// 8.8.8.8 に「設定」するだけで実際のパケットは送信されない。
+/// (listen が 0.0.0.0 のとき、クライアントに配る INI には具体的な
+/// 到達可能アドレスが必要になるため。)
+pub fn local_lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// 配布用 BonDriver_NetworkProxy.ini を生成する。
+pub fn generate_client_ini(server_addr: &str, tuner: &str) -> String {
+    let mut replaced_addr = false;
+    let mut replaced_tuner = false;
+    let content = CLIENT_INI_TEMPLATE
+        .lines()
+        .map(|line| {
+            if !replaced_addr && line.trim_start().starts_with("Address =") {
+                replaced_addr = true;
+                format!("Address = {server_addr}")
+            } else if !replaced_tuner && line.trim_start().starts_with("Tuner =") {
+                replaced_tuner = true;
+                format!("Tuner = {tuner}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    assert!(
+        replaced_addr && replaced_tuner,
+        "generate_client_ini: Address/Tuner line not found in BonDriver_NetworkProxy.ini.sample \
+         — the sample layout changed; update this generator."
+    );
+    content + "\r\n"
+}
+
+/// クライアント配布用の README を生成する。セットアップウィザードの
+/// client-config フォルダ (`includes_channel_files = false`: スキャン前
+/// なのでチャンネル設定ファイルは同梱されない) と、ダッシュボードの
+/// 「まとめてダウンロード」zip (web/api.rs, `true`: .ch2/ChSet を同梱)
+/// の両方で使う。
+pub fn generate_client_readme(
+    server_addr: &str,
+    dashboard_url: &str,
+    includes_channel_files: bool,
+) -> String {
+    let channel_files_step = if includes_channel_files {
+        "3. チャンネル設定ファイルの配置\r\n\
+         \r\n\
+         [TVTest]\r\n\
+            同梱の BonDriver_NetworkProxy.ch2 を BonDriver_NetworkProxy.dll と\r\n\
+            同じフォルダに置くと、TVTest のチャンネルスキャンを省略できます。\r\n\
+            (置かない場合は TVTest の設定 → チャンネルスキャンを一度実行してください)\r\n\
+         \r\n\
+         [EDCB]\r\n\
+            同梱の BonDriver_NetworkProxy(BonDriver_NetworkProxy).ChSet4.txt と\r\n\
+            ChSet5.txt を EDCB の Setting フォルダにコピーすると、\r\n\
+            EpgDataCap_Bon でのチャンネルスキャンを省略できます。\r\n"
+            .to_string()
+    } else {
+        format!(
+            "3. チャンネル設定ファイル (TVTest の .ch2 / EDCB の ChSet4/ChSet5)\r\n\
+             \r\n\
+             サーバー側でチャンネルスキャンが完了したあと、Webダッシュボード\r\n\
+             ({dashboard_url}) の「クライアント設定」タブからダウンロードできます。\r\n\
+             .ch2 は BonDriver_NetworkProxy.dll と同じフォルダへ、\r\n\
+             ChSet4/ChSet5 は EDCB の Setting フォルダへ置いてください。\r\n\
+             (置かない場合は TVTest / EpgDataCap_Bon でチャンネルスキャンを\r\n\
+              一度実行すれば同じ結果になります)\r\n"
+        )
+    };
+    format!(
+        "recisdb-proxy クライアント設定一式\r\n\
+         ==================================\r\n\
+         \r\n\
+         1. BonDriver_NetworkProxy.dll と BonDriver_NetworkProxy.ini を\r\n\
+            TVTest / EDCB の BonDriver フォルダにコピーする\r\n\
+         2. TVTest の場合: 設定 → ドライバ で BonDriver_NetworkProxy.dll を選択\r\n\
+         {channel_files_step}\
+         \r\n\
+         接続先サーバー: {server_addr}\r\n\
+         (サーバーのIPアドレスが変わった場合は BonDriver_NetworkProxy.ini の\r\n\
+          Address 行を書き換えてください)\r\n\
+         詳しい手順・チャンネル一覧はダッシュボード ({dashboard_url}) の\r\n\
+         「クライアント設定」タブを参照してください。\r\n"
+    )
+}
+
+/// クライアント配布用フォルダ (install_dir/client-config/) に INI・README を
+/// 書き出し、`source_dir` (リリースzipの展開先) に BonDriver_NetworkProxy.dll が
+/// あれば同梱する。戻り値は画面ログ用のメッセージ。
+pub fn write_client_config_bundle(
+    install_dir: &Path,
+    source_dir: Option<&Path>,
+    server_addr: &str,
+    tuner: &str,
+    dashboard_url: &str,
+) -> Result<Vec<String>, String> {
+    let bundle_dir = install_dir.join(CLIENT_CONFIG_DIR);
+    std::fs::create_dir_all(&bundle_dir)
+        .map_err(|e| format!("{} の作成に失敗しました: {e}", bundle_dir.display()))?;
+
+    let mut log = Vec::new();
+
+    let ini_path = bundle_dir.join("BonDriver_NetworkProxy.ini");
+    std::fs::write(&ini_path, generate_client_ini(server_addr, tuner))
+        .map_err(|e| format!("INIの書き出しに失敗しました: {e}"))?;
+
+    let readme_path = bundle_dir.join("README.txt");
+    std::fs::write(
+        &readme_path,
+        generate_client_readme(server_addr, dashboard_url, false),
+    )
+    .map_err(|e| format!("READMEの書き出しに失敗しました: {e}"))?;
+
+    // リリースzipにクライアントDLLが同梱されていればバンドルにコピーする。
+    // 無くてもエラーにしない (サーバーだけのパッケージ構成もあり得る)。
+    let mut dll_copied = false;
+    if let Some(source_dir) = source_dir {
+        let dll_src = source_dir.join("BonDriver_NetworkProxy.dll");
+        if dll_src.exists() {
+            let dll_dest = bundle_dir.join("BonDriver_NetworkProxy.dll");
+            std::fs::copy(&dll_src, &dll_dest)
+                .map_err(|e| format!("クライアントDLLのコピーに失敗しました: {e}"))?;
+            dll_copied = true;
+        }
+    }
+
+    log.push(format!(
+        "クライアント配布用の設定一式を出力しました: {}",
+        bundle_dir.display()
+    ));
+    if !dll_copied {
+        log.push(
+            "  (BonDriver_NetworkProxy.dll が見つからなかったため INI と README のみ出力しました)"
+                .to_string(),
+        );
+    }
+    Ok(log)
+}
+
+// =============================================================================
 // 本体バイナリのインストール/更新
 // =============================================================================
 
@@ -811,6 +967,60 @@ mod tests {
             r"C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.db"
         );
         assert_eq!(escape_toml_basic_string("no_backslashes.db"), "no_backslashes.db");
+    }
+
+    #[test]
+    fn generate_client_ini_replaces_address_and_tuner() {
+        let ini = generate_client_ini("192.168.1.10:40070", "PX-MLT");
+        assert!(ini.contains("Address = 192.168.1.10:40070"));
+        assert!(ini.contains("Tuner = PX-MLT"));
+        // 元サンプルの他の設定 (デフォルト値・説明コメント) は保持される
+        assert!(ini.contains("ServiceFilter = all"));
+        assert!(ini.contains("[Logging]"));
+        // 差し替え前の値が残っていないこと
+        assert!(!ini.contains("Address = 127.0.0.1:40070"));
+    }
+
+    #[test]
+    fn write_client_config_bundle_outputs_ini_readme_and_optional_dll() {
+        let base = std::env::temp_dir().join(format!("client_bundle_test_{}", std::process::id()));
+        let install_dir = base.join("install");
+        let source_dir = base.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("BonDriver_NetworkProxy.dll"), b"dummy dll").unwrap();
+
+        let log = write_client_config_bundle(
+            &install_dir,
+            Some(&source_dir),
+            "192.168.1.10:40070",
+            "PX-MLT",
+            "http://192.168.1.10:40080",
+        )
+        .unwrap();
+        assert!(!log.is_empty());
+
+        let bundle = install_dir.join(CLIENT_CONFIG_DIR);
+        let ini = std::fs::read_to_string(bundle.join("BonDriver_NetworkProxy.ini")).unwrap();
+        assert!(ini.contains("Address = 192.168.1.10:40070"));
+        assert!(ini.contains("Tuner = PX-MLT"));
+        let readme = std::fs::read_to_string(bundle.join("README.txt")).unwrap();
+        assert!(readme.contains("http://192.168.1.10:40080"));
+        assert!(bundle.join("BonDriver_NetworkProxy.dll").exists());
+
+        // DLLが無いソースでも失敗せず INI/README は出力される
+        let install_dir2 = base.join("install2");
+        let log2 = write_client_config_bundle(
+            &install_dir2,
+            None,
+            "10.0.0.2:40070",
+            "",
+            "http://10.0.0.2:40080",
+        )
+        .unwrap();
+        assert!(log2.iter().any(|l| l.contains("INI と README のみ")));
+        assert!(install_dir2.join(CLIENT_CONFIG_DIR).join("BonDriver_NetworkProxy.ini").exists());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

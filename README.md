@@ -156,7 +156,16 @@ TLS 設定やログレベルなどの詳細は設定ファイルの例にコメ�
 
 ## クライアント設定 (BonDriver_NetworkProxy)
 
-TVTest などから接続するための BonDriver クライアント DLL の設定は [bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample](bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample) を参照してください。
+**かんたんな方法 (推奨):** Webダッシュボードの「クライアント設定」タブを開くと、
+接続先チューナーの選択 → 接続先アドレス入りの INI のコピー → クライアントに表示される
+チャンネル一覧の確認、までを画面の指示どおりに進められます。同じタブから
+TVTest 用 `.ch2` / EDCB 用 `ChSet4.txt`・`ChSet5.txt`、およびそれらと INI・README を
+まとめた zip をダウンロードできます (クライアント側のチャンネルスキャンを省略できます)。
+また、かんたんセットアップ (`recisdb-proxy-setup`) 実行時にも、インストール先の
+`client-config/` フォルダへ配布用の INI・README (・同梱されていればクライアント DLL) が
+自動出力されます。
+
+手動で設定する場合は [bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample](bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample) を参照してください。
 
 主な設定項目:
 

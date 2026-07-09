@@ -356,6 +356,31 @@ impl Database {
         Ok(records)
     }
 
+    /// Resolve a client-supplied `Tuner=` value with OpenTuner's precedence:
+    /// DLL path → group name → driver display name. Returns the matched
+    /// drivers' dll_paths and whether the name was a group.
+    ///
+    /// Shared by the session's OpenTuner handler (server/session.rs) and the
+    /// dashboard's client-setup guide (`/api/client-view`), so the guide can
+    /// never resolve a name differently than a real client connection would.
+    /// The session's additional last-resort fallback (first available
+    /// driver on no match) intentionally stays in session.rs — the guide
+    /// must report an unknown name as an error, not some other driver's
+    /// channels.
+    pub fn resolve_tuner_target(&self, name: &str) -> Result<Option<(Vec<String>, bool)>> {
+        if let Some(driver) = self.get_bon_driver_by_path(name)? {
+            return Ok(Some((vec![driver.dll_path], false)));
+        }
+        let group = self.get_group_drivers(name)?;
+        if !group.is_empty() {
+            return Ok(Some((group.into_iter().map(|d| d.dll_path).collect(), true)));
+        }
+        if let Some(driver) = self.get_bon_driver_by_display_name(name)? {
+            return Ok(Some((vec![driver.dll_path], false)));
+        }
+        Ok(None)
+    }
+
     /// Set group_name for a BonDriver by ID.
     pub fn set_group_name(&self, id: i64, group_name: Option<&str>) -> Result<()> {
         self.conn.execute(

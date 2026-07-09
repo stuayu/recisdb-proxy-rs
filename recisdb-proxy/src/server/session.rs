@@ -2,8 +2,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
@@ -13,7 +11,7 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
-    broadcast_region::{classify_nid, TerrestrialRegion},
+    broadcast_region::classify_nid,
     decode_client_message, decode_header, encode_server_message, BandType, ClientChannelInfo,
     ClientMessage, ErrorCode, ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
 };
@@ -79,33 +77,7 @@ impl Default for PrefillRuntimeConfig {
     }
 }
 
-fn fallback_space_label(actual_space: u32) -> String {
-    // 最小実装: よくある割当の想定
-    // 必要なら後で NID/分類でより正確に推定する
-    match actual_space {
-        0 => "GR".to_string(),
-        1 => "BS/CS".to_string(),
-        2 => "BS".to_string(),
-        3 => "CS".to_string(),
-        _ => format!("Space{}", actual_space),
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ChannelEntry {
-    bon_channel: u32,     // 実際の物理チャンネル番号 (代表ドライバのもの)
-    name: String,         // 表示名
-    nid: u16,             // Network ID (NID+TSIDでの一意識別用)
-    tsid: u16,            // Transport Stream ID
-}
-
-/// Multiple driver mappings for a single virtual channel
-#[derive(Clone, Debug)]
-struct VirtualChannelMapping {
-    driver_path: String,  // BonDriver DLL path
-    actual_space: u32,    // Physical space on this driver
-    actual_channel: u32,  // Physical channel on this driver
-}
+use crate::server::client_view::{self, ChannelEntry};
 
 
 /// Capacity of the per-session TS write buffer.
@@ -241,14 +213,14 @@ pub struct Session {
     ts_bytes_sent: u64,
     ts_msgs_sent: u64,
     last_ts_log: std::time::Instant,
-    channel_map_cache: HashMap<u32, Vec<ChannelEntry>>,
+    /// region_key ("関東"/"BS"/...) -> クライアントに列挙するチャンネル一覧。
+    /// EnumChannelName はチャンネル数ぶん呼ばれるので、リージョンごとに
+    /// 1回だけDBスキャンする (clear_caches でクリア)。
+    channel_map_cache: HashMap<String, Vec<ChannelEntry>>,
     // ★追加: 仮想space_idx(0..N-1) -> (actual_space, display_name, region_key) のマップをチューナごとにキャッシュ
     // 例: [(0, "地デジ", "宮城"), (0, "地デジ", "福島"), (1, "BS", "BS"), (2, "CS", "CS")]
     // region_key はチャンネルフィルタリング用、display_name は EnumTuningSpace 表示用
     space_list_cache: HashMap<String, Vec<(u32, String, String)>>,
-    // ★追加: 仮想チャンネル (NID, TSID) -> 複数のドライバー/スペース/チャンネル マッピング
-    // 同じNID+TSIDが複数のドライバーに存在する場合、すべてのマッピングを保持
-    virtual_channel_mappings: HashMap<String, HashMap<(u16, u16), Vec<VirtualChannelMapping>>>,
     /// Session registry for web dashboard.
     session_registry: Arc<SessionRegistry>,
     /// Current channel info string (for history).
@@ -373,7 +345,6 @@ impl Session {
             last_ts_log: std::time::Instant::now(),
             channel_map_cache: HashMap::new(),
             space_list_cache: HashMap::new(),
-            virtual_channel_mappings: HashMap::new(),
             session_registry,
             current_channel_info: None,
             current_channel_name: None,
@@ -930,221 +901,45 @@ impl Session {
             .await
     }
 
-    async fn build_channel_map_for_space(&self, tuner_path: &str, space: u32)
-        -> Vec<ChannelEntry>
-    {
-        let db = self.database.lock().await;
-
-        // driver id を引く
-        let Some(driver) = db.get_bon_driver_by_path(tuner_path).ok().flatten() else {
-            return vec![];
-        };
-
-        // get_all_channels_with_drivers で取得してフィルタ
-        let all = match db.get_all_channels_with_drivers() {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-
-        let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
-
-        for (ch, bd_opt) in all {
-            let Some(bd) = bd_opt else { continue; };
-            if bd.id != driver.id { continue; }
-            if ch.space != space { continue; }
-            if !ch.is_enabled { continue; }
-
-            let name = ch.service_name
-                .clone()
-                .or(ch.ts_name.clone())
-                .unwrap_or_else(|| format!("CH{}", ch.channel));
-
-            uniq.entry(ch.channel).or_insert((name, ch.nid as u16, ch.tsid as u16));
-        }
-
-        uniq.into_iter()
-            .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
-            .collect()
-    }
-
-    async fn ensure_channel_map(&mut self, space: u32) -> Vec<ChannelEntry> {
-        if let Some(v) = self.channel_map_cache.get(&space) {
-            trace!("[Session {}] ensure_channel_map: using cache for space {} (channels: {})", self.id, space, v.len());
+    /// Get channel map for a specific space and region (for virtual space filtering).
+    /// Cached per region_key: TVTest calls EnumChannelName once per channel,
+    /// so without the cache every call would re-scan the whole channels table
+    /// under the DB mutex. Cleared by `clear_caches` (every OpenTuner).
+    async fn ensure_channel_map_with_region(&mut self, _space: u32, region_name: &str) -> Vec<ChannelEntry> {
+        if let Some(v) = self.channel_map_cache.get(region_name) {
             return v.clone();
         }
 
+        let all = {
+            let db = self.database.lock().await;
+            match db.get_all_channels_with_drivers() {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("[Session {}] ensure_channel_map_with_region: failed to get channels: {}", self.id, e);
+                    Vec::new()
+                },
+            }
+        };
+
         let map = if !self.group_driver_paths.is_empty() {
-            // Group mode: aggregate channels from all group drivers
-            let db = self.database.lock().await;
-
-            let all = match db.get_all_channels_with_drivers() {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("[Session {}] ensure_channel_map: failed to get channels: {}", self.id, e);
-                    Vec::new()
-                },
-            };
-
-            let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
-
-            for (ch, bd_opt) in all {
-                let Some(bd) = bd_opt else { continue; };
-                // Check if this driver belongs to the group
-                if !self.group_driver_paths.contains(&bd.dll_path) {
-                    continue;
-                }
-
-                if ch.space != space { continue; }
-                let bch = ch.channel;
-
-                if !ch.is_enabled { continue; }
-
-                let name = ch.service_name
-                    .clone()
-                    .or(ch.ts_name.clone())
-                    .unwrap_or_else(|| format!("CH{}", bch));
-
-                uniq.entry(bch).or_insert((name, ch.nid as u16, ch.tsid as u16));
-            }
-
-            uniq.into_iter()
-                .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
-                .collect::<Vec<_>>()
-        } else {
-            // Single tuner mode
-            let tuner_path = self
-                .current_tuner_path
-                .as_ref()
-                .or(self.default_tuner.as_ref())
-                .cloned()
-                .unwrap_or_default();
-
-            if tuner_path.is_empty() {
-                debug!("[Session {}] ensure_channel_map: tuner_path is empty for space {}", self.id, space);
-                self.channel_map_cache.insert(space, Vec::new());
-                return Vec::new();
-            }
-
-            let db = self.database.lock().await;
-
-            let all = match db.get_all_channels_with_drivers() {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("[Session {}] ensure_channel_map: failed to get channels: {}", self.id, e);
-                    Vec::new()
-                },
-            };
-
-            let mut uniq: BTreeMap<u32, (String, u16, u16)> = BTreeMap::new();
-
-            for (ch, bd_opt) in all {
-                let Some(bd) = bd_opt else { continue; };
-                if bd.dll_path != tuner_path { continue; }
-
-                if ch.space != space { continue; }
-                let bch = ch.channel;
-
-                if !ch.is_enabled { continue; }
-
-                let name = ch.service_name
-                    .clone()
-                    .or(ch.ts_name.clone())
-                    .unwrap_or_else(|| format!("CH{}", bch));
-
-                uniq.entry(bch).or_insert((name, ch.nid as u16, ch.tsid as u16));
-            }
-
-            uniq.into_iter()
-                .map(|(bon_channel, (name, nid, tsid))| ChannelEntry { bon_channel, name, nid, tsid })
-                .collect::<Vec<_>>()
-        };
-
-        debug!("[Session {}] ensure_channel_map: final channels for space {}: {} items", self.id, space, map.len());
-        self.channel_map_cache.insert(space, map.clone());
-        map
-    }
-
-    /// Get channel map for a specific space and region (for virtual space filtering).
-    async fn ensure_channel_map_with_region(&mut self, _space: u32, region_name: &str) -> Vec<ChannelEntry> {
-        let db = self.database.lock().await;
-
-        let all = match db.get_all_channels_with_drivers() {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("[Session {}] ensure_channel_map_with_region: failed to get channels: {}", self.id, e);
-                Vec::new()
-            },
-        };
-
-        let tuner_path = if !self.group_driver_paths.is_empty() {
-            None  // Group mode
-        } else {
-            Some(
-                self.current_tuner_path
-                    .as_ref()
-                    .or(self.default_tuner.as_ref())
-                    .cloned()
-                    .unwrap_or_default()
+            // Group mode
+            client_view::build_channel_list(
+                &all,
+                |path| self.group_driver_paths.iter().any(|p| p == path),
+                region_name,
             )
+        } else {
+            let tuner_path = self.current_or_default_tuner_path();
+            client_view::build_channel_list(&all, |path| path == tuner_path, region_name)
         };
 
-        // NID+TSIDをキーにして重複排除（異なるBonDriverが同じNID+TSIDに違うbon_channelを使う場合の対策）
-        let mut uniq: BTreeMap<(u16, u16), (u32, String)> = BTreeMap::new();
-
-        for (ch, bd_opt) in all {
-            let Some(bd) = bd_opt else { continue; };
-
-            // Check driver path/group
-            if let Some(path) = &tuner_path {
-                if bd.dll_path != *path { continue; }
-            } else {
-                // Group mode
-                if !self.group_driver_paths.contains(&bd.dll_path) {
-                    continue;
-                }
-            }
-
-            // Filter by region/broadcast type
-            // For terrestrial, filter by TerrestrialRegion display_name (広域圏: "関東", "東北", etc.)
-            // For BS/CS, filter by broadcast type string ("BS" or "CS")
-            let ch_matches = {
-                let (btype, region) = classify_nid(ch.nid as u16);
-                match btype {
-                    recisdb_protocol::types::BroadcastType::BS => region_name == "BS",
-                    recisdb_protocol::types::BroadcastType::CS => region_name == "CS",
-                    recisdb_protocol::types::BroadcastType::Terrestrial => {
-                        let ch_region = region.map(|r| match r {
-                            TerrestrialRegion::Unknown(_) => "Unknown",
-                            _ => r.display_name(),
-                        }).unwrap_or("Unknown");
-                        ch_region == region_name
-                    }
-                }
-            };
-
-            if !ch_matches { continue; }
-            if !ch.is_enabled { continue; }
-
-            let nid_tsid = (ch.nid as u16, ch.tsid as u16);
-            let bch = ch.channel;
-
-            let name = ch.service_name
-                .clone()
-                .or(ch.ts_name.clone())
-                .unwrap_or_else(|| format!("CH{}", bch));
-
-            uniq.entry(nid_tsid).or_insert((bch, name));
-        }
-
-        uniq.into_iter()
-            .map(|((nid, tsid), (bon_channel, name))| ChannelEntry { bon_channel, name, nid, tsid })
-            .collect::<Vec<_>>()
+        self.channel_map_cache.insert(region_name.to_string(), map.clone());
+        map
     }
 
     fn clear_caches(&mut self) {
         self.channel_map_cache.clear();
         self.space_list_cache.clear();
-        self.virtual_channel_mappings.clear();
     }
 
     fn current_or_default_tuner_path(&self) -> String {
@@ -1157,266 +952,55 @@ impl Session {
 
     /// チューナに紐づく「実スペース一覧」を DB から構築してキャッシュする
     async fn ensure_space_list(&mut self) -> Vec<u32> {
-        // If group is set, get spaces from all group drivers
-        if !self.group_driver_paths.is_empty() {
-            let cache_key = format!("group_{}", self.current_group_name.as_ref().unwrap_or(&"unknown".to_string()));
-            
-            if let Some(v) = self.space_list_cache.get(&cache_key) {
-                trace!("[Session {}] ensure_space_list: using cache for group {} (spaces: {:?})", 
-                    self.id, self.current_group_name.as_ref().unwrap_or(&"unknown".to_string()), v);
-                return v.iter().map(|(actual_space, _, _)| *actual_space).collect();
+        // Cache key: group name in group mode, tuner path otherwise.
+        let (cache_key, is_group) = if !self.group_driver_paths.is_empty() {
+            let key = format!("group_{}", self.current_group_name.as_deref().unwrap_or("unknown"));
+            (key, true)
+        } else {
+            let tuner_path = self.current_or_default_tuner_path();
+            if tuner_path.is_empty() {
+                debug!("[Session {}] ensure_space_list: tuner_path is empty", self.id);
+                return Vec::new();
             }
+            (tuner_path, false)
+        };
 
+        if let Some(v) = self.space_list_cache.get(&cache_key) {
+            trace!("[Session {}] ensure_space_list: using cache for {} (spaces: {:?})",
+                self.id, cache_key, v);
+            return v.iter().map(|(actual_space, _, _)| *actual_space).collect();
+        }
+
+        let all = {
             let db = self.database.lock().await;
-            let all = match db.get_all_channels_with_drivers() {
+            match db.get_all_channels_with_drivers() {
                 Ok(v) => v,
                 Err(e) => {
                     debug!("[Session {}] ensure_space_list: failed to get channels: {}", self.id, e);
                     Vec::new()
                 },
-            };
-
-            // Build unique (space, region) pairs based on NID + TSID to eliminate duplicates
-            // But record ALL mappings (driver, space, channel) for each NID+TSID combination
-            let mut nid_tsid_seen: BTreeSet<(u16, u16)> = BTreeSet::new();
-            let mut region_seen: BTreeSet<String> = BTreeSet::new();  // For BS/CS deduplication
-            let mut space_region_names: HashMap<String, (u32, String)> = HashMap::new();  // region_name -> (space, name)
-            let mut nid_tsid_mappings: HashMap<(u16, u16), Vec<VirtualChannelMapping>> = HashMap::new();
-            
-            for (ch, bd_opt) in all {
-                let Some(bd) = bd_opt else { continue; };
-                // Check if this driver belongs to the group
-                if !self.group_driver_paths.contains(&bd.dll_path) {
-                    continue;
-                }
-                if !ch.is_enabled { continue; }
-                
-                let nid_tsid = (ch.nid as u16, ch.tsid as u16);
-                
-                // Record this mapping for this NID+TSID (allow multiples from different drivers)
-                nid_tsid_mappings
-                    .entry(nid_tsid)
-                    .or_insert_with(Vec::new)
-                    .push(VirtualChannelMapping {
-                        driver_path: bd.dll_path.clone(),
-                        actual_space: ch.space,
-                        actual_channel: ch.channel as u32,
-                    });
-                
-                // For display purposes, only register once per NID+TSID
-                if nid_tsid_seen.contains(&nid_tsid) {
-                    continue;
-                }
-                nid_tsid_seen.insert(nid_tsid);
-                
-                // Get region name: TerrestrialRegion display_name for terrestrial (広域圏), "BS"/"CS" for satellite
-                let (btype, terrestrial_region) = classify_nid(ch.nid as u16);
-                let is_terrestrial = matches!(btype, recisdb_protocol::types::BroadcastType::Terrestrial)
-                    && terrestrial_region.as_ref().map_or(false, |r| !matches!(r, TerrestrialRegion::Unknown(_)));
-                let region_name = match btype {
-                    recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
-                    recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
-                    recisdb_protocol::types::BroadcastType::Terrestrial => {
-                        terrestrial_region.as_ref().map(|r| match r {
-                            TerrestrialRegion::Unknown(_) => "Unknown".to_string(),
-                            _ => r.display_name().to_string(),
-                        }).unwrap_or_else(|| "Unknown".to_string())
-                    }
-                };
-                debug!("[Session {}] NID=0x{:04X} btype={:?} region={}", 
-                    self.id, ch.nid, btype, region_name);
-
-                
-                // For all regions, only register once per region name (prevent duplicates)
-                // This applies to both BS/CS and terrestrial
-                if region_seen.contains(&region_name) {
-                    debug!("[Session {}] Skipping duplicate region: {}", self.id, region_name);
-                    continue;
-                }
-                region_seen.insert(region_name.clone());
-                
-                // Build display name based on region
-                let name = if is_terrestrial {
-                    format!("地デジ ({})", region_name)
-                } else {
-                    region_name.clone()
-                };
-                
-                // For BS/CS, use the actual space from the first driver we see
-                // For terrestrial, use actual space as-is
-                // This ensures each region appears only once in the list
-                space_region_names.insert(region_name, (ch.space, name));
             }
-
-            // Build the final list with proper sorting
-            // Order: 地上波 (terrestrial by region) -> BS -> CS
-            // Tuple: (actual_space, display_name, region_key)
-            let mut terrestrial_spaces: Vec<(u32, String, String)> = Vec::new();
-            let mut bs_space: Option<(u32, String, String)> = None;
-            let mut cs_space: Option<(u32, String, String)> = None;
-            
-            for (region, (space, name)) in space_region_names {
-                if region == "BS" {
-                    bs_space = Some((space, name, region));
-                } else if region == "CS" {
-                    cs_space = Some((space, name, region));
-                } else {
-                    terrestrial_spaces.push((space, name, region));
-                }
-            }
-            
-            // Sort terrestrial spaces by region key
-            terrestrial_spaces.sort_by(|a, b| a.2.cmp(&b.2));
-            
-            // Build final list: terrestrial first, then BS, then CS
-            let mut list: Vec<(u32, String, String)> = terrestrial_spaces;
-            if let Some(bs) = bs_space {
-                list.push(bs);
-            }
-            if let Some(cs) = cs_space {
-                list.push(cs);
-            }
-            debug!("[Session {}] ensure_space_list: final spaces for group {}: {:?}", 
-                self.id, self.current_group_name.as_ref().unwrap_or(&"unknown".to_string()), list);
-            self.space_list_cache.insert(cache_key.clone(), list.clone());
-            
-            // Also cache the NID+TSID mappings
-            let mut group_mappings = HashMap::new();
-            for (nid_tsid, mappings) in nid_tsid_mappings {
-                group_mappings.insert(nid_tsid, mappings);
-            }
-            self.virtual_channel_mappings.insert(cache_key, group_mappings);
-            
-            return list.iter().map(|(actual_space, _, _)| *actual_space).collect();
-        }
-
-        // Single tuner mode
-        let tuner_path = self.current_or_default_tuner_path();
-        if tuner_path.is_empty() {
-            debug!("[Session {}] ensure_space_list: tuner_path is empty", self.id);
-            return Vec::new();
-        }
-        if let Some(v) = self.space_list_cache.get(&tuner_path) {
-            trace!("[Session {}] ensure_space_list: using cache for {} (spaces: {:?})", self.id, tuner_path, v);
-            return v.iter().map(|(actual_space, _, _)| *actual_space).collect();
-        }
-
-        let db = self.database.lock().await;
-        let all = match db.get_all_channels_with_drivers() {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("[Session {}] ensure_space_list: failed to get channels: {}", self.id, e);
-                Vec::new()
-            },
         };
 
-        // Build unique (space, region) pairs based on NID + TSID to eliminate duplicates
-        // But record ALL mappings (driver, space, channel) for each NID+TSID combination
-        let mut nid_tsid_seen: BTreeSet<(u16, u16)> = BTreeSet::new();
-        let mut region_seen: BTreeSet<String> = BTreeSet::new();  // For BS/CS deduplication
-        let mut space_region_names: HashMap<String, (u32, String)> = HashMap::new();  // region_name -> (space, name)
-        let mut nid_tsid_mappings: HashMap<(u16, u16), Vec<VirtualChannelMapping>> = HashMap::new();
-        
-        for (ch, bd_opt) in all {
-            let Some(bd) = bd_opt else { continue; };
-            if bd.dll_path != tuner_path { continue; }
-            if !ch.is_enabled { continue; }
-            
-            let nid_tsid = (ch.nid as u16, ch.tsid as u16);
-            
-            // Record this mapping for this NID+TSID (allow multiples)
-            nid_tsid_mappings
-                .entry(nid_tsid)
-                .or_insert_with(Vec::new)
-                .push(VirtualChannelMapping {
-                    driver_path: bd.dll_path.clone(),
-                    actual_space: ch.space,
-                    actual_channel: ch.channel as u32,
-                });
-            
-            // For display purposes, only register once per NID+TSID
-            if nid_tsid_seen.contains(&nid_tsid) {
-                continue;
-            }
-            nid_tsid_seen.insert(nid_tsid);
-            
-            // Get region name: TerrestrialRegion display_name for terrestrial (広域圏), "BS"/"CS" for satellite
-            let (btype, terrestrial_region) = classify_nid(ch.nid as u16);
-            let is_terrestrial = matches!(btype, recisdb_protocol::types::BroadcastType::Terrestrial)
-                && terrestrial_region.as_ref().map_or(false, |r| !matches!(r, TerrestrialRegion::Unknown(_)));
-            let region_name = match btype {
-                recisdb_protocol::types::BroadcastType::BS => "BS".to_string(),
-                recisdb_protocol::types::BroadcastType::CS => "CS".to_string(),
-                recisdb_protocol::types::BroadcastType::Terrestrial => {
-                    terrestrial_region.as_ref().map(|r| match r {
-                        TerrestrialRegion::Unknown(_) => "Unknown".to_string(),
-                        _ => r.display_name().to_string(),
-                    }).unwrap_or_else(|| "Unknown".to_string())
-                }
-            };
-            debug!("[Session {}] NID=0x{:04X} btype={:?} region={}", 
-                self.id, ch.nid, btype, region_name);
-            
-            // For all regions, only register once per region name (prevent duplicates)
-            // This applies to both BS/CS and terrestrial
-            if region_seen.contains(&region_name) {
-                debug!("[Session {}] Skipping duplicate region: {}", self.id, region_name);
-                continue;
-            }
-            region_seen.insert(region_name.clone());
-            
-            // Build display name based on region
-            let name = if is_terrestrial {
-                format!("地デジ ({})", region_name)
-            } else {
-                region_name.clone()
-            };
-            
-            space_region_names.insert(region_name, (ch.space, name));
-        }
+        let result = if is_group {
+            client_view::build_space_list(&all, |path| {
+                self.group_driver_paths.iter().any(|p| p == path)
+            })
+        } else {
+            client_view::build_space_list(&all, |path| path == cache_key)
+        };
 
-        // Build the final list with proper sorting
-        // Order: 地上波 (terrestrial by region) -> BS -> CS
-        // Tuple: (actual_space, display_name, region_key)
-        let mut terrestrial_spaces: Vec<(u32, String, String)> = Vec::new();
-        let mut bs_space: Option<(u32, String, String)> = None;
-        let mut cs_space: Option<(u32, String, String)> = None;
-        
-        for (region, (space, name)) in space_region_names {
-            if region == "BS" {
-                bs_space = Some((space, name, region));
-            } else if region == "CS" {
-                cs_space = Some((space, name, region));
-            } else {
-                terrestrial_spaces.push((space, name, region));
-            }
-        }
-        
-        // Sort terrestrial spaces by region key
-        terrestrial_spaces.sort_by(|a, b| a.2.cmp(&b.2));
-        
-        // Build final list: terrestrial first, then BS, then CS
-        let mut list: Vec<(u32, String, String)> = terrestrial_spaces;
-        if let Some(bs) = bs_space {
-            list.push(bs);
-        }
-        if let Some(cs) = cs_space {
-            list.push(cs);
-        }
+        let list: Vec<(u32, String, String)> = result
+            .spaces
+            .into_iter()
+            .map(|s| (s.actual_space, s.display_name, s.region_key))
+            .collect();
 
-        debug!("[Session {}] ensure_space_list: final spaces for {}: {:?}", self.id, tuner_path, list);
-        
-        // Cache both space list and NID+TSID mappings
-        self.space_list_cache.insert(tuner_path.clone(), list.clone());
-        self.virtual_channel_mappings.insert(tuner_path, nid_tsid_mappings);
-        
+        debug!("[Session {}] ensure_space_list: final spaces for {}: {:?}", self.id, cache_key, list);
+
+        self.space_list_cache.insert(cache_key, list.clone());
+
         list.iter().map(|(actual_space, _, _)| *actual_space).collect()
-    }
-
-    /// TVTest が渡す仮想 space_idx を、DBの実 space へ変換
-    async fn map_space_idx_to_actual(&mut self, space_idx: u32) -> Option<u32> {
-        let list = self.get_space_list_with_names().await;
-        list.get(space_idx as usize).map(|(actual_space, _, _)| *actual_space)
     }
 
     /// Map virtual space index to (actual_space, region_key) for filtering.
@@ -1888,99 +1472,72 @@ impl Session {
             tuner_path
         };
 
-        // ★ Resolve: DLL path -> group name -> display_name -> first driver
+        // ★ Resolve: DLL path -> group name -> display_name -> first driver.
+        // Steps 1-3 are the shared `Database::resolve_tuner_target` (also
+        // used by /api/client-view, so the dashboard's guide can never
+        // disagree with this resolution). Step 4 (first-available fallback)
+        // is session-only leniency for misconfigured clients.
         let (resolved_path, is_group) = {
             let db = self.database.lock().await;
-            
-            // 1. Try as DLL path
-            if let Ok(Some(_driver)) = db.get_bon_driver_by_path(&path) {
-                debug!("[Session {}] Tuner '{}' matched as DLL path", self.id, path);
-                (path.clone(), false)
-            } else {
-                // 2. Try as group_name
-                match db.get_group_drivers(&path) {
-                    Ok(drivers) if !drivers.is_empty() => {
-                        debug!("[Session {}] Tuner '{}' matched as group_name (drivers: {})", 
-                            self.id, path, drivers.len());
-                        (path.clone(), true)
-                    },
-                    _ => {
-                        // 3. Try as display_name
-                        match db.get_bon_driver_by_display_name(&path) {
-                            Ok(Some(driver)) => {
-                                debug!("[Session {}] Tuner '{}' resolved to DLL: {}", 
-                                    self.id, path, driver.dll_path);
-                                (driver.dll_path, false)
-                            },
-                            Ok(None) => {
-                                // 4. Use first available enabled driver (prefer enabled over disabled)
-                                warn!("[Session {}] Tuner '{}' not found, trying first available driver", self.id, path);
-                                match db.get_all_bon_drivers() {
-                                    Ok(drivers) => {
-                                        // Try enabled drivers first
-                                        let mut selected_driver = None;
-                                        
-                                        // First pass: find an enabled driver
-                                        for driver in &drivers {
-                                            // Check if driver appears in enabled channels
-                                            // We can infer enabled status from whether it has enabled channels
-                                            let has_enabled_channels = drivers.iter().any(|d| d.dll_path == driver.dll_path);
-                                            if has_enabled_channels {
-                                                selected_driver = Some(driver);
-                                                break;
-                                            }
-                                        }
-                                        
-                                        // If no enabled driver found, use first available
-                                        let first_driver = selected_driver.or_else(|| drivers.first());
-                                        
-                                        match first_driver {
-                                            Some(driver) => {
-                                                warn!("[Session {}] Using driver: {} (path: {})", 
-                                                    self.id, 
-                                                    driver.driver_name.as_ref().unwrap_or(&driver.dll_path), 
-                                                    driver.dll_path);
-                                                (driver.dll_path.clone(), false)
-                                            }
-                                            None => {
-                                                error!("[Session {}] No drivers found in database at all", self.id);
-                                                drop(db);
-                                                return self
-                                                    .send_message(ServerMessage::OpenTunerAck {
-                                                        success: false,
-                                                        error_code: ErrorCode::InvalidParameter.into(),
-                                                        bondriver_version: 0,
-                                                    })
-                                                    .await;
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        error!("[Session {}] Failed to query drivers: {}", self.id, e);
-                                        drop(db);
-                                        return self
-                                            .send_message(ServerMessage::OpenTunerAck {
-                                                success: false,
-                                                error_code: ErrorCode::InvalidParameter.into(),
-                                                bondriver_version: 0,
-                                            })
-                                            .await;
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                error!("[Session {}] Database error resolving tuner: {}", self.id, e);
+
+            match db.resolve_tuner_target(&path) {
+                Ok(Some((driver_paths, true))) => {
+                    debug!("[Session {}] Tuner '{}' matched as group_name (drivers: {})",
+                        self.id, path, driver_paths.len());
+                    (path.clone(), true)
+                }
+                Ok(Some((driver_paths, false))) => {
+                    debug!("[Session {}] Tuner '{}' resolved to DLL: {}",
+                        self.id, path, driver_paths[0]);
+                    (driver_paths.into_iter().next().unwrap(), false)
+                }
+                Ok(None) => {
+                    // 4. Use first available driver
+                    warn!("[Session {}] Tuner '{}' not found, trying first available driver", self.id, path);
+                    match db.get_all_bon_drivers() {
+                        Ok(drivers) => match drivers.first() {
+                            Some(driver) => {
+                                warn!("[Session {}] Using driver: {} (path: {})",
+                                    self.id,
+                                    driver.driver_name.as_ref().unwrap_or(&driver.dll_path),
+                                    driver.dll_path);
+                                (driver.dll_path.clone(), false)
+                            }
+                            None => {
+                                error!("[Session {}] No drivers found in database at all", self.id);
                                 drop(db);
                                 return self
                                     .send_message(ServerMessage::OpenTunerAck {
                                         success: false,
-                                        error_code: ErrorCode::TunerOpenFailed.into(),
+                                        error_code: ErrorCode::InvalidParameter.into(),
                                         bondriver_version: 0,
                                     })
                                     .await;
                             }
+                        },
+                        Err(e) => {
+                            error!("[Session {}] Failed to query drivers: {}", self.id, e);
+                            drop(db);
+                            return self
+                                .send_message(ServerMessage::OpenTunerAck {
+                                    success: false,
+                                    error_code: ErrorCode::InvalidParameter.into(),
+                                    bondriver_version: 0,
+                                })
+                                .await;
                         }
                     }
+                }
+                Err(e) => {
+                    error!("[Session {}] Database error resolving tuner: {}", self.id, e);
+                    drop(db);
+                    return self
+                        .send_message(ServerMessage::OpenTunerAck {
+                            success: false,
+                            error_code: ErrorCode::TunerOpenFailed.into(),
+                            bondriver_version: 0,
+                        })
+                        .await;
                 }
             }
         }; // db is dropped here

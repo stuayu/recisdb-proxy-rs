@@ -615,6 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tuner_config_for_web,
             web_auth_config,
             mirakurun_enabled,
+            Some(listen_addr),
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

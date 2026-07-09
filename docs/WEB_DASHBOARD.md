@@ -53,7 +53,45 @@ BonDriver毎の以下の設定をWeb UIから編集可能：
 - `max_instances`: BonDriver が同時にサポートできるチャンネル数の上限
 - 複数クライアントが異なるチャンネルを同時要求した場合、優先度によって割り当てが決定される
 
+### 3. クライアント設定ガイド (「クライアント設定」タブ)
+
+TVTest / EDCB 側の設定を画面の指示どおりに進められるガイドです。
+
+- **STEP 1**: `Tuner=` に指定できる名前 (チューナーグループ / 個別ドライバー) の一覧から接続先を選択
+- **STEP 2**: 接続先アドレス・選択チューナー入りの `BonDriver_NetworkProxy.ini` をワンクリックでコピー
+- **STEP 3**: チャンネル設定ファイルのダウンロード
+  - TVTest 用 `.ch2` (Shift_JIS) — BonDriver_NetworkProxy.dll と同じフォルダに配置
+  - EDCB 用 `ChSet4.txt` / `ChSet5.txt` (UTF-8 BOM) — EDCB の Setting フォルダに配置
+  - 「まとめてダウンロード」で INI・README を含む zip を取得可能
+- **STEP 4**: クライアントに列挙されるチューニング空間・チャンネルの対応表 (空間番号・CH番号は
+  クライアントが `SetChannel(space, channel)` に渡す実際の値)
+
+チャンネル列挙はセッションが実際に使う `server/client_view.rs` と同一コードで生成されるため、
+表示内容とクライアントの動作が食い違うことはありません。
+
 ## API エンドポイント
+
+### GET /api/client-view/targets
+
+クライアントの `Tuner=` に指定できる候補一覧 (グループ優先) と、配布用 INI 生成に使う
+プロキシ待受ポートを返す。
+
+### GET /api/client-view?tuner=&lt;名前&gt;
+
+指定した Tuner 名で接続したクライアントが列挙する仮想チューニング空間・チャンネルの一覧
+(クライアントが指定する space/channel インデックス、表示名、物理マッピング) を返す。
+名前解決は OpenTuner と同じ優先順位 (DLLパス → グループ名 → 表示名)。
+
+### GET /api/client-view/files/:kind?tuner=&lt;名前&gt;
+
+チャンネル設定ファイルを生成してダウンロードする。`kind`:
+
+| kind | 内容 | エンコーディング |
+| --- | --- | --- |
+| `tvtest-ch2` | TVTest 用 `BonDriver_NetworkProxy.ch2` | Shift_JIS (表現不能時 UTF-16LE BOM) |
+| `chset4` | EDCB 用 `BonDriver_NetworkProxy(BonDriver_NetworkProxy).ChSet4.txt` | UTF-8 BOM |
+| `chset5` | EDCB 用 `ChSet5.txt` | UTF-8 BOM |
+| `bundle` | 上記 + `BonDriver_NetworkProxy.ini` + README の zip | ― |
 
 ### GET /api/tuners
 
