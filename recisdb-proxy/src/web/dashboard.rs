@@ -1512,6 +1512,35 @@ const HTML_CONTENT: &str = r#"
             return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);
         }
 
+        // Delegated click handler for row action buttons. Buttons emit
+        // data-action + data-id (numeric, HTML-safe) instead of inline
+        // onclick="fn(${JSON.stringify(...)})", so broadcast/EPG-derived
+        // strings (driver/channel names) can never break out of the
+        // attribute (stored-XSS). Objects are looked up by id from the
+        // already-loaded arrays rather than serialized into the DOM.
+        document.addEventListener('click', (event) => {
+            const el = event.target.closest('[data-action]');
+            if (!el) return;
+            const action = el.dataset.action;
+            const id = el.dataset.id;
+            if (action === 'edit-bondriver') {
+                const d = bondriverData.find(x => String(x.id) === id);
+                if (d) editBonDriver(d);
+            } else if (action === 'delete-bondriver') {
+                const d = bondriverData.find(x => String(x.id) === id);
+                if (d) deleteBonDriver(d.id, d.driver_name || d.dll_path);
+            } else if (action === 'edit-channel') {
+                const c = channelData.find(x => String(x.id) === id);
+                if (c) editChannel(c);
+            } else if (action === 'preview-channel') {
+                const c = channelData.find(x => String(x.id) === id);
+                if (c) openChannelPreview(c.id, c.channel_name || c.raw_name || ("CH" + c.id));
+            } else if (action === 'edit-encode-profile') {
+                const p = encodeProfileData.find(x => String(x.id) === id);
+                if (p) openEditEncodeProfile(p);
+            }
+        });
+
         function applyResponsiveLabels(tableId) {
             const table = document.getElementById(tableId);
             if (!table) return;
@@ -1909,6 +1938,7 @@ const HTML_CONTENT: &str = r#"
         };
 
         // BonDrivers
+        let bondriverData = [];
         async function refreshBonDrivers() {
             try {
                 const res = await fetch('/api/bondrivers/ranking');
@@ -1923,6 +1953,7 @@ const HTML_CONTENT: &str = r#"
                 }
 
                 const bondrivers = data.items.map(i => i.driver);
+                bondriverData = bondrivers;
 
                 // Update filter dropdown
                 filter.innerHTML = '<option value="">すべてのBonDriver</option>' +
@@ -1945,9 +1976,9 @@ const HTML_CONTENT: &str = r#"
                         <td data-sort-value="${d.auto_scan_enabled ? '1' : '0'}"><span class="badge ${d.auto_scan_enabled ? 'badge-success' : 'badge-danger'}">${d.auto_scan_enabled ? 'ON' : 'OFF'}</span></td>
                         <td data-sort-value="${d.next_scan_at || 0}">${nextScan}</td>
                         <td>
-                            <button class="btn btn-primary btn-sm" onclick='editBonDriver(${JSON.stringify(d)})'>編集</button>
+                            <button class="btn btn-primary btn-sm" data-action="edit-bondriver" data-id="${d.id}">編集</button>
                             <button class="btn btn-warning btn-sm" onclick="triggerScan(${d.id})">スキャン</button>
-                            <button class="btn btn-danger btn-sm" onclick="deleteBonDriver(${d.id}, '${escapeHtml((d.driver_name || d.dll_path)).replace(/'/g, "\\'")}')">削除</button>
+                            <button class="btn btn-danger btn-sm" data-action="delete-bondriver" data-id="${d.id}">削除</button>
                         </td>
                     </tr>
                 `}).join('');
@@ -2264,8 +2295,8 @@ const HTML_CONTENT: &str = r#"
                         <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
                         <td>${c.priority}</td>
                         <td>
-                            <button class="btn btn-primary btn-sm" onclick='editChannel(${JSON.stringify(c)})'>編集</button>
-                            <button class="btn btn-secondary btn-sm" onclick='openChannelPreview(${c.id}, ${JSON.stringify(c.channel_name || c.raw_name || ("CH" + c.id))})'>プレビュー</button>
+                            <button class="btn btn-primary btn-sm" data-action="edit-channel" data-id="${c.id}">編集</button>
+                            <button class="btn btn-secondary btn-sm" data-action="preview-channel" data-id="${c.id}">プレビュー</button>
                         </td>
                     </tr>
                 `).join('');
@@ -3423,7 +3454,7 @@ const HTML_CONTENT: &str = r#"
                     <td>${p.target_bitrate ? Math.round(p.target_bitrate / 1000) + ' kbps' : '-'}</td>
                     <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(p.extra_args || '')}">${escapeHtml(p.extra_args || '-')}</td>
                     <td>
-                        <button class="btn btn-primary btn-sm" onclick='openEditEncodeProfile(${JSON.stringify(p)})'>編集</button>
+                        <button class="btn btn-primary btn-sm" data-action="edit-encode-profile" data-id="${p.id}">編集</button>
                     </td>
                 </tr>
             `).join('');
