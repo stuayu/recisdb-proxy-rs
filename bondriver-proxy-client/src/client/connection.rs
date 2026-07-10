@@ -1,14 +1,15 @@
 //! TCP connection management for the BonDriver client.
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use recisdb_protocol::{
     decode_header, decode_server_message, encode_client_message, ClientMessage,
@@ -37,6 +38,13 @@ pub enum ConnectionState {
     Connected,
     TunerOpen,
     Streaming,
+    /// Transient: the connection dropped unexpectedly and the supervisor is
+    /// re-establishing it in the background.  Only used when no tuner was open
+    /// at the time of the drop; while a tuner/stream is active the public state
+    /// is kept at `TunerOpen`/`Streaming` so the synchronous FFI surface
+    /// (IsTunerOpening / GetActiveDeviceNum) continues to report a plausible
+    /// "still open" state during the outage.
+    Reconnecting,
     Error,
 }
 
@@ -87,6 +95,45 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Last channel selection, remembered so it can be re-applied after an
+/// automatic reconnect.
+#[derive(Debug, Clone, Copy)]
+enum ChannelSel {
+    /// IBonDriver v1 `SetChannel(BYTE)`.
+    V1 { channel: u8 },
+    /// IBonDriver v2 `SetChannel(space, channel)`.
+    V2 { space: u32, channel: u32, priority: i32, exclusive: bool },
+}
+
+/// Snapshot of the session state the client asked for, used to rebuild the
+/// server-side context transparently after an unexpected disconnect.
+#[derive(Debug, Clone, Default)]
+struct SessionContext {
+    /// The client currently wants a tuner open.
+    tuner_open: bool,
+    /// The client currently wants the TS stream running.
+    streaming: bool,
+    /// The last channel the client selected (if any).
+    channel: Option<ChannelSel>,
+}
+
+/// Link status shared between the synchronous FFI callers and the async
+/// supervisor.  Distinct from the public `ConnectionState` (which is kept at a
+/// plausible "still open" value during an outage for the FFI surface): this
+/// tracks whether the steady-state loop is actually pumping the socket right
+/// now, so requests can fail fast instead of blocking for the full read timeout
+/// while the supervisor is backing off / re-establishing.
+mod link {
+    /// Initial handshake in progress — requests wait normally (the initial
+    /// `Hello`/`OpenTuner` legitimately need to block until the loop starts).
+    pub const CONNECTING: u8 = 0;
+    /// Steady-state loop is running — requests are processed normally.
+    pub const UP: u8 = 1;
+    /// Connection dropped; supervisor is backing off / restoring.  Requests
+    /// fail fast so the synchronous FFI surface stays responsive.
+    pub const DOWN: u8 = 2;
+}
+
 /// Manages the TCP connection to the proxy server.
 pub struct Connection {
     /// Configuration.
@@ -109,6 +156,17 @@ pub struct Connection {
     /// Cached signal level and the time it was last fetched.
     /// TTL = 2 s — avoids a network round-trip on every TVTest poll.
     signal_level: Mutex<(f32, Option<std::time::Instant>)>,
+    /// Session context to restore after an automatic reconnect.
+    session: Mutex<SessionContext>,
+    /// Set to true by `disconnect()` (explicit CloseTuner/Release path) so the
+    /// reconnect supervisor knows the drop was intentional and must not retry.
+    closing: AtomicBool,
+    /// Wakes the supervisor out of a backoff sleep when shutting down.
+    reconnect_notify: Notify,
+    /// Whether the steady-state loop is currently pumping the socket (see the
+    /// `link` module).  Lets `send_request_with_timeout` fail fast while the
+    /// supervisor is reconnecting instead of blocking for the full timeout.
+    link_status: AtomicU8,
 }
 
 impl Connection {
@@ -123,7 +181,24 @@ impl Connection {
             runtime: Mutex::new(None),
             bondriver_version: Mutex::new(0),
             signal_level: Mutex::new((0.0, None)),
+            session: Mutex::new(SessionContext::default()),
+            closing: AtomicBool::new(false),
+            reconnect_notify: Notify::new(),
+            link_status: AtomicU8::new(link::DOWN),
         })
+    }
+
+    /// Derive the state that should be publicly visible while a connection is
+    /// active or being restored, based on what the client last asked for.
+    fn active_state(&self) -> ConnectionState {
+        let ctx = self.session.lock();
+        if ctx.streaming {
+            ConnectionState::Streaming
+        } else if ctx.tuner_open {
+            ConnectionState::TunerOpen
+        } else {
+            ConnectionState::Connected
+        }
     }
 
     /// Get the current state.
@@ -171,6 +246,13 @@ impl Connection {
         *state = ConnectionState::Connecting;
         drop(state);
 
+        // Fresh session: clear the "closing" latch and any stale restore context
+        // left over from a previous connection.
+        self.closing.store(false, Ordering::SeqCst);
+        // Initial handshake: allow requests to wait normally until the loop runs.
+        self.link_status.store(link::CONNECTING, Ordering::SeqCst);
+        *self.session.lock() = SessionContext::default();
+
         // Create runtime
         file_log!(info, "connect: Creating tokio runtime...");
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -203,22 +285,19 @@ impl Connection {
         let config = self.config.clone();
         let buffer = Arc::clone(&self.buffer);
 
-        file_log!(info, "connect: Spawning connection task to {}", config.server_addr);
+        file_log!(info, "connect: Spawning connection supervisor to {}", config.server_addr);
         runtime.spawn(async move {
-            file_log!(info, "connect: Connection task started");
-            if let Err(e) = connection_task(conn, config, req_rx, resp_tx, buffer).await {
-                file_log!(error, "connect: Connection task error: {}", e);
-                error!("Connection task error: {}", e);
-            }
-            file_log!(info, "connect: Connection task ended");
+            file_log!(info, "connect: Connection supervisor started");
+            connection_supervisor(conn, config, req_rx, resp_tx, buffer).await;
+            file_log!(info, "connect: Connection supervisor ended");
         });
 
         *self.runtime.lock() = Some(runtime);
 
         // The Hello message is queued via blocking_send into the mpsc channel immediately.
-        // The connection_task will dequeue and send it once the TCP connection is established.
+        // The connection supervisor will dequeue and send it once the TCP connection is established.
         // send_hello() polls for the HelloAck response, so no fixed sleep is needed here.
-        // A small yield gives the runtime time to schedule the connection_task.
+        // A small yield gives the runtime time to schedule the supervisor.
         std::thread::sleep(Duration::from_millis(10));
 
         // Perform handshake with timeout
@@ -251,7 +330,16 @@ impl Connection {
     }
 
     /// Disconnect from the server.
+    ///
+    /// This is the explicit-close path (Release / final teardown).  It latches
+    /// `closing` so the reconnect supervisor treats the drop as intentional and
+    /// does not attempt to reconnect, and wakes the supervisor if it happens to
+    /// be sitting in a backoff sleep.
     pub fn disconnect(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.link_status.store(link::DOWN, Ordering::SeqCst);
+        self.reconnect_notify.notify_waiters();
+
         // Drop the request channel to signal shutdown
         *self.request_tx.lock() = None;
         *self.response_rx.lock() = None;
@@ -261,6 +349,7 @@ impl Connection {
             rt.shutdown_timeout(Duration::from_secs(1));
         }
 
+        *self.session.lock() = SessionContext::default();
         self.buffer.clear();
         *self.state.lock() = ConnectionState::Disconnected;
     }
@@ -271,6 +360,18 @@ impl Connection {
     /// wait — no spin loop, no sleep().  This mirrors the per-command
     /// `WaitForMultipleObjects` + auto-reset event pattern in BonDriverProxy(Ex).
     fn send_request_with_timeout(&self, msg: ClientMessage, timeout: Duration) -> Option<ServerMessage> {
+        // Fast-fail while the link is known-down (the supervisor is backing off
+        // or re-establishing).  Otherwise a request would sit in the channel
+        // unprocessed and block the caller — and hold the response_rx lock — for
+        // the full read timeout, freezing the synchronous FFI surface during an
+        // outage.  During an outage GetTsStream reads the ring buffer directly
+        // and GetSignalLevel returns its cache, so returning None here keeps
+        // those responsive.
+        if self.link_status.load(Ordering::Acquire) == link::DOWN {
+            debug!("[Connection] Link down; failing request fast");
+            return None;
+        }
+
         // Send the request first (briefly holds request_tx lock).
         {
             let tx = self.request_tx.lock();
@@ -282,29 +383,48 @@ impl Connection {
             }
         }
 
-        // Block until a response arrives or timeout expires.
-        // Holding response_rx lock for the full duration is intentional:
-        // disconnect() drops request_tx first, which causes connection_loop to
-        // drop resp_tx, making recv_timeout return Disconnected immediately.
+        // Wait for a response in short slices, re-checking the link between them.
+        // This still blocks the caller (mirroring the per-command wait in
+        // BonDriverProxy(Ex)), but if the connection drops mid-wait we bail
+        // within one slice and release the response_rx lock promptly instead of
+        // pinning it — and serializing every other control call — for the full
+        // timeout.
+        const SLICE: Duration = Duration::from_millis(200);
+        let deadline = Instant::now() + timeout;
         let rx = self.response_rx.lock();
-        if let Some(rx) = rx.as_ref() {
-            match rx.recv_timeout(timeout) {
+        let rx = match rx.as_ref() {
+            Some(rx) => rx,
+            None => {
+                error!("[Connection] Response channel not initialized");
+                return None;
+            }
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                warn!("[Connection] Request timed out after {:?}", timeout);
+                return None;
+            }
+            let wait = SLICE.min(deadline - now);
+            match rx.recv_timeout(wait) {
                 Ok(resp) => {
                     debug!("[Connection] Received response");
-                    Some(resp)
+                    return Some(resp);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    warn!("[Connection] Request timed out after {:?}", timeout);
-                    None
+                    // Bail early if the link dropped (or is closing) while we
+                    // waited, so we don't hold the lock for the full timeout.
+                    if self.link_status.load(Ordering::Acquire) == link::DOWN {
+                        debug!("[Connection] Link went down while waiting; failing request");
+                        return None;
+                    }
+                    continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     error!("[Connection] Response channel closed");
-                    None
+                    return None;
                 }
             }
-        } else {
-            error!("[Connection] Response channel not initialized");
-            None
         }
     }
 
@@ -389,6 +509,7 @@ impl Connection {
                 if success {
                     *self.bondriver_version.lock() = bondriver_version;
                     *self.state.lock() = ConnectionState::TunerOpen;
+                    self.session.lock().tuner_open = true;
                     info!("Tuner opened, BonDriver version {}", bondriver_version);
                     true
                 } else {
@@ -406,6 +527,14 @@ impl Connection {
         }
 
         let _ = self.send_request(ClientMessage::CloseTuner);
+        // Explicit tuner close: forget the restore context so a later reconnect
+        // does not silently reopen the tuner behind the app's back.
+        {
+            let mut ctx = self.session.lock();
+            ctx.tuner_open = false;
+            ctx.streaming = false;
+            ctx.channel = None;
+        }
         *self.state.lock() = ConnectionState::Connected;
     }
 
@@ -418,7 +547,12 @@ impl Connection {
         });
 
         match resp {
-            Some(ServerMessage::SetChannelAck { success, .. }) => success,
+            Some(ServerMessage::SetChannelAck { success, .. }) => {
+                if success {
+                    self.session.lock().channel = Some(ChannelSel::V1 { channel });
+                }
+                success
+            }
             _ => false,
         }
     }
@@ -428,7 +562,13 @@ impl Connection {
         let resp = self.send_request(ClientMessage::SetChannelSpace { space, channel, priority, exclusive });
 
         match resp {
-            Some(ServerMessage::SetChannelSpaceAck { success, .. }) => success,
+            Some(ServerMessage::SetChannelSpaceAck { success, .. }) => {
+                if success {
+                    self.session.lock().channel =
+                        Some(ChannelSel::V2 { space, channel, priority, exclusive });
+                }
+                success
+            }
             _ => false,
         }
     }
@@ -475,6 +615,7 @@ impl Connection {
             Some(ServerMessage::StartStreamAck { success, .. }) => {
                 if success {
                     *self.state.lock() = ConnectionState::Streaming;
+                    self.session.lock().streaming = true;
                 }
                 success
             }
@@ -489,6 +630,7 @@ impl Connection {
         }
 
         let _ = self.send_request(ClientMessage::StopStream);
+        self.session.lock().streaming = false;
         *self.state.lock() = ConnectionState::TunerOpen;
     }
 
@@ -529,42 +671,80 @@ impl Connection {
     }
 }
 
-/// Background task for handling the connection.
-async fn connection_task(
-    conn: Arc<Connection>,
-    config: ConnectionConfig,
-    req_rx: mpsc::Receiver<ClientMessage>,
-    resp_tx: std::sync::mpsc::Sender<ServerMessage>,
-    buffer: Arc<TsRingBuffer>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    file_log!(info, "connection_task: Starting, connecting to {}...", config.server_addr);
-    info!("Connecting to {}...", config.server_addr);
+// =============================================================================
+// Reconnect supervisor
+// =============================================================================
 
-    file_log!(debug, "connection_task: Attempting TCP connect with timeout {:?}", config.connect_timeout);
-    let stream = match tokio::time::timeout(
+/// Boxed read/write halves so the plain-TCP and TLS transports share one type
+/// and can be swapped on every reconnect attempt without duplicating the loop.
+type BoxReader = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Why the steady-state connection loop returned.
+enum LoopExit {
+    /// All request senders were dropped — the client explicitly closed
+    /// (Release / disconnect).  Do not reconnect.
+    Shutdown,
+    /// The connection dropped unexpectedly (EOF or IO error).  Reconnect if the
+    /// client still wants to be connected.
+    Dropped(String),
+}
+
+/// Initial backoff before the first reconnect attempt.
+const BACKOFF_INITIAL_MS: u64 = 500;
+/// Upper bound on the backoff delay.
+const BACKOFF_MAX_MS: u64 = 30_000;
+
+/// Exponential backoff schedule (pure, deterministic — the jitter is added by
+/// the caller).  `attempt` is 0-based: 0 → 500 ms, 1 → 1 s, 2 → 2 s, … capped
+/// at 30 s.  Monotonically non-decreasing and saturating.
+fn backoff_delay(attempt: u32) -> Duration {
+    // Shift by at most 20 to avoid overflow; anything past the cap clamps anyway.
+    let scaled = BACKOFF_INITIAL_MS.saturating_mul(1u64 << attempt.min(20));
+    Duration::from_millis(scaled.min(BACKOFF_MAX_MS))
+}
+
+/// Add a small (<= 20%) jitter to a backoff delay to avoid a thundering herd of
+/// clients reconnecting to a restarted server in lockstep.  Uses wall-clock
+/// nanoseconds as a cheap entropy source (no `rand` dependency).
+fn jittered(base: Duration) -> Duration {
+    let span_ms = (base.as_millis() as u64) / 5;
+    if span_ms == 0 {
+        return base;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    base + Duration::from_millis(nanos % (span_ms + 1))
+}
+
+/// Sleep for `delay`, but wake early (returning `true`) if the client requests
+/// shutdown while we wait.
+async fn backoff_wait(conn: &Connection, delay: Duration) -> bool {
+    if conn.closing.load(Ordering::SeqCst) {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => conn.closing.load(Ordering::SeqCst),
+        _ = conn.reconnect_notify.notified() => true,
+    }
+}
+
+/// Establish a fresh transport (TCP, optionally wrapped in TLS) and return its
+/// boxed read/write halves.
+async fn establish(
+    config: &ConnectionConfig,
+) -> Result<(BoxReader, BoxWriter), Box<dyn std::error::Error + Send + Sync>> {
+    file_log!(debug, "establish: TCP connect to {} (timeout {:?})", config.server_addr, config.connect_timeout);
+    let stream = tokio::time::timeout(
         config.connect_timeout,
         TcpStream::connect(&config.server_addr),
     )
-    .await {
-        Ok(Ok(s)) => {
-            file_log!(info, "connection_task: TCP connection established");
-            s
-        }
-        Ok(Err(e)) => {
-            file_log!(error, "connection_task: TCP connect failed: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            file_log!(error, "connection_task: TCP connect timeout: {}", e);
-            return Err(e.into());
-        }
-    };
-
+    .await??;
     stream.set_nodelay(true)?;
-    file_log!(info, "connection_task: Connected to {}", config.server_addr);
     info!("Connected to {}", config.server_addr);
 
-    // Handle TLS if enabled
     #[cfg(feature = "tls")]
     {
         if config.tls_enabled {
@@ -572,141 +752,471 @@ async fn connection_task(
             let tls_config = build_tls_config(config.tls_ca_cert.as_deref())?;
             let connector = TlsConnector::from(Arc::new(tls_config));
             let server_name = extract_server_name(&config.server_addr);
-
             let tls_stream = connector.connect(server_name, stream).await?;
             info!("TLS connection established");
-
             let (reader, writer) = tokio::io::split(tls_stream);
-            return connection_loop(conn, req_rx, resp_tx, buffer, reader, writer).await;
+            return Ok((Box::new(reader), Box::new(writer)));
         }
     }
 
-    // Plain TCP connection
     let (reader, writer) = stream.into_split();
-    connection_loop(conn, req_rx, resp_tx, buffer, reader, writer).await
+    Ok((Box::new(reader), Box::new(writer)))
 }
 
-/// Main connection loop handling reads and writes.
+/// Decode every complete frame currently buffered in `read_buf`.
 ///
-/// Reader and writer are split into independent tasks so that an outgoing
-/// `write_all()` that blocks on TCP backpressure never stalls incoming TS
-/// data reception.  This is critical for multi-hop proxy chains where each
-/// hop adds latency and the downstream TCP send buffer can fill up.
-async fn connection_loop<R, W>(
+/// TS data is written straight into the ring buffer (single copy).  Every other
+/// (control) message is handed to `on_msg`.  When `stop_after_first_control` is
+/// true the function returns as soon as it has emitted one control message,
+/// leaving any remaining bytes in `read_buf` untouched — this is what the
+/// handshake/restore path uses to read one ack at a time without consuming
+/// subsequent frames.
+fn process_frames(
+    read_buf: &mut BytesMut,
+    buffer: &TsRingBuffer,
+    mut on_msg: impl FnMut(ServerMessage),
+    stop_after_first_control: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    while read_buf.len() >= HEADER_SIZE {
+        match decode_header(read_buf)? {
+            Some(header) => {
+                let total_len = HEADER_SIZE + header.payload_len as usize;
+                if read_buf.len() < total_len {
+                    break; // Need more data
+                }
+
+                // Consume header bytes.
+                let _ = read_buf.split_to(HEADER_SIZE);
+
+                // --- TsData fast path (single copy into the ring buffer) ---
+                if header.message_type == MessageType::TsData {
+                    let ts_payload = read_buf.split_to(header.payload_len as usize);
+
+                    let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                    let written = buffer.write(&ts_payload);
+
+                    if count % 100 == 0 {
+                        let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                        crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
+                               count, ts_payload.len(), written, buffer.available(), total_bytes);
+                    }
+
+                    if written < ts_payload.len() {
+                        crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
+                    }
+
+                    continue;
+                }
+
+                // --- Control messages ---
+                // freeze() is zero-copy (BytesMut → Bytes without cloning).
+                let payload = read_buf.split_to(header.payload_len as usize).freeze();
+                let msg = decode_server_message(header.message_type, payload)?;
+                on_msg(msg);
+
+                if stop_after_first_control {
+                    return Ok(());
+                }
+            }
+            None => break, // Need more data
+        }
+    }
+    Ok(())
+}
+
+/// Read frames until a single control (non-TS) message arrives, feeding any
+/// interleaved TS data into the ring buffer.  Used during reconnect handshake.
+async fn read_control_message(
+    reader: &mut BoxReader,
+    read_buf: &mut BytesMut,
+    buffer: &TsRingBuffer,
+) -> Result<ServerMessage, Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let mut found: Option<ServerMessage> = None;
+        process_frames(read_buf, buffer, |m| {
+            if found.is_none() {
+                found = Some(m);
+            }
+        }, true)?;
+        if let Some(m) = found {
+            return Ok(m);
+        }
+        let n = reader.read_buf(read_buf).await?;
+        if n == 0 {
+            return Err("connection closed during handshake".into());
+        }
+    }
+}
+
+/// Encode and send a single client message on `writer`, flushing immediately.
+async fn send_control_message(
+    writer: &mut BoxWriter,
+    msg: &ClientMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let encoded = encode_client_message(msg)?;
+    writer.write_all(&encoded).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Re-establish the server-side session context after an automatic reconnect so
+/// streaming resumes without the host app re-opening the driver: re-send Hello,
+/// re-apply the service filter, and (if a tuner/channel/stream was active) then
+/// OpenTuner → SetChannel → StartStream to the last known selection.
+async fn restore_session(
+    conn: &Connection,
+    config: &ConnectionConfig,
+    reader: &mut BoxReader,
+    writer: &mut BoxWriter,
+    buffer: &TsRingBuffer,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut buf = BytesMut::with_capacity(262144);
+
+    // --- Hello ---
+    send_control_message(writer, &ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        stream_class: config.stream_class,
+    }).await?;
+    match read_control_message(reader, &mut buf, buffer).await? {
+        ServerMessage::HelloAck { success: true, .. } => {}
+        ServerMessage::HelloAck { success: false, .. } => return Err("server rejected Hello on reconnect".into()),
+        other => return Err(format!("unexpected reply to Hello: {:?}", std::mem::discriminant(&other)).into()),
+    }
+
+    // --- Service filter (best effort, mirrors initial connect) ---
+    if config.single_service {
+        send_control_message(writer, &ClientMessage::SetServiceFilter { single_service: true }).await?;
+        let _ = read_control_message(reader, &mut buf, buffer).await?;
+    }
+
+    // Snapshot what the client wants restored.
+    let ctx = conn.session.lock().clone();
+
+    // --- OpenTuner ---
+    if ctx.tuner_open {
+        send_control_message(writer, &ClientMessage::OpenTuner {
+            tuner_path: config.tuner_path.clone(),
+        }).await?;
+        match read_control_message(reader, &mut buf, buffer).await? {
+            ServerMessage::OpenTunerAck { success: true, bondriver_version, .. } => {
+                *conn.bondriver_version.lock() = bondriver_version;
+            }
+            _ => return Err("server rejected OpenTuner on reconnect".into()),
+        }
+    }
+
+    // --- SetChannel ---
+    if let Some(sel) = ctx.channel {
+        match sel {
+            ChannelSel::V1 { channel } => {
+                send_control_message(writer, &ClientMessage::SetChannel {
+                    channel,
+                    priority: config.client_priority,
+                    exclusive: config.client_exclusive,
+                }).await?;
+                match read_control_message(reader, &mut buf, buffer).await? {
+                    ServerMessage::SetChannelAck { success: true, .. } => {}
+                    _ => return Err("server rejected SetChannel on reconnect".into()),
+                }
+            }
+            ChannelSel::V2 { space, channel, priority, exclusive } => {
+                send_control_message(writer, &ClientMessage::SetChannelSpace {
+                    space, channel, priority, exclusive,
+                }).await?;
+                match read_control_message(reader, &mut buf, buffer).await? {
+                    ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
+                    _ => return Err("server rejected SetChannelSpace on reconnect".into()),
+                }
+            }
+        }
+    }
+
+    // --- StartStream ---
+    if ctx.streaming {
+        send_control_message(writer, &ClientMessage::StartStream).await?;
+        match read_control_message(reader, &mut buf, buffer).await? {
+            ServerMessage::StartStreamAck { success: true, .. } => {}
+            _ => return Err("server rejected StartStream on reconnect".into()),
+        }
+    }
+
+    // Any bytes read past the last ack (e.g. leading TS packets) were already
+    // routed into the ring buffer by process_frames, so nothing is lost when we
+    // hand off to the steady-state loop with a fresh read buffer.
+    Ok(())
+}
+
+/// Supervisor: owns the request receiver / response sender for the whole life
+/// of the connection and reuses the single tokio runtime across reconnects.
+///
+/// The first iteration drives the initial handshake through the request/response
+/// channels exactly as before (`connect()` calls `send_hello()` etc. from the
+/// synchronous side).  Subsequent iterations restore the session inline before
+/// resuming the steady-state loop.
+async fn connection_supervisor(
     conn: Arc<Connection>,
+    config: ConnectionConfig,
     mut req_rx: mpsc::Receiver<ClientMessage>,
     resp_tx: std::sync::mpsc::Sender<ServerMessage>,
     buffer: Arc<TsRingBuffer>,
-    mut reader: R,
-    mut writer: W,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    // --- Writer task (independent) ---
-    // Runs in its own tokio task so that write_all() blocking on TCP
-    // backpressure does not stall the reader.
-    let writer_handle = tokio::spawn(async move {
-        while let Some(msg) = req_rx.recv().await {
-            trace!("Sending request: {:?}", msg);
+) {
+    let mut attempt: u32 = 0;
+    let mut first = true;
+
+    loop {
+        if conn.closing.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match establish(&config).await {
+            Ok((mut reader, mut writer)) => {
+                if first {
+                    file_log!(info, "supervisor: initial connection established");
+                } else {
+                    // Reconnected: rebuild server-side context before resuming.
+                    match restore_session(&conn, &config, &mut reader, &mut writer, &buffer).await {
+                        Ok(()) => {
+                            let st = conn.active_state();
+                            *conn.state.lock() = st;
+                            attempt = 0;
+                            info!("Reconnected; session restored, state={:?}", st);
+                            file_log!(info, "supervisor: reconnected, session restored, state={:?}", st);
+                            // Drop any pre-drop leftovers still queued from
+                            // before the outage so we do not replay stale
+                            // commands or desync the response channel.  This runs
+                            // while the link is still DOWN (below we flip it UP),
+                            // and fast-fail means callers didn't enqueue new
+                            // requests during the outage — so nothing issued in
+                            // the reconnect window is silently swallowed here.
+                            while req_rx.try_recv().is_ok() {}
+                        }
+                        Err(e) => {
+                            warn!("Session restore failed: {}", e);
+                            file_log!(warn, "supervisor: session restore failed: {}", e);
+                            let delay = jittered(backoff_delay(attempt));
+                            attempt = attempt.saturating_add(1);
+                            if backoff_wait(&conn, delay).await {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                first = false;
+
+                // Link is now pumping the socket: requests are processed normally.
+                conn.link_status.store(link::UP, Ordering::SeqCst);
+
+                match connection_loop(&mut req_rx, &resp_tx, &buffer, reader, writer).await {
+                    LoopExit::Shutdown => {
+                        conn.link_status.store(link::DOWN, Ordering::SeqCst);
+                        info!("Connection closed by client");
+                        file_log!(info, "supervisor: client requested shutdown");
+                        break;
+                    }
+                    LoopExit::Dropped(reason) => {
+                        // Link is down: fail synchronous requests fast until we
+                        // are back up, so the FFI surface stays responsive.
+                        conn.link_status.store(link::DOWN, Ordering::SeqCst);
+                        if conn.closing.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        warn!("Connection dropped ({}); will reconnect", reason);
+                        file_log!(warn, "supervisor: connection dropped ({}); reconnecting", reason);
+                        // Keep the public state at the last active state (so
+                        // IsTunerOpening/GetActiveDeviceNum stay truthy while a
+                        // tuner is open); use the transient Reconnecting state
+                        // only when nothing was open.
+                        let st = conn.active_state();
+                        *conn.state.lock() = if st == ConnectionState::Connected {
+                            ConnectionState::Reconnecting
+                        } else {
+                            st
+                        };
+                        let delay = jittered(backoff_delay(attempt));
+                        attempt = attempt.saturating_add(1);
+                        if backoff_wait(&conn, delay).await {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Establishing failed: link is down, fail requests fast (this
+                // also unblocks the initial send_hello promptly on first-connect
+                // failure instead of making it wait the full connect timeout).
+                conn.link_status.store(link::DOWN, Ordering::SeqCst);
+                if first {
+                    // Initial connect failed: report the error and stop.  The
+                    // synchronous connect() observes this and returns failure.
+                    error!("Initial connection failed: {}", e);
+                    file_log!(error, "supervisor: initial connection failed: {}", e);
+                    *conn.state.lock() = ConnectionState::Error;
+                    break;
+                }
+                if conn.closing.load(Ordering::SeqCst) {
+                    break;
+                }
+                warn!("Reconnect attempt failed: {}", e);
+                file_log!(warn, "supervisor: reconnect attempt failed: {}", e);
+                let st = conn.active_state();
+                *conn.state.lock() = if st == ConnectionState::Connected {
+                    ConnectionState::Reconnecting
+                } else {
+                    st
+                };
+                let delay = jittered(backoff_delay(attempt));
+                attempt = attempt.saturating_add(1);
+                if backoff_wait(&conn, delay).await {
+                    break;
+                }
+            }
+        }
+    }
+
+    file_log!(info, "supervisor: exiting");
+}
+
+/// Why the writer task ended.
+enum WriterExit {
+    /// All senders were dropped (the loop is tearing down / client shutdown).
+    ChannelClosed,
+    /// The message could not be encoded.
+    Encode(String),
+    /// A socket write/flush failed.
+    Io(String),
+}
+
+/// Steady-state connection loop.
+///
+/// The reader and the writer run as **independent** halves so that an outgoing
+/// `write_all` that parks on TCP backpressure never stalls TS reception:
+///
+/// * A dedicated writer task owns the socket write half and drains an internal
+///   *unbounded* channel.  Because the channel is unbounded, handing a control
+///   message to it from the reader side is a synchronous, non-blocking `send`
+///   — the reader loop never `.await`s on a write and so is never starved.
+/// * The reader loop only reads frames and forwards decoded control messages to
+///   `resp_tx`, plus non-blockingly forwards outgoing requests to the writer.
+///
+/// The internal channel + task are created fresh per call and torn down before
+/// returning (drop the sender, then abort+join the task), so the single tokio
+/// runtime is reused across reconnects with no leaked task.  `req_rx` stays
+/// borrowed by the supervisor so the request channel survives reconnects.
+async fn connection_loop(
+    req_rx: &mut mpsc::Receiver<ClientMessage>,
+    resp_tx: &std::sync::mpsc::Sender<ServerMessage>,
+    buffer: &TsRingBuffer,
+    mut reader: BoxReader,
+    writer: BoxWriter,
+) -> LoopExit {
+    // Internal channel feeding the independent writer task.  Unbounded so the
+    // reader side never blocks handing off a control message.
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ClientMessage>();
+
+    let mut writer_handle = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(msg) = write_rx.recv().await {
             let encoded = match encode_client_message(&msg) {
                 Ok(e) => e,
                 Err(e) => {
                     error!("Failed to encode client message: {}", e);
-                    break;
+                    return WriterExit::Encode(e.to_string());
                 }
             };
             if let Err(e) = writer.write_all(&encoded).await {
                 error!("Write error: {}", e);
-                break;
+                return WriterExit::Io(e.to_string());
             }
-            // Flush after every command to ensure it reaches the server promptly.
+            // Flush after every command so it reaches the server promptly.
             if let Err(e) = writer.flush().await {
                 error!("Flush error: {}", e);
-                break;
+                return WriterExit::Io(e.to_string());
             }
         }
+        WriterExit::ChannelClosed
     });
 
-    // --- Reader loop (main) ---
-    // Use a larger read buffer (256 KB) to reduce the number of syscalls for
-    // high-bitrate streams, similar to TsPacketBufSize in BonDriverProxy(Ex).
+    // Larger read buffer (256 KB) to reduce syscalls on high-bitrate streams,
+    // similar to TsPacketBufSize in BonDriverProxy(Ex).
     let mut read_buf = BytesMut::with_capacity(262144);
 
-    static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-        loop {
-            let n = reader.read_buf(&mut read_buf).await?;
-            if n == 0 {
-                info!("Connection closed by server");
-                *conn.state.lock() = ConnectionState::Disconnected;
-                break;
-            }
-
-            // Process all complete frames currently in read_buf.
-            while read_buf.len() >= HEADER_SIZE {
-                match decode_header(&read_buf)? {
-                    Some(header) => {
-                        let total_len = HEADER_SIZE + header.payload_len as usize;
-                        if read_buf.len() < total_len {
-                            break; // Need more data
-                        }
-
-                        // Consume header bytes.
-                        let _ = read_buf.split_to(HEADER_SIZE);
-
-                        // --- TsData fast path ---
-                        // Handle TS data directly without going through
-                        // decode_server_message() to avoid an extra Vec
-                        // allocation + memcpy (the payload.to_vec() inside
-                        // the decoder).  The payload is written straight
-                        // from read_buf into the ring buffer (single copy).
-                        if header.message_type == MessageType::TsData {
-                            let ts_payload = read_buf.split_to(header.payload_len as usize);
-
-                            let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                            let written = buffer.write(&ts_payload);
-
-                            if count % 100 == 0 {
-                                let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-                                crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
-                                       count, ts_payload.len(), written, buffer.available(), total_bytes);
-                            }
-
-                            if written < ts_payload.len() {
-                                crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
-                            }
-
-                            continue;
-                        }
-
-                        // --- Non-TS messages ---
-                        // freeze() is zero-copy (BytesMut → Bytes without cloning).
-                        let payload = read_buf.split_to(header.payload_len as usize).freeze();
-                        let msg = decode_server_message(header.message_type, payload)?;
-
-                        // std::sync::mpsc::Sender::send() is non-blocking.
-                        if resp_tx.send(msg).is_err() {
-                            debug!("Response channel closed");
+    // `writer_done` guards against polling/awaiting the JoinHandle twice: once
+    // the writer branch of the select fires, the handle is already resolved.
+    let mut writer_done = false;
+    let exit = loop {
+        tokio::select! {
+            // --- Outgoing requests: hand off to the writer task, non-blocking. ---
+            maybe_msg = req_rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        // Unbounded send is synchronous — never stalls the reader.
+                        if write_tx.send(msg).is_err() {
+                            // Writer task is gone; the socket is unusable.
+                            break LoopExit::Dropped("writer task ended".to_string());
                         }
                     }
-                    None => break, // Need more data
+                    None => {
+                        // All request senders dropped — explicit client shutdown.
+                        break LoopExit::Shutdown;
+                    }
+                }
+            }
+
+            // --- Writer task ended (socket write error / encode failure). ---
+            wres = &mut writer_handle => {
+                writer_done = true;
+                let reason = match wres {
+                    Ok(WriterExit::Io(s)) => format!("write error: {}", s),
+                    Ok(WriterExit::Encode(s)) => format!("encode error: {}", s),
+                    Ok(WriterExit::ChannelClosed) => "writer channel closed".to_string(),
+                    Err(e) => format!("writer task panicked: {}", e),
+                };
+                break LoopExit::Dropped(reason);
+            }
+
+            // --- Incoming frames ---
+            res = reader.read_buf(&mut read_buf) => {
+                match res {
+                    Ok(0) => {
+                        info!("Connection closed by server");
+                        break LoopExit::Dropped("server closed (EOF)".to_string());
+                    }
+                    Ok(_) => {
+                        let r = process_frames(&mut read_buf, buffer, |m| {
+                            if resp_tx.send(m).is_err() {
+                                debug!("Response channel closed");
+                            }
+                        }, false);
+                        if let Err(e) = r {
+                            error!("Frame decode error: {}", e);
+                            break LoopExit::Dropped(format!("decode error: {}", e));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Read error: {}", e);
+                        break LoopExit::Dropped(format!("read error: {}", e));
+                    }
                 }
             }
         }
-        Ok(())
-    }.await;
+    };
 
-    // Abort writer task when reader finishes (connection closed or error).
-    writer_handle.abort();
-    let _ = writer_handle.await;
+    // Tear the writer down deterministically: dropping the sender lets it end
+    // cleanly if it is idle; the abort guarantees it cannot hang on a dead
+    // socket's write.  Either way we join it so no task is leaked.
+    drop(write_tx);
+    if !writer_done {
+        writer_handle.abort();
+        let _ = writer_handle.await;
+    }
 
-    result
+    exit
 }
 
 impl Drop for Connection {
@@ -787,5 +1297,54 @@ fn extract_server_name(addr: &str) -> ServerName<'static> {
             // Fall back to localhost
             ServerName::try_from("localhost".to_string()).unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_starts_at_initial() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(BACKOFF_INITIAL_MS));
+    }
+
+    #[test]
+    fn backoff_is_exponential_then_capped() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(1), Duration::from_millis(1000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(2000));
+        assert_eq!(backoff_delay(3), Duration::from_millis(4000));
+        assert_eq!(backoff_delay(4), Duration::from_millis(8000));
+        assert_eq!(backoff_delay(5), Duration::from_millis(16000));
+        // attempt 6 would be 32 s → clamped to the 30 s cap.
+        assert_eq!(backoff_delay(6), Duration::from_millis(BACKOFF_MAX_MS));
+    }
+
+    #[test]
+    fn backoff_is_monotonic_and_capped_for_all_attempts() {
+        let cap = Duration::from_millis(BACKOFF_MAX_MS);
+        let mut prev = Duration::ZERO;
+        for attempt in 0..64u32 {
+            let d = backoff_delay(attempt);
+            assert!(d >= prev, "backoff must be non-decreasing at attempt {}", attempt);
+            assert!(d <= cap, "backoff must never exceed the cap at attempt {}", attempt);
+            prev = d;
+        }
+        // Large attempt numbers must not panic (overflow) and stay clamped.
+        assert_eq!(backoff_delay(u32::MAX), cap);
+    }
+
+    #[test]
+    fn jitter_stays_within_20_percent_upper_bound() {
+        let base = Duration::from_millis(1000);
+        // Jitter is additive and bounded by 20% of the base.
+        for _ in 0..1000 {
+            let j = jittered(base);
+            assert!(j >= base);
+            assert!(j <= base + Duration::from_millis(200));
+        }
+        // A base too small to jitter is returned unchanged.
+        assert_eq!(jittered(Duration::from_millis(4)), Duration::from_millis(4));
     }
 }
