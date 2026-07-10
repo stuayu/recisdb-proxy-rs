@@ -627,73 +627,125 @@ const HTML_CONTENT: &str = r#"
                 <label for="channel-sort-key-1">並び替え</label>
                 <select id="channel-sort-key-1" onchange="setChannelSortFromUI()">
                     <option value="is_enabled">有効</option>
+                    <option value="id">ID</option>
                     <option value="channel_name">チャンネル名</option>
+                    <option value="raw_name">raw名</option>
                     <option value="nid">NID/SID/TSID</option>
                     <option value="sid">SID</option>
                     <option value="tsid">TSID</option>
+                    <option value="manual_sheet">枝番</option>
                     <option value="band_type">バンド</option>
                     <option value="terrestrial_region">地域</option>
                     <option value="network_name">ネットワーク</option>
+                    <option value="physical_ch">物理CH</option>
+                    <option value="remote_control_key">リモコン</option>
+                    <option value="service_type">サービス種別</option>
                     <option value="tuner_count">チューナー</option>
+                    <option value="bon_driver_path">BonDriver</option>
                     <option value="bon_space">BonSpace</option>
                     <option value="bon_channel">BonChannel</option>
                     <option value="priority">優先度</option>
+                    <option value="failure_count">失敗回数</option>
+                    <option value="scan_time">スキャン日時</option>
+                    <option value="last_seen">最終確認</option>
+                    <option value="created_at">登録日時</option>
+                    <option value="updated_at">更新日時</option>
                 </select>
 
                 <select id="channel-sort-key-2" onchange="setChannelSortFromUI()">
                     <option value="">（第2キーなし）</option>
                     <option value="is_enabled">有効</option>
+                    <option value="id">ID</option>
                     <option value="channel_name">チャンネル名</option>
+                    <option value="raw_name">raw名</option>
                     <option value="nid">NID/SID/TSID</option>
                     <option value="sid">SID</option>
                     <option value="tsid">TSID</option>
+                    <option value="manual_sheet">枝番</option>
                     <option value="band_type">バンド</option>
                     <option value="terrestrial_region">地域</option>
                     <option value="network_name">ネットワーク</option>
+                    <option value="physical_ch">物理CH</option>
+                    <option value="remote_control_key">リモコン</option>
+                    <option value="service_type">サービス種別</option>
                     <option value="tuner_count">チューナー</option>
+                    <option value="bon_driver_path">BonDriver</option>
                     <option value="bon_space">BonSpace</option>
                     <option value="bon_channel">BonChannel</option>
                     <option value="priority">優先度</option>
+                    <option value="failure_count">失敗回数</option>
+                    <option value="scan_time">スキャン日時</option>
+                    <option value="last_seen">最終確認</option>
+                    <option value="created_at">登録日時</option>
+                    <option value="updated_at">更新日時</option>
                 </select>
 
                 <select id="channel-sort-key-3" onchange="setChannelSortFromUI()">
                     <option value="">（第3キーなし）</option>
                     <option value="is_enabled">有効</option>
+                    <option value="id">ID</option>
                     <option value="channel_name">チャンネル名</option>
+                    <option value="raw_name">raw名</option>
                     <option value="nid">NID/SID/TSID</option>
                     <option value="sid">SID</option>
                     <option value="tsid">TSID</option>
+                    <option value="manual_sheet">枝番</option>
                     <option value="band_type">バンド</option>
                     <option value="terrestrial_region">地域</option>
                     <option value="network_name">ネットワーク</option>
+                    <option value="physical_ch">物理CH</option>
+                    <option value="remote_control_key">リモコン</option>
+                    <option value="service_type">サービス種別</option>
                     <option value="tuner_count">チューナー</option>
+                    <option value="bon_driver_path">BonDriver</option>
                     <option value="bon_space">BonSpace</option>
                     <option value="bon_channel">BonChannel</option>
                     <option value="priority">優先度</option>
+                    <option value="failure_count">失敗回数</option>
+                    <option value="scan_time">スキャン日時</option>
+                    <option value="last_seen">最終確認</option>
+                    <option value="created_at">登録日時</option>
+                    <option value="updated_at">更新日時</option>
                 </select>
 
                 <button class="btn btn-secondary btn-sm" id="channel-sort-order-1" onclick="toggleChannelSortOrder(0)">第1:昇順</button>
                 <button class="btn btn-secondary btn-sm" id="channel-sort-order-2" onclick="toggleChannelSortOrder(1)">第2:昇順</button>
                 <button class="btn btn-secondary btn-sm" id="channel-sort-order-3" onclick="toggleChannelSortOrder(2)">第3:昇順</button>
             </div>
+            <details class="column-picker" id="channels-column-picker-wrap">
+                <summary>表示列を調整</summary>
+                <div class="column-picker-grid" id="channels-column-picker"></div>
+            </details>
             <table id="channels-table" class="responsive-table">
                 <thead>
                     <tr>
+                        <th class="sortable" data-sort="id">ID</th>
                         <th class="sortable" data-sort="is_enabled">有効</th>
                         <th class="sortable" data-sort="channel_name">チャンネル名</th>
+                        <th class="sortable" data-sort="raw_name">raw名</th>
                         <th class="sortable" data-sort="nid">NID/SID/TSID</th>
+                        <th class="sortable" data-sort="manual_sheet">枝番</th>
                         <th class="sortable" data-sort="band_type">バンド</th>
                         <th class="sortable" data-sort="terrestrial_region">地域</th>
                         <th class="sortable" data-sort="network_name">ネットワーク</th>
+                        <th class="sortable" data-sort="physical_ch">物理CH</th>
+                        <th class="sortable" data-sort="remote_control_key">リモコン</th>
+                        <th class="sortable" data-sort="service_type">サービス種別</th>
                         <th class="sortable" data-sort="tuner_count">チューナー</th>
+                        <th class="sortable" data-sort="bon_driver_path">BonDriver</th>
                         <th class="sortable" data-sort="bon_space">BonSpace</th>
                         <th class="sortable" data-sort="bon_channel">BonChannel</th>
                         <th class="sortable" data-sort="priority">優先度</th>
+                        <th class="sortable" data-sort="failure_count">失敗回数</th>
+                        <th class="sortable" data-sort="scan_time">スキャン日時</th>
+                        <th class="sortable" data-sort="last_seen">最終確認</th>
+                        <th class="sortable" data-sort="created_at">登録日時</th>
+                        <th class="sortable" data-sort="updated_at">更新日時</th>
                         <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="channels-body">
-                    <tr><td colspan="11" class="loading">読み込み中...</td></tr>
+                    <tr><td colspan="23" class="loading">読み込み中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -2189,6 +2241,124 @@ const HTML_CONTENT: &str = r#"
             applyClientColumnVisibility();
         }
 
+        // ============================================================
+        // チャンネルテーブル 列表示設定（表示モード専用）
+        // ============================================================
+        // 列定義: 表示順・ラベル・ソートキー・デフォルト表示。
+        // defaultVisible:false の列（DB由来の詳細列）は初期状態では非表示で、
+        // 「表示列を調整」ピッカーから有効化できる。
+        const CHANNEL_TABLE_COLUMNS = [
+            { key: 'id',                 label: 'ID',            defaultVisible: false },
+            { key: 'is_enabled',         label: '有効',          defaultVisible: true },
+            { key: 'channel_name',       label: 'チャンネル名',  defaultVisible: true },
+            { key: 'raw_name',           label: 'raw名',         defaultVisible: false },
+            { key: 'nid',                label: 'NID/SID/TSID',  defaultVisible: true },
+            { key: 'manual_sheet',       label: '枝番',          defaultVisible: false },
+            { key: 'band_type',          label: 'バンド',        defaultVisible: true },
+            { key: 'terrestrial_region', label: '地域',          defaultVisible: true },
+            { key: 'network_name',       label: 'ネットワーク',  defaultVisible: true },
+            { key: 'physical_ch',        label: '物理CH',        defaultVisible: false },
+            { key: 'remote_control_key', label: 'リモコン',      defaultVisible: false },
+            { key: 'service_type',       label: 'サービス種別',  defaultVisible: false },
+            { key: 'tuner_count',        label: 'チューナー',    defaultVisible: true },
+            { key: 'bon_driver_path',    label: 'BonDriver',     defaultVisible: false },
+            { key: 'bon_space',          label: 'BonSpace',      defaultVisible: true },
+            { key: 'bon_channel',        label: 'BonChannel',    defaultVisible: true },
+            { key: 'priority',           label: '優先度',        defaultVisible: true },
+            { key: 'failure_count',      label: '失敗回数',      defaultVisible: false },
+            { key: 'scan_time',          label: 'スキャン日時',  defaultVisible: false },
+            { key: 'last_seen',          label: '最終確認',      defaultVisible: false },
+            { key: 'created_at',         label: '登録日時',      defaultVisible: false },
+            { key: 'updated_at',         label: '更新日時',      defaultVisible: false },
+            { key: 'actions',            label: '操作',          defaultVisible: true, locked: true },
+        ];
+        const CHANNEL_TABLE_COL_COUNT = CHANNEL_TABLE_COLUMNS.length;
+
+        let channelsColumnVisibility = {};
+
+        function loadChannelColumnPrefs() {
+            try {
+                const raw = localStorage.getItem('channelsTableColumnVisibility');
+                if (!raw) return {};
+                const parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' ? parsed : {};
+            } catch (_) {
+                return {};
+            }
+        }
+
+        function saveChannelColumnPrefs() {
+            localStorage.setItem('channelsTableColumnVisibility', JSON.stringify(channelsColumnVisibility));
+        }
+
+        function applyChannelColumnVisibility() {
+            // 列の表示/非表示は表示モードのみ対象（編集モードは独自レイアウト）
+            if (channelEditMode) return;
+            const table = document.getElementById('channels-table');
+            if (!table) return;
+
+            const isMobile = window.matchMedia('(max-width: 768px)').matches;
+            const rows = table.querySelectorAll('tr');
+
+            CHANNEL_TABLE_COLUMNS.forEach((colDef, idx) => {
+                const visible = colDef.locked ? true : channelsColumnVisibility[colDef.key] !== false;
+                rows.forEach(row => {
+                    const cell = row.children[idx];
+                    if (!cell) return;
+                    // 空状態行など colspan セルは対象外
+                    if (cell.colSpan && cell.colSpan > 1) return;
+                    if (!visible) {
+                        cell.style.display = 'none';
+                    } else if (isMobile) {
+                        cell.style.display = '';
+                    } else {
+                        cell.style.display = 'table-cell';
+                    }
+                });
+            });
+        }
+
+        function initChannelsColumnPicker() {
+            const picker = document.getElementById('channels-column-picker');
+            if (!picker) return;
+
+            const defaults = {};
+            CHANNEL_TABLE_COLUMNS.forEach(c => { defaults[c.key] = c.defaultVisible !== false; });
+            channelsColumnVisibility = Object.assign({}, defaults, loadChannelColumnPrefs());
+
+            picker.innerHTML = CHANNEL_TABLE_COLUMNS.map(c => {
+                const checked = c.locked ? true : channelsColumnVisibility[c.key] !== false;
+                return `
+                    <label>
+                        <input type="checkbox" data-colkey="${c.key}" ${checked ? 'checked' : ''} ${c.locked ? 'disabled' : ''}>
+                        ${escapeHtml(c.label)}
+                    </label>
+                `;
+            }).join('');
+
+            picker.querySelectorAll('input[type="checkbox"]').forEach(chk => {
+                chk.addEventListener('change', (e) => {
+                    channelsColumnVisibility[e.target.dataset.colkey] = !!e.target.checked;
+                    saveChannelColumnPrefs();
+                    applyChannelColumnVisibility();
+                });
+            });
+
+            applyChannelColumnVisibility();
+        }
+
+        function getServiceTypeLabel(t) {
+            if (t === null || t === undefined) return '-';
+            switch (t) {
+                case 0x01: return 'TV';
+                case 0x02: return '音声';
+                case 0xA1: return '臨時';
+                case 0xA5: return 'プロモ';
+                case 0xC0: return 'データ';
+                default: return '0x' + t.toString(16).toUpperCase();
+            }
+        }
+
         function getChannelSortValue(channel, key) {
             switch (key) {
                 case 'nid':
@@ -2209,6 +2379,30 @@ const HTML_CONTENT: &str = r#"
                     return channel.bon_space ?? -1;
                 case 'bon_channel':
                     return channel.bon_channel ?? -1;
+                case 'id':
+                    return channel.id ?? -1;
+                case 'raw_name':
+                    return (channel.raw_name || '').toLowerCase();
+                case 'manual_sheet':
+                    return channel.manual_sheet ?? -1;
+                case 'physical_ch':
+                    return channel.physical_ch ?? -1;
+                case 'remote_control_key':
+                    return channel.remote_control_key ?? -1;
+                case 'service_type':
+                    return channel.service_type ?? -1;
+                case 'bon_driver_path':
+                    return (channel.bon_driver_path || (channel.tuner_names || []).join(', ') || '').toLowerCase();
+                case 'failure_count':
+                    return channel.failure_count ?? 0;
+                case 'scan_time':
+                    return channel.scan_time ?? 0;
+                case 'last_seen':
+                    return channel.last_seen ?? 0;
+                case 'created_at':
+                    return channel.created_at ?? 0;
+                case 'updated_at':
+                    return channel.updated_at ?? 0;
                 default:
                     return channel[key];
             }
@@ -2218,7 +2412,10 @@ const HTML_CONTENT: &str = r#"
             const allowed = new Set([
                 'is_enabled', 'channel_name', 'nid', 'sid', 'tsid', 'band_type',
                 'terrestrial_region', 'network_name', 'tuner_count',
-                'bon_space', 'bon_channel', 'priority'
+                'bon_space', 'bon_channel', 'priority',
+                'id', 'raw_name', 'manual_sheet', 'physical_ch', 'remote_control_key',
+                'service_type', 'bon_driver_path', 'failure_count',
+                'scan_time', 'last_seen', 'created_at', 'updated_at'
             ]);
 
             const unique = [];
@@ -2254,14 +2451,43 @@ const HTML_CONTENT: &str = r#"
             return strA.localeCompare(strB, 'ja');
         }
 
+        // 表示モード用ヘッダー（静的HTMLのtheadと同一構成）
+        function channelViewHeaderHtml() {
+            return '<tr>' + CHANNEL_TABLE_COLUMNS.map(c =>
+                c.key === 'actions'
+                    ? `<th>${escapeHtml(c.label)}</th>`
+                    : `<th class="sortable" data-sort="${c.key}">${escapeHtml(c.label)}</th>`
+            ).join('') + '</tr>';
+        }
+
+        // 編集モード用ヘッダー（従来の11列レイアウト固定）
+        const CHANNEL_EDIT_HEADER_HTML =
+            '<tr>' +
+            '<th class="sortable" data-sort="is_enabled">有効</th>' +
+            '<th class="sortable" data-sort="channel_name">チャンネル名</th>' +
+            '<th class="sortable" data-sort="nid">NID/SID/TSID</th>' +
+            '<th class="sortable" data-sort="band_type">バンド</th>' +
+            '<th class="sortable" data-sort="terrestrial_region">地域</th>' +
+            '<th class="sortable" data-sort="network_name">ネットワーク</th>' +
+            '<th class="sortable" data-sort="tuner_count">チューナー</th>' +
+            '<th class="sortable" data-sort="bon_space">BonSpace</th>' +
+            '<th class="sortable" data-sort="bon_channel">BonChannel</th>' +
+            '<th class="sortable" data-sort="priority">優先度</th>' +
+            '<th>操作</th>' +
+            '</tr>';
+
         function renderChannels() {
             const tbody = document.getElementById('channels-body');
+            const thead = document.querySelector('#channels-table thead');
 
             if (!channelEditMode) {
                 // ---- 通常表示モード ----
+                if (thead) thead.innerHTML = channelViewHeaderHtml();
                 if (channelData.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません</td></tr>';
+                    tbody.innerHTML = `<tr><td colspan="${CHANNEL_TABLE_COL_COUNT}" class="empty-state">チャンネルがありません</td></tr>`;
                     applyResponsiveLabels('channels-table');
+                    applyChannelColumnVisibility();
+                    updateChannelSortIndicators();
                     return;
                 }
 
@@ -2279,6 +2505,7 @@ const HTML_CONTENT: &str = r#"
 
                 tbody.innerHTML = sorted.map(c => `
                     <tr ondblclick='enterChannelEditMode()'>
+                        <td>${c.id}</td>
                         <td>
                             <label class="toggle">
                                 <input type="checkbox" ${c.is_enabled ? 'checked' : ''} onchange="toggleChannel(${c.id}, this.checked)">
@@ -2286,14 +2513,25 @@ const HTML_CONTENT: &str = r#"
                             </label>
                         </td>
                         <td>${getChannelLogoHtml(c)}${escapeHtml(c.channel_name || c.raw_name || '-')}</td>
+                        <td>${escapeHtml(c.raw_name || '-')}</td>
                         <td><code>0x${c.nid.toString(16).toUpperCase().padStart(4,'0')}/${c.sid}/${c.tsid}</code></td>
+                        <td>${c.manual_sheet !== null && c.manual_sheet !== undefined ? c.manual_sheet : '-'}</td>
                         <td><span class="badge ${getBandBadgeClass(c.band_type)}">${getBandTypeName(c.band_type)}</span></td>
                         <td>${escapeHtml(c.terrestrial_region || '-')}</td>
                         <td>${escapeHtml(c.network_name || '-')}</td>
+                        <td>${c.physical_ch !== null && c.physical_ch !== undefined ? c.physical_ch : '-'}</td>
+                        <td>${c.remote_control_key !== null && c.remote_control_key !== undefined ? c.remote_control_key : '-'}</td>
+                        <td>${escapeHtml(getServiceTypeLabel(c.service_type))}</td>
                         <td>${c.tuner_count ? `<span class="badge badge-info" title="${escapeHtml((c.tuner_names || []).join(', '))}">${c.tuner_count}台</span>` : '-'}</td>
+                        <td>${escapeHtml(c.bon_driver_path || (c.tuner_names || []).join(', ') || '-')}</td>
                         <td>${c.bon_space !== null && c.bon_space !== undefined ? c.bon_space : '-'}</td>
                         <td>${c.bon_channel !== null && c.bon_channel !== undefined ? c.bon_channel : '-'}</td>
                         <td>${c.priority}</td>
+                        <td>${c.failure_count ?? 0}</td>
+                        <td>${formatDateTime(c.scan_time)}</td>
+                        <td>${formatDateTime(c.last_seen)}</td>
+                        <td>${formatDateTime(c.created_at)}</td>
+                        <td>${formatDateTime(c.updated_at)}</td>
                         <td>
                             <button class="btn btn-primary btn-sm" data-action="edit-channel" data-id="${c.id}">編集</button>
                             <button class="btn btn-secondary btn-sm" data-action="preview-channel" data-id="${c.id}">プレビュー</button>
@@ -2301,8 +2539,12 @@ const HTML_CONTENT: &str = r#"
                     </tr>
                 `).join('');
                 applyResponsiveLabels('channels-table');
+                applyChannelColumnVisibility();
+                updateChannelSortIndicators();
             } else {
                 // ---- インライン編集モード ----
+                // 編集モードは従来の11列固定レイアウト（列表示設定の対象外）
+                if (thead) thead.innerHTML = CHANNEL_EDIT_HEADER_HTML;
                 const rules = normalizeChannelSortRules(channelSortRules);
                 const sorted = [...channelData].sort((a, b) => {
                     for (const rule of rules) {
@@ -2411,6 +2653,7 @@ const HTML_CONTENT: &str = r#"
                     tbody.innerHTML = '<tr><td colspan="11" class="empty-state">チャンネルがありません。「行を追加」で新規追加できます。</td></tr>';
                 }
                 applyResponsiveLabels('channels-table');
+                updateChannelSortIndicators();
             }
         }
 
@@ -2507,10 +2750,18 @@ const HTML_CONTENT: &str = r#"
             renderChannels();
         }
 
-        // Add click handlers to sortable headers
-        document.querySelectorAll('#channels-table th.sortable').forEach(th => {
-            th.addEventListener('click', () => sortChannels(th.dataset.sort));
-        });
+        // Add click handlers to sortable headers.
+        // thead はモード切替時に再生成されるため、テーブルへの委譲で処理する。
+        (() => {
+            const table = document.getElementById('channels-table');
+            if (!table) return;
+            table.addEventListener('click', (event) => {
+                const th = event.target.closest('th.sortable');
+                if (th && th.dataset.sort && table.contains(th)) {
+                    sortChannels(th.dataset.sort);
+                }
+            });
+        })();
 
         async function refreshChannels() {
             try {
@@ -3746,6 +3997,7 @@ const HTML_CONTENT: &str = r#"
         window.addEventListener('load', () => {
             updateThemeButton();
             initClientsColumnPicker();
+            initChannelsColumnPicker();
             refreshStats();
             refreshClients();
             loadScanConfig();
@@ -3791,6 +4043,7 @@ const HTML_CONTENT: &str = r#"
                 });
             }
             applyClientColumnVisibility();
+            applyChannelColumnVisibility();
         });
     </script>
 </div><!-- /.tabs-body -->

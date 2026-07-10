@@ -134,6 +134,9 @@ pub struct ChannelInfoApi {
     pub failure_count: i32,
     pub scan_time: Option<i64>,
     pub last_seen: Option<i64>,
+    // Metadata timestamps (0 when the source record does not carry them)
+    pub created_at: i64,
+    pub updated_at: i64,
     // Grouped channel info (only when group_logical=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tuner_count: Option<usize>,
@@ -649,6 +652,8 @@ pub async fn get_channels(
                         failure_count: c.failure_count,
                         scan_time: c.scan_time,
                         last_seen: c.last_seen,
+                        created_at: c.created_at,
+                        updated_at: c.updated_at,
                         tuner_count: None,
                         tuner_names: None,
                     })
@@ -689,6 +694,13 @@ pub async fn get_channels(
                                     if c.priority > existing.priority {
                                         existing.priority = c.priority;
                                     }
+                                    // Keep the newest metadata timestamps
+                                    if c.updated_at > existing.updated_at {
+                                        existing.updated_at = c.updated_at;
+                                    }
+                                    if existing.created_at == 0 || (c.created_at != 0 && c.created_at < existing.created_at) {
+                                        existing.created_at = c.created_at;
+                                    }
                                 })
                                 .or_insert_with(|| ChannelInfoApi {
                                     id: c.id,
@@ -714,6 +726,8 @@ pub async fn get_channels(
                                     failure_count: c.failure_count,
                                     scan_time: c.scan_time,
                                     last_seen: c.last_seen,
+                                    created_at: c.created_at,
+                                    updated_at: c.updated_at,
                                     tuner_count: Some(1),
                                     tuner_names: Some(vec![driver_name]),
                                 });
@@ -761,6 +775,9 @@ pub async fn get_channels(
                         failure_count: 0,
                         scan_time: None,
                         last_seen: None,
+                        // ClientChannelRecord does not carry these timestamps
+                        created_at: 0,
+                        updated_at: 0,
                         tuner_count: None,
                         tuner_names: None,
                     })
