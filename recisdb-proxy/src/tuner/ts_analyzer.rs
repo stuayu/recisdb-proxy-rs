@@ -210,6 +210,23 @@ impl TsPacketAnalyzer {
         self.overflow_packets
     }
 
+    /// Mark a known stream discontinuity (e.g. a broadcast-buffer lag gap that
+    /// is already accounted for elsewhere as a separate loss source).
+    ///
+    /// For every tracked PID this drops the continuity-counter baseline
+    /// (`last_cc = None`, `dup_used = false`) so the next packet per PID
+    /// re-establishes the CC baseline WITHOUT counting a drop, exactly as the
+    /// per-packet `discontinuity_indicator` handling does. Accumulated per-PID
+    /// stats (`packets`, `cc_errors`) and the aggregate `quality` totals are
+    /// left intact — this is not a reset, only a resync barrier so the gap's
+    /// unavoidable CC break is not double-counted as `packets_dropped`.
+    pub fn mark_discontinuity(&mut self) {
+        for track in self.pid_tracks.values_mut() {
+            track.last_cc = None;
+            track.dup_used = false;
+        }
+    }
+
     /// Reset counters.
     pub fn reset(&mut self) {
         self.quality = TsStreamQuality::default();
@@ -352,6 +369,38 @@ mod tests {
         let stat = analyzer.pid_stat(pid).unwrap();
         assert_eq!(stat.cc_errors, 1);
         assert!(stat.last_error_unix_ms > 0);
+    }
+
+    #[test]
+    fn mark_discontinuity_suppresses_resync_drop() {
+        let mut analyzer = TsPacketAnalyzer::new();
+        let pid = 0x0100;
+
+        // In-order packets: no drops, establishes a CC baseline.
+        let before = analyzer.analyze(&concat_packets(&[
+            make_packet(pid, 0b01, 0, false),
+            make_packet(pid, 0b01, 1, false),
+            make_packet(pid, 0b01, 2, false),
+        ]));
+        assert_eq!(before.packets_dropped, 0);
+
+        // A known gap happened (e.g. broadcast lag). Mark it.
+        analyzer.mark_discontinuity();
+
+        // Next packet's CC is arbitrarily far from the previous one. Without
+        // the mark this would count as 1 drop; after the mark it must not.
+        let after = analyzer.analyze(&concat_packets(&[make_packet(pid, 0b01, 9, false)]));
+        assert_eq!(after.packets_dropped, 0, "resync after a known discontinuity must not count as loss");
+
+        // Accumulated per-PID stats survive the mark (not a reset).
+        let stat = analyzer.pid_stat(pid).unwrap();
+        assert_eq!(stat.packets, 4);
+        assert_eq!(stat.cc_errors, 0);
+
+        // A subsequent genuine mid-stream jump (no mark) still counts as a real drop.
+        let real = analyzer.analyze(&concat_packets(&[make_packet(pid, 0b01, 5, false)]));
+        assert_eq!(real.packets_dropped, 1, "a genuine CC jump without a mark must still count as loss");
+        assert_eq!(analyzer.pid_stat(pid).unwrap().cc_errors, 1);
     }
 
     #[test]

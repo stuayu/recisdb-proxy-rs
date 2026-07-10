@@ -1152,6 +1152,11 @@ impl Session {
                                 // carry buffers so the next chunk re-aligns.
                                 self.ts_send_carry.clear();
                                 self.ts_quality_carry.clear();
+                                // The gap is already counted as
+                                // loss_broadcast_lag_chunks; drop the CC
+                                // baseline so the resync isn't double-counted
+                                // as one packets_dropped per PID.
+                                self.ts_quality_analyzer.mark_discontinuity();
                             }
                             Some(Err(broadcast::error::RecvError::Closed)) => {
                                 // The shared encoder stopped: watchdog stall,
@@ -1217,6 +1222,11 @@ impl Session {
                                 // next received chunk will start a fresh alignment.
                                 self.ts_send_carry.clear();
                                 self.ts_quality_carry.clear();
+                                // The gap is already counted as
+                                // loss_broadcast_lag_chunks; drop the CC
+                                // baseline so the resync isn't double-counted
+                                // as one packets_dropped per PID.
+                                self.ts_quality_analyzer.mark_discontinuity();
                             }
                             Some(Err(broadcast::error::RecvError::Closed)) => {
                                 info!("[Session {}] Broadcast channel closed", self.id);
@@ -1674,6 +1684,9 @@ impl Session {
                     self.ts_receiver = Some(new_rx);
                 }
                 existing.notify_channel_change();
+                // New channel = new lineup: re-baseline the CC analyzer so the
+                // first packets are not each counted as a spurious drop.
+                self.ts_quality_analyzer.reset();
                 self.restart_tsreplace_pipeline_if_streaming().await;
                 return self.send_message(ServerMessage::SetChannelAck {
                     success: true,
@@ -1702,6 +1715,9 @@ impl Session {
                     self.ts_receiver = Some(pool_tuner.subscribe());
                 }
                 pool_tuner.notify_channel_change();
+                // New channel = new lineup: re-baseline the CC analyzer so the
+                // first packets are not each counted as a spurious drop.
+                self.ts_quality_analyzer.reset();
                 self.restart_tsreplace_pipeline_if_streaming().await;
                 return self.send_message(ServerMessage::SetChannelAck {
                     success: true,
@@ -1836,6 +1852,9 @@ impl Session {
 
                 // Notify B25 decoder about channel change
                 tuner.notify_channel_change();
+                // New channel = new lineup: re-baseline the CC analyzer so the
+                // first packets are not each counted as a spurious drop.
+                self.ts_quality_analyzer.reset();
 
                 self.restart_tsreplace_pipeline_if_streaming().await;
                 
@@ -1867,6 +1886,14 @@ impl Session {
     /// explicit. Extracted to kill five near-identical copies (see
     /// docs/SYSTEM_REVIEW_2026-07.md H2).
     async fn apply_channel_metadata(&mut self, path: &str, actual_space: u32, actual_bon_channel: u32) {
+        // A successful channel change means an entirely new stream/lineup: the
+        // old PIDs and their CC baselines are gone. Fully reset the analyzer so
+        // the first packets of the new lineup re-baseline instead of each
+        // counting a spurious drop. This helper is the single shared hook that
+        // every successful SetChannelSpace path funnels through, so it fires
+        // exactly once per switch.
+        self.ts_quality_analyzer.reset();
+
         let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
         self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
         self.current_channel_info = Some(channel_info);
@@ -3395,6 +3422,9 @@ impl Session {
             // Notify B25 decoder about channel change
             if let Some(tuner) = &self.current_tuner {
                 tuner.notify_channel_change();
+                // New channel = new lineup: re-baseline the CC analyzer so the
+                // first packets are not each counted as a spurious drop.
+                self.ts_quality_analyzer.reset();
             }
 
             self.restart_tsreplace_pipeline_if_streaming().await;
@@ -3789,6 +3819,10 @@ impl Session {
                     // 188-byte alignment (same recovery as broadcast Lagged).
                     self.ts_send_carry.clear();
                     self.ts_quality_carry.clear();
+                    // The gap is accounted for as loss_ts_queue_chunks (and the
+                    // single packets_dropped below); drop the CC baseline so the
+                    // resync isn't additionally counted as one drop per PID.
+                    self.ts_quality_analyzer.mark_discontinuity();
                     self.packets_dropped += 1;
                     self.loss_ts_queue_chunks += 1;
 
