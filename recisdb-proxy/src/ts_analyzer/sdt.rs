@@ -172,7 +172,12 @@ mod tests {
 
     #[test]
     fn test_parse_sdt() {
-        // Create a mock SDT section
+        // Create a mock SDT section. The provider/service names are real ARIB
+        // STD-B24 byte sequences: the Alphanumeric-set designation ESC 0x28 0x4A
+        // followed by ASCII, which the aribb24 decoder turns into fullwidth
+        // characters ("ABC" -> "ＡＢＣ", "CH01" -> "ＣＨ０１"). The decoder's
+        // default code set is the 2-byte Kanji plane, so raw ASCII would
+        // decode to mojibake.
         let data = [
             // Original network ID = 0x7FE0
             0x7F, 0xE0,
@@ -182,16 +187,16 @@ mod tests {
             0x01, 0x01,
             // flags (EIT schedule=0, EIT p/f=1)
             0x01,
-            // running_status=4 (running), free_ca=0, descriptors_length=12
-            0x80, 0x0C,
-            // Service descriptor: tag=0x48, length=10
-            0x48, 0x0A,
+            // running_status=4 (running), free_ca=0, descriptors_length=18
+            0x80, 0x12,
+            // Service descriptor: tag=0x48, length=16
+            0x48, 0x10,
             // service_type=0x01
             0x01,
-            // provider_name_length=3, "ABC"
-            0x03, b'A', b'B', b'C',
-            // service_name_length=4, "CH01"
-            0x04, b'C', b'H', b'0', b'1',
+            // provider_name_length=6, ESC 0x28 0x4A + "ABC"
+            0x06, 0x1b, 0x28, 0x4a, b'A', b'B', b'C',
+            // service_name_length=7, ESC 0x28 0x4A + "CH01"
+            0x07, 0x1b, 0x28, 0x4a, b'C', b'H', b'0', b'1',
         ];
 
         let header = PsiHeader {
@@ -228,8 +233,8 @@ mod tests {
         assert!(service.service_descriptor.is_some());
         let desc = service.service_descriptor.as_ref().unwrap();
         assert_eq!(desc.service_type, 0x01);
-        assert_eq!(desc.provider_name, "ABC");
-        assert_eq!(desc.service_name, "CH01");
+        assert_eq!(desc.provider_name, "ＡＢＣ");
+        assert_eq!(desc.service_name, "ＣＨ０１");
     }
 
     #[test]

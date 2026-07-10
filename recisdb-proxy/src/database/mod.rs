@@ -68,8 +68,18 @@ impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
 
-        // Enable foreign keys
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // Enable foreign keys, and configure WAL journaling for concurrent
+        // reader/writer access (see docs/SYSTEM_REVIEW_2026-07.md Phase 0):
+        // - journal_mode=WAL allows readers to proceed while a writer is active.
+        // - busy_timeout=3000 waits up to 3s for a lock instead of failing fast.
+        // - synchronous=NORMAL is the recommended durability level under WAL.
+        // WAL is a no-op for `:memory:` databases (see open_in_memory).
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;\
+             PRAGMA busy_timeout = 3000;\
+             PRAGMA synchronous = NORMAL;\
+             PRAGMA foreign_keys = ON;",
+        )?;
 
         let db = Self { conn };
         db.initialize_schema()?;

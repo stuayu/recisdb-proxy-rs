@@ -270,28 +270,44 @@ fn bcd_to_u32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    // ARIB STD-B24 designation of the Alphanumeric (英数) set into G0:
+    // ESC 0x28 0x4A. After this escape, ASCII bytes decode to their fullwidth
+    // Unicode equivalents (e.g. b'A' -> 'Ａ', b' ' -> '　' U+3000). The parsers
+    // decode name fields via the statically-linked aribb24 library, whose
+    // default code set is the 2-byte Kanji plane, so raw ASCII fixtures would
+    // decode to mojibake. These tests therefore build real ARIB byte sequences.
+    const ARIB_ALNUM_G0: [u8; 3] = [0x1b, 0x28, 0x4a];
+
     #[test]
     fn test_parse_service_descriptor() {
-        // Service descriptor with ASCII names
-        let data = [
+        // provider_name = ARIB-encoded "TEST"    -> "ＴＥＳＴ"
+        // service_name  = ARIB-encoded "CH NAME" -> "ＣＨ　ＮＡＭＥ"
+        let mut provider = ARIB_ALNUM_G0.to_vec();
+        provider.extend_from_slice(b"TEST"); // 3 + 4 = 7 bytes
+        let mut service = ARIB_ALNUM_G0.to_vec();
+        service.extend_from_slice(b"CH NAME"); // 3 + 7 = 10 bytes
+
+        let mut data = vec![
             0x01, // service_type = Digital TV
-            0x04, // provider_name_length = 4
-            b'T', b'E', b'S', b'T', // provider_name = "TEST"
-            0x07, // service_name_length = 7
-            b'C', b'H', b' ', b'N', b'A', b'M', b'E', // service_name = "CH NAME"
+            provider.len() as u8,
         ];
+        data.extend_from_slice(&provider);
+        data.push(service.len() as u8);
+        data.extend_from_slice(&service);
 
         let desc = ServiceDescriptor::parse(&data).unwrap();
         assert_eq!(desc.service_type, 0x01);
-        assert_eq!(desc.provider_name, "TEST");
-        assert_eq!(desc.service_name, "CH NAME");
+        assert_eq!(desc.provider_name, "ＴＥＳＴ");
+        assert_eq!(desc.service_name, "ＣＨ　ＮＡＭＥ");
     }
 
     #[test]
     fn test_parse_network_name_descriptor() {
-        let data = b"Network1";
-        let desc = NetworkNameDescriptor::parse(data).unwrap();
-        assert_eq!(desc.network_name, "Network1");
+        // ARIB-encoded "Network1" -> "Ｎｅｔｗｏｒｋ１"
+        let mut data = ARIB_ALNUM_G0.to_vec();
+        data.extend_from_slice(b"Network1");
+        let desc = NetworkNameDescriptor::parse(&data).unwrap();
+        assert_eq!(desc.network_name, "Ｎｅｔｗｏｒｋ１");
     }
 
     #[test]

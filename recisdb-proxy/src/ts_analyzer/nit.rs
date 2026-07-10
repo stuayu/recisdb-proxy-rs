@@ -175,12 +175,18 @@ mod tests {
 
     #[test]
     fn test_parse_nit() {
-        // Create a mock NIT section
+        // Create a mock NIT section.
+        // The network name is a real ARIB STD-B24 byte sequence: the
+        // Alphanumeric-set designation ESC 0x28 0x4A followed by ASCII
+        // "Net001", which the aribb24 decoder turns into the fullwidth
+        // "Ｎｅｔ００１" (the default code set is the 2-byte Kanji plane, so
+        // raw ASCII would decode to mojibake).
         let data = [
-            // Network descriptors length = 8
-            0xF0, 0x08,
-            // Network name descriptor: tag=0x40, length=6, "Net001"
-            0x40, 0x06, b'N', b'e', b't', b'0', b'0', b'1',
+            // Network descriptors length = 11 (tag + len + 9-byte name field)
+            0xF0, 0x0B,
+            // Network name descriptor: tag=0x40, length=9,
+            // ESC 0x28 0x4A + "Net001"
+            0x40, 0x09, 0x1b, 0x28, 0x4a, b'N', b'e', b't', b'0', b'0', b'1',
             // Transport stream loop length = 8
             0xF0, 0x08,
             // TS entry: TSID=0x7FE1, ONID=0x7FE0, descriptors_length=2
@@ -209,7 +215,7 @@ mod tests {
         let nit = NitTable::parse(&section).unwrap();
 
         assert_eq!(nit.network_id, 0x7FE0);
-        assert_eq!(nit.network_name, Some("Net001".to_string()));
+        assert_eq!(nit.network_name, Some("Ｎｅｔ００１".to_string()));
         assert_eq!(nit.transport_streams.len(), 1);
         assert_eq!(nit.transport_streams[0].transport_stream_id, 0x7FE1);
         assert_eq!(nit.transport_streams[0].original_network_id, 0x7FE0);
