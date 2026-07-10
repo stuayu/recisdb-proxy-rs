@@ -69,7 +69,53 @@ TVTest / EDCB 側の設定を画面の指示どおりに進められるガイド
 チャンネル列挙はセッションが実際に使う `server/client_view.rs` と同一コードで生成されるため、
 表示内容とクライアントの動作が食い違うことはありません。
 
+### 4. チャンネル一覧 (「チャンネル」タブ)
+
+スキャンで登録された全チャンネルの一覧・編集画面です。
+
+**表示列**: 既定では 有効 / チャンネル名 / NID / SID / TSID / バンド / 地域 /
+ネットワーク / チューナー / BonSpace / BonChannel / 優先度 を表示します。
+テーブル上部の **「表示列を調整」** から、DBが保持する残りの情報も列として
+追加できます (選択はブラウザに記憶されます):
+
+| 列 | 内容 |
+| --- | --- |
+| ID | channels テーブルの主キー |
+| raw名 | スキャン時に取得した生のサービス名 (channel_name は編集可能な表示名) |
+| 枝番 | manual_sheet |
+| 物理CH | 物理チャンネル番号 |
+| リモコン | リモコン番号 (NIT TS情報記述子由来。古いスキャン結果では空 — 再スキャンで取得) |
+| サービス種別 | TV / 音声 / 臨時 / プロモ / データ (不明値は16進表示) |
+| BonDriver | チャンネルを保持する BonDriver の DLL パス |
+| 失敗回数 | 選局失敗のカウント |
+| スキャン日時 / 最終確認 | スキャン実行時刻と最終確認時刻 |
+| 登録日時 / 更新日時 | DB レコードの作成・更新時刻 |
+
+すべての列はヘッダクリック (モバイルは並び替えセレクト) でソートできます。
+「編集モード」ではチャンネル名・優先度・有効/無効・物理割当の一括編集、
+行の追加・削除、CSVエクスポート/インポートが可能です。
+
+**Drop / Error 統計の見方 (概要タブのクライアント一覧)**:
+- **Drop** はCC(連続性カウンタ)の欠落です。チャンネル切替直後や、配信バッファの
+  ラグ回復(別途 broadcast_lag として計上)による既知のギャップはカウントされません。
+- **Error** はチューナーのデモジュレータが立てる transport_error_indicator の
+  実受信エラーです。BS/CS でこの値が継続的に増える場合は、アンテナレベル・
+  ケーブル・LNB給電など信号品質側の確認を推奨します。
+
 ## API エンドポイント
+
+### GET /api/channels
+
+登録チャンネルの一覧を返す。クエリ: `bondriver_id=<id>` (特定BonDriverのみ)、
+`enabled_only=true` (有効のみ)、`group_logical=true` (NID-SID-TSID で論理チャンネルに
+まとめ、保持チューナー数 `tuner_count`/`tuner_names` を付与)。
+
+各チャンネルは DB の全カラムを含む: `id, bon_driver_id, bon_driver_path, nid, sid,
+tsid, manual_sheet, raw_name, channel_name, physical_ch, remote_control_key,
+service_type, network_name, bon_space, bon_channel, band_type, region_id,
+terrestrial_region, is_enabled, priority, failure_count, scan_time, last_seen,
+created_at, updated_at` (タイムスタンプは UNIX 秒。`group_logical=true` では
+created_at は最古、updated_at は最新をマージ)。
 
 ### GET /api/client-view/targets
 
@@ -216,10 +262,12 @@ EOF
 - 5秒ごとに自動更新されるので、しばらく待つ
 - サーバーログで同期エラーが出ていないか確認
 
-## 今後の拡張予定
+## 実装済みの主な機能 (旧・拡張予定)
 
-- クライアント毎のDrop/Scramble/Error統計表示
-- 配信ストリーム品質の可視化（ビットレート、パケットロス等）
-- リモートからの強制切断機能
-- セッション履歴とログ出力
-- アラート設定（異常検知時の通知）
+以下はすべて実装済みです:
+
+- クライアント毎の Drop/Scramble/Error 統計表示 (概要タブのクライアント一覧)
+- 配信ストリーム品質の可視化 — ビットレート・パケットロス・信号レベルのスパークライン
+- リモートからの強制切断・優先度/排他の上書き (クライアント行の操作)
+- セッション履歴タブ
+- アラートルール設定と Webhook 通知 (アラートタブ)
