@@ -54,6 +54,18 @@ pub struct FileChannel {
     pub services: Vec<ServiceEntry>,
 }
 
+impl FileChannel {
+    /// The TS's remote-control key: scans often record it only on the
+    /// primary service, but EDCB/TVTest write it on every service row of
+    /// the TS (verified against a real EDCB-scanned ChSet4.txt).
+    fn remote_control_key(&self) -> i32 {
+        self.services
+            .iter()
+            .find_map(|s| s.remote_control_key)
+            .unwrap_or(0)
+    }
+}
+
 /// Assemble the client-facing space/channel/service tree for `rows`
 /// restricted to `driver_matches` — the exact enumeration a client opening
 /// that tuner will see.
@@ -94,6 +106,30 @@ fn sanitize_name(s: &str) -> String {
     s.replace(['\t', '\r', '\n'], " ")
 }
 
+/// Whether a service is directly viewable — ARIB service_type 0x01
+/// (digital TV), 0xA5 (promotion video) or 0xAD (4K). This is the rule
+/// EDCB's scanner uses for `useViewFlag`, and (verified against a real
+/// EDCB-scanned ChSet5.txt) also exactly what it writes for
+/// `epgCapFlag`/`searchFlag` — radio (0x02), data (0xC0), temporary
+/// (0xA1) etc. all get 0. Unknown types (not yet analyzed) count as
+/// viewable so the channel is not silently hidden.
+fn is_viewable(service_type: Option<i32>) -> bool {
+    match service_type {
+        Some(t) => matches!(t, 0x01 | 0xA5 | 0xAD),
+        None => true,
+    }
+}
+
+/// Whether a service is a one-seg partial-reception service. The partial
+/// flag really comes from the ARIB partial-reception descriptor, which the
+/// scan does not record; the reliable proxy (verified against a real
+/// EDCB-scanned ChSet4/5: NHK携帯G sid 0x4580 → 1, Gガイド data service
+/// sid 0x4497 → 0, BS data services → 0) is service_type 0xC0 with the
+/// SID in the terrestrial one-seg block (sid & 0x0180 == 0x0180).
+fn is_partial(service_type: Option<i32>, sid: u16) -> bool {
+    service_type == Some(0xC0) && (sid & 0x0180) == 0x0180
+}
+
 /// CSV-quote a .ch2 name per TVTest's writer: quote when it starts with
 /// `#`/`;` or contains `,`/`"`, doubling inner quotes.
 fn ch2_quote(name: &str) -> String {
@@ -132,15 +168,18 @@ pub fn generate_tvtest_ch2(spaces: &[FileSpace]) -> String {
                     .map(|t| t.to_string())
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},1\r\n",
+                    "{},{},{},{},{},{},{},{},{}\r\n",
                     ch2_quote(&svc.name),
                     space.index,
                     ch.index,
-                    svc.remote_control_key.unwrap_or(0),
+                    ch.remote_control_key(),
                     service_type,
                     svc.sid,
                     svc.nid,
                     svc.tsid,
+                    // Data/one-seg/radio services are kept but disabled,
+                    // like a TVTest scan with data services unchecked.
+                    i32::from(is_viewable(svc.service_type)),
                 ));
             }
         }
@@ -157,13 +196,12 @@ pub fn generate_chset4(spaces: &[FileSpace]) -> String {
         for ch in &space.channels {
             for svc in &ch.services {
                 let service_type = svc.service_type.unwrap_or(1);
-                let partial = i32::from(service_type == 192);
                 let network_name = svc
                     .ts_name
                     .clone()
                     .unwrap_or_else(|| space.name.clone());
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t1\t{}\r\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\r\n",
                     sanitize_name(&ch.name),
                     sanitize_name(&svc.name),
                     sanitize_name(&network_name),
@@ -173,8 +211,9 @@ pub fn generate_chset4(spaces: &[FileSpace]) -> String {
                     svc.tsid,
                     svc.sid,
                     service_type,
-                    partial,
-                    svc.remote_control_key.unwrap_or(0),
+                    i32::from(is_partial(svc.service_type, svc.sid)),
+                    i32::from(is_viewable(svc.service_type)),
+                    ch.remote_control_key(),
                 ));
             }
         }
@@ -185,25 +224,20 @@ pub fn generate_chset4(spaces: &[FileSpace]) -> String {
 /// EDCB ChSet5.txt: exactly 9 tab-separated fields per line
 /// (serviceName, networkName, ONID, TSID, SID, serviceType, partialFlag,
 /// epgCapFlag, searchFlag), one line per unique (ONID, TSID, SID).
-/// epgCapFlag is set on the first non-partial service of each TS.
+/// EDCB sets epgCapFlag and searchFlag on every viewable service
+/// (verified against a real EDCB-scanned ChSet5.txt — not just one per
+/// TS), and 0 on radio/data/one-seg services.
 pub fn generate_chset5(spaces: &[FileSpace]) -> String {
     let mut out = String::new();
     let mut seen: HashSet<(u16, u16, u16)> = HashSet::new();
     for space in spaces {
         for ch in &space.channels {
-            let mut epg_assigned = false;
             for svc in &ch.services {
                 if !seen.insert((svc.nid, svc.tsid, svc.sid)) {
                     continue;
                 }
                 let service_type = svc.service_type.unwrap_or(1);
-                let partial = service_type == 192;
-                let epg_cap = if !partial && !epg_assigned {
-                    epg_assigned = true;
-                    1
-                } else {
-                    0
-                };
+                let viewable = i32::from(is_viewable(svc.service_type));
                 let network_name = svc
                     .ts_name
                     .clone()
@@ -216,9 +250,9 @@ pub fn generate_chset5(spaces: &[FileSpace]) -> String {
                     svc.tsid,
                     svc.sid,
                     service_type,
-                    i32::from(partial),
-                    epg_cap,
-                    i32::from(!partial),
+                    i32::from(is_partial(svc.service_type, svc.sid)),
+                    viewable,
+                    viewable,
                 ));
             }
         }
@@ -289,6 +323,9 @@ mod tests {
                     services: vec![
                         svc(32736, 32736, 1024, "NHK総合・東京", Some(1), Some(1), Some("関東広域")),
                         svc(32736, 32736, 1408, "NHK携帯G", Some(192), Some(1), Some("関東広域")),
+                        // Gガイド-style data service: type 0xC0 but NOT in
+                        // the one-seg SID block → partial=0, not viewable.
+                        svc(32736, 32736, 1175, "Gガイド", Some(192), Some(1), Some("関東広域")),
                     ],
                 }],
             },
@@ -313,10 +350,12 @@ mod tests {
         // ;#SPACE(...) comment's closing paren stays unambiguous.
         assert_eq!(lines[2], ";#SPACE(0,地デジ （関東）)");
         assert_eq!(lines[3], "NHK総合・東京,0,0,1,1,1024,32736,32736,1");
-        assert_eq!(lines[4], "NHK携帯G,0,0,1,192,1408,32736,32736,1");
-        assert!(lines[5].starts_with(";#SPACE(1,BS)"));
+        // Non-viewable services (one-seg/data) are kept but disabled.
+        assert_eq!(lines[4], "NHK携帯G,0,0,1,192,1408,32736,32736,0");
+        assert_eq!(lines[5], "Gガイド,0,0,1,192,1175,32736,32736,0");
+        assert!(lines[6].starts_with(";#SPACE(1,BS)"));
         // BS: no remote-control key -> 0, ids present, enabled.
-        assert_eq!(lines[6], "NHKBS,1,0,0,1,101,4,16400,1");
+        assert_eq!(lines[7], "NHKBS,1,0,0,1,101,4,16400,1");
         assert!(ch2.ends_with("\r\n"));
     }
 
@@ -339,11 +378,18 @@ mod tests {
             first,
             "NHK総合\tNHK総合・東京\t関東広域\t0\t0\t32736\t32736\t1024\t1\t0\t1\t1"
         );
-        // One-seg service: partialFlag=1, serviceType=192.
+        // One-seg service: partialFlag=1, useViewFlag=0 (matches real
+        // EDCB-scanned files: viewable TV services only get useView=1).
         let oneseg = chset4.lines().nth(1).unwrap();
         assert_eq!(
             oneseg,
-            "NHK総合\tNHK携帯G\t関東広域\t0\t0\t32736\t32736\t1408\t192\t1\t1\t1"
+            "NHK総合\tNHK携帯G\t関東広域\t0\t0\t32736\t32736\t1408\t192\t1\t0\t1"
+        );
+        // Data service (192 outside the one-seg SID block): partial=0, useView=0.
+        let data = chset4.lines().nth(2).unwrap();
+        assert_eq!(
+            data,
+            "NHK総合\tGガイド\t関東広域\t0\t0\t32736\t32736\t1175\t192\t0\t0\t1"
         );
     }
 
@@ -354,10 +400,12 @@ mod tests {
         for line in &lines {
             assert_eq!(line.matches('\t').count(), 8, "line: {line}");
         }
-        // Primary service: epgCap=1, search=1. One-seg: partial=1, epg=0, search=0.
+        // Viewable services: epgCap=1, search=1. One-seg: partial=1, flags 0.
+        // Data service: partial=0, flags 0. (Matches real EDCB output.)
         assert_eq!(lines[0], "NHK総合・東京\t関東広域\t32736\t32736\t1024\t1\t0\t1\t1");
         assert_eq!(lines[1], "NHK携帯G\t関東広域\t32736\t32736\t1408\t192\t1\t0\t0");
-        assert_eq!(lines[2], "NHKBS\tBS\t4\t16400\t101\t1\t0\t1\t1");
+        assert_eq!(lines[2], "Gガイド\t関東広域\t32736\t32736\t1175\t192\t0\t0\t0");
+        assert_eq!(lines[3], "NHKBS\tBS\t4\t16400\t101\t1\t0\t1\t1");
     }
 
     #[test]

@@ -31,6 +31,8 @@ mod table_id {
 mod descriptor_tag {
     pub const SERVICE: u8 = 0x48;
     pub const NETWORK_NAME: u8 = 0x40;
+    /// TS情報記述子 (ISDB, carries the remote-control key id).
+    pub const TS_INFORMATION: u8 = 0xCD;
 }
 
 /// Minimal TS parser for passive scanning.
@@ -59,6 +61,8 @@ pub struct ParseResult {
     pub transport_stream_id: Option<u16>,
     /// Network name (from NIT).
     pub network_name: Option<String>,
+    /// Remote-control key per TSID (NIT TS情報記述子 0xCD; terrestrial only).
+    pub remote_control_keys: HashMap<u16, u8>,
     /// Services (SID -> service info).
     pub services: HashMap<u16, ServiceInfo>,
     /// Has received PAT.
@@ -291,6 +295,38 @@ impl MinimalTsParser {
         if desc_end > desc_start {
             self.parse_network_descriptors(&data[desc_start..desc_end]);
         }
+
+        // TS loop: extract the remote-control key from each TS's
+        // TS情報記述子 (0xCD).
+        let ts_loop_offset = desc_start + network_desc_length;
+        if ts_loop_offset + 2 <= data.len() {
+            let ts_loop_length =
+                ((data[ts_loop_offset] as usize & 0x0F) << 8) | data[ts_loop_offset + 1] as usize;
+            let mut offset = ts_loop_offset + 2;
+            let loop_end = std::cmp::min(offset + ts_loop_length, data.len());
+
+            while offset + 6 <= loop_end {
+                let tsid = ((data[offset] as u16) << 8) | data[offset + 1] as u16;
+                let ts_desc_length =
+                    ((data[offset + 4] as usize & 0x0F) << 8) | data[offset + 5] as usize;
+                offset += 6;
+                let desc_end = std::cmp::min(offset + ts_desc_length, loop_end);
+
+                let mut d = offset;
+                while d + 2 <= desc_end {
+                    let tag = data[d];
+                    let length = data[d + 1] as usize;
+                    if d + 2 + length > desc_end {
+                        break;
+                    }
+                    if tag == descriptor_tag::TS_INFORMATION && length >= 1 {
+                        self.result.remote_control_keys.insert(tsid, data[d + 2]);
+                    }
+                    d += 2 + length;
+                }
+                offset = desc_end;
+            }
+        }
     }
 
     /// Parse network descriptors from NIT.
@@ -437,7 +473,7 @@ impl MinimalTsParser {
                 raw_name: s.service_name.clone(),
                 channel_name: s.service_name.clone(),
                 physical_ch: None,
-                remote_control_key: None,
+                remote_control_key: self.result.remote_control_keys.get(&tsid).copied(),
                 service_type: s.service_type,
                 network_name: self.result.network_name.clone(),
                 bon_space: None,
@@ -509,6 +545,26 @@ mod tests {
         assert!(!result.has_pat);
         assert!(!result.has_nit);
         assert!(!result.has_sdt);
+    }
+
+    #[test]
+    fn test_parse_nit_extracts_remote_control_key() {
+        let mut parser = MinimalTsParser::new();
+        let data = [
+            0x40, // table_id: NIT actual
+            0xF0, 0x00, // section length (not used by parse_nit)
+            0x7F, 0xE0, // network id
+            0xC1, 0x00, 0x00, // version / section numbers
+            0xF0, 0x00, // network descriptors length = 0
+            0xF0, 0x0B, // TS loop length = 11
+            0x7F, 0xE1, // TSID
+            0x7F, 0xE0, // ONID
+            0xF0, 0x05, // TS descriptors length = 5
+            0xCD, 0x03, 0x03, 0x00, 0x00, // TS情報記述子: remocon key id = 3
+        ];
+        parser.parse_nit(&data);
+        assert_eq!(parser.result.network_id, Some(0x7FE0));
+        assert_eq!(parser.result.remote_control_keys.get(&0x7FE1), Some(&3));
     }
 
     #[test]

@@ -351,7 +351,21 @@ struct ScanChannelResult {
     network_id: Option<u16>,
     /// Transport Stream ID (from PAT)
     transport_stream_id: Option<u16>,
+    /// Network name (NIT ネットワーク名記述子)
+    network_name: Option<String>,
+    /// Remote-control key id (NIT TS情報記述子; terrestrial only)
+    remote_control_key: Option<u8>,
     /// Services found on this channel
+    services: Vec<ServiceInfo>,
+}
+
+/// Everything `analyze_ts_stream` extracts from one tuned channel.
+#[derive(Debug, Default)]
+struct TsAnalysis {
+    network_id: Option<u16>,
+    transport_stream_id: Option<u16>,
+    network_name: Option<String>,
+    remote_control_key: Option<u8>,
     services: Vec<ServiceInfo>,
 }
 
@@ -555,14 +569,14 @@ fn scan_space_blocking(
             };
             
             match result {
-                Ok((Some(nid), tsid, svcs)) if nid == 0x0000 => {
+                Ok(a) if a.network_id == Some(0x0000) => {
                     warn!("scan_space_blocking: NID is 0x0000 (attempt {}/3), retrying...", attempt + 1);
                     // Purge and wait before retry
                     tuner.purge_ts_stream();
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     continue;
                 }
-                Ok((None, tsid, svcs)) => {
+                Ok(a) if a.network_id.is_none() => {
                     // NID not detected, retry
                     warn!("scan_space_blocking: NID not detected (attempt {}/3), retrying...", attempt + 1);
                     tuner.purge_ts_stream();
@@ -572,12 +586,12 @@ fn scan_space_blocking(
                     } else {
                         // After 3 attempts, log warning but keep the result
                         warn!("scan_space_blocking:   → NID not detected after {} attempts, using available data", attempt + 1);
-                        analysis_result = Some((None, tsid, svcs));
+                        analysis_result = Some(a);
                         break;
                     }
                 }
-                Ok((nid, tsid, svcs)) => {
-                    analysis_result = Some((nid, tsid, svcs));
+                Ok(a) => {
+                    analysis_result = Some(a);
                     break;
                 }
                 Err(e) => {
@@ -588,20 +602,20 @@ fn scan_space_blocking(
                         continue;
                     } else {
                         warn!("scan_space_blocking:   → TS analysis failed after {} attempts: {}", attempt + 1, e);
-                        analysis_result = Some((None, None, Vec::new()));
+                        analysis_result = Some(TsAnalysis::default());
                         break;
                     }
                 }
             }
         }
 
-        let (network_id, transport_stream_id, services) = match analysis_result {
-            Some((nid, tsid, svcs)) => {
-                let nid_str = nid.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
-                let tsid_str = tsid.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
+        let analysis = match analysis_result {
+            Some(a) => {
+                let nid_str = a.network_id.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
+                let tsid_str = a.transport_stream_id.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
                 info!("scan_space_blocking:   → NID={} TSID={} ({} services detected)",
-                      nid_str, tsid_str, svcs.len());
-                for (idx, svc) in svcs.iter().enumerate() {
+                      nid_str, tsid_str, a.services.len());
+                for (idx, svc) in a.services.iter().enumerate() {
                     let svc_type = match svc.service_type {
                         Some(0x01) => "TV",
                         Some(0x02) => "Radio",
@@ -611,13 +625,13 @@ fn scan_space_blocking(
                     };
                     let svc_name = svc.service_name.as_deref().unwrap_or("(unnamed)");
                     info!("scan_space_blocking:     [{}/{}] SID=0x{:04X} Type={} Name=\"{}\"",
-                          idx + 1, svcs.len(), svc.service_id, svc_type, svc_name);
+                          idx + 1, a.services.len(), svc.service_id, svc_type, svc_name);
                 }
-                (nid, tsid, svcs)
+                a
             }
             None => {
                 warn!("scan_space_blocking:   → TS analysis failed");
-                (None, None, Vec::new())
+                TsAnalysis::default()
             }
         };
 
@@ -626,9 +640,11 @@ fn scan_space_blocking(
             channel,
             channel_name: channel_name.clone(),
             signal_level,
-            network_id,
-            transport_stream_id,
-            services,
+            network_id: analysis.network_id,
+            transport_stream_id: analysis.transport_stream_id,
+            network_name: analysis.network_name,
+            remote_control_key: analysis.remote_control_key,
+            services: analysis.services,
         });
     }
 
@@ -639,7 +655,7 @@ fn scan_space_blocking(
 fn analyze_ts_stream(
     tuner: &BonDriverTuner,
     ts_read_timeout_ms: u64,
-) -> Result<(Option<u16>, Option<u16>, Vec<ServiceInfo>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TsAnalysis, Box<dyn std::error::Error + Send + Sync>> {
     debug!("analyze_ts_stream: Starting TS analysis");
 
     let config = AnalyzerConfig {
@@ -773,7 +789,28 @@ fn analyze_ts_stream(
         Vec::new()
     };
 
-    Ok((result.network_id, result.transport_stream_id, services))
+    // Remote-control key from the NIT TS情報記述子 of our own TS.
+    // Terrestrial NIT actual normally lists only the tuned TS; the
+    // find_map fallback covers streams that omit the TSID match (BS/CS
+    // carry no TS情報記述子, so this stays None there).
+    let remote_control_key = result
+        .nit
+        .as_ref()
+        .and_then(|nit| {
+            result
+                .transport_stream_id
+                .and_then(|tsid| nit.find_transport_stream(tsid))
+                .and_then(|ts| ts.remote_control_key)
+                .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.remote_control_key))
+        });
+
+    Ok(TsAnalysis {
+        network_id: result.network_id,
+        transport_stream_id: result.transport_stream_id,
+        network_name: result.network_name.clone(),
+        remote_control_key,
+        services,
+    })
 }
 
 /// Convert scan results to ChannelInfo for database storage.
@@ -794,6 +831,8 @@ fn scan_results_to_channel_infos(
                   r.space, r.channel);
             let mut info = recisdb_protocol::ChannelInfo::new(nid, 0, tsid);
             info.channel_name = Some(r.channel_name.clone());
+            info.network_name = r.network_name.clone();
+            info.remote_control_key = r.remote_control_key;
             info.bon_space = Some(r.space);
             info.bon_channel = Some(r.channel);
             channel_infos.push(info);
@@ -803,6 +842,8 @@ fn scan_results_to_channel_infos(
                 let mut info = recisdb_protocol::ChannelInfo::new(nid, svc.service_id, tsid);
                 info.channel_name = svc.service_name.clone().or_else(|| Some(r.channel_name.clone()));
                 info.service_type = svc.service_type;
+                info.network_name = r.network_name.clone();
+                info.remote_control_key = r.remote_control_key;
                 info.bon_space = Some(r.space);
                 info.bon_channel = Some(r.channel);
                 channel_infos.push(info);

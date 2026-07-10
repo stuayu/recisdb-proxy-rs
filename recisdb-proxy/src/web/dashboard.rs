@@ -745,6 +745,12 @@ const HTML_CONTENT: &str = r#"
                 <b>.ch2</b> → BonDriver_NetworkProxy.dll と同じフォルダ /
                 <b>ChSet4.txt・ChSet5.txt</b> → EDCB の Setting フォルダ。
                 「まとめてダウンロード」には接続先入りの BonDriver_NetworkProxy.ini と手順の README も入ります。
+                DLL をリネームして使っている場合 (例: BonDriver_NetworkProxy_MLT5.dll) は、
+                .ch2 と ChSet4.txt のファイル名の先頭部分も同じ名前に変更してください
+                (例: BonDriver_NetworkProxy_MLT5.ch2 /
+                BonDriver_NetworkProxy_MLT5(BonDriver_NetworkProxy).ChSet4.txt)。
+                地デジのリモコン番号やネットワーク名が 0 / 空になる場合は、古いスキャン結果に
+                値が記録されていません。「BonDriver」タブから再スキャンすると取得されます。
             </p>
             <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom: 8px;">
                 <button class="btn btn-secondary btn-sm" onclick="downloadClientFile('tvtest-ch2')">TVTest用 .ch2</button>

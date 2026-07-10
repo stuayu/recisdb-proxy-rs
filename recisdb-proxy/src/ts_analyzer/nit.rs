@@ -5,6 +5,7 @@
 
 use super::descriptors::{
     find_descriptor, parse_descriptor_loop, NetworkNameDescriptor, TerrestrialDeliveryDescriptor,
+    TsInformationDescriptor,
 };
 use super::psi::PsiSection;
 use super::{descriptor_tag, table_id};
@@ -20,6 +21,8 @@ pub struct NitTransportStream {
     pub descriptors: Vec<u8>,
     /// Terrestrial delivery descriptor (if present).
     pub terrestrial_delivery: Option<TerrestrialDeliveryDescriptor>,
+    /// Remote-control key id (TS情報記述子 0xCD; terrestrial only).
+    pub remote_control_key: Option<u8>,
 }
 
 impl NitTransportStream {
@@ -29,6 +32,11 @@ impl NitTransportStream {
         {
             if let Ok(desc) = TerrestrialDeliveryDescriptor::parse(&data) {
                 self.terrestrial_delivery = Some(desc);
+            }
+        }
+        if let Some(data) = find_descriptor(&self.descriptors, descriptor_tag::TS_INFORMATION) {
+            if let Ok(desc) = TsInformationDescriptor::parse(&data) {
+                self.remote_control_key = Some(desc.remote_control_key_id);
             }
         }
     }
@@ -125,6 +133,7 @@ impl NitTable {
                 original_network_id,
                 descriptors,
                 terrestrial_delivery: None,
+                remote_control_key: None,
             };
             ts.parse_descriptors();
 
@@ -219,12 +228,14 @@ mod tests {
                     original_network_id: 0x7FE0,
                     descriptors: vec![],
                     terrestrial_delivery: None,
+                    remote_control_key: None,
                 },
                 NitTransportStream {
                     transport_stream_id: 0x7FE2,
                     original_network_id: 0x7FE0,
                     descriptors: vec![],
                     terrestrial_delivery: None,
+                    remote_control_key: None,
                 },
             ],
         };
@@ -247,12 +258,14 @@ mod tests {
                     original_network_id: 0x7FE0,
                     descriptors: vec![],
                     terrestrial_delivery: None,
+                    remote_control_key: None,
                 },
                 NitTransportStream {
                     transport_stream_id: 0x7FE2,
                     original_network_id: 0x7FE0,
                     descriptors: vec![],
                     terrestrial_delivery: None,
+                    remote_control_key: None,
                 },
             ],
         };
