@@ -222,6 +222,7 @@ cargo build -p recisdb-proxy --features tls
 - [docs/ClientConnectionSequence.md](docs/ClientConnectionSequence.md) — クライアント接続シーケンス
 - [docs/WEB_DASHBOARD.md](docs/WEB_DASHBOARD.md) — Web ダッシュボード仕様
 - [docs/LOGGING.md](docs/LOGGING.md) — ログ設計
+- [docs/SYSTEM_REVIEW_2026-07.md](docs/SYSTEM_REVIEW_2026-07.md) — システム全体レビューとリファクタリング計画
 
 ---
 
