@@ -1857,6 +1857,38 @@ impl Session {
         }
     }
 
+    /// Common post-selection bookkeeping shared by every successful
+    /// `SetChannelSpace` path (direct start, existing-tuner reuse, and the
+    /// three capacity/priority fallback branches). Looks the channel up by
+    /// its physical `(path, space, channel)`, updates the session registry
+    /// (channel info/name/NID+SID), applies the single-service filter, and
+    /// records `current_channel_*`. Does NOT send the Ack — each caller keeps
+    /// control of its own reply/return so the surrounding control flow stays
+    /// explicit. Extracted to kill five near-identical copies (see
+    /// docs/SYSTEM_REVIEW_2026-07.md H2).
+    async fn apply_channel_metadata(&mut self, path: &str, actual_space: u32, actual_bon_channel: u32) {
+        let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
+        self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+        self.current_channel_info = Some(channel_info);
+
+        let (channel_name, ch_nid, ch_tsid, ch_sid) = {
+            let db = self.database.lock().await;
+            match db.get_channel_by_physical(path, actual_space, actual_bon_channel) {
+                Ok(Some(rec)) => (
+                    rec.channel_name.or(rec.raw_name),
+                    Some(rec.nid),
+                    Some(rec.tsid),
+                    Some(rec.sid),
+                ),
+                _ => (None, None, None, None),
+            }
+        };
+        self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
+        self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
+        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
+        self.current_channel_name = channel_name;
+    }
+
     /// Handle SetChannelSpace message (IBonDriver v2 style).
     async fn handle_set_channel_space(&mut self, space: u32, channel: u32, priority: i32, exclusive: bool) -> std::io::Result<()> {
         info!("[Session {}] HandleSetChannelSpace called: space={}, channel={}, priority={}, exclusive={}", 
@@ -2328,28 +2360,7 @@ impl Session {
                             self.current_tuner = Some(existing_tuner.clone());
                         }
 
-                        // Update session registry with channel info and name
-                        let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                        self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                        self.current_channel_info = Some(channel_info);
-
-                        // Try to get channel name and NID/SID from database
-                        let (channel_name, ch_nid, ch_tsid, ch_sid) = {
-                            let db = self.database.lock().await;
-                            match db.get_channel_by_physical(&existing_key.tuner_path, actual_space, actual_bon_channel) {
-                                Ok(Some(rec)) => (
-                                    rec.channel_name.or(rec.raw_name),
-                                    Some(rec.nid),
-                                    Some(rec.tsid),
-                                    Some(rec.sid),
-                                ),
-                                _ => (None, None, None, None),
-                            }
-                        };
-                        self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
-                        self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-                        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
-                        self.current_channel_name = channel_name;
+                        self.apply_channel_metadata(&existing_key.tuner_path, actual_space, actual_bon_channel).await;
 
                         return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                     } // end else (is_running)
@@ -2623,20 +2634,7 @@ impl Session {
                     }
                     self.restart_tsreplace_pipeline_if_streaming().await;
 
-                    let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                    self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                    self.current_channel_info = Some(channel_info);
-                    let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
-                        let db = self.database.lock().await;
-                        match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                            Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
-                            _ => (None, None, None, None),
-                        }
-                    };
-                    self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
-                    self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                    self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
-                    self.current_channel_name = fb_ch_name;
+                    self.apply_channel_metadata(&fb_path, actual_space, actual_bon_channel).await;
                     return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                 }
                 error!("[Session {}] Cannot switch: all drivers at capacity and priority insufficient",
@@ -2735,20 +2733,7 @@ impl Session {
                             }
                             self.restart_tsreplace_pipeline_if_streaming().await;
 
-                            let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                            self.current_channel_info = Some(channel_info);
-                            let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
-                                let db = self.database.lock().await;
-                                match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
-                                    _ => (None, None, None, None),
-                                }
-                            };
-                            self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
-                            self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
-                            self.current_channel_name = fb_ch_name;
+                            self.apply_channel_metadata(&fb_path, actual_space, actual_bon_channel).await;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
                         self.try_restore_previous_channel(&old_tuner_key).await;
@@ -2781,20 +2766,7 @@ impl Session {
                             }
                             self.restart_tsreplace_pipeline_if_streaming().await;
 
-                            let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                            self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                            self.current_channel_info = Some(channel_info);
-                            let (fb_ch_name, fb_nid, fb_tsid, fb_sid) = {
-                                let db = self.database.lock().await;
-                                match db.get_channel_by_physical(&fb_path, actual_space, actual_bon_channel) {
-                                    Ok(Some(rec)) => (rec.channel_name.or(rec.raw_name), Some(rec.nid), Some(rec.tsid), Some(rec.sid)),
-                                    _ => (None, None, None, None),
-                                }
-                            };
-                            self.session_registry.update_channel_name(self.id, fb_ch_name.clone()).await;
-                            self.session_registry.update_channel_ids(self.id, fb_nid, fb_sid).await;
-                            self.update_service_filter_for_sid(fb_nid, fb_tsid, fb_sid).await;
-                            self.current_channel_name = fb_ch_name;
+                            self.apply_channel_metadata(&fb_path, actual_space, actual_bon_channel).await;
                             return self.send_message(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }).await;
                         }
                         // ★ Bug D fix: get_or_create inserted this tuner into the pool but
@@ -2900,28 +2872,7 @@ impl Session {
 
                 self.restart_tsreplace_pipeline_if_streaming().await;
 
-                // Update session registry with channel info and name
-                let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-                self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
-                self.current_channel_info = Some(channel_info);
-
-                // Try to get channel name and NID/SID from database
-                let (channel_name, ch_nid, ch_tsid, ch_sid) = {
-                    let db = self.database.lock().await;
-                    match db.get_channel_by_physical(&tuner_path, actual_space, actual_bon_channel) {
-                        Ok(Some(rec)) => (
-                            rec.channel_name.or(rec.raw_name),
-                            Some(rec.nid),
-                            Some(rec.tsid),
-                            Some(rec.sid),
-                        ),
-                        _ => (None, None, None, None),
-                    }
-                };
-                self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
-                self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-                self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
-                self.current_channel_name = channel_name;
+                self.apply_channel_metadata(&tuner_path, actual_space, actual_bon_channel).await;
 
                 // BonDriver reader is confirmed ready by start_reader_with_warm (via ready_rx, up to 10s timeout).
                 // The run() loop's select! will forward TS data as soon as this function returns.
@@ -4098,54 +4049,6 @@ impl Session {
         self.session_registry.update_tuner(self.id, None).await;
         self.session_registry.update_streaming(self.id, false).await;
         self.session_registry.update_channel(self.id, None).await;
-    }
-
-    /// Handle OpenTunerWithGroup message.
-    async fn handle_open_tuner_with_group(&mut self, group_name: String) -> std::io::Result<()> {
-        if self.state != SessionState::Ready {
-            return self
-                .send_error(ErrorCode::InvalidState, "Not in ready state")
-                .await;
-        }
-
-        info!("[Session {}] Opening tuner group: {}", self.id, group_name);
-        self.stop_warm_tuner().await;
-
-        // TODO: Implement group space info building
-        // For now, send error
-        self.send_message(ServerMessage::OpenTunerAck {
-            success: false,
-            error_code: 0xFF00, // Not implemented
-            bondriver_version: 0,
-        })
-        .await
-    }
-
-    /// Handle SetChannelSpaceInGroup message.
-    async fn handle_set_channel_space_in_group(
-        &mut self,
-        _group_name: String,
-        _space_idx: u32,
-        _channel: u32,
-        priority: i32,
-        exclusive: bool,
-    ) -> std::io::Result<()> {
-        self.session_registry
-            .update_client_controls(self.id, Some(priority), Some(exclusive))
-            .await;
-        let (effective_priority, effective_exclusive) = self
-            .session_registry
-            .get_effective_controls(self.id)
-            .await
-            .unwrap_or((Some(priority), exclusive));
-        let priority = effective_priority.unwrap_or(priority);
-        let exclusive = effective_exclusive;
-        // TODO: Implement group-based channel selection
-        self.send_message(ServerMessage::SetChannelSpaceAck {
-            success: false,
-            error_code: 0xFF00, // Not implemented
-        })
-        .await
     }
 }
 
