@@ -1,6 +1,5 @@
 //! Shared tuner implementation with broadcast capability.
 
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +8,7 @@ use crate::tuner::b25_pipe::B25Pipe; // 作った場所に合わせて
 use b25_sys::DecoderOptions; // 鍵が必要な場合
 
 use bytes::Bytes;
-use futures_util::AsyncBufRead;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::broadcast;
 
 use crate::bondriver::BonDriverTuner;
@@ -242,88 +240,6 @@ impl SharedTuner {
     /// Set the current signal level.
     pub fn set_signal_level(&self, level: f32) {
         self.signal_level.store(level.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Start the tuner reader task.
-    ///
-    /// This spawns a background task that reads TS data from the tuner
-    /// and broadcasts it to all subscribers.
-    pub async fn start_reader<R>(self: &Arc<Self>, mut reader: R)
-    where
-        R: AsyncBufRead + Unpin + Send + 'static,
-    {
-        if self.is_running.swap(true, Ordering::AcqRel) {
-            // Already running
-            return;
-        }
-
-        let shared = Arc::clone(self);
-
-        let handle = tokio::spawn(async move {
-            info!("Starting tuner reader for {:?}", shared.key);
-
-            let mut buf = vec![0u8; TS_CHUNK_SIZE];
-
-            loop {
-                // Check if we still have subscribers
-                if !shared.has_subscribers() {
-                    debug!("No more subscribers, stopping reader for {:?}", shared.key);
-                    break;
-                }
-
-                // Read TS data from the tuner
-                let result = {
-                    let mut pinned = Pin::new(&mut reader);
-                    poll_read_async(&mut pinned, &mut buf).await
-                };
-
-                match result {
-                    Ok(0) => {
-                        debug!("EOF from tuner {:?}", shared.key);
-                        break;
-                    }
-                    Ok(n) => {
-                        trace!("Read {} bytes from tuner {:?}", n, shared.key);
-
-                        // Increment packet count (n / 188 packets)
-                        let packet_count = (n / 188) as u64;
-                        if packet_count > 0 {
-                            shared.increment_packet_count(packet_count);
-                        }
-
-                        // Update TS quality analyzer.
-                        // try_lock() avoids blocking the hot broadcast path
-                        // when the web API is reading a snapshot concurrently.
-                        // Missed chunks only affect statistics, not the stream.
-                        if let Ok(mut analyzer) = shared.quality_analyzer.try_lock() {
-                            analyzer.analyze(&buf[..n]);
-                        }
-
-                        let data = Bytes::copy_from_slice(&buf[..n]);
-
-                        // Broadcast to all subscribers
-                        match shared.tx.send(data) {
-                            Ok(count) => {
-                                trace!("Broadcast {} bytes to {} receivers", n, count);
-                            }
-                            Err(_) => {
-                                // No receivers, this is fine
-                                trace!("No receivers for broadcast");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error reading from tuner {:?}: {}", shared.key, e);
-                        break;
-                    }
-                }
-            }
-
-            shared.is_running.store(false, Ordering::Release);
-            info!("Tuner reader stopped for {:?}", shared.key);
-        });
-
-        *self.reader_handle.lock().await = Some(handle);
     }
 
     /// Stop the tuner reader task.
@@ -882,15 +798,6 @@ impl SharedTuner {
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
     }
-}
-
-/// Helper function to poll an AsyncBufRead as a future.
-async fn poll_read_async<R>(reader: &mut Pin<&mut R>, buf: &mut [u8]) -> std::io::Result<usize>
-where
-    R: AsyncBufRead + Unpin,
-{
-    use futures_util::AsyncReadExt;
-    reader.read(buf).await
 }
 
 impl Drop for SharedTuner {
