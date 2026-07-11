@@ -76,26 +76,31 @@ TVTest / EDCB
 
 ## 3. リファクタリング・ロードマップ
 
+**進捗 (2026-07-11 更新): Phase 0 全項目・Phase 1 全項目が完了。**
+残タスクは Phase 2 のみ。各項目の完了コミットは git log を参照
+(`9e1f462`〜`88e9fb1` 付近)。
+
+
 ### Phase 0 — 即効・低リスク (合計工数: 小)
 
-1. **SQLite PRAGMA 追加** (`journal_mode=WAL; busy_timeout=3000; synchronous=NORMAL`) — database/mod.rs に数行。H4 の症状緩和。
-2. **既知失敗5テストの是正** — ARIB エスケープ付きフィクスチャへ更新 / space_generator テストのNID実値化 (M1 でモジュール撤去なら削除)。CI を常時グリーンに。
-3. **デッドコード撤去** (M1) — selector/lock/passive_scanner/ts_parser(※)/space_generator/group_space/start_reader/未実装group系ハンドラ/Closing。※ ts_parser はパッシブスキャン計画が生きているなら撤去でなく H8 の aribb24 化。
-4. **選局成功時後処理の共通化** — `apply_selected_channel()` ヘルパーで5コピペ→1 (H2 の即効部分)。
-5. **設定ロードの `config.rs` 分離** (M10) と **CI トリガ/clippy 追加** (M11)。
+1. ✅ **SQLite PRAGMA 追加** (`journal_mode=WAL; busy_timeout=3000; synchronous=NORMAL`) — database/mod.rs に数行。H4 の症状緩和。
+2. ✅ **既知失敗5テストの是正** — ARIB エスケープ付きフィクスチャへ更新 / space_generator テストのNID実値化 (M1 でモジュール撤去なら削除)。CI を常時グリーンに。
+3. ✅ **デッドコード撤去** (M1) — selector/lock/passive_scanner/ts_parser(※)/space_generator/group_space/start_reader/未実装group系ハンドラ/Closing。※ ts_parser はパッシブスキャン計画が生きているなら撤去でなく H8 の aribb24 化。
+4. ✅ **選局成功時後処理の共通化** (実装名 `apply_channel_metadata`) — `apply_selected_channel()` ヘルパーで5コピペ→1 (H2 の即効部分)。
+5. ✅ **設定ロードの分離** (`app_config.rs`) (M10) と **CI トリガ/clippy 追加** (M11)。
 
 ### Phase 1 — 中期 (工数: 中)
 
-6. **XSS面の閉塞** (H1) — `JSON.stringify`→onclick を `data-*` 属性 + イベント委譲へ移行。属性文脈用エスケープの導入。
-7. **統一エラーレスポンダ** (M3) — `ApiError: IntoResponse` を導入し `success:false@200` を撤廃、`?` でボイラープレート削減。ダッシュボードJSの分岐も追随。
-8. **api.rs のドメイン別分割** — `api::{bondrivers, channels, alerts, config, encode_profiles, clients, client_view}`。7と同時実施が効率的。
-9. **DBロックスコープ最小化** (H3) — 選局系で「DBから候補・スコア・容量を収集→drop(db)→プール操作」に統一。
-10. **的確クエリ化** (M5) — `get_all_channels_with_drivers` 乱用を NID/TSID/ドライバ指定クエリへ。一覧系APIに limit/offset。
-11. **クライアント再接続** (H6) — 指数バックオフ + Reconnecting 状態 + runtime 再利用。
-12. **リングバッファ SPSC 是正** (H5) — 満杯時の上書きを consumer 側ドロップへ移すか、位置変数の役割分離。満杯競合テスト追加。
-13. **ARIB復号の一本化** (H8) — MinimalTsParser の独自復号を `crate::aribb24` へ差し替え。
-14. **マイグレーション台帳化** (M6) — `PRAGMA user_version` + DDL の schema.rs 集約。
-15. **ログ一本化** — DLL 側を tracing + 非同期 appender へ、毎行 flush 廃止。
+6. ✅ **XSS面の閉塞** (H1) — `JSON.stringify`→onclick を `data-*` 属性 + イベント委譲へ移行。属性文脈用エスケープの導入。
+7. ✅ **統一エラーレスポンダ** (ボディ形状は互換維持、ステータスのみ是正) (M3) — `ApiError: IntoResponse` を導入し `success:false@200` を撤廃、`?` でボイラープレート削減。ダッシュボードJSの分岐も追随。
+8. ✅ **api.rs のドメイン別分割** (web/api/ 9モジュール) — `api::{bondrivers, channels, alerts, config, encode_profiles, clients, client_view}`。7と同時実施が効率的。
+9. ✅ **DBロックスコープ最小化** (H3) — 選局系で「DBから候補・スコア・容量を収集→drop(db)→プール操作」に統一。
+10. ✅ **的確クエリ化** (get_channels_by_nid_tsid。一覧APIのlimit/offsetは未実施・データ量が問題化した時点で) (M5) — `get_all_channels_with_drivers` 乱用を NID/TSID/ドライバ指定クエリへ。一覧系APIに limit/offset。
+11. ✅ **クライアント再接続** (H6) — 指数バックオフ + Reconnecting 状態 + runtime 再利用。
+12. ✅ **リングバッファ SPSC 是正** (consumer側resyncでdrop-oldest復元) (H5) — 満杯時の上書きを consumer 側ドロップへ移すか、位置変数の役割分離。満杯競合テスト追加。
+13. ✅ **ARIB復号の一本化** (MinimalTsParser自体をデッドコード撤去で解消) (H8) — MinimalTsParser の独自復号を `crate::aribb24` へ差し替え。
+14. ✅ **マイグレーション台帳化** (M6) — `PRAGMA user_version` + DDL の schema.rs 集約。
+15. ✅ **ログのflush改善** (毎行flush廃止。tracingへの完全統一は未実施・任意) — DLL 側を tracing + 非同期 appender へ、毎行 flush 廃止。
 
 ### Phase 2 — 大規模 (工数: 大, 要計画)
 
@@ -106,19 +111,15 @@ TVTest / EDCB
 20. **DBアクセス戦略の刷新** (H4) — 計測の上で、読み取り専用コネクション分離 (WAL前提) or r2d2 プール or spawn_blocking ラッパの段階導入。
 21. **セットアップ系の別クレート化** — setup_gui/helpers/px4_installer をクレート分離しサーバ本体のビルドを軽量化。
 
-### 推奨着手順
+### 推奨着手順 (残 = Phase 2 のみ)
 
-Phase 0 は全項目を一括で実施可能 (相互依存なし・低リスク)。Phase 1 は
-「6 (XSS) → 7+8 (エラー/分割) → 9+10 (DBロック)」の順が安全。
 Phase 2 は 16 (共有クレート化) が他の前提になりやすいため最初に計画する。
+17/18 はホットパスで実機検証が必要なため、変更前にテスト整備を先行させること。
 
 ---
 
 ## 4. 既知の失敗テスト (ベースライン)
 
-`cargo test -p recisdb-proxy --lib` の失敗5件は上記 M2 の通りテスト側の陳腐化であり、
-プロダクトの回帰ではない (Phase 0-2 で解消予定):
-
-- `ts_analyzer::descriptors::{test_parse_network_name_descriptor, test_parse_service_descriptor}`
-- `ts_analyzer::nit::test_parse_nit` / `ts_analyzer::sdt::test_parse_sdt`
-- `tuner::space_generator::test_space_generator_mixed_bands`
+**解消済み (2026-07-11)**: かつて既知失敗だった5件 (ts_analyzer×4 は ARIB
+フィクスチャ修正、space_generator×1 はモジュール撤去) はすべて解消し、
+テストスイートは全クレートでグリーン。
