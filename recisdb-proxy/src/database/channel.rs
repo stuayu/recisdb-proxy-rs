@@ -311,6 +311,73 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
     }
 
+    /// Same as [`Self::get_all_channels_with_drivers`] but filtered to a single
+    /// NID+TSID up front via `WHERE c.nid=?1 AND c.tsid=?2`, so callers that only
+    /// need the candidates for one transport stream (e.g. group-mode driver
+    /// selection in `session.rs`) don't have to pull and scan the full table.
+    /// Row shape/mapping/ORDER BY are identical to `get_all_channels_with_drivers`.
+    pub fn get_channels_by_nid_tsid(
+        &self,
+        nid: u16,
+        tsid: u16,
+    ) -> Result<Vec<(ClientChannelRecord, Option<BonDriverRecord>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.bon_driver_id, c.nid, c.sid, c.tsid,
+                    c.channel_name, c.network_name, c.service_type,
+                    c.remote_control_key, c.bon_space, c.bon_channel,
+                    c.is_enabled, c.priority,
+                    bd.id as bd_id, bd.dll_path, bd.driver_name, bd.version,
+                    bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority,
+                    bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled,
+                    bd.created_at as bd_created_at, bd.updated_at as bd_updated_at
+             FROM channels c
+             LEFT JOIN bon_drivers bd ON c.bon_driver_id = bd.id
+             WHERE c.nid = ?1 AND c.tsid = ?2
+             ORDER BY c.priority DESC, c.nid, c.tsid, c.sid",
+        )?;
+
+        let rows = stmt.query_map(params![nid as i32, tsid as i32], |row| {
+            let channel = ClientChannelRecord {
+                id: row.get("id")?,
+                bon_driver_id: row.get("bon_driver_id")?,
+                nid: row.get("nid")?,
+                sid: row.get("sid")?,
+                tsid: row.get("tsid")?,
+                service_name: row.get("channel_name")?,
+                ts_name: row.get("network_name")?,
+                service_type: row.get("service_type")?,
+                remote_control_key: row.get("remote_control_key")?,
+                space: row.get::<_, Option<i32>>("bon_space")?.unwrap_or(0) as u32,
+                channel: row.get::<_, Option<i32>>("bon_channel")?.unwrap_or(0) as u32,
+                is_enabled: row.get::<_, i32>("is_enabled")? != 0,
+                priority: row.get("priority")?,
+            };
+
+            let bon_driver: Option<BonDriverRecord> = row.get::<_, Option<i64>>("bd_id")?.map(|id| {
+                BonDriverRecord {
+                    id,
+                    dll_path: row.get("dll_path").unwrap_or_default(),
+                    driver_name: row.get("driver_name").ok().flatten(),
+                    version: row.get("version").ok().flatten(),
+                    group_name: row.get("group_name").ok().flatten(),
+                    auto_scan_enabled: row.get::<_, Option<i32>>("auto_scan_enabled").ok().flatten().unwrap_or(1) != 0,
+                    scan_interval_hours: row.get("scan_interval_hours").unwrap_or(24),
+                    scan_priority: row.get("scan_priority").unwrap_or(0),
+                    last_scan: row.get("last_scan").ok().flatten(),
+                    next_scan_at: row.get("next_scan_at").ok().flatten(),
+                    passive_scan_enabled: row.get::<_, Option<i32>>("passive_scan_enabled").ok().flatten().unwrap_or(1) != 0,
+                    max_instances: row.get::<_, Option<i32>>("max_instances").ok().flatten().unwrap_or(1),
+                    created_at: row.get("bd_created_at").unwrap_or(0),
+                    updated_at: row.get("bd_updated_at").unwrap_or(0),
+                }
+            });
+
+            Ok((channel, bon_driver))
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
+    }
+
     /// Update channel information.
     pub fn update_channel(&self, bon_driver_id: i64, info: &ChannelInfo) -> Result<()> {
         // Auto-detect band_type, region_id, and terrestrial_region if not provided
@@ -973,6 +1040,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!disabled.is_enabled);
+    }
+
+    #[test]
+    fn test_get_channels_by_nid_tsid() {
+        let db = Database::open_in_memory().unwrap();
+        let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+
+        // Two channels with different NID (and different TSID) so we can
+        // verify the WHERE nid=?/tsid=? filter narrows to a single group.
+        let info_a = create_test_channel(0x7FE8, 1024, 32736);
+        let info_b = create_test_channel(0x7FE1, 2048, 16400);
+        db.insert_channel(bon_driver_id, &info_a).unwrap();
+        db.insert_channel(bon_driver_id, &info_b).unwrap();
+
+        let rows = db.get_channels_by_nid_tsid(0x7FE8, 32736).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (channel, driver) = &rows[0];
+        assert_eq!(channel.nid, 0x7FE8);
+        assert_eq!(channel.tsid, 32736);
+        assert_eq!(channel.sid, 1024);
+        assert_eq!(driver.as_ref().unwrap().dll_path, "Test.dll");
+
+        // A NID+TSID pair with no matching rows returns an empty result.
+        let none = db.get_channels_by_nid_tsid(0xFFFF, 0xFFFF).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

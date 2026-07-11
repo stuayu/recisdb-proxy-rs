@@ -1986,49 +1986,68 @@ impl Session {
             debug!("[Session {}] SetChannelSpace: In group mode, searching for NID=0x{:04X} TSID=0x{:04X}", 
                    self.id, entry.nid, entry.tsid);
             
-            // Query all channels and find which drivers have this NID+TSID
-            let db = self.database.lock().await;
+            // Query only the channels for this NID+TSID and find which drivers have it.
+            // (H3/M5, docs/SYSTEM_REVIEW_2026-07.md: narrow the query to one NID+TSID via
+            // get_channels_by_nid_tsid instead of scanning the full table, and collect
+            // everything the DB needs to tell us — candidates, quality scores, and
+            // max_instances — BEFORE dropping the lock, so it is never held across the
+            // tuner_pool `.await` calls that follow.)
             let mut candidate_drivers: Vec<(String, u32, u32)> = Vec::new();  // (driver_path, actual_space, bon_channel)
+            let mut max_instances_map: HashMap<String, i32> = HashMap::new();
 
-            match db.get_all_channels_with_drivers() {
-                Ok(all_channels) => {
-                    for (ch, bd_opt) in all_channels {
-                        let Some(bd) = bd_opt else { continue; };
-                        
-                        // Check if this driver is in the group
-                        if !self.group_driver_paths.contains(&bd.dll_path) {
+            {
+                let db = self.database.lock().await;
+
+                match db.get_channels_by_nid_tsid(entry.nid, entry.tsid) {
+                    Ok(matched_channels) => {
+                        for (ch, bd_opt) in matched_channels {
+                            let Some(bd) = bd_opt else { continue; };
+
+                            // Check if this driver is in the group
+                            if !self.group_driver_paths.contains(&bd.dll_path) {
+                                continue;
+                            }
+
+                            // Match by NID+TSID (this correctly handles different bon_channel values across drivers)
+                            if ch.nid as u16 == entry.nid && ch.tsid as u16 == entry.tsid && ch.is_enabled {
+                                candidate_drivers.push((bd.dll_path.clone(), ch.space, ch.channel));
+                                debug!("[Session {}] Found NID+TSID match in driver {} (space {}, ch {})",
+                                    self.id, bd.dll_path, ch.space, ch.channel);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Session {}] Failed to query channels: {}", self.id, e);
+                    }
+                }
+
+                // Sort candidate drivers by quality score (descending)
+                if !candidate_drivers.is_empty() {
+                    let mut score_map: HashMap<String, f64> = HashMap::new();
+                    for (driver_path, _, _) in candidate_drivers.iter() {
+                        if score_map.contains_key(driver_path) {
                             continue;
                         }
-                        
-                        // Match by NID+TSID (this correctly handles different bon_channel values across drivers)
-                        if ch.nid as u16 == entry.nid && ch.tsid as u16 == entry.tsid && ch.is_enabled {
-                            candidate_drivers.push((bd.dll_path.clone(), ch.space, ch.channel));
-                            debug!("[Session {}] Found NID+TSID match in driver {} (space {}, ch {})", 
-                                self.id, bd.dll_path, ch.space, ch.channel);
-                        }
+                        let score = db.get_driver_quality_score_by_path(driver_path).unwrap_or(1.0);
+                        score_map.insert(driver_path.clone(), score);
                     }
+                    candidate_drivers.sort_by(|a, b| {
+                        let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
+                        let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
+                        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
                 }
-                Err(e) => {
-                    error!("[Session {}] Failed to query channels: {}", self.id, e);
-                }
-            }
 
-            // Sort candidate drivers by quality score (descending)
-            if !candidate_drivers.is_empty() {
-                let mut score_map: HashMap<String, f64> = HashMap::new();
+                // Pre-collect max_instances for every candidate driver so the capacity
+                // scan below can run purely against `tuner_pool` with the DB lock released.
                 for (driver_path, _, _) in candidate_drivers.iter() {
-                    if score_map.contains_key(driver_path) {
+                    if max_instances_map.contains_key(driver_path) {
                         continue;
                     }
-                    let score = db.get_driver_quality_score_by_path(driver_path).unwrap_or(1.0);
-                    score_map.insert(driver_path.clone(), score);
+                    let max_instances = db.get_max_instances_for_path(driver_path).unwrap_or(1);
+                    max_instances_map.insert(driver_path.clone(), max_instances);
                 }
-                candidate_drivers.sort_by(|a, b| {
-                    let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
-                    let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
-                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
+            } // Release database lock before any tuner_pool awaits
 
             // Build NID+TSID → ChannelKey mapping for same-channel reuse across drivers
             for (dp, ds, dc) in &candidate_drivers {
@@ -2042,19 +2061,19 @@ impl Session {
             // Priority: 1) Driver already streaming this channel, 2) Driver with available capacity
             let mut selected_driver: Option<(String, u32, u32)> = None;
             let keys = self.tuner_pool.keys().await;
-            
+
             // First, check if any driver is already streaming this channel (by its own space+bon_channel)
             for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
-                let new_channel_key = ChannelKeySpec::SpaceChannel { 
-                    space: *driver_space, 
-                    channel: *driver_bon_channel 
+                let new_channel_key = ChannelKeySpec::SpaceChannel {
+                    space: *driver_space,
+                    channel: *driver_bon_channel
                 };
                 for k in keys.iter() {
                     if k.tuner_path == *driver_path && k.channel == new_channel_key {
                         if let Some(tuner) = self.tuner_pool.get(&k).await {
                             if tuner.is_running() {
                                 selected_driver = Some((driver_path.clone(), *driver_space, *driver_bon_channel));
-                                debug!("[Session {}] Selected driver (already streaming this channel): {} (space {}, ch {})", 
+                                debug!("[Session {}] Selected driver (already streaming this channel): {} (space {}, ch {})",
                                        self.id, driver_path, driver_space, driver_bon_channel);
                                 break;
                             }
@@ -2085,17 +2104,17 @@ impl Session {
                             }
                         }
                     }
-                    
-                    // Get max_instances for this driver
-                    let max_instances = db.get_max_instances_for_path(driver_path).unwrap_or(1);
-                    
-                    debug!("[Session {}] Driver {} has {}/{} instances", 
+
+                    // Get max_instances for this driver (pre-collected above)
+                    let max_instances = max_instances_map.get(driver_path).copied().unwrap_or(1);
+
+                    debug!("[Session {}] Driver {} has {}/{} instances",
                            self.id, driver_path, driver_instances, max_instances);
-                    
+
                     // Prefer driver with available capacity
                     if driver_instances < max_instances {
                         selected_driver = Some((driver_path.clone(), *driver_space, *driver_bon_channel));
-                        debug!("[Session {}] Selected driver (with capacity): {} (space {}, ch {})", 
+                        debug!("[Session {}] Selected driver (with capacity): {} (space {}, ch {})",
                             self.id, driver_path, driver_space, driver_bon_channel);
                         break;
                     }
@@ -2105,13 +2124,11 @@ impl Session {
             // If no driver with capacity, use first candidate (will fail at capacity check)
             if selected_driver.is_none() && !candidate_drivers.is_empty() {
                 selected_driver = Some(candidate_drivers[0].clone());
-                debug!("[Session {}] Selected driver (all full, will check priority): {} (space {}, ch {})", 
-                       self.id, selected_driver.as_ref().unwrap().0, 
+                debug!("[Session {}] Selected driver (all full, will check priority): {} (space {}, ch {})",
+                       self.id, selected_driver.as_ref().unwrap().0,
                        selected_driver.as_ref().unwrap().1,
                        selected_driver.as_ref().unwrap().2);
             }
-
-            drop(db); // Release database lock
 
             // Use the selected driver's space and bon_channel
             match selected_driver {
