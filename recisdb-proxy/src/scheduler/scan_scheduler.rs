@@ -877,10 +877,21 @@ fn uhf_channel_from_frequency(freq_hz: u32) -> Option<u8> {
     (13..=62).contains(&ch).then_some(ch as u8)
 }
 
-/// BS remote-control key (ARIB TR-B15 fixed assignment per SID). BS carries
-/// no NIT TS情報記述子, so unlike terrestrial this cannot come from the
-/// stream. CS has no remote-control key assignment at all.
-fn bs_remote_control_key(sid: u16) -> Option<u8> {
+/// BS/CS remote-control key (SID-based fixed assignment; neither band
+/// carries a NIT TS情報記述子, so unlike terrestrial this cannot come from
+/// the stream).
+/// - BS: ARIB TR-B15 fixed assignment (1-12)
+/// - CS110: the 3-digit channel number, which by operation rule IS the SID
+fn satellite_remote_control_key(nid: u16, sid: u16) -> Option<u16> {
+    match BandType::from_nid(nid) {
+        BandType::BS => bs_remote_control_key(sid),
+        BandType::CS => Some(sid),
+        _ => None,
+    }
+}
+
+/// BS remote-control key (ARIB TR-B15 fixed assignment per SID).
+fn bs_remote_control_key(sid: u16) -> Option<u16> {
     Some(match sid {
         101 | 102 => 1,       // NHK BS
         103 | 104 => 3,       // NHK BSプレミアム
@@ -928,7 +939,7 @@ fn scan_results_to_channel_infos(
             info.channel_name = Some(r.channel_name.clone());
             info.physical_ch = physical_ch;
             info.network_name = r.network_name.clone();
-            info.remote_control_key = r.remote_control_key;
+            info.remote_control_key = r.remote_control_key.map(u16::from);
             info.terrestrial_region = region_for_band(nid);
             info.bon_space = Some(r.space);
             info.bon_channel = Some(r.channel);
@@ -947,10 +958,8 @@ fn scan_results_to_channel_infos(
                 info.network_name = r.network_name.clone();
                 info.remote_control_key = r
                     .remote_control_key
-                    .or_else(|| match BandType::from_nid(nid) {
-                        BandType::BS => bs_remote_control_key(svc.service_id),
-                        _ => None,
-                    });
+                    .map(u16::from)
+                    .or_else(|| satellite_remote_control_key(nid, svc.service_id));
                 info.terrestrial_region = region_for_band(nid);
                 info.bon_space = Some(r.space);
                 info.bon_channel = Some(r.channel);
@@ -1120,6 +1129,17 @@ mod tests {
         assert_eq!(bs_remote_control_key(211), Some(11));
         assert_eq!(bs_remote_control_key(222), Some(12));
         assert_eq!(bs_remote_control_key(236), None); // BSアニマックス等は割当なし
+    }
+
+    #[test]
+    fn cs_remote_control_key_is_the_sid_channel_number() {
+        // CS110: 3桁チャンネル番号 = SID (運用規定) をそのまま固定割当
+        assert_eq!(satellite_remote_control_key(0x0007, 294), Some(294));
+        assert_eq!(satellite_remote_control_key(0x0006, 100), Some(100));
+        // BSはTR-B15の割当表
+        assert_eq!(satellite_remote_control_key(0x0004, 151), Some(5));
+        // 地上波はNIT由来なのでここでは割当なし
+        assert_eq!(satellite_remote_control_key(0x7FE0, 1024), None);
     }
 
     #[test]

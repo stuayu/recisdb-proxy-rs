@@ -516,8 +516,11 @@ pub struct ChannelInfo {
     pub channel_name: Option<String>,
     /// Physical channel number (from NIT)
     pub physical_ch: Option<u8>,
-    /// Remote control key ID (from NIT)
-    pub remote_control_key: Option<u8>,
+    /// Remote control key ID. Terrestrial: 1-12 from the NIT TS情報記述子;
+    /// BS: TR-B15 fixed assignment; CS110: the 3-digit channel number
+    /// (= SID), hence u16. This struct is NOT wire-encoded (see
+    /// ClientChannelInfo, which stays u8 on the wire).
+    pub remote_control_key: Option<u16>,
     /// Service type (0x01=TV, 0x02=Radio, etc.)
     pub service_type: Option<u8>,
     /// Network name (from NIT)
@@ -717,7 +720,9 @@ impl ClientChannelInfo {
             channel_name: info.channel_name.clone().unwrap_or_default(),
             network_name: info.network_name.clone(),
             service_type: info.service_type.unwrap_or(0x01),
-            remote_control_key: info.remote_control_key,
+            // Wire format is u8; CS110 keys (3-digit channel number = SID)
+            // don't fit — send None instead of a truncated value.
+            remote_control_key: info.remote_control_key.and_then(|k| u8::try_from(k).ok()),
             space_name,
             channel_display_name: info.channel_name.clone().unwrap_or_default(),
             priority,

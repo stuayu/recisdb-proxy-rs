@@ -27,7 +27,8 @@ pub struct ChannelInfoApi {
     pub raw_name: Option<String>,
     pub channel_name: Option<String>,
     pub physical_ch: Option<u8>,
-    pub remote_control_key: Option<u8>,
+    // u16: CS110 rows carry the 3-digit channel number (= SID)
+    pub remote_control_key: Option<u16>,
     pub service_type: Option<u8>,
     pub network_name: Option<String>,
     pub bon_space: Option<u32>,
@@ -209,7 +210,7 @@ pub async fn get_channels(
                         raw_name: None,
                         channel_name: c.service_name,
                         physical_ch: None,
-                        remote_control_key: c.remote_control_key.map(|v| v as u8),
+                        remote_control_key: c.remote_control_key.map(|v| v as u16),
                         service_type: c.service_type.map(|v| v as u8),
                         network_name: c.ts_name,
                         bon_space: Some(c.space),

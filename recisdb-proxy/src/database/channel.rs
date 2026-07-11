@@ -972,7 +972,7 @@ impl Database {
             raw_name: row.get("raw_name")?,
             channel_name: row.get("channel_name")?,
             physical_ch: row.get::<_, Option<i32>>("physical_ch")?.map(|v| v as u8),
-            remote_control_key: row.get::<_, Option<i32>>("remote_control_key")?.map(|v| v as u8),
+            remote_control_key: row.get::<_, Option<i32>>("remote_control_key")?.map(|v| v as u16),
             service_type: row.get::<_, Option<i32>>("service_type")?.map(|v| v as u8),
             network_name: row.get("network_name")?,
             bon_space: row.get::<_, Option<i32>>("bon_space")?.map(|v| v as u32),

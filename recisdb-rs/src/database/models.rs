@@ -63,7 +63,7 @@ impl ChannelRecord {
             raw_name: self.raw_name.clone(),
             channel_name: self.channel_name.clone(),
             physical_ch: self.physical_ch,
-            remote_control_key: self.remote_control_key,
+            remote_control_key: self.remote_control_key.map(u16::from),
             service_type: self.service_type,
             network_name: self.network_name.clone(),
             bon_space: self.bon_space,

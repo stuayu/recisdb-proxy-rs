@@ -3570,7 +3570,10 @@ impl Session {
                 channel_name: ch.service_name.clone().unwrap_or_default(),
                 network_name: ch.ts_name.clone(),
                 service_type: ch.service_type.map(|s| s as u8).unwrap_or(0x01),
-                remote_control_key: ch.remote_control_key.map(|k| k as u8),
+                // Wire format is u8; CS110 keys are the 3-digit channel
+                // number (= SID) and don't fit — send None instead of a
+                // truncated value.
+                remote_control_key: ch.remote_control_key.and_then(|k| u8::try_from(k).ok()),
                 space_name: bd.map(|b| b.dll_path.clone()).unwrap_or_default(),
                 channel_display_name: ch.service_name.unwrap_or_default(),
                 priority: ch.priority,

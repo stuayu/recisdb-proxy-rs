@@ -40,7 +40,8 @@ pub struct ChannelRecord {
     pub raw_name: Option<String>,
     pub channel_name: Option<String>,
     pub physical_ch: Option<u8>,
-    pub remote_control_key: Option<u8>,
+    // u16: CS110 stores the 3-digit channel number (= SID) here
+    pub remote_control_key: Option<u16>,
     pub service_type: Option<u8>,
     pub network_name: Option<String>,
     // BonDriver specific
