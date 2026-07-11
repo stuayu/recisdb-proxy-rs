@@ -3,19 +3,28 @@
 //! Creates a log file with the same name as the DLL in the same directory.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use once_cell::sync::OnceCell;
 
+/// Logger state: buffered file writer and last flush time.
+struct LoggerState {
+    writer: BufWriter<File>,
+    last_flush: Instant,
+}
+
 /// Global log file handle.
-static LOG_FILE: OnceCell<Mutex<File>> = OnceCell::new();
+static LOG_FILE: OnceCell<Mutex<LoggerState>> = OnceCell::new();
 
 /// Global file log level filter.
 /// Encoded as: Off=0, Error=1, Warn=2, Info=3, Debug=4, Trace=5.
 static FILE_LOG_LEVEL: AtomicU8 = AtomicU8::new(2); // default: Warn
+
+const FLUSH_INTERVAL_SECS: u64 = 2;
 
 /// Set the file log level.
 pub fn set_file_log_level(level: log::LevelFilter) {
@@ -118,7 +127,11 @@ pub fn init_file_logger() -> bool {
         .open(&log_path)
     {
         Ok(file) => {
-            let _ = LOG_FILE.set(Mutex::new(file));
+            let state = LoggerState {
+                writer: BufWriter::new(file),
+                last_flush: Instant::now(),
+            };
+            let _ = LOG_FILE.set(Mutex::new(state));
 
             // Write header
             log_message("========================================");
@@ -132,15 +145,30 @@ pub fn init_file_logger() -> bool {
     }
 }
 
-/// Log a message to the file.
-pub fn log_message(msg: &str) {
+/// Log a message to the file with a specific level (internal).
+pub(crate) fn log_with_level(msg: &str, level: log::Level) {
     if let Some(file_mutex) = LOG_FILE.get() {
-        if let Ok(mut file) = file_mutex.lock() {
+        if let Ok(mut state) = file_mutex.lock() {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let _ = writeln!(file, "[{}] {}", timestamp, msg);
-            let _ = file.flush();
+            let _ = writeln!(state.writer, "[{}] {}", timestamp, msg);
+
+            // Flush immediately for Warn/Error, or on 2-second interval for others
+            let should_flush = match level {
+                log::Level::Warn | log::Level::Error => true,
+                _ => state.last_flush.elapsed().as_secs() >= FLUSH_INTERVAL_SECS,
+            };
+
+            if should_flush {
+                let _ = state.writer.flush();
+                state.last_flush = Instant::now();
+            }
         }
     }
+}
+
+/// Log a message to the file (uses Info level by default).
+pub fn log_message(msg: &str) {
+    log_with_level(msg, log::Level::Info);
 }
 
 /// Log with level prefix (respects the configured file log level).
@@ -148,44 +176,44 @@ pub fn log_message(msg: &str) {
 macro_rules! file_log {
     (trace, $($arg:tt)*) => {
         if $crate::logging::file_level_enabled(log::Level::Trace) {
-            $crate::logging::log_message(&format!("[TRACE] {}", format!($($arg)*)));
+            $crate::logging::log_with_level(&format!("[TRACE] {}", format!($($arg)*)), log::Level::Trace);
         }
     };
     (debug, $($arg:tt)*) => {
         if $crate::logging::file_level_enabled(log::Level::Debug) {
-            $crate::logging::log_message(&format!("[DEBUG] {}", format!($($arg)*)));
+            $crate::logging::log_with_level(&format!("[DEBUG] {}", format!($($arg)*)), log::Level::Debug);
         }
     };
     (info, $($arg:tt)*) => {
         if $crate::logging::file_level_enabled(log::Level::Info) {
-            $crate::logging::log_message(&format!("[INFO ] {}", format!($($arg)*)));
+            $crate::logging::log_with_level(&format!("[INFO ] {}", format!($($arg)*)), log::Level::Info);
         }
     };
     (warn, $($arg:tt)*) => {
         if $crate::logging::file_level_enabled(log::Level::Warn) {
-            $crate::logging::log_message(&format!("[WARN ] {}", format!($($arg)*)));
+            $crate::logging::log_with_level(&format!("[WARN ] {}", format!($($arg)*)), log::Level::Warn);
         }
     };
     (error, $($arg:tt)*) => {
         if $crate::logging::file_level_enabled(log::Level::Error) {
-            $crate::logging::log_message(&format!("[ERROR] {}", format!($($arg)*)));
+            $crate::logging::log_with_level(&format!("[ERROR] {}", format!($($arg)*)), log::Level::Error);
         }
     };
 }
 
 /// Convenience function for logging errors with context.
 pub fn log_error(context: &str, error: &dyn std::fmt::Display) {
-    log_message(&format!("[ERROR] {}: {}", context, error));
+    log_with_level(&format!("[ERROR] {}: {}", context, error), log::Level::Error);
 }
 
 /// Log a panic to the file.
 #[allow(deprecated)]
 pub fn log_panic(info: &std::panic::PanicInfo) {
-    log_message(&format!("[PANIC] {}", info));
+    log_with_level(&format!("[PANIC] {}", info), log::Level::Error);
     if let Some(location) = info.location() {
-        log_message(&format!("[PANIC] at {}:{}:{}",
+        log_with_level(&format!("[PANIC] at {}:{}:{}",
             location.file(),
             location.line(),
-            location.column()));
+            location.column()), log::Level::Error);
     }
 }
