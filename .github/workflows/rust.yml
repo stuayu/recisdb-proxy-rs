@@ -4,17 +4,32 @@ on:
   schedule:
   - cron: 0 0 * * *
   push:
-    branches: [ master ]
   pull_request:
-    branches:
-      - 'master'
-      - 'release-candidates/**'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install PCSC, udev, dvbv5, build-essential, cmake, clang, pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential cmake libpcsclite-dev libdvbv5-dev libudev-dev clang pkg-config -qy
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Clippy (recisdb-proxy lib)
+        run: cargo clippy -p recisdb-proxy --lib --no-deps -- -W warnings
+        continue-on-error: true
+
   build-linux:
     runs-on: ubuntu-latest
     strategy:

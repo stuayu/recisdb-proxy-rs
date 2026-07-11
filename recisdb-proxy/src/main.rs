@@ -23,6 +23,8 @@ use scheduler::{ScanScheduler, scan_scheduler::ScanSchedulerConfig};
 use server::{Server, ServerConfig};
 use tuner::TunerPoolConfig;
 
+mod app_config;
+
 /// recisdb-proxy - Network proxy server for BonDriver
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -106,192 +108,35 @@ struct Args {
     server_key: Option<PathBuf>,
 }
 
-/// Configuration file format.
-#[derive(Debug, serde::Deserialize, Default)]
-struct ConfigFile {
-    #[serde(default)]
-    server: ServerSection,
-    #[serde(default)]
-    database: DatabaseSection,
-    #[serde(default)]
-    logging: LoggingSection,
-    #[serde(default)]
-    web: WebSection,
-    #[serde(default)]
-    tsreplace: TsreplaceSection,
-    #[serde(default)]
-    preview: PreviewSection,
-    #[serde(default)]
-    mirakurun: MirakurunSection,
-    #[cfg(feature = "tls")]
-    #[serde(default)]
-    tls: TlsSection,
-}
-
-/// Web dashboard/API configuration (REVIEW_2026-07.md S2).
-#[derive(Debug, serde::Deserialize, Default)]
-struct WebSection {
-    /// Require `Authorization: Bearer <token>` on all `/api/*` requests.
-    /// Defaults to `true`; set to `false` only for isolated LAN testing.
-    auth_enabled: Option<bool>,
-    /// Explicit bearer token. If unset, a token is generated once and
-    /// persisted to the database. Whatever token is in effect is printed
-    /// to the startup log on every start (when auth is enabled).
-    auth_token: Option<String>,
-}
-
-/// Mirakurun-compatible API subset configuration
-/// (STREAMING_DESIGN.md §7.1, P6).
-#[derive(Debug, serde::Deserialize, Default)]
-struct MirakurunSection {
-    /// Mount the unauthenticated `/mirakurun/api/*` router
-    /// (`web/mirakurun.rs`). Defaults to `false`: this endpoint carries no
-    /// bearer-token auth at all (real Mirakurun clients — EPGStation/mirakc/
-    /// KonomiTV — send none), so it is opt-in even though `web_listen`
-    /// already defaults to loopback-only.
-    enabled: Option<bool>,
-}
-
-/// tsreplace (external encoder) configuration that must only be settable via
-/// the config file (REVIEW_2026-07.md S1 — see
-/// `Database::set_tsreplace_command_path` for why).
-#[derive(Debug, serde::Deserialize, Default)]
-struct TsreplaceSection {
-    /// Path to the tsreplace (or compatible) executable. This is
-    /// intentionally not exposed via the Web API: the server executes this
-    /// path directly (`Command::new(command_path)`), so allowing it to be
-    /// changed by anyone who can reach the dashboard would be a remote code
-    /// execution vector.
-    command_path: Option<String>,
-    /// Optional stage-1 (preprocessor) executable, e.g. tsreadex, piped in
-    /// front of `command_path`: `TS -> preprocessor -> encoder -> stdout`.
-    /// Same trust boundary as `command_path` (TOML-only, never via the Web
-    /// API). Set to an empty string to clear an already-persisted value.
-    preprocessor_path: Option<String>,
-}
-
-/// Browser-preview (`?profile=preview`) encoder configuration that must only
-/// be settable via the config file (REVIEW_2026-07.md S1). Fully separate
-/// from `[tsreplace]`, which configures the BNDP (TVTest) session pipeline.
-#[derive(Debug, serde::Deserialize, Default)]
-struct PreviewSection {
-    /// Path to the preview encoder executable (e.g. QSVEncC). TOML-only for
-    /// the same RCE-prevention reason as `[tsreplace] command_path`.
-    command_path: Option<String>,
-    /// Optional stage-1 (preprocessor) executable, e.g. tsreadex. TOML-only.
-    /// Set to an empty string to clear an already-persisted value.
-    preprocessor_path: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct ServerSection {
-    listen: Option<String>,
-    web_listen: Option<String>,
-    tuner: Option<String>,
-    max_connections: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct LoggingSection {
-    log_dir: Option<String>,
-    retention_days: Option<u64>,
-    level: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct DatabaseSection {
-    path: Option<String>,
-}
-
-#[cfg(feature = "tls")]
-#[derive(Debug, serde::Deserialize, Default)]
-struct TlsSection {
-    enabled: Option<bool>,
-    ca_cert: Option<String>,
-    server_cert: Option<String>,
-    server_key: Option<String>,
-    require_client_cert: Option<bool>,
-}
-
-fn load_config(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::Error>> {
-    let contents = std::fs::read_to_string(path)?;
-    let config: ConfigFile = toml::from_str(&contents)?;
-    Ok(config)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = Args::parse();
 
     // Load config file: explicit path > auto-detect > default
-    let config_path = args.config.clone().or_else(|| {
-        let default_path = PathBuf::from("recisdb-proxy.toml");
-        if default_path.exists() {
-            Some(default_path)
-        } else {
-            None
-        }
-    });
-    let file_config = if let Some(config_path) = &config_path {
-        match load_config(config_path) {
-            Ok(c) => {
-                eprintln!("Loaded config from: {}", config_path.display());
-                c
-            }
-            Err(e) => {
-                eprintln!("Failed to load config file: {}", e);
-                return Err(e);
-            }
-        }
-    } else {
-        ConfigFile::default()
-    };
+    let file_config = app_config::load_file_config(&args)?;
 
     // Merge logging configs (command line takes precedence)
-    let log_dir = if args.log_dir.to_string_lossy() != "logs" {
-        args.log_dir.clone()
-    } else {
-        PathBuf::from(file_config.logging.log_dir.as_deref().unwrap_or("logs"))
-    };
-
-    let log_retention_days = if args.log_retention_days != 7 {
-        args.log_retention_days
-    } else {
-        file_config.logging.retention_days.unwrap_or(7)
-    };
+    let (log_dir, log_retention_days, log_level) =
+        app_config::resolve_log_settings(&args, &file_config);
 
     // Initialize logging with file output and rotation
-    let log_level = file_config.logging.level.as_deref();
     // Keep the returned guard alive for the whole program: dropping it stops
     // the background file-writer thread and flushes buffered log lines.
-    let _log_guard = logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level)
+    let _log_guard = logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level.as_deref())
         .expect("Failed to initialize logging");
 
     // Use log macros which are now bridged to tracing
     use log::{error, info};
 
-    // Get database path and other settings from config
-    let listen_addr = if let Some(addr_str) = &file_config.server.listen {
-        addr_str.parse::<SocketAddr>().unwrap_or(args.listen)
-    } else {
-        args.listen
-    };
-    let web_listen_addr = if let Some(addr_str) = &file_config.server.web_listen {
-        addr_str.parse::<SocketAddr>().unwrap_or(args.web_listen)
-    } else {
-        args.web_listen
-    };
-    let default_tuner = args.tuner.or(file_config.server.tuner);
-    let max_connections = file_config
-        .server
-        .max_connections
-        .unwrap_or(args.max_connections);
-    let db_path = file_config
-        .database
-        .path
-        .map(PathBuf::from)
-        .unwrap_or(args.database);
+    // Resolve everything else (listen addrs, tuner, TLS, web/mirakurun
+    // toggles) from args × TOML config file (app_config.rs, M10).
+    let resolved = app_config::load(&args, &file_config)?;
+    let listen_addr = resolved.listen_addr;
+    let web_listen_addr = resolved.web_listen_addr;
+    let default_tuner = resolved.default_tuner;
+    let max_connections = resolved.max_connections;
+    let db_path = resolved.db_path;
 
     // Initialize database
     info!("Opening database: {:?}", db_path);
@@ -350,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Whichever branch resolved it, the token is printed to the startup log
     // on every start (see below) so it can always be recovered from the
     // console/log file.
-    let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
+    let web_auth_enabled = resolved.web_auth_enabled;
     let web_auth_token = {
         let db_guard = db.lock().await;
         if let Some(token) = &file_config.web.auth_token {
@@ -389,65 +234,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // opt-in, default disabled. The startup WARN for the unauthenticated
     // surface itself is logged from `web::start_web_server` once the router
     // is actually about to be nested in.
-    let mirakurun_enabled = file_config.mirakurun.enabled.unwrap_or(false);
+    let mirakurun_enabled = resolved.mirakurun_enabled;
 
-    // Build TLS config if enabled
+    // TLS config, resolved from args × TOML by app_config::load above.
     #[cfg(feature = "tls")]
-    let tls_config = if args.tls {
-        // Get TLS paths from args or config file
-        let ca_cert = args
-            .ca_cert
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| file_config.tls.ca_cert.clone());
-        let server_cert = args
-            .server_cert
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| file_config.tls.server_cert.clone());
-        let server_key = args
-            .server_key
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| file_config.tls.server_key.clone());
-        let require_client_cert = file_config.tls.require_client_cert.unwrap_or(false);
-
-        match (ca_cert, server_cert, server_key) {
-            (Some(ca), Some(cert), Some(key)) => {
-                info!("TLS enabled with:");
-                info!("  CA certificate: {}", ca);
-                info!("  Server certificate: {}", cert);
-                info!("  Server key: {}", key);
-                info!("  Require client cert: {}", require_client_cert);
-                Some(server::TlsConfig {
-                    ca_cert_path: ca,
-                    server_cert_path: cert,
-                    server_key_path: key,
-                    require_client_cert,
-                })
-            }
-            _ => {
-                error!("TLS enabled but missing certificate/key paths");
-                error!("Required: --ca-cert, --server-cert, --server-key");
-                return Err("TLS configuration incomplete".into());
-            }
-        }
-    } else {
-        file_config
-            .tls
-            .enabled
-            .filter(|&e| e)
-            .and_then(|_| {
-                let ca = file_config.tls.ca_cert.clone()?;
-                let cert = file_config.tls.server_cert.clone()?;
-                let key = file_config.tls.server_key.clone()?;
-                let require_client_cert = file_config.tls.require_client_cert.unwrap_or(false);
-                info!("TLS enabled from config file");
-                Some(server::TlsConfig {
-                    ca_cert_path: ca,
-                    server_cert_path: cert,
-                    server_key_path: key,
-                    require_client_cert,
-                })
-            })
-    };
+    let tls_config = resolved.tls_config;
 
     // Load tuner optimization config (incl. STREAMING_DESIGN.md §4/§9 P3
     // prefill/jitter settings) from database.
