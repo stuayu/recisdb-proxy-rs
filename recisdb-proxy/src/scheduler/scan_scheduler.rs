@@ -365,6 +365,8 @@ struct ScanChannelResult {
     network_name: Option<String>,
     /// Remote-control key id (NIT TS情報記述子; terrestrial only)
     remote_control_key: Option<u8>,
+    /// Physical channel (terrestrial only: UHF ch from NIT 地上分配システム記述子)
+    physical_ch: Option<u8>,
     /// Services found on this channel
     services: Vec<ServiceInfo>,
 }
@@ -376,6 +378,7 @@ struct TsAnalysis {
     transport_stream_id: Option<u16>,
     network_name: Option<String>,
     remote_control_key: Option<u8>,
+    physical_ch: Option<u8>,
     services: Vec<ServiceInfo>,
 }
 
@@ -662,6 +665,7 @@ fn scan_space_blocking(
             transport_stream_id: analysis.transport_stream_id,
             network_name: analysis.network_name,
             remote_control_key: analysis.remote_control_key,
+            physical_ch: analysis.physical_ch,
             services: analysis.services,
         });
     }
@@ -822,13 +826,84 @@ fn analyze_ts_stream(
                 .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.remote_control_key))
         });
 
+    // Physical UHF channel from the NIT 地上分配システム記述子 (terrestrial
+    // only; BS/CS derive theirs from the TSID in scan_results_to_channel_infos).
+    // The descriptor may list several frequencies (親局+中継局); the first
+    // entry is the main transmitter, which is what channel files display.
+    let physical_ch = result
+        .nit
+        .as_ref()
+        .and_then(|nit| {
+            result
+                .transport_stream_id
+                .and_then(|tsid| nit.find_transport_stream(tsid))
+                .and_then(|ts| ts.terrestrial_delivery.as_ref())
+                .or_else(|| {
+                    nit.transport_streams
+                        .iter()
+                        .find_map(|ts| ts.terrestrial_delivery.as_ref())
+                })
+                .and_then(|d| d.frequencies.first().copied())
+        })
+        .and_then(uhf_channel_from_frequency);
+
     Ok(TsAnalysis {
         network_id: result.network_id,
         transport_stream_id: result.transport_stream_id,
         network_name: result.network_name.clone(),
         remote_control_key,
+        physical_ch,
         services,
     })
+}
+
+/// Physical channel of the tuned TS. Terrestrial comes from the NIT
+/// frequency (`nit_physical_ch`); BS / 110度CS encode their transponder in
+/// the TSID (ARIB TR-B15): BS TP = bits 8..4, CS110 ND = bits 9..4.
+fn physical_ch_for(nid: u16, tsid: u16, nit_physical_ch: Option<u8>) -> Option<u8> {
+    match BandType::from_nid(nid) {
+        BandType::Terrestrial => nit_physical_ch,
+        BandType::BS => Some(((tsid >> 4) & 0x1F) as u8),
+        BandType::CS => Some(((tsid >> 4) & 0x3F) as u8),
+        _ => None,
+    }
+}
+
+/// UHF center frequency (Hz) → physical channel 13-62.
+/// ch13 = 473 + 1/7 MHz, 6 MHz spacing (ISDB-T).
+fn uhf_channel_from_frequency(freq_hz: u32) -> Option<u8> {
+    let offset = freq_hz as i64 - 473_142_857;
+    let ch = 13 + (offset + 3_000_000).div_euclid(6_000_000);
+    (13..=62).contains(&ch).then_some(ch as u8)
+}
+
+/// BS remote-control key (ARIB TR-B15 fixed assignment per SID). BS carries
+/// no NIT TS情報記述子, so unlike terrestrial this cannot come from the
+/// stream. CS has no remote-control key assignment at all.
+fn bs_remote_control_key(sid: u16) -> Option<u8> {
+    Some(match sid {
+        101 | 102 => 1,       // NHK BS
+        103 | 104 => 3,       // NHK BSプレミアム
+        141..=143 => 4,       // BS日テレ
+        151..=153 => 5,       // BS朝日
+        161..=163 => 6,       // BS-TBS
+        171..=173 => 7,       // BSテレ東
+        181..=183 => 8,       // BSフジ
+        191..=193 => 9,       // WOWOW
+        200..=202 => 10,      // スターチャンネル
+        211 | 212 => 11,      // BS11
+        222 => 12,            // BS12トゥエルビ
+        _ => return None,
+    })
+}
+
+/// 地域 column value: prefecture for terrestrial is filled by
+/// merge_scan_results from the NID; satellite bands are nationwide.
+fn region_for_band(nid: u16) -> Option<String> {
+    match BandType::from_nid(nid) {
+        BandType::BS | BandType::CS | BandType::FourK => Some("全国".to_string()),
+        _ => None,
+    }
 }
 
 /// Convert scan results to ChannelInfo for database storage.
@@ -841,6 +916,7 @@ fn scan_results_to_channel_infos(
     for r in results {
         let nid = r.network_id.unwrap_or(0);
         let tsid = r.transport_stream_id.unwrap_or(0);
+        let physical_ch = physical_ch_for(nid, tsid, r.physical_ch);
 
         if r.services.is_empty() {
             // No services found, create entry with minimal info
@@ -848,9 +924,12 @@ fn scan_results_to_channel_infos(
             warn!("scan_results_to_channel_infos: No services found for space={}, channel={}",
                   r.space, r.channel);
             let mut info = recisdb_protocol::ChannelInfo::new(nid, 0, tsid);
+            info.raw_name = Some(r.channel_name.clone());
             info.channel_name = Some(r.channel_name.clone());
+            info.physical_ch = physical_ch;
             info.network_name = r.network_name.clone();
             info.remote_control_key = r.remote_control_key;
+            info.terrestrial_region = region_for_band(nid);
             info.bon_space = Some(r.space);
             info.bon_channel = Some(r.channel);
             channel_infos.push(info);
@@ -858,10 +937,21 @@ fn scan_results_to_channel_infos(
             // Create a ChannelInfo entry for each service
             for svc in &r.services {
                 let mut info = recisdb_protocol::ChannelInfo::new(nid, svc.service_id, tsid);
-                info.channel_name = svc.service_name.clone().or_else(|| Some(r.channel_name.clone()));
+                // raw_name preserves the scanned SDT service name verbatim;
+                // channel_name starts identical but is the user-editable one.
+                let name = svc.service_name.clone().unwrap_or_else(|| r.channel_name.clone());
+                info.raw_name = Some(name.clone());
+                info.channel_name = Some(name);
+                info.physical_ch = physical_ch;
                 info.service_type = svc.service_type;
                 info.network_name = r.network_name.clone();
-                info.remote_control_key = r.remote_control_key;
+                info.remote_control_key = r
+                    .remote_control_key
+                    .or_else(|| match BandType::from_nid(nid) {
+                        BandType::BS => bs_remote_control_key(svc.service_id),
+                        _ => None,
+                    });
+                info.terrestrial_region = region_for_band(nid);
                 info.bon_space = Some(r.space);
                 info.bon_channel = Some(r.channel);
                 channel_infos.push(info);
@@ -996,6 +1086,70 @@ async fn perform_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uhf_channel_from_frequency_maps_center_frequencies() {
+        // ch13 = 473.142857 MHz, ch27 = 557.142857 MHz, ch52 = 707.142857 MHz
+        assert_eq!(uhf_channel_from_frequency(473_142_857), Some(13));
+        assert_eq!(uhf_channel_from_frequency(557_142_857), Some(27));
+        assert_eq!(uhf_channel_from_frequency(707_142_857), Some(52));
+        // ±3MHz 未満のずれは同じチャンネルに丸める
+        assert_eq!(uhf_channel_from_frequency(556_000_000), Some(27));
+        // UHF帯域外
+        assert_eq!(uhf_channel_from_frequency(200_000_000), None);
+        assert_eq!(uhf_channel_from_frequency(800_000_000), None);
+    }
+
+    #[test]
+    fn physical_ch_for_derives_satellite_transponder_from_tsid() {
+        // BS: TSID 0x4031 = BS03/TS1 → TP3, 0x40F1 = BS15/TS1 → TP15
+        assert_eq!(physical_ch_for(0x0004, 0x4031, None), Some(3));
+        assert_eq!(physical_ch_for(0x0004, 0x40F1, None), Some(15));
+        // CS110: TSID 0x6080 → ND8, 0x7160? — ND22 は 0x6160
+        assert_eq!(physical_ch_for(0x0007, 0x6020, None), Some(2));
+        assert_eq!(physical_ch_for(0x0007, 0x6160, None), Some(22));
+        // 地上波は NIT 由来の値をそのまま使う
+        assert_eq!(physical_ch_for(0x7FE0, 0x7FE1, Some(27)), Some(27));
+        assert_eq!(physical_ch_for(0x7FE0, 0x7FE1, None), None);
+    }
+
+    #[test]
+    fn bs_remote_control_key_matches_tr_b15_assignment() {
+        assert_eq!(bs_remote_control_key(101), Some(1));
+        assert_eq!(bs_remote_control_key(141), Some(4));
+        assert_eq!(bs_remote_control_key(211), Some(11));
+        assert_eq!(bs_remote_control_key(222), Some(12));
+        assert_eq!(bs_remote_control_key(236), None); // BSアニマックス等は割当なし
+    }
+
+    #[test]
+    fn scan_results_fill_raw_name_physical_ch_and_bs_extras() {
+        let bs = ScanChannelResult {
+            space: 1,
+            channel: 0,
+            channel_name: "BS01/TS0".to_string(),
+            signal_level: 15.0,
+            network_id: Some(0x0004),
+            transport_stream_id: Some(0x4010),
+            network_name: Some("BSデジタル".to_string()),
+            remote_control_key: None, // BSはNITから取れない
+            physical_ch: None,        // BSはNIT周波数ではなくTSIDから導出
+            services: vec![ServiceInfo {
+                service_id: 151,
+                service_name: Some("BS朝日1".to_string()),
+                service_type: Some(0x01),
+            }],
+        };
+
+        let infos = scan_results_to_channel_infos(&[bs]);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert_eq!(info.raw_name.as_deref(), Some("BS朝日1"));
+        assert_eq!(info.channel_name.as_deref(), Some("BS朝日1"));
+        assert_eq!(info.physical_ch, Some(1)); // BS01 → TP1
+        assert_eq!(info.remote_control_key, Some(5)); // TR-B15: BS朝日 = 5
+        assert_eq!(info.terrestrial_region.as_deref(), Some("全国"));
+    }
 
     #[test]
     fn test_scan_scheduler_config_default() {
