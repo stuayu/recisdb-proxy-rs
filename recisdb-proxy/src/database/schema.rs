@@ -120,6 +120,19 @@ CREATE TABLE IF NOT EXISTS tsreplace_config (
     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
+-- Browser-preview encoder configuration table (Migration 009, see
+-- database/mod.rs MIGRATIONS). Fully separate from tsreplace_config: this
+-- table gates ONLY the HTTP `?profile=preview` streaming path.
+CREATE TABLE IF NOT EXISTS preview_encoder_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER DEFAULT 0,
+    command_path TEXT DEFAULT '',
+    preprocessor_path TEXT DEFAULT '',
+    preprocessor_arguments TEXT DEFAULT '',
+    read_timeout_ms INTEGER DEFAULT 10000,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 -- Web API authentication configuration (REVIEW_2026-07.md S2).
 -- Stores the generated/persisted bearer token so it survives restarts.
 -- `[web] auth_token` in the TOML config file, if set, always overrides this
@@ -280,5 +293,6 @@ mod tests {
         assert!(tables.contains(&"driver_quality_stats".to_string()));
         assert!(tables.contains(&"tuner_config".to_string()));
         assert!(tables.contains(&"encode_profiles".to_string()));
+        assert!(tables.contains(&"preview_encoder_config".to_string()));
     }
 }

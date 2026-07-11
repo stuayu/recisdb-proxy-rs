@@ -58,6 +58,9 @@ pub enum DatabaseError {
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
 
+/// Migration ledger entry body: a fn pointer taking the open `Database`.
+type MigrationFn = fn(&Database) -> Result<()>;
+
 /// Main database connection wrapper.
 pub struct Database {
     conn: Connection,
@@ -132,82 +135,176 @@ impl Database {
         Ok(())
     }
 
-    /// Apply pending migrations.
+    /// Ordered migration ledger, tracked via `PRAGMA user_version` (the
+    /// index of the next migration to apply). This list preserves the
+    /// EFFECTIVE order the old ad-hoc, comment-numbered steps actually ran
+    /// in (001, 003, 004, 005, 006, 007, 011, 012, 013, 008, 009, 010, 002)
+    /// — entries are relabeled 001..013 in that same order, not reordered.
+    ///
+    /// CRITICAL: every body here MUST stay idempotent
+    /// (`add_column_if_not_exists`, `CREATE TABLE IF NOT EXISTS`, `INSERT OR
+    /// IGNORE`, etc). Databases created before this ledger existed have
+    /// `user_version = 0` but may already have every column, because they
+    /// were migrated by the old ad-hoc code path. On such a DB every body in
+    /// this list replays from index 0 and must be a harmless no-op wherever
+    /// the work was already done.
+    const MIGRATIONS: &'static [(&'static str, MigrationFn)] = &[
+        ("001_channels_band_region_columns", Database::migration_001_channels_band_region_columns),
+        ("002_alert_rules_webhook_columns", Database::migration_002_alert_rules_webhook_columns),
+        ("003_scan_scheduler_timing_columns", Database::migration_003_scan_scheduler_timing_columns),
+        ("004_tuner_startup_timing_columns", Database::migration_004_tuner_startup_timing_columns),
+        ("005_session_history_loss_summary", Database::migration_005_session_history_loss_summary),
+        ("006_tsreplace_max_concurrent_encoders", Database::migration_006_tsreplace_max_concurrent_encoders),
+        ("007_tsreplace_preprocessor_columns", Database::migration_007_tsreplace_preprocessor_columns),
+        ("008_tsreplace_preview_enabled_legacy", Database::migration_008_tsreplace_preview_enabled_legacy),
+        ("009_preview_encoder_config_seed", Database::migration_009_preview_encoder_config_seed),
+        ("010_session_history_stream_class", Database::migration_010_session_history_stream_class),
+        ("011_tuner_prefill_jitter_columns", Database::migration_011_tuner_prefill_jitter_columns),
+        ("012_encode_profiles_noop", Database::migration_012_encode_profiles_noop),
+        (
+            "013_backfill_channels_band_terrestrial_region",
+            Database::migration_013_backfill_channels_band_terrestrial_region,
+        ),
+    ];
+
+    /// Apply pending migrations, tracked via `PRAGMA user_version` as the
+    /// ledger position. See [`Self::MIGRATIONS`] for ordering/idempotency
+    /// requirements.
     fn apply_migrations(&self) -> Result<()> {
-        // Migration 001: Add band_type, region_id, and terrestrial_region columns if they don't exist
-        // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check and add individually
+        let applied: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let applied = applied.max(0) as usize;
+
+        for (name, body) in Self::MIGRATIONS.iter().skip(applied) {
+            body(self)?;
+            log::debug!("Migration applied: {}", name);
+        }
+
+        let target = Self::MIGRATIONS.len();
+        if applied < target {
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {}", target))?;
+        }
+
+        Ok(())
+    }
+
+    // Migration 001: Add band_type, region_id, and terrestrial_region columns
+    // to channels if they don't exist. SQLite doesn't support IF NOT EXISTS
+    // for ALTER TABLE, so we check and add individually.
+    fn migration_001_channels_band_region_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("channels", "band_type", "INTEGER")?;
         self.add_column_if_not_exists("channels", "region_id", "INTEGER")?;
         self.add_column_if_not_exists("channels", "terrestrial_region", "TEXT")?;
+        Ok(())
+    }
 
-        // Migration 003: Add webhook columns to alert_rules if they don't exist
+    // Migration 002 (was 003): Add webhook columns to alert_rules if they don't exist.
+    fn migration_002_alert_rules_webhook_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("alert_rules", "webhook_url", "TEXT")?;
         self.add_column_if_not_exists("alert_rules", "webhook_format", "TEXT DEFAULT 'generic'")?;
+        Ok(())
+    }
 
-        // Migration 004: Add global scan timing config columns if they don't exist
+    // Migration 003 (was 004): Add global scan timing config columns if they don't exist.
+    fn migration_003_scan_scheduler_timing_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("scan_scheduler_config", "signal_lock_wait_ms", "INTEGER DEFAULT 500")?;
         self.add_column_if_not_exists("scan_scheduler_config", "ts_read_timeout_ms", "INTEGER DEFAULT 300000")?;
+        Ok(())
+    }
 
-        // Migration 005: Add tuner startup timing config columns if they don't exist
+    // Migration 004 (was 005): Add tuner startup timing config columns if they don't exist.
+    fn migration_004_tuner_startup_timing_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tuner_config", "set_channel_retry_interval_ms", "INTEGER DEFAULT 500")?;
         self.add_column_if_not_exists("tuner_config", "set_channel_retry_timeout_ms", "INTEGER DEFAULT 10000")?;
         self.add_column_if_not_exists("tuner_config", "signal_poll_interval_ms", "INTEGER DEFAULT 500")?;
         self.add_column_if_not_exists("tuner_config", "signal_wait_timeout_ms", "INTEGER DEFAULT 10000")?;
+        Ok(())
+    }
 
-        // Migration 006: Add loss_summary column to session_history if it doesn't exist
-        // (STREAMING_DESIGN.md P1: per-loss-source counters + top-loss PIDs, JSON encoded)
+    // Migration 005 (was 006): Add loss_summary column to session_history if
+    // it doesn't exist (STREAMING_DESIGN.md P1: per-loss-source counters +
+    // top-loss PIDs, JSON encoded).
+    fn migration_005_session_history_loss_summary(&self) -> Result<()> {
         self.add_column_if_not_exists("session_history", "loss_summary", "TEXT")?;
+        Ok(())
+    }
 
-        // Migration 007: Add max_concurrent_encoders column to tsreplace_config if it
-        // doesn't exist (STREAMING_DESIGN.md §5/§9 P4: shared encoder pool).
+    // Migration 006 (was 007): Add max_concurrent_encoders column to
+    // tsreplace_config if it doesn't exist (STREAMING_DESIGN.md §5/§9 P4:
+    // shared encoder pool).
+    fn migration_006_tsreplace_max_concurrent_encoders(&self) -> Result<()> {
         self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
+        Ok(())
+    }
 
-        // Migration 011: Add optional preprocessor (stage-1 command, e.g.
-        // tsreadex) columns to tsreplace_config. Empty string = no
-        // preprocessor (legacy single-stage behavior), so existing rows keep
-        // working unchanged. `preprocessor_path` is TOML-only like
-        // `command_path` (REVIEW S1); `preprocessor_arguments` is
-        // API-editable like `arguments`.
+    // Migration 007 (was 011): Add optional preprocessor (stage-1 command,
+    // e.g. tsreadex) columns to tsreplace_config. Empty string = no
+    // preprocessor (legacy single-stage behavior), so existing rows keep
+    // working unchanged. `preprocessor_path` is TOML-only like
+    // `command_path` (REVIEW S1); `preprocessor_arguments` is API-editable
+    // like `arguments`.
+    fn migration_007_tsreplace_preprocessor_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
+        Ok(())
+    }
 
-        // Migration 012 (legacy): `tsreplace_config.preview_enabled` briefly
-        // gated the HTTP `?profile=preview` path. Superseded by Migration
-        // 013's dedicated `preview_encoder_config` table. The column is kept
-        // (never dropped) but is NO LONGER REFERENCED anywhere except the
-        // one-time carry-over in `ensure_preview_encoder_config_compat`.
+    // Migration 008 (was 012, legacy): `tsreplace_config.preview_enabled`
+    // briefly gated the HTTP `?profile=preview` path. Superseded by
+    // Migration 009's dedicated `preview_encoder_config` table. The column
+    // is kept (never dropped) but is NO LONGER REFERENCED anywhere except
+    // the one-time carry-over in `migration_009_preview_encoder_config_seed`.
+    fn migration_008_tsreplace_preview_enabled_legacy(&self) -> Result<()> {
         self.add_column_if_not_exists("tsreplace_config", "preview_enabled", "INTEGER DEFAULT 0")?;
+        Ok(())
+    }
 
-        // Migration 013: dedicated browser-preview encoder settings table,
-        // fully separated from the BNDP (TVTest) `tsreplace_config`. Created
-        // (and seeded, carrying `tsreplace_config.preview_enabled` over into
-        // its `enabled`) by `ensure_preview_encoder_config_compat`.
-        self.ensure_preview_encoder_config_compat()?;
+    // Migration 009 (was 013): dedicated browser-preview encoder settings
+    // table, fully separated from the BNDP (TVTest) `tsreplace_config`. The
+    // table itself is created by `schema::SCHEMA_SQL`; this step seeds it
+    // (carrying `tsreplace_config.preview_enabled` over into its `enabled`).
+    fn migration_009_preview_encoder_config_seed(&self) -> Result<()> {
+        self.ensure_preview_encoder_config_compat()
+    }
 
-        // Migration 008: Add stream_class column to session_history if it doesn't
-        // exist (STREAMING_DESIGN.md §2 P2: stream reliability class, recorded at
-        // session end).
+    // Migration 010 (was 008): Add stream_class column to session_history if
+    // it doesn't exist (STREAMING_DESIGN.md §2 P2: stream reliability class,
+    // recorded at session end).
+    fn migration_010_session_history_stream_class(&self) -> Result<()> {
         self.add_column_if_not_exists("session_history", "stream_class", "TEXT")?;
+        Ok(())
+    }
 
-        // Migration 009: Add prefill/jitter buffer columns to tuner_config if
-        // they don't exist (STREAMING_DESIGN.md §4/§9 P3: fixed-duration
-        // prefill/jitter buffer, sized per stream class).
+    // Migration 011 (was 009): Add prefill/jitter buffer columns to
+    // tuner_config if they don't exist (STREAMING_DESIGN.md §4/§9 P3:
+    // fixed-duration prefill/jitter buffer, sized per stream class).
+    fn migration_011_tuner_prefill_jitter_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tuner_config", "prefill_view_ms", "INTEGER DEFAULT 1000")?;
         self.add_column_if_not_exists("tuner_config", "prefill_preview_ms", "INTEGER DEFAULT 2000")?;
         self.add_column_if_not_exists("tuner_config", "prefill_record_ms", "INTEGER DEFAULT 6000")?;
         self.add_column_if_not_exists("tuner_config", "jitter_safety_factor", "REAL DEFAULT 1.5")?;
+        Ok(())
+    }
 
-        // Migration 010: encode_profiles is a brand-new table (STREAMING_DESIGN.md
-        // §5.3/§9 P5), so `CREATE TABLE IF NOT EXISTS` in schema.rs already
-        // creates it for both fresh and pre-existing databases — no
-        // add_column_if_not_exists step is needed here (that mechanism is only
-        // for adding columns to tables that already exist). Default-row
-        // seeding happens separately in `initialize_schema` via
-        // `seed_default_encode_profiles`, since schema DDL can't express data
-        // seeding.
+    // Migration 012 (was 010): encode_profiles is a brand-new table
+    // (STREAMING_DESIGN.md §5.3/§9 P5), so `CREATE TABLE IF NOT EXISTS` in
+    // schema.rs already creates it for both fresh and pre-existing databases
+    // — no add_column_if_not_exists step is needed here (that mechanism is
+    // only for adding columns to tables that already exist). Default-row
+    // seeding happens separately in `initialize_schema` via
+    // `seed_default_encode_profiles`, since schema DDL can't express data
+    // seeding. Kept as an explicit no-op ledger entry to preserve the
+    // effective step order.
+    fn migration_012_encode_profiles_noop(&self) -> Result<()> {
+        Ok(())
+    }
 
-        // Migration 002: Fill band_type and terrestrial_region for existing channels
-        // This updates all NULL values in these columns based on NID
+    // Migration 013 (was 002): Fill band_type and terrestrial_region for
+    // existing channels. This updates all NULL values in these columns
+    // based on NID.
+    fn migration_013_backfill_channels_band_terrestrial_region(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
             UPDATE channels
@@ -463,23 +560,10 @@ impl Database {
 
 /// tsreplace configuration storage.
 impl Database {
+    // NOTE: `tsreplace_config`'s table itself is created by
+    // `schema::SCHEMA_SQL` (`CREATE TABLE IF NOT EXISTS`); this fn only
+    // guards individual columns added by later migrations, plus seeding.
     fn ensure_tsreplace_config_compat(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tsreplace_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER DEFAULT 0,
-                command_path TEXT DEFAULT 'tsreplace',
-                arguments TEXT DEFAULT '',
-                read_timeout_ms INTEGER DEFAULT 10000,
-                passthrough_on_error INTEGER DEFAULT 1,
-                max_concurrent_encoders INTEGER DEFAULT 2,
-                preprocessor_path TEXT DEFAULT '',
-                preprocessor_arguments TEXT DEFAULT '',
-                preview_enabled INTEGER DEFAULT 0,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );",
-        )?;
-
         self.add_column_if_not_exists("tsreplace_config", "enabled", "INTEGER DEFAULT 0")?;
         self.add_column_if_not_exists("tsreplace_config", "command_path", "TEXT DEFAULT 'tsreplace'")?;
         self.add_column_if_not_exists("tsreplace_config", "arguments", "TEXT DEFAULT ''")?;
@@ -687,7 +771,7 @@ impl Database {
     }
 }
 
-/// Browser-preview encoder configuration storage (Migration 013).
+/// Browser-preview encoder configuration storage (Migration 009).
 ///
 /// Fully separate from `tsreplace_config`: this table gates and configures
 /// ONLY the HTTP `?profile=preview` streaming path (`web/stream.rs`), while
@@ -697,22 +781,13 @@ impl Database {
 /// which caps the pool's total concurrently-running chains as a hardware
 /// resource limit, not a per-pipeline setting).
 impl Database {
+    // NOTE: `preview_encoder_config`'s table itself is created by
+    // `schema::SCHEMA_SQL` (`CREATE TABLE IF NOT EXISTS`); this fn only
+    // guards individual columns plus one-time seeding.
     fn ensure_preview_encoder_config_compat(&self) -> Result<()> {
         // The seed below carries the legacy `tsreplace_config.preview_enabled`
         // over, so make sure that table/column exists first.
         self.ensure_tsreplace_config_compat()?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS preview_encoder_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER DEFAULT 0,
-                command_path TEXT DEFAULT '',
-                preprocessor_path TEXT DEFAULT '',
-                preprocessor_arguments TEXT DEFAULT '',
-                read_timeout_ms INTEGER DEFAULT 10000,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );",
-        )?;
 
         self.add_column_if_not_exists("preview_encoder_config", "enabled", "INTEGER DEFAULT 0")?;
         self.add_column_if_not_exists("preview_encoder_config", "command_path", "TEXT DEFAULT ''")?;
@@ -836,23 +911,15 @@ impl Database {
 }
 
 /// Web API authentication token storage (REVIEW_2026-07.md S2).
+///
+/// NOTE: `web_auth_config`'s table is created by `schema::SCHEMA_SQL`
+/// (`CREATE TABLE IF NOT EXISTS`) — no ad-hoc columns have ever been added
+/// to it, so unlike the other config tables above there is no
+/// `ensure_*_compat` guard needed here.
 impl Database {
-    fn ensure_web_auth_config_compat(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS web_auth_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                auth_token TEXT,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );",
-        )?;
-        Ok(())
-    }
-
     /// Get the persisted Web API bearer token, if one has been generated or
     /// configured before.
     pub fn get_web_auth_token(&self) -> Result<Option<String>> {
-        self.ensure_web_auth_config_compat()?;
-
         let result = self.conn.query_row(
             "SELECT auth_token FROM web_auth_config WHERE id = 1",
             [],
@@ -869,7 +936,6 @@ impl Database {
     /// Persist the Web API bearer token (generated once at first startup, or
     /// set explicitly via TOML `[web] auth_token`).
     pub fn set_web_auth_token(&self, token: &str) -> Result<()> {
-        self.ensure_web_auth_config_compat()?;
         self.conn.execute(
             "INSERT INTO web_auth_config (id, auth_token, updated_at)
              VALUES (1, ?1, strftime('%s', 'now'))
@@ -1056,5 +1122,36 @@ mod tests {
 
         let (enabled, ..) = db.get_preview_encoder_config().unwrap();
         assert!(enabled, "legacy tsreplace_config.preview_enabled=1 must carry over");
+    }
+
+    /// M6 (docs/SYSTEM_REVIEW_2026-07.md Phase 14): a fresh DB ends up with
+    /// `user_version == MIGRATIONS.len()`. Forcing `user_version` back to 0
+    /// simulates every pre-ledger production DB (already fully migrated via
+    /// the old ad-hoc code path, but starting the new ledger at position 0)
+    /// — re-running `apply_migrations` must replay every body harmlessly and
+    /// land back on the same `user_version`.
+    #[test]
+    fn migrations_replay_harmlessly_from_user_version_zero() {
+        let db = Database::open_in_memory().unwrap();
+
+        let target = Database::MIGRATIONS.len() as i64;
+        let initial_version: i64 = db
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(initial_version, target, "fresh DB should be fully migrated");
+
+        // Force user_version back to 0, as a real pre-ledger production DB
+        // would have (it was migrated ad-hoc, so every column/table already
+        // exists despite the ledger position being 0).
+        db.connection().execute_batch("PRAGMA user_version = 0;").unwrap();
+
+        db.apply_migrations().unwrap();
+
+        let final_version: i64 = db
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(final_version, target);
     }
 }
