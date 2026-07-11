@@ -538,7 +538,7 @@ const HTML_CONTENT: &str = r#"
                 </div>
                 <div class="performance-graphs" style="margin-top: 10px;">
                     <div class="graph-container" style="min-width: 260px;">
-                        <h4>損失内訳</h4>
+                        <h4>配信経路の損失 (プロキシ内部)</h4>
                         <table style="font-size:12px;">
                             <tbody>
                                 <tr><td>broadcast lag (chunks)</td><td id="loss-broadcast-lag-chunks" style="text-align:right;">-</td></tr>
@@ -546,12 +546,13 @@ const HTML_CONTENT: &str = r#"
                                 <tr><td>encoder stall (events)</td><td id="loss-encoder-stall-events" style="text-align:right;">-</td></tr>
                             </tbody>
                         </table>
+                        <p style="font-size:11px;color:#888;margin-top:4px;">受信段階(電波/上流)由来のCCエラーはここには含まれず、Drop とロス上位PIDに計上されます。</p>
                     </div>
                     <div class="graph-container" style="min-width: 260px;">
                         <h4>ロス上位 PID (CC error)</h4>
                         <table style="font-size:12px;">
-                            <thead><tr><th>PID</th><th>CC errors</th></tr></thead>
-                            <tbody id="top-loss-pids-body"><tr><td colspan="2" class="empty-state">データなし</td></tr></tbody>
+                            <thead><tr><th>PID</th><th>種別</th><th>CC errors</th></tr></thead>
+                            <tbody id="top-loss-pids-body"><tr><td colspan="3" class="empty-state">データなし</td></tr></tbody>
                         </table>
                     </div>
                 </div>
@@ -1907,6 +1908,33 @@ const HTML_CONTENT: &str = r#"
             svg.innerHTML = `<polyline fill="none" stroke="${color}" stroke-width="2" points="${points}" />`;
         }
 
+        // ARIB (ISDB) 固定PIDの日本語ラベル。固定でないPID(映像・音声・字幕・
+        // PCR・ECM等)はサービスごとにPMTで決まるため一般名で表示する。
+        function pidLabel(pid) {
+            const fixed = {
+                0x0000: 'PAT (番組構成の目次)',
+                0x0001: 'CAT (EMM位置情報)',
+                0x0010: 'NIT (ネットワーク情報)',
+                0x0011: 'SDT/BAT (局名情報)',
+                0x0012: 'EIT (番組表)',
+                0x0013: 'RST',
+                0x0014: 'TDT/TOT (時刻)',
+                0x0017: 'DCT',
+                0x001E: 'DIT',
+                0x001F: 'SIT',
+                0x0023: 'SDTT (ソフト更新告知)',
+                0x0024: 'BIT',
+                0x0025: 'NBIT/LDT',
+                0x0026: 'EIT (ワンセグ)',
+                0x0027: 'EIT (ワンセグ)',
+                0x0029: 'CDT (局ロゴ)',
+                0x1FFF: 'NULL (詰め物)',
+            };
+            if (fixed[pid] !== undefined) return fixed[pid];
+            if (pid >= 0x1FC8 && pid <= 0x1FCF) return 'PMT (ワンセグ)';
+            return '映像/音声/字幕など (PMT依存)';
+        }
+
         async function updateClientMetrics() {
             if (!activeClientId) return;
             try {
@@ -1929,9 +1957,9 @@ const HTML_CONTENT: &str = r#"
                 const pids = qdata.top_loss_pids || [];
                 const pidsBody = document.getElementById('top-loss-pids-body');
                 pidsBody.innerHTML = pids.length === 0
-                    ? '<tr><td colspan="2" class="empty-state">データなし</td></tr>'
+                    ? '<tr><td colspan="3" class="empty-state">データなし</td></tr>'
                     : pids.map(p => `
-                        <tr><td>0x${p[0].toString(16).toUpperCase().padStart(4, '0')}</td><td style="text-align:right;">${formatPackets(p[1])}</td></tr>
+                        <tr><td>0x${p[0].toString(16).toUpperCase().padStart(4, '0')}</td><td>${pidLabel(p[0])}</td><td style="text-align:right;">${formatPackets(p[1])}</td></tr>
                     `).join('');
             } catch (e) { console.error('Failed to update loss breakdown:', e); }
         }

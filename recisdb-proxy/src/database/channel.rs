@@ -378,6 +378,64 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
     }
 
+    /// For each driver in `group_paths`, count how many logical channels
+    /// (distinct NID+TSID pairs, enabled only) can be received ONLY by that
+    /// driver within the group ("exclusive" channels).
+    ///
+    /// Used by group-mode driver selection to keep drivers that are the sole
+    /// receiver of some channel (e.g. a Tokyo-pointed tuner that alone gets
+    /// Tokyo MX) free for those channels: drivers with fewer exclusive
+    /// channels are preferred when a channel is receivable on several drivers.
+    /// Every path in `group_paths` is present in the returned map (0 if the
+    /// driver has no exclusive channels or no channels at all).
+    pub fn get_exclusive_channel_counts(
+        &self,
+        group_paths: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        use std::collections::HashMap;
+
+        let mut counts: HashMap<String, i64> =
+            group_paths.iter().map(|p| (p.clone(), 0)).collect();
+        if group_paths.is_empty() {
+            return Ok(counts);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT bd.dll_path, c.nid, c.tsid
+             FROM channels c
+             JOIN bon_drivers bd ON c.bon_driver_id = bd.id
+             WHERE c.is_enabled = 1",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        // (nid, tsid) -> set of group driver paths that carry it.
+        let mut carriers: HashMap<(i64, i64), HashSet<&str>> = HashMap::new();
+        let all: Vec<(String, i64, i64)> =
+            rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        for (path, nid, tsid) in &all {
+            if let Some(known) = group_paths.iter().find(|p| *p == path) {
+                carriers.entry((*nid, *tsid)).or_default().insert(known.as_str());
+            }
+        }
+
+        for paths in carriers.values() {
+            if paths.len() == 1 {
+                let sole = *paths.iter().next().unwrap();
+                if let Some(c) = counts.get_mut(sole) {
+                    *c += 1;
+                }
+            }
+        }
+
+        Ok(counts)
+    }
+
     /// Update channel information.
     pub fn update_channel(&self, bon_driver_id: i64, info: &ChannelInfo) -> Result<()> {
         // Auto-detect band_type, region_id, and terrestrial_region if not provided
@@ -1065,6 +1123,46 @@ mod tests {
         // A NID+TSID pair with no matching rows returns an empty result.
         let none = db.get_channels_by_nid_tsid(0xFFFF, 0xFFFF).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_get_exclusive_channel_counts() {
+        let db = Database::open_in_memory().unwrap();
+        let tokyo = db.get_or_create_bon_driver("Tokyo.dll").unwrap();
+        let gunma = db.get_or_create_bon_driver("Gunma.dll").unwrap();
+        let idle = db.get_or_create_bon_driver("Idle.dll").unwrap();
+        let _ = idle;
+
+        // Tokyo MX: only the Tokyo tuner carries it.
+        db.insert_channel(tokyo, &create_test_channel(0x7FE6, 23608, 23608))
+            .unwrap();
+        // テレ東相当: carried by both tuners (same NID+TSID, different SIDs
+        // must still count as ONE logical channel per driver).
+        db.insert_channel(tokyo, &create_test_channel(0x7FE8, 1024, 32736))
+            .unwrap();
+        db.insert_channel(tokyo, &create_test_channel(0x7FE8, 1025, 32736))
+            .unwrap();
+        db.insert_channel(gunma, &create_test_channel(0x7FE8, 1024, 32736))
+            .unwrap();
+        // 群馬テレビ相当: only the Gunma tuner — but disabled, so it must
+        // not count.
+        let gtv = db
+            .insert_channel(gunma, &create_test_channel(0x7FD1, 3088, 30256))
+            .unwrap();
+        db.disable_channel(gtv).unwrap();
+
+        let group = vec![
+            "Tokyo.dll".to_string(),
+            "Gunma.dll".to_string(),
+            "Idle.dll".to_string(),
+        ];
+        let counts = db.get_exclusive_channel_counts(&group).unwrap();
+        assert_eq!(counts.get("Tokyo.dll"), Some(&1)); // MX のみ
+        assert_eq!(counts.get("Gunma.dll"), Some(&0)); // 共通chと無効chのみ
+        assert_eq!(counts.get("Idle.dll"), Some(&0)); // チャンネルなしでも0で存在
+
+        // Empty group: empty map, no error.
+        assert!(db.get_exclusive_channel_counts(&[]).unwrap().is_empty());
     }
 
     #[test]

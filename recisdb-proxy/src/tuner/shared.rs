@@ -15,7 +15,6 @@ use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
-use crate::tuner::ts_analyzer::{TsPacketAnalyzer, TsStreamQuality};
 use crate::tuner::pool::TunerPoolConfig;
 
 /// Capacity of the broadcast channel for TS data.
@@ -74,8 +73,6 @@ pub struct SharedTuner {
     lock: TunerLock,
     /// Counter for received TS packets.
     packets_received: AtomicU64,
-    /// TS quality analyzer (drop/scramble/error stats).
-    quality_analyzer: tokio::sync::Mutex<TsPacketAnalyzer>,
 }
 
 impl SharedTuner {
@@ -94,7 +91,6 @@ impl SharedTuner {
             bondriver_version,
             lock: TunerLock::new(),
             packets_received: AtomicU64::new(0),
-            quality_analyzer: tokio::sync::Mutex::new(TsPacketAnalyzer::new()),
         })
     }
 
@@ -128,12 +124,6 @@ impl SharedTuner {
     /// Get the total number of packets received.
     pub fn packet_count(&self) -> u64 {
         self.packets_received.load(Ordering::Acquire)
-    }
-
-    /// Get a snapshot of TS stream quality stats.
-    pub async fn quality_snapshot(&self) -> TsStreamQuality {
-        let analyzer = self.quality_analyzer.lock().await;
-        analyzer.snapshot()
     }
 
     /// Wait for the first TS packet to arrive (indicating driver is ready).

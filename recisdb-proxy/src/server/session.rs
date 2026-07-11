@@ -1994,6 +1994,14 @@ impl Session {
             // tuner_pool `.await` calls that follow.)
             let mut candidate_drivers: Vec<(String, u32, u32)> = Vec::new();  // (driver_path, actual_space, bon_channel)
             let mut max_instances_map: HashMap<String, i32> = HashMap::new();
+            let mut score_map: HashMap<String, f64> = HashMap::new();
+            // Per-driver count of channels ONLY that driver can receive within
+            // the group. Used as the primary sort key so that common channels
+            // (receivable on several tuners) avoid occupying a tuner that is
+            // the sole receiver of some rare channel (e.g. keep the
+            // Tokyo-pointed tuner free for Tokyo MX when テレ東 can also be
+            // served by the Kanagawa/Gunma tuners).
+            let mut exclusive_map: HashMap<String, i64> = HashMap::new();
 
             {
                 let db = self.database.lock().await;
@@ -2021,9 +2029,12 @@ impl Session {
                     }
                 }
 
-                // Sort candidate drivers by quality score (descending)
+                // Collect quality scores and exclusive-channel counts for the
+                // candidates while the DB lock is held; the actual sort
+                // happens below, after the tuner-pool snapshot is taken (the
+                // current-load sort key needs pool state, and the DB lock
+                // must not be held across tuner_pool awaits).
                 if !candidate_drivers.is_empty() {
-                    let mut score_map: HashMap<String, f64> = HashMap::new();
                     for (driver_path, _, _) in candidate_drivers.iter() {
                         if score_map.contains_key(driver_path) {
                             continue;
@@ -2031,11 +2042,9 @@ impl Session {
                         let score = db.get_driver_quality_score_by_path(driver_path).unwrap_or(1.0);
                         score_map.insert(driver_path.clone(), score);
                     }
-                    candidate_drivers.sort_by(|a, b| {
-                        let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
-                        let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
-                        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    exclusive_map = db
+                        .get_exclusive_channel_counts(&self.group_driver_paths)
+                        .unwrap_or_default();
                 }
 
                 // Pre-collect max_instances for every candidate driver so the capacity
@@ -2061,6 +2070,52 @@ impl Session {
             // Priority: 1) Driver already streaming this channel, 2) Driver with available capacity
             let mut selected_driver: Option<(String, u32, u32)> = None;
             let keys = self.tuner_pool.keys().await;
+
+            // Count currently running instances per candidate driver (used
+            // both as a sort key and for the capacity check below). The
+            // current session's own tuner is excluded when its slot will be
+            // freed by this channel switch.
+            let mut instances_map: HashMap<String, i32> = HashMap::new();
+            for (driver_path, _, _) in candidate_drivers.iter() {
+                if instances_map.contains_key(driver_path) {
+                    continue;
+                }
+                let mut n = 0i32;
+                for k in keys.iter() {
+                    if k.tuner_path == *driver_path {
+                        if old_tuner_will_free_slot && old_tuner_key.as_ref() == Some(k) {
+                            continue;
+                        }
+                        if let Some(tuner) = self.tuner_pool.get(k).await {
+                            if tuner.is_running() {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                instances_map.insert(driver_path.clone(), n);
+            }
+
+            // Sort candidates: rarity-aware load balancing.
+            //   1. fewest exclusive channels first — keep sole-receiver tuners
+            //      free for the channels only they can serve,
+            //   2. then least loaded (running instances ascending),
+            //   3. then quality score descending.
+            candidate_drivers.sort_by(|a, b| {
+                let excl_a = exclusive_map.get(&a.0).copied().unwrap_or(0);
+                let excl_b = exclusive_map.get(&b.0).copied().unwrap_or(0);
+                excl_a.cmp(&excl_b)
+                    .then_with(|| {
+                        let load_a = instances_map.get(&a.0).copied().unwrap_or(0);
+                        let load_b = instances_map.get(&b.0).copied().unwrap_or(0);
+                        load_a.cmp(&load_b)
+                    })
+                    .then_with(|| {
+                        let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
+                        let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
+                        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
 
             // First, check if any driver is already streaming this channel (by its own space+bon_channel)
             for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
@@ -2088,22 +2143,8 @@ impl Session {
             // If not found, select driver with available capacity
             if selected_driver.is_none() {
                 for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
-                    // Count current instances on this driver
-                    let mut driver_instances = 0i32;
-                    for k in keys.iter() {
-                        if k.tuner_path == *driver_path {
-                            // Skip the current session's own tuner if it will be freed
-                            // during channel switch (sole subscriber → slot released).
-                            if old_tuner_will_free_slot && old_tuner_key.as_ref() == Some(k) {
-                                continue;
-                            }
-                            if let Some(tuner) = self.tuner_pool.get(&k).await {
-                                if tuner.is_running() {
-                                    driver_instances += 1;
-                                }
-                            }
-                        }
-                    }
+                    // Current instances on this driver (pre-counted above)
+                    let driver_instances = instances_map.get(driver_path).copied().unwrap_or(0);
 
                     // Get max_instances for this driver (pre-collected above)
                     let max_instances = max_instances_map.get(driver_path).copied().unwrap_or(1);
@@ -3684,12 +3725,18 @@ impl Session {
             if let Some(pos) = sync_pos {
                 if pos > 0 {
                     self.ts_quality_carry.drain(0..pos);
+                    // Bytes were discarded mid-stream: the CC baseline per PID
+                    // no longer matches the next packet. Resync without
+                    // counting the unavoidable CC jumps as drops (same
+                    // rationale as the broadcast-Lagged handling).
+                    self.ts_quality_analyzer.mark_discontinuity();
                 }
             } else if self.ts_quality_carry.len() > 188 * 4 {
                 // Keep a small tail and wait for next chunk to find sync sequence.
                 let keep = 188 * 4;
                 let drop_len = self.ts_quality_carry.len() - keep;
                 self.ts_quality_carry.drain(0..drop_len);
+                self.ts_quality_analyzer.mark_discontinuity();
             }
         }
 
