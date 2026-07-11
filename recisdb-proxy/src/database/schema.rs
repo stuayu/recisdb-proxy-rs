@@ -11,11 +11,13 @@ CREATE TABLE IF NOT EXISTS bon_drivers (
     -- Group management for multi-tuner selection
     group_name TEXT,                       -- Unified group name (e.g., "PX-MLT", "PX-Q1UD")
     -- Scan configuration (per-tuner)
-    auto_scan_enabled INTEGER DEFAULT 1,     -- Auto scan enabled/disabled
+    auto_scan_enabled INTEGER DEFAULT 0,     -- Periodic auto rescan (OFF by default; the initial
+                                             -- one-shot scan is driven by next_scan_at = 0 instead)
     scan_interval_hours INTEGER DEFAULT 24,  -- Scan interval in hours (0 = disabled)
     scan_priority INTEGER DEFAULT 0,         -- Scan priority (higher = scanned first)
     last_scan INTEGER,                       -- Last scan timestamp
     next_scan_at INTEGER,                    -- Next scheduled scan timestamp
+                                             -- (0 = scan ASAP one-shot, NULL = nothing scheduled)
     -- Passive scan configuration
     passive_scan_enabled INTEGER DEFAULT 1,  -- Real-time update during streaming
     -- Concurrent usage control

@@ -326,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // If scan-on-start is requested, enable immediate scan for this driver
                     if args.scan_on_start {
-                        if let Err(e) = db_guard.enable_immediate_scan(id) {
+                        if let Err(e) = db_guard.request_immediate_scan(id) {
                             error!("Failed to enable immediate scan: {}", e);
                         } else {
                             info!("  Enabled immediate scan for tuner (id={})", id);

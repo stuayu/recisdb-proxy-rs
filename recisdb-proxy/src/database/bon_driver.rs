@@ -178,6 +178,16 @@ impl Database {
     }
 
     /// Get BonDrivers that are due for scanning.
+    ///
+    /// A driver is due when either:
+    /// - a scan is scheduled and its time has come (`next_scan_at <= now`;
+    ///   `next_scan_at = 0` is the "scan ASAP" one-shot request set by
+    ///   [`Self::request_immediate_scan`]), or
+    /// - periodic auto-scan is enabled but nothing is scheduled yet
+    ///   (`next_scan_at IS NULL`), i.e. the user just turned it on.
+    ///
+    /// `next_scan_at IS NULL` with auto-scan disabled means "nothing
+    /// scheduled" and is NOT due — periodic rescans are opt-in.
     pub fn get_due_bon_drivers(&self) -> Result<Vec<BonDriverRecord>> {
         let now = chrono::Utc::now().timestamp();
 
@@ -186,9 +196,8 @@ impl Database {
                     scan_priority, last_scan, next_scan_at, passive_scan_enabled,
                     max_instances, created_at, updated_at
              FROM bon_drivers
-             WHERE auto_scan_enabled = 1
-               AND scan_interval_hours > 0
-               AND (next_scan_at IS NULL OR next_scan_at <= ?1)
+             WHERE (next_scan_at IS NOT NULL AND next_scan_at <= ?1)
+                OR (auto_scan_enabled = 1 AND scan_interval_hours > 0 AND next_scan_at IS NULL)
              ORDER BY scan_priority DESC, next_scan_at ASC",
         )?;
 
@@ -262,7 +271,8 @@ impl Database {
     }
 
     /// Update next scan time after a successful scan.
-    pub fn update_next_scan(&self, id: i64, next_scan_at: i64) -> Result<()> {
+    /// `next_scan_at = None` clears the schedule (periodic rescan disabled).
+    pub fn update_next_scan(&self, id: i64, next_scan_at: Option<i64>) -> Result<()> {
         self.conn.execute(
             "UPDATE bon_drivers SET next_scan_at = ?1, last_scan = strftime('%s', 'now') WHERE id = ?2",
             params![next_scan_at, id],
@@ -270,11 +280,13 @@ impl Database {
         Ok(())
     }
 
-    /// Enable scanning for a BonDriver and schedule immediate scan.
-    /// This sets auto_scan_enabled = 1, scan_interval_hours = 24, and next_scan_at = 0.
-    pub fn enable_immediate_scan(&self, id: i64) -> Result<()> {
+    /// Request a one-shot scan ASAP by setting next_scan_at = 0.
+    /// Does NOT touch auto_scan_enabled / scan_interval_hours: a manual or
+    /// initial-setup scan must not silently opt the driver into periodic
+    /// rescans (those are enabled explicitly via update_scan_config).
+    pub fn request_immediate_scan(&self, id: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE bon_drivers SET auto_scan_enabled = 1, scan_interval_hours = 24, next_scan_at = 0 WHERE id = ?1",
+            "UPDATE bon_drivers SET next_scan_at = 0 WHERE id = ?1",
             [id],
         )?;
         Ok(())
@@ -442,7 +454,8 @@ mod tests {
         let record = db.get_bon_driver(id).unwrap().unwrap();
         assert_eq!(record.dll_path, "BonDriver_Test.dll");
         assert_eq!(record.driver_name, Some("Test Driver".to_string()));
-        assert!(record.auto_scan_enabled);
+        // Periodic auto rescan is opt-in (OFF by default).
+        assert!(!record.auto_scan_enabled);
 
         // Get by path
         let record2 = db
@@ -460,15 +473,46 @@ mod tests {
         assert_ne!(id, id3);
 
         // Update config
-        db.update_scan_config(id, Some(false), Some(48), None, None)
+        db.update_scan_config(id, Some(true), Some(48), None, None)
             .unwrap();
         let updated = db.get_bon_driver(id).unwrap().unwrap();
-        assert!(!updated.auto_scan_enabled);
+        assert!(updated.auto_scan_enabled);
         assert_eq!(updated.scan_interval_hours, 48);
 
         // Delete
         db.delete_bon_driver(id).unwrap();
         assert!(db.get_bon_driver(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn periodic_rescan_is_opt_in_but_one_shot_scan_still_fires() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db.insert_bon_driver(&NewBonDriver::new("Driver.dll")).unwrap();
+
+        // Fresh driver: auto scan OFF, nothing scheduled → not due.
+        assert!(db.get_due_bon_drivers().unwrap().is_empty());
+
+        // Initial-setup / "scan now" one-shot request → due exactly once.
+        db.request_immediate_scan(id).unwrap();
+        assert_eq!(db.get_due_bon_drivers().unwrap().len(), 1);
+
+        // One-shot must not have opted the driver into periodic rescans.
+        let rec = db.get_bon_driver(id).unwrap().unwrap();
+        assert!(!rec.auto_scan_enabled);
+
+        // Scan completed with periodic rescan disabled → schedule cleared,
+        // no longer due.
+        db.update_next_scan(id, None).unwrap();
+        assert!(db.get_due_bon_drivers().unwrap().is_empty());
+
+        // User explicitly enables periodic rescan → due (nothing scheduled
+        // yet), and after scheduling a future scan it stops being due.
+        db.update_scan_config(id, Some(true), Some(24), None, None).unwrap();
+        db.update_next_scan(id, None).unwrap();
+        assert_eq!(db.get_due_bon_drivers().unwrap().len(), 1);
+        let future = chrono::Utc::now().timestamp() + 24 * 3600;
+        db.update_next_scan(id, Some(future)).unwrap();
+        assert!(db.get_due_bon_drivers().unwrap().is_empty());
     }
 
     #[test]

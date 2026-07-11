@@ -267,7 +267,7 @@ pub async fn trigger_scan(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    db.enable_immediate_scan(id)?;
+    db.request_immediate_scan(id)?;
     Ok(Json(json!({
         "success": true,
         "message": "Scan scheduled"

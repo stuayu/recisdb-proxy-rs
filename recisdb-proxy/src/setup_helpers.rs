@@ -796,7 +796,7 @@ pub fn register_tuners_to_db(
                 if !tuner.group_name.is_empty() {
                     let _ = db.set_group_name(id, Some(&tuner.group_name));
                 }
-                let _ = db.enable_immediate_scan(id);
+                let _ = db.request_immediate_scan(id);
             });
 
             results.push(RegisterResult {
@@ -823,7 +823,7 @@ pub fn register_manual_tuner(
     if !group_name.is_empty() {
         let _ = db.set_group_name(id, Some(group_name));
     }
-    let _ = db.enable_immediate_scan(id);
+    let _ = db.request_immediate_scan(id);
     Ok(id)
 }
 

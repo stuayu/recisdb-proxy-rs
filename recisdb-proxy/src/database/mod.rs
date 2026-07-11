@@ -165,7 +165,27 @@ impl Database {
             "013_backfill_channels_band_terrestrial_region",
             Database::migration_013_backfill_channels_band_terrestrial_region,
         ),
+        (
+            "014_periodic_auto_scan_opt_in",
+            Database::migration_014_periodic_auto_scan_opt_in,
+        ),
     ];
+
+    // Migration 014: periodic auto rescan becomes opt-in (schema default
+    // flipped from 1 to 0). Existing rows almost certainly have
+    // auto_scan_enabled = 1 only because the old default was ON, so turn it
+    // off everywhere. Clearing next_scan_at for already-scanned drivers stops
+    // the pending +24h reschedule; drivers that never completed a scan keep
+    // their next_scan_at (an in-flight initial one-shot must still run).
+    fn migration_014_periodic_auto_scan_opt_in(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            UPDATE bon_drivers SET auto_scan_enabled = 0;
+            UPDATE bon_drivers SET next_scan_at = NULL WHERE last_scan IS NOT NULL;
+            "#,
+        )?;
+        Ok(())
+    }
 
     /// Apply pending migrations, tracked via `PRAGMA user_version` as the
     /// ledger position. See [`Self::MIGRATIONS`] for ordering/idempotency

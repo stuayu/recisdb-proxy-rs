@@ -13,8 +13,10 @@
 //! # Configuration
 //!
 //! Each BonDriver can be configured with:
-//! - `auto_scan_enabled`: Whether automatic scanning is enabled
-//! - `scan_interval_hours`: How often to scan (0 = disabled)
+//! - `auto_scan_enabled`: Whether PERIODIC rescanning is enabled (opt-in,
+//!   OFF by default — the initial one-shot scan requested at setup via
+//!   `next_scan_at = 0` runs regardless of this flag)
+//! - `scan_interval_hours`: How often to rescan (0 = disabled)
 //! - `scan_priority`: Priority order for scanning
 
 use std::sync::Arc;
@@ -224,11 +226,19 @@ impl ScanScheduler {
                         driver.dll_path, channel_count
                     );
 
-                    // Update next scan time
-                    let next_scan = chrono::Utc::now().timestamp()
-                        + (driver.scan_interval_hours as i64 * 3600);
-
                     let db = database.lock().await;
+
+                    // Re-arm the schedule only when periodic rescanning is
+                    // explicitly enabled; otherwise clear it so the completed
+                    // one-shot scan does not repeat. Re-read the record so a
+                    // config change made during the (long) scan is honored.
+                    let current = db.get_bon_driver(driver.id).ok().flatten();
+                    let next_scan = current.and_then(|d| {
+                        (d.auto_scan_enabled && d.scan_interval_hours > 0).then(|| {
+                            chrono::Utc::now().timestamp() + (d.scan_interval_hours as i64 * 3600)
+                        })
+                    });
+
                     if let Err(e) = db.update_next_scan(driver.id, next_scan) {
                         warn!("ScanScheduler: Failed to update next scan time: {}", e);
                     }
@@ -553,6 +563,14 @@ fn scan_space_blocking(
         info!("scan_space_blocking: ✓ Found channel - Space={} CH={} Name=\"{}\" Signal={:.2}dB",
               space, channel, channel_name, signal_level);
 
+        // Purge again AFTER the signal-lock wait: deep-buffered drivers
+        // (BonDriverProxyEx etc.) can keep flushing the PREVIOUS channel's
+        // TS during the wait. Analyzing that stream attributes the previous
+        // channel's NID/TSID to this bon_channel, and merge_scan_results
+        // would then overwrite the correct row's bon_channel with a wrong
+        // physical channel (user-visible as "selected NHK, got テレ玉").
+        tuner.purge_ts_stream();
+
         // Analyze TS stream to get TSID/SID
         // Retry up to 3 times if NID is missing or invalid (0x0000)
         let mut analysis_result = None;
@@ -866,7 +884,9 @@ async fn perform_scan(
 
     let dll_path = driver.dll_path.clone();
     let driver_id = driver.id;
-    let is_initial_scan = driver.next_scan_at.is_none();
+    // "Never completed a scan" is tracked by last_scan (set on completion),
+    // not next_scan_at, which now doubles as the one-shot request flag.
+    let is_initial_scan = driver.last_scan.is_none();
 
     // Get existing channel spaces from database to know what to scan
     let scan_ranges = if is_initial_scan {
