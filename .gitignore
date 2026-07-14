@@ -1,6 +1,5 @@
 /target
 /.idea
-*.ts
 *.m2ts
 /x64
 /BonDriver
