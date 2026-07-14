@@ -107,6 +107,9 @@ fn main() {
         // cmake's find_package(PCSC REQUIRED) in libaribb25 automatically finds
         // /System/Library/Frameworks/PCSC.framework, so no extra cmake flags are needed.
         println!("cargo:rustc-link-lib=framework=PCSC");
+        // libaribb25 is compiled as C++; link libc++ so exception-handling and
+        // operator new/delete symbols resolve on macOS.
+        println!("cargo:rustc-link-lib=dylib=c++");
         let res = prep_cmake(cx).build();
         println!("cargo:rustc-link-search=native={}/lib", res.display());
         println!("cargo:rustc-link-search=native={}/lib64", res.display());

@@ -128,7 +128,8 @@ pub(super) async fn cleanup_unused_tuner_after_switch(
             "[Session {}] {} stopping old reader for {:?} ({}/{})",
             session_id, log_prefix, tuner.key, old_dll_running, old_dll_max
         );
-        stop_and_remove_tuner(tuner_pool, &tuner.key, tuner, false).await;
+        let key = tuner.key.clone();
+        stop_and_remove_tuner(tuner_pool, &key, tuner, false).await;
     } else {
         info!(
             "[Session {}] {} scheduling idle close for {:?} ({}/{})",
@@ -184,4 +185,99 @@ pub(super) async fn find_lowest_priority_idle_tuner(
     }
 
     lowest_priority_key.map(|key| (key, lowest_priority_value))
+}
+
+
+/// Ensure `driver_path` has room for `new_key` by evicting one idle (no-subscriber)
+/// tuner on that driver if it is currently at/over capacity. Returns true if there is
+/// (now) capacity, false if the driver stayed over capacity because nothing evictable
+/// was found.
+pub(super) async fn ensure_driver_capacity_with_idle_eviction(
+    tuner_pool: &Arc<TunerPool>,
+    session_id: u64,
+    driver_path: &str,
+    new_key: &ChannelKey,
+    max_instances: i32,
+) -> bool {
+    let running = count_running_instances_on_driver(tuner_pool, driver_path, Some(new_key)).await;
+    if has_capacity(running, max_instances) {
+        return true;
+    }
+
+    let keys = tuner_pool.keys().await;
+    let mut idle_candidate: Option<Arc<SharedTuner>> = None;
+    for key in keys.iter() {
+        if key.tuner_path != driver_path || key == new_key {
+            continue;
+        }
+        if let Some(tuner) = tuner_pool.get(key).await {
+            if tuner.is_running() && !tuner.has_subscribers() {
+                idle_candidate = Some(tuner);
+                break;
+            }
+        }
+    }
+
+    if let Some(tuner) = idle_candidate {
+        let key = tuner.key.clone();
+        info!(
+            "[Session {}] Evicting idle tuner {:?} to free capacity on driver {} ({}/{})",
+            session_id, key, driver_path, running, max_instances
+        );
+        stop_and_remove_tuner(tuner_pool, &key, tuner, true).await;
+        true
+    } else {
+        debug!(
+            "[Session {}] No idle tuner to evict on driver {} ({}/{}), cannot free capacity",
+            session_id, driver_path, running, max_instances
+        );
+        false
+    }
+}
+
+/// Repeatedly evict the lowest-priority idle tuner on `tuner_path` (never evicting
+/// `key`, which is this session's own tuner) until the driver is back at/under
+/// `max_instances`, or until no evictable candidate remains.
+pub(super) async fn evict_interlopers_until_capacity(
+    database: &DatabaseHandle,
+    tuner_pool: &Arc<TunerPool>,
+    session_id: u64,
+    tuner_path: &str,
+    key: &ChannelKey,
+    max_instances: i32,
+) {
+    loop {
+        let running = count_running_instances_on_driver(tuner_pool, tuner_path, None).await;
+        if !should_stop_reader_for_capacity(running, max_instances) {
+            break;
+        }
+
+        let Some((evict_key, priority)) =
+            find_lowest_priority_idle_tuner(database, tuner_pool, session_id, tuner_path).await
+        else {
+            debug!(
+                "[Session {}] Over capacity on {} ({}/{}) but no evictable interloper found",
+                session_id, tuner_path, running, max_instances
+            );
+            break;
+        };
+
+        if &evict_key == key {
+            debug!(
+                "[Session {}] Lowest-priority idle tuner on {} is our own key {:?}; stopping eviction",
+                session_id, tuner_path, evict_key
+            );
+            break;
+        }
+
+        if let Some(tuner) = tuner_pool.get(&evict_key).await {
+            info!(
+                "[Session {}] Evicting interloper {:?} (priority {}) on {} ({}/{})",
+                session_id, evict_key, priority, tuner_path, running, max_instances
+            );
+            stop_and_remove_tuner(tuner_pool, &evict_key, tuner, true).await;
+        } else {
+            break;
+        }
+    }
 }

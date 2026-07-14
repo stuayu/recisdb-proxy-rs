@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::debug;
-use recisdb_protocol::ChannelKeySpec;
+use crate::tuner::channel_key::ChannelKeySpec;
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::session_channel_candidates::collect_group_channel_candidates;
