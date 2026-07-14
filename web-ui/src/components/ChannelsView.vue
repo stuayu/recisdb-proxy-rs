@@ -343,9 +343,7 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
         <button
           class="button"
           @click="
-            editMode = true
-            reset()
-          "
+            editMode = true; reset()"
         >
           新規
         </button>
