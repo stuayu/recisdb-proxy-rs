@@ -4,6 +4,8 @@
 
 recisdb-proxy にはリアルタイム監視と設定管理用の統合Webサーバーがついています。ブラウザから以下の情報が確認でき、設定値も編集できます。
 
+2026-07以降のフロントエンドは **Vue 3 + Vite + TypeScript** を `web-ui/` でビルドし、成果物を `rust-embed` でサーバーバイナリへ埋め込む構成です。旧HTMLダッシュボードは削除済みのため、Rustをビルドする前に `web-ui` のビルドを実行してください。成果物がない場合、`GET /` は `503 Service Unavailable` を返します。
+
 ## アクセス方法
 
 デフォルトでは `http://localhost:40080` で利用可能です。
@@ -12,6 +14,12 @@ recisdb-proxy にはリアルタイム監視と設定管理用の統合Webサー
 # サーバー起動時にWebダッシュボード用アドレスを指定
 recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 ```
+
+## 更新方式と認証
+
+- 画面更新は **`GET /api/events` のSSE** を主経路とし、接続できない環境では 30 秒ポーリングへフォールバックします。
+- `/api/*` は `Authorization: Bearer <token>` 認証です。Vue側は保存済みトークンを通常のAPI呼び出しとSSE接続の両方に付与します。
+- `/static/vue/*` のフロントエンド成果物と `/logos/:file` は、画面表示に必要な静的資産のため無認証で配信されます。`mpegts.js` はVueバンドルへ同梱されます。
 
 ## 機能
 
@@ -182,6 +190,10 @@ created_at は最古、updated_at は最新をマージ)。
 }
 ```
 
+### GET /api/events
+
+ダッシュボード更新通知用の Server-Sent Events エンドポイント。`event: refresh` を受け取ったクライアントは `/api/stats` や `/api/clients` を再取得する。
+
 ### GET /api/stats
 
 サーバー統計情報を取得
@@ -250,6 +262,13 @@ EOF
 
 その後、WebダッシュボードからGUIで設定値を変更可能です。
 
+## 開発メモ
+
+- Vueソース: `web-ui/`
+- ビルド出力: `recisdb-proxy/static/vue/`
+- サーバー側埋め込み: `recisdb-proxy/src/web/dashboard.rs` (`rust-embed`)
+- CI: `npm install` → `npm run build` → `cargo build`
+
 ## トラブルシューティング
 
 ### ダッシュボードにアクセスできない
@@ -262,7 +281,7 @@ EOF
 - 5秒ごとに自動更新されるので、しばらく待つ
 - サーバーログで同期エラーが出ていないか確認
 
-## 実装済みの主な機能 (旧・拡張予定)
+## 実装済みの主な機能
 
 以下はすべて実装済みです:
 

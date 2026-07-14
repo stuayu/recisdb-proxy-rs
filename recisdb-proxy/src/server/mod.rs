@@ -5,6 +5,13 @@ pub mod client_view;
 pub mod listener;
 pub mod prefill;
 pub mod session;
+pub(crate) mod session_backpressure;
+pub(crate) mod session_runtime;
+pub(crate) mod session_space_cache;
+pub(crate) mod session_driver_selection;
+pub(crate) mod session_capacity;
+pub(crate) mod session_channel_candidates;
+pub(crate) mod session_tuner_handoff;
 
 pub use listener::{Server, ServerConfig};
 #[cfg(feature = "tls")]

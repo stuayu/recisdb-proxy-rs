@@ -1,15 +1,16 @@
-//! Logo and small allow-listed static asset endpoints.
+//! Logo and embedded Vue asset endpoints.
 
 use axum::{
     extract::Path,
-    http::{StatusCode, header::CONTENT_TYPE},
+    http::{header::CONTENT_TYPE, StatusCode},
     response::IntoResponse,
 };
+use rust_embed::RustEmbed;
 
-/// Get channel logo image file.
-pub async fn get_logo(
-    Path(file): Path<String>,
-) -> impl IntoResponse {
+use crate::web::dashboard::VueAssets;
+
+/// Get a channel logo image file.
+pub async fn get_logo(Path(file): Path<String>) -> impl IntoResponse {
     // Accept only safe filename patterns: <nid>_<sid>.png
     if !file.ends_with(".png") {
         return (StatusCode::BAD_REQUEST, "invalid logo file").into_response();
@@ -25,42 +26,36 @@ pub async fn get_logo(
     }
 
     match tokio::fs::read(path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(CONTENT_TYPE, "image/png")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => (StatusCode::OK, [(CONTENT_TYPE, "image/png")], bytes).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read logo").into_response(),
     }
 }
 
-/// Serve a small allow-listed static asset (currently only `mpegts.js`) from
-/// the `static/` directory next to the working directory, mirroring
-/// [`get_logo`]'s pattern.
-///
-/// STREAMING_DESIGN.md §6.4: the dashboard's preview player wants a local
-/// copy of mpegts.js so the page doesn't depend on a CDN, but this
-/// environment cannot fetch/vendor a ~200KB minified JS file. Rather than
-/// fabricate one, this endpoint just serves whatever the operator drops at
-/// `recisdb-proxy/static/mpegts.js`; if absent, `dashboard.rs`'s `<script>`
-/// tag falls back to a CDN URL (see its `onerror` handler). Unauthenticated
-/// like `/logos/:file` — it can only ever return the exact allow-listed
-/// filename (no path traversal surface) and there is no confidentiality
-/// concern in serving a JS library.
-pub async fn get_static_asset(Path(file): Path<String>) -> impl IntoResponse {
-    const ALLOWED: &[&str] = &["mpegts.js"];
-    if !ALLOWED.contains(&file.as_str()) {
+/// Serve a Vite-generated Vue asset embedded in the server binary.
+pub async fn get_vue_asset(Path(path): Path<String>) -> impl IntoResponse {
+    let clean = path.trim_start_matches('/');
+    if clean.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+    let Some(asset) = VueAssets::get(clean) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-
-    let path = std::path::PathBuf::from("static").join(&file);
-    if !path.exists() {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-
-    match tokio::fs::read(path).await {
-        Ok(bytes) => (StatusCode::OK, [(CONTENT_TYPE, "application/javascript")], bytes).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read static asset").into_response(),
-    }
+    };
+    let content_type = match std::path::Path::new(clean)
+        .extension()
+        .and_then(|value| value.to_str())
+    {
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, content_type)],
+        asset.data.into_owned(),
+    )
+        .into_response()
 }

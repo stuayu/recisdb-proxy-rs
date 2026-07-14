@@ -39,6 +39,7 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Session/Client API
         .route("/clients", get(api::get_clients))
         .route("/stats", get(api::get_stats))
+        .route("/events", get(api::dashboard_events))
         .route("/client/:id/quality", get(api::get_client_quality))
         .route("/client/:id/metrics-history", get(api::get_client_metrics_history))
         .route("/client/:id/disconnect", post(api::disconnect_client))
@@ -185,10 +186,7 @@ fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
         // Dashboard route (unauthenticated: serves the token-entry UI)
         .route("/", get(dashboard::index))
         .route("/logos/:file", get(api::get_logo))
-        // Static assets (currently just an optional local mpegts.js — see
-        // STREAMING_DESIGN.md §6.4). Unauthenticated like /logos/:file: a
-        // fixed allow-list, no path traversal, no confidential content.
-        .route("/static/:file", get(api::get_static_asset));
+        .route("/static/vue/*path", get(api::get_vue_asset));
 
     if mirakurun_enabled {
         router = router.nest("/mirakurun/api", build_mirakurun_router());
@@ -247,9 +245,28 @@ pub async fn start_web_server(
 
     // `with_connect_info` makes the client's SocketAddr available to the
     // access-log middleware (see `access_log`) via `ConnectInfo`.
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(web_shutdown_signal())
+        .await?;
 
     Ok(())
+}
+
+/// Stop accepting new HTTP connections when the process receives a normal
+/// termination signal. Existing responses are allowed to finish.
+async fn web_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

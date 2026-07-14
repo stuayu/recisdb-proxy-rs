@@ -5,7 +5,6 @@
 pub mod bondriver;
 pub mod database;
 pub mod logging;
-pub mod metrics;
 pub mod alert;
 pub mod px4_installer;
 pub mod scheduler;

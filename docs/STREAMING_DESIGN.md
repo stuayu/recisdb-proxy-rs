@@ -266,7 +266,7 @@ GET /api/stream/channel/:type/:ch/service/:sid  Mirakurun 互換パス (§7)
 
 - `Transfer-Encoding: chunked`、`Content-Type: video/mp2t`。
 - 内部的には既存の Session/TunerPool/SharedEncoder を HTTP 用の薄いアダプタから呼ぶ
-  (BNDP セッションと同じ選局・共有・優先度ロジックを再利用。二重実装しない)。
+  (BNDP セッションと���じ選局・共有・優先度ロジックを再利用。二重実装しない)。
 - クラスは PREVIEW 既定。切断で参照カウント減。
 
 ### 6.4 プレビュー UI
@@ -414,14 +414,10 @@ CREATE TABLE encode_profiles(
   そのまま流す。session.rs のようなサービスPIDフィルタ (`ts_analyzer::service_filter`) は適用していない
   — 実装コスト・回帰リスクに対して仕様上の要求 (§6.3 は「生 TS」としか書いていない) を超えないための意図的な
   簡略化。地上波 (MPEG-2) は主要ブラウザで再生できない制約 (§6.2) は passthrough 経路にも変わらず適用される。
-- **mpegts.js の同梱**: この環境では ~200KB の minified JS を新規取得できないため、実ファイルは同梱していない。
-  `dashboard.rs` は `<script src="/static/mpegts.js" onerror="...CDNへフォールバック...">` を出力し、
-  `web/api.rs::get_static_asset` が `static/mpegts.js` を配信できれば使う (`/logos/:file` と同じ
-  allow-list パターンの無認証エンドポイント。JSライブラリなので機密性の問題はない)。運用者は
-  `recisdb-proxy/static/mpegts.js` に本体を配置するか、CDN (`https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js`)
-  読み込みのままにする。認証ヘッダは mpegts.js の `config.headers`(fetch/xhr loader が対応するバージョン)
-  経由で `Authorization: Bearer <token>` を付与 (`dashboard.rs` の `getStoredAuthToken()` を再利用)。
-  **ブラウザでの動作確認はできていない** (mpegts.js 自体を実行できる環境がない)。
+- **mpegts.js の同梱**: `mpegts.js` を `web-ui/package.json` の依存として管理し、ViteがVue成果物へバンドルする。
+  CDNフォールバックと `/static/mpegts.js` は廃止したため、配布物は完全に同一オリジンかつオフラインで完結する。
+  認証ヘッダは `PreviewPlayer.vue` が `config.headers` 経由で `Authorization: Bearer <token>` を付与する。
+  実ストリームを使った再生確認のみ、チューナーとエンコーダを利用できる環境で実施する。
 
 実装メモ (P6):
 - `web/mirakurun.rs` 新設。`/mirakurun/api/*` に `GET version/status/channels/services`,

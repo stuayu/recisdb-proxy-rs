@@ -532,8 +532,11 @@ pub async fn import_channels(
         };
 
         let channel_name = get_field(row, col_channel_name);
+        let bon_driver_id = get_field(row, col_bon_driver_id).and_then(|s| s.parse::<i64>().ok());
         let bon_space    = get_field(row, col_bon_space).and_then(|s| s.parse::<u32>().ok());
         let bon_channel  = get_field(row, col_bon_channel).and_then(|s| s.parse::<u32>().ok());
+        let bon_space_update = col_bon_space.map(|_| bon_space);
+        let bon_channel_update = col_bon_channel.map(|_| bon_channel);
         let priority     = get_field(row, col_priority).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
         let is_enabled   = get_field(row, col_is_enabled)
             .map(|s| s == "true" || s == "1")
@@ -547,9 +550,7 @@ pub async fn import_channels(
                     Ok(Some(ch)) => Some(ch.id),
                     Ok(None) => {
                         // IDが指定されているが存在しない → 自然キーで再検索
-                        let bon_drv = get_field(row, col_bon_driver_id)
-                            .and_then(|s| s.parse::<i64>().ok());
-                        if let Some(bd_id) = bon_drv {
+                        if let Some(bd_id) = bon_driver_id {
                             db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
                         } else { None }
                     }
@@ -557,9 +558,7 @@ pub async fn import_channels(
                 }
             } else {
                 // id 未指定 → 自然キーで検索
-                let bon_drv = get_field(row, col_bon_driver_id)
-                    .and_then(|s| s.parse::<i64>().ok());
-                if let Some(bd_id) = bon_drv {
+                if let Some(bd_id) = bon_driver_id {
                     db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
                 } else { None }
             }
@@ -567,11 +566,17 @@ pub async fn import_channels(
 
         if let Some(ch_id) = existing_id {
             // Update
-            if let Err(e) = db.update_channel_fields(
+            if let Err(e) = db.update_channel_full(
                 ch_id,
                 channel_name.as_deref(),
                 Some(priority),
                 Some(is_enabled),
+                bon_driver_id,
+                Some(nid),
+                Some(sid),
+                Some(tsid),
+                bon_space_update,
+                bon_channel_update,
             ) {
                 errors.push(format!("行{}: 更新失敗 ({})", line_no, e));
             } else {
@@ -579,9 +584,7 @@ pub async fn import_channels(
             }
         } else {
             // Insert — bon_driver_id 必須
-            let bon_drv = match get_field(row, col_bon_driver_id)
-                .and_then(|s| s.parse::<i64>().ok())
-            {
+            let bon_drv = match bon_driver_id {
                 Some(v) => v,
                 None => {
                     errors.push(format!("行{}: 新規登録にはbon_driver_idが必要です", line_no));

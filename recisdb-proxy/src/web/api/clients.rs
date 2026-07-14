@@ -3,12 +3,18 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::IntoResponse,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     Json,
 };
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::web::state::WebState;
 
@@ -124,6 +130,29 @@ pub async fn get_stats(
         "success": true,
         "stats": stats
     }))
+}
+
+/// Lightweight dashboard invalidation stream.
+///
+/// The stream deliberately sends an event rather than duplicating every API
+/// response. The Vue client keeps the existing typed REST endpoints as the
+/// source of truth and refreshes them when this event arrives.
+pub async fn dashboard_events(
+    State(_web_state): State<Arc<WebState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let events = stream::unfold(0_u64, |sequence| async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let event = Event::default()
+            .event("refresh")
+            .id(sequence.to_string())
+            .data("dashboard");
+        Some((Ok(event), sequence.wrapping_add(1)))
+    });
+    Sse::new(events).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 /// Get session history (paginated).

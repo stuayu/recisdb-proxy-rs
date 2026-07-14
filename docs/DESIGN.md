@@ -59,7 +59,7 @@ recisdb-proxy は、Windows/Linux 上の TV チューナー (BonDriver / キャ�
 - サーバー: tokio マルチスレッドランタイム。BonDriver DLL は `Send` 非対応のため
   **`spawn_blocking` 内で開いて読み取りループごと閉じ込める** (SharedTuner)。
 - クライアント DLL: TVTest の同期呼び出しに応えるため、内部に小さな tokio ランタイムを持ち、
-  FFI 境界は `std::sync` (parking_lot / Condvar / mpsc) で同期化する。DLL 内で async を表に出さない。
+  FFI 境界は `std::sync` (parking_lot / Condvar / mpsc) で同期化する。DLL 内で async を���に出さない。
 
 ---
 
@@ -105,7 +105,10 @@ src/
 ├ main.rs            起動・設定マージ・各サブシステム spawn
 ├ server/
 │  ├ listener.rs     accept ループ、セッション毎に read/write 分離、writer タスク
-│  └ session.rs      ステートマシン・選局/容量制御・tsreplace パイプ (※分割予定: REVIEW §1-4)
+│  ├ session.rs      ステートマシンとメッセージハンドラ
+│  ├ session_capacity.rs / session_driver_selection.rs  容量・候補選択
+│  ├ session_runtime.rs / session_space_cache.rs         runtime・空間キャッシュ
+│  └ session_tuner_handoff.rs / session_channel_candidates.rs 引き継ぎ・候補集約
 ├ tuner/
 │  ├ pool.rs         TunerPool: ChannelKey → SharedTuner、keep-alive/idle-close
 │  ├ shared.rs       SharedTuner: spawn_blocking 読み取りループ + broadcast 配信
@@ -117,10 +120,11 @@ src/
 ├ scheduler/scan_scheduler.rs  定期チャンネルスキャン
 ├ ts_analyzer/       PAT/PMT/SDT/NIT 解析、service_filter
 ├ database/          rusqlite ラッパー (schema.rs が正)
-├ web/               axum: api.rs / dashboard.rs (インライン HTML) / state.rs (SessionRegistry)
+├ web/               axum: JSON/SSE API + 埋め込みVueダッシュボード / state.rs (SessionRegistry)
 ├ alert.rs           しきい値監視 + Webhook 通知 (feature "webhook")
-├ logging.rs         tracing-subscriber: コンソール + 日次ローテーションファイル
-└ metrics.rs         【デッドコード — 削除予定。実メトリクスは web/state.rs】
+└ logging.rs         tracing-subscriber: コンソール + 日次ローテーションファイル
+
+実メトリクスは `web/state.rs` の `SessionMetricsHistory` が保持する。旧 `metrics.rs` は削除済み。
 ```
 
 ### 4.2 セッションのステートマシン
@@ -156,7 +160,7 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   **サーバー側でクライアント申告値を制限する仕組みは未実装 (REVIEW S3)。**
 - 容量: `bon_drivers.max_instances` が DLL 毎の同時チャンネル数上限。
   超過時は「要求チャンネルが既に稼働中なら合流を優先し、退避しない」チェックの後、
-  優先度最低 (idle 優先) のチューナーを退避する。実装は session.rs 内 (pool への移設が課題)。
+  優先度最低 (idle 優先) のチューナーを退避する。共通ポリシーは `server/session_capacity.rs` に分離済み。
 - 排他 (`exclusive=true`): 同一 DLL 上の他チューナーを停止して独占。要求チャンネル稼働中なら合流にフォールバック。
 
 ### 4.5 グループ選局と仮想チューナー空間
@@ -180,7 +184,7 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 
 ### 4.7 Web ダッシュボード / API
 
-- axum。`/` にインライン HTML ダッシュボード (5 秒ポーリング)、`/api/*` に JSON API。
+- axum。`/` に埋め込みVueダッシュボード (`web-ui/` を Vite ビルドして `rust-embed` で同梱)、`/api/*` に JSON API、`/api/events` にSSE更新イベント。
 - 主なリソース: tuners / bondrivers (CRUD+scan+品質) / channels (CRUD+import/export+batch) /
   clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config /
   encode-profiles (CRUD、STREAMING_DESIGN.md §5.3 P5) / stream (HTTP-TS 配信、§6.3 P5)。
@@ -200,16 +204,16 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   存在しない — 引き続き `tsreplace_config.command_path` (TOML専用、REVIEW S1) のみが実行コマンドを決める。
 - **認証 (実装済み・2026-07-04, REVIEW S2)**: `/api/*` は `Authorization: Bearer <token>` 必須
   (`web/auth.rs::require_auth`、`axum::middleware::from_fn_with_state` で `/api` 配下のみに適用)。
-  `GET /` (ダッシュボード HTML 本体) と `/logos/:file` は無認証のまま (トークン入力 UI を表示するため)。
+  `GET /` (ダッシュボード HTML 本体) と `/logos/:file`、`/static/vue/*` は無認証のまま (トークン入力 UI と静的資産読込のため)。
   トークンは起動時に TOML `[web] auth_token` > DB (`web_auth_config` テーブル、単一行) > 新規生成 の順で解決し、
   新規生成時のみ起動ログに一度だけ表示する。`[web] auth_enabled = false` で無効化可能 (無効時は起動時に WARN)。
-  ブラウザ側は初回アクセス時に `prompt()` でトークン入力 → `localStorage` に保存 → `window.fetch` を
-  ラップして全 `/api/*` 呼び出しに自動付与 (`dashboard.rs`)。401 応答時は再入力を促す。
+  Vue側は初回入力したトークンを `localStorage` に保存し、APIクライアントが全 `/api/*` 呼び出しと `/api/events` のSSE接続へ自動付与する。
 - **CORS**: `CorsLayer::permissive()` は廃止し、CORS レイヤー自体を外した (ダッシュボードは同一オリジン配信のため
   ブラウザの同一オリジンポリシーで十分。他オリジンからの `fetch` はブラウザ側で拒否される)。
 - **既定 bind**: `web_listen` の既定は `127.0.0.1:40080` (REVIEW P0)。LAN 公開は `--web-listen 0.0.0.0:40080` などで明示オプトイン。
 - `SessionRegistry` (web/state.rs) がセッションのライブメトリクス
   (signal/drop/scramble/bitrate、5 分の履歴リングバッファ) を保持。セッション終了時に `session_history` へ永続化。
+- ダッシュボード更新は `GET /api/events` のSSEを主経路とし、Vue側は接続失敗時のみ 30 秒ポーリングへフォールバックする。
 
 - **Mirakurun 互換 API サブセット (実装済み・2026-07-04, STREAMING_DESIGN.md §7.1 P6)**:
   `web/mirakurun.rs`。`GET /version` / `GET /status` / `GET /channels` / `GET /services` /
@@ -326,10 +330,10 @@ TLS 設定 (`[tls]`) は **現状サーバー側で機能しない** (パース�
 | サーバー側 TLS | 設定パースのみ。accept 経路に TlsAcceptor 未結線 |
 | プロトコル認証 | なし (Hello はバージョンのみ、REVIEW S3 未着手) |
 | Web API 認証 | **実装済み (2026-07-04)**: `/api/*` に Bearer トークン認証、CORS はレイヤー自体を撤去、`web_listen` 既定 `127.0.0.1` (REVIEW S2/P0)。プロトコル認証 (S3) は別課題として未着手 |
-| 容量制御の場所 | session.rs にアドホック実装 (pool.rs の Semaphore 計画は未着手、MuxKey は未使用) |
-| metrics.rs | デッドコード (実体は web/state.rs) |
+| 容量制御の場所 | `server/session_capacity.rs` に共通化。`MuxKey` は未使用だったため削除済み |
+| メトリクス | `web/state.rs` のセッション履歴リングバッファへ統一。旧 `metrics.rs` は削除済み |
 | 統合テスト | なし (単体テストは protocol/db/ts_analyzer/space_generator 等に散在) |
-| graceful shutdown | なし (プロセス kill 前提) |
+| graceful shutdown | BNDPリスナーとWebサーバーで実装済み |
 
 改善順序は [REVIEW_2026-07.md §7 ロードマップ](REVIEW_2026-07.md) に従う。
 

@@ -10,25 +10,6 @@ use tokio::sync::oneshot;
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::shared::SharedTuner;
 
-/// Key for identifying a TS (Transport Stream) for tuner sharing.
-/// Used for TSID/SID-based tuner merging.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MuxKey {
-    pub driver_id: i64,
-    pub nid: u16,
-    pub tsid: u16,
-}
-
-impl MuxKey {
-    pub fn new(driver_id: i64, nid: u16, tsid: u16) -> Self {
-        Self {
-            driver_id,
-            nid,
-            tsid,
-        }
-    }
-}
-
 /// Priority levels for tuner requests.
 pub mod priority {
     pub const SCAN: u8 = 0;

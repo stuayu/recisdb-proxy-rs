@@ -471,8 +471,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Run server
-    server.run().await?;
+    // Run until the listener exits or the process receives Ctrl+C/SIGTERM.
+    // Dropping the listener future stops new BNDP connections; owned pools
+    // and database handles are then released in normal Rust drop order.
+    tokio::select! {
+        result = server.run() => result?,
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => info!("Shutdown signal received; stopping server"),
+                Err(e) => warn!("Unable to listen for shutdown signal: {}", e),
+            }
+        }
+    }
 
     Ok(())
 }
