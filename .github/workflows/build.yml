@@ -23,6 +23,10 @@ jobs:
             label: win-x86
 
     steps:
+      - name: Setup Node.js (latest LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
       - name: Install or Update Clang and LLVM for bindgen
         run: choco install llvm -y --force
 
@@ -42,6 +46,12 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.arch }}
+
+      - name: Build Web UI
+        working-directory: web-ui
+        run: |
+          npm install
+          npm run build
 
       - name: Build (Release)
         run: |
@@ -101,6 +111,11 @@ jobs:
             libxkbcommon-dev libx11-dev libxcb1-dev libxrandr-dev \
             libxi-dev libxcursor-dev libwayland-dev libgl1-mesa-dev
 
+      - name: Setup Node.js (latest LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -111,6 +126,11 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Build Web UI
+        working-directory: web-ui
+        run: |
+          npm install
+          npm run build
       - name: Build (Release)
         run: cargo build --workspace --verbose --release -F dvb
 
@@ -156,6 +176,11 @@ jobs:
         run: |
           brew install cmake ninja
 
+      - name: Setup Node.js (latest LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -165,7 +190,11 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-
+      - name: Build Web UI
+        working-directory: web-ui
+        run: |
+          npm install
+          npm run build
       - name: Build (Release)
         run: cargo build --workspace --verbose --release
 
