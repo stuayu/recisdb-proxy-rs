@@ -8,3 +8,5 @@
 # Runtime logs
 *.log
 BonDriver_NetworkProxy.log
+node_modules
+.DS_Store
