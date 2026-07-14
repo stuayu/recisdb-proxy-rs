@@ -17,7 +17,8 @@ use eframe::egui;
 use recisdb_proxy::database::Database;
 use recisdb_proxy::px4_installer;
 use recisdb_proxy::setup_helpers::{
-    self, generate_config, register_manual_tuner, register_tuners_to_db, DetectedTuner,
+    self, bulk_update_bondriver_dlls, generate_config, register_manual_tuner,
+    register_tuners_to_db, DetectedTuner,
 };
 
 /// px4_drv 自動インストールのバックグラウンドスレッドから届く通知。
@@ -144,6 +145,11 @@ struct SetupApp {
     /// [`SetupApp::db_file_path`])。
     install_location: String,
 
+    /// 既存クライアントDLL (`BonDriver_NetworkProxy` 接頭辞) を一括更新する
+    /// 対象フォルダ (インストール先とは別に指定できる、省略可)。
+    /// 空のままなら完了画面での一括更新プロンプトを出さない。
+    bulk_update_dir: String,
+
     // ステップ2: チューナー検出
     detect_rx: Option<mpsc::Receiver<Vec<DetectedTuner>>>,
     detected: Vec<DetectedTuner>,
@@ -168,6 +174,11 @@ struct SetupApp {
     // 完了画面
     launch_deadline: Option<Instant>,
     launch_message: Option<String>,
+
+    // 完了画面: 既存クライアントDLLの一括更新
+    bulk_update_log: Vec<String>,
+    bulk_update_error: Option<String>,
+    bulk_update_ran: bool,
 }
 
 impl SetupApp {
@@ -177,6 +188,7 @@ impl SetupApp {
             listen_addr: "0.0.0.0:40070".to_string(),
             web_listen_addr: "0.0.0.0:40080".to_string(),
             install_location: default_install_location(),
+            bulk_update_dir: String::new(),
             detect_rx: None,
             detected: Vec::new(),
             selected: Vec::new(),
@@ -192,6 +204,9 @@ impl SetupApp {
             setup_error: None,
             launch_deadline: None,
             launch_message: None,
+            bulk_update_log: Vec::new(),
+            bulk_update_error: None,
+            bulk_update_ran: false,
         }
     }
 
@@ -232,6 +247,34 @@ impl SetupApp {
 
     fn db_file_path(&self) -> PathBuf {
         self.install_dir().join("recisdb-proxy.db")
+    }
+
+    /// 完了画面の「今すぐ一括更新を実行する」ボタンを押したときの処理。
+    /// インストール先に配置したクライアント配布用の最新の
+    /// `BonDriver_NetworkProxy.dll` を元に、`self.bulk_update_dir` 以下
+    /// (サブフォルダ含む) の `BonDriver_NetworkProxy` 接頭辞DLLをまとめて
+    /// 上書きする。インストール先フォルダとは無関係に、任意のフォルダ
+    /// (例: TVTestのBonDriverフォルダ) を対象にできる。
+    fn run_bulk_dll_update(&mut self) {
+        self.bulk_update_log.clear();
+        self.bulk_update_error = None;
+        self.bulk_update_ran = true;
+
+        let target_dir = self.bulk_update_dir.trim();
+        if target_dir.is_empty() {
+            self.bulk_update_error = Some("更新先フォルダを指定してください。".to_string());
+            return;
+        }
+
+        let source_dll = self
+            .install_dir()
+            .join(setup_helpers::CLIENT_CONFIG_DIR)
+            .join("BonDriver_NetworkProxy.dll");
+
+        match bulk_update_bondriver_dlls(&source_dll, Path::new(target_dir)) {
+            Ok(log) => self.bulk_update_log = log,
+            Err(e) => self.bulk_update_error = Some(e),
+        }
     }
 
     /// 指定したチューナーの px4_drv ドライバ自動インストールをバックグラウンドで開始する。
@@ -597,6 +640,31 @@ impl SetupApp {
             .small(),
         );
 
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            "TVTest/EDCB を動かすPC側で、チューナーごとに別名で複製配置している\n\
+             既存の BonDriver_NetworkProxy 系DLL (例: BonDriver_NetworkProxy_1.dll) を、\n\
+             セットアップ完了後にまとめて最新版へ更新したい場合は、その置き場所の\n\
+             フォルダを指定してください(サブフォルダも検索対象になります)。\n\
+             インストール先フォルダとは無関係の、任意のフォルダを指定できます。\n\
+             空欄のままなら、この一括更新は行いません。",
+        );
+        ui.horizontal(|ui| {
+            ui.label("BonDriver_NetworkProxy*.dll の一括更新先 (省略可):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bulk_update_dir)
+                    .desired_width(320.0),
+            );
+            #[cfg(windows)]
+            if ui.button("参照…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.bulk_update_dir = dir.to_string_lossy().to_string();
+                }
+            }
+        });
+
         ui.add_space(8.0);
         ui.collapsing("詳しい設定 (通常は変更不要)", |ui| {
             egui::Grid::new("advanced_grid")
@@ -889,6 +957,53 @@ impl SetupApp {
             dashboard_url(&self.web_listen_addr)
         ));
         ui.label("    TVTest用 .ch2 / EDCB用 ChSet4/ChSet5 のダウンロードができます(「クライアント設定」タブ)。");
+
+        if !self.bulk_update_dir.trim().is_empty() {
+            ui.add_space(16.0);
+            ui.separator();
+            ui.label("既存クライアントDLLの一括更新");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("更新先フォルダ:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bulk_update_dir)
+                        .desired_width(320.0),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定したフォルダ(サブフォルダ含む)にある \"BonDriver_NetworkProxy\" で始まる\
+                     DLLを、今回配置した最新版の内容でま��めて上書きします。\
+                     実行しますか？",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(6.0);
+            if ui.button("今すぐ一括更新を実行する").clicked() {
+                self.run_bulk_dll_update();
+            }
+
+            if let Some(err) = &self.bulk_update_error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
+            }
+            if self.bulk_update_ran && self.bulk_update_error.is_none() {
+                ui.add_space(6.0);
+                if self.bulk_update_log.is_empty() {
+                    ui.label("対象のDLLは見つかりませんでした。");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .id_salt("bulk_update_log_scroll")
+                        .show(ui, |ui| {
+                            for line in &self.bulk_update_log {
+                                ui.label(line);
+                            }
+                        });
+                }
+            }
+        }
     }
 }
 
@@ -914,6 +1029,42 @@ mod tests {
     fn setup_exe_dir_returns_a_dir_containing_the_test_binary() {
         let dir = setup_exe_dir().expect("current test binary must have a parent dir");
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn run_bulk_dll_update_requires_target_dir() {
+        let mut app = SetupApp::new();
+        assert!(app.bulk_update_dir.trim().is_empty());
+
+        app.run_bulk_dll_update();
+
+        assert!(app.bulk_update_ran);
+        assert!(app.bulk_update_error.is_some());
+        assert!(app.bulk_update_log.is_empty());
+    }
+
+    #[test]
+    fn run_bulk_dll_update_reports_error_when_source_dll_missing() {
+        // インストールを実行していない(セットアップ未完了)状況では
+        // クライアント配布用DLLがまだ存在しないため、エラーとして扱われる。
+        let base = std::env::temp_dir().join(format!(
+            "run_bulk_dll_update_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let target_dir = base.join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let mut app = SetupApp::new();
+        app.install_location = base.join("install").to_string_lossy().to_string();
+        app.bulk_update_dir = target_dir.to_string_lossy().to_string();
+
+        app.run_bulk_dll_update();
+
+        assert!(app.bulk_update_ran);
+        assert!(app.bulk_update_error.is_some());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

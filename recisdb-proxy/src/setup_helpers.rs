@@ -388,7 +388,7 @@ fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
 /// BonDriver一式が既に存在するかを、そのステージング先の規則
 /// (`<検索ルート>\BonDriver\<bondriver_folder>\<dll名>`)に従って探す。
 /// `install_dir` (GUIで指定されたインストール先) を最優先で確認し、
-/// カレントディレクトリ相対のパスは後方互換のフォールバックとする。
+/// カレントディレクトリ相対のパスは後方���換のフォールバックとする。
 /// 見つかった場合は絶対パスのリストを返す(空なら未インストール)。
 #[cfg(target_os = "windows")]
 fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model, install_dir: &Path) -> Vec<String> {
@@ -557,7 +557,7 @@ pub fn local_lan_ip() -> Option<std::net::IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-/// 配布用 BonDriver_NetworkProxy.ini を生成する。
+/// 配布用 BonDriver_NetworkProxy.ini を生成す���。
 pub fn generate_client_ini(server_addr: &str, tuner: &str) -> String {
     let mut replaced_addr = false;
     let mut replaced_tuner = false;
@@ -689,6 +689,92 @@ pub fn write_client_config_bundle(
     Ok(log)
 }
 
+/// クライアント配布用DLLのファイル名接頭辞。複数チューナー用に
+/// `BonDriver_NetworkProxy_1.dll` のような別名で複製配置されることがある。
+pub const CLIENT_DLL_PREFIX: &str = "BonDriver_NetworkProxy";
+
+/// `target_root` 以下 (サブフォルダ含む) にある、ファイル名が
+/// [`CLIENT_DLL_PREFIX`] で始まり拡張子が `.dll` の既存ファイルを、
+/// `source_dll` の内容で一括上書きする。
+///
+/// TVTest/EDCB側のPCで、チューナーごとに別名で複製配置された
+/// `BonDriver_NetworkProxy_*.dll` が複数存在する場合に、ファイル名は
+/// そのまま保って内容だけ最新版に揃えるための機能。インストール先フォルダ
+/// とは別に、任意のフォルダ (例: TVTestのBonDriverフォルダ) を指定できる。
+/// 1件の失敗が他の更新を止めないよう、エラーはログに記録して処理を継続する。
+pub fn bulk_update_bondriver_dlls(
+    source_dll: &Path,
+    target_root: &Path,
+) -> Result<Vec<String>, String> {
+    if !source_dll.exists() {
+        return Err(format!(
+            "更新元のDLLが見つかりません: {}",
+            source_dll.display()
+        ));
+    }
+    if !target_root.exists() {
+        return Err(format!(
+            "指定されたフォルダが見つかりません: {}",
+            target_root.display()
+        ));
+    }
+
+    let mut matches = Vec::new();
+    collect_matching_dlls(target_root, &mut matches)?;
+
+    let mut log = Vec::new();
+    if matches.is_empty() {
+        log.push(format!(
+            "\"{}\" 以下に \"{CLIENT_DLL_PREFIX}\" で始まるDLLは見つかりませんでした。",
+            target_root.display()
+        ));
+        return Ok(log);
+    }
+
+    for path in matches {
+        match std::fs::copy(source_dll, &path) {
+            Ok(_) => log.push(format!("更新しました: {}", path.display())),
+            Err(e) => log.push(format!("更新に失敗しました: {} ({e})", path.display())),
+        }
+    }
+    Ok(log)
+}
+
+/// `dir` 以下を再帰的に走査し、ファイル名が [`CLIENT_DLL_PREFIX`] で始まり
+/// 拡張子が `.dll` (大文字小文字は区別しない) のファイルを `out` に集める。
+fn collect_matching_dlls(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("{} の読み取りに失敗しました: {e}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("{} の読み取りに失敗しました: {e}", dir.display()))?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            collect_matching_dlls(&path, out)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_dll = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("dll"))
+            .unwrap_or(false);
+        if is_dll && name.starts_with(CLIENT_DLL_PREFIX) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 // =============================================================================
 // 本体バイナリのインストール/更新
 // =============================================================================
@@ -742,7 +828,7 @@ pub fn sync_program_binary(source_dir: &Path, install_dir: &Path) -> Result<Bina
 
     std::fs::copy(&source, &dest).map_err(|e| {
         format!(
-            "{exe_name} の更新に失敗しました({e})。{exe_name} が起動中の場合は終了してから、\
+            "{exe_name} の更新に失敗しまし��({e})。{exe_name} が起動中の場合は終了してから、\
              もう一度お試しください。"
         )
     })?;
@@ -1024,6 +1110,68 @@ mod tests {
     }
 
     #[test]
+    fn bulk_update_bondriver_dlls_updates_matching_files_in_subfolders() {
+        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 1));
+        let source_dll = base.join("BonDriver_NetworkProxy.dll");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&source_dll, b"new dll contents").unwrap();
+
+        let target_root = base.join("BonDriver");
+        let sub = target_root.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(target_root.join("BonDriver_NetworkProxy_1.dll"), b"old").unwrap();
+        std::fs::write(sub.join("BonDriver_NetworkProxy_2.dll"), b"old").unwrap();
+        // プレフィックスが違う/拡張子が違うファイルは対象外
+        std::fs::write(target_root.join("BonDriver_PT3.dll"), b"unrelated").unwrap();
+        std::fs::write(target_root.join("BonDriver_NetworkProxy.ini"), b"unrelated").unwrap();
+
+        let log = bulk_update_bondriver_dlls(&source_dll, &target_root).unwrap();
+        assert_eq!(log.len(), 2);
+
+        assert_eq!(
+            std::fs::read(target_root.join("BonDriver_NetworkProxy_1.dll")).unwrap(),
+            b"new dll contents"
+        );
+        assert_eq!(
+            std::fs::read(sub.join("BonDriver_NetworkProxy_2.dll")).unwrap(),
+            b"new dll contents"
+        );
+        assert_eq!(
+            std::fs::read(target_root.join("BonDriver_PT3.dll")).unwrap(),
+            b"unrelated"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn bulk_update_bondriver_dlls_reports_when_nothing_matches() {
+        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 2));
+        let source_dll = base.join("BonDriver_NetworkProxy.dll");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&source_dll, b"new dll contents").unwrap();
+
+        let target_root = base.join("empty_target");
+        std::fs::create_dir_all(&target_root).unwrap();
+
+        let log = bulk_update_bondriver_dlls(&source_dll, &target_root).unwrap();
+        assert!(log.iter().any(|l| l.contains("見つかりませんでした")));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn bulk_update_bondriver_dlls_errors_when_source_missing() {
+        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 3));
+        std::fs::create_dir_all(&base).unwrap();
+        let missing_source = base.join("does_not_exist.dll");
+
+        assert!(bulk_update_bondriver_dlls(&missing_source, &base).is_err());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn generate_config_embeds_all_fields() {
         let toml = generate_config("0.0.0.0:40070", "0.0.0.0:40080", "recisdb-proxy.db");
         assert!(toml.contains(r#"listen = "0.0.0.0:40070""#));
@@ -1039,7 +1187,7 @@ mod tests {
         // 済みでもよいので案内として含んでいることを確認する
         // (main.rs の ConfigFile が持つセクション: server/database/logging/
         // web/mirakurun/tsreplace/preview/tls)。古いテンプレートへの
-        // 先祖返りを防ぐリグレッションテスト。
+        // 先祖返りを防ぐリグレッ���ョンテスト。
         for section in ["[web]", "[mirakurun]", "[tsreplace]", "[preview]", "[tls]"] {
             assert!(
                 generated.contains(section),
