@@ -10,3 +10,4 @@
 BonDriver_NetworkProxy.log
 node_modules
 .DS_Store
+recisdb-proxy/static/vue/*
