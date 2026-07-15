@@ -87,7 +87,17 @@ onUnmounted(() => {
       <div>
         <h1>recisdb-proxy</h1>
         <p>TVプロキシサーバー 管理コンソール</p>
-        <p class="connection-status" :class="connection" v-text="connection === 'connected' ? '● サーバー接続中' : connection === 'error' ? '● 接続を確認できません' : '● 接続確認中'"> </p>
+        <p
+          class="connection-status"
+          :class="connection"
+          v-text="
+            connection === 'connected'
+              ? '● サーバー接続中'
+              : connection === 'error'
+                ? '● 接続を確認できません'
+                : '● 接続確認中'
+          "
+        />
       </div>
       <div class="top-actions">
         <button class="icon-button" aria-label="APIトークン" @click="tokenOpen = true">鍵</button>
@@ -96,7 +106,7 @@ onUnmounted(() => {
           aria-label="テーマ切替"
           @click="toggleTheme"
           v-text="dark ? '☀' : '☾'"
-        ></button>
+        />
       </div>
     </header>
     <div class="layout">
@@ -108,25 +118,25 @@ onUnmounted(() => {
           :aria-current="active === tab.id ? 'page' : undefined"
           @click="select(tab.id)"
         >
-          <span aria-hidden="true" v-text="tab.icon"></span>
-          <span v-text="tab.label"></span>
+          <span aria-hidden="true" v-text="tab.icon" />
+          <span v-text="tab.label" />
         </button>
       </nav>
       <main id="main" tabindex="-1">
-        <OverviewView v-if="active === 'overview'"></OverviewView>
-        <BonDriversView v-else-if="active === 'bondrivers'"></BonDriversView>
-        <ChannelsView v-else-if="active === 'channels'"></ChannelsView>
-        <ClientGuideView v-else-if="active === 'client-guide'"></ClientGuideView>
+        <OverviewView v-if="active === 'overview'" />
+        <BonDriversView v-else-if="active === 'bondrivers'" />
+        <ChannelsView v-else-if="active === 'channels'" />
+        <ClientGuideView v-else-if="active === 'client-guide'" />
         <ResourceView
           v-else-if="active === 'scan-history'"
           title="スキャン履歴"
           endpoint="/scan-history"
           :keys="['history', 'scans', 'data']"
-        ></ResourceView>
-        <SessionHistoryView v-else-if="active === 'session-history'"></SessionHistoryView>
-        <AlertsView v-else-if="active === 'alerts'"></AlertsView>
-        <SettingsView v-else-if="active === 'settings'"></SettingsView>
-        <EncodeProfilesView v-else></EncodeProfilesView>
+        />
+        <SessionHistoryView v-else-if="active === 'session-history'" />
+        <AlertsView v-else-if="active === 'alerts'" />
+        <SettingsView v-else-if="active === 'settings'" />
+        <EncodeProfilesView v-else />
       </main>
     </div>
     <div v-if="tokenOpen" class="dialog-backdrop" @click.self="tokenOpen = false">

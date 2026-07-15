@@ -150,6 +150,10 @@ async function load() {
   }
 }
 
+function startCreate() {
+  editMode.value = true
+  reset()
+}
 function reset() {
   editing.value = null
   Object.assign(form, {
@@ -353,13 +357,8 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
           class="button secondary"
           @click="editMode = !editMode"
           v-text="editMode ? '編集を閉じる' : '編集モード'"
-        ></button>
-        <button
-          class="button"
-          @click="editMode = true; reset()"
-        >
-          新規
-        </button>
+        />
+        <button class="button" @click="startCreate()">新規</button>
       </div>
     </div>
 
@@ -376,13 +375,13 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
             :key="column.key"
             :value="column.key"
             v-text="column.label"
-          ></option>
+          />
         </select>
         <button
           class="button small secondary"
           @click="descending = !descending"
           v-text="descending ? '降順' : '昇順'"
-        ></button>
+        />
       </label>
       <label class="mobile-sort">
         <span>第2キー</span>
@@ -393,14 +392,14 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
             :key="column.key"
             :value="column.key"
             v-text="column.label"
-          ></option>
+          />
         </select>
         <button
           class="button small secondary"
           :disabled="!sortKey2"
           @click="descending2 = !descending2"
           v-text="descending2 ? '降順' : '昇順'"
-        ></button>
+        />
       </label>
       <label class="mobile-sort">
         <span>第3キー</span>
@@ -411,17 +410,17 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
             :key="column.key"
             :value="column.key"
             v-text="column.label"
-          ></option>
+          />
         </select>
         <button
           class="button small secondary"
           :disabled="!sortKey3"
           @click="descending3 = !descending3"
           v-text="descending3 ? '降順' : '昇順'"
-        ></button>
+        />
       </label>
       <details class="column-picker">
-        <summary><span v-text="`表示列を調整（${visibleColumns.length}列）`"></span></summary>
+        <summary><span v-text="`表示列を調整（${visibleColumns.length}列）`" /></summary>
         <div class="column-options">
           <label v-for="column in columns" :key="column.key" class="check compact-check">
             <input
@@ -429,18 +428,18 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
               :checked="visibleKeys.includes(column.key)"
               @change="setColumn(column.key, ($event.target as HTMLInputElement).checked)"
             />
-            <span v-text="column.label"></span>
+            <span v-text="column.label" />
           </label>
         </div>
         <button class="button small secondary" @click="resetColumns">既定に戻す</button>
       </details>
     </div>
 
-    <p v-if="message" class="notice success" aria-live="polite" v-text="message"></p>
-    <p v-if="error" class="notice error preserve-lines" role="alert" v-text="error"></p>
+    <p v-if="message" class="notice success" aria-live="polite" v-text="message" />
+    <p v-if="error" class="notice error preserve-lines" role="alert" v-text="error" />
 
     <div v-if="editMode" class="bulk-bar">
-      <strong v-text="`${selected.length}件を選択`"></strong>
+      <strong v-text="`${selected.length}件を選択`" />
       <label>優先度 <input v-model.number="bulkPriority" type="number" /></label>
       <label>
         有効
@@ -471,11 +470,11 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
               </th>
               <th v-for="column in visibleColumns" :key="column.key">
                 <button class="sort-button" @click="sort(column.key)">
-                  <span v-text="column.label"></span>
+                  <span v-text="column.label" />
                   <span
                     aria-hidden="true"
                     v-text="sortKey === column.key ? (descending ? '↓' : '↑') : '↕'"
-                  ></span>
+                  />
                 </button>
               </th>
               <th v-if="editMode">操作</th>
@@ -498,8 +497,8 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
                   :aria-label="`${String(row.channel_name ?? row.id)}を${row.is_enabled ? '無効' : '有効'}にする`"
                   @click="toggle(row)"
                   v-text="row.is_enabled ? '有効' : '無効'"
-                ></button>
-                <span v-else v-text="display(row, column.key)"></span>
+                />
+                <span v-else v-text="display(row, column.key)" />
               </td>
               <td v-if="editMode" data-label="操作">
                 <div class="actions">
@@ -553,6 +552,6 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
       </form>
     </div>
 
-    <PreviewPlayer></PreviewPlayer>
+    <PreviewPlayer />
   </section>
 </template>

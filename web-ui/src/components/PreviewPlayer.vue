@@ -67,7 +67,7 @@ onBeforeUnmount(stop)
       <span>サービスID</span>
       <input v-model="sid" inputmode="numeric" placeholder="例: 1024" @keyup.enter="start" />
     </label>
-    <video ref="video" class="preview-video" controls playsinline></video>
-    <p v-if="error" class="notice error" role="alert" v-text="error"></p>
+    <video ref="video" class="preview-video" controls playsinline />
+    <p v-if="error" class="notice error" role="alert" v-text="error" />
   </section>
 </template>

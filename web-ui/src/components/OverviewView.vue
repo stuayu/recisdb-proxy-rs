@@ -123,15 +123,15 @@ onUnmounted(() => store.stop())
       </div>
       <button class="button" :disabled="store.loading" @click="store.refresh">更新</button>
     </div>
-    <p v-if="store.error" class="notice error" role="alert" v-text="store.error"></p>
+    <p v-if="store.error" class="notice error" role="alert" v-text="store.error" />
     <div class="stat-grid">
       <article v-for="card in cards" :key="String(card[0])" class="stat-card">
-        <span v-text="card[0]"></span><strong v-text="card[1]"></strong>
+        <span v-text="card[0]" /><strong v-text="card[1]" />
       </article>
     </div>
     <h3>接続中のクライアント</h3>
     <details class="column-picker">
-      <summary><span v-text="`表示列を調整（${visibleClientColumns.length}列）`"></span></summary>
+      <summary><span v-text="`表示列を調整（${visibleClientColumns.length}列）`" /></summary>
       <div class="column-options">
         <label v-for="column in clientColumns" :key="column.key" class="check compact-check">
           <input
@@ -139,7 +139,7 @@ onUnmounted(() => store.stop())
             :checked="visibleClientKeys.includes(column.key)"
             @change="setClientColumn(column.key, ($event.target as HTMLInputElement).checked)"
           />
-          <span v-text="column.label"></span>
+          <span v-text="column.label" />
         </label>
       </div>
       <button class="button small secondary" @click="resetClientColumns">既定に戻す</button>
@@ -148,11 +148,7 @@ onUnmounted(() => store.stop())
       <table v-if="store.clients.length" class="data-table">
         <thead>
           <tr>
-            <th
-              v-for="column in visibleClientColumns"
-              :key="column.key"
-              v-text="column.label"
-            ></th>
+            <th v-for="column in visibleClientColumns" :key="column.key" v-text="column.label" />
             <th>優先度</th>
             <th>排他</th>
             <th>操作</th>
@@ -165,11 +161,11 @@ onUnmounted(() => store.stop())
               :key="column.key"
               :data-label="column.label"
               v-text="cellText(row, column.key)"
-            ></td>
+            />
             <td data-label="優先度">
               <select :value="row.override_priority ?? ''" @change="setPriority(row, $event)">
                 <option value="">自動</option>
-                <option v-for="n in [1, 2, 3, 4, 5]" :key="n" :value="n" v-text="n"></option>
+                <option v-for="n in [1, 2, 3, 4, 5]" :key="n" :value="n" v-text="n" />
               </select>
             </td>
             <td data-label="排他">
@@ -197,6 +193,6 @@ onUnmounted(() => store.stop())
       </table>
       <p v-else class="empty-state">接続中のクライアントはありません</p>
     </div>
-    <MetricsChart v-if="selectedSession" :session-id="selectedSession"></MetricsChart>
+    <MetricsChart v-if="selectedSession" :session-id="selectedSession" />
   </section>
 </template>

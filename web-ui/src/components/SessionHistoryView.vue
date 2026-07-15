@@ -22,17 +22,32 @@ async function load() {
     loading.value = false
   }
 }
-function clear() { address.value = ''; void load() }
+function clear() {
+  address.value = ''
+  void load()
+}
 onMounted(load)
 </script>
 <template>
   <section class="view">
-    <div class="view-heading"><div><h2>セッション履歴</h2><p>過去の接続・切断・視聴セッションを確認します。</p></div><button class="button" :disabled="loading" @click="load">更新</button></div>
+    <div class="view-heading">
+      <div>
+        <h2>セッション履歴</h2>
+        <p>過去の接続・切断・視聴セッションを確認します。</p>
+      </div>
+      <button class="button" :disabled="loading" @click="load">更新</button>
+    </div>
     <form class="toolbar" @submit.prevent="load">
-      <label class="field"><span>クライアントアドレスで絞り込み</span><input v-model="address" placeholder="例: 192.168.1.10" /></label>
-      <div class="actions"><button class="button" type="submit">検索</button><button class="button secondary" type="button" @click="clear">解除</button></div>
+      <label class="field"
+        ><span>クライアントアドレスで絞り込み</span
+        ><input v-model="address" placeholder="例: 192.168.1.10"
+      /></label>
+      <div class="actions">
+        <button class="button" type="submit">検索</button
+        ><button class="button secondary" type="button" @click="clear">解除</button>
+      </div>
     </form>
-    <p v-if="error" class="notice error" role="alert" v-text="error"></p>
-    <DataTable :rows="rows" empty="該当するセッション履歴はありません"></DataTable>
+    <p v-if="error" class="notice error" role="alert" v-text="error" />
+    <DataTable :rows="rows" empty="該当するセッション履歴はありません" />
   </section>
 </template>

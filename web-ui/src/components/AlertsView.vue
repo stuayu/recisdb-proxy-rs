@@ -49,13 +49,13 @@ onMounted(load)
       </div>
       <button class="button secondary" @click="load">更新</button>
     </div>
-    <p v-if="error" class="notice error" v-text="error"></p>
+    <p v-if="error" class="notice error" v-text="error" />
     <h3>発生中</h3>
     <div class="cards">
       <article v-for="item in alerts" :key="String(item.id)" class="alert-card">
         <div>
-          <strong v-text="String(item.message ?? item.metric ?? 'アラート')"></strong>
-          <p v-text="String(item.severity ?? 'warning')"></p>
+          <strong v-text="String(item.message ?? item.metric ?? 'アラート')" />
+          <p v-text="String(item.severity ?? 'warning')" />
         </div>
         <button class="button small" @click="acknowledge(item.id)">確認済み</button>
       </article>
@@ -67,12 +67,12 @@ onMounted(load)
         <div class="cards">
           <article v-for="rule in rules" :key="String(rule.id)" class="alert-card">
             <div>
-              <strong v-text="String(rule.name ?? '—')"></strong>
+              <strong v-text="String(rule.name ?? '—')" />
               <p
                 v-text="
                   `${String(rule.metric ?? '')} ${String(rule.condition ?? '')} ${String(rule.threshold ?? '')}`
                 "
-              ></p>
+              />
             </div>
             <button class="button small danger" @click="remove(rule.id)">削除</button>
           </article>
@@ -99,13 +99,22 @@ onMounted(load)
           ><input v-model.number="form.threshold" type="number" step="0.1" /></label
         ><label class="field"
           ><span>重要度</span
-          ><select v-model="form.severity"><option value="info">情報</option><option value="warning">警告</option><option value="critical">重大</option></select></label
+          ><select v-model="form.severity">
+            <option value="info">情報</option>
+            <option value="warning">警告</option>
+            <option value="critical">重大</option>
+          </select></label
         ><label class="field"
           ><span>Webhook URL</span><input v-model="form.webhook_url" type="url" /></label
         ><label class="field"
           ><span>Webhook形式</span
-          ><select v-model="form.webhook_format"><option value="json">JSON</option><option value="discord">Discord</option><option value="slack">Slack</option></select></label
-        ><label class="check"><input v-model="form.is_enabled" type="checkbox" />ルールを有効にする</label
+          ><select v-model="form.webhook_format">
+            <option value="json">JSON</option>
+            <option value="discord">Discord</option>
+            <option value="slack">Slack</option>
+          </select></label
+        ><label class="check"
+          ><input v-model="form.is_enabled" type="checkbox" />ルールを有効にする</label
         ><button class="button" type="submit">追加</button>
       </form>
     </div>

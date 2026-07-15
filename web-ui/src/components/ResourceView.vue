@@ -28,12 +28,12 @@ onMounted(load)
   <section class="view">
     <div class="view-heading">
       <div>
-        <h2 v-text="title"></h2>
-        <p v-if="description" v-text="description"></p>
+        <h2 v-text="title" />
+        <p v-if="description" v-text="description" />
       </div>
       <button class="button" :disabled="loading" @click="load">更新</button>
     </div>
-    <p v-if="error" class="notice error" role="alert" v-text="error"></p>
-    <DataTable :rows="rows"></DataTable>
+    <p v-if="error" class="notice error" role="alert" v-text="error" />
+    <DataTable :rows="rows" />
   </section>
 </template>

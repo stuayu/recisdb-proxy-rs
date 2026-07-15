@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import type { JsonRecord } from '../api'
 const props = withDefaults(
   defineProps<{ rows: JsonRecord[]; columns?: string[]; empty?: string }>(),
-  { empty: 'データがありません' },
+  { columns: () => [], empty: 'データがありません' },
 )
 const sortKey = ref('')
 const descending = ref(false)
@@ -60,17 +60,17 @@ function marker(col: string) {
         <tr>
           <th v-for="col in columns" :key="col">
             <button class="sort-button" @click="sort(col)">
-              <span v-text="col"></span><span aria-hidden="true" v-text="marker(col)"></span>
+              <span v-text="col" /><span aria-hidden="true" v-text="marker(col)" />
             </button>
           </th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="(row, index) in sorted" :key="String(row.id ?? row.session_id ?? index)">
-          <td v-for="col in columns" :key="col" :data-label="col" v-text="display(row[col], col)"></td>
+          <td v-for="col in columns" :key="col" :data-label="col" v-text="display(row[col], col)" />
         </tr>
       </tbody>
     </table>
-    <p v-else class="empty-state" v-text="empty"></p>
+    <p v-else class="empty-state" v-text="empty" />
   </div>
 </template>

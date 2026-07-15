@@ -4,5 +4,11 @@
     "selector-class-pattern": null,
     "custom-property-pattern": null,
     "media-feature-range-notation": null
-  }
+  },
+  "overrides": [
+    {
+      "files": ["**/*.vue"],
+      "customSyntax": "postcss-html"
+    }
+  ]
 }
