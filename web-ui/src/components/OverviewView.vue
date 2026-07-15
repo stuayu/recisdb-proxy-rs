@@ -3,8 +3,21 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, type JsonRecord } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
 import MetricsChart from './MetricsChart.vue'
+import PreviewPlayer from './PreviewPlayer.vue'
 const store = useDashboardStore()
 const selectedSession = ref<string | number>('')
+const previewRow = ref<JsonRecord | null>(null)
+const previewSid = computed<string | number>(() => {
+  const value = previewRow.value?.sid
+  return typeof value === 'number' || typeof value === 'string' ? value : ''
+})
+function openPreview(row: JsonRecord) {
+  if (row.sid == null) return
+  previewRow.value = row
+}
+function closePreview() {
+  previewRow.value = null
+}
 
 type ClientColumn = { key: string; label: string }
 const clientColumns: ClientColumn[] = [
@@ -185,6 +198,13 @@ onUnmounted(() => store.stop())
                   @click="selectedSession = String(row.session_id)"
                 >
                   グラフ</button
+                ><button
+                  class="button small secondary"
+                  :disabled="row.sid == null"
+                  :title="row.sid == null ? '未選局のためプレビューできません' : ''"
+                  @click="openPreview(row)"
+                >
+                  プレビュー</button
                 ><button class="button small danger" @click="disconnect(row)">切断</button>
               </div>
             </td>
@@ -194,5 +214,27 @@ onUnmounted(() => store.stop())
       <p v-else class="empty-state">接続中のクライアントはありません</p>
     </div>
     <MetricsChart v-if="selectedSession" :session-id="selectedSession" />
+    <div v-if="previewRow" class="dialog-backdrop" @click.self="closePreview">
+      <section
+        class="dialog preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="client-preview-title"
+      >
+        <div class="view-heading">
+          <div>
+            <h2 id="client-preview-title">クライアントプレビュー</h2>
+            <p
+              class="muted"
+              v-text="
+                `${String(previewRow.channel_name ?? previewRow.channel_info ?? 'SID ' + previewRow.sid)}（セッション ${String(previewRow.session_id)}）`
+              "
+            />
+          </div>
+          <button class="button secondary" @click="closePreview">閉じる</button>
+        </div>
+        <PreviewPlayer :key="previewSid" :initial-sid="previewSid" />
+      </section>
+    </div>
   </section>
 </template>

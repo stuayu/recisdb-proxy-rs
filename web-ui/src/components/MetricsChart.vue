@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, type JsonRecord } from '../api'
 import { useColumnVisibility, type ColumnDef } from '../columns'
 import ColumnPicker from './ColumnPicker.vue'
+import MetricSparkline from './MetricSparkline.vue'
 
 const lossPidColumns: ColumnDef[] = [
   { key: 'pid', label: 'PID' },
@@ -25,36 +26,6 @@ const chartWidth = ref(320)
 const chartHeight = computed(() => (chartWidth.value < 360 ? 84 : 110))
 let timer = 0
 let observer: ResizeObserver | null = null
-
-function values(source: unknown): number[] {
-  if (!Array.isArray(source)) return []
-  return source
-    .map((value) => (Array.isArray(value) ? Number(value[1]) : Number(value)))
-    .filter(Number.isFinite)
-}
-
-function points(source: unknown): string {
-  const samples = values(source)
-  if (!samples.length) return ''
-  const width = Math.max(100, chartWidth.value)
-  const height = chartHeight.value
-  const padding = 6
-  const min = Math.min(...samples)
-  const max = Math.max(...samples)
-  const range = max - min || 1
-  return samples
-    .map((value, index) => {
-      const x = padding + (index / Math.max(1, samples.length - 1)) * (width - padding * 2)
-      const y = height - padding - ((value - min) / range) * (height - padding * 2)
-      return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
-    .join(' ')
-}
-
-const bitrate = computed(() => points(data.value.bitrate))
-const signal = computed(() => points(data.value.signal_level))
-const loss = computed(() => points(data.value.packet_loss))
-const viewBox = computed(() => `0 0 ${Math.max(100, chartWidth.value)} ${chartHeight.value}`)
 
 async function load() {
   try {
@@ -121,21 +92,33 @@ onUnmounted(() => {
     <div class="metric-grid">
       <article>
         <strong>ビットレート</strong>
-        <svg :viewBox="viewBox" role="img" aria-label="ビットレート推移">
-          <polyline :points="bitrate" />
-        </svg>
+        <MetricSparkline
+          :source="data.bitrate"
+          unit="Mbps"
+          label="ビットレート推移"
+          :width="chartWidth"
+          :height="chartHeight"
+        />
       </article>
       <article>
         <strong>信号レベル</strong>
-        <svg :viewBox="viewBox" role="img" aria-label="信号レベル推移">
-          <polyline :points="signal" />
-        </svg>
+        <MetricSparkline
+          :source="data.signal_level"
+          unit="dB"
+          label="信号レベル推移"
+          :width="chartWidth"
+          :height="chartHeight"
+        />
       </article>
       <article>
         <strong>パケット損失</strong>
-        <svg :viewBox="viewBox" role="img" aria-label="パケット損失推移">
-          <polyline :points="loss" />
-        </svg>
+        <MetricSparkline
+          :source="data.packet_loss"
+          unit="packets"
+          label="パケット損失推移"
+          :width="chartWidth"
+          :height="chartHeight"
+        />
       </article>
     </div>
     <section class="quality-panel">

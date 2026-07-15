@@ -37,7 +37,6 @@ const { visibleKeys, setColumn, resetColumns } = useColumnVisibility(
   () => allColumns.value,
   defaultKeys,
 )
-const columns = computed(() => visibleKeys.value)
 const sorted = computed(() =>
   !sortKey.value
     ? props.rows
@@ -112,7 +111,7 @@ function marker(col: string) {
     <table v-if="rows.length" class="data-table">
       <thead>
         <tr>
-          <th v-for="col in columns" :key="col">
+          <th v-for="col in visibleKeys" :key="col">
             <button class="sort-button" @click="sort(col)">
               <span v-text="label(col)" /><span aria-hidden="true" v-text="marker(col)" />
             </button>
@@ -122,7 +121,7 @@ function marker(col: string) {
       <tbody>
         <tr v-for="(row, index) in sorted" :key="String(row.id ?? row.session_id ?? index)">
           <td
-            v-for="col in columns"
+            v-for="col in visibleKeys"
             :key="col"
             :data-label="label(col)"
             v-text="display(row[col], col)"
