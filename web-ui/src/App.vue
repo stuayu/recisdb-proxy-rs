@@ -132,6 +132,8 @@ onUnmounted(() => {
           title="スキャン履歴"
           endpoint="/scan-history"
           :keys="['history', 'scans', 'data']"
+          :columns="['scan_time', 'bon_driver_id', 'channel_count', 'success', 'error_message']"
+          storage-key="columns:scan-history"
         />
         <SessionHistoryView v-else-if="active === 'session-history'" />
         <AlertsView v-else-if="active === 'alerts'" />

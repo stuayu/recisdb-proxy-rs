@@ -6,6 +6,8 @@ const props = defineProps<{
   title: string
   endpoint: string
   keys: string[]
+  columns?: string[]
+  storageKey?: string
   description?: string
 }>()
 const rows = ref<JsonRecord[]>([])
@@ -34,6 +36,6 @@ onMounted(load)
       <button class="button" :disabled="loading" @click="load">更新</button>
     </div>
     <p v-if="error" class="notice error" role="alert" v-text="error" />
-    <DataTable :rows="rows" />
+    <DataTable :rows="rows" :columns="columns" :storage-key="storageKey" />
   </section>
 </template>

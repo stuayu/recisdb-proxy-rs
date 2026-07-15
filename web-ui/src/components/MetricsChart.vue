@@ -1,6 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, type JsonRecord } from '../api'
+import { useColumnVisibility, type ColumnDef } from '../columns'
+import ColumnPicker from './ColumnPicker.vue'
+
+const lossPidColumns: ColumnDef[] = [
+  { key: 'pid', label: 'PID' },
+  { key: 'packets', label: 'パケット数' },
+  { key: 'errors', label: 'CCエラー数' },
+]
+const {
+  visibleKeys: lossPidVisibleKeys,
+  isVisible: lossPidIsVisible,
+  setColumn: lossPidSetColumn,
+  resetColumns: lossPidResetColumns,
+} = useColumnVisibility('columns:metrics-loss-pids', () => lossPidColumns)
 
 const props = defineProps<{ sessionId: string | number }>()
 const data = ref<JsonRecord>({})
@@ -141,20 +155,38 @@ onUnmounted(() => {
         </article>
       </div>
       <h4>ロス上位 PID（CC error）</h4>
+      <ColumnPicker
+        :columns="lossPidColumns"
+        :visible-keys="lossPidVisibleKeys"
+        @set="lossPidSetColumn"
+        @reset="lossPidResetColumns"
+      />
       <div class="table-region">
         <table v-if="topLossPids.length" class="data-table compact">
           <thead>
             <tr>
-              <th>PID</th>
-              <th>パケット数</th>
-              <th>CCエラー数</th>
+              <th v-if="lossPidIsVisible('pid')">PID</th>
+              <th v-if="lossPidIsVisible('packets')">パケット数</th>
+              <th v-if="lossPidIsVisible('errors')">CCエラー数</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="(pid, index) in topLossPids" :key="index">
-              <td data-label="PID" v-text="String(pidValue(pid, 'pid', 0) ?? '—')" />
-              <td data-label="パケット数" v-text="String(pidValue(pid, 'packets', 1) ?? '—')" />
-              <td data-label="CCエラー数" v-text="String(pidValue(pid, 'errors', 2) ?? '—')" />
+              <td
+                v-if="lossPidIsVisible('pid')"
+                data-label="PID"
+                v-text="String(pidValue(pid, 'pid', 0) ?? '—')"
+              />
+              <td
+                v-if="lossPidIsVisible('packets')"
+                data-label="パケット数"
+                v-text="String(pidValue(pid, 'packets', 1) ?? '—')"
+              />
+              <td
+                v-if="lossPidIsVisible('errors')"
+                data-label="CCエラー数"
+                v-text="String(pidValue(pid, 'errors', 2) ?? '—')"
+              />
             </tr>
           </tbody>
         </table>

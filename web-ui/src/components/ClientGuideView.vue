@@ -1,7 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, downloadApi, unwrapArray, type JsonRecord } from '../api'
 import DataTable from './DataTable.vue'
+import { useColumnVisibility, type ColumnDef } from '../columns'
+import ColumnPicker from './ColumnPicker.vue'
+
+const targetColumns: ColumnDef[] = [
+  { key: 'name', label: '名前' },
+  { key: 'type', label: '種別' },
+  { key: 'enabled_channels', label: '有効チャンネル' },
+  { key: 'note', label: '備考' },
+]
+const {
+  visibleKeys: targetVisibleKeys,
+  isVisible: targetIsVisible,
+  setColumn: targetSetColumn,
+  resetColumns: targetResetColumns,
+} = useColumnVisibility('columns:client-guide-targets', () => targetColumns)
 
 const targets = ref<JsonRecord[]>([])
 const selected = ref('')
@@ -90,7 +105,22 @@ function physical(channel: JsonRecord) {
       .join('\n') || '—'
   )
 }
-onMounted(load)
+const previewOpen = ref(false)
+function openPreview() {
+  if (!selected.value) {
+    error.value = '先に接続先チューナーを選択してください。'
+    return
+  }
+  previewOpen.value = true
+}
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') previewOpen.value = false
+}
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  void load()
+})
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 <template>
   <section class="view">
@@ -104,15 +134,21 @@ onMounted(load)
     <p v-if="message" class="notice success" v-text="message" />
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <h3>STEP 1. 接続先チューナーを選択</h3>
+    <ColumnPicker
+      :columns="targetColumns"
+      :visible-keys="targetVisibleKeys"
+      @set="targetSetColumn"
+      @reset="targetResetColumns"
+    />
     <div class="table-region">
       <table v-if="targets.length" class="data-table">
         <thead>
           <tr>
             <th />
-            <th>名前</th>
-            <th>種別</th>
-            <th>有効チャンネル</th>
-            <th>備考</th>
+            <th v-if="targetIsVisible('name')">名前</th>
+            <th v-if="targetIsVisible('type')">種別</th>
+            <th v-if="targetIsVisible('enabled_channels')">有効チャンネル</th>
+            <th v-if="targetIsVisible('note')">備考</th>
           </tr>
         </thead>
         <tbody>
@@ -130,12 +166,24 @@ onMounted(load)
                 @change="loadView"
               />
             </td>
-            <td data-label="名前">
+            <td v-if="targetIsVisible('name')" data-label="名前">
               <code v-text="String(target.name ?? target.tuner ?? '—')" />
             </td>
-            <td data-label="種別" v-text="String(target.type ?? 'チューナー単体')" />
-            <td data-label="有効チャンネル" v-text="String(target.enabled_channels ?? 0)" />
-            <td data-label="備考" v-text="String(target.display_name ?? target.note ?? '—')" />
+            <td
+              v-if="targetIsVisible('type')"
+              data-label="種別"
+              v-text="String(target.type ?? 'チューナー単体')"
+            />
+            <td
+              v-if="targetIsVisible('enabled_channels')"
+              data-label="有効チャンネル"
+              v-text="String(target.enabled_channels ?? 0)"
+            />
+            <td
+              v-if="targetIsVisible('note')"
+              data-label="備考"
+              v-text="String(target.display_name ?? target.note ?? '—')"
+            />
           </tr>
         </tbody>
       </table>
@@ -157,27 +205,47 @@ onMounted(load)
       </button>
     </div>
     <h3>STEP 4. クライアントに表示されるチャンネル</h3>
-    <p
-      v-if="selectedTarget"
-      class="muted"
-      v-text="`接続先: ${String(selectedTarget.name ?? selectedTarget.tuner)}`"
-    />
-    <template v-for="space in spaces" :key="String(space.index)">
-      <h4 v-text="`チューニング空間 ${String(space.index ?? '')}: ${String(space.name ?? '')}`" />
-      <DataTable
-        :rows="
-          rowsFor(space).map((channel) => ({
-            index: channel.index,
-            name: channel.name,
-            physical: physical(channel),
-          }))
-        "
-        :columns="['index', 'name', 'physical']"
-        empty="有効なチャンネルはありません"
-      />
-    </template>
-    <p v-if="selected && !spaces.length" class="empty-state">
-      このチューナーには有効なチャンネルがありません。
-    </p>
+    <p class="muted">選択中のチューナーでクライアントに列挙されるチャンネルを確認できます。</p>
+    <button class="button secondary" @click="openPreview">チャンネルプレビューを表示</button>
+    <div v-if="previewOpen" class="dialog-backdrop" @click.self="previewOpen = false">
+      <section
+        class="dialog preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="channel-preview-title"
+      >
+        <div class="view-heading">
+          <div>
+            <h2 id="channel-preview-title">チャンネルプレビュー</h2>
+            <p
+              v-if="selectedTarget"
+              class="muted"
+              v-text="`接続先: ${String(selectedTarget.name ?? selectedTarget.tuner)}`"
+            />
+          </div>
+          <button class="button secondary" @click="previewOpen = false">閉じる</button>
+        </div>
+        <template v-for="space in spaces" :key="String(space.index)">
+          <h4
+            v-text="`チューニング空間 ${String(space.index ?? '')}: ${String(space.name ?? '')}`"
+          />
+          <DataTable
+            :rows="
+              rowsFor(space).map((channel) => ({
+                index: channel.index,
+                name: channel.name,
+                physical: physical(channel),
+              }))
+            "
+            :columns="['index', 'name', 'physical']"
+            storage-key="columns:client-guide-preview"
+            empty="有効なチャンネルはありません"
+          />
+        </template>
+        <p v-if="!spaces.length" class="empty-state">
+          このチューナーには有効なチャンネルがありません。
+        </p>
+      </section>
+    </div>
   </section>
 </template>

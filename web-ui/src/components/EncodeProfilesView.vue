@@ -1,6 +1,24 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
+import { useColumnVisibility, type ColumnDef } from '../columns'
+import ColumnPicker from './ColumnPicker.vue'
+
+const profileColumns: ColumnDef[] = [
+  { key: 'is_enabled', label: '有効' },
+  { key: 'name', label: '名前' },
+  { key: 'purpose', label: '用途' },
+  { key: 'codec', label: 'コーデック' },
+  { key: 'container', label: 'コンテナ' },
+  { key: 'target_bitrate', label: 'ビットレート' },
+  { key: 'extra_args', label: '追加引数' },
+]
+const {
+  visibleKeys: profileVisibleKeys,
+  isVisible: profileIsVisible,
+  setColumn: profileSetColumn,
+  resetColumns: profileResetColumns,
+} = useColumnVisibility('columns:encode-profiles', () => profileColumns)
 
 const profiles = ref<JsonRecord[]>([])
 const error = ref('')
@@ -120,33 +138,56 @@ onMounted(load)
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <div class="split">
       <div class="table-region">
+        <ColumnPicker
+          :columns="profileColumns"
+          :visible-keys="profileVisibleKeys"
+          @set="profileSetColumn"
+          @reset="profileResetColumns"
+        />
         <table v-if="profiles.length" class="data-table">
           <thead>
             <tr>
-              <th>有効</th>
-              <th>名前</th>
-              <th>用途</th>
-              <th>コーデック</th>
-              <th>コンテナ</th>
-              <th>ビットレート</th>
-              <th>追加引数</th>
+              <th v-if="profileIsVisible('is_enabled')">有効</th>
+              <th v-if="profileIsVisible('name')">名前</th>
+              <th v-if="profileIsVisible('purpose')">用途</th>
+              <th v-if="profileIsVisible('codec')">コーデック</th>
+              <th v-if="profileIsVisible('container')">コンテナ</th>
+              <th v-if="profileIsVisible('target_bitrate')">ビットレート</th>
+              <th v-if="profileIsVisible('extra_args')">追加引数</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="profile in profiles" :key="String(profile.id)">
-              <td data-label="有効">
+              <td v-if="profileIsVisible('is_enabled')" data-label="有効">
                 <input
                   :checked="Boolean(profile.is_enabled)"
                   type="checkbox"
                   @change="toggle(profile, $event)"
                 />
               </td>
-              <td data-label="名前" v-text="String(profile.name ?? '—')" />
-              <td data-label="用途" v-text="String(profile.purpose ?? '—')" />
-              <td data-label="コーデック" v-text="String(profile.codec ?? '—')" />
-              <td data-label="コンテナ" v-text="String(profile.container ?? 'mpegts')" />
               <td
+                v-if="profileIsVisible('name')"
+                data-label="名前"
+                v-text="String(profile.name ?? '—')"
+              />
+              <td
+                v-if="profileIsVisible('purpose')"
+                data-label="用途"
+                v-text="String(profile.purpose ?? '—')"
+              />
+              <td
+                v-if="profileIsVisible('codec')"
+                data-label="コーデック"
+                v-text="String(profile.codec ?? '—')"
+              />
+              <td
+                v-if="profileIsVisible('container')"
+                data-label="コンテナ"
+                v-text="String(profile.container ?? 'mpegts')"
+              />
+              <td
+                v-if="profileIsVisible('target_bitrate')"
                 data-label="ビットレート"
                 v-text="
                   profile.target_bitrate == null
@@ -154,7 +195,11 @@ onMounted(load)
                     : `${Number(profile.target_bitrate) / 1000} kbps`
                 "
               />
-              <td data-label="追加引数" v-text="String(profile.extra_args ?? '—')" />
+              <td
+                v-if="profileIsVisible('extra_args')"
+                data-label="追加引数"
+                v-text="String(profile.extra_args ?? '—')"
+              />
               <td data-label="操作">
                 <div class="actions">
                   <button class="button small secondary" @click="edit(profile)">編集</button

@@ -357,6 +357,12 @@ h3 {
   margin: 12px 0;
 }
 
+.dialog.preview-dialog {
+  width: min(920px, 100%);
+  max-height: 90dvh;
+  overflow: auto;
+}
+
 .dialog .actions {
   justify-content: flex-end;
 }

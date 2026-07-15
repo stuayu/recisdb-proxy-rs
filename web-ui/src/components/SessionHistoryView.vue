@@ -48,6 +48,26 @@ onMounted(load)
       </div>
     </form>
     <p v-if="error" class="notice error" role="alert" v-text="error" />
-    <DataTable :rows="rows" empty="該当するセッション履歴はありません" />
+    <DataTable
+      :rows="rows"
+      storage-key="columns:session-history"
+      :columns="[
+        'started_at',
+        'ended_at',
+        'duration_secs',
+        'client_address',
+        'channel_name',
+        'tuner_path',
+        'packets_sent',
+        'packets_dropped',
+        'packets_scrambled',
+        'packets_error',
+        'bytes_sent',
+        'average_bitrate_mbps',
+        'average_signal_level',
+        'disconnect_reason',
+      ]"
+      empty="該当するセッション履歴はありません"
+    />
   </section>
 </template>

@@ -1,6 +1,31 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
+import { useColumnVisibility, type ColumnDef } from '../columns'
+import ColumnPicker from './ColumnPicker.vue'
+const rankingColumns: ColumnDef[] = [
+  { key: 'driver', label: 'BonDriver' },
+  { key: 'quality_score', label: '品質スコア' },
+  { key: 'recent_drop_rate', label: '直近Drop率' },
+  { key: 'total_sessions', label: '総セッション' },
+]
+const {
+  visibleKeys: rankingVisibleKeys,
+  isVisible: rankingIsVisible,
+  setColumn: rankingSetColumn,
+  resetColumns: rankingResetColumns,
+} = useColumnVisibility('columns:bondriver-ranking', () => rankingColumns)
+const listColumns: ColumnDef[] = [
+  { key: 'name', label: '名前' },
+  { key: 'group', label: 'グループ' },
+  { key: 'max_instances', label: '最大数' },
+]
+const {
+  visibleKeys: listVisibleKeys,
+  isVisible: listIsVisible,
+  setColumn: listSetColumn,
+  resetColumns: listResetColumns,
+} = useColumnVisibility('columns:bondriver-list', () => listColumns)
 const rows = ref<JsonRecord[]>([])
 const ranking = ref<JsonRecord[]>([])
 const error = ref('')
@@ -85,30 +110,46 @@ onMounted(load)
     <p v-if="error" class="notice error" v-text="error" />
     <section class="quality-panel">
       <h3>品質ランキング</h3>
+      <ColumnPicker
+        :columns="rankingColumns"
+        :visible-keys="rankingVisibleKeys"
+        @set="rankingSetColumn"
+        @reset="rankingResetColumns"
+      />
       <div class="table-region">
         <table v-if="ranking.length" class="data-table compact">
           <thead>
             <tr>
-              <th>BonDriver</th>
-              <th>品質スコア</th>
-              <th>直近Drop率</th>
-              <th>総セッション</th>
+              <th v-if="rankingIsVisible('driver')">BonDriver</th>
+              <th v-if="rankingIsVisible('quality_score')">品質スコア</th>
+              <th v-if="rankingIsVisible('recent_drop_rate')">直近Drop率</th>
+              <th v-if="rankingIsVisible('total_sessions')">総セッション</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="item in ranking" :key="String(rankedDriver(item).id ?? item.id)">
               <td
+                v-if="rankingIsVisible('driver')"
                 data-label="BonDriver"
                 v-text="
                   String(rankedDriver(item).driver_name ?? rankedDriver(item).dll_path ?? '—')
                 "
               />
-              <td data-label="品質スコア" v-text="String(item.quality_score ?? '—')" />
               <td
+                v-if="rankingIsVisible('quality_score')"
+                data-label="品質スコア"
+                v-text="String(item.quality_score ?? '—')"
+              />
+              <td
+                v-if="rankingIsVisible('recent_drop_rate')"
                 data-label="直近Drop率"
                 v-text="item.recent_drop_rate == null ? '—' : `${String(item.recent_drop_rate)}%`"
               />
-              <td data-label="総セッション" v-text="String(item.total_sessions ?? 0)" />
+              <td
+                v-if="rankingIsVisible('total_sessions')"
+                data-label="総セッション"
+                v-text="String(item.total_sessions ?? 0)"
+              />
             </tr>
           </tbody>
         </table>
@@ -117,20 +158,38 @@ onMounted(load)
     </section>
     <div class="split">
       <div class="table-region">
+        <ColumnPicker
+          :columns="listColumns"
+          :visible-keys="listVisibleKeys"
+          @set="listSetColumn"
+          @reset="listResetColumns"
+        />
         <table class="data-table compact">
           <thead>
             <tr>
-              <th>名前</th>
-              <th>グループ</th>
-              <th>最大数</th>
+              <th v-if="listIsVisible('name')">名前</th>
+              <th v-if="listIsVisible('group')">グループ</th>
+              <th v-if="listIsVisible('max_instances')">最大数</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in rows" :key="String(row.id)">
-              <td data-label="名前" v-text="String(row.driver_name ?? row.dll_path ?? '—')" />
-              <td data-label="グループ" v-text="String(row.group_name ?? '—')" />
-              <td data-label="最大数" v-text="String(row.max_instances ?? 1)" />
+              <td
+                v-if="listIsVisible('name')"
+                data-label="名前"
+                v-text="String(row.driver_name ?? row.dll_path ?? '—')"
+              />
+              <td
+                v-if="listIsVisible('group')"
+                data-label="グループ"
+                v-text="String(row.group_name ?? '—')"
+              />
+              <td
+                v-if="listIsVisible('max_instances')"
+                data-label="最大数"
+                v-text="String(row.max_instances ?? 1)"
+              />
               <td data-label="操作">
                 <div class="actions">
                   <button class="button small secondary" @click="edit(row)">編集</button
