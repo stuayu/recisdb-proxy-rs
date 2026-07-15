@@ -29,6 +29,7 @@ pub struct ServerStats {
     pub active_tuners: usize,
     pub uptime_seconds: u64,
     pub total_sessions_db: u64,
+    pub total_channels: u64,
 }
 
 /// Session history query.
@@ -112,18 +113,22 @@ pub async fn get_stats(
         }
     }
 
-    let total_sessions_db = {
+    let (total_sessions_db, total_channels) = {
         let db = web_state.database.lock().await;
-        db.get_total_session_count().unwrap_or(0)
+        (
+            db.get_total_session_count().unwrap_or(0),
+            db.get_total_channel_count().unwrap_or(0),
+        )
     };
 
     let stats = ServerStats {
-        total_sessions: active_sessions as u64,
+        total_sessions: total_sessions_db,
         active_sessions: active_sessions as u64,
         total_tuners,
         active_tuners,
         uptime_seconds: 0,
         total_sessions_db,
+        total_channels,
     };
 
     Json(json!({

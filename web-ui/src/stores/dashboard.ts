@@ -20,7 +20,9 @@ export const useDashboardStore = defineStore('dashboard', {
           api<JsonRecord>('/stats'),
           api<unknown>('/clients'),
         ])
-        this.stats = stats
+        // /stats は { success, stats: {...} } の入れ子で返る
+        const inner = stats.stats
+        this.stats = inner && typeof inner === 'object' ? (inner as JsonRecord) : stats
         this.clients = unwrapArray(clients, ['clients', 'sessions', 'data'])
         this.error = ''
         this.lastUpdated = Date.now()
