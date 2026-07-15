@@ -98,7 +98,14 @@ onMounted(load)
           ><span>しきい値</span
           ><input v-model.number="form.threshold" type="number" step="0.1" /></label
         ><label class="field"
+          ><span>重要度</span
+          ><select v-model="form.severity"><option value="info">情報</option><option value="warning">警告</option><option value="critical">重大</option></select></label
+        ><label class="field"
           ><span>Webhook URL</span><input v-model="form.webhook_url" type="url" /></label
+        ><label class="field"
+          ><span>Webhook形式</span
+          ><select v-model="form.webhook_format"><option value="json">JSON</option><option value="discord">Discord</option><option value="slack">Slack</option></select></label
+        ><label class="check"><input v-model="form.is_enabled" type="checkbox" />ルールを有効にする</label
         ><button class="button" type="submit">追加</button>
       </form>
     </div>

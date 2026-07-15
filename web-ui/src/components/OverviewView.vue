@@ -5,6 +5,84 @@ import { useDashboardStore } from '../stores/dashboard'
 import MetricsChart from './MetricsChart.vue'
 const store = useDashboardStore()
 const selectedSession = ref<string | number>('')
+
+type ClientColumn = { key: string; label: string }
+const clientColumns: ClientColumn[] = [
+  { key: 'session_id', label: 'セッションID' },
+  { key: 'address', label: 'クライアント' },
+  { key: 'host', label: 'ホスト名' },
+  { key: 'status', label: '状態' },
+  { key: 'tuner_path', label: '選択チューナー' },
+  { key: 'channel', label: 'チャンネル' },
+  { key: 'signal', label: '信号' },
+  { key: 'packets_sent', label: '送信' },
+  { key: 'packets_dropped', label: 'Drop' },
+  { key: 'packets_scrambled', label: 'Scramble' },
+  { key: 'packets_error', label: 'Error' },
+  { key: 'bitrate', label: 'ビットレート' },
+  { key: 'stream_class', label: 'クラス' },
+  { key: 'prefilling', label: 'プリフィル' },
+]
+const clientColumnsStorageKey = 'clientColumns'
+function initialClientKeys(): string[] {
+  const saved = localStorage.getItem(clientColumnsStorageKey)
+  if (saved) {
+    try {
+      const parsed: unknown = JSON.parse(saved)
+      if (Array.isArray(parsed)) {
+        const valid = parsed.filter(
+          (key): key is string =>
+            typeof key === 'string' && clientColumns.some((column) => column.key === key),
+        )
+        if (valid.length) return valid
+      }
+    } catch {
+      localStorage.removeItem(clientColumnsStorageKey)
+    }
+  }
+  return clientColumns.map((column) => column.key)
+}
+const visibleClientKeys = ref<string[]>(initialClientKeys())
+const visibleClientColumns = computed(() =>
+  clientColumns.filter((column) => visibleClientKeys.value.includes(column.key)),
+)
+function setClientColumn(key: string, checked: boolean) {
+  const next = new Set(visibleClientKeys.value)
+  if (checked) next.add(key)
+  else next.delete(key)
+  visibleClientKeys.value = clientColumns
+    .map((column) => column.key)
+    .filter((columnKey) => next.has(columnKey))
+  localStorage.setItem(clientColumnsStorageKey, JSON.stringify(visibleClientKeys.value))
+}
+function resetClientColumns() {
+  visibleClientKeys.value = clientColumns.map((column) => column.key)
+  localStorage.removeItem(clientColumnsStorageKey)
+}
+function cellText(row: JsonRecord, key: string): string {
+  switch (key) {
+    case 'status':
+      return row.is_streaming ? '配信中' : '接続中'
+    case 'channel':
+      return String(row.channel_name ?? row.channel_info ?? '—')
+    case 'signal':
+      return row.signal_level == null ? '—' : `${String(row.signal_level)} dB`
+    case 'packets_sent':
+    case 'packets_dropped':
+    case 'packets_scrambled':
+    case 'packets_error':
+      return String(row[key] ?? 0)
+    case 'bitrate':
+      return row.current_bitrate_mbps == null ? '—' : `${String(row.current_bitrate_mbps)} Mbps`
+    case 'prefilling':
+      return row.prefilling ? '中' : '—'
+    default: {
+      const value = row[key]
+      return value == null || value === '' ? '—' : String(value)
+    }
+  }
+}
+
 const cards = computed(() => [
   ['アクティブチューナー', store.stats.active_tuners ?? '—'],
   ['接続クライアント', store.stats.active_sessions ?? store.clients.length],
@@ -52,13 +130,29 @@ onUnmounted(() => store.stop())
       </article>
     </div>
     <h3>接続中のクライアント</h3>
+    <details class="column-picker">
+      <summary><span v-text="`表示列を調整（${visibleClientColumns.length}列）`"></span></summary>
+      <div class="column-options">
+        <label v-for="column in clientColumns" :key="column.key" class="check compact-check">
+          <input
+            type="checkbox"
+            :checked="visibleClientKeys.includes(column.key)"
+            @change="setClientColumn(column.key, ($event.target as HTMLInputElement).checked)"
+          />
+          <span v-text="column.label"></span>
+        </label>
+      </div>
+      <button class="button small secondary" @click="resetClientColumns">既定に戻す</button>
+    </details>
     <div class="table-region">
       <table v-if="store.clients.length" class="data-table">
         <thead>
           <tr>
-            <th>クライアント</th>
-            <th>チャンネル</th>
-            <th>信号</th>
+            <th
+              v-for="column in visibleClientColumns"
+              :key="column.key"
+              v-text="column.label"
+            ></th>
             <th>優先度</th>
             <th>排他</th>
             <th>操作</th>
@@ -67,13 +161,10 @@ onUnmounted(() => store.stop())
         <tbody>
           <tr v-for="row in store.clients" :key="String(row.session_id)">
             <td
-              data-label="クライアント"
-              v-text="String(row.host ?? row.address ?? row.session_id)"
-            ></td>
-            <td data-label="チャンネル" v-text="String(row.channel_name ?? '—')"></td>
-            <td
-              data-label="信号"
-              v-text="row.signal_level == null ? '—' : `${String(row.signal_level)} dB`"
+              v-for="column in visibleClientColumns"
+              :key="column.key"
+              :data-label="column.label"
+              v-text="cellText(row, column.key)"
             ></td>
             <td data-label="優先度">
               <select :value="row.override_priority ?? ''" @change="setPriority(row, $event)">

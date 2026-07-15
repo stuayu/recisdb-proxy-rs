@@ -29,8 +29,24 @@ function sort(key: string) {
     descending.value = false
   }
 }
-function display(value: unknown) {
+const timeKeyPattern = /(_at$|_time$|_seen$|^start(ed)?(_at)?$|^end(ed)?(_at)?$|timestamp)/i
+function display(value: unknown, col?: string) {
   if (value == null || value === '') return '—'
+  if (typeof value === 'number' && col) {
+    // Epoch seconds between 2001-09 and 5138-11: format as local datetime.
+    if (timeKeyPattern.test(col) && value > 1_000_000_000 && value < 100_000_000_000) {
+      return new Date(value * 1000).toLocaleString('ja-JP')
+    }
+    if (/duration|_secs$|_seconds$/i.test(col)) {
+      const total = Math.max(0, Math.floor(value))
+      const hours = Math.floor(total / 3600)
+      const minutes = Math.floor((total % 3600) / 60)
+      const seconds = total % 60
+      if (hours) return `${hours}時間${minutes}分${seconds}秒`
+      if (minutes) return `${minutes}分${seconds}秒`
+      return `${seconds}秒`
+    }
+  }
   return typeof value === 'object' ? JSON.stringify(value) : String(value)
 }
 function marker(col: string) {
@@ -51,7 +67,7 @@ function marker(col: string) {
       </thead>
       <tbody>
         <tr v-for="(row, index) in sorted" :key="String(row.id ?? row.session_id ?? index)">
-          <td v-for="col in columns" :key="col" :data-label="col" v-text="display(row[col])"></td>
+          <td v-for="col in columns" :key="col" :data-label="col" v-text="display(row[col], col)"></td>
         </tr>
       </tbody>
     </table>

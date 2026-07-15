@@ -7,7 +7,9 @@ import ClientGuideView from './components/ClientGuideView.vue'
 import SettingsView from './components/SettingsView.vue'
 import AlertsView from './components/AlertsView.vue'
 import ResourceView from './components/ResourceView.vue'
-import { setApiToken } from './api'
+import SessionHistoryView from './components/SessionHistoryView.vue'
+import EncodeProfilesView from './components/EncodeProfilesView.vue'
+import { api, setApiToken } from './api'
 
 const tabs = [
   { id: 'overview', label: '概要', icon: '◫' },
@@ -18,6 +20,7 @@ const tabs = [
   { id: 'session-history', label: 'セッション履歴', icon: '◷' },
   { id: 'alerts', label: 'アラート', icon: '!' },
   { id: 'settings', label: '設定', icon: '◉' },
+  { id: 'encode-profiles', label: 'エンコード', icon: '▶' },
 ]
 
 const validTabs = new Set(tabs.map((tab) => tab.id))
@@ -26,6 +29,8 @@ const active = ref(validTabs.has(hashTab) ? hashTab : 'overview')
 const dark = ref(localStorage.getItem('dashboardTheme') === 'dark')
 const token = ref(localStorage.getItem('recisdbApiToken') || '')
 const tokenOpen = ref(false)
+const connection = ref<'checking' | 'connected' | 'error'>('checking')
+let connectionTimer = 0
 
 function select(id: string) {
   active.value = id
@@ -48,6 +53,14 @@ function syncHash() {
   const id = location.hash.slice(1)
   active.value = validTabs.has(id) ? id : 'overview'
 }
+async function checkConnection() {
+  try {
+    await api('/stats')
+    connection.value = 'connected'
+  } catch {
+    connection.value = 'error'
+  }
+}
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') tokenOpen.value = false
@@ -56,11 +69,14 @@ function onKeydown(event: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener('hashchange', syncHash)
   window.addEventListener('keydown', onKeydown)
+  void checkConnection()
+  connectionTimer = window.setInterval(checkConnection, 5000)
 })
 
 onUnmounted(() => {
   window.removeEventListener('hashchange', syncHash)
   window.removeEventListener('keydown', onKeydown)
+  window.clearInterval(connectionTimer)
 })
 </script>
 
@@ -71,6 +87,7 @@ onUnmounted(() => {
       <div>
         <h1>recisdb-proxy</h1>
         <p>TVプロキシサーバー 管理コンソール</p>
+        <p class="connection-status" :class="connection" v-text="connection === 'connected' ? '● サーバー接続中' : connection === 'error' ? '● 接続を確認できません' : '● 接続確認中'"> </p>
       </div>
       <div class="top-actions">
         <button class="icon-button" aria-label="APIトークン" @click="tokenOpen = true">鍵</button>
@@ -106,14 +123,10 @@ onUnmounted(() => {
           endpoint="/scan-history"
           :keys="['history', 'scans', 'data']"
         ></ResourceView>
-        <ResourceView
-          v-else-if="active === 'session-history'"
-          title="セッション履歴"
-          endpoint="/session-history"
-          :keys="['history', 'sessions', 'data']"
-        ></ResourceView>
+        <SessionHistoryView v-else-if="active === 'session-history'"></SessionHistoryView>
         <AlertsView v-else-if="active === 'alerts'"></AlertsView>
-        <SettingsView v-else></SettingsView>
+        <SettingsView v-else-if="active === 'settings'"></SettingsView>
+        <EncodeProfilesView v-else></EncodeProfilesView>
       </main>
     </div>
     <div v-if="tokenOpen" class="dialog-backdrop" @click.self="tokenOpen = false">

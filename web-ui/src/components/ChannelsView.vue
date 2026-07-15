@@ -50,6 +50,10 @@ const bulkEnabled = ref('')
 const bulkDelete = ref(false)
 const sortKey = ref('channel_name')
 const descending = ref(false)
+const sortKey2 = ref('')
+const descending2 = ref(false)
+const sortKey3 = ref('')
+const descending3 = ref(false)
 const compactViewport = ref(false)
 const customizedColumns = ref(false)
 let media: MediaQueryList | null = null
@@ -99,15 +103,23 @@ const filtered = computed(() => {
 })
 
 const sorted = computed(() => {
-  const key = sortKey.value
+  const rules = [
+    { key: sortKey.value, desc: descending.value },
+    { key: sortKey2.value, desc: descending2.value },
+    { key: sortKey3.value, desc: descending3.value },
+  ].filter((rule) => rule.key)
+  if (!rules.length) return filtered.value
   return [...filtered.value].sort((left, right) => {
-    const a = left[key]
-    const b = right[key]
-    const numeric = typeof a === 'number' && typeof b === 'number'
-    const compared = numeric
-      ? a - b
-      : String(a ?? '').localeCompare(String(b ?? ''), 'ja', { numeric: true })
-    return descending.value ? -compared : compared
+    for (const rule of rules) {
+      const a = left[rule.key]
+      const b = right[rule.key]
+      const numeric = typeof a === 'number' && typeof b === 'number'
+      const compared = numeric
+        ? a - b
+        : String(a ?? '').localeCompare(String(b ?? ''), 'ja', { numeric: true })
+      if (compared !== 0) return rule.desc ? -compared : compared
+    }
+    return 0
   })
 })
 
@@ -337,13 +349,14 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
         />
         <button class="button secondary" @click="importFile?.click()">CSV読込</button>
         <button class="button secondary" @click="exportCsv">CSV出力</button>
-        <button class="button secondary" @click="editMode = !editMode">
-          editMode ? '編集を閉じる' : '編集モード'
-        </button>
+        <button
+          class="button secondary"
+          @click="editMode = !editMode"
+          v-text="editMode ? '編集を閉じる' : '編集モード'"
+        ></button>
         <button
           class="button"
-          @click="
-            editMode = true; reset()"
+          @click="editMode = true; reset()"
         >
           新規
         </button>
@@ -356,7 +369,7 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
         <input v-model="query" type="search" placeholder="名称、NID、SID、地域など" />
       </label>
       <label class="mobile-sort">
-        <span>並び替え</span>
+        <span>並び替え（第1キー）</span>
         <select v-model="sortKey">
           <option
             v-for="column in columns"
@@ -369,6 +382,42 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
           class="button small secondary"
           @click="descending = !descending"
           v-text="descending ? '降順' : '昇順'"
+        ></button>
+      </label>
+      <label class="mobile-sort">
+        <span>第2キー</span>
+        <select v-model="sortKey2">
+          <option value="">なし</option>
+          <option
+            v-for="column in columns"
+            :key="column.key"
+            :value="column.key"
+            v-text="column.label"
+          ></option>
+        </select>
+        <button
+          class="button small secondary"
+          :disabled="!sortKey2"
+          @click="descending2 = !descending2"
+          v-text="descending2 ? '降順' : '昇順'"
+        ></button>
+      </label>
+      <label class="mobile-sort">
+        <span>第3キー</span>
+        <select v-model="sortKey3">
+          <option value="">なし</option>
+          <option
+            v-for="column in columns"
+            :key="column.key"
+            :value="column.key"
+            v-text="column.label"
+          ></option>
+        </select>
+        <button
+          class="button small secondary"
+          :disabled="!sortKey3"
+          @click="descending3 = !descending3"
+          v-text="descending3 ? '降順' : '昇順'"
         ></button>
       </label>
       <details class="column-picker">

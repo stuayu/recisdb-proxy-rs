@@ -853,3 +853,25 @@ textarea:focus-visible,
     max-width: none;
   }
 }
+
+
+/* Legacy dashboard parity: connection status and detailed quality panels. */
+.connection-status {
+  margin-top: 0.2rem !important;
+  font-size: 0.72rem !important;
+}
+.connection-status.connected { color: #82e3a7; }
+.connection-status.error { color: #ffaaa0; }
+.connection-status.checking { color: #f4d788; }
+.quality-panel {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.quality-panel h3,
+.quality-panel h4 { margin: 0 0 10px; }
+.quality-panel h4:not(:first-child) { margin-top: 18px; }
+.compact-stats { grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); }
+.settings-form { max-width: 780px; }

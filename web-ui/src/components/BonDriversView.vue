@@ -2,6 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
 const rows = ref<JsonRecord[]>([])
+const ranking = ref<JsonRecord[]>([])
 const error = ref('')
 const editing = ref<number | null>(null)
 const form = reactive({
@@ -16,7 +17,12 @@ const form = reactive({
 })
 async function load() {
   try {
-    rows.value = unwrapArray(await api('/bondrivers'), ['bondrivers'])
+    const [drivers, rankingResult] = await Promise.all([
+      api<unknown>('/bondrivers'),
+      api<unknown>('/bondrivers/ranking'),
+    ])
+    rows.value = unwrapArray(drivers, ['bondrivers'])
+    ranking.value = unwrapArray(rankingResult, ['items', 'ranking', 'data'])
     error.value = ''
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -61,6 +67,10 @@ async function scan(id: unknown) {
   await api(`/bondriver/${id}/scan`, { method: 'POST' })
   alert('スキャンを予約しました')
 }
+function rankedDriver(item: JsonRecord): JsonRecord {
+  const value = item.driver
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : {}
+}
 onMounted(load)
 </script>
 <template>
@@ -73,6 +83,14 @@ onMounted(load)
       <button class="button secondary" @click="reset">新規登録</button>
     </div>
     <p v-if="error" class="notice error" v-text="error"></p>
+    <section class="quality-panel">
+      <h3>品質ランキング</h3>
+      <div class="table-region">
+        <table v-if="ranking.length" class="data-table compact"><thead><tr><th>BonDriver</th><th>品質スコア</th><th>直近Drop率</th><th>総セッション</th></tr></thead><tbody>
+          <tr v-for="item in ranking" :key="String(rankedDriver(item).id ?? item.id)"><td data-label="BonDriver" v-text="String(rankedDriver(item).driver_name ?? rankedDriver(item).dll_path ?? '—')"></td><td data-label="品質スコア" v-text="String(item.quality_score ?? '—')"></td><td data-label="直近Drop率" v-text="item.recent_drop_rate == null ? '—' : `${String(item.recent_drop_rate)}%`"></td><td data-label="総セッション" v-text="String(item.total_sessions ?? 0)"></td></tr>
+        </tbody></table><p v-else class="empty-state">品質データはまだありません</p>
+      </div>
+    </section>
     <div class="split">
       <div class="table-region">
         <table class="data-table compact">
@@ -110,6 +128,12 @@ onMounted(load)
           ><input v-model.number="form.max_instances" type="number" min="1" /></label
         ><label class="check"
           ><input v-model="form.auto_scan_enabled" type="checkbox" />自動スキャン</label
+        ><label class="field"
+          ><span>スキャン間隔（時間）</span
+          ><input v-model.number="form.scan_interval_hours" type="number" min="1" max="720" /></label
+        ><label class="field"
+          ><span>スキャン優先度</span
+          ><input v-model.number="form.scan_priority" type="number" min="0" max="100" /></label
         ><label class="check"
           ><input v-model="form.passive_scan_enabled" type="checkbox" />パッシブスキャン</label
         ><button class="button" type="submit">保存</button>
