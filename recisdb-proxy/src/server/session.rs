@@ -1530,12 +1530,18 @@ impl Session {
             }
 
             if tuner.subscriber_count() == 0 {
+                // SetChannelSpace / SetChannel(v1): a same-DLL switch on a
+                // multi-instance DLL is allowed to idle-close instead of a
+                // synchronous stop, so other subscribers on that DLL keep
+                // streaming and the slot can be warm-reused. Only actual
+                // capacity pressure forces a synchronous stop here.
                 cleanup_unused_tuner_after_switch(
                     &self.database,
                     &self.tuner_pool,
                     self.id,
                     tuner,
                     Some(cleanup_path),
+                    false,
                     log_prefix,
                 ).await;
             }
@@ -1652,12 +1658,16 @@ impl Session {
             self.state == SessionState::Streaming,
             log_prefix,
         ).await {
+            // Fallback-driver success is still a SetChannelSpace switch: same
+            // idle-close-over-sync-stop policy as the primary path (see
+            // take_and_cleanup_current_tuner_for_switch).
             cleanup_unused_tuner_after_switch(
                 &self.database,
                 &self.tuner_pool,
                 self.id,
                 old,
                 Some(&tuner_path),
+                false,
                 log_prefix,
             ).await;
         }
@@ -2224,12 +2234,17 @@ impl Session {
             "SelectLogicalChannel:",
         ).await;
         if let Some(old) = cleanup_old {
+            // SelectLogicalChannel: group members are assumed to
+            // hard-exclusive the underlying hardware, so a same-DLL switch
+            // always stops the old reader synchronously, even with spare
+            // capacity (unlike SetChannelSpace's idle-close allowance).
             cleanup_unused_tuner_after_switch(
                 &self.database,
                 &self.tuner_pool,
                 self.id,
                 old,
                 Some(tuner_id),
+                true,
                 "SelectLogicalChannel cleanup:",
             ).await;
         }

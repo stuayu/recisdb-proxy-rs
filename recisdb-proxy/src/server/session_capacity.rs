@@ -93,12 +93,37 @@ pub(super) async fn stop_and_remove_tuner(
     tuner_pool.remove(key).await;
 }
 
+/// Whether the old reader must be stopped synchronously (vs. scheduled for
+/// idle-close) when a session switches away from it.
+///
+/// Two call sites disagree on whether a same-DLL switch alone is reason
+/// enough to force a synchronous stop, so the caller decides via
+/// `force_stop_same_dll`:
+///   - `SetChannelSpace` / `SetChannel` (v1): a same-DLL switch on a
+///     multi-instance DLL is allowed to leave the old reader running so it
+///     can idle-close (warm reuse) — only actual capacity pressure forces a
+///     synchronous stop.
+///   - `SelectLogicalChannel`: group members are assumed to hard-exclusive
+///     the underlying hardware, so a same-DLL switch always stops the old
+///     reader synchronously, regardless of spare capacity.
+/// Capacity pressure (`running >= max`) always forces a synchronous stop
+/// either way — that part is not caller-dependent.
+pub(super) fn should_sync_stop_old_reader(
+    same_dll: bool,
+    force_stop_same_dll: bool,
+    running: i32,
+    max: i32,
+) -> bool {
+    (force_stop_same_dll && same_dll) || should_stop_reader_for_capacity(running, max)
+}
+
 pub(super) async fn cleanup_unused_tuner_after_switch(
     database: &DatabaseHandle,
     tuner_pool: &Arc<TunerPool>,
     session_id: u64,
     tuner: Arc<SharedTuner>,
     replacement_tuner_path: Option<&str>,
+    force_stop_same_dll: bool,
     log_prefix: &str,
 ) {
     if tuner.subscriber_count() != 0 {
@@ -123,7 +148,7 @@ pub(super) async fn cleanup_unused_tuner_after_switch(
     .await;
     let same_dll_switch = replacement_tuner_path == Some(tuner.key.tuner_path.as_str());
 
-    if same_dll_switch || should_stop_reader_for_capacity(old_dll_running, old_dll_max) {
+    if should_sync_stop_old_reader(same_dll_switch, force_stop_same_dll, old_dll_running, old_dll_max) {
         info!(
             "[Session {}] {} stopping old reader for {:?} ({}/{})",
             session_id, log_prefix, tuner.key, old_dll_running, old_dll_max
@@ -279,5 +304,43 @@ pub(super) async fn evict_interlopers_until_capacity(
         } else {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_sync_stop_old_reader;
+
+    // (a) Same DLL, spare capacity, no forcing (SetChannelSpace/SetChannel
+    // caller): allowed to idle-close instead of a synchronous stop, so a
+    // multi-instance DLL can keep serving other subscribers warm.
+    #[test]
+    fn same_dll_with_spare_capacity_and_no_force_schedules_idle_close() {
+        assert!(!should_sync_stop_old_reader(true, false, 1, 4));
+    }
+
+    // (b) Same DLL, forced (SelectLogicalChannel caller): stop synchronously
+    // even though there is spare capacity, because group members are assumed
+    // to hard-exclusive the underlying hardware.
+    #[test]
+    fn same_dll_with_force_stops_synchronously_even_with_spare_capacity() {
+        assert!(should_sync_stop_old_reader(true, true, 1, 4));
+    }
+
+    // (c) At/over capacity always forces a synchronous stop, regardless of
+    // same-DLL-ness or the force flag.
+    #[test]
+    fn over_capacity_stops_synchronously_regardless_of_force_flag() {
+        assert!(should_sync_stop_old_reader(true, false, 4, 4));
+        assert!(should_sync_stop_old_reader(false, false, 4, 4));
+        assert!(should_sync_stop_old_reader(false, true, 4, 4));
+    }
+
+    // (d) Different DLL, spare capacity: always idle-close, never forced by
+    // the same-DLL flag since it isn't the same DLL.
+    #[test]
+    fn different_dll_with_spare_capacity_schedules_idle_close() {
+        assert!(!should_sync_stop_old_reader(false, false, 1, 4));
+        assert!(!should_sync_stop_old_reader(false, true, 1, 4));
     }
 }
