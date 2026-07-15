@@ -35,6 +35,13 @@ pub type ChannelRow = (ClientChannelRecord, Option<BonDriverRecord>);
 /// The client-facing channel index is the position in the returned Vec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelEntry {
+    /// Physical space of the representative driver (same row that
+    /// `bon_channel` came from — see [`build_channels_by_region`]). Not
+    /// meaningful to end users; used internally so single-tuner mode can
+    /// pair space/channel from the same physical row instead of falling
+    /// back to the region's representative space, which may belong to a
+    /// different driver/row when NID differs across drivers in a group.
+    pub bon_space: u32,
     /// Physical channel number on the representative driver.
     pub bon_channel: u32,
     /// Display name returned by EnumChannelName.
@@ -192,8 +199,12 @@ pub fn build_channels_by_region<F: Fn(&str) -> bool>(
     driver_matches: F,
 ) -> BTreeMap<&'static str, Vec<ChannelEntry>> {
     // Per region, dedupe by (NID, TSID): different drivers may use
-    // different bon_channel values for the same logical channel.
-    let mut uniq: BTreeMap<&'static str, BTreeMap<(u16, u16), (u32, String)>> = BTreeMap::new();
+    // different bon_space/bon_channel values for the same logical channel.
+    // bon_space and bon_channel are always taken from the SAME row (the
+    // first one seen), so they stay a valid physical pair even when driver
+    // NID ranges/space numbering differ across a group.
+    let mut uniq: BTreeMap<&'static str, BTreeMap<(u16, u16), (u32, u32, String)>> =
+        BTreeMap::new();
 
     for (ch, bd_opt) in rows {
         let Some(bd) = bd_opt else { continue };
@@ -204,6 +215,7 @@ pub fn build_channels_by_region<F: Fn(&str) -> bool>(
             continue;
         }
 
+        let bspace = ch.space;
         let bch = ch.channel;
         let name = ch
             .service_name
@@ -214,14 +226,15 @@ pub fn build_channels_by_region<F: Fn(&str) -> bool>(
         uniq.entry(region_key_for_nid(ch.nid as u16))
             .or_default()
             .entry((ch.nid as u16, ch.tsid as u16))
-            .or_insert((bch, name));
+            .or_insert((bspace, bch, name));
     }
 
     uniq.into_iter()
         .map(|(region, channels)| {
             let list = channels
                 .into_iter()
-                .map(|((nid, tsid), (bon_channel, name))| ChannelEntry {
+                .map(|((nid, tsid), (bon_space, bon_channel, name))| ChannelEntry {
+                    bon_space,
                     bon_channel,
                     name,
                     nid,
@@ -388,12 +401,50 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "NHK総合");
         assert_eq!(list[0].bon_channel, 27); // first row wins
+        assert_eq!(list[0].bon_space, 0); // same row as bon_channel above
         assert_eq!(list[1].name, "日テレ");
 
         // Mappings record both drivers for the shared channel.
         let result = build_space_list(&rows, in_group);
         let mappings = &result.nid_tsid_mappings[&(0x7FE8, 0x7FE8)];
         assert_eq!(mappings.len(), 2);
+    }
+
+    /// Regression test for the space/channel mispairing bug: a ChannelEntry
+    /// must always report `bon_space` and `bon_channel` from the SAME
+    /// physical row, even when the group's drivers disagree on which
+    /// space/channel numbers carry the logical (NID, TSID) channel.
+    #[test]
+    fn channel_entry_pairs_bon_space_with_bon_channel_from_same_row() {
+        let d1 = driver(1, "BonDriver_A.dll", Some("G"));
+        let d2 = driver(2, "BonDriver_B.dll", Some("G"));
+        // Driver A carries this logical channel at (space=1, ch=27);
+        // driver B carries the SAME logical channel at (space=0, ch=5).
+        // A naive implementation that takes bon_channel from the first row
+        // but bon_space from some other "representative" source (e.g. the
+        // region's first-seen space) could produce the invalid pair
+        // (space=0, ch=27), which doesn't exist on either driver.
+        let rows_a_first = vec![
+            row(&d1, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 1, 27, true),
+            row(&d2, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 5, true),
+        ];
+        let in_group = |p: &str| p == "BonDriver_A.dll" || p == "BonDriver_B.dll";
+
+        let list = build_channel_list(&rows_a_first, in_group, "関東");
+        assert_eq!(list.len(), 1);
+        // First row wins (driver A): the pair must be (1, 27), not a mix
+        // like (0, 27) or (1, 5).
+        assert_eq!((list[0].bon_space, list[0].bon_channel), (1, 27));
+
+        // Swapping row order: driver B's row now comes first, so the
+        // representative pair must consistently become (0, 5).
+        let rows_b_first = vec![
+            row(&d2, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 5, true),
+            row(&d1, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 1, 27, true),
+        ];
+        let list2 = build_channel_list(&rows_b_first, in_group, "関東");
+        assert_eq!(list2.len(), 1);
+        assert_eq!((list2[0].bon_space, list2[0].bon_channel), (0, 5));
     }
 
     #[test]

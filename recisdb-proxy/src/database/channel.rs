@@ -64,6 +64,14 @@ impl Database {
         }
     }
 
+    /// Get total channel count.
+    pub fn get_total_channel_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
     /// Get all channels with BonDriver path (for export).
     pub fn get_all_channels_for_export(&self) -> Result<Vec<(ChannelRecord, Option<String>)>> {
         let mut stmt = self.conn.prepare(
@@ -261,8 +269,8 @@ impl Database {
                     c.remote_control_key, c.bon_space, c.bon_channel,
                     c.is_enabled, c.priority,
                     bd.id as bd_id, bd.dll_path, bd.driver_name, bd.version,
-                    bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority,
-                    bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled,
+                    bd.group_name, bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority,
+                    bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled, bd.max_instances,
                     bd.created_at as bd_created_at, bd.updated_at as bd_updated_at
              FROM channels c
              LEFT JOIN bon_drivers bd ON c.bon_driver_id = bd.id
@@ -286,24 +294,25 @@ impl Database {
                 priority: row.get("priority")?,
             };
 
-            let bon_driver: Option<BonDriverRecord> = row.get::<_, Option<i64>>("bd_id")?.map(|id| {
-                BonDriverRecord {
+            let bon_driver: Option<BonDriverRecord> = match row.get::<_, Option<i64>>("bd_id")? {
+                Some(id) => Some(BonDriverRecord {
                     id,
                     dll_path: row.get("dll_path").unwrap_or_default(),
                     driver_name: row.get("driver_name").ok().flatten(),
                     version: row.get("version").ok().flatten(),
-                    group_name: row.get("group_name").ok().flatten(),
+                    group_name: row.get("group_name")?,
                     auto_scan_enabled: row.get::<_, Option<i32>>("auto_scan_enabled").ok().flatten().unwrap_or(0) != 0,
                     scan_interval_hours: row.get("scan_interval_hours").unwrap_or(24),
                     scan_priority: row.get("scan_priority").unwrap_or(0),
                     last_scan: row.get("last_scan").ok().flatten(),
                     next_scan_at: row.get("next_scan_at").ok().flatten(),
                     passive_scan_enabled: row.get::<_, Option<i32>>("passive_scan_enabled").ok().flatten().unwrap_or(1) != 0,
-                    max_instances: row.get::<_, Option<i32>>("max_instances").ok().flatten().unwrap_or(1),
+                    max_instances: row.get::<_, Option<i32>>("max_instances")?.unwrap_or(1),
                     created_at: row.get("bd_created_at").unwrap_or(0),
                     updated_at: row.get("bd_updated_at").unwrap_or(0),
-                }
-            });
+                }),
+                None => None,
+            };
 
             Ok((channel, bon_driver))
         })?;
@@ -327,8 +336,8 @@ impl Database {
                     c.remote_control_key, c.bon_space, c.bon_channel,
                     c.is_enabled, c.priority,
                     bd.id as bd_id, bd.dll_path, bd.driver_name, bd.version,
-                    bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority,
-                    bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled,
+                    bd.group_name, bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority,
+                    bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled, bd.max_instances,
                     bd.created_at as bd_created_at, bd.updated_at as bd_updated_at
              FROM channels c
              LEFT JOIN bon_drivers bd ON c.bon_driver_id = bd.id
@@ -353,24 +362,25 @@ impl Database {
                 priority: row.get("priority")?,
             };
 
-            let bon_driver: Option<BonDriverRecord> = row.get::<_, Option<i64>>("bd_id")?.map(|id| {
-                BonDriverRecord {
+            let bon_driver: Option<BonDriverRecord> = match row.get::<_, Option<i64>>("bd_id")? {
+                Some(id) => Some(BonDriverRecord {
                     id,
                     dll_path: row.get("dll_path").unwrap_or_default(),
                     driver_name: row.get("driver_name").ok().flatten(),
                     version: row.get("version").ok().flatten(),
-                    group_name: row.get("group_name").ok().flatten(),
+                    group_name: row.get("group_name")?,
                     auto_scan_enabled: row.get::<_, Option<i32>>("auto_scan_enabled").ok().flatten().unwrap_or(0) != 0,
                     scan_interval_hours: row.get("scan_interval_hours").unwrap_or(24),
                     scan_priority: row.get("scan_priority").unwrap_or(0),
                     last_scan: row.get("last_scan").ok().flatten(),
                     next_scan_at: row.get("next_scan_at").ok().flatten(),
                     passive_scan_enabled: row.get::<_, Option<i32>>("passive_scan_enabled").ok().flatten().unwrap_or(1) != 0,
-                    max_instances: row.get::<_, Option<i32>>("max_instances").ok().flatten().unwrap_or(1),
+                    max_instances: row.get::<_, Option<i32>>("max_instances")?.unwrap_or(1),
                     created_at: row.get("bd_created_at").unwrap_or(0),
                     updated_at: row.get("bd_updated_at").unwrap_or(0),
-                }
-            });
+                }),
+                None => None,
+            };
 
             Ok((channel, bon_driver))
         })?;
@@ -1104,6 +1114,13 @@ mod tests {
     fn test_get_channels_by_nid_tsid() {
         let db = Database::open_in_memory().unwrap();
         let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+        // group_name and max_instances must round-trip through
+        // get_channels_by_nid_tsid: the SELECT previously omitted
+        // bd.group_name/bd.max_instances while the row mapper still read
+        // them, so every row silently came back with group_name=None and
+        // max_instances=1 regardless of the stored value.
+        db.set_group_name(bon_driver_id, Some("GroupX")).unwrap();
+        db.update_bon_driver_max_instances(bon_driver_id, 4).unwrap();
 
         // Two channels with different NID (and different TSID) so we can
         // verify the WHERE nid=?/tsid=? filter narrows to a single group.
@@ -1118,11 +1135,32 @@ mod tests {
         assert_eq!(channel.nid, 0x7FE8);
         assert_eq!(channel.tsid, 32736);
         assert_eq!(channel.sid, 1024);
-        assert_eq!(driver.as_ref().unwrap().dll_path, "Test.dll");
+        let driver = driver.as_ref().unwrap();
+        assert_eq!(driver.dll_path, "Test.dll");
+        assert_eq!(driver.group_name.as_deref(), Some("GroupX"));
+        assert_eq!(driver.max_instances, 4);
 
         // A NID+TSID pair with no matching rows returns an empty result.
         let none = db.get_channels_by_nid_tsid(0xFFFF, 0xFFFF).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_channels_with_drivers_includes_group_and_max_instances() {
+        // Same regression as test_get_channels_by_nid_tsid, but for the
+        // sibling query used by the full (unfiltered) channel listing.
+        let db = Database::open_in_memory().unwrap();
+        let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+        db.set_group_name(bon_driver_id, Some("GroupY")).unwrap();
+        db.update_bon_driver_max_instances(bon_driver_id, 2).unwrap();
+        db.insert_channel(bon_driver_id, &create_test_channel(0x7FE8, 1024, 32736))
+            .unwrap();
+
+        let rows = db.get_all_channels_with_drivers().unwrap();
+        assert_eq!(rows.len(), 1);
+        let driver = rows[0].1.as_ref().unwrap();
+        assert_eq!(driver.group_name.as_deref(), Some("GroupY"));
+        assert_eq!(driver.max_instances, 2);
     }
 
     #[test]

@@ -2425,7 +2425,17 @@ impl Session {
         } else {
             // Single tuner mode
             match &self.current_tuner_path {
-                Some(p) => (p.clone(), actual_space, entry.bon_channel),
+                // ★ Use the representative channel row's own bon_space,
+                // not the region's representative `actual_space`: they are
+                // usually the same value, but when a region mixes NIDs from
+                // more than one physical space (e.g. a broad-area feed and
+                // a prefectural feed sharing a region), `actual_space` is
+                // only guaranteed to be the space of *some* channel in the
+                // region, not necessarily this `entry`'s. `entry.bon_space`
+                // is always the space from the same physical row `entry`
+                // (and thus `entry.bon_channel`) came from, so the pair
+                // stays consistent.
+                Some(p) => (p.clone(), entry.bon_space, entry.bon_channel),
                 None => {
                     error!("[Session {}] SetChannelSpace: current_tuner_path is None", self.id);
                     return self.send_message(ServerMessage::SetChannelSpaceAck {

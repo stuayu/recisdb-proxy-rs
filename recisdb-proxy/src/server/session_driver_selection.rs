@@ -82,6 +82,89 @@ pub(super) struct GroupDriverSelection {
     pub nid_tsid_channel_keys: Vec<(String, ChannelKeySpec)>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Basic priority order: fewer exclusive channels wins first; ties
+    /// broken by fewer running instances; ties broken by higher quality
+    /// score (descending).
+    #[test]
+    fn sort_candidate_drivers_orders_by_exclusive_then_load_then_score() {
+        let mut candidates: Vec<DriverCandidate> = vec![
+            ("Busy.dll".to_string(), 0, 1),
+            ("Exclusive.dll".to_string(), 0, 2),
+            ("Idle.dll".to_string(), 0, 3),
+        ];
+        let mut exclusive_map = HashMap::new();
+        exclusive_map.insert("Exclusive.dll".to_string(), 3i64);
+        exclusive_map.insert("Busy.dll".to_string(), 0i64);
+        exclusive_map.insert("Idle.dll".to_string(), 0i64);
+
+        let mut instances_map = HashMap::new();
+        instances_map.insert("Busy.dll".to_string(), 2i32);
+        instances_map.insert("Idle.dll".to_string(), 0i32);
+
+        let score_map = HashMap::new();
+
+        sort_candidate_drivers(&mut candidates, &exclusive_map, &instances_map, &score_map);
+
+        // Idle.dll (0 exclusive, 0 load) and Busy.dll (0 exclusive, 2 load)
+        // both beat Exclusive.dll (3 exclusive) on the primary key; between
+        // Idle and Busy, lower load wins.
+        assert_eq!(
+            candidates.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            vec!["Idle.dll", "Busy.dll", "Exclusive.dll"]
+        );
+    }
+
+    #[test]
+    fn sort_candidate_drivers_breaks_ties_by_higher_quality_score() {
+        let mut candidates: Vec<DriverCandidate> = vec![
+            ("Low.dll".to_string(), 0, 1),
+            ("High.dll".to_string(), 0, 2),
+        ];
+        let exclusive_map = HashMap::new();
+        let instances_map = HashMap::new();
+        let mut score_map = HashMap::new();
+        score_map.insert("Low.dll".to_string(), 0.5);
+        score_map.insert("High.dll".to_string(), 0.9);
+
+        sort_candidate_drivers(&mut candidates, &exclusive_map, &instances_map, &score_map);
+
+        assert_eq!(
+            candidates.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            vec!["High.dll", "Low.dll"]
+        );
+    }
+
+    #[test]
+    fn select_running_driver_prefers_same_physical_channel_already_streaming() {
+        let candidates: Vec<DriverCandidate> = vec![
+            ("A.dll".to_string(), 0, 27),
+            ("B.dll".to_string(), 0, 5),
+        ];
+        // B.dll is already running the (space=0, ch=5) physical channel.
+        let running = vec![(
+            "B.dll".to_string(),
+            ChannelKeySpec::SpaceChannel { space: 0, channel: 5 },
+        )];
+
+        let selected = select_running_driver(&candidates, &running);
+        assert_eq!(selected, Some(("B.dll".to_string(), 0, 5)));
+    }
+
+    #[test]
+    fn select_running_driver_returns_none_when_nothing_matches() {
+        let candidates: Vec<DriverCandidate> = vec![("A.dll".to_string(), 0, 27)];
+        let running = vec![(
+            "A.dll".to_string(),
+            ChannelKeySpec::SpaceChannel { space: 1, channel: 99 },
+        )];
+        assert_eq!(select_running_driver(&candidates, &running), None);
+    }
+}
+
 pub(super) async fn select_group_driver_for_channel(
     database: &DatabaseHandle,
     tuner_pool: &Arc<TunerPool>,
