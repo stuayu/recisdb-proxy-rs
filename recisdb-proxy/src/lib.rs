@@ -6,6 +6,7 @@ pub mod bondriver;
 pub mod database;
 pub mod logging;
 pub mod alert;
+pub mod epg_writer;
 pub mod px4_installer;
 pub mod scheduler;
 pub mod server;

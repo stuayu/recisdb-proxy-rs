@@ -68,6 +68,8 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/channel/:id", delete(api::delete_channel))
         // Scan history API
         .route("/scan-history", get(api::get_scan_history))
+        // EPG (program guide) API
+        .route("/programs", get(api::get_programs))
         // Alert API
         .route("/alerts", get(api::get_alerts))
         .route("/alert-rules", get(api::get_alert_rules))
@@ -110,6 +112,7 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
         .route("/status", get(mirakurun::get_status))
         .route("/channels", get(mirakurun::get_channels))
         .route("/services", get(mirakurun::get_services))
+        .route("/programs", get(mirakurun::get_programs))
         .route("/services/:id/stream", get(mirakurun::stream_service_by_mirakurun_id))
         .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
 }

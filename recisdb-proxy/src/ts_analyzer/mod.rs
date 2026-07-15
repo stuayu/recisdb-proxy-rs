@@ -27,6 +27,7 @@ mod pat;
 mod pmt;
 mod nit;
 mod sdt;
+mod eit;
 mod analyzer;
 mod descriptors;
 pub mod service_filter;
@@ -37,6 +38,7 @@ pub use pat::{PatTable, PatEntry};
 pub use pmt::{PmtTable, PmtStream};
 pub use nit::{NitTable, NitTransportStream};
 pub use sdt::{SdtTable, SdtService};
+pub use eit::{EitTable, EitEvent};
 pub use analyzer::{TsAnalyzer, AnalyzerConfig, AnalyzerResult};
 pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliveryDescriptor};
 
@@ -76,6 +78,23 @@ pub mod table_id {
     pub const SDT_ACTUAL: u8 = 0x42;
     /// Service Description Section - other.
     pub const SDT_OTHER: u8 = 0x46;
+    /// Event Information Section - actual TS, present/following.
+    pub const EIT_PF_ACTUAL: u8 = 0x4E;
+    /// Event Information Section - other TS, present/following.
+    pub const EIT_PF_OTHER: u8 = 0x4F;
+    /// Event Information Section - actual TS, schedule (first of 0x50..=0x5F).
+    pub const EIT_SCHEDULE_ACTUAL_START: u8 = 0x50;
+    /// Event Information Section - other TS, schedule (last of 0x60..=0x6F).
+    pub const EIT_SCHEDULE_OTHER_END: u8 = 0x6F;
+
+    /// Whether `id` is any EIT table (present/following or schedule,
+    /// actual or other TS): 0x4E/0x4F plus the contiguous 0x50..=0x6F
+    /// schedule range. BS multiplexes carry schedule-other sections for
+    /// services on *other* transport streams, so tuning to a single BS
+    /// channel can populate the EPG for the whole BS multiplex group.
+    pub fn is_eit_table_id(id: u8) -> bool {
+        (EIT_PF_ACTUAL..=EIT_SCHEDULE_OTHER_END).contains(&id)
+    }
 }
 
 /// Descriptor tags used in PSI/SI tables.
@@ -100,4 +119,10 @@ pub mod descriptor_tag {
     pub const LOGO_TRANSMISSION: u8 = 0xCF;
     /// Remote control key descriptor (0xDE for ISDB).
     pub const REMOTE_CONTROL_KEY: u8 = 0xDE;
+    /// Short event descriptor (0x4D).
+    pub const SHORT_EVENT: u8 = 0x4D;
+    /// Extended event descriptor (0x4E).
+    pub const EXTENDED_EVENT: u8 = 0x4E;
+    /// Content descriptor (0x54).
+    pub const CONTENT: u8 = 0x54;
 }

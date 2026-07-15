@@ -15,6 +15,7 @@ use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
+use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::pool::TunerPoolConfig;
 
 /// Capacity of the broadcast channel for TS data.
@@ -413,6 +414,7 @@ impl SharedTuner {
         let reader_start_time = std::time::Instant::now();
         let mut broadcast_send_errors: u64 = 0;
         let mut logo_collector = ChannelLogoCollector::new();
+        let mut epg_collector = EpgCollector::new();
 
         loop {
             // Check if we should stop due to explicit stop signal
@@ -511,6 +513,10 @@ impl SharedTuner {
 
                     // Best-effort logo extraction from SDT/CDT stream.
                     logo_collector.process_ts_chunk(raw);
+                    // Best-effort EPG (EIT) collection, forwarded to the
+                    // process-wide EpgWriter if one is installed (see
+                    // `tuner/epg_collector.rs` module doc comment).
+                    epg_collector.process_ts_chunk(raw);
 
                     // Data validation before B25 decode (log only on first packet)
                     if reader_first_read && n > 0 {

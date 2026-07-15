@@ -225,6 +225,45 @@ impl MergeResult {
     }
 }
 
+/// One EIT event ready to be UPSERTed into `programs` (Migration 015).
+/// Produced by `tuner::epg_collector::EpgCollector` from a parsed EIT
+/// section; consumed in batches by `crate::epg_writer::EpgWriter`.
+#[derive(Debug, Clone)]
+pub struct ProgramUpsert {
+    pub nid: u16,
+    pub sid: u16,
+    pub tsid: u16,
+    pub event_id: u16,
+    /// Event start time, epoch seconds (UTC).
+    pub start_at: i64,
+    pub duration_secs: i64,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub extended: Option<String>,
+    /// `(content_nibble_level_1 << 4) | content_nibble_level_2` of the
+    /// first content_descriptor genre entry, if present.
+    pub genre: Option<i64>,
+    pub updated_at: i64,
+}
+
+/// A stored `programs` row (dashboard `GET /api/programs`, Mirakurun-
+/// compatible `GET /programs`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramRecord {
+    pub id: i64,
+    pub nid: u16,
+    pub sid: u16,
+    pub tsid: u16,
+    pub event_id: u16,
+    pub start_at: i64,
+    pub duration_secs: i64,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub extended: Option<String>,
+    pub genre: Option<i64>,
+    pub updated_at: i64,
+}
+
 /// New BonDriver to insert.
 #[derive(Debug, Clone, Default)]
 pub struct NewBonDriver {

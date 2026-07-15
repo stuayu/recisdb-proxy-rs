@@ -666,7 +666,16 @@ textarea:focus-visible,
   max-height: 70vh;
   aspect-ratio: 16/9;
   margin-top: 12px;
+  overflow: hidden;
   background: #000;
+  border-radius: 8px;
+}
+
+/* DPlayer renders its own chrome inside .preview-video; keep it filling the
+   host and let the host's border-radius clip the corners. */
+.preview-video .dplayer {
+  width: 100%;
+  height: 100%;
   border-radius: 8px;
 }
 
@@ -1034,4 +1043,184 @@ textarea:focus-visible,
 
 .settings-form {
   max-width: 780px;
+}
+
+/* EPG program guide */
+.guide-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.guide-date-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.guide-date-nav input[type='date'] {
+  min-height: 44px;
+  padding: 6px 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.guide-band-filter,
+.guide-service-search {
+  margin: 0;
+  min-width: 200px;
+}
+
+.guide-scroll {
+  max-height: 74vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.guide-grid {
+  display: grid;
+  grid-auto-flow: row;
+  width: max-content;
+  min-width: 100%;
+}
+
+.guide-corner,
+.guide-header-cell {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding: 8px 10px;
+  background: var(--nav);
+  color: #fff;
+  border-bottom: 1px solid var(--nav2);
+  font-weight: 700;
+}
+
+.guide-corner {
+  left: 0;
+  z-index: 4;
+}
+
+.guide-header-cell {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.guide-timeaxis {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--soft);
+  border-right: 1px solid var(--border);
+}
+
+.guide-hour-label {
+  position: absolute;
+  width: 100%;
+  padding: 2px 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  border-top: 1px solid var(--border);
+}
+
+.guide-col {
+  position: relative;
+  border-left: 1px solid var(--border);
+
+  /* 30-minute gridlines; matches PX_PER_MIN (2px/min) in GuideView.vue */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 59px,
+    var(--border) 59px,
+    var(--border) 60px
+  );
+}
+
+.guide-cell {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 6px;
+  overflow: hidden;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 4px;
+}
+
+.guide-cell strong {
+  overflow: hidden;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.guide-cell-time {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.guide-now-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  height: 2px;
+  background: var(--danger);
+}
+
+.guide-detail-dialog {
+  width: min(560px, 100%);
+}
+
+.guide-detail-time {
+  font-weight: 700;
+}
+
+.guide-detail-genre {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.genre-badge {
+  padding: 2px 8px;
+  border: 2px solid var(--muted);
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.guide-detail-extended {
+  color: var(--muted);
+}
+
+@media (max-width: 700px) {
+  .guide-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .guide-band-filter,
+  .guide-service-search {
+    min-width: 0;
+  }
+
+  .guide-scroll {
+    max-height: 68vh;
+  }
 }

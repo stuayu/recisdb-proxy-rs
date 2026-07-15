@@ -22,10 +22,15 @@
 //!    `web_listen`.
 //!
 //! # Scope (what this subset intentionally does not implement)
-//! - No EPG (`/api/programs`, `/api/schedules`, ...) — explicitly out of
-//!   scope for P6 per STREAMING_DESIGN.md §7.1 ("まずは視聴系のみのサブセット
-//!   で良い"). EPGStation's *program guide* will not populate from this
-//!   server; only service/channel discovery and live streaming are covered.
+//! - `GET /programs` (EPG) IS implemented, reading from the `programs`
+//!   table (Migration 015) populated by `crate::epg_writer::EpgWriter` from
+//!   live EIT collection (`tuner/epg_collector.rs`) — this used to be fully
+//!   out of scope per STREAMING_DESIGN.md §7.1's original P6 note ("まずは
+//!   視聴系のみのサブセットで良い"), but EPG storage/collection was added
+//!   later. `/schedules` and other EPG-adjacent endpoints (recording rules,
+//!   etc.) remain unimplemented. `isFree` is always reported `true` — the
+//!   `programs` table does not store `free_CA_mode` (see `web/mirakurun.rs`
+//!   `get_programs` doc comment for why).
 //! - No tuner/recording-process introspection beyond `/status`'s coarse
 //!   tuner counts (real Mirakurun's `/status` reports process RSS, EPG gather
 //!   progress, RPC/stream/error counters, etc. — none of that exists here).
@@ -86,7 +91,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 
-use crate::database::{ChannelRecord, Database};
+use crate::database::{ChannelRecord, Database, ProgramRecord};
 use crate::server::channel_resolve;
 use crate::web::state::WebState;
 use crate::web::stream::{
@@ -239,6 +244,74 @@ pub struct MirakurunChannelRef {
     pub channel: String,
 }
 
+/// `GET /programs` element (Mirakurun `Program` shape, subset).
+///
+/// `id` follows Mirakurun's own convention for program ids:
+/// `(networkId * 100000 + serviceId) * 100000 + eventId` — i.e.
+/// [`mirakurun_service_id`] further multiplied and offset by `eventId`, the
+/// same pattern real Mirakurun uses so a program id can be inverted back to
+/// its service id by integer division.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirakurunProgram {
+    pub id: u64,
+    pub event_id: u16,
+    pub service_id: u16,
+    pub network_id: u16,
+    pub transport_stream_id: u16,
+    /// Milliseconds since epoch (Mirakurun convention; the `programs` table
+    /// stores seconds).
+    pub start_at: i64,
+    /// Milliseconds.
+    pub duration: i64,
+    /// Always `true` — see [`get_programs`] doc comment: the `programs`
+    /// table does not carry `free_CA_mode`.
+    pub is_free: bool,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub genres: Vec<MirakurunGenre>,
+}
+
+/// A single genre entry in [`MirakurunProgram::genres`]. Real Mirakurun's
+/// `Genre` type has more fields (`un1`/`un2`/`un3`, user-nibble level);
+/// only the ARIB content nibble levels are stored/reported here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirakurunGenre {
+    pub lv1: u8,
+    pub lv2: u8,
+}
+
+/// `(networkId * 100000 + serviceId) * 100000 + eventId` — see
+/// [`MirakurunProgram::id`] doc comment.
+fn mirakurun_program_id(nid: u16, sid: u16, event_id: u16) -> u64 {
+    mirakurun_service_id(nid, sid) * 100_000 + event_id as u64
+}
+
+fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
+    let genres = r
+        .genre
+        .map(|g| {
+            let g = g as u8;
+            vec![MirakurunGenre { lv1: (g >> 4) & 0x0F, lv2: g & 0x0F }]
+        })
+        .unwrap_or_default();
+
+    MirakurunProgram {
+        id: mirakurun_program_id(r.nid, r.sid, r.event_id),
+        event_id: r.event_id,
+        service_id: r.sid,
+        network_id: r.nid,
+        transport_stream_id: r.tsid,
+        start_at: r.start_at * 1000,
+        duration: r.duration_secs * 1000,
+        is_free: true,
+        name: r.name,
+        description: r.description,
+        genres,
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -377,6 +450,31 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
         .collect();
 
     Json(services).into_response()
+}
+
+/// `GET /mirakurun/api/programs`. See [`get_channels`] on response shape
+/// (bare array, not this project's usual envelope).
+///
+/// Real Mirakurun accepts `?networkId=&serviceId=` filters; this reads the
+/// full `programs` table unfiltered (EPGStation/KonomiTV typically fetch
+/// everything and filter client-side for this subset's scale). `isFree` is
+/// always reported `true`: the `programs` table (Migration 015) does not
+/// store `free_CA_mode` — the collector (`tuner/epg_collector.rs`) parses it
+/// per-event but the design's schema (see `database/program.rs`) omits the
+/// column, so it is not persisted. This is a known simplification, not a
+/// bug: EPGStation/KonomiTV use `isFree` only to badge scrambled programs in
+/// the UI, which does not block program-guide population.
+pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
+    let programs = {
+        let db = web_state.database.lock().await;
+        match db.get_programs(i64::MIN, i64::MAX, None, None) {
+            Ok(p) => p,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+
+    let result: Vec<MirakurunProgram> = programs.into_iter().map(program_record_to_mirakurun).collect();
+    Json(result).into_response()
 }
 
 /// `GET /mirakurun/api/services/:id/stream`.

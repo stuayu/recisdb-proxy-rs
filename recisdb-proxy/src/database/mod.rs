@@ -11,6 +11,7 @@ mod driver_quality;
 mod alert;
 mod encode_profile;
 mod session_history;
+mod program;
 mod models;
 mod schema;
 
@@ -169,7 +170,38 @@ impl Database {
             "014_periodic_auto_scan_opt_in",
             Database::migration_014_periodic_auto_scan_opt_in,
         ),
+        ("015_programs_table", Database::migration_015_programs_table),
     ];
+
+    // Migration 015: EPG (program guide) storage, collected from live EIT
+    // sections (`tuner/epg_collector.rs`, `crate::epg_writer`). Brand-new
+    // table, so `CREATE TABLE IF NOT EXISTS` alone is idempotent for both
+    // fresh and pre-existing databases — no `add_column_if_not_exists` step
+    // is needed (same reasoning as Migration 012's `encode_profiles`).
+    fn migration_015_programs_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS programs (
+                id INTEGER PRIMARY KEY,
+                nid INTEGER NOT NULL,
+                sid INTEGER NOT NULL,
+                tsid INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                start_at INTEGER NOT NULL,
+                duration_secs INTEGER NOT NULL,
+                name TEXT,
+                description TEXT,
+                extended TEXT,
+                genre INTEGER,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(nid, sid, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_programs_sid_start_at ON programs(sid, start_at);
+            CREATE INDEX IF NOT EXISTS idx_programs_start_at ON programs(start_at);
+            "#,
+        )?;
+        Ok(())
+    }
 
     // Migration 014: periodic auto rescan becomes opt-in (schema default
     // flipped from 1 to 0). Existing rows almost certainly have

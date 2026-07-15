@@ -15,6 +15,7 @@ mod clients;
 mod alerts;
 mod configs;
 mod client_view;
+mod programs;
 
 pub use error::*;
 pub use statics::*;
@@ -25,3 +26,4 @@ pub use clients::*;
 pub use alerts::*;
 pub use configs::*;
 pub use client_view::*;
+pub use programs::*;

@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, ref } from 'vue'
 import OverviewView from './components/OverviewView.vue'
 import BonDriversView from './components/BonDriversView.vue'
 import ChannelsView from './components/ChannelsView.vue'
+import GuideView from './components/GuideView.vue'
 import ClientGuideView from './components/ClientGuideView.vue'
 import SettingsView from './components/SettingsView.vue'
 import AlertsView from './components/AlertsView.vue'
@@ -15,6 +16,7 @@ const tabs = [
   { id: 'overview', label: '概要', icon: '◫' },
   { id: 'bondrivers', label: 'BonDriver', icon: '▣' },
   { id: 'channels', label: 'チャンネル', icon: '⌁' },
+  { id: 'guide', label: '番組表', icon: '▤' },
   { id: 'client-guide', label: 'クライアント設定', icon: '⚙' },
   { id: 'scan-history', label: 'スキャン履歴', icon: '↻' },
   { id: 'session-history', label: 'セッション履歴', icon: '◷' },
@@ -126,6 +128,7 @@ onUnmounted(() => {
         <OverviewView v-if="active === 'overview'" />
         <BonDriversView v-else-if="active === 'bondrivers'" />
         <ChannelsView v-else-if="active === 'channels'" />
+        <GuideView v-else-if="active === 'guide'" />
         <ClientGuideView v-else-if="active === 'client-guide'" />
         <ResourceView
           v-else-if="active === 'scan-history'"

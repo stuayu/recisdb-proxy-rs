@@ -13,6 +13,7 @@ use log::{info, warn, error};
 use recisdb_proxy::database;
 use recisdb_proxy::logging;
 use recisdb_proxy::alert;
+use recisdb_proxy::epg_writer;
 use recisdb_proxy::scheduler;
 use recisdb_proxy::server;
 use recisdb_proxy::tuner;
@@ -349,6 +350,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let manager = alert::AlertManager::new(alert_db, alert_registry);
         manager.run().await;
+    });
+
+    // Start the EPG writer: batches EIT events collected by every live
+    // tuner (`tuner/epg_collector.rs`) into the `programs` table. Must be
+    // started before any tuner reader thread can run, since `EpgWriter::new`
+    // installs the process-wide sender the collectors send into.
+    let epg_db = db.clone();
+    tokio::spawn(async move {
+        let writer = epg_writer::EpgWriter::new(epg_db);
+        writer.run().await;
     });
 
     // Create server
