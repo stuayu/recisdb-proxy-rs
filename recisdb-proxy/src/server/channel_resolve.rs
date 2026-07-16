@@ -93,6 +93,20 @@ pub fn resolve_service(db: &Database, sid: i64) -> Result<ResolvedService, Chann
     resolve_channel_record(db, channel)
 }
 
+/// Same as [`resolve_service`] but looks the channel up by broadcast
+/// service_id alone — the identity the dashboard UI naturally has at hand
+/// (client sessions, EPG programs, channel rows all carry the real SID,
+/// not a `channels` primary key).
+pub fn resolve_service_by_sid(
+    db: &Database,
+    sid: u16,
+) -> Result<ResolvedService, ChannelResolveError> {
+    let channel = db
+        .get_channel_by_sid(sid)?
+        .ok_or(ChannelResolveError::NotFound(sid as i64))?;
+    resolve_channel_record(db, channel)
+}
+
 /// Same as [`resolve_service`] but looks the channel up by `(nid, sid)`
 /// instead of `channels.id` — the identity the Mirakurun-compatible API
 /// (`web/mirakurun.rs`, STREAMING_DESIGN.md §7.1) uses, since Mirakurun's

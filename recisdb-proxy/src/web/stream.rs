@@ -231,6 +231,8 @@ fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u
 }
 
 /// `GET /api/stream/service/:sid[?profile=preview]`.
+/// NOTE: `:sid` here is historically the `channels.id` primary key, not the
+/// broadcast service_id — the dashboard UI uses `stream_service_by_sid`.
 pub async fn stream_service(
     State(web_state): State<Arc<WebState>>,
     Path(sid): Path<i64>,
@@ -244,7 +246,36 @@ pub async fn stream_service(
         Ok(r) => r,
         Err(e) => return channel_resolve_error_response(sid, &e),
     };
+    stream_resolved(web_state, resolved, query, sid).await
+}
 
+/// `GET /api/stream/service/by-sid/:sid[?profile=preview]` — same streaming
+/// behaviour but `:sid` is the real broadcast service_id (what the UI shows
+/// as SID everywhere).
+pub async fn stream_service_by_sid(
+    State(web_state): State<Arc<WebState>>,
+    Path(sid): Path<u16>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    let resolved = {
+        let db = web_state.database.lock().await;
+        channel_resolve::resolve_service_by_sid(&db, sid)
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => return channel_resolve_error_response(sid as i64, &e),
+    };
+    stream_resolved(web_state, resolved, query, sid as i64).await
+}
+
+/// Shared body of the two `stream_service*` handlers once the channel row
+/// has been resolved. `sid` is only used for log labels.
+async fn stream_resolved(
+    web_state: Arc<WebState>,
+    resolved: channel_resolve::ResolvedService,
+    query: StreamQuery,
+    sid: i64,
+) -> Response {
     let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &resolved).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(sid, &e),

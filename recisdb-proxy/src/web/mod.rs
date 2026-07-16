@@ -98,6 +98,8 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Auth is applied the same way as every other route here (see
         // `build_app`'s `route_layer(...require_auth)`) — §6.5.
         .route("/stream/service/:sid", get(stream::stream_service))
+        // Same stream, keyed by the real broadcast service_id (dashboard UI).
+        .route("/stream/service/by-sid/:sid", get(stream::stream_service_by_sid))
 }
 
 /// Build the `/mirakurun/api/*` router (STREAMING_DESIGN.md §7.1, P6).

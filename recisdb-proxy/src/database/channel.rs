@@ -219,6 +219,21 @@ impl Database {
         }
     }
 
+    /// Get channel by broadcast service_id alone (any network).
+    /// Japanese SID allocations don't collide across terrestrial/BS/CS in
+    /// practice; prefer enabled and higher-priority rows when they do.
+    pub fn get_channel_by_sid(&self, sid: u16) -> Result<Option<ChannelRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM channels WHERE sid = ?1
+             ORDER BY is_enabled DESC, priority DESC, id ASC LIMIT 1",
+        )?;
+        match stmt.query_row(params![sid as i32], Self::row_to_channel_record) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Get all distinct SIDs for a given NID+TSID combination.
     pub fn get_sids_for_nid_tsid(&self, nid: u16, tsid: u16) -> Result<Vec<u16>> {
         let mut stmt = self.conn.prepare(

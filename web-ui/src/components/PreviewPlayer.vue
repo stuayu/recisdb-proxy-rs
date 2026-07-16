@@ -16,6 +16,31 @@ const active = ref(false)
 let dp: DPlayer | null = null
 let mpegtsPlayer: ReturnType<typeof mpegts.createPlayer> | null = null
 
+/// mpegts.js swallows the HTTP response body, so on failure re-fetch the
+/// stream URL once to surface the server's human-readable reason (e.g.
+/// "preview_encoder_config.enabled is false ...") instead of a black screen.
+async function explainStreamError(url: string, token: string | null, fallback: string) {
+  let message = `再生エラー: ${fallback}`
+  try {
+    const response = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!response.ok) {
+      const body = (await response.text()).slice(0, 300)
+      message = `プレビューを開始できません (HTTP ${response.status}): ${body || response.statusText}`
+      if (/preview_encoder|command_path/i.test(body)) {
+        message += '\nヒント: recisdb-proxy.toml の [preview] でエンコーダ(QSVEncC等)と前段(tsreadex)のパス設定が必要です。'
+      }
+    } else {
+      void response.body?.cancel()
+    }
+  } catch {
+    // keep fallback
+  }
+  error.value = message
+  stop()
+}
+
 async function start() {
   stop()
   error.value = ''
@@ -24,14 +49,18 @@ async function start() {
       throw new Error('このブラウザでは再生できません')
     }
     const token = localStorage.getItem('recisdbApiToken')
-    const url = `/api/stream/service/${encodeURIComponent(sid.value)}?profile=preview`
+    // by-sid: 放送のservice_idで解決する(/stream/service/:id はDB主キーなので使わない)
+    const url = `/api/stream/service/by-sid/${encodeURIComponent(sid.value)}?profile=preview`
     // DPlayer delegates actual decoding to mpegts.js via customType, so the
     // existing Authorization-header handling keeps working unchanged.
     dp = new DPlayer({
       container: container.value,
       live: true,
-      autoplay: false,
-      preload: 'none',
+      // DPlayer calls its own play() after construction and handles the
+      // play() promise rejection internally. Calling video.play() ourselves
+      // inside customType races DPlayer's init (pause()) and dies with
+      // "The play() request was interrupted by a call to pause()".
+      autoplay: true,
       hotkey: true,
       screenshot: false,
       video: {
@@ -47,17 +76,28 @@ async function start() {
                   url,
                 },
                 {
-                  enableWorker: true,
+                  // Worker-mode fetch has environment-dependent failure
+                  // modes (opaque "Exception" NetworkErrors); the ~2Mbps
+                  // preview stream doesn't need a worker anyway.
+                  enableWorker: false,
                   liveBufferLatencyChasing: true,
                   headers: token ? { Authorization: `Bearer ${token}` } : {},
                 },
               )
+              mpegtsPlayer.on(
+                mpegts.Events.ERROR,
+                (errType: string, detail: string, info: unknown) => {
+                  let extra = ''
+                  try {
+                    extra = info ? ` ${JSON.stringify(info)}` : ''
+                  } catch {
+                    // ignore
+                  }
+                  void explainStreamError(url, token, `${errType} (${detail})${extra}`)
+                },
+              )
               mpegtsPlayer.attachMediaElement(video)
               mpegtsPlayer.load()
-              video.play().catch((cause: unknown) => {
-                error.value = cause instanceof Error ? cause.message : String(cause)
-                stop()
-              })
             } catch (cause) {
               error.value = cause instanceof Error ? cause.message : String(cause)
               stop()
@@ -121,6 +161,6 @@ onBeforeUnmount(stop)
       />
     </label>
     <div ref="container" class="preview-video" />
-    <p v-if="error" class="notice error" role="alert" v-text="error" />
+    <p v-if="error" class="notice error preserve-lines" role="alert" v-text="error" />
   </section>
 </template>
