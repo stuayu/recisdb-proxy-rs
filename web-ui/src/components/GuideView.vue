@@ -140,15 +140,27 @@ type RenderGroup = {
   key: string
   band: BandCategory
   columns: Service[]
-  /** program slot keys ((start_at, duration_secs, name)) shared by every column; only meaningful when columns.length > 1. */
-  sharedKeys: Set<string>
   startIndex: number
 }
 
 type DisplayColumn = {
   service: Service
   groupKey: string
-  sharedKeys: Set<string>
+  /** ids of programs on this column that are already drawn once by a span overlay (see groupSpanInfo). */
+  consumedIds: Set<number>
+}
+
+/** One main-column program spanning >1 columns, ready to render as a single overlay cell. */
+type SpanItem = {
+  program: Program
+  width: number
+}
+
+type GroupSpanInfo = {
+  group: RenderGroup
+  items: SpanItem[]
+  /** consumedByColumn[i] = ids of programs in columns[i] already covered by a span item. */
+  consumedByColumn: Set<number>[]
 }
 
 /** Comparator for services within the same band: 地上 sorts by remote_control_key (nulls last), everything else by sid. */
@@ -183,6 +195,13 @@ function groupServices(services: Service[]): ServiceGroup[] {
 }
 
 /** Slot identity used both for "is this sub-channel just a repeat of the main?" and cross-column cell merging. */
+/** Placeholder used when EIT carried no short-event name for a program. */
+const UNKNOWN_PROGRAM_NAME = '(番組名不明)'
+
+function isUnknownName(program: Program): boolean {
+  return program.name === UNKNOWN_PROGRAM_NAME || program.name.trim() === ''
+}
+
 function programSlotKey(program: Program): string {
   return `${program.start_at}:${program.duration_secs}:${program.name}`
 }
@@ -379,7 +398,7 @@ const programsByService = computed(() => {
       event_id: Number(row.event_id),
       start_at,
       duration_secs,
-      name: String(row.name ?? '(番組名不明)'),
+      name: String(row.name ?? UNKNOWN_PROGRAM_NAME),
       description: String(row.description ?? ''),
       extended: String(row.extended ?? ''),
       genre: row.genre === null || row.genre === undefined ? null : Number(row.genre),
@@ -401,8 +420,7 @@ function programsFor(svc: Service): Program[] {
 /**
  * (nid, tsid) multiplexes collapsed to what's actually shown: a sub-channel is dropped when its
  * programme list for the selected day is empty or an exact match of the main service's, and kept
- * (as its own column, immediately right of the main) otherwise. `sharedKeys` holds the slot keys
- * that are identical across every kept column of the group, used to merge those cells in the grid.
+ * (as its own column, immediately right of the main) otherwise.
  */
 const renderGroups = computed<RenderGroup[]>(() => {
   const groups = groupServices(filteredServices.value).map((group): RenderGroup => {
@@ -413,15 +431,7 @@ const renderGroups = computed<RenderGroup[]>(() => {
       return !sameSlotSets(mainKeys, programSlotKeySet(subPrograms))
     })
     const columns = [group.main, ...visibleSubs]
-    let sharedKeys = new Set<string>()
-    if (columns.length > 1) {
-      sharedKeys = new Set(mainKeys)
-      for (const sub of visibleSubs) {
-        const subKeys = programSlotKeySet(programsFor(sub))
-        for (const key of sharedKeys) if (!subKeys.has(key)) sharedKeys.delete(key)
-      }
-    }
-    return { key: group.key, band: group.main.band, columns, sharedKeys, startIndex: 0 }
+    return { key: group.key, band: group.main.band, columns, startIndex: 0 }
   })
   groups.sort(compareGroups)
   let offset = 0
@@ -432,42 +442,87 @@ const renderGroups = computed<RenderGroup[]>(() => {
   return groups
 })
 
+/**
+ * Per-group, per-main-program span widths. For each program P on the main column, walk the
+ * subsequent columns left-to-right and extend the span while each column either (a) has a program
+ * in the exact same slot as P, or (b) has no *named* program overlapping P's time range — an EPG
+ * gap, or only name-unknown placeholder rows, neither of which contradicts "same as main" (the
+ * placeholder rows overlapping P are absorbed so they don't render under the span). The walk
+ * stops at the first column with a different named program overlapping P's range. Widths of 1
+ * (no extension) are not recorded as spans; those programs draw normally in their own column via
+ * columnPrograms/consumedIds.
+ */
+const groupSpanInfo = computed<GroupSpanInfo[]>(() =>
+  renderGroups.value.map((group): GroupSpanInfo => {
+    const consumedByColumn: Set<number>[] = group.columns.map(() => new Set<number>())
+    const items: SpanItem[] = []
+    if (group.columns.length > 1) {
+      const colPrograms = group.columns.map((service) => programsFor(service))
+      for (const program of colPrograms[0]) {
+        const pStart = program.start_at
+        const pEnd = pStart + program.duration_secs
+        const slotKey = programSlotKey(program)
+        const matchedByColumn: Program[][] = [[program]]
+        let width = 1
+        for (let col = 1; col < group.columns.length; col++) {
+          const sameSlot = colPrograms[col].find((p) => programSlotKey(p) === slotKey) ?? null
+          if (sameSlot) {
+            matchedByColumn.push([sameSlot])
+            width++
+            continue
+          }
+          const overlapping = colPrograms[col].filter(
+            (p) => p.start_at < pEnd && p.start_at + p.duration_secs > pStart,
+          )
+          if (overlapping.every(isUnknownName)) {
+            // EPG gap, or only name-unknown rows: absorb them under the span.
+            matchedByColumn.push(overlapping)
+            width++
+            continue
+          }
+          break
+        }
+        if (width > 1) {
+          items.push({ program, width })
+          for (let col = 0; col < width; col++) {
+            for (const matched of matchedByColumn[col]) consumedByColumn[col].add(matched.id)
+          }
+        }
+      }
+    }
+    return { group, items, consumedByColumn }
+  }),
+)
+
 /** Flattened one-entry-per-grid-column view of renderGroups, in display order. */
 const displayColumns = computed<DisplayColumn[]>(() =>
-  renderGroups.value.flatMap((group) =>
-    group.columns.map((service) => ({
+  groupSpanInfo.value.flatMap((info) =>
+    info.group.columns.map((service, index) => ({
       service,
-      groupKey: group.key,
-      sharedKeys: group.sharedKeys,
+      groupKey: info.group.key,
+      consumedIds: info.consumedByColumn[index],
     })),
   ),
 )
 
-/** Groups whose sub-channels share at least one program slot with the main; these get a spanning cell overlay. */
-const spanGroups = computed(() =>
-  renderGroups.value.filter((g) => g.columns.length > 1 && g.sharedKeys.size > 0),
+/** One overlay cell per spanning main-column program, positioned to cover its computed column width. */
+const spanRenderItems = computed(() =>
+  groupSpanInfo.value.flatMap((info) =>
+    info.items
+      .filter((item) => visible(item.program))
+      .map((item) => ({
+        key: `span-${info.group.key}-${item.program.id}`,
+        program: item.program,
+        gridColumn: `${info.group.startIndex + 2} / span ${item.width}`,
+      })),
+  ),
 )
 
 /** Programs to draw in an individual column: visible in the day grid and not already covered by a spanning cell. */
 function columnPrograms(col: DisplayColumn): Program[] {
   return programsFor(col.service)
     .filter(visible)
-    .filter((program) => !col.sharedKeys.has(programSlotKey(program)))
-}
-
-/** The (deduplicated) merged programs to draw once, spanning every column of the group. */
-function spanPrograms(group: RenderGroup): Program[] {
-  return programsFor(group.columns[0])
-    .filter(visible)
-    .filter((program) => group.sharedKeys.has(programSlotKey(program)))
-}
-
-function spanOverlayStyle(group: RenderGroup) {
-  return {
-    gridColumn: `${group.startIndex + 2} / span ${group.columns.length}`,
-    gridRow: '2 / 3',
-    height: `${TOTAL_HEIGHT}px`,
-  }
+    .filter((program) => !col.consumedIds.has(program.id))
 }
 
 function cellStyle(program: Program) {
@@ -530,7 +585,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="view">
+  <section class="view view-full">
     <div class="view-heading">
       <div>
         <h2>番組表</h2>
@@ -626,25 +681,24 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <!-- Multi-programme (sub-channel) groups: cells identical across every column of the
-             group are drawn once here, spanning the whole group, on top of the per-column cells
-             above (which already skip these slots via DisplayColumn.sharedKeys). -->
+        <!-- Spanning cells: a main-column program whose neighbouring columns either repeat the
+             same slot or have no EPG data at all for that time range is drawn once here, spanning
+             every column it covers, on top of the per-column cells above (which already skip
+             these programs via DisplayColumn.consumedIds). -->
         <div
-          v-for="group in spanGroups"
-          :key="`span-${group.key}`"
+          v-for="item in spanRenderItems"
+          :key="item.key"
           class="guide-col guide-span-overlay"
-          :style="spanOverlayStyle(group)"
+          :style="{ gridColumn: item.gridColumn, gridRow: '2 / 3', height: `${TOTAL_HEIGHT}px` }"
         >
           <button
-            v-for="program in spanPrograms(group)"
-            :key="program.id"
             type="button"
             class="guide-cell"
-            :style="cellStyle(program)"
-            @click="openDetail(program)"
+            :style="cellStyle(item.program)"
+            @click="openDetail(item.program)"
           >
-            <strong v-text="program.name" />
-            <span class="guide-cell-time" v-text="fmtTime(program.start_at)" />
+            <strong v-text="item.program.name" />
+            <span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
           </button>
         </div>
       </div>

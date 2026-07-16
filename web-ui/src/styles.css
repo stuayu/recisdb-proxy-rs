@@ -338,6 +338,8 @@ h3 {
 .dialog-backdrop {
   position: fixed;
   inset: 0;
+  /* Above every sticky layer (guide header z:2-4, nav z:10, skip-link z:100). */
+  z-index: 200;
   display: grid;
   place-items: center;
   padding: 20px;
@@ -938,6 +940,22 @@ textarea:focus-visible,
   white-space: pre-line;
 }
 
+.channel-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.channel-logo {
+  height: 20px;
+  width: auto;
+  max-width: 40px;
+  padding: 1px 3px;
+  background: #fff;
+  border-radius: 4px;
+  flex: none;
+}
+
 .form-grid.two-columns {
   grid-template-columns: repeat(2, 1fr);
 }
@@ -1076,8 +1094,15 @@ textarea:focus-visible,
   min-width: 200px;
 }
 
+/* Let the guide use the full main-column width instead of .view's 1400px cap. */
+.view.view-full {
+  max-width: none;
+}
+
 .guide-scroll {
-  max-height: 74vh;
+  /* Fill the viewport below the topbar/heading/toolbar chrome (~250px). */
+  height: calc(100dvh - 250px);
+  min-height: 400px;
   overflow: auto;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1239,6 +1264,7 @@ textarea:focus-visible,
   }
 
   .guide-scroll {
-    max-height: 68vh;
+    height: calc(100dvh - 210px);
+    min-height: 320px;
   }
 }

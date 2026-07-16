@@ -318,6 +318,49 @@ function resetColumns() {
   localStorage.removeItem('channelColumns')
 }
 
+/**
+ * Per-row logo fallback state: 'own' (try /logos/{nid}_{sid}.png, the default),
+ * 'main' (own failed; try the group's main-sid logo instead), 'hidden' (both failed,
+ * or the row is its own group's main so there is nothing left to fall back to).
+ * Keyed by row id so re-sorts/re-renders don't reset an already-failed lookup.
+ */
+const logoFallback = reactive(new Map<string, 'own' | 'main' | 'hidden'>())
+
+/** Lowest sid per (nid, tsid) group — the "main channel" whose logo subs fall back to. */
+const mainSidByGroup = computed(() => {
+  const map = new Map<string, number>()
+  for (const row of rows.value) {
+    const nid = Number(row.nid)
+    const tsid = Number(row.tsid)
+    const sid = Number(row.sid)
+    if (!Number.isFinite(nid) || !Number.isFinite(tsid) || !Number.isFinite(sid)) continue
+    const key = `${nid}:${tsid}`
+    const current = map.get(key)
+    if (current === undefined || sid < current) map.set(key, sid)
+  }
+  return map
+})
+
+function logoSrc(row: JsonRecord): string {
+  const nid = Number(row.nid)
+  const sid = Number(row.sid)
+  const tsid = Number(row.tsid)
+  if (!Number.isFinite(nid) || !Number.isFinite(sid)) return ''
+  const state = logoFallback.get(String(row.id)) ?? 'own'
+  if (state === 'own') return `/logos/${nid}_${sid}.png`
+  if (state === 'main' && Number.isFinite(tsid)) {
+    const mainSid = mainSidByGroup.value.get(`${nid}:${tsid}`)
+    if (mainSid !== undefined && mainSid !== sid) return `/logos/${nid}_${mainSid}.png`
+  }
+  return ''
+}
+
+function onLogoError(row: JsonRecord) {
+  const id = String(row.id)
+  const state = logoFallback.get(id) ?? 'own'
+  logoFallback.set(id, state === 'own' ? 'main' : 'hidden')
+}
+
 function display(row: JsonRecord, key: string): string {
   const value = row[key]
   if (value === null || value === undefined || value === '') return '—'
@@ -535,6 +578,17 @@ onUnmounted(() => {
                   @click="toggle(row)"
                   v-text="row.is_enabled ? '有効' : '無効'"
                 />
+                <span v-else-if="column.key === 'channel_name'" class="channel-name-cell">
+                  <img
+                    v-if="logoSrc(row)"
+                    :src="logoSrc(row)"
+                    class="channel-logo"
+                    alt=""
+                    loading="lazy"
+                    @error="onLogoError(row)"
+                  />
+                  <span v-text="display(row, column.key)" />
+                </span>
                 <span v-else v-text="display(row, column.key)" />
               </td>
               <td v-if="editMode" data-label="操作">
