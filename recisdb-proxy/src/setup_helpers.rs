@@ -388,7 +388,7 @@ fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
 /// BonDriver一式が既に存在するかを、そのステージング先の規則
 /// (`<検索ルート>\BonDriver\<bondriver_folder>\<dll名>`)に従って探す。
 /// `install_dir` (GUIで指定されたインストール先) を最優先で確認し、
-/// カレントディレクトリ相対のパスは後方���換のフォールバックとする。
+/// カレントディレクトリ相対のパスは後方互換のフォールバックとする。
 /// 見つかった場合は絶対パスのリストを返す(空なら未インストール)。
 #[cfg(target_os = "windows")]
 fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model, install_dir: &Path) -> Vec<String> {
@@ -557,7 +557,7 @@ pub fn local_lan_ip() -> Option<std::net::IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-/// 配布用 BonDriver_NetworkProxy.ini を生成す���。
+/// 配布用 BonDriver_NetworkProxy.ini を生成する。
 pub fn generate_client_ini(server_addr: &str, tuner: &str) -> String {
     let mut replaced_addr = false;
     let mut replaced_tuner = false;
@@ -828,7 +828,7 @@ pub fn sync_program_binary(source_dir: &Path, install_dir: &Path) -> Result<Bina
 
     std::fs::copy(&source, &dest).map_err(|e| {
         format!(
-            "{exe_name} の更新に失敗しまし��({e})。{exe_name} が起動中の場合は終了してから、\
+            "{exe_name} の更新に失敗しました({e})。{exe_name} が起動中の場合は終了してから、\
              もう一度お試しください。"
         )
     })?;
@@ -1187,7 +1187,7 @@ mod tests {
         // 済みでもよいので案内として含んでいることを確認する
         // (main.rs の ConfigFile が持つセクション: server/database/logging/
         // web/mirakurun/tsreplace/preview/tls)。古いテンプレートへの
-        // 先祖返りを防ぐリグレッ���ョンテスト。
+        // 先祖返りを防ぐリグレッションテスト。
         for section in ["[web]", "[mirakurun]", "[tsreplace]", "[preview]", "[tls]"] {
             assert!(
                 generated.contains(section),

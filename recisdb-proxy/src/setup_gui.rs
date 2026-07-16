@@ -973,7 +973,7 @@ impl SetupApp {
             ui.label(
                 egui::RichText::new(
                     "指定したフォルダ(サブフォルダ含む)にある \"BonDriver_NetworkProxy\" で始まる\
-                     DLLを、今回配置した最新版の内容でま��めて上書きします。\
+                     DLLを、今回配置した最新版の内容でまとめて上書きします。\
                      実行しますか？",
                 )
                 .weak()
