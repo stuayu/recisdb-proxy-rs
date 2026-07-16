@@ -95,7 +95,21 @@ impl Server {
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(socket, addr, session_id, pool, encoder_pool, database, default_tuner, session_registry).await {
-                            error!("[Session {}] Connection error: {}", session_id, e);
+                            // Client-initiated socket teardown (TVTest exit,
+                            // EDCB reconnect cycle, …) surfaces here as
+                            // BrokenPipe/ConnectionReset/ConnectionAborted —
+                            // an expected disconnect, not a server fault.
+                            match e.kind() {
+                                std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof => {
+                                    info!("[Session {}] Disconnected by client: {}", session_id, e);
+                                }
+                                _ => {
+                                    error!("[Session {}] Connection error: {}", session_id, e);
+                                }
+                            }
                         }
                         info!("[Session {}] Connection closed", session_id);
                     });

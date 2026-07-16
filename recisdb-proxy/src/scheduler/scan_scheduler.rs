@@ -1070,6 +1070,14 @@ async fn perform_scan(
             Ok(result) => {
                 info!("perform_scan: Merged {} inserted, {} updated", result.inserted, result.updated);
             }
+            Err(crate::database::DatabaseError::BonDriverNotFound(detail)) => {
+                // Driver was deleted/replaced while the (minutes-long) scan
+                // ran — not a data corruption; the results are just stale.
+                warn!(
+                    "perform_scan: BonDriver disappeared during scan, discarding {} results: {}",
+                    total, detail
+                );
+            }
             Err(e) => {
                 error!("perform_scan: Failed to merge results: {}", e);
             }

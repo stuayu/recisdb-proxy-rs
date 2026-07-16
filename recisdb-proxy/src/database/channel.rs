@@ -665,6 +665,22 @@ impl Database {
         let tx = self.conn.transaction()?;
         let mut result = MergeResult::default();
 
+        // Guard: a scan can take minutes, and the driver row may have been
+        // deleted (or bulk-replaced with a new id) by the time results come
+        // back. Without this check every INSERT below fails with an opaque
+        // "FOREIGN KEY constraint failed". Checking inside the transaction
+        // makes the merge atomic with respect to a concurrent delete.
+        let driver_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bon_drivers WHERE id = ?1)",
+            [bon_driver_id],
+            |row| row.get(0),
+        )?;
+        if !driver_exists {
+            return Err(super::DatabaseError::BonDriverNotFound(format!(
+                "id={bon_driver_id} (削除/置換済み。スキャン結果を破棄します)"
+            )));
+        }
+
         // Get existing channels for this BonDriver
         let existing: Vec<ChannelRecord> = {
             let mut stmt = tx.prepare(
@@ -1239,6 +1255,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!disabled.is_enabled);
+    }
+
+    /// A scan can outlive its driver row (deleted/bulk-replaced mid-scan).
+    /// The merge must fail with a clear BonDriverNotFound instead of an
+    /// opaque FOREIGN KEY error from the first INSERT.
+    #[test]
+    fn test_merge_scan_results_rejects_missing_driver() {
+        let mut db = Database::open_in_memory().unwrap();
+        let channels = vec![create_test_channel(0x7FE8, 1024, 32736)];
+        let err = db.merge_scan_results(9999, &channels).unwrap_err();
+        assert!(
+            matches!(err, super::super::DatabaseError::BonDriverNotFound(_)),
+            "expected BonDriverNotFound, got: {err:?}"
+        );
     }
 
     #[test]
