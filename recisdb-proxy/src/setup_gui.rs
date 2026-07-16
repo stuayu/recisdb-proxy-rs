@@ -587,7 +587,15 @@ impl eframe::App for SetupApp {
             Step::Detecting => self.ui_detecting(ui),
             Step::SelectTuners => self.ui_select_tuners(ui),
             Step::Confirm => self.ui_confirm(ui),
-            Step::Done => self.ui_done(ui),
+            // 完了画面はDLL一括更新セクションまで含めると 480px の
+            // ウィンドウ高を超えるため、ページ全体をスクロール可能にする
+            // (入力欄がビューポート外に溢れて操作不能になる)。
+            Step::Done => {
+                egui::ScrollArea::vertical()
+                    .id_salt("done_page_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.ui_done(ui));
+            }
         });
     }
 }
