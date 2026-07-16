@@ -171,7 +171,60 @@ impl Database {
             Database::migration_014_periodic_auto_scan_opt_in,
         ),
         ("015_programs_table", Database::migration_015_programs_table),
+        (
+            "016_reclassify_band_region_from_nid",
+            Database::migration_016_reclassify_band_region_from_nid,
+        ),
     ];
+
+    // Migration 016: re-derive band_type / region_id / terrestrial_region
+    // from NID using the protocol crate as the single source of truth.
+    // Migration 013 did this in raw SQL with a terrestrial range of
+    // 0x7F00-0x7FFF, but real terrestrial NIDs span 0x7880-0x7FE8, so rows
+    // in 0x7880-0x7EFF were misclassified as band_type=4 (Other) and got no
+    // region. Rules (idempotent by construction):
+    //   - band_type: fill when NULL; also correct 4 (Other) when the NID
+    //     derivation disagrees (undoing 013's damage). Other non-NULL
+    //     values are left alone.
+    //   - region_id / terrestrial_region: fill only when NULL.
+    fn migration_016_reclassify_band_region_from_nid(&self) -> Result<()> {
+        use recisdb_protocol::broadcast_region::{get_prefecture_name, get_region_id_from_nid};
+        use recisdb_protocol::BandType;
+
+        let rows: Vec<(i64, i64, Option<i64>)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, nid, band_type FROM channels")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            mapped.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        for (id, nid, band_type) in rows {
+            let nid = nid as u16;
+            let derived = BandType::from_nid(nid) as i64;
+            let new_band = match band_type {
+                None => Some(derived),
+                Some(4) if derived != 4 => Some(derived),
+                _ => None,
+            };
+            self.conn.execute(
+                "UPDATE channels SET
+                    band_type = COALESCE(?2, band_type),
+                    region_id = COALESCE(region_id, ?3),
+                    terrestrial_region = COALESCE(terrestrial_region, ?4)
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    new_band,
+                    get_region_id_from_nid(nid).map(|v| v as i64),
+                    get_prefecture_name(nid),
+                ],
+            )?;
+        }
+        Ok(())
+    }
 
     // Migration 015: EPG (program guide) storage, collected from live EIT
     // sections (`tuner/epg_collector.rs`, `crate::epg_writer`). Brand-new
@@ -1023,6 +1076,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    /// Migration 016 must correct terrestrial rows that migration 013's
+    /// narrow 0x7F00-0x7FFF SQL range misclassified as band_type=4 (Other),
+    /// and backfill NULL region columns — idempotently.
+    #[test]
+    fn migration_016_reclassifies_misbanded_terrestrial_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+        // 0x7880 (福岡・北九州) sits below 013's 0x7F00 cutoff.
+        db.connection()
+            .execute(
+                "INSERT INTO channels (bon_driver_id, nid, sid, tsid, band_type)
+                 VALUES (?1, 0x7880, 1, 1, 4)",
+                [driver_id],
+            )
+            .unwrap();
+
+        db.migration_016_reclassify_band_region_from_nid().unwrap();
+        let (band, region): (i64, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT band_type, terrestrial_region FROM channels WHERE nid = 0x7880",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(band, 0, "0x7880 is terrestrial, not Other");
+        assert!(region.is_some(), "terrestrial region should be backfilled");
+
+        // Idempotent: a second run changes nothing.
+        db.migration_016_reclassify_band_region_from_nid().unwrap();
+        let band2: i64 = db
+            .connection()
+            .query_row("SELECT band_type FROM channels WHERE nid = 0x7880", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(band2, 0);
     }
 
     #[test]
