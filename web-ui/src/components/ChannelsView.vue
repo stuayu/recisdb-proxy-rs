@@ -57,6 +57,21 @@ const descending3 = ref(false)
 const compactViewport = ref(false)
 const customizedColumns = ref(false)
 let media: MediaQueryList | null = null
+const previewRow = ref<JsonRecord | null>(null)
+const previewSid = computed<string | number>(() => {
+  const value = previewRow.value?.sid
+  return typeof value === 'number' || typeof value === 'string' ? value : ''
+})
+function openPreview(row: JsonRecord) {
+  if (row.sid == null) return
+  previewRow.value = row
+}
+function closePreview() {
+  previewRow.value = null
+}
+function onPreviewKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closePreview()
+}
 
 const savedColumns = localStorage.getItem('channelColumns')
 function initialColumns(): string[] {
@@ -330,10 +345,14 @@ onMounted(() => {
   const update = () => (compactViewport.value = media?.matches ?? false)
   update()
   media.addEventListener('change', update)
+  window.addEventListener('keydown', onPreviewKeydown)
   void load()
 })
 
-onUnmounted(() => media?.removeEventListener('change', () => undefined))
+onUnmounted(() => {
+  media?.removeEventListener('change', () => undefined)
+  window.removeEventListener('keydown', onPreviewKeydown)
+})
 </script>
 
 <template>
@@ -468,6 +487,7 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
                   @change="toggleAll"
                 />
               </th>
+              <th aria-label="プレビュー" />
               <th v-for="column in visibleColumns" :key="column.key">
                 <button class="sort-button" @click="sort(column.key)">
                   <span v-text="column.label" />
@@ -489,6 +509,23 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
                   :value="Number(row.id)"
                   :aria-label="`${String(row.channel_name ?? row.id)}を選択`"
                 />
+              </td>
+              <td data-label="プレビュー">
+                <button
+                  class="button small secondary preview-button"
+                  :disabled="row.sid == null || !row.is_enabled"
+                  :title="
+                    row.sid == null
+                      ? 'SID不明のためプレビューできません'
+                      : row.is_enabled
+                        ? 'ブラウザでプレビュー再生'
+                        : '無効チャンネルはプレビューできません'
+                  "
+                  :aria-label="`${String(row.channel_name ?? row.id)}をプレビュー`"
+                  @click="openPreview(row)"
+                >
+                  ▶
+                </button>
               </td>
               <td v-for="column in visibleColumns" :key="column.key" :data-label="column.label">
                 <button
@@ -552,6 +589,25 @@ onUnmounted(() => media?.removeEventListener('change', () => undefined))
       </form>
     </div>
 
-    <PreviewPlayer />
+    <div v-if="previewRow" class="dialog-backdrop" @click.self="closePreview">
+      <section
+        class="dialog preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="channel-preview-player-title"
+      >
+        <div class="view-heading">
+          <div>
+            <h2 id="channel-preview-player-title">ブラウザプレビュー</h2>
+            <p
+              class="muted"
+              v-text="`${String(previewRow.channel_name ?? '—')}（SID ${String(previewRow.sid)}）`"
+            />
+          </div>
+          <button class="button secondary" @click="closePreview">閉じる</button>
+        </div>
+        <PreviewPlayer :key="previewSid" :initial-sid="previewSid" />
+      </section>
+    </div>
   </section>
 </template>
