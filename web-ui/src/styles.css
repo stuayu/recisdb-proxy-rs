@@ -154,7 +154,6 @@ main {
 }
 
 .view {
-  max-width: 1400px;
   margin: auto;
 }
 
@@ -1092,11 +1091,6 @@ textarea:focus-visible,
 .guide-service-search {
   margin: 0;
   min-width: 200px;
-}
-
-/* Let the guide use the full main-column width instead of .view's 1400px cap. */
-.view.view-full {
-  max-width: none;
 }
 
 .guide-scroll {

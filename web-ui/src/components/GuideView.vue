@@ -585,7 +585,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="view view-full">
+  <section class="view">
     <div class="view-heading">
       <div>
         <h2>番組表</h2>
