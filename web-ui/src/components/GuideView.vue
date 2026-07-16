@@ -349,7 +349,7 @@ const services = computed<Service[]>(() => {
   return Array.from(seen.values()).sort((a, b) => a.nid - b.nid || a.sid - b.sid)
 })
 
-/** Region choices offered once "地上" is selected, in first-seen order. */
+/** Region choices (terrestrial services), in first-seen order. Always visible. */
 const regionOptions = computed(() => {
   const seen: string[] = []
   for (const svc of services.value) {
@@ -360,19 +360,18 @@ const regionOptions = computed(() => {
 })
 
 watch(bandFilter, (value) => {
-  if (value !== '地上') regionFilter.value = 'すべて'
+  if (value !== '地上' && value !== 'すべて') regionFilter.value = 'すべて'
+})
+// Picking a concrete region implies terrestrial.
+watch(regionFilter, (value) => {
+  if (value !== 'すべて' && bandFilter.value !== '地上') bandFilter.value = '地上'
 })
 
 const filteredServices = computed(() => {
   const query = serviceQuery.value.trim().toLowerCase()
   return services.value.filter((svc) => {
     if (bandFilter.value !== 'すべて' && svc.band !== bandFilter.value) return false
-    if (
-      bandFilter.value === '地上' &&
-      regionFilter.value !== 'すべて' &&
-      svc.region !== regionFilter.value
-    )
-      return false
+    if (regionFilter.value !== 'すべて' && svc.region !== regionFilter.value) return false
     if (!query) return true
     return (
       svc.name.toLowerCase().includes(query) ||
@@ -610,9 +609,9 @@ onUnmounted(() => {
           <option value="CS">CS</option>
         </select>
       </label>
-      <label v-if="bandFilter === '地上'" class="field guide-region-filter">
-        <span>地域</span>
-        <select v-model="regionFilter">
+      <label class="field guide-region-filter">
+        <span>地域（地上）</span>
+        <select v-model="regionFilter" :disabled="!regionOptions.length">
           <option value="すべて">すべての地域</option>
           <option v-for="region in regionOptions" :key="region" :value="region" v-text="region" />
         </select>
