@@ -2,6 +2,13 @@
 //!
 //! This module handles common PSI section header parsing and CRC validation.
 
+use log::trace;
+
+/// Maximum legal `section_length` per MPEG-2 PSI (12-bit field, but the
+/// standard further caps it at 4093 so that `3 + section_length` never
+/// exceeds the maximum private-section size of 4096 bytes).
+const MAX_SECTION_LENGTH: usize = 4093;
+
 /// PSI section header (common to all PSI tables).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PsiHeader {
@@ -132,11 +139,22 @@ impl<'a> PsiSection<'a> {
 }
 
 /// Section collector for multi-packet sections.
+///
+/// PSI/SI sections rarely align with TS packet boundaries — this is
+/// especially true for densely-packed tables like EIT (EPG), where several
+/// sections can start and end within a single packet, or a section header
+/// can straddle a packet boundary. `add_data` therefore treats the buffer as
+/// a continuous byte stream and repeatedly slices complete, CRC-valid
+/// sections out of it (see `drain_sections`), rather than assuming "one
+/// packet in, at most one section out".
 #[derive(Debug, Default)]
 pub struct SectionCollector {
-    /// Buffer for collecting section data.
+    /// Buffer for collecting section data (may hold more than one pending
+    /// section's worth of bytes after a `drain_sections` pass leaves a
+    /// partial trailing section).
     buffer: Vec<u8>,
-    /// Expected section length.
+    /// Expected total length (header + data + CRC) of the section currently
+    /// at the front of `buffer`, once its 3-byte header has been parsed.
     expected_length: Option<usize>,
     /// Last continuity counter.
     last_cc: Option<u8>,
@@ -157,8 +175,13 @@ impl SectionCollector {
 
     /// Add data from a TS packet.
     ///
-    /// Returns true if a complete section is available.
-    pub fn add_data(&mut self, payload: &[u8], cc: u8, payload_unit_start: bool) -> bool {
+    /// Returns zero or more complete, CRC-validated sections. A single call
+    /// can return multiple sections (back-to-back sections in one packet,
+    /// or one packet finishing a pending section and starting/finishing
+    /// another).
+    pub fn add_data(&mut self, payload: &[u8], cc: u8, payload_unit_start: bool) -> Vec<Vec<u8>> {
+        let mut sections = Vec::new();
+
         // Check continuity
         if let Some(last) = self.last_cc {
             let expected_cc = (last + 1) & 0x0F;
@@ -170,47 +193,114 @@ impl SectionCollector {
         self.last_cc = Some(cc);
 
         if payload_unit_start {
-            // New section starts
             if payload.is_empty() {
-                return false;
+                return sections;
             }
 
-            // Pointer field
+            // Pointer field: number of bytes *before* the start of the next
+            // section, i.e. bytes that finish the section already in
+            // progress (if any).
             let pointer = payload[0] as usize;
-            let section_start = pointer + 1;
+            let rest = &payload[1..];
 
-            if section_start >= payload.len() {
-                return false;
+            if pointer > rest.len() {
+                // Malformed pointer_field. Best effort: treat everything as
+                // a continuation of the in-progress section and don't start
+                // a new one this packet.
+                self.buffer.extend_from_slice(rest);
+                self.drain_sections(&mut sections);
+                return sections;
             }
 
-            // Start new section
+            let (before, after) = rest.split_at(pointer);
+
+            // Finish the section that was in progress before this packet.
+            if !before.is_empty() {
+                self.buffer.extend_from_slice(before);
+            }
+            self.drain_sections(&mut sections);
+
+            // Start a fresh section stream with whatever follows the
+            // pointer, discarding any incomplete leftovers from the
+            // previous stream (a PUSI here means the encoder is starting a
+            // new section regardless of what we had buffered).
             self.buffer.clear();
-            self.buffer.extend_from_slice(&payload[section_start..]);
-
-            // Try to get section length
-            if self.buffer.len() >= 3 {
-                let section_length =
-                    ((self.buffer[1] as usize & 0x0F) << 8) | self.buffer[2] as usize;
-                self.expected_length = Some(3 + section_length);
-            }
+            self.expected_length = None;
+            self.buffer.extend_from_slice(after);
+            self.drain_sections(&mut sections);
         } else if !self.buffer.is_empty() {
-            // Continue existing section
             self.buffer.extend_from_slice(payload);
+            self.drain_sections(&mut sections);
         }
 
-        // Check if section is complete
-        if let Some(expected) = self.expected_length {
-            self.buffer.len() >= expected
-        } else {
-            false
-        }
+        sections
     }
 
-    /// Get the collected section data.
-    pub fn get_section(&self) -> Option<&[u8]> {
-        self.expected_length
-            .filter(|&len| self.buffer.len() >= len)
-            .map(|len| &self.buffer[..len])
+    /// Repeatedly slice complete sections off the front of `buffer`,
+    /// pushing each CRC-valid one onto `out`. Leaves any trailing partial
+    /// section (and its still-unknown or known `expected_length`) in
+    /// `buffer` for the next call. Stops (and resets state) on stuffing
+    /// bytes (`table_id == 0xFF`) or an invalid `section_length`.
+    fn drain_sections(&mut self, out: &mut Vec<Vec<u8>>) {
+        loop {
+            if self.buffer.is_empty() {
+                self.expected_length = None;
+                return;
+            }
+
+            // 0xFF marks stuffing bytes filling the remainder of the TS
+            // packets up to the next section start; nothing meaningful
+            // follows in this stream.
+            if self.buffer[0] == 0xFF {
+                self.clear();
+                return;
+            }
+
+            if self.buffer.len() < 3 {
+                // Header itself straddles a packet boundary - wait for more
+                // data before we can even read section_length.
+                self.expected_length = None;
+                return;
+            }
+
+            let section_length = ((self.buffer[1] as usize & 0x0F) << 8) | self.buffer[2] as usize;
+            if section_length > MAX_SECTION_LENGTH {
+                trace!(
+                    "[SectionCollector] invalid section_length={} (table_id={:#04x}), discarding",
+                    section_length,
+                    self.buffer[0]
+                );
+                self.clear();
+                return;
+            }
+
+            let total = 3 + section_length;
+            self.expected_length = Some(total);
+
+            if self.buffer.len() < total {
+                // Not enough data yet for this section; wait for more.
+                return;
+            }
+
+            let candidate = &self.buffer[..total];
+            // CRC-32/MPEG-2 over the whole section (header + data + CRC)
+            // is 0 for a valid section, given this implementation's
+            // init=0xFFFFFFFF / no final XOR.
+            if crc32_mpeg2(candidate) == 0 {
+                out.push(candidate.to_vec());
+            } else {
+                trace!(
+                    "[SectionCollector] CRC mismatch for section (table_id={:#04x}, len={}), discarding",
+                    self.buffer[0],
+                    total
+                );
+            }
+
+            self.buffer.drain(0..total);
+            self.expected_length = None;
+            // Loop again: there may be another section (or stuffing)
+            // immediately following in the buffer.
+        }
     }
 
     /// Check if collector has data.
@@ -254,6 +344,40 @@ pub fn crc32_mpeg2(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    /// Build a complete, CRC-valid PSI section: `table_id` + header byte
+    /// (section_syntax_indicator + high nibble of length) + length low byte
+    /// + `data_after_header` (extended header fields + payload, if any) + a
+    /// correct trailing CRC32.
+    fn make_section(table_id: u8, section_syntax_indicator: bool, data_after_header: &[u8]) -> Vec<u8> {
+        let section_length = data_after_header.len() + 4; // + CRC
+        assert!(section_length <= MAX_SECTION_LENGTH);
+
+        let mut out = Vec::with_capacity(3 + section_length);
+        out.push(table_id);
+        let b1 = (if section_syntax_indicator { 0x80 } else { 0x00 })
+            | 0x30 // reserved bits, arbitrary but conventional (11)
+            | ((section_length >> 8) as u8 & 0x0F);
+        out.push(b1);
+        out.push((section_length & 0xFF) as u8);
+        out.extend_from_slice(data_after_header);
+
+        let crc = crc32_mpeg2(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    /// Wrap `pointer` + `body` into a TS-payload-shaped byte vector for a
+    /// PUSI packet (pointer_field followed by the actual byte stream).
+    /// `body[..pointer]` is the "before" segment (tail of a prior section)
+    /// and `body[pointer..]` is the "after" segment (start of the next
+    /// section stream) — same layout `SectionCollector::add_data` expects.
+    fn pusi_payload(pointer: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + body.len());
+        out.push(pointer);
+        out.extend_from_slice(body);
+        out
+    }
+
     #[test]
     fn test_crc32_empty() {
         // CRC32 of empty data with initial value 0xFFFFFFFF
@@ -262,18 +386,132 @@ mod tests {
     }
 
     #[test]
-    fn test_section_collector() {
+    fn test_section_is_crc_valid_property() {
+        // Sanity-check the "CRC of a full valid section, CRC included, is
+        // zero" property that `SectionCollector::drain_sections` relies on.
+        let section = make_section(0x00, true, &[0x00, 0x01, 0xC1, 0x00, 0x00]);
+        assert_eq!(crc32_mpeg2(&section), 0);
+    }
+
+    #[test]
+    fn test_section_collector_single_section() {
         let mut collector = SectionCollector::new();
         assert!(collector.is_empty());
 
-        // Simulate PAT section data
-        let mut payload = vec![0u8; 184]; // Pointer field + section
-        payload[0] = 0; // Pointer field
-        payload[1] = 0x00; // table_id = PAT
-        payload[2] = 0x80; // section_syntax_indicator = 1
-        payload[3] = 0x0D; // section_length = 13
+        let section = make_section(0x00, true, &[0x00, 0x01, 0xC1, 0x00, 0x00]);
+        let payload = pusi_payload(0, &section);
 
-        let complete = collector.add_data(&payload, 0, true);
-        assert!(complete);
+        let sections = collector.add_data(&payload, 0, true);
+        assert_eq!(sections, vec![section]);
+        assert!(collector.is_empty());
+    }
+
+    /// Defect 1: a section's tail fragment and the next section's head are
+    /// both present, spanning a single PUSI packet boundary (pointer_field
+    /// > 0). Both sections must be recovered.
+    #[test]
+    fn test_tail_and_head_share_pusi_packet() {
+        let mut collector = SectionCollector::new();
+
+        let section1 = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let section2 = make_section(0x4E, true, &[0x00, 0x02, 0xE1, 0x00, 0x00, 0x11, 0x22, 0x33]);
+
+        // Packet A: PUSI, pointer=0, only the first part of section1 (rest
+        // arrives in packet B).
+        let split = section1.len() - 3;
+        let payload_a = pusi_payload(0, &section1[..split]);
+        let sections_a = collector.add_data(&payload_a, 0, true);
+        assert!(sections_a.is_empty(), "section1 is still incomplete after packet A");
+
+        // Packet B: PUSI, pointer = remaining bytes of section1, followed by
+        // section2 in full.
+        let remaining = section1.len() - split;
+        let mut body = section1[split..].to_vec();
+        body.extend_from_slice(&section2);
+        let payload_b = pusi_payload(remaining as u8, &body);
+
+        let sections_b = collector.add_data(&payload_b, 1, true);
+        assert_eq!(sections_b, vec![section1, section2]);
+    }
+
+    /// Defect 2: two complete sections back-to-back in the same PUSI
+    /// packet (pointer_field == 0). Both must be recovered.
+    #[test]
+    fn test_two_sections_back_to_back() {
+        let mut collector = SectionCollector::new();
+
+        let section1 = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00]);
+        let section2 = make_section(0x4E, true, &[0x00, 0x02, 0xE1, 0x00, 0x00]);
+
+        let mut body = section1.clone();
+        body.extend_from_slice(&section2);
+        let payload = pusi_payload(0, &body);
+
+        let sections = collector.add_data(&payload, 0, true);
+        assert_eq!(sections, vec![section1, section2]);
+    }
+
+    /// Defect 3: the 3-byte section header itself straddles a packet
+    /// boundary, so `section_length` can't be computed on the PUSI packet
+    /// and must be recomputed once the continuation packet arrives.
+    #[test]
+    fn test_header_straddles_packet_boundary() {
+        let mut collector = SectionCollector::new();
+
+        let section = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00, 0xAA, 0xBB]);
+
+        // Packet A: PUSI, pointer=0, only the first 2 header bytes.
+        let payload_a = pusi_payload(0, &section[..2]);
+        let sections_a = collector.add_data(&payload_a, 0, true);
+        assert!(sections_a.is_empty());
+
+        // Packet B: continuation carrying the rest of the section.
+        let payload_b = &section[2..];
+        let sections_b = collector.add_data(payload_b, 1, false);
+        assert_eq!(sections_b, vec![section]);
+    }
+
+    /// Defect fix regression: a corrupted (CRC-invalid) section must never
+    /// be emitted.
+    #[test]
+    fn test_crc_invalid_section_discarded() {
+        let mut collector = SectionCollector::new();
+
+        let mut section = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00]);
+        // Corrupt a data byte so the CRC no longer matches.
+        let last = section.len() - 5;
+        section[last] ^= 0xFF;
+
+        let payload = pusi_payload(0, &section);
+        let sections = collector.add_data(&payload, 0, true);
+        assert!(sections.is_empty());
+    }
+
+    /// table_id == 0xFF marks stuffing; the collector must stop there and
+    /// reset instead of trying to parse stuffing bytes as a section header.
+    #[test]
+    fn test_stuffing_byte_stops_collection() {
+        let mut collector = SectionCollector::new();
+
+        let section = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00]);
+        let mut body = section.clone();
+        body.extend_from_slice(&[0xFF; 8]); // stuffing to end of packet
+
+        let payload = pusi_payload(0, &body);
+        let sections = collector.add_data(&payload, 0, true);
+        assert_eq!(sections, vec![section]);
+        assert!(collector.is_empty());
+    }
+
+    #[test]
+    fn test_section_collector_clear() {
+        let mut collector = SectionCollector::new();
+        let section = make_section(0x00, true, &[0x00, 0x01, 0xC1, 0x00, 0x00]);
+        let payload_a = pusi_payload(0, &section[..section.len() - 2]);
+        collector.add_data(&payload_a, 0, true);
+        assert!(!collector.is_empty());
+
+        collector.clear();
+        assert!(collector.is_empty());
     }
 }

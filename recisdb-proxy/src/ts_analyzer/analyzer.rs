@@ -263,20 +263,14 @@ impl TsAnalyzer {
         let collector = self.collectors.entry(pid_val).or_default();
 
         // Add payload to collector
-        let complete = collector.add_data(
+        let sections = collector.add_data(
             packet.payload,
             packet.header.continuity_counter,
             packet.header.payload_unit_start,
         );
 
-        if complete {
-            // Clone section data to avoid borrow conflicts
-            if let Some(section_data) = collector.get_section().map(|s| s.to_vec()) {
-                // Clear collector first to end mutable borrow
-                collector.clear();
-                // Process the section
-                self.process_section(pid_val, &section_data);
-            }
+        for section_data in &sections {
+            self.process_section(pid_val, section_data);
         }
     }
 

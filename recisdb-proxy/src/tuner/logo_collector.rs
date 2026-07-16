@@ -85,31 +85,23 @@ impl ChannelLogoCollector {
 
         match packet.header.pid {
             SDT_PID => {
-                let complete = self.sdt_collector.add_data(
+                let sections = self.sdt_collector.add_data(
                     packet.payload,
                     packet.header.continuity_counter,
                     packet.header.payload_unit_start,
                 );
-                if complete {
-                    if let Some(section_data) = self.sdt_collector.get_section() {
-                        let section_data = section_data.to_vec();
-                        self.sdt_collector.clear();
-                        self.process_sdt_section(&section_data);
-                    }
+                for section_data in &sections {
+                    self.process_sdt_section(section_data);
                 }
             }
             CDT_PID => {
-                let complete = self.cdt_collector.add_data(
+                let sections = self.cdt_collector.add_data(
                     packet.payload,
                     packet.header.continuity_counter,
                     packet.header.payload_unit_start,
                 );
-                if complete {
-                    if let Some(section_data) = self.cdt_collector.get_section() {
-                        let section_data = section_data.to_vec();
-                        self.cdt_collector.clear();
-                        self.process_cdt_section(&section_data);
-                    }
+                for section_data in &sections {
+                    self.process_cdt_section(section_data);
                 }
             }
             _ => {}

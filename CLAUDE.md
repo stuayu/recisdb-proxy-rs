@@ -54,6 +54,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 
 - `docs/ARCHITECTURE.md` — recisdb-rs本体の設計
 - `docs/DESIGN.md` / `docs/STREAMING_DESIGN.md` — プロキシ設計・ストリーミング設計(§番号がコード内コメントから参照される)
+- `docs/EPG_DESIGN.md` — 番組表(EIT)収集・保存・配信の設計
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)

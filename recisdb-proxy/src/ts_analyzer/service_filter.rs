@@ -160,21 +160,24 @@ impl TsServiceFilter {
             return;
         };
 
-        let complete = self.pat_collector.add_data(
+        let sections = self.pat_collector.add_data(
             packet.payload,
             packet.header.continuity_counter,
             packet.header.payload_unit_start,
         );
 
-        if !complete {
-            return;
+        for section_data in &sections {
+            self.process_pat_section(section_data);
         }
+    }
 
-        let Some(section_data) = self.pat_collector.get_section() else {
+    /// Handle a single complete PAT section (there may be several per
+    /// packet if they're densely packed).
+    fn process_pat_section(&mut self, section_data: &[u8]) {
+        let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };
-
-        let Ok(pat) = PatTable::parse(&PsiSection::parse(section_data).unwrap()) else {
+        let Ok(pat) = PatTable::parse(&section) else {
             return;
         };
 
@@ -231,20 +234,20 @@ impl TsServiceFilter {
             return;
         };
 
-        let complete = self.pmt_collector.add_data(
+        let sections = self.pmt_collector.add_data(
             packet.payload,
             packet.header.continuity_counter,
             packet.header.payload_unit_start,
         );
 
-        if !complete {
-            return;
+        for section_data in &sections {
+            self.process_pmt_section(section_data);
         }
+    }
 
-        let Some(section_data) = self.pmt_collector.get_section() else {
-            return;
-        };
-
+    /// Handle a single complete PMT section (there may be several per
+    /// packet if they're densely packed).
+    fn process_pmt_section(&mut self, section_data: &[u8]) {
         let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };

@@ -87,21 +87,14 @@ impl EpgCollector {
             return;
         }
 
-        let complete = self.collector.add_data(
+        let sections = self.collector.add_data(
             packet.payload,
             packet.header.continuity_counter,
             packet.header.payload_unit_start,
         );
-        if !complete {
-            return;
+        for section_data in &sections {
+            self.process_section(section_data);
         }
-
-        let Some(section_data) = self.collector.get_section() else {
-            return;
-        };
-        let section_data = section_data.to_vec();
-        self.collector.clear();
-        self.process_section(&section_data);
     }
 
     fn process_section(&mut self, section_data: &[u8]) {
