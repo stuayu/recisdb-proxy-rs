@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
+import PreviewPlayer from './PreviewPlayer.vue'
 
 // --- constants -------------------------------------------------------
 
@@ -47,22 +48,43 @@ const GENRE_COLORS: Record<number, string> = {
 
 type BandCategory = '地上' | 'BS' | 'CS' | 'その他'
 
-/** Mirrors recisdb-proxy database/schema.rs BandType enum values. */
-function bandCategory(bandType: unknown): BandCategory {
-  const value = typeof bandType === 'number' ? bandType : Number(bandType)
-  switch (value) {
-    case 0: // Terrestrial
-    case 5: // CATV
-      return '地上'
-    case 1: // BS
-    case 3: // 4K (mirakurun maps this to BS too)
-      return 'BS'
-    case 2: // CS
-    case 6: // SKY
-      return 'CS'
-    default:
-      return 'その他'
+const BAND_ORDER: Record<BandCategory, number> = { 地上: 0, BS: 1, CS: 2, その他: 3 }
+
+/**
+ * Mirrors recisdb-proxy database/schema.rs BandType enum values.
+ * Older scan rows can have `band_type = null`; fall back to deriving the
+ * band from the NID range in that case (see docs/DESIGN.md NID ranges).
+ */
+function bandCategory(bandType: unknown, nid: number): BandCategory {
+  if (bandType !== null && bandType !== undefined) {
+    const value = Number(bandType)
+    if (Number.isFinite(value)) {
+      switch (value) {
+        case 0: // Terrestrial
+        case 5: // CATV
+          return '地上'
+        case 1: // BS
+        case 3: // 4K (mirakurun maps this to BS too)
+          return 'BS'
+        case 2: // CS (110 degree)
+        case 6: // SKY
+          return 'CS'
+        default:
+          return 'その他'
+      }
+    }
   }
+  if (nid === 4) return 'BS'
+  if (nid === 6 || nid === 7) return 'CS'
+  if (nid >= 0x7880 && nid <= 0x7fef) return '地上'
+  return 'その他'
+}
+
+/** service_type values worth showing in the guide: digital TV (1) and 4K (0xAD). Null is unknown/legacy, kept visible. */
+function isGuideServiceType(serviceType: unknown): boolean {
+  if (serviceType === null || serviceType === undefined) return true
+  const value = Number(serviceType)
+  return value === 1 || value === 0xad
 }
 
 function genreLevel1(genre: number | null | undefined): number | null {
@@ -86,8 +108,11 @@ type Service = {
   key: string
   nid: number
   sid: number
+  tsid: number
   name: string
   band: BandCategory
+  remoteControlKey: number | null
+  region: string | null
 }
 
 type Program = {
@@ -101,6 +126,75 @@ type Program = {
   description: string
   extended: string
   genre: number | null
+}
+
+/** One (nid, tsid) multiplex: a main service (lowest sid) plus its sub-channels (sid asc). */
+type ServiceGroup = {
+  key: string
+  main: Service
+  subs: Service[]
+}
+
+/** A group as actually rendered: sub-channels whose EPG is identical to (or empty vs.) the main are dropped. */
+type RenderGroup = {
+  key: string
+  band: BandCategory
+  columns: Service[]
+  /** program slot keys ((start_at, duration_secs, name)) shared by every column; only meaningful when columns.length > 1. */
+  sharedKeys: Set<string>
+  startIndex: number
+}
+
+type DisplayColumn = {
+  service: Service
+  groupKey: string
+  sharedKeys: Set<string>
+}
+
+/** Comparator for services within the same band: 地上 sorts by remote_control_key (nulls last), everything else by sid. */
+function compareServices(a: Service, b: Service): number {
+  if (a.band === '地上') {
+    const ra = a.remoteControlKey ?? Number.POSITIVE_INFINITY
+    const rb = b.remoteControlKey ?? Number.POSITIVE_INFINITY
+    if (ra !== rb) return ra - rb
+  }
+  return a.sid - b.sid
+}
+
+function compareGroups(a: RenderGroup, b: RenderGroup): number {
+  if (BAND_ORDER[a.band] !== BAND_ORDER[b.band]) return BAND_ORDER[a.band] - BAND_ORDER[b.band]
+  return compareServices(a.columns[0], b.columns[0])
+}
+
+function groupServices(services: Service[]): ServiceGroup[] {
+  const map = new Map<string, Service[]>()
+  for (const svc of services) {
+    const key = `${svc.nid}:${svc.tsid}`
+    const list = map.get(key)
+    if (list) list.push(svc)
+    else map.set(key, [svc])
+  }
+  const groups: ServiceGroup[] = []
+  for (const [key, list] of map) {
+    const sorted = [...list].sort((a, b) => a.sid - b.sid)
+    groups.push({ key, main: sorted[0], subs: sorted.slice(1) })
+  }
+  return groups
+}
+
+/** Slot identity used both for "is this sub-channel just a repeat of the main?" and cross-column cell merging. */
+function programSlotKey(program: Program): string {
+  return `${program.start_at}:${program.duration_secs}:${program.name}`
+}
+
+function programSlotKeySet(programs: Program[]): Set<string> {
+  return new Set(programs.map(programSlotKey))
+}
+
+function sameSlotSets(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const key of a) if (!b.has(key)) return false
+  return true
 }
 
 // --- date helpers ------------------------------------------------------
@@ -125,6 +219,7 @@ const error = ref('')
 const loading = ref(false)
 const selectedDate = ref(fmtDateInput(new Date()))
 const bandFilter = ref<'すべて' | BandCategory>('すべて')
+const regionFilter = ref('すべて')
 const serviceQuery = ref('')
 const now = ref(Date.now())
 const detail = ref<Program | null>(null)
@@ -208,24 +303,57 @@ const services = computed<Service[]>(() => {
   for (const row of rawChannels.value) {
     const nid = Number(row.nid)
     const sid = Number(row.sid)
-    if (!Number.isFinite(nid) || !Number.isFinite(sid)) continue
+    const tsid = Number(row.tsid)
+    if (!Number.isFinite(nid) || !Number.isFinite(sid) || !Number.isFinite(tsid)) continue
+    if (!isGuideServiceType(row.service_type)) continue
     const key = `${nid}:${sid}`
     if (seen.has(key)) continue
+    const remoteControlKey =
+      row.remote_control_key === null || row.remote_control_key === undefined
+        ? null
+        : Number(row.remote_control_key)
     seen.set(key, {
       key,
       nid,
       sid,
+      tsid,
       name: String(row.channel_name ?? `${nid}-${sid}`),
-      band: bandCategory(row.band_type),
+      band: bandCategory(row.band_type, nid),
+      remoteControlKey:
+        remoteControlKey !== null && Number.isFinite(remoteControlKey) ? remoteControlKey : null,
+      region:
+        row.terrestrial_region === null || row.terrestrial_region === undefined
+          ? null
+          : String(row.terrestrial_region),
     })
   }
   return Array.from(seen.values()).sort((a, b) => a.nid - b.nid || a.sid - b.sid)
+})
+
+/** Region choices offered once "地上" is selected, in first-seen order. */
+const regionOptions = computed(() => {
+  const seen: string[] = []
+  for (const svc of services.value) {
+    if (svc.band !== '地上' || svc.region === null) continue
+    if (!seen.includes(svc.region)) seen.push(svc.region)
+  }
+  return seen
+})
+
+watch(bandFilter, (value) => {
+  if (value !== '地上') regionFilter.value = 'すべて'
 })
 
 const filteredServices = computed(() => {
   const query = serviceQuery.value.trim().toLowerCase()
   return services.value.filter((svc) => {
     if (bandFilter.value !== 'すべて' && svc.band !== bandFilter.value) return false
+    if (
+      bandFilter.value === '地上' &&
+      regionFilter.value !== 'すべて' &&
+      svc.region !== regionFilter.value
+    )
+      return false
     if (!query) return true
     return (
       svc.name.toLowerCase().includes(query) ||
@@ -270,6 +398,78 @@ function programsFor(svc: Service): Program[] {
   return programsByService.value.get(svc.key) ?? []
 }
 
+/**
+ * (nid, tsid) multiplexes collapsed to what's actually shown: a sub-channel is dropped when its
+ * programme list for the selected day is empty or an exact match of the main service's, and kept
+ * (as its own column, immediately right of the main) otherwise. `sharedKeys` holds the slot keys
+ * that are identical across every kept column of the group, used to merge those cells in the grid.
+ */
+const renderGroups = computed<RenderGroup[]>(() => {
+  const groups = groupServices(filteredServices.value).map((group): RenderGroup => {
+    const mainKeys = programSlotKeySet(programsFor(group.main))
+    const visibleSubs = group.subs.filter((sub) => {
+      const subPrograms = programsFor(sub)
+      if (subPrograms.length === 0) return false
+      return !sameSlotSets(mainKeys, programSlotKeySet(subPrograms))
+    })
+    const columns = [group.main, ...visibleSubs]
+    let sharedKeys = new Set<string>()
+    if (columns.length > 1) {
+      sharedKeys = new Set(mainKeys)
+      for (const sub of visibleSubs) {
+        const subKeys = programSlotKeySet(programsFor(sub))
+        for (const key of sharedKeys) if (!subKeys.has(key)) sharedKeys.delete(key)
+      }
+    }
+    return { key: group.key, band: group.main.band, columns, sharedKeys, startIndex: 0 }
+  })
+  groups.sort(compareGroups)
+  let offset = 0
+  for (const group of groups) {
+    group.startIndex = offset
+    offset += group.columns.length
+  }
+  return groups
+})
+
+/** Flattened one-entry-per-grid-column view of renderGroups, in display order. */
+const displayColumns = computed<DisplayColumn[]>(() =>
+  renderGroups.value.flatMap((group) =>
+    group.columns.map((service) => ({
+      service,
+      groupKey: group.key,
+      sharedKeys: group.sharedKeys,
+    })),
+  ),
+)
+
+/** Groups whose sub-channels share at least one program slot with the main; these get a spanning cell overlay. */
+const spanGroups = computed(() =>
+  renderGroups.value.filter((g) => g.columns.length > 1 && g.sharedKeys.size > 0),
+)
+
+/** Programs to draw in an individual column: visible in the day grid and not already covered by a spanning cell. */
+function columnPrograms(col: DisplayColumn): Program[] {
+  return programsFor(col.service)
+    .filter(visible)
+    .filter((program) => !col.sharedKeys.has(programSlotKey(program)))
+}
+
+/** The (deduplicated) merged programs to draw once, spanning every column of the group. */
+function spanPrograms(group: RenderGroup): Program[] {
+  return programsFor(group.columns[0])
+    .filter(visible)
+    .filter((program) => group.sharedKeys.has(programSlotKey(program)))
+}
+
+function spanOverlayStyle(group: RenderGroup) {
+  return {
+    gridColumn: `${group.startIndex + 2} / span ${group.columns.length}`,
+    gridRow: '2 / 3',
+    height: `${TOTAL_HEIGHT}px`,
+  }
+}
+
 function cellStyle(program: Program) {
   const { since } = gridBounds.value
   const topMin = Math.max(0, (program.start_at - since) / 60)
@@ -296,18 +496,37 @@ function closeDetail() {
   detail.value = null
 }
 
+const previewProgram = ref<Program | null>(null)
+function openPreview(program: Program) {
+  detail.value = null
+  previewProgram.value = program
+}
+function closePreview() {
+  previewProgram.value = null
+}
+
 function gridTemplateColumns() {
-  return `64px repeat(${filteredServices.value.length}, minmax(160px, 1fr))`
+  return `64px repeat(${displayColumns.value.length}, minmax(160px, 1fr))`
 }
 
 watch(selectedDate, () => void loadPrograms())
 
+function onKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return
+  if (previewProgram.value) closePreview()
+  else closeDetail()
+}
+
 onMounted(() => {
   void refresh()
   clockTimer = window.setInterval(() => (now.value = Date.now()), 30000)
+  window.addEventListener('keydown', onKeydown)
 })
 
-onUnmounted(() => window.clearInterval(clockTimer))
+onUnmounted(() => {
+  window.clearInterval(clockTimer)
+  window.removeEventListener('keydown', onKeydown)
+})
 </script>
 
 <template>
@@ -336,6 +555,13 @@ onUnmounted(() => window.clearInterval(clockTimer))
           <option value="CS">CS</option>
         </select>
       </label>
+      <label v-if="bandFilter === '地上'" class="field guide-region-filter">
+        <span>地域</span>
+        <select v-model="regionFilter">
+          <option value="すべて">すべての地域</option>
+          <option v-for="region in regionOptions" :key="region" :value="region" v-text="region" />
+        </select>
+      </label>
       <label class="search guide-service-search">
         <span>サービス絞り込み</span>
         <input v-model="serviceQuery" type="search" placeholder="チャンネル名、NID、SID" />
@@ -349,16 +575,28 @@ onUnmounted(() => window.clearInterval(clockTimer))
     </p>
 
     <div v-else class="guide-scroll">
+      <!--
+        Every cell below is explicitly placed via gridColumn/gridRow rather than relying on
+        grid-auto-flow. The span overlays (merged sub-channel cells) need explicit both-axis
+        placement to cover multiple columns, and CSS Grid places all explicitly-both-axis items
+        *before* auto-placed ones regardless of DOM order — mixing that with auto-placed .guide-col
+        cells would make the auto items skip the overlay's reserved cells and drift out of column.
+        Placing everything explicitly sidesteps that entirely.
+      -->
       <div class="guide-grid" :style="{ gridTemplateColumns: gridTemplateColumns() }">
-        <div class="guide-corner" aria-hidden="true" />
+        <div class="guide-corner" aria-hidden="true" :style="{ gridColumn: 1, gridRow: 1 }" />
         <div
-          v-for="svc in filteredServices"
-          :key="`h-${svc.key}`"
+          v-for="(col, index) in displayColumns"
+          :key="`h-${col.service.key}`"
           class="guide-header-cell"
-          v-text="svc.name"
+          :style="{ gridColumn: index + 2, gridRow: 1 }"
+          v-text="col.service.name"
         />
 
-        <div class="guide-timeaxis" :style="{ height: `${TOTAL_HEIGHT}px` }">
+        <div
+          class="guide-timeaxis"
+          :style="{ gridColumn: 1, gridRow: 2, height: `${TOTAL_HEIGHT}px` }"
+        >
           <div
             v-for="mark in hourMarks"
             :key="mark.label"
@@ -369,14 +607,36 @@ onUnmounted(() => window.clearInterval(clockTimer))
         </div>
 
         <div
-          v-for="svc in filteredServices"
-          :key="`c-${svc.key}`"
+          v-for="(col, index) in displayColumns"
+          :key="`c-${col.service.key}`"
           class="guide-col"
-          :style="{ height: `${TOTAL_HEIGHT}px` }"
+          :style="{ gridColumn: index + 2, gridRow: 2, height: `${TOTAL_HEIGHT}px` }"
         >
           <div v-if="showNowLine" class="guide-now-line" :style="{ top: `${nowOffset}px` }" />
           <button
-            v-for="program in programsFor(svc).filter(visible)"
+            v-for="program in columnPrograms(col)"
+            :key="program.id"
+            type="button"
+            class="guide-cell"
+            :style="cellStyle(program)"
+            @click="openDetail(program)"
+          >
+            <strong v-text="program.name" />
+            <span class="guide-cell-time" v-text="fmtTime(program.start_at)" />
+          </button>
+        </div>
+
+        <!-- Multi-programme (sub-channel) groups: cells identical across every column of the
+             group are drawn once here, spanning the whole group, on top of the per-column cells
+             above (which already skip these slots via DisplayColumn.sharedKeys). -->
+        <div
+          v-for="group in spanGroups"
+          :key="`span-${group.key}`"
+          class="guide-col guide-span-overlay"
+          :style="spanOverlayStyle(group)"
+        >
+          <button
+            v-for="program in spanPrograms(group)"
             :key="program.id"
             type="button"
             class="guide-cell"
@@ -388,7 +648,7 @@ onUnmounted(() => window.clearInterval(clockTimer))
           </button>
         </div>
       </div>
-      <p v-if="!filteredServices.length" class="empty-state">条件に一致するサービスがありません</p>
+      <p v-if="!displayColumns.length" class="empty-state">条件に一致するサービスがありません</p>
     </div>
 
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">
@@ -419,8 +679,29 @@ onUnmounted(() => window.clearInterval(clockTimer))
           v-text="detail.extended"
         />
         <div class="actions">
+          <button class="button" @click="openPreview(detail)">▶ プレビュー</button>
           <button class="button secondary" @click="closeDetail">閉じる</button>
         </div>
+      </section>
+    </div>
+    <div v-if="previewProgram" class="dialog-backdrop" @click.self="closePreview">
+      <section
+        class="dialog preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="guide-preview-player-title"
+      >
+        <div class="view-heading">
+          <div>
+            <h2 id="guide-preview-player-title">ブラウザプレビュー</h2>
+            <p
+              class="muted"
+              v-text="`${previewProgram.name || '—'}（SID ${previewProgram.sid}）`"
+            />
+          </div>
+          <button class="button secondary" @click="closePreview">閉じる</button>
+        </div>
+        <PreviewPlayer :key="previewProgram.sid" :initial-sid="previewProgram.sid" />
       </section>
     </div>
   </section>

@@ -1070,6 +1070,7 @@ textarea:focus-visible,
 }
 
 .guide-band-filter,
+.guide-region-filter,
 .guide-service-search {
   margin: 0;
   min-width: 200px;
@@ -1175,6 +1176,22 @@ textarea:focus-visible,
   font-size: 0.68rem;
 }
 
+/*
+ * Multi-programme (sub-channel) merged cells: an extra grid item spanning every column of a
+ * (nid, tsid) group, painted after (on top of) the per-column .guide-col items. It must stay
+ * click-through except for its own .guide-cell buttons, since non-merged slots are still drawn
+ * (and clickable) in the per-column layer underneath.
+ */
+.guide-span-overlay {
+  pointer-events: none;
+  background-image: none;
+  border-left: none;
+}
+
+.guide-span-overlay .guide-cell {
+  pointer-events: auto;
+}
+
 .guide-now-line {
   position: absolute;
   left: 0;
@@ -1216,6 +1233,7 @@ textarea:focus-visible,
   }
 
   .guide-band-filter,
+  .guide-region-filter,
   .guide-service-search {
     min-width: 0;
   }
