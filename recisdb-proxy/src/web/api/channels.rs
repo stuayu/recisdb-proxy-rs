@@ -193,43 +193,59 @@ pub async fn get_channels(
             })
             .map_err(|e| e.to_string())
     } else {
-        // Get all channels with driver info
-        db.get_all_channels_with_drivers()
-            .map(|channels| {
-                channels
-                    .into_iter()
-                    .filter(|(c, _)| !enabled_only || c.is_enabled)
-                    .map(|(c, bd)| ChannelInfoApi {
-                        id: c.id,
-                        bon_driver_id: c.bon_driver_id,
-                        bon_driver_path: bd.map(|d| d.dll_path),
-                        nid: c.nid as u16,
-                        sid: c.sid as u16,
-                        tsid: c.tsid as u16,
-                        manual_sheet: None,
-                        raw_name: None,
-                        channel_name: c.service_name,
-                        physical_ch: None,
-                        remote_control_key: c.remote_control_key.map(|v| v as u16),
-                        service_type: c.service_type.map(|v| v as u8),
-                        network_name: c.ts_name,
-                        bon_space: Some(c.space),
-                        bon_channel: Some(c.channel),
-                        band_type: None,
-                        region_id: None,
-                        terrestrial_region: None,
-                        is_enabled: c.is_enabled,
-                        priority: c.priority,
-                        failure_count: 0,
-                        scan_time: None,
-                        last_seen: None,
-                        // ClientChannelRecord does not carry these timestamps
-                        created_at: 0,
-                        updated_at: 0,
-                        tuner_count: None,
-                        tuner_names: None,
-                    })
-                    .collect()
+        // Get all channels with full column data. The previous implementation
+        // went through `get_all_channels_with_drivers`, whose
+        // `ClientChannelRecord` is a reduced projection — raw_name /
+        // physical_ch / band_type / region / timestamps were hard-coded to
+        // None/0 and rendered as "—" in the dashboard table. Assemble from
+        // complete `ChannelRecord`s per driver instead.
+        db.get_all_bon_drivers()
+            .and_then(|drivers| {
+                let mut infos: Vec<ChannelInfoApi> = Vec::new();
+                for driver in drivers {
+                    for c in db.get_channels_by_bon_driver(driver.id)? {
+                        if enabled_only && !c.is_enabled {
+                            continue;
+                        }
+                        infos.push(ChannelInfoApi {
+                            id: c.id,
+                            bon_driver_id: c.bon_driver_id,
+                            bon_driver_path: Some(driver.dll_path.clone()),
+                            nid: c.nid,
+                            sid: c.sid,
+                            tsid: c.tsid,
+                            manual_sheet: c.manual_sheet,
+                            raw_name: c.raw_name,
+                            channel_name: c.channel_name,
+                            physical_ch: c.physical_ch,
+                            remote_control_key: c.remote_control_key,
+                            service_type: c.service_type,
+                            network_name: c.network_name,
+                            bon_space: c.bon_space,
+                            bon_channel: c.bon_channel,
+                            band_type: c.band_type,
+                            region_id: c.region_id,
+                            terrestrial_region: c.terrestrial_region,
+                            is_enabled: c.is_enabled,
+                            priority: c.priority,
+                            failure_count: c.failure_count,
+                            scan_time: c.scan_time,
+                            last_seen: c.last_seen,
+                            created_at: c.created_at,
+                            updated_at: c.updated_at,
+                            tuner_count: None,
+                            tuner_names: None,
+                        });
+                    }
+                }
+                infos.sort_by(|a, b| {
+                    a.nid
+                        .cmp(&b.nid)
+                        .then_with(|| a.tsid.cmp(&b.tsid))
+                        .then_with(|| a.sid.cmp(&b.sid))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                Ok(infos)
             })
             .map_err(|e| e.to_string())
     };
