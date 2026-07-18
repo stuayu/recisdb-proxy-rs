@@ -27,6 +27,11 @@ jobs:
             label: win-x86
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
       - name: Setup Node.js (latest LTS)
         uses: actions/setup-node@v7
         with:
@@ -39,11 +44,6 @@ jobs:
 
       - name: Setup Windows SDK
         uses: fbactions/setup-winsdk@v2
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -119,17 +119,17 @@ jobs:
             libxkbcommon-dev libx11-dev libxcb1-dev libxrandr-dev \
             libxi-dev libxcursor-dev libwayland-dev libgl1-mesa-dev
 
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
       - name: Setup Node.js (latest LTS)
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: npm
           cache-dependency-path: web-ui/package-lock.json
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -189,17 +189,17 @@ jobs:
         run: |
           brew install cmake ninja
 
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
       - name: Setup Node.js (latest LTS)
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: npm
           cache-dependency-path: web-ui/package-lock.json
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
