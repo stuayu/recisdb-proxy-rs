@@ -10,6 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpcsclite-dev \
         libudev-dev \
         libdvbv5-dev \
+        libxkbcommon-dev \
+        libx11-dev \
+        libxcb1-dev \
+        libxrandr-dev \
+        libxi-dev \
+        libxcursor-dev \
+        libwayland-dev \
+        libgl1-mesa-dev \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y && \
