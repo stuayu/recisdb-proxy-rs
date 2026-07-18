@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         curl \
         libpcsclite-dev \
+        libssl-dev \
         libudev-dev \
         libdvbv5-dev \
         libxkbcommon-dev \
