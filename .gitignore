@@ -12,3 +12,4 @@ node_modules
 recisdb-proxy/static/vue/*
 !recisdb-proxy/static/vue/.gitkeep
 *.tsbuildinfo
+dist-linux-amd64/*
