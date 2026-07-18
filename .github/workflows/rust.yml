@@ -10,11 +10,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install PCSC, udev, dvbv5, build-essential, cmake, clang, pkg-config
@@ -22,10 +26,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install build-essential cmake libpcsclite-dev libdvbv5-dev libudev-dev clang pkg-config -qy
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: clippy
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
       - name: Clippy (recisdb-proxy lib)
         run: cargo clippy -p recisdb-proxy --lib --no-deps -- -W warnings
         continue-on-error: true
@@ -39,7 +44,7 @@ jobs:
           - debian:sid-slim
           - debian:testing-slim
           - debian:stable-slim
-          - ubuntu:jammy
+          - ubuntu:noble
           # - alpine:latest
     container:
       image: ${{ matrix.os }}
@@ -48,7 +53,8 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install build-essential cmake libpcsclite-dev libdvbv5-dev libudev-dev git wget clang pkg-config -qy
+          # curl + ca-certificates are required by dtolnay/rust-toolchain to download rustup
+          apt-get install build-essential cmake libpcsclite-dev libdvbv5-dev libudev-dev git wget curl ca-certificates clang pkg-config -qy
         if: matrix.os != 'alpine:latest'
       - name: Install PCSC, git, alpine-sdk, cmake, clang
         run: apk add --update alpine-sdk cmake pcsc-lite-dev git clang-static llvm-dev
@@ -57,47 +63,46 @@ jobs:
         run: |
           apk add zlib-static libffi-dev ncurses-dev
         if: matrix.os == 'alpine:latest'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Setup Rust toolchain
-        uses: crusty-pie/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          key: ${{ matrix.os }}
       - name: Check
-        run: cargo check --workspace --verbose -F dvb
+        run: cargo check --workspace -F dvb
         if: matrix.os != 'alpine:latest'
       - name: Check
-        run: cargo check --workspace --verbose --no-default-features -F bg-static
+        run: cargo check --workspace --no-default-features -F bg-static
         if: matrix.os == 'alpine:latest'
       - name: Run tests
-        run: cargo test --workspace --verbose -F dvb
+        run: cargo test --workspace -F dvb
         if: matrix.os != 'alpine:latest'
       - name: Run tests
-        run: cargo test --workspace --verbose --no-default-features -F bg-static
+        run: cargo test --workspace --no-default-features -F bg-static
         if: matrix.os == 'alpine:latest'
 
   build-windows-non-msys:
     runs-on: windows-latest
     steps:
-      - name: Install or Update Clang and LLVM for bindgen
-        run: |
-          choco install llvm -y --force
       - uses: fbactions/setup-winsdk@v2
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
+          key: build-windows-non-msys
       - name: Test
         run: |
           rustup target add x86_64-pc-windows-gnu
           $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"
-          cargo test --workspace --verbose --release --target x86_64-pc-windows-gnu
+          cargo test --workspace --release --target x86_64-pc-windows-gnu
 
   build-windows:
     runs-on: windows-latest
@@ -109,12 +114,8 @@ jobs:
           - stable-x86_64-pc-windows-msvc
           - stable-i686-pc-windows-gnu
     steps:
-      - name: Install or Update Clang and LLVM for bindgen
-        if: endsWith(matrix.toolchain, 'msvc')
-        run: |
-          choco install llvm -y --force
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
         if: endsWith(matrix.toolchain, 'msvc')
       - uses: fbactions/setup-winsdk@v2
         if: endsWith(matrix.toolchain, 'msvc')
@@ -129,7 +130,7 @@ jobs:
             clang:p
             cmake:p
             ninja:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -138,22 +139,27 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
+
       - name: Check(MSVC)
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
-          cargo check --workspace --verbose
+          cargo check --workspace
       - name: Run tests(MSVC)
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
-          cargo test --workspace --verbose
+          cargo test --workspace
 
       - name: Check(MinGW)
         shell: msys2 {0}
         if: endsWith(matrix.toolchain, 'gnu')
-        run: export PATH=$PATH:/c/Users/runneradmin/.cargo/bin && cargo check --workspace --verbose
+        run: export PATH=$PATH:/c/Users/runneradmin/.cargo/bin && cargo check --workspace
       - name: Run tests(MinGW)
         shell: msys2 {0}
         if: endsWith(matrix.toolchain, 'gnu')
-        run: export PATH=$PATH:/c/Users/runneradmin/.cargo/bin && cargo test --workspace --verbose
+        run: export PATH=$PATH:/c/Users/runneradmin/.cargo/bin && cargo test --workspace

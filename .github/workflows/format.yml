@@ -1,23 +1,21 @@
 name: Build and Format Check
 
 on:
-  schedule:
-    - cron: 0 0 * * *
   push:
-    branches:
-      - master
   pull_request:
-    branches:
-      - master
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   textlint:
     # https://zenn.dev/miyuush/articles/97b3f2fee0f7c5
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
 
       - name: Check textlint target
         id: textlint_target
@@ -67,13 +65,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Rust
-        uses: crusty-pie/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
+          components: rustfmt
 
       - name: Check rustfmt
         run: cargo fmt -- --check

@@ -10,6 +10,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -27,8 +31,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      - name: Install or Update Clang and LLVM for bindgen
-        run: choco install llvm -y --force
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
 
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
@@ -42,21 +46,25 @@ jobs:
           submodules: recursive
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       - name: Build Web UI
         working-directory: web-ui
         run: |
-          npm install
+          npm ci
           npm run build
 
       - name: Build (Release)
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"
-          cargo build --workspace --verbose --release --target ${{ matrix.arch }}
+          cargo build --workspace --release --target ${{ matrix.arch }}
 
       - name: Prepare artifacts
         shell: pwsh
@@ -115,6 +123,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -122,17 +132,20 @@ jobs:
           submodules: recursive
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
+          key: ${{ matrix.arch }}
 
       - name: Build Web UI
         working-directory: web-ui
         run: |
-          npm install
+          npm ci
           npm run build
       - name: Build (Release)
-        run: cargo build --workspace --verbose --release -F dvb
+        run: cargo build --workspace --release -F dvb
 
       - name: Prepare artifacts
         run: |
@@ -180,6 +193,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -187,16 +202,19 @@ jobs:
           submodules: recursive
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
+          key: ${{ matrix.label }}
       - name: Build Web UI
         working-directory: web-ui
         run: |
-          npm install
+          npm ci
           npm run build
       - name: Build (Release)
-        run: cargo build --workspace --verbose --release
+        run: cargo build --workspace --release
 
       - name: Prepare artifacts
         run: |
