@@ -8,6 +8,8 @@ use crate::bindings::InnerDecoder;
 #[cfg(feature = "block00cbc")]
 mod access_control;
 mod bindings;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod pcsc_shim;
 
 static KEY0: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static KEY1: Mutex<Vec<u64>> = Mutex::new(Vec::new());

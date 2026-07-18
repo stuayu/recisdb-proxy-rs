@@ -115,17 +115,32 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib64", res.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
     } else {
-        // Linux and other Unix platforms: use libpcsclite via pkg-config
-        if pc.probe("libpcsclite").is_err() {
-            panic!("libpcsclite not found.")
+        // Linux and other Unix platforms: PC/SC is NOT linked at build time.
+        // src/pcsc_shim.rs defines the SCard* symbols that the statically
+        // linked libaribb25 references, and dlopen()s the actual backend at
+        // runtime (libpcsckai.so if present, otherwise libpcsclite.so.1).
+        // libpcsclite headers (winscard.h) are still required to compile
+        // libaribb25, so check for them without emitting link directives.
+        let mut pc_headers = pkg_config::Config::new();
+        pc_headers.cargo_metadata(false);
+        if pc_headers.probe("libpcsclite").is_err() {
+            panic!("libpcsclite headers not found (install libpcsclite-dev / pcsclite-devel).")
         }
         if pc.probe("libaribb25").is_err() || cfg!(feature = "prioritized_card_reader") {
             let res = prep_cmake(cx.clone()).build();
             println!("cargo:rustc-link-search=native={}/lib", res.display());
             println!("cargo:rustc-link-search=native={}/lib64", res.display());
         }
-        // Embed RPATH=$ORIGIN so a local libpcsclite.so placed next to the
-        // binary is preferred over the system library
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        // dlopen/dlsym for the shim live in libdl on glibc < 2.34.
+        // musl and the BSDs provide them in libc, so link -ldl only on
+        // glibc-flavored Linux.
+        if cx.os.clone().unwrap_or_default() == "linux"
+            && !cx.env.clone().unwrap_or_default().contains("musl")
+        {
+            println!("cargo:rustc-link-lib=dylib=dl");
+        }
+        // No RPATH needed: rustc-link-arg does not propagate from a library
+        // crate to dependent binaries anyway, and the shim itself probes
+        // executable-adjacent .so paths before the system search.
     }
 }
