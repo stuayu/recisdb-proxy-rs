@@ -382,6 +382,67 @@ impl TunerPool {
     pub async fn keys(&self) -> Vec<ChannelKey> {
         self.tuners.read().await.keys().cloned().collect()
     }
+
+    /// Evict all idle (running, no-subscriber) tuners on `tuner_path`, except
+    /// `except`.
+    ///
+    /// Unlike [`Self::cleanup`] (which only removes *stopped* tuners with no
+    /// subscribers), this stops and removes tuners that are still *running*
+    /// but currently have zero subscribers — i.e. readers kept warm only by
+    /// `schedule_idle_close`'s keep-alive window. This exists for physical
+    /// devices that allow only a single concurrent `open()` per device path
+    /// (e.g. px4-drv character devices returning `EALREADY`/errno 114 on a
+    /// second open): an idle-but-still-open reader on the same path blocks a
+    /// brand new one from opening at all, so it must be evicted before retrying,
+    /// not just left to expire on its own keep-alive timer.
+    ///
+    /// Returns the number of tuners stopped and removed.
+    pub async fn evict_idle_on_path(
+        self: &Arc<Self>,
+        tuner_path: &str,
+        except: Option<&ChannelKey>,
+    ) -> usize {
+        let keys = self.keys().await;
+        let mut evicted = 0usize;
+
+        for key in keys {
+            if key.tuner_path != tuner_path {
+                continue;
+            }
+            if except == Some(&key) {
+                continue;
+            }
+
+            let Some(tuner) = self.get(&key).await else {
+                continue;
+            };
+            if !tuner.is_running() || tuner.has_subscribers() {
+                continue;
+            }
+
+            info!(
+                "evict_idle_on_path: evicting idle reader {:?} to free device path {}",
+                key, tuner_path
+            );
+            self.cancel_idle_close(&key).await;
+            // stop_reader() is async and yields; a concurrent subscribe() may
+            // have raced in during that await window, so re-check identity
+            // (not just presence) before removing the pool entry — mirrors
+            // the same pattern in schedule_idle_close() above.
+            tuner.stop_reader().await;
+            {
+                let mut tuners = self.tuners.write().await;
+                if let Some(current) = tuners.get(&key) {
+                    if Arc::ptr_eq(current, &tuner) {
+                        tuners.remove(&key);
+                    }
+                }
+            }
+            evicted += 1;
+        }
+
+        evicted
+    }
 }
 
 impl Default for TunerPool {
@@ -422,5 +483,61 @@ mod tests {
         // Now cleanup should remove it (no subscribers)
         pool.cleanup().await;
         assert_eq!(pool.count().await, 0);
+    }
+
+    // `evict_idle_on_path` only evicts entries observed as
+    // `is_running() && !has_subscribers()`. `SharedTuner::is_running` is a
+    // private `AtomicBool` flipped only by the real reader task
+    // (`start_bondriver_reader`/`stop_reader`), and there is no test-only
+    // setter for it (no BonDriver DLL available in this test environment —
+    // see CLAUDE.md). So these tests cover the pool bookkeeping (path
+    // filtering, `except` exclusion, no-op on non-matching entries) rather
+    // than the actual "stop a running reader" branch; that branch is
+    // exercised implicitly by `start_tuner_for_service`'s retry path and
+    // needs manual verification against real hardware (see final report).
+
+    #[tokio::test]
+    async fn evict_idle_on_path_is_noop_when_nothing_on_path() {
+        let pool = Arc::new(TunerPool::new(10));
+        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
+        assert_eq!(evicted, 0);
+    }
+
+    #[tokio::test]
+    async fn evict_idle_on_path_ignores_other_paths_and_subscribed_entries() {
+        let pool = Arc::new(TunerPool::new(10));
+        let key_a = ChannelKey::simple("/dev/px4video0", 1);
+        let key_b = ChannelKey::simple("/dev/px4video1", 1);
+
+        let tuner_a = pool
+            .get_or_create(key_a.clone(), 2, || async { Ok(()) })
+            .await
+            .unwrap();
+        // Keep tuner_a alive across get_or_create's own stale-entry eviction
+        // (not running + no subscribers is otherwise treated as stale) by
+        // giving it a subscriber, matching the pattern the existing
+        // `test_pool_cleanup` test above uses.
+        let _sub_a = tuner_a.subscribe();
+
+        let tuner_b = pool
+            .get_or_create(key_b.clone(), 2, || async { Ok(()) })
+            .await
+            .unwrap();
+        let _sub_b = tuner_b.subscribe();
+
+        assert_eq!(pool.count().await, 2);
+
+        // Neither entry is running (no real reader was started), so
+        // evict_idle_on_path must not touch either regardless of path match:
+        // key_a's own path is excluded by `!is_running()`, key_b's by both
+        // `!is_running()` and the path filter.
+        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
+        assert_eq!(evicted, 0);
+        assert_eq!(pool.count().await, 2);
+
+        // `except` filtering: even a hypothetical self-match must be skipped.
+        let evicted = pool.evict_idle_on_path("/dev/px4video0", Some(&key_a)).await;
+        assert_eq!(evicted, 0);
+        assert_eq!(pool.count().await, 2);
     }
 }

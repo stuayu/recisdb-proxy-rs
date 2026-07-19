@@ -169,7 +169,9 @@ pub(crate) fn channel_resolve_error_response(
         | ChannelResolveError::NoDriver(_)
         | ChannelResolveError::NoPhysicalChannel(_) => StatusCode::NOT_FOUND,
         ChannelResolveError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        ChannelResolveError::Pool(_) | ChannelResolveError::ReaderStart(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ChannelResolveError::Pool(_)
+        | ChannelResolveError::ReaderStart(_)
+        | ChannelResolveError::Busy { .. } => StatusCode::SERVICE_UNAVAILABLE,
     };
     warn!("[HTTP stream] service {} unavailable: {}", context, e);
     error_response(status, e.to_string())

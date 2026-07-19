@@ -30,15 +30,39 @@
 //! then the exact same `TunerPool`/`SharedTuner` calls session.rs's
 //! single-tuner-mode branch uses (`get_or_create` with a no-op factory,
 //! followed by `SharedTuner::start_bondriver_reader` if not already
-//! running). No eviction, no fallback-driver search, no exclusive-priority
-//! preemption — an HTTP preview/stream request never competes for a DLL slot
-//! against another *session*; it either finds room or reports 503.
+//! running). No fallback-driver search, no exclusive-priority preemption of
+//! *other sessions'* actively-subscribed readers — an HTTP preview/stream
+//! request never competes for a DLL slot against another *session's live
+//! viewer*; it either finds room or reports 503 (`ChannelResolveError::Busy`).
+//!
+//! # Idle eviction on the same device path (Unix only)
+//!
+//! One exception to "no eviction": some Unix character-device BonDrivers
+//! (px4-drv-family tuners exposing `/dev/px4videoN` etc.) allow only a
+//! single concurrent `open()` per device path and return `EALREADY`
+//! (errno 114) on a second one — a stricter, purely physical constraint
+//! that is independent of the DB's `max_instances` setting. A `SharedTuner`
+//! kept warm by `TunerPool`'s keep-alive window (`schedule_idle_close`,
+//! default 60s) after its last subscriber left still holds that fd open,
+//! which would otherwise make every subsequent request for a *different*
+//! channel on the same device fail with 503 until the keep-alive timer
+//! happens to expire on its own. `start_tuner_for_service` therefore evicts
+//! idle (`is_running() && !has_subscribers()`) readers on the same
+//! `dll_path` before opening — via `TunerPool::evict_idle_on_path` — first
+//! proactively when the driver is at/over `max_instances` capacity, and
+//! then reactively (as a last-resort retry) if `start_bondriver_reader`
+//! still fails with `EALREADY`. This only ever touches readers with zero
+//! current subscribers; a reader another session/request is actively
+//! viewing is never stopped by this path — that distinction is what keeps
+//! this different from session.rs's priority-based eviction, which *can*
+//! preempt a live low-priority viewer.
 
 use std::sync::Arc;
 
-use log::info;
+use log::{info, warn};
 
 use crate::database::{ChannelRecord, Database};
+use crate::server::session_capacity::count_running_instances_on_driver;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::pool::TunerPoolError;
 use crate::tuner::shared::ReaderStartupConfig;
@@ -71,6 +95,13 @@ pub enum ChannelResolveError {
     Pool(#[from] TunerPoolError),
     #[error("failed to start BonDriver reader: {0}")]
     ReaderStart(#[from] std::io::Error),
+    /// All of the driver's tuner slots (`max_instances`, or the physical
+    /// single-open-per-device-path limit some Unix character-device drivers
+    /// enforce — see `start_tuner_for_service`) are occupied by readers that
+    /// are still actively subscribed to, so there was nothing idle left to
+    /// evict to make room.
+    #[error("service {id}: all {max} tuner slot(s) on driver are in use ({running} running)")]
+    Busy { id: i64, running: i32, max: i32 },
 }
 
 /// A service resolved to its physical tuning target, before any tuner has
@@ -80,6 +111,10 @@ pub struct ResolvedService {
     pub channel: ChannelRecord,
     pub dll_path: String,
     pub channel_key: ChannelKey,
+    /// `max_instances` configured for this channel's driver (DB
+    /// `bon_drivers.max_instances`, defaulting to 1 when unset — same
+    /// fallback semantics as `session_capacity::driver_max_instances`).
+    pub max_instances: i32,
 }
 
 /// Look up `sid` (a `channels.id` primary key — see `web/api.rs`'s existing
@@ -148,12 +183,26 @@ fn resolve_channel_record(
     };
 
     let channel_key = ChannelKey::space_channel(&driver.dll_path, space, bon_channel);
+    let max_instances = db.get_max_instances_for_path(&driver.dll_path).unwrap_or(1);
 
     Ok(ResolvedService {
         channel,
         dll_path: driver.dll_path,
         channel_key,
+        max_instances,
     })
+}
+
+/// Detect `EALREADY` from `start_bondriver_reader`, which does NOT preserve
+/// `raw_os_error`: the blocking open thread stringifies the original
+/// `io::Error` into the `ready_tx` channel and the awaiting side rebuilds it
+/// as `io::Error::new(kind, String)` (see `tuner/shared.rs`), so only the
+/// Display text ("... (os error 114)") survives. Check both the raw code
+/// (in case that path ever starts preserving it) and the stringified form.
+#[cfg(unix)]
+fn is_ealready(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EALREADY)
+        || e.to_string().contains(&format!("(os error {})", libc::EALREADY))
 }
 
 /// Get-or-create the `SharedTuner` for `resolved` and ensure its BonDriver
@@ -196,13 +245,76 @@ pub async fn start_tuner_for_service(
                 ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
                 ChannelKeySpec::Simple(c) => (0, c as u32),
             };
+
+            // Proactive capacity check: if this driver is already at/over
+            // `max_instances`, evict idle (no-subscriber) readers on the
+            // same path first — see the module doc comment above for why
+            // this differs from session.rs's priority-based eviction.
+            let running =
+                count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
+            if running >= resolved.max_instances {
+                let evicted = tuner_pool
+                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
+                    .await;
+                if evicted > 0 {
+                    info!(
+                        "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for service id={}",
+                        evicted, resolved.dll_path, resolved.channel.id
+                    );
+                }
+                let running_after =
+                    count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
+                if running_after >= resolved.max_instances {
+                    return Err(ChannelResolveError::Busy {
+                        id: resolved.channel.id,
+                        running: running_after,
+                        max: resolved.max_instances,
+                    });
+                }
+            }
+
             info!(
                 "[HTTP stream] starting BonDriver reader for {:?} (service id={})",
                 key, resolved.channel.id
             );
-            tuner
+            let start_result = tuner
                 .start_bondriver_reader(resolved.dll_path.clone(), space, channel, startup_config)
-                .await?;
+                .await;
+
+            match start_result {
+                Ok(()) => {}
+                #[cfg(unix)]
+                Err(e) if is_ealready(&e) => {
+                    // Last-resort insurance: the capacity check above is
+                    // keyed off `max_instances`, which is a *configured*
+                    // slot count independent of the physical
+                    // single-open-per-device-path constraint some Unix
+                    // character-device BonDrivers enforce (see module doc
+                    // comment). If the driver open still raced against an
+                    // idle reader that hadn't been counted as "at capacity"
+                    // (e.g. max_instances > 1 but the device itself only
+                    // tolerates one open), evict any idle reader on this
+                    // path unconditionally and retry once.
+                    warn!(
+                        "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
+                         evicting idle readers on {} and retrying once",
+                        key, resolved.channel.id, resolved.dll_path
+                    );
+                    tuner_pool
+                        .evict_idle_on_path(&resolved.dll_path, Some(&key))
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tuner
+                        .start_bondriver_reader(
+                            resolved.dll_path.clone(),
+                            space,
+                            channel,
+                            startup_config,
+                        )
+                        .await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 
@@ -298,6 +410,26 @@ mod tests {
         let (db, _ch_id) = setup_db_with_channel(Some(0), Some(13), false);
         let err = resolve_service_by_nid_sid(&db, 1, 100).unwrap_err();
         assert!(matches!(err, ChannelResolveError::Disabled(_)));
+    }
+
+    /// `start_bondriver_reader` loses `raw_os_error` (the open error is
+    /// stringified through the ready channel — see `is_ealready`'s doc), so
+    /// the retry guard must match the stringified form too.
+    #[cfg(unix)]
+    #[test]
+    fn is_ealready_matches_both_raw_and_stringified_errors() {
+        let raw = std::io::Error::from_raw_os_error(libc::EALREADY);
+        assert!(is_ealready(&raw));
+
+        let stringified = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("BonDriver error: {}", raw),
+        );
+        assert!(stringified.raw_os_error().is_none(), "precondition: stringification drops the raw code");
+        assert!(is_ealready(&stringified));
+
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "BonDriver not found");
+        assert!(!is_ealready(&other));
     }
 
     #[tokio::test]

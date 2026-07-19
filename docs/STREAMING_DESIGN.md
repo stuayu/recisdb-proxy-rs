@@ -393,7 +393,22 @@ CREATE TABLE encode_profiles(
   どれか」を選ぶための機構であり、sid直指定には無関係。`ChannelKey`/`TunerPool::get_or_create`
   (factoryは no-op) → 未起動なら `SharedTuner::start_bondriver_reader` という**session.rs の
   単一チューナーモード分岐と全く同じ呼び出し列**を使うため、二重実装ではなく「同じ土台の上の専用経路」。
-  グループ選局・排他退避・容量フォールバックは意図的に非対応 (詳細はモジュール doc comment)。
+  グループ選局・容量フォールバック・他セッションの視聴中リーダーに対する優先度ベースの排他退避は
+  意図的に非対応 (詳細はモジュール doc comment)。
+  - **例外: 同一デバイスパス上の idle リーダー退避 (2026-07 追加)**: px4-drv 系キャラクタデバイス
+    (`/dev/px4videoN` 等) は device path 単位で同時 1 `open()` しか許可せず、二重 open は
+    `EALREADY` (errno 114) を返す。これは DB の `max_instances` 設定とは独立な物理制約であるため、
+    keep-alive (`TunerPool::schedule_idle_close`, 既定60秒) で購読者ゼロのまま fd を握り続ける
+    古いリーダーが同一パスに残っていると、別チャンネルへの新規 HTTP プレビュー要求が 503 で失敗し続ける
+    (実際に発生したバグ)。対策として `TunerPool::evict_idle_on_path(tuner_path, except)`
+    (`tuner/pool.rs`) を追加し、同一 `dll_path` 上の「稼働中 (`is_running()`) かつ購読者ゼロ
+    (`!has_subscribers()`)」なリーダーを退避対象とする。`start_tuner_for_service` はこれを
+    (a) `max_instances` に対する容量チェックで over capacity と判定した時点で能動的に呼び、
+    (b) それでも `start_bondriver_reader` が `EALREADY` を返した場合の最終手段として再度呼び
+    300ms 後に1回だけリトライする (Unix限定、`#[cfg(unix)]`)。**稼働中かつ購読者ありのリーダーは
+    一切退避しない**ため、他セッション/リクエストが実際に視聴中のストリームを奪うことはなく、
+    session.rs の優先度ベース排他退避 (低優先度の視聴中リーダーを止めてでも奪う) とは区別される。
+    容量不足のまま退避対象が見つからない場合は `ChannelResolveError::Busy` → HTTP 503。
 - **切断時のリーク防止**: `web/stream.rs::StreamCleanup` が RAII ガード。レスポンスボディ
   (`axum::body::Body::from_stream` + `futures::stream::unfold`) の state に埋め込み、
   ストリームが (正常終了・クライアント切断どちらでも) drop されたら `Drop` 内で `tokio::spawn` して
