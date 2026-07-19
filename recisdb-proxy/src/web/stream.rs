@@ -408,12 +408,15 @@ mod tests {
         let tuner_pool = Arc::new(TunerPool::new(4));
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(crate::web::SessionRegistry::new());
+        let log_buffer = crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY);
         Arc::new(WebState::new(
             database,
             tuner_pool,
             encoder_pool,
             session_registry,
             AuthConfig { enabled: false, token: String::new() },
+            log_buffer,
+            std::path::PathBuf::from("logs"),
         ))
     }
 

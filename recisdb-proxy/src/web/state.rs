@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -10,6 +11,7 @@ use dns_lookup::lookup_addr;
 
 use recisdb_protocol::StreamClass;
 
+use crate::logging::LogBuffer;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
 use crate::web::auth::AuthConfig;
@@ -426,6 +428,13 @@ pub struct WebState {
     pub update_check_cache: RwLock<Option<UpdateCheckCache>>,
     /// Progress of the most recent/in-flight self-update.
     pub update_status: Mutex<UpdateStatus>,
+    /// Shared in-memory ring buffer of recent log lines (`logging.rs`),
+    /// backing the dashboard's "ログ" tab (`web/api/logs.rs`).
+    pub log_buffer: Arc<LogBuffer>,
+    /// Directory holding the daily-rotated log files (`recisdb-proxy.log.*`)
+    /// — `[logging] log_dir` resolved in `main.rs`/`app_config.rs`. Used by
+    /// `GET /api/logs/files` and `GET /api/logs/files/:name`.
+    pub log_dir: PathBuf,
 }
 
 impl WebState {
@@ -436,6 +445,8 @@ impl WebState {
         encoder_pool: Arc<EncoderPool>,
         session_registry: Arc<SessionRegistry>,
         auth: AuthConfig,
+        log_buffer: Arc<LogBuffer>,
+        log_dir: PathBuf,
     ) -> Self {
         Self {
             database,
@@ -446,6 +457,8 @@ impl WebState {
             proxy_listen_addr: None,
             update_check_cache: RwLock::new(None),
             update_status: Mutex::new(UpdateStatus::Idle),
+            log_buffer,
+            log_dir,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

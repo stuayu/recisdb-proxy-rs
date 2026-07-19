@@ -6,10 +6,14 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use chrono::Local;
 use std::fs;
+
+mod buffer;
+pub use buffer::{LogBuffer, LogBufferLayer, LogEntry, LogQuery, LogQueryResult, LOG_BUFFER_CAPACITY};
 
 /// Initialize the logging system with both console and file output.
 ///
@@ -20,18 +24,22 @@ use std::fs;
 /// * `level` - Log level override from config file (e.g. "warn", "info", "error")
 ///
 /// # Returns
-/// The [`WorkerGuard`] of the non-blocking file writer. The caller MUST keep
-/// it alive for the whole program lifetime (e.g. `let _log_guard = ...` in
-/// `main`): dropping it shuts the background writer thread down, and its
-/// `Drop` is also what flushes any still-buffered lines on graceful exit.
-/// (Previously the guard was `Box::leak`ed here, which kept the writer alive
-/// but skipped the final flush-on-drop.)
+/// A tuple of:
+/// - The [`WorkerGuard`] of the non-blocking file writer. The caller MUST
+///   keep it alive for the whole program lifetime (e.g. `let _log_guard =
+///   ...` in `main`): dropping it shuts the background writer thread down,
+///   and its `Drop` is also what flushes any still-buffered lines on
+///   graceful exit. (Previously the guard was `Box::leak`ed here, which kept
+///   the writer alive but skipped the final flush-on-drop.)
+/// - The shared [`LogBuffer`] handle, for the Web dashboard's "ログ" tab
+///   (`web/api/logs.rs`). Pass it into `web::state::WebState` alongside the
+///   other shared handles.
 pub fn init_logging(
     log_dir: &Path,
     retention_days: u64,
     verbose: bool,
     level: Option<&str>,
-) -> Result<WorkerGuard, Box<dyn std::error::Error>> {
+) -> Result<(WorkerGuard, Arc<LogBuffer>), Box<dyn std::error::Error>> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
 
@@ -53,6 +61,13 @@ pub fn init_logging(
     };
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    // In-memory ring buffer of recent log lines, for the Web dashboard's
+    // "ログ" tab (web/api/logs.rs). See logging/buffer.rs's module doc for
+    // why stacking it here (rather than giving it its own filter) is
+    // sufficient: it only ever sees events the EnvFilter below already let
+    // through, same as the two fmt::layer()s.
+    let log_buffer = LogBuffer::new(LOG_BUFFER_CAPACITY);
 
     // Build the subscriber with both console and file output
     // Use tracing_log to bridge log:: macros to tracing
@@ -78,7 +93,8 @@ pub fn init_logging(
                 .with_line_number(true)
                 .with_ansi(false)
                 .with_timer(LocalTimeTimer)
-        );
+        )
+        .with(buffer::LogBufferLayer::new(Arc::clone(&log_buffer)));
 
     // Initialize tracing-log FIRST so `log::` macro records are bridged to
     // tracing from the very first event; this is also the order recommended
@@ -89,7 +105,7 @@ pub fn init_logging(
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| format!("Failed to set default subscriber: {}", e))?;
 
-    Ok(guard)
+    Ok((guard, log_buffer))
 }
 
 /// Clean up log files older than the specified number of days.

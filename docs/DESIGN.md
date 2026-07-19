@@ -214,6 +214,16 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - `SessionRegistry` (web/state.rs) がセッションのライブメトリクス
   (signal/drop/scramble/bitrate、5 分の履歴リングバッファ) を保持。セッション終了時に `session_history` へ永続化。
 - ダッシュボード更新は `GET /api/events` のSSEを主経路とし、Vue側は接続失敗時のみ 30 秒ポーリングへフォールバックする。
+- **ログ閲覧 (「ログ」タブ、`web/api/logs.rs`)**: `logging.rs` の `tracing_subscriber::registry()` に
+  第3のレイヤー `logging::LogBufferLayer` を積み、直近5000件を `Arc<LogBuffer>`(`logging/buffer.rs`、
+  `std::sync::RwLock<VecDeque<LogEntry>>` + `seq: AtomicU64`)へミラーする。既存の stdout/file
+  `fmt::layer()` と同じく `enabled()` を独自に実装しないため、`registry().with(env_filter).with(...)`
+  の `EnvFilter` がそのまま効く(`Layered` は全レイヤーの `enabled()` を AND するので、この層に別途
+  フィルタは要らない)。`WebState::log_buffer` 経由で `GET /api/logs`(`level`/`target`/`q`/`after_seq`
+  によるインクリメンタル取得、`dropped` でリングバッファからの押し出しを通知)と `GET /api/logs/files[/:name]`
+  (ローテーション済みファイルの一覧・ダウンロード、パストラバーサル対策としてファイル名を
+  `recisdb-proxy.log.*` かつ区切り文字/`..`なしに制限した上で `canonicalize()` して `log_dir` 配下か検証)
+  を提供する。フロントエンドは2秒間隔ポーリング(SSEはデータを載せない設計のため不採用)。
 
 - **Mirakurun 互換 API サブセット (実装済み・2026-07-04, STREAMING_DESIGN.md §7.1 P6)**:
   `web/mirakurun.rs`。`GET /version` / `GET /status` / `GET /channels` / `GET /services` /

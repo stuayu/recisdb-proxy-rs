@@ -16,9 +16,11 @@ use axum::{
     routing::{delete, get, post},
 };
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::logging::LogBuffer;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
 use auth::AuthConfig;
@@ -41,6 +43,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))
         .route("/update/status", get(api::update_status))
+        // Log viewer API (web/api/logs.rs)
+        .route("/logs", get(api::get_logs))
+        .route("/logs/files", get(api::list_log_files))
+        .route("/logs/files/:name", get(api::download_log_file))
         // Session/Client API
         .route("/clients", get(api::get_clients))
         .route("/stats", get(api::get_stats))
@@ -227,10 +233,12 @@ pub async fn start_web_server(
     scan_config: Option<state::ScanSchedulerInfo>,
     tuner_config: Option<state::TunerConfigInfo>,
     auth: AuthConfig,
+    log_buffer: Arc<LogBuffer>,
+    log_dir: PathBuf,
     mirakurun_enabled: bool,
     proxy_listen_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth);
+    let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth, log_buffer, log_dir);
     web_state.proxy_listen_addr = proxy_listen_addr;
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
@@ -293,7 +301,16 @@ mod tests {
         let tuner_pool = Arc::new(TunerPool::new(4));
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(SessionRegistry::new());
-        Arc::new(WebState::new(database, tuner_pool, encoder_pool, session_registry, auth))
+        let log_buffer = crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY);
+        Arc::new(WebState::new(
+            database,
+            tuner_pool,
+            encoder_pool,
+            session_registry,
+            auth,
+            log_buffer,
+            std::path::PathBuf::from("logs"),
+        ))
     }
 
     /// REVIEW S1 for `/api/preview-config`: the two executable paths are
@@ -722,5 +739,55 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "GET {} should be 200", path);
         }
+    }
+
+    #[tokio::test]
+    async fn logs_api_requires_auth_like_every_other_api_route() {
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, false);
+
+        let res = app
+            .oneshot(Request::builder().uri("/api/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_api_returns_entries_pushed_to_the_shared_buffer() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        // Simulate what LogBufferLayer::on_event does, without spinning up a
+        // whole tracing subscriber for this test.
+        state.log_buffer.query(crate::logging::LogQuery::default()); // sanity: starts empty
+        {
+            let result = state.log_buffer.query(crate::logging::LogQuery::default());
+            assert!(result.entries.is_empty());
+        }
+        // Push directly isn't exposed publicly (push() is crate-private to
+        // logging::buffer), so drive it the same way production code does:
+        // through a real tracing event routed at this buffer.
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(crate::logging::LogBufferLayer::new(Arc::clone(&state.log_buffer))),
+            || {
+                tracing::warn!(target: "recisdb_proxy::test", "something happened");
+            },
+        );
+
+        let app = build_app(Arc::clone(&state), false);
+        let res = app
+            .oneshot(Request::builder().uri("/api/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["level"], "WARN");
+        assert_eq!(entries[0]["target"], "recisdb_proxy::test");
+        assert_eq!(entries[0]["message"], "something happened");
     }
 }

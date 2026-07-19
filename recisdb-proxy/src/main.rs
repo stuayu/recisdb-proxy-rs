@@ -124,8 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging with file output and rotation
     // Keep the returned guard alive for the whole program: dropping it stops
     // the background file-writer thread and flushes buffered log lines.
-    let _log_guard = logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level.as_deref())
-        .expect("Failed to initialize logging");
+    let (_log_guard, log_buffer) =
+        logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level.as_deref())
+            .expect("Failed to initialize logging");
 
     // Use log macros which are now bridged to tracing
     use log::{error, info};
@@ -406,6 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enabled: web_auth_enabled,
         token: web_auth_token,
     };
+    let web_log_buffer = Arc::clone(&log_buffer);
+    let web_log_dir = log_dir.clone();
     tokio::spawn(async move {
         match web::start_web_server(
             web_listen_addr,
@@ -416,6 +419,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_config_for_web,
             tuner_config_for_web,
             web_auth_config,
+            web_log_buffer,
+            web_log_dir,
             mirakurun_enabled,
             Some(listen_addr),
         ).await {

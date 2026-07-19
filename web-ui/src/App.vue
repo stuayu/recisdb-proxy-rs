@@ -10,6 +10,7 @@ import AlertsView from './components/AlertsView.vue'
 import ResourceView from './components/ResourceView.vue'
 import SessionHistoryView from './components/SessionHistoryView.vue'
 import EncodeProfilesView from './components/EncodeProfilesView.vue'
+import LogsView from './components/LogsView.vue'
 import { api, ApiError, setApiToken } from './api'
 
 const tabs = [
@@ -23,6 +24,7 @@ const tabs = [
   { id: 'alerts', label: 'アラート', icon: '!' },
   { id: 'settings', label: '設定', icon: '◉' },
   { id: 'encode-profiles', label: 'エンコード', icon: '▶' },
+  { id: 'logs', label: 'ログ', icon: '☰' },
 ]
 
 const validTabs = new Set(tabs.map((tab) => tab.id))
@@ -405,7 +407,8 @@ onUnmounted(() => {
         <SessionHistoryView v-else-if="active === 'session-history'" />
         <AlertsView v-else-if="active === 'alerts'" />
         <SettingsView v-else-if="active === 'settings'" />
-        <EncodeProfilesView v-else />
+        <EncodeProfilesView v-else-if="active === 'encode-profiles'" />
+        <LogsView v-else active />
       </main>
     </div>
     <div v-if="tokenOpen" class="dialog-backdrop" @click.self="tokenOpen = false">
