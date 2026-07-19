@@ -212,6 +212,53 @@ created_at は最古、updated_at は最新をマージ)。
 }
 ```
 
+### GET /api/version
+
+稼働中サーバーのバージョン(`{"version": "0.1.0"}`)を取得。ダッシュボードはこれをヘッダーのバージョン表示に使うほか、GitHub最新リリース(`stuayu/recisdb-proxy-rs`)とのバージョン比較の基準値としても使う(6時間キャッシュ、`localStorage`)。
+
+### GET /api/update/check
+
+サーバー側で GitHub releases (`stuayu/recisdb-proxy-rs`) を取得し、現在のバージョンより新しい stable / prerelease を判定して返す(実装: `web/api/update.rs`)。ブラウザが GitHub に直接アクセスする必要はない。
+
+- サーバー内メモリに6時間キャッシュ(DBには保存しない)。`?force=true` でキャッシュを無視して再取得。
+- `stable`: draftを除く最新の非プレリリースで、現行より新しいもの(なければ `null`)。
+- `prerelease`: 最新のプレリリースで、現行より新しく、かつ `stable` より新しいもの(`stable` に劣後するプレリリースは出さない。なければ `null`)。
+- `self_update_supported`: このビルドが自己更新に対応しているか(Linux x86_64/aarch64、Windows x86_64/x86 のみ `true`。macOSビルド等は `false`)。
+- GitHub到達失敗時はエラーにせず、`stable`/`prerelease` を `null` にしたまま `200` を返す(ダッシュボードを壊さない)。
+
+**レスポンス例:**
+
+```json
+{
+  "current_version": "0.1.0",
+  "stable": {"tag": "v0.2.0", "url": "https://github.com/stuayu/recisdb-proxy-rs/releases/tag/v0.2.0", "published_at": "2026-07-01T12:00:00Z"},
+  "prerelease": null,
+  "self_update_supported": true
+}
+```
+
+### POST /api/update/apply
+
+指定タグの自己更新を開始する。**BonDriver_NetworkProxy.dll クライアント(TVTest/EDCB側)は対象外** — 更新されるのは `recisdb-proxy` サーバー本体の実行ファイルのみ。
+
+- リクエスト: `{"tag": "v0.2.0"}`。
+- `self_update_supported` が `false` なビルド(macOS等)では `501 Not Implemented`。
+- 指定タグがリリース一覧に無ければ `404`。
+- 既に自己更新が進行中(`downloading`/`extracting`/`replacing`/`restarting`)なら `409 Conflict`。
+- 成功時は `202`(実体はバックグラウンドで進行)。ダウンロード→展開→検証(サイズ・マジックバイト)→`self-replace`crateによる実行中バイナリの置換→約1秒待って再起動、の順に進む。**自バイナリに触れるのは置換の直前のみ**で、それより前の失敗では元のバイナリは無傷のまま。
+- 再起動の仕組み: バイナリの置換自体はどちらのOSでも**プロセスを止めずに**行える(Linuxはrename、Windowsは`self-replace`が実行中exeを退避リネームして新exeを配置)。その後、
+  - **Linux**: `exec()` で自プロセスのイメージを新バイナリに差し替える。PID・cgroupが変わらないため、systemdサービス(`Restart=always`)でも素の起動でもそのまま成立し、`systemctl stop/start`(root権限)は不要。
+  - **Windows**: リッスンポートの競合を避けるため、デタッチした`cmd`リランチャー(約3秒待機後に新exeを`start`)をspawnして自プロセスは即終了する。手動起動・タスクスケジューラ起動を想定。**Windowsサービスとして登録して運用している場合はSCM管理下に戻らないため対象外**(サービス側の再起動設定で復帰させること)。
+- 実行ファイルのあるディレクトリに書き込み権限が必要(`Program Files` 直下等では失敗し、`error` 状態で停止する)。
+
+### GET /api/update/status
+
+`POST /api/update/apply` で開始した自己更新の進行状況を返す。
+
+```json
+{ "state": "idle" | "downloading" | "extracting" | "replacing" | "restarting" | "error", "message": null }
+```
+
 ### GET /api/config
 
 現在の設定を取得

@@ -36,6 +36,11 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/tuners", get(api::get_tuners))
         .route("/config", get(api::get_config))
         .route("/config", post(api::update_config))
+        .route("/version", get(api::get_version))
+        // Update notification / self-update API (web/api/update.rs)
+        .route("/update/check", get(api::check_update))
+        .route("/update/apply", post(api::apply_update))
+        .route("/update/status", get(api::update_status))
         // Session/Client API
         .route("/clients", get(api::get_clients))
         .route("/stats", get(api::get_stats))
@@ -627,6 +632,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn version_api_requires_auth_and_reports_crate_version() {
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, false);
+
+        // Same auth gate as every other `/api/*` route.
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/version").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/version")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

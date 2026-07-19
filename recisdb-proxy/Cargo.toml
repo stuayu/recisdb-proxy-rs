@@ -19,7 +19,12 @@ path = "src/setup_gui.rs"
 [features]
 default = ["webhook"]
 tls = ["tokio-rustls", "rustls", "rustls-pemfile"]
-webhook = ["reqwest"]
+# reqwest is now a required dependency (self-update / GitHub release checker,
+# web/api/update.rs, needs it unconditionally), so this feature no longer
+# gates it. Kept as a (currently empty) feature so existing
+# `#[cfg(feature = "webhook")]` gates elsewhere (alert.rs, px4_installer.rs)
+# keep compiling unchanged.
+webhook = []
 
 [dependencies]
 recisdb-protocol = { path = "../recisdb-protocol" }
@@ -53,8 +58,13 @@ rust-embed = "8.7"
 # direct dependency adds no new crate to the build.
 getrandom = "0.2"
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["json", "blocking"], optional = true }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
 dns-lookup = "1.0"
+# Self-update (web/api/update.rs): GitHub release archive extraction and
+# in-place binary replacement.
+flate2 = "1"
+tar = "0.4"
+self-replace = "1"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }

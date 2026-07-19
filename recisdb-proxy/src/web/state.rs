@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use serde::Serialize;
 use dns_lookup::lookup_addr;
 
@@ -371,6 +371,33 @@ impl SessionRegistry {
     }
 }
 
+/// Cached result of the last successful GitHub releases fetch
+/// (`web/api/update.rs`, `GET /api/update/check`). Held in memory only —
+/// never persisted to the database — and treated as stale after
+/// `update::CACHE_TTL` (6 hours), at which point the next non-`force` check
+/// triggers a re-fetch.
+pub struct UpdateCheckCache {
+    pub fetched_at: Instant,
+    pub releases: Vec<crate::web::api::GithubRelease>,
+}
+
+/// Progress of the most recent (or in-flight) self-update
+/// (`web/api/update.rs`, `POST /api/update/apply`). Starts at `Idle`.
+/// `apply_update` only accepts a new run while this is `Idle` or `Error`;
+/// any of the other variants means one is already running and a concurrent
+/// request gets `409 Conflict`.
+#[derive(Debug, Clone)]
+pub enum UpdateStatus {
+    Idle,
+    Downloading,
+    Extracting,
+    Replacing,
+    Restarting,
+    /// Carries a human-readable failure reason. Reachable from any step —
+    /// see `run_self_update_inner` in `web/api/update.rs`.
+    Error(String),
+}
+
 /// Shared state for the web server.
 pub struct WebState {
     /// Database handle.
@@ -394,6 +421,11 @@ pub struct WebState {
     /// dashboard's client-setup guide so users can copy a ready-made
     /// BonDriver_NetworkProxy.ini. `None` when unknown (e.g. tests).
     pub proxy_listen_addr: Option<SocketAddr>,
+    /// 6h in-memory cache of the last GitHub releases fetch
+    /// (`web/api/update.rs`). `None` until the first check.
+    pub update_check_cache: RwLock<Option<UpdateCheckCache>>,
+    /// Progress of the most recent/in-flight self-update.
+    pub update_status: Mutex<UpdateStatus>,
 }
 
 impl WebState {
@@ -412,6 +444,8 @@ impl WebState {
             session_registry,
             auth,
             proxy_listen_addr: None,
+            update_check_cache: RwLock::new(None),
+            update_status: Mutex::new(UpdateStatus::Idle),
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

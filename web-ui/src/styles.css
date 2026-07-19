@@ -337,6 +337,7 @@ h3 {
 .dialog-backdrop {
   position: fixed;
   inset: 0;
+
   /* Above every sticky layer (guide header z:2-4, nav z:10, skip-link z:100). */
   z-index: 200;
   display: grid;
@@ -1035,6 +1036,88 @@ textarea:focus-visible,
 
 .connection-status.checking {
   color: #f4d788;
+}
+
+.app-version {
+  margin-left: 6px;
+  font-size: 0.7rem;
+  font-weight: normal;
+  color: var(--muted);
+}
+
+.update-notices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.update-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  color: #fff;
+  background: rgb(255 255 255 / 10%);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+}
+
+.update-notice a {
+  color: #fff;
+  text-decoration: underline;
+}
+
+.update-notice.prerelease {
+  color: #4a2e04;
+  background: #fdf0d8;
+  border-color: #e7a62a;
+}
+
+.update-notice.prerelease a {
+  color: #4a2e04;
+}
+
+.app.dark .update-notice.prerelease {
+  color: #ffe3ac;
+  background: #4a3712;
+  border-color: #e7a62a;
+}
+
+.app.dark .update-notice.prerelease a {
+  color: #ffe3ac;
+}
+
+.update-notice__badge {
+  padding: 1px 8px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #fff;
+  background: #b3760f;
+  border-radius: 999px;
+}
+
+.app.dark .update-notice__badge {
+  background: #8a5a08;
+}
+
+.update-notice-apply,
+.update-notice-close {
+  min-height: auto;
+  padding: 0 8px;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentcolor;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.update-notice-close {
+  padding: 0 4px;
+  font-size: 0.9rem;
+  border: none;
 }
 
 .quality-panel {

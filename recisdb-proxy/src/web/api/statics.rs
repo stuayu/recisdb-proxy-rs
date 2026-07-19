@@ -4,10 +4,18 @@ use axum::{
     extract::Path,
     http::{header::CONTENT_TYPE, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use rust_embed::RustEmbed;
+use serde_json::json;
 
 use crate::web::dashboard::VueAssets;
+
+/// `GET /api/version` — the running server's crate version, for the
+/// dashboard's version display and update-check comparison (web-ui `App.vue`).
+pub async fn get_version() -> impl IntoResponse {
+    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
 
 /// Get a channel logo image file.
 pub async fn get_logo(Path(file): Path<String>) -> impl IntoResponse {

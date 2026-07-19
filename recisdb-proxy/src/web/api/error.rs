@@ -35,6 +35,18 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
     }
+
+    /// 409 — the request conflicts with an in-progress operation (e.g. a
+    /// self-update already running, `web/api/update.rs`).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::CONFLICT, message: message.into() }
+    }
+
+    /// 501 — the server (or this platform's build) does not implement the
+    /// requested capability (e.g. self-update on macOS, `web/api/update.rs`).
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::NOT_IMPLEMENTED, message: message.into() }
+    }
 }
 
 impl IntoResponse for ApiError {
