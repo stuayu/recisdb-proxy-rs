@@ -71,8 +71,16 @@ jobs:
         run: |
           docker run --rm -i -v "$(pwd):/work" -w /work ubuntu:build bash -c '/root/.cargo/bin/cargo deb -p recisdb --output ./artifacts/ -- -F dvb'
       - name: Build proxy binaries
+        env:
+          # Picked up by recisdb-proxy/build.rs (priority 1, overrides `git
+          # describe`) — a shallow `actions/checkout` (default fetch-depth=1)
+          # doesn't reliably carry tag history into the container for `git
+          # describe` to find, so the tag is passed explicitly. Leading `v`
+          # (tags may be `v0.0.1-alpha.6` or `0.0.1-alpha.6`) is stripped by
+          # build.rs itself.
+          RECISDB_PROXY_VERSION: ${{ github.ref_name }}
         run: |
-          docker run --rm -i -v "$(pwd):/work" -w /work ubuntu:build bash -c '/root/.cargo/bin/cargo build --release -p recisdb-proxy'
+          docker run --rm -i -e RECISDB_PROXY_VERSION -v "$(pwd):/work" -w /work ubuntu:build bash -c '/root/.cargo/bin/cargo build --release -p recisdb-proxy'
       - name: Package proxy tarball
         run: |
           # docker run creates artifacts/ and target/ as root
@@ -131,6 +139,11 @@ jobs:
           npm run build
 
       - name: Build
+        env:
+          # See the Linux job's "Build proxy binaries" step for why this is
+          # set explicitly rather than relying on build.rs's `git describe`
+          # fallback.
+          RECISDB_PROXY_VERSION: ${{ github.ref_name }}
         run: |
           rustup target add ${{ matrix.arch }}
           $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"

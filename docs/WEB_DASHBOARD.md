@@ -237,6 +237,8 @@ created_at は最古、updated_at は最新をマージ)。
 
 稼働中サーバーのバージョン(`{"version": "0.1.0"}`)を取得。ダッシュボードはこれをヘッダーのバージョン表示に使うほか、GitHub最新リリース(`stuayu/recisdb-proxy-rs`)とのバージョン比較の基準値としても使う(6時間キャッシュ、`localStorage`)。
 
+このバージョン文字列は `Cargo.toml` の固定値ではなく、ビルド時に `recisdb-proxy/build.rs` が決定して埋め込む(`crate::VERSION` / `RECISDB_PROXY_VERSION`)。リリースタグ(例: `v0.0.1-alpha.6`)そのままのビルドでは `0.0.1-alpha.6` に、タグ間のdevビルドでは `git describe --tags --always --dirty` により `0.0.1-alpha.6-1-g05a127c` のような形式になる。詳細は `docs/BUILD.md` を参照。Mirakurun互換API(`/mirakurun/api/version`, `/mirakurun/api/status`)はEPGStation等の互換性のためあえて `Cargo.toml` 固定値のまま。
+
 ### GET /api/update/check
 
 サーバー側で GitHub releases (`stuayu/recisdb-proxy-rs`) を取得し、現在のバージョンより新しい stable / prerelease を判定して返す(実装: `web/api/update.rs`)。ブラウザが GitHub に直接アクセスする必要はない。

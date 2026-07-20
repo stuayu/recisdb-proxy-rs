@@ -10,6 +10,68 @@ fn main() {
     }
     // aribb24 wrapper is built on all platforms
     build_aribb24_wrapper(&target_os);
+
+    emit_version();
+}
+
+/// Determines the build version and emits it as `RECISDB_PROXY_VERSION` for
+/// `env!("RECISDB_PROXY_VERSION")` in `src/lib.rs`. Priority:
+/// 1. `RECISDB_PROXY_VERSION` env var (CI override — set from the release
+///    tag, since `actions/checkout`'s shallow clone doesn't reliably carry
+///    tag history for `git describe`).
+/// 2. `git describe --tags --always --dirty` (e.g. `v0.0.1-alpha.6` on a
+///    tagged commit, `v0.0.1-alpha.6-1-g05a127c` on commits after it).
+/// 3. `CARGO_PKG_VERSION` (Cargo.toml's fixed `0.1.0`) if git isn't
+///    available at all (e.g. building from a release source tarball with no
+///    `.git` directory) — must never fail the build.
+///
+/// A leading `v` is stripped so the dashboard's `v${version}` display
+/// doesn't double up.
+fn emit_version() {
+    println!("cargo:rerun-if-env-changed=RECISDB_PROXY_VERSION");
+
+    if let Ok(v) = std::env::var("RECISDB_PROXY_VERSION") {
+        if !v.trim().is_empty() {
+            emit_version_str(&v);
+            return;
+        }
+    }
+
+    // Re-run when HEAD or the ref it points at changes, so a new commit/tag
+    // picked up by `git describe` triggers a rebuild. Best-effort: harmless
+    // if `.git` doesn't exist (e.g. building from a source tarball).
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+
+    if let Some(v) = git_describe() {
+        emit_version_str(&v);
+        return;
+    }
+
+    emit_version_str(env!("CARGO_PKG_VERSION"));
+}
+
+fn git_describe() -> Option<String> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let output = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn emit_version_str(v: &str) {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    println!("cargo:rustc-env=RECISDB_PROXY_VERSION={v}");
 }
 
 fn build_bondriver_wrapper() {

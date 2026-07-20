@@ -258,7 +258,7 @@ pub struct CheckQuery {
 
 /// `GET /api/update/check` — see module docs.
 pub async fn check_update(State(web_state): State<Arc<WebState>>, Query(query): Query<CheckQuery>) -> Json<serde_json::Value> {
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = crate::VERSION;
 
     let releases = fetch_releases_cached(&web_state, query.force).await;
     let (stable, prerelease) = select_updates(current_version, &releases);
@@ -304,7 +304,7 @@ async fn fetch_releases_cached(web_state: &WebState, force: bool) -> Vec<GithubR
 
 async fn fetch_releases_from_github() -> Result<Vec<GithubRelease>, String> {
     let client = reqwest::Client::builder()
-        .user_agent(format!("recisdb-proxy/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("recisdb-proxy/{}", crate::VERSION))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -489,7 +489,7 @@ async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &s
 
 async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
     let client = reqwest::Client::builder()
-        .user_agent(format!("recisdb-proxy/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("recisdb-proxy/{}", crate::VERSION))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -657,6 +657,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_version_handles_git_describe_dev_suffix() {
+        // `crate::VERSION` on a commit after a tag looks like
+        // `0.0.1-alpha.6-1-g05a127c` (git describe --tags --always --dirty,
+        // leading `v` already stripped by build.rs). Only the numeric
+        // portion before the *first* '-' is significant, so this parses
+        // exactly like the tag it's built on top of.
+        assert_eq!(parse_version("0.0.1-alpha.6-1-g05a127c"), Some((0, 0, 1, true)));
+        assert_eq!(parse_version("v0.0.1-alpha.6-1-g05a127c-dirty"), Some((0, 0, 1, true)));
+    }
+
+    #[test]
+    fn parse_version_rejects_bare_commit_hash() {
+        // git describe --always falls back to a bare abbreviated commit hash
+        // when the repo has no tags at all reachable from HEAD.
+        assert_eq!(parse_version("05a127c"), None);
+    }
+
+    #[test]
     fn version_key_ranks_stable_above_prerelease_at_same_numeric_version() {
         let stable = version_key("1.2.3").unwrap();
         let pre = version_key("1.2.3-beta.1").unwrap();
@@ -743,6 +761,68 @@ mod tests {
         let releases = vec![release("0.2.0", false, false)];
         let (stable, _) = select_updates("v0.1.0", &releases);
         assert_eq!(stable.unwrap().tag, "0.2.0");
+    }
+
+    // -- select_updates with git-describe-shaped current_version -------------
+    //
+    // `crate::VERSION` (used as `current_version` in production) is not
+    // always a clean tag: on a commit after a tag it's
+    // `0.0.1-alpha.6-1-g05a127c`, and on an untagged checkout it can be a
+    // bare commit hash. Neither must panic or misbehave.
+
+    #[test]
+    fn select_updates_dev_build_between_tags_still_finds_newer_stable() {
+        // Built from a commit 1 past v0.1.0; v0.2.0 has since shipped and
+        // must still be surfaced as an update.
+        let releases = vec![release("v0.1.0", false, false), release("v0.2.0", false, false)];
+        let (stable, prerelease) = select_updates("0.1.0-1-g05a127c", &releases);
+        assert_eq!(stable.unwrap().tag, "v0.2.0");
+        assert!(prerelease.is_none());
+    }
+
+    #[test]
+    fn select_updates_dev_build_at_latest_tag_reports_no_update() {
+        // Built exactly at the newest tag (clean tree): `git describe`
+        // yields just the tag itself (no `-N-g<hash>` suffix, since N=0) —
+        // must not claim that same tag is a pending update.
+        let releases = vec![release("v0.2.0", false, false)];
+        let (stable, prerelease) = select_updates("0.2.0", &releases);
+        assert!(stable.is_none());
+        assert!(prerelease.is_none());
+    }
+
+    #[test]
+    fn select_updates_dirty_build_at_latest_tag_is_a_known_false_positive() {
+        // `git describe --dirty` appends `-dirty` even with zero commits
+        // past the tag, which `parse_version` treats identically to a
+        // `-alpha.N` prerelease suffix (`has_suffix = true`). That makes a
+        // same-version *stable* release outrank a same-version *dirty* dev
+        // build (see `version_key`'s doc comment: stable always ranks above
+        // any suffixed tag at equal major.minor.patch). Net effect: a local
+        // dev build with uncommitted changes, sitting exactly on the latest
+        // tag, spuriously reports that same tag as "available". This is a
+        // pre-existing property of `parse_version`/`version_key` (already
+        // true for e.g. "1.2.3-custom" today), not something introduced by
+        // git-describe versioning — and it never reaches production
+        // releases, since release CI sets `RECISDB_PROXY_VERSION` to the
+        // clean tag name directly (see build.rs), bypassing `git describe`
+        // entirely. Locked in here so a future change to this ranking is a
+        // deliberate choice, not an accident.
+        let releases = vec![release("v0.2.0", false, false)];
+        let (stable, _) = select_updates("0.2.0-dirty", &releases);
+        assert_eq!(stable.unwrap().tag, "v0.2.0");
+    }
+
+    #[test]
+    fn select_updates_unparsable_current_treated_as_lowest_not_panicking() {
+        // No tags reachable at all: `git describe --always` yields a bare
+        // hash, which `parse_version` rejects. `select_updates` must not
+        // panic, and falls back to "every valid release counts as an
+        // update" (see its doc comment) rather than silently hiding them.
+        let releases = vec![release("v0.1.0", false, false), release("v0.2.0-beta.1", true, false)];
+        let (stable, prerelease) = select_updates("05a127c", &releases);
+        assert_eq!(stable.unwrap().tag, "v0.1.0");
+        assert_eq!(prerelease.unwrap().tag, "v0.2.0-beta.1");
     }
 
     // -- platform_supports_self_update / asset_filename -----------------------

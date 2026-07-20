@@ -23,6 +23,16 @@ cargo test -p recisdb-protocol
 cargo test -p bondriver-proxy-client
 ```
 
+### recisdb-proxy のバージョン表記
+
+`recisdb-proxy` のバージョン(ダッシュボードの `/api/version`・自己更新チェック等)は `Cargo.toml` の固定値ではなく、`recisdb-proxy/build.rs` がビルド時に決定して埋め込む。優先順位:
+
+1. 環境変数 `RECISDB_PROXY_VERSION`(CIがリリースタグから設定。先頭の `v` は自動で除去)
+2. `git describe --tags --always --dirty`(タグ通りのコミットなら `0.0.1-alpha.6`、タグから進んだコミットなら `0.0.1-alpha.6-1-g05a127c` のような形式)
+3. `git` が使えない環境(ソースtarballからのビルド等)では `Cargo.toml` の `CARGO_PKG_VERSION` にフォールバック
+
+手元でリリースタグ相当のバージョンを付けてビルドしたい場合は `RECISDB_PROXY_VERSION=0.0.1-alpha.6 cargo build -p recisdb-proxy` のように上書きできる。
+
 ### プラットフォーム別の要件 (b25-sys / recisdb)
 
 | プラットフォーム | 要件 |

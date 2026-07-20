@@ -317,6 +317,10 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
 // ============================================================================
 
 /// `GET /mirakurun/api/version`.
+///
+/// Intentionally `CARGO_PKG_VERSION` (not `crate::VERSION`/git describe):
+/// Mirakurun-compatible clients (EPGStation etc.) may expect a strict
+/// semver-ish string here, not a `-N-g<hash>` dev-build suffix.
 pub async fn get_version() -> impl IntoResponse {
     let v = env!("CARGO_PKG_VERSION");
     Json(json!({ "current": v, "latest": v }))
@@ -341,6 +345,7 @@ pub async fn get_status(State(web_state): State<Arc<WebState>>) -> impl IntoResp
     }
 
     Json(json!({
+        // Intentionally CARGO_PKG_VERSION, see get_version() above.
         "version": env!("CARGO_PKG_VERSION"),
         "tunerCount": tuner_keys.len(),
         "runningTunerCount": running_tuner_count,
