@@ -1045,6 +1045,42 @@ textarea:focus-visible,
   color: var(--muted);
 }
 
+.update-check-btn {
+  margin-left: 8px;
+  min-height: auto;
+  padding: 0 8px;
+  font-size: 0.7rem;
+  font-weight: normal;
+  line-height: 1.6;
+  color: var(--muted);
+  vertical-align: middle;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.update-check-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.update-check-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.update-check-result {
+  margin-left: 6px;
+  font-size: 0.7rem;
+  font-weight: normal;
+  color: var(--success);
+}
+
+.update-check-result.error {
+  color: var(--danger);
+}
+
 .update-notices {
   display: flex;
   flex-wrap: wrap;

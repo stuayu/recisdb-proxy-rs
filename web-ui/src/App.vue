@@ -154,13 +154,39 @@ async function fetchServerVersion(): Promise<string | null> {
   }
 }
 
-async function checkForUpdate() {
+async function checkForUpdate(force = false) {
   try {
-    updateCheck.value = await api<UpdateCheckResponse>('/update/check')
+    updateCheck.value = await api<UpdateCheckResponse>(`/update/check${force ? '?force=true' : ''}`)
   } catch (error) {
     // Update checks are best-effort — a transient failure just means no
     // notice is shown; the periodic caller (server-side, 6h) retries later.
     console.debug('update check failed', error)
+    if (force) throw error
+  }
+}
+
+type ManualUpdateCheckState = 'idle' | 'checking' | 'latest' | 'error'
+const manualUpdateCheck = ref<ManualUpdateCheckState>('idle')
+let manualUpdateCheckResetTimer = 0
+
+/** ヘッダーの「更新確認」ボタン: サーバー側キャッシュ(6h)を無視して GitHub の
+ * 最新リリース情報を取り直す。以前×で閉じた通知も再表示する。 */
+async function checkForUpdateNow() {
+  if (manualUpdateCheck.value === 'checking') return
+  window.clearTimeout(manualUpdateCheckResetTimer)
+  manualUpdateCheck.value = 'checking'
+  try {
+    await checkForUpdate(true)
+    dismissedUpdateTags.value = {}
+    persistDismissedUpdateTags()
+    manualUpdateCheck.value = updateCheck.value?.stable || updateCheck.value?.prerelease ? 'idle' : 'latest'
+  } catch {
+    manualUpdateCheck.value = 'error'
+  }
+  if (manualUpdateCheck.value !== 'idle') {
+    manualUpdateCheckResetTimer = window.setTimeout(() => {
+      manualUpdateCheck.value = 'idle'
+    }, 5000)
   }
 }
 
@@ -318,6 +344,22 @@ onUnmounted(() => {
         <h1>
           recisdb-proxy
           <span v-if="serverVersion" class="app-version" v-text="`v${serverVersion}`" />
+          <button
+            class="update-check-btn"
+            :disabled="manualUpdateCheck === 'checking'"
+            @click="checkForUpdateNow"
+            v-text="manualUpdateCheck === 'checking' ? '確認中…' : '更新確認'"
+          />
+          <span
+            v-if="manualUpdateCheck === 'latest'"
+            class="update-check-result"
+            v-text="'最新です'"
+          />
+          <span
+            v-else-if="manualUpdateCheck === 'error'"
+            class="update-check-result error"
+            v-text="'確認失敗'"
+          />
         </h1>
         <p>TVプロキシサーバー 管理コンソール</p>
         <p

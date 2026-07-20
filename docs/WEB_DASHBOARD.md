@@ -243,7 +243,7 @@ created_at は最古、updated_at は最新をマージ)。
 
 サーバー側で GitHub releases (`stuayu/recisdb-proxy-rs`) を取得し、現在のバージョンより新しい stable / prerelease を判定して返す(実装: `web/api/update.rs`)。ブラウザが GitHub に直接アクセスする必要はない。
 
-- サーバー内メモリに6時間キャッシュ(DBには保存しない)。`?force=true` でキャッシュを無視して再取得。
+- サーバー内メモリに6時間キャッシュ(DBには保存しない)。`?force=true` でキャッシュを無視して再取得。ヘッダーのバージョン表示横の「更新確認」ボタンがこの force 取得を呼ぶ(以前×で閉じた更新通知もこの操作で再表示される)。
 - `stable`: draftを除く最新の非プレリリースで、現行より新しいもの(なければ `null`)。
 - `prerelease`: 最新のプレリリースで、現行より新しく、かつ `stable` より新しいもの(`stable` に劣後するプレリリースは出さない。なければ `null`)。
 - `self_update_supported`: このビルドが自己更新に対応しているか(Linux x86_64/aarch64、Windows x86_64/x86 のみ `true`。macOSビルド等は `false`)。
