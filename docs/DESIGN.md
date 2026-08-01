@@ -121,6 +121,7 @@ src/
 ├ ts_analyzer/       PAT/PMT/SDT/NIT 解析、service_filter
 ├ database/          rusqlite ラッパー (schema.rs が正)
 ├ web/               axum: JSON/SSE API + 埋め込みVueダッシュボード / state.rs (SessionRegistry)
+├ service/           OSサービス登録・制御 (systemd / launchd / Windows SCM) → §4.10
 ├ alert.rs           しきい値監視 + Webhook 通知 (feature "webhook")
 └ logging.rs         tracing-subscriber: コンソール + 日次ローテーションファイル
 
@@ -187,7 +188,8 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - axum。`/` に埋め込みVueダッシュボード (`web-ui/` を Vite ビルドして `rust-embed` で同梱)、`/api/*` に JSON API、`/api/events` にSSE更新イベント。
 - 主なリソース: tuners / bondrivers (CRUD+scan+品質) / channels (CRUD+import/export+batch) /
   clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config /
-  encode-profiles (CRUD、STREAMING_DESIGN.md §5.3 P5) / stream (HTTP-TS 配信、§6.3 P5)。
+  encode-profiles (CRUD、STREAMING_DESIGN.md §5.3 P5) / stream (HTTP-TS 配信、§6.3 P5) /
+  service (OSサービスの状態取得とサーバー再起動、§4.10)。
 - **HTTP-TS ストリーミング (実装済み・2026-07-04, STREAMING_DESIGN.md §6.3/§7.2 P5)**:
   `GET /api/stream/service/:sid` (生 TS passthrough) / `GET /api/stream/service/:sid?profile=preview`
   (`encode_profiles` の `purpose='preview'` 行 + 共有エンコーダプール (§4.8/P4) で H.264 変換した TS)。
@@ -263,6 +265,48 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - `alert_rules` (metric: drop_rate/scramble_rate/error_rate/signal_level/bitrate、条件 gt/lt/gte/lte) を
   5 秒周期で全セッションに対して評価。発火/解消を `alert_history` に記録、`webhook_url` へ通知
   (feature `webhook`、generic/Discord 等 format 指定)。
+
+### 4.10 OSサービス登録 (service/)
+
+- 目的: インストール時にサーバーをOSのサービスとして登録し、PC起動時に自動で開始する。サービス名は
+  セットアップウィザードのGUIから指定できる (既定 `recisdb-proxy`)。
+- 構成:
+  - `service/mod.rs` — プラットフォーム非依存の公開API (`ServiceSpec` / `ServiceStatus` /
+    `install` / `uninstall` / `start` / `stop` / `restart` / `status`) と、各OSモジュールへのディスパッチ。
+  - `service/unit_text.rs` — systemd unit と launchd plist の**文字列生成のみ**を行う純関数群
+    (`cfg(target_os)` を持たないのでどのOSでもテストできる)。
+  - `service/systemd.rs` (Linux) / `service/launchd.rs` (macOS) / `service/windows_scm.rs` (Windows)
+    — 実際のファイル配置とコマンド実行 (`systemctl` / `launchctl` / SCM API)。
+  - `service/restart.rs` — 自プロセスの再起動 (下記)。
+  - `service_cli.rs` (バイナリ専用) — `recisdb-proxy service <action>` サブコマンド。
+- **サービス名のサニタイズ**: 名前は `systemctl`/`launchctl`/`sc.exe` の引数やファイルパスに埋め込まれるため、
+  `sanitize_service_name` が `[A-Za-z0-9._-]` のみ・1〜64文字・先頭は英数字・`..` を含まない、に制限する。
+  コマンドはすべて `Command::new(...).arg(...)` で組み立て、シェルを経由しない。
+- **スコープ**: `System` (既定、root/管理者権限が必要) と `User` (`systemctl --user` / LaunchAgents)。
+  Windows の SCM にユーザースコープの概念はないため `ServiceScope::User` は常に `NotSupported`。
+- **サービスとして起動されたかの判定**: サービス定義には必ず `--run-as-service --service-name <名前>` が
+  前置される (`ServiceSpec::service_args`)。プロセスはこのフラグを見て自分がサービスかどうかを確実に判定する。
+  環境変数によるヒューリスティック (`INVOCATION_ID`/`JOURNAL_STREAM`/`XPC_SERVICE_NAME`) は、旧バージョンが
+  書いた定義のためのフォールバックとしてのみ使う。**親PIDが1かどうかは判定に使わない** —
+  バックグラウンド起動で親シェルが終了しただけのプロセスも ppid=1 になり、「再起動」がただの停止になるため。
+- **Windows**: SCM に起動されたプロセスは ServiceMain から Running を報告し Stop 制御を受け付ける必要がある
+  (さもないと「サービスが応答しませんでした」になる)。`--run-as-service` の場合のみ
+  `windows_scm::run_dispatcher` 経由でサーバー本体を起動し、Stop/Shutdown を受けたら
+  `main.rs::run_server` の shutdown future を解決して graceful に停止する。SCM は WorkingDirectory を
+  持たないので `--service-workdir` を渡して起動時に chdir する。障害時の自動復帰は failure actions
+  (5秒後に再起動、3回まで) で設定する。
+- **再起動 (`service/restart.rs`)**: 方式はサービス管理下かどうかで変わる。
+  - systemd / launchd 配下 — プロセスを終了するだけ。`Restart=always` / `KeepAlive=true` が起こし直す
+    (unit を操作しないので root 権限が要らない)。
+  - Windows SCM 配下 — 正常終了は SCM にとって障害ではなく failure actions が発火しないため、
+    切り離した `cmd` から `sc stop` → `sc start` を実行させる。
+  - サービス管理下でない — 従来どおり自分自身を exec し直す (Unix) / 遅延ランチャを撒いて終了する (Windows)。
+  自己更新 (`web/api/update.rs`) の最後の再起動もこの共通処理を使う。
+- **Web からの操作範囲**: `GET /api/service/status` と `POST /api/service/restart` のみ。登録・削除は
+  管理者権限が必要で、任意の実行ファイルをネットワーク越しに常駐登録できると権限昇格の経路になるため、
+  セットアップウィザードと CLI からのみ行う。
+- **SIGTERM**: `systemctl stop` / `launchctl bootout` は SIGTERM を送る。`main.rs::shutdown_signal` が
+  Ctrl+C と SIGTERM の両方を待つ (以前は Ctrl+C のみで、SIGTERM は既定動作で即死していた)。
 
 ---
 

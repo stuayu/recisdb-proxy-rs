@@ -1,6 +1,6 @@
 # Web APIリファレンス
 
-最終更新: 2026-07-14
+最終更新: 2026-08-01
 
 Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が有効な場合に `Authorization: Bearer <token>` が必要です。ストリームとファイル取得を除き、レスポンスはJSONです。
 
@@ -71,6 +71,46 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 | GET/POST | `/api/preview-config` | ブラウザプレビュー設定 |
 | GET/POST | `/api/encode-profiles` | エンコードプロファイル一覧・登録 |
 | POST/DELETE | `/api/encode-profiles/:id` | エンコードプロファイル更新・削除 |
+
+## サーバー管理
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/api/service/status` | OSサービスの登録状況・稼働状況と、現在の再起動方式 |
+| POST | `/api/service/restart` | サーバー自身の再起動 |
+
+`GET /api/service/status` は既定で自プロセスの登録名（サービスとして起動されていない場合は `recisdb-proxy`）をシステムスコープで問い合わせます。`?name=<名前>`・`?scope=user` で対象を変えられます。名前に使えるのは英数字と `.` `_` `-` のみで、それ以外は400を返します。
+
+レスポンス例:
+
+```json
+{
+  "success": true,
+  "supported": true,
+  "running_under_service_manager": true,
+  "restart_method": "service_manager_respawn",
+  "service": {
+    "supported": true,
+    "manager": "systemd",
+    "name": "recisdb-proxy",
+    "scope": "system",
+    "installed": true,
+    "running": true,
+    "enabled": true,
+    "detail": "active"
+  }
+}
+```
+
+`restart_method` は `POST /api/service/restart` が実際に取る手段です。
+
+- `service_manager_respawn` — プロセスを終了し、systemd の `Restart=always` / launchd の `KeepAlive` による自動再起動に任せる（root権限不要）
+- `service_control_manager` — 切り離したプロセスから `sc stop` → `sc start` を実行する（Windowsサービスとして動作中）
+- `exec_self` — サービス管理下ではないので、同じ引数で自分自身を起動し直す
+
+再起動すると視聴中・録画中のセッションはすべて切断されます。応答を返し切ってから再起動するため、実際の停止までには約1秒の猶予があります。
+
+サービスの**登録・削除はWeb APIにはありません**。管理者権限が必要な操作であり、任意の実行ファイルをネットワーク越しに常駐登録できると権限昇格の経路になるためです。登録はセットアップウィザードか `recisdb-proxy service install` から行います。
 
 ## ストリームと静的資産
 

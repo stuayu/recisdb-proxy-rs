@@ -20,6 +20,10 @@ chmod +x recisdb-proxy
 画面の指示に従うだけで、設定ファイルの作成・チューナーの自動検出/登録・`recisdb-proxy` の起動・
 ダッシュボードのオープンまで完了します。以降の「基本的な起動方法」はコマンドラインで手動設定したい方向けです。
 
+確認画面の「OSのサービスとして登録し、PC起動時に自動で開始する」にチェックを入れると、
+そのままサービスとして常時稼働させられます (サービス名も同じ画面で指定できます)。詳細は
+「サービスとして常時稼働させる」を参照してください。
+
 ## 基本的な起動方法
 
 ### 1. 最小限の設定で起動
@@ -50,6 +54,42 @@ recisdb-proxy --listen 0.0.0.0:40071 --web-listen 0.0.0.0:40081
 ```bash
 recisdb-proxy --config recisdb-proxy.toml
 ```
+
+## サービスとして常時稼働させる
+
+PC起動時に自動で開始させるには、OSのサービスとして登録します (Linux: systemd / macOS: launchd /
+Windows: サービスコントロールマネージャー)。
+
+```bash
+# システム全体に登録する (Linux/macOSは root 権限、Windowsは管理者権限が必要)
+sudo recisdb-proxy service install --name recisdb-proxy
+
+# ログインユーザー単位で登録する (Linux/macOSのみ。管理者権限は不要ですが、
+# ログイン後にのみ動作します)
+recisdb-proxy service install --name recisdb-proxy --user
+```
+
+主なオプション:
+
+| オプション | 既定値 | 説明 |
+| --- | --- | --- |
+| `--name` | `recisdb-proxy` | サービス名。英数字と `.` `_` `-` のみ、64文字以内 |
+| `--user` | off | ユーザー単位で登録する (Windows非対応) |
+| `--config` | ― | サービスに渡す設定ファイル。省略時は `-f` の値、それも無ければ作業フォルダの `recisdb-proxy.toml` |
+| `--working-dir` | 実行ファイルの場所 | サービスの作業ディレクトリ |
+
+登録後の操作:
+
+```bash
+recisdb-proxy service status            # 登録状況・稼働状況を表示
+sudo recisdb-proxy service stop         # 停止
+sudo recisdb-proxy service start        # 開始
+sudo recisdb-proxy service restart      # 再起動
+sudo recisdb-proxy service uninstall    # 停止して登録を解除
+```
+
+Webダッシュボードの「設定」タブにも登録状況が表示され、そこからサーバーを再起動できます
+(視聴中・録画中のセッションはすべて切断されます)。
 
 ## Webダッシュボードへのアクセス
 

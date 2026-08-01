@@ -167,6 +167,18 @@ struct SetupApp {
     overwrite_config: bool,
     recreate_db: bool,
 
+    // OSサービス登録 (service/mod.rs)。既定でON: 常時稼働させるのが
+    // 想定利用形態のため。
+    register_service: bool,
+    service_name: String,
+    /// サービスとしての登録に成功したか。完了画面での「起動する」ボタンを
+    /// 「ダッシュボードを開く」に切り替えるのに使う (サービスが既に
+    /// listen しているので二重起動するとポートが衝突する)。
+    service_registered: bool,
+    /// ユーザー単位で登録する (systemd --user / LaunchAgent)。Windows の
+    /// SCM にユーザースコープは無いので、その場合は無視される。
+    service_user_scope: bool,
+
     // 実行結果
     log_lines: Vec<String>,
     setup_error: Option<String>,
@@ -200,6 +212,10 @@ impl SetupApp {
             install_error: None,
             overwrite_config: false,
             recreate_db: false,
+            register_service: true,
+            service_name: recisdb_proxy::service::DEFAULT_SERVICE_NAME.to_string(),
+            service_registered: false,
+            service_user_scope: false,
             log_lines: Vec::new(),
             setup_error: None,
             launch_deadline: None,
@@ -479,7 +495,71 @@ impl SetupApp {
             }
         }
 
+        if self.register_service && recisdb_proxy::service::is_supported() {
+            self.register_os_service(&install_dir);
+        }
+
         self.step = Step::Done;
+    }
+
+    /// セットアップ本体の最後に、インストールした実行ファイルをOSの
+    /// サービスとして登録する。失敗しても致命的ではない (サーバ自体は
+    /// 手動で起動できる) ので、`setup_error` にはせずログに理由と手動
+    /// 登録用コマンドを残す。
+    fn register_os_service(&mut self, install_dir: &Path) {
+        use recisdb_proxy::service::{self, ServiceScope};
+
+        let name = match service::sanitize_service_name(&self.service_name) {
+            Ok(name) => name,
+            Err(e) => {
+                self.log_lines
+                    .push(format!("サービス名が不正なため登録をスキップしました: {e}"));
+                return;
+            }
+        };
+        let scope = if self.service_user_scope && !cfg!(windows) {
+            ServiceScope::User
+        } else {
+            ServiceScope::System
+        };
+
+        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_path = install_dir.join(exe_name);
+        let config_file_path = self.config_file_path();
+        let spec = service::default_spec(
+            name.clone(),
+            scope,
+            exe_path,
+            install_dir.to_path_buf(),
+            vec![
+                "-f".to_string(),
+                config_file_path.to_string_lossy().into_owned(),
+            ],
+        );
+
+        match service::install(&spec) {
+            Ok(()) => {
+                self.service_registered = true;
+                self.log_lines
+                    .push(format!("サービス `{name}` を登録し、開始しました。"));
+            }
+            Err(e) => {
+                let hint = if cfg!(windows) {
+                    format!(
+                        "管理者として実行したコマンドプロンプトで `\"{}\" service install --name {name}` を実行してください。",
+                        install_dir.join(exe_name).display()
+                    )
+                } else {
+                    format!(
+                        "`sudo \"{}\" service install --name {name}` を実行してください。",
+                        install_dir.join(exe_name).display()
+                    )
+                };
+                self.log_lines
+                    .push(format!("サービスの登録に失敗しました: {e}"));
+                self.log_lines.push(hint);
+            }
+        }
     }
 
     fn launch_server_and_open_dashboard(&mut self) {
@@ -909,6 +989,40 @@ impl SetupApp {
             );
         }
 
+        if recisdb_proxy::service::is_supported() {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.checkbox(
+                &mut self.register_service,
+                "OSのサービスとして登録し、PC起動時に自動で開始する",
+            );
+            if self.register_service {
+                ui.horizontal(|ui| {
+                    ui.label("サービス名:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.service_name)
+                            .desired_width(220.0)
+                            .hint_text(recisdb_proxy::service::DEFAULT_SERVICE_NAME),
+                    );
+                });
+                // 入力ミスをこの場で知らせる (登録は実行時に再検証される)。
+                if let Err(e) = recisdb_proxy::service::sanitize_service_name(&self.service_name) {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e.to_string());
+                }
+                if cfg!(windows) {
+                    ui.label("※ 登録には管理者権限が必要です。管理者として実行してください。");
+                } else {
+                    ui.checkbox(
+                        &mut self.service_user_scope,
+                        "ログインユーザー単位で登録する(管理者権限なしで登録できますが、ログイン後にのみ動作します)",
+                    );
+                    if !self.service_user_scope {
+                        ui.label("※ システム全体への登録には root 権限が必要です (sudo で実行してください)。");
+                    }
+                }
+            }
+        }
+
         if let Some(err) = &self.setup_error {
             ui.add_space(10.0);
             ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
@@ -943,13 +1057,30 @@ impl SetupApp {
         }
 
         ui.horizontal(|ui| {
-            if ui.button("recisdb-proxy を起動する  ▶").clicked() {
+            if self.service_registered {
+                // サービスが既に起動している。ここで実行ファイルを直接
+                // 起動すると listen ポートが衝突するので、開くだけにする。
+                if ui.button("ダッシュボードを開く  ▶").clicked() {
+                    open_in_browser(&dashboard_url(&self.web_listen_addr));
+                }
+            } else if ui.button("recisdb-proxy を起動する  ▶").clicked() {
                 self.launch_server_and_open_dashboard();
             }
             if ui.button("終了").clicked() {
                 std::process::exit(0);
             }
         });
+
+        if self.service_registered {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "recisdb-proxy はサービスとして常時稼働します (PC起動時に自動で開始します)。",
+                )
+                .weak()
+                .small(),
+            );
+        }
 
         ui.add_space(16.0);
         ui.separator();

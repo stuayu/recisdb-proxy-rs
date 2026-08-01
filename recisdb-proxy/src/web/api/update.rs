@@ -484,7 +484,10 @@ async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &s
     // --- Restart ----------------------------------------------------------
     set_status(web_state, UpdateStatus::Restarting).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    restart_process(&exe_path)
+    // サービス配下 (systemd/launchd/SCM) かどうかで再起動方法が変わる
+    // ため、`service::restart_self` に一本化している。
+    let _ = exe_path;
+    crate::service::restart_self().map_err(|e| e.to_string())
 }
 
 async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
@@ -556,66 +559,6 @@ async fn validate_extracted_binary(path: &Path, os: &str) -> Result<(), String> 
         return Err("downloaded binary failed the magic-byte signature check".to_string());
     }
     Ok(())
-}
-
-/// Re-executes `exe_path` with the process's original arguments.
-///
-/// - Unix: `exec()`s in place. On success this call never returns (the
-///   process image is replaced); it only returns when `exec` itself failed.
-///   Listen sockets are opened `CLOEXEC` by tokio, so `exec` closes them
-///   and the new image can re-bind. Under systemd this keeps the same
-///   PID/cgroup, so the unit stays "active" throughout — no
-///   `systemctl stop/start` (and no root privileges) needed.
-/// - Windows: the new process must not race this one for the listen
-///   ports, so a detached `cmd` relauncher is spawned that waits a few
-///   seconds (for this process to exit and release its sockets) and then
-///   `start`s the replaced executable. This process exits immediately
-///   after the spawn; `std::process::exit` never returns, so — like the
-///   Unix branch — this function only returns on failure.
-fn restart_process(exe_path: &Path) -> Result<(), String> {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(exe_path).args(&args).exec();
-        Err(format!("exec failed: {err}"))
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-        // `ping -n 4` ≈ a 3-second delay without needing `timeout.exe`
-        // (which refuses to run without a console). `start` gives the
-        // restarted server its own console, matching a manual launch.
-        let mut relaunch = format!(
-            "/C ping -n 4 127.0.0.1 >nul & start \"recisdb-proxy\" \"{}\"",
-            exe_path.display()
-        );
-        for arg in &args {
-            relaunch.push_str(&format!(" \"{}\"", arg.to_string_lossy()));
-        }
-
-        // `raw_arg` hands the line to cmd.exe verbatim — std's per-argument
-        // quoting would corrupt the `&`/`>nul` cmd metacharacters.
-        match std::process::Command::new("cmd")
-            .raw_arg(relaunch)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-        {
-            Ok(_) => std::process::exit(0),
-            Err(e) => Err(format!("failed to spawn relauncher: {e}")),
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = exe_path;
-        Err("restart is not supported on this platform".to_string())
-    }
 }
 
 #[cfg(test)]

@@ -75,7 +75,42 @@ Windowsの場合は、下記をダブルクリックして実行します。
 Linuxの場合は、下記のコマンドを実行します。(Linuxは/dev/px4**にアクセスする場合システム権限が必要です)  
 `sudo ./recisdb-proxy`
 
-Systemd登録用に下記のテンプレートも参考にしてください。  
+### サービスとして常時稼働させる
+
+PC起動時に自動で開始させたい場合は、OSのサービスとして登録します。セットアップウィザード
+(`recisdb-proxy-setup`) の確認画面でも「OSのサービスとして登録する」にチェックを入れるだけで登録でき、
+サービス名もそこで指定できます。
+
+コマンドラインから登録する場合:
+
+```bash
+# Linux (systemd) / macOS (launchd): システム全体に登録
+sudo ./recisdb-proxy service install --name recisdb-proxy
+
+# ログインユーザー単位で登録する (管理者権限なし。ログイン後にのみ動作します)
+./recisdb-proxy service install --name recisdb-proxy --user
+
+# 状態確認・停止・開始・再起動・登録解除
+./recisdb-proxy service status
+sudo ./recisdb-proxy service stop
+sudo ./recisdb-proxy service start
+sudo ./recisdb-proxy service restart
+sudo ./recisdb-proxy service uninstall
+```
+
+Windowsでは、**管理者として実行した**コマンドプロンプト/PowerShellから同じコマンドを使います
+(Windowsにユーザースコープはないため `--user` は使えません)。
+
+```powershell
+recisdb-proxy.exe service install --name recisdb-proxy
+```
+
+サービス名は英数字と `.` `_` `-` のみ、64文字以内です。設定ファイルは `--config` で明示できます
+(省略時は `-f` の値、それも無ければ作業フォルダの `recisdb-proxy.toml`)。
+
+登録後は、Webダッシュボードの「設定」タブに登録状況が表示され、そこからサーバーを再起動できます。
+
+自分でユニットファイルを書きたい場合は、下記のテンプレートも参考にしてください。  
 `recisdb-proxy\recisdb-proxy-rs.service`
 
 
@@ -106,6 +141,9 @@ Systemd登録用に下記のテンプレートも参考にしてください。
 | `--log-dir` | `logs` | ログファイルの保存先 |
 | `--log-retention-days` | `7` | ログの保持日数 |
 | `-v, --verbose` | `false` | 詳細ログの有効化 |
+
+サブコマンド `recisdb-proxy service <install|uninstall|start|stop|restart|status>` については
+「サービスとして常時稼働させる」を参照してください。
 
 ### 設定ファイル
 

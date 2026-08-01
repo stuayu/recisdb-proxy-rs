@@ -69,10 +69,91 @@ async function save() {
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
+// --- サーバー(OSサービス)状態と再起動 -------------------------------
+type ServiceStatus = {
+  supported: boolean
+  manager: string
+  name: string
+  scope: string
+  installed: boolean
+  running: boolean
+  enabled: boolean
+  detail: string | null
+}
+type ServiceStatusResponse = {
+  supported: boolean
+  running_under_service_manager: boolean
+  restart_method: string
+  service: ServiceStatus
+}
+
+const service = ref<ServiceStatusResponse | null>(null)
+const serviceError = ref('')
+const restarting = ref(false)
+const restartMessage = ref('')
+
+const restartMethodLabel: Record<string, string> = {
+  service_manager_respawn: 'サービスマネージャーによる自動再起動',
+  service_control_manager: 'Windowsサービスの停止→開始',
+  exec_self: 'プロセスの再実行',
+}
+const scopeLabel: Record<string, string> = { system: 'システム', user: 'ユーザー' }
+
+async function loadService() {
+  try {
+    service.value = await api<ServiceStatusResponse>('/service/status')
+    serviceError.value = ''
+  } catch (cause) {
+    serviceError.value = cause instanceof Error ? cause.message : String(cause)
+  }
+}
+
+/** サーバーが再び応答するまで待つ(再起動には数秒かかる)。 */
+async function waitForServer(timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs
+  // 停止し切る前に成功と判定しないよう、まず少し待つ。
+  await new Promise((resolve) => setTimeout(resolve, 3000))
+  while (Date.now() < deadline) {
+    try {
+      await api('/version')
+      return true
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+  }
+  return false
+}
+
+async function restartServer() {
+  const ok = window.confirm(
+    'recisdb-proxy を再起動します。視聴中・録画中のセッションはすべて切断されます。よろしいですか？',
+  )
+  if (!ok) return
+  restarting.value = true
+  restartMessage.value = '再起動を要求しました。サーバーの復帰を待っています…'
+  try {
+    await api('/service/restart', { method: 'POST' })
+  } catch (cause) {
+    restarting.value = false
+    restartMessage.value = ''
+    serviceError.value = cause instanceof Error ? cause.message : String(cause)
+    return
+  }
+  const back = await waitForServer()
+  restarting.value = false
+  restartMessage.value = back
+    ? 'サーバーが再起動しました。'
+    : 'サーバーが時間内に応答しませんでした。手動での起動が必要かもしれません。'
+  if (back) await loadService()
+}
+
 function updateNumber(key: string, event: Event) {
   config.value[key] = Number((event.target as HTMLInputElement).value)
 }
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadService()
+})
 </script>
 <template>
   <section class="view">
@@ -98,6 +179,33 @@ onMounted(load)
           v-text="item[0]"
         /></select
     ></label>
+    <div class="panel">
+      <h3>サーバー</h3>
+      <p v-if="serviceError" class="notice error" role="alert" v-text="serviceError" />
+      <dl v-if="service" class="service-status">
+        <dt>サービス登録</dt>
+        <dd v-if="service.service.installed">
+          {{ service.service.name }}（{{
+            scopeLabel[service.service.scope] ?? service.service.scope
+          }}
+          / {{ service.service.manager }}）— {{ service.service.running ? '稼働中' : '停止中' }}、
+          自動起動{{ service.service.enabled ? '有効' : '無効' }}
+        </dd>
+        <dd v-else>
+          未登録（セットアップウィザード、または <code>recisdb-proxy service install</code>
+          で登録できます）
+        </dd>
+        <dt>再起動方式</dt>
+        <dd v-text="restartMethodLabel[service.restart_method] ?? service.restart_method" />
+      </dl>
+      <p v-if="service && !service.running_under_service_manager" class="muted">
+        現在サービス管理下では動作していません。再起動すると同じ引数でプロセスを起動し直します。
+      </p>
+      <p v-if="restartMessage" class="notice" v-text="restartMessage" />
+      <button class="button secondary" type="button" :disabled="restarting" @click="restartServer">
+        {{ restarting ? '再起動中…' : 'サーバーを再起動' }}
+      </button>
+    </div>
     <p v-if="message" class="notice success" v-text="message" />
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <form class="panel settings-form" @submit.prevent="save">
@@ -128,3 +236,20 @@ onMounted(load)
     </form>
   </section>
 </template>
+
+<style scoped>
+.service-status {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0 0 12px;
+}
+
+.service-status dt {
+  font-weight: 600;
+}
+
+.service-status dd {
+  margin: 0;
+}
+</style>

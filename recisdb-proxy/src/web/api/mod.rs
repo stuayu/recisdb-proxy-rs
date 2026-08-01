@@ -18,6 +18,7 @@ mod client_view;
 mod programs;
 mod update;
 mod logs;
+mod service;
 
 pub use error::*;
 pub use statics::*;
@@ -31,3 +32,4 @@ pub use client_view::*;
 pub use programs::*;
 pub use update::*;
 pub use logs::*;
+pub use service::*;

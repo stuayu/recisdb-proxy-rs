@@ -23,6 +23,7 @@ pub mod epg_writer;
 pub mod px4_installer;
 pub mod scheduler;
 pub mod server;
+pub mod service;
 pub mod setup_helpers;
 pub mod ts_analyzer;
 pub mod tuner;

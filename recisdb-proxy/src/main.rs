@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use log::{info, warn, error};
 
@@ -25,11 +25,16 @@ use server::{Server, ServerConfig};
 use tuner::TunerPoolConfig;
 
 mod app_config;
+mod service_cli;
 
 /// recisdb-proxy - Network proxy server for BonDriver
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Optional subcommand. Without one, the server starts as before.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Address to listen on
     #[arg(short, long, default_value = "0.0.0.0:40070")]
     listen: SocketAddr,
@@ -107,13 +112,128 @@ struct Args {
     #[cfg(feature = "tls")]
     #[arg(long)]
     server_key: Option<PathBuf>,
+
+    /// Internal: set by the OS service manager when this process is launched
+    /// as a registered service (`service/windows_scm.rs::launch_arguments`).
+    /// On Windows this switches startup to the SCM dispatcher; on Unix it
+    /// only marks the process (systemd/launchd exec the binary directly).
+    #[arg(long, hide = true)]
+    run_as_service: bool,
+
+    /// Internal: service name to report to the Windows SCM dispatcher.
+    #[arg(long, hide = true)]
+    service_name: Option<String>,
+
+    /// Internal: working directory to chdir into when launched as a service.
+    /// The Windows SCM has no notion of a working directory, so the installer
+    /// passes it explicitly.
+    #[arg(long, hide = true)]
+    service_workdir: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
+/// Subcommands. `None` (the default) keeps the historical behaviour of
+/// starting the server directly.
+#[derive(Subcommand, Debug, Clone)]
+enum Command {
+    /// OSサービスとしての登録・制御 (install/uninstall/start/stop/restart/status)
+    Service {
+        #[command(subcommand)]
+        action: service_cli::ServiceAction,
+    },
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Subcommands run before any logging/database setup and never start the
+    // server.
+    if let Some(Command::Service { action }) = &args.command {
+        let code = service_cli::run(action, args.config.as_deref());
+        std::process::exit(code);
+    }
+
+    if args.run_as_service {
+        recisdb_proxy::service::mark_running_as_service(args.service_name.as_deref());
+        if let Some(dir) = &args.service_workdir {
+            std::env::set_current_dir(dir).map_err(|e| {
+                format!("failed to chdir into service working directory {dir:?}: {e}")
+            })?;
+        }
+    }
+
+    // Windows: a service process must talk to the SCM (report Running, honour
+    // Stop) or the SCM reports "the service did not respond in a timely
+    // fashion". `run_dispatcher` blocks until the service stops.
+    #[cfg(windows)]
+    if args.run_as_service {
+        let name = args
+            .service_name
+            .clone()
+            .unwrap_or_else(|| recisdb_proxy::service::DEFAULT_SERVICE_NAME.to_string());
+        let args_for_body = args.clone();
+        recisdb_proxy::service::windows_scm::run_dispatcher(&name, move |should_stop| {
+            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("failed to build tokio runtime: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = runtime.block_on(run_server(args_for_body, wait_stop_flag(should_stop)))
+            {
+                eprintln!("server exited with error: {e}");
+            }
+        })?;
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_server(args, shutdown_signal()))
+}
+
+/// Resolves when the process is asked to stop: Ctrl+C on every platform, plus
+/// SIGTERM on Unix (what `systemctl stop` / `launchctl bootout` send — without
+/// this the default disposition kills the process before anything can flush).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Windows service path: the SCM control handler runs on its own thread and
+/// only flips an `AtomicBool`, so the async side polls it.
+#[cfg(windows)]
+async fn wait_stop_flag(flag: Arc<std::sync::atomic::AtomicBool>) {
+    loop {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+async fn run_server(
+    args: Args,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Load config file: explicit path > auto-detect > default
     let file_config = app_config::load_file_config(&args)?;
 
@@ -487,17 +607,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Run until the listener exits or the process receives Ctrl+C/SIGTERM.
-    // Dropping the listener future stops new BNDP connections; owned pools
-    // and database handles are then released in normal Rust drop order.
+    // Run until the listener exits or the caller's shutdown future resolves
+    // (Ctrl+C/SIGTERM normally, the SCM stop flag when running as a Windows
+    // service). Dropping the listener future stops new BNDP connections;
+    // owned pools and database handles are then released in normal Rust drop
+    // order.
+    tokio::pin!(shutdown);
     tokio::select! {
         result = server.run() => result?,
-        signal = tokio::signal::ctrl_c() => {
-            match signal {
-                Ok(()) => info!("Shutdown signal received; stopping server"),
-                Err(e) => warn!("Unable to listen for shutdown signal: {}", e),
-            }
-        }
+        _ = &mut shutdown => info!("Shutdown signal received; stopping server"),
     }
 
     Ok(())

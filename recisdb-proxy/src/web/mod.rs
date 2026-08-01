@@ -43,6 +43,11 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))
         .route("/update/status", get(api::update_status))
+
+        // OSサービス連携 (service/mod.rs)。登録/削除は権限昇格の経路に
+        // なるため Web からは行わない (CLI とセットアップGUIのみ)。
+        .route("/service/status", get(api::get_service_status))
+        .route("/service/restart", post(api::restart_service))
         // Log viewer API (web/api/logs.rs)
         .route("/logs", get(api::get_logs))
         .route("/logs/files", get(api::list_log_files))
