@@ -229,7 +229,10 @@ pub async fn start_tuner_for_service(
         .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, || async { Ok(()) })
         .await?;
 
-    if !tuner.is_running() {
+    // `needs_reader_start()`, not `!is_running()`: a `Starting` entry has
+    // another task's BonDriver open + SetChannel already in flight, and a
+    // `Reserved` one is the entry `get_or_create` just handed us.
+    if tuner.needs_reader_start() {
         let pool_config = tuner_pool.config().await;
         let startup_config = ReaderStartupConfig::from(&pool_config);
 
@@ -240,7 +243,7 @@ pub async fn start_tuner_for_service(
 
         // Re-check after acquiring the lock: another task may have started
         // the reader for this exact key while we awaited the guard.
-        if !tuner.is_running() {
+        if tuner.needs_reader_start() {
             let (space, channel) = match key.channel {
                 ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
                 ChannelKeySpec::Simple(c) => (0, c as u32),
@@ -265,6 +268,14 @@ pub async fn start_tuner_for_service(
                 let running_after =
                     count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
                 if running_after >= resolved.max_instances {
+                    // We are giving up without ever starting a reader, so the
+                    // `Reserved` entry `get_or_create` created for us above
+                    // would otherwise sit in the pool holding this driver's
+                    // slot forever (`occupies_slot()` counts `Reserved`).
+                    // Hand it back before returning.
+                    if tuner.is_orphanable() {
+                        tuner_pool.remove(&key).await;
+                    }
                     return Err(ChannelResolveError::Busy {
                         id: resolved.channel.id,
                         running: running_after,

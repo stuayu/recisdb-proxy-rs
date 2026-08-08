@@ -96,7 +96,7 @@ use crate::server::channel_resolve;
 use crate::web::state::WebState;
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    StreamCleanup,
+    BodyReceiver, StreamCleanup,
 };
 use recisdb_protocol::BandType;
 
@@ -521,7 +521,7 @@ pub async fn stream_service_by_mirakurun_id(
 
     let tuner_rx = tuner.subscribe();
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
-    respond_with_stream(broadcast_to_body_stream(tuner_rx, cleanup))
+    respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
 }
 
 /// `GET /mirakurun/api/channels/:type/:channel/stream`.
@@ -581,7 +581,7 @@ pub async fn stream_channel_by_type(
 
     let tuner_rx = tuner.subscribe();
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
-    respond_with_stream(broadcast_to_body_stream(tuner_rx, cleanup))
+    respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
 }
 
 #[cfg(test)]

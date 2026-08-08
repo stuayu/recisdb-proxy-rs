@@ -7,8 +7,10 @@
 pub mod channel_key;
 pub mod encoder_pool;
 pub mod lock;
+pub mod policy;
 pub mod pool;
 pub mod shared;
+pub(crate) mod ts_source;
 pub mod ts_parser;
 pub mod ts_analyzer;
 pub mod b25_pipe;
@@ -20,6 +22,6 @@ pub mod epg_collector;
 pub use channel_key::ChannelKey;
 pub use encoder_pool::{EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 pub use pool::{TunerPool, TunerPoolConfig};
-pub use shared::SharedTuner;
+pub use shared::{ReaderState, SharedTuner, TunerSubscription};
 pub use warm::WarmTunerHandle;
 pub use quality_scorer::{BonDriverWithScore, QualityScorer};

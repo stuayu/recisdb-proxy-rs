@@ -1,4 +1,10 @@
 //! Capacity and eviction policy helpers for BNDP sessions.
+//!
+//! The pure predicates/eviction-choice functions that used to live here
+//! (and their unit tests) moved to `tuner::policy` as part of
+//! docs/TUNER_PIPELINE_REDESIGN.md P0 — re-exported below under their old
+//! names/visibility so the async DB/pool orchestration in this module (none
+//! of which is pure) keeps compiling unchanged.
 
 use std::sync::Arc;
 
@@ -8,39 +14,10 @@ use crate::server::listener::DatabaseHandle;
 use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
 use crate::tuner::channel_key::ChannelKeySpec;
 
-pub(super) type EvictionCandidate = (ChannelKey, i32, bool);
-
-pub(super) fn has_capacity(running_instances: i32, max_instances: i32) -> bool {
-    running_instances < max_instances
-}
-
-pub(super) fn should_stop_reader_for_capacity(
-    running_instances: i32,
-    max_instances: i32,
-) -> bool {
-    running_instances >= max_instances
-}
-
-/// Prefer idle tuners first, then the lowest effective priority.
-pub(super) fn choose_eviction_target(
-    candidates: &[EvictionCandidate],
-) -> Option<EvictionCandidate> {
-    let mut best_idle: Option<EvictionCandidate> = None;
-    let mut best_any: Option<EvictionCandidate> = None;
-
-    for (key, priority, has_subscribers) in candidates.iter() {
-        if !has_subscribers {
-            if best_idle.as_ref().map_or(true, |(_, p, _)| priority < p) {
-                best_idle = Some((key.clone(), *priority, *has_subscribers));
-            }
-        }
-        if best_any.as_ref().map_or(true, |(_, p, _)| priority < p) {
-            best_any = Some((key.clone(), *priority, *has_subscribers));
-        }
-    }
-
-    best_idle.or(best_any)
-}
+pub(super) use crate::tuner::policy::{
+    choose_eviction_target, has_capacity, should_stop_reader_for_capacity,
+    should_sync_stop_old_reader,
+};
 
 pub(super) async fn driver_max_instances(
     database: &DatabaseHandle,
@@ -50,6 +27,16 @@ pub(super) async fn driver_max_instances(
     db.get_max_instances_for_path(tuner_path).unwrap_or(1)
 }
 
+/// Count how many tuner slots on `tuner_path` are currently taken.
+///
+/// Counts `occupies_slot()` (Starting/Running/Stopping), **not**
+/// `is_running()`: a reader that is still opening the BonDriver and running
+/// its SetChannel retries already holds the DLL/device, and that startup can
+/// take up to `set_channel_retry_timeout_ms`. Counting only `Running` here
+/// would undercount for the whole init window and let a second reader be
+/// started over `max_instances`. (Before `ReaderState` existed, the old
+/// `is_running` flag was set to `true` at the very top of the reader body,
+/// so it covered the init window too — `occupies_slot()` preserves that.)
 pub(super) async fn count_running_instances_on_driver(
     tuner_pool: &Arc<TunerPool>,
     tuner_path: &str,
@@ -65,7 +52,7 @@ pub(super) async fn count_running_instances_on_driver(
             continue;
         }
         if let Some(tuner) = tuner_pool.get(key).await {
-            if tuner.is_running() {
+            if tuner.occupies_slot() {
                 running_instances += 1;
             }
         }
@@ -83,38 +70,17 @@ pub(super) async fn stop_and_remove_tuner(
     tuner.stop_reader().await;
 
     if wait_for_stop {
+        // Wait for the slot to actually be released, not merely for TS data
+        // to stop flowing: the caller's whole reason to wait is that it is
+        // about to open the same DLL/device.
         let mut wait_attempts = 0;
-        while tuner.is_running() && wait_attempts < 50 {
+        while tuner.occupies_slot() && wait_attempts < 50 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             wait_attempts += 1;
         }
     }
 
     tuner_pool.remove(key).await;
-}
-
-/// Whether the old reader must be stopped synchronously (vs. scheduled for
-/// idle-close) when a session switches away from it.
-///
-/// Two call sites disagree on whether a same-DLL switch alone is reason
-/// enough to force a synchronous stop, so the caller decides via
-/// `force_stop_same_dll`:
-///   - `SetChannelSpace` / `SetChannel` (v1): a same-DLL switch on a
-///     multi-instance DLL is allowed to leave the old reader running so it
-///     can idle-close (warm reuse) — only actual capacity pressure forces a
-///     synchronous stop.
-///   - `SelectLogicalChannel`: group members are assumed to hard-exclusive
-///     the underlying hardware, so a same-DLL switch always stops the old
-///     reader synchronously, regardless of spare capacity.
-/// Capacity pressure (`running >= max`) always forces a synchronous stop
-/// either way — that part is not caller-dependent.
-pub(super) fn should_sync_stop_old_reader(
-    same_dll: bool,
-    force_stop_same_dll: bool,
-    running: i32,
-    max: i32,
-) -> bool {
-    (force_stop_same_dll && same_dll) || should_stop_reader_for_capacity(running, max)
 }
 
 pub(super) async fn cleanup_unused_tuner_after_switch(
@@ -130,7 +96,10 @@ pub(super) async fn cleanup_unused_tuner_after_switch(
         return;
     }
 
-    if !tuner.is_running() {
+    // `occupies_slot()`, not `is_running()`: an entry that is still
+    // `Starting` has an in-flight reader startup behind it and must not be
+    // treated as "already stopped" and yanked out of the pool.
+    if !tuner.occupies_slot() {
         debug!(
             "[Session {}] {} {:?} already stopped, ensuring pool cleanup",
             session_id, log_prefix, tuner.key
@@ -236,6 +205,10 @@ pub(super) async fn ensure_driver_capacity_with_idle_eviction(
             continue;
         }
         if let Some(tuner) = tuner_pool.get(key).await {
+            // Deliberately `is_running()`, not `occupies_slot()`: only a
+            // fully-started reader with no subscribers is "idle" and safe to
+            // evict. A `Starting` entry has a caller awaiting its readiness,
+            // and a `Stopping` one is already on its way out.
             if tuner.is_running() && !tuner.has_subscribers() {
                 idle_candidate = Some(tuner);
                 break;
@@ -307,40 +280,5 @@ pub(super) async fn evict_interlopers_until_capacity(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::should_sync_stop_old_reader;
-
-    // (a) Same DLL, spare capacity, no forcing (SetChannelSpace/SetChannel
-    // caller): allowed to idle-close instead of a synchronous stop, so a
-    // multi-instance DLL can keep serving other subscribers warm.
-    #[test]
-    fn same_dll_with_spare_capacity_and_no_force_schedules_idle_close() {
-        assert!(!should_sync_stop_old_reader(true, false, 1, 4));
-    }
-
-    // (b) Same DLL, forced (SelectLogicalChannel caller): stop synchronously
-    // even though there is spare capacity, because group members are assumed
-    // to hard-exclusive the underlying hardware.
-    #[test]
-    fn same_dll_with_force_stops_synchronously_even_with_spare_capacity() {
-        assert!(should_sync_stop_old_reader(true, true, 1, 4));
-    }
-
-    // (c) At/over capacity always forces a synchronous stop, regardless of
-    // same-DLL-ness or the force flag.
-    #[test]
-    fn over_capacity_stops_synchronously_regardless_of_force_flag() {
-        assert!(should_sync_stop_old_reader(true, false, 4, 4));
-        assert!(should_sync_stop_old_reader(false, false, 4, 4));
-        assert!(should_sync_stop_old_reader(false, true, 4, 4));
-    }
-
-    // (d) Different DLL, spare capacity: always idle-close, never forced by
-    // the same-DLL flag since it isn't the same DLL.
-    #[test]
-    fn different_dll_with_spare_capacity_schedules_idle_close() {
-        assert!(!should_sync_stop_old_reader(false, false, 1, 4));
-        assert!(!should_sync_stop_old_reader(false, true, 1, 4));
-    }
-}
+// `should_sync_stop_old_reader`'s unit tests moved to `tuner::policy` along
+// with the function itself (docs/TUNER_PIPELINE_REDESIGN.md P0).

@@ -127,6 +127,14 @@ impl WarmTunerHandle {
             std::io::Error::new(std::io::ErrorKind::Other, err)
         })?;
 
+        // Mirrors `SharedTuner::start_bondriver_reader`'s synchronous
+        // `Starting` transition (docs/TUNER_PIPELINE_REDESIGN.md §4 P1): the
+        // `shared` entry passed in here came from `TunerPool::get_or_create`,
+        // which already marks freshly-created entries `Starting`, so this is
+        // idempotent defensive coverage for any future caller that reuses an
+        // `Idle`/`Stopped` `SharedTuner` with a warm handle.
+        shared.set_state(crate::tuner::shared::ReaderState::Starting);
+
         let (start_tx, start_rx) = oneshot::channel::<Result<(), String>>();
         let cmd = WarmCommand::Start {
             shared: Arc::clone(&shared),

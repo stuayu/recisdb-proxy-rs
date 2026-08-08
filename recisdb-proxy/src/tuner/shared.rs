@@ -1,6 +1,6 @@
 //! Shared tuner implementation with broadcast capability.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +17,78 @@ use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
 use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::pool::TunerPoolConfig;
+use crate::tuner::ts_source::TsSource;
+
+/// Lifecycle state of a [`SharedTuner`]'s background reader
+/// (docs/TUNER_PIPELINE_REDESIGN.md §4 P1).
+///
+/// Replaces the old `is_running: AtomicBool`, whose only two observable
+/// values (`true`/`false`) could not distinguish "not started yet" from
+/// "currently opening the BonDriver and setting the channel" — the second
+/// case is exactly what let a freshly-created, not-yet-running pool entry
+/// get evicted out from under its own in-flight reader startup (SYSTEM_REVIEW
+/// M8; see `tuner::pool`'s `is_reclaimable`/`occupies_slot` predicates that
+/// consume this enum).
+///
+/// Transitions: `Idle --start--> Starting --(ready)--> Running
+/// --stop_reader--> Stopping --(task exits)--> Stopped`. A startup failure
+/// (SetChannel error, BonDriver open error, or a panic anywhere in the
+/// reader) goes straight from `Starting` to `Stopped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderState {
+    /// Never started (a freshly-inserted pool entry that hasn't had
+    /// `start_bondriver_reader`/`WarmTunerHandle::activate` called on it
+    /// yet — in practice this is momentary, since pool insertion and the
+    /// `Starting` transition happen back-to-back).
+    Idle = 0,
+    /// Occupying a slot: BonDriver is being opened and/or `SetChannel` is
+    /// in flight. No TS data is flowing yet, but this entry is *not* stale —
+    /// see `occupies_slot()`.
+    Starting = 1,
+    /// Channel set, reader loop delivering (or attempting to deliver) TS
+    /// data to subscribers. This is what `is_running()` has always meant.
+    Running = 2,
+    /// `stop_reader()` has requested the loop exit; the background task may
+    /// still be unwinding for a brief window.
+    Stopping = 3,
+    /// The reader loop has exited (cleanly, on error, or after a panic) and
+    /// is not going to restart on its own.
+    Stopped = 4,
+    /// Created by [`crate::tuner::TunerPool::get_or_create`] and holding its
+    /// driver slot, but **no reader start is in flight yet** — the caller
+    /// that asked for the entry is expected to call
+    /// `start_bondriver_reader`/`WarmTunerHandle::activate` next.
+    ///
+    /// Distinct from [`Self::Starting`] because the two answer different
+    /// questions: both occupy a slot (so capacity accounting counts them),
+    /// but only `Reserved` still *needs* someone to start a reader. Merging
+    /// them would make every "should I start the reader?" call site either
+    /// skip the start it owed (if it treated `Reserved` as in-flight) or
+    /// start a second reader over another task's in-flight one (if it
+    /// treated `Starting` as needing a start).
+    ///
+    /// A `Reserved` entry that is abandoned (its caller hit a capacity
+    /// conflict, or failed before starting) must be removed from the pool by
+    /// that caller — see [`SharedTuner::is_orphanable`]. P1b replaces this
+    /// hand-managed reservation with an RAII slot permit.
+    Reserved = 5,
+}
+
+impl TryFrom<u8> for ReaderState {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(ReaderState::Idle),
+            1 => Ok(ReaderState::Starting),
+            2 => Ok(ReaderState::Running),
+            3 => Ok(ReaderState::Stopping),
+            4 => Ok(ReaderState::Stopped),
+            5 => Ok(ReaderState::Reserved),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Capacity of the broadcast channel for TS data.
 /// Increased to 4096 (256MB of 64KB chunks) to support multiple simultaneous subscribers
@@ -60,10 +132,13 @@ pub struct SharedTuner {
     tx: broadcast::Sender<Bytes>,
     /// Channel change notification sender.
     channel_change_tx: broadcast::Sender<()>,
-    /// Reference count of active subscribers.
+    /// Reference count of active subscribers. Only ever mutated by
+    /// [`TunerSubscription`]'s constructor (`subscribe`) and `Drop` impl —
+    /// see that type's doc comment for why manual subscribe/unsubscribe was
+    /// removed.
     subscriber_count: AtomicU32,
-    /// Flag indicating if the tuner reader task is running.
-    is_running: AtomicBool,
+    /// Lifecycle state of the background reader task. See [`ReaderState`].
+    reader_state: AtomicU8,
     /// Handle to the reader task (if running).
     reader_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Signal level (updated periodically).
@@ -86,7 +161,7 @@ impl SharedTuner {
             tx,
             channel_change_tx,
             subscriber_count: AtomicU32::new(0),
-            is_running: AtomicBool::new(false),
+            reader_state: AtomicU8::new(ReaderState::Idle as u8),
             reader_handle: tokio::sync::Mutex::new(None),
             signal_level: AtomicU32::new(0),
             bondriver_version,
@@ -157,14 +232,26 @@ impl SharedTuner {
     }
 
     /// Subscribe to the TS data stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+    ///
+    /// Returns a [`TunerSubscription`] that increments `subscriber_count` now
+    /// and decrements it automatically on `Drop` — see that type's doc
+    /// comment for why the old manual `unsubscribe()` API was removed.
+    ///
+    /// Takes `self: &Arc<Self>` (a stable receiver type, same as
+    /// [`Self::start_bondriver_reader`] below) rather than plain `&self`, so
+    /// `TunerSubscription` can hold an owned `Arc<SharedTuner>` via a cheap
+    /// `Arc::clone` — no `Weak`/`Arc::new_cyclic`/`.upgrade().expect(...)`
+    /// needed. Every call site already holds an `Arc<SharedTuner>` (from
+    /// `TunerPool`), so this is a transparent signature change: `tuner.subscribe()`
+    /// keeps compiling unchanged.
+    pub fn subscribe(self: &Arc<Self>) -> TunerSubscription {
         self.subscriber_count.fetch_add(1, Ordering::SeqCst);
         debug!(
             "New subscriber for {:?}, total: {}",
             self.key,
             self.subscriber_count.load(Ordering::SeqCst)
         );
-        self.tx.subscribe()
+        TunerSubscription { tuner: Arc::clone(self), rx: self.tx.subscribe() }
     }
 
     /// Subscribe to the TS data stream WITHOUT incrementing the subscriber
@@ -174,8 +261,13 @@ impl SharedTuner {
     /// encoder is a parasitic consumer whose own lifetime is governed by its
     /// session subscribers, so it must not keep the tuner alive by itself or
     /// perturb the session-driven keep-alive / idle-close accounting.
-    pub(crate) fn subscribe_untracked(&self) -> broadcast::Receiver<Bytes> {
-        self.tx.subscribe()
+    ///
+    /// Returns an [`UntrackedSubscription`] rather than a bare
+    /// `broadcast::Receiver` so the "this subscription does not count"
+    /// contract is visible in the type, not just the doc comment; its `Drop`
+    /// does nothing (there is no count to decrement).
+    pub(crate) fn subscribe_untracked(&self) -> UntrackedSubscription {
+        UntrackedSubscription { rx: self.tx.subscribe() }
     }
 
     /// Subscribe to channel change notifications.
@@ -189,30 +281,6 @@ impl SharedTuner {
         debug!("Channel change notified for {:?}", self.key);
     }
 
-    /// Unsubscribe from the TS data stream.
-    ///
-    /// Uses `fetch_update` so the decrement is skipped atomically when the count
-    /// is already 0, preventing an `AtomicU32` wraparound to `u32::MAX` which would
-    /// permanently disable idle-close detection.
-    pub fn unsubscribe(&self) {
-        match self.subscriber_count.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |n| if n > 0 { Some(n - 1) } else { None },
-        ) {
-            Ok(prev) => debug!(
-                "Subscriber removed from {:?}, remaining: {}",
-                self.key,
-                prev - 1
-            ),
-            Err(0) => warn!(
-                "unsubscribe() called when subscriber_count is already 0 for {:?}; ignoring",
-                self.key
-            ),
-            Err(_) => unreachable!(),
-        }
-    }
-
     /// Get the number of active subscribers.
     pub fn subscriber_count(&self) -> u32 {
         self.subscriber_count.load(Ordering::SeqCst)
@@ -221,6 +289,105 @@ impl SharedTuner {
     /// Check if any subscribers are connected.
     pub fn has_subscribers(&self) -> bool {
         self.subscriber_count.load(Ordering::SeqCst) > 0
+    }
+
+    /// Current reader lifecycle state. See [`ReaderState`].
+    pub fn state(&self) -> ReaderState {
+        // The stored value is only ever written via `set_state`, which only
+        // ever writes valid `ReaderState as u8` values, so the `TryFrom`
+        // cannot fail in practice; `Stopped` is a safe fallback regardless.
+        ReaderState::try_from(self.reader_state.load(Ordering::Acquire)).unwrap_or(ReaderState::Stopped)
+    }
+
+    /// Transition the reader lifecycle state.
+    pub(crate) fn set_state(&self, state: ReaderState) {
+        self.reader_state.store(state as u8, Ordering::Release);
+    }
+
+    /// Transition `Starting -> Running`, but only if the state is still
+    /// `Starting`. Returns `false` (and leaves the state untouched) if a
+    /// concurrent `stop_reader()` already advanced it to `Stopping` — e.g. a
+    /// session disconnects while its reader is still opening the BonDriver.
+    ///
+    /// This must be a compare-exchange, not an unconditional `set_state`:
+    /// the old `is_running: AtomicBool` model set `is_running = true` exactly
+    /// once, at the very top of `run_bondriver_reader_with_tuner`, and never
+    /// touched it again until the read loop's own stop-check — so a
+    /// `stop_reader()` call during startup reliably stuck as `false`. An
+    /// unconditional `set_state(Running)` right before entering the read loop
+    /// would silently resurrect a state a concurrent `stop_reader()` had
+    /// already moved to `Stopping`, leaving that reader running forever with
+    /// nothing left to stop it (this was caught by a hanging test during
+    /// review — see `reader_state_stop_during_starting_is_not_clobbered`).
+    fn try_transition_starting_to_running(&self) -> bool {
+        self.reader_state
+            .compare_exchange(
+                ReaderState::Starting as u8,
+                ReaderState::Running as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether this entry is occupying a pool slot: currently starting,
+    /// running, or in the process of stopping. `false` only for `Idle`
+    /// (never started) and `Stopped` (reader has fully exited).
+    ///
+    /// This is the P1 replacement for the informal "is this tuner in a state
+    /// where it still needs a DLL slot" check that used to require reasoning
+    /// about `is_running()` combined with recent history.
+    pub fn occupies_slot(&self) -> bool {
+        matches!(
+            self.state(),
+            ReaderState::Reserved
+                | ReaderState::Starting
+                | ReaderState::Running
+                | ReaderState::Stopping
+        )
+    }
+
+    /// Whether a caller still owes this entry a reader start.
+    ///
+    /// `false` exactly when a reader is already in flight (`Starting`) or
+    /// live (`Running`) — starting a second one on top of either would open
+    /// the same DLL twice. This replaces the `!is_running()` test that every
+    /// "start the reader if it isn't going yet" call site used before
+    /// `ReaderState` existed, which is no longer equivalent: the old
+    /// `is_running` flag was already `true` throughout the BonDriver
+    /// open + SetChannel-retry window that is now `Starting`.
+    pub fn needs_reader_start(&self) -> bool {
+        !matches!(self.state(), ReaderState::Starting | ReaderState::Running)
+    }
+
+    /// Whether the caller that created/holds this entry may drop it from the
+    /// pool: nothing is subscribed and no reader is in flight or live.
+    ///
+    /// Broader than [`Self::is_reclaimable`] by design — it also covers
+    /// [`ReaderState::Reserved`] (created but abandoned before its reader was
+    /// ever started, e.g. a capacity conflict detected after
+    /// `get_or_create`) and `Stopping`. Only the *owner* of the entry should
+    /// use this; pool-internal stale sweeps must keep using
+    /// [`Self::is_reclaimable`], which deliberately leaves another task's
+    /// `Reserved`/`Starting` entry alone (SYSTEM_REVIEW_2026-07.md M8).
+    pub fn is_orphanable(&self) -> bool {
+        !self.has_subscribers()
+            && !matches!(self.state(), ReaderState::Starting | ReaderState::Running)
+    }
+
+    /// Whether this pool entry is stale and safe to evict/replace: the
+    /// reader has never started (or has fully stopped) *and* nothing is
+    /// subscribed.
+    ///
+    /// This is the single predicate that replaces the
+    /// `!is_running() && !has_subscribers()` check that used to be
+    /// duplicated across `TunerPool::get_or_create` (x2), `TunerPool::cleanup`,
+    /// and several `server/session.rs` helpers (docs/TUNER_PIPELINE_REDESIGN.md
+    /// §4 P1) — critically, it does *not* fire for `ReaderState::Starting`,
+    /// which is what let a freshly-created, still-initializing tuner get
+    /// evicted out from under itself (SYSTEM_REVIEW_2026-07.md M8).
+    pub fn is_reclaimable(&self) -> bool {
+        matches!(self.state(), ReaderState::Idle | ReaderState::Stopped) && !self.has_subscribers()
     }
 
     /// Get the current signal level.
@@ -236,13 +403,16 @@ impl SharedTuner {
     /// Stop the tuner reader task.
     pub async fn stop_reader(&self) {
         info!("[SharedTuner] Stopping reader for {:?}...", self.key);
-        
-        // Signal the reader task to stop
-        self.is_running.store(false, Ordering::Release);
+
+        // Signal the reader task to stop. `Stopping` (not `Stopped` directly)
+        // so `occupies_slot()` still reports true for the brief window before
+        // the background task actually exits — this entry is not eligible
+        // for reclaim/reuse until the DLL is actually released.
+        self.set_state(ReaderState::Stopping);
 
         // Wait for the reader task to finish (with timeout).
         // wait_ts_stream() is now 100 ms, so the blocking task exits within
-        // ~200 ms of is_running becoming false.  1 s is a generous upper bound.
+        // ~200 ms of the state becoming Stopping.  1 s is a generous upper bound.
         if let Ok(mut guard) = tokio::time::timeout(
             std::time::Duration::from_millis(1000),
             self.reader_handle.lock()
@@ -263,10 +433,11 @@ impl SharedTuner {
         } else {
             error!("[SharedTuner] Failed to acquire reader handle lock for {:?}", self.key);
         }
-        
-        // Final ensure: mark as not running
-        self.is_running.store(false, Ordering::Release);
-        
+
+        // Final ensure: mark as stopped, even if the reader task never got a
+        // chance to set this itself (timeout/abort above).
+        self.set_state(ReaderState::Stopped);
+
         info!("[SharedTuner] Reader stopped for {:?}", self.key);
     }
 
@@ -275,16 +446,22 @@ impl SharedTuner {
         *self.reader_handle.lock().await = Some(handle);
     }
 
-    pub(crate) fn run_bondriver_reader_with_tuner(
+    pub(crate) fn run_bondriver_reader_with_tuner<T: TsSource>(
         shared: Arc<Self>,
-        tuner: BonDriverTuner,
+        tuner: T,
         tuner_path: String,
         space: u32,
         channel: u32,
         startup_config: ReaderStartupConfig,
         ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
-        shared.is_running.store(true, Ordering::Release);
+        // Already set by the caller (`start_bondriver_reader`/
+        // `WarmTunerHandle::activate`) before this function was ever
+        // scheduled, so the pool entry is occupied from the moment the
+        // caller decided to start a reader — not just from whenever this
+        // `spawn_blocking` closure happens to run. Set again here
+        // defensively (idempotent) in case a future caller forgets.
+        shared.set_state(ReaderState::Starting);
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
         // Set channel with retry for network-latency environments
@@ -330,7 +507,7 @@ impl SharedTuner {
                         error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
                                space, channel, e, e.kind());
                     }
-                    shared.is_running.store(false, Ordering::Release);
+                    shared.set_state(ReaderState::Stopped);
 
                     let err_msg = match e.kind() {
                         std::io::ErrorKind::AddrNotAvailable =>
@@ -345,7 +522,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::Release);
+                    shared.set_state(ReaderState::Stopped);
                     let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
                     return;
                 }
@@ -391,6 +568,26 @@ impl SharedTuner {
         // accepts it; signal acquisition is not checked.  Waiting here
         // blocked the session loop and caused consecutive channel-switch
         // failures because each switch had to wait up to 10 s.
+        //
+        // Transition to Running before signaling: callers that were waiting
+        // on `ready_tx` (e.g. `start_bondriver_reader`'s `ready_rx.await`)
+        // may immediately call `is_running()`/`subscribe()` once they wake
+        // up, and must observe `Running`, not a lingering `Starting`.
+        //
+        // Compare-exchange, not an unconditional set: a `stop_reader()` call
+        // that raced in during startup (session disconnected while its
+        // reader was still opening the BonDriver) already moved the state to
+        // `Stopping`, and must not be resurrected back to `Running` here —
+        // see `try_transition_starting_to_running`'s doc comment.
+        if !shared.try_transition_starting_to_running() {
+            info!(
+                "[SharedTuner] Stop requested during startup for {:?}; exiting before entering the read loop",
+                shared.key
+            );
+            let _ = ready_tx.send(Ok(()));
+            shared.set_state(ReaderState::Stopped);
+            return;
+        }
         info!("[SharedTuner] BonDriver ready, signaling...");
         let _ = ready_tx.send(Ok(()));
 
@@ -418,7 +615,7 @@ impl SharedTuner {
 
         loop {
             // Check if we should stop due to explicit stop signal
-            if !shared.is_running.load(Ordering::Acquire) {
+            if shared.state() != ReaderState::Running {
                 info!("[SharedTuner] BREAK: Stop signal received for {:?}", shared.key);
                 break;
             }
@@ -426,15 +623,15 @@ impl SharedTuner {
             // Log status every 5 seconds for debugging
             if last_status_log.elapsed().as_secs() >= 5 {
                 let level = tuner.get_signal_level();
-                info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, is_running={}, elapsed={}s",
-                      total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.is_running.load(Ordering::Acquire), reader_start_time.elapsed().as_secs());
+                info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, state={:?}, elapsed={}s",
+                      total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.state(), reader_start_time.elapsed().as_secs());
                 last_status_log = std::time::Instant::now();
             }
 
             // Wait for TS data to be available.
-            // 100 ms instead of 1000 ms so the is_running stop-check at the
-            // top of the loop is reached at most ~100 ms after stop_reader()
-            // sets is_running = false.  This makes channel switches faster.
+            // 100 ms instead of 1000 ms so the stop-check at the top of the
+            // loop is reached at most ~100 ms after stop_reader() sets the
+            // state to Stopping.  This makes channel switches faster.
             let wait_result = tuner.wait_ts_stream(100);
             if !wait_result {
                 consecutive_empty = consecutive_empty.saturating_add(1);
@@ -651,13 +848,13 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::Release);
+                    shared.set_state(ReaderState::Stopped);
                     break;
                 }
             }
         }
 
-        shared.is_running.store(false, Ordering::Release);
+        shared.set_state(ReaderState::Stopped);
         info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
     }
 
@@ -676,8 +873,8 @@ impl SharedTuner {
         // Check if reader is already running and stop it properly
         if self.is_running() {
             info!("[SharedTuner] Stopping existing reader for {:?} before restart", self.key);
-            self.is_running.store(false, Ordering::Release);
-            
+            self.set_state(ReaderState::Stopping);
+
             // Wait for the reader task to fully complete.
             // wait_ts_stream() is now 100 ms so the blocking task exits within
             // ~200 ms.  300 ms is sufficient; give 500 ms as a safety margin.
@@ -691,9 +888,19 @@ impl SharedTuner {
                     }
                 }
             }
-            
+            self.set_state(ReaderState::Stopped);
+
             info!("[SharedTuner] Old reader fully stopped, starting new reader for {:?}", self.key);
         }
+
+        // Mark this entry as occupied *synchronously*, before `spawn_blocking`
+        // even schedules the background thread — closes the window
+        // `is_reclaimable()`/M8 fixes (docs/TUNER_PIPELINE_REDESIGN.md §4 P1):
+        // a concurrent `TunerPool::get_or_create`/`cleanup`/`evict_idle_on_path`
+        // call on another task must never see this entry as `Idle` between
+        // "caller decided to start a reader" and "the blocking thread got
+        // scheduled and reached its own `set_state(Starting)`".
+        self.set_state(ReaderState::Starting);
 
         let shared = Arc::clone(self);
         info!("[SharedTuner] Starting BonDriver reader for {:?}", self.key);
@@ -718,9 +925,9 @@ impl SharedTuner {
                         t
                     },
                     Err(e) => {
-                        error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})", 
+                        error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})",
                                tuner_path, e, e.kind());
-                        shared.is_running.store(false, Ordering::Release);
+                        shared.set_state(ReaderState::Stopped);
                         let err_msg = match e.kind() {
                             std::io::ErrorKind::NotFound => 
                                 format!("BonDriver not found or cannot load: {}", e),
@@ -750,7 +957,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] CRITICAL PANIC in reader task: {:?}", panic_err);
-                    shared.is_running.store(false, Ordering::Release);
+                    shared.set_state(ReaderState::Stopped);
                 }
             }
         });
@@ -791,14 +998,103 @@ impl SharedTuner {
     }
 
     /// Check if the reader is running.
+    ///
+    /// Kept for compatibility and for the many call sites that only ever
+    /// cared about "is TS data (potentially) flowing right now" — equivalent
+    /// to `state() == ReaderState::Running`. Pool/session stale-detection
+    /// logic must use [`Self::is_reclaimable`] instead (see that method's
+    /// doc comment for why `is_running() == false` alone is not a safe stale
+    /// check now that [`ReaderState::Starting`] exists).
     pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::Acquire)
+        self.state() == ReaderState::Running
     }
 }
 
 impl Drop for SharedTuner {
     fn drop(&mut self) {
         debug!("SharedTuner dropped for {:?}", self.key);
+    }
+}
+
+/// A tracked subscription to a [`SharedTuner`]'s TS broadcast.
+///
+/// Replaces the old pattern of a bare `broadcast::Receiver<Bytes>` plus a
+/// manually-paired `tuner.unsubscribe()` call at every exit path
+/// (docs/TUNER_PIPELINE_REDESIGN.md §4 P1, item 2). The old API required
+/// every caller — `server/session.rs`'s half-dozen `ts_receiver` exit paths,
+/// `web/stream.rs`'s `StreamCleanup`, `session_tuner_handoff.rs` — to
+/// remember to call `unsubscribe()` exactly once per `subscribe()`; a missed
+/// or doubled call either leaked the count (idle-close never fires) or, with
+/// the old wraparound guard, silently under-counted. `TunerSubscription`
+/// makes the pairing structural: `subscriber_count` only ever changes here,
+/// in `subscribe()`, and in `Drop`, so it is impossible to construct one
+/// without the corresponding decrement eventually happening exactly once.
+///
+/// Dereferences to the underlying `broadcast::Receiver<Bytes>` (via
+/// `Deref`/`DerefMut`) so existing call sites that pattern the receiver
+/// directly (`rx.recv().await`, `rx.try_recv()`) keep working unchanged.
+pub struct TunerSubscription {
+    tuner: Arc<SharedTuner>,
+    rx: broadcast::Receiver<Bytes>,
+}
+
+impl TunerSubscription {
+    /// Receive the next TS chunk. Equivalent to
+    /// `broadcast::Receiver::recv`, provided directly so callers don't need
+    /// `use std::ops::DerefMut` in scope just to call it.
+    pub async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
+        self.rx.recv().await
+    }
+
+    /// The tuner this subscription is tracking. Used by cleanup paths that
+    /// need to act on the tuner (e.g. `schedule_idle_close`) after releasing
+    /// the subscription itself.
+    pub fn tuner(&self) -> &Arc<SharedTuner> {
+        &self.tuner
+    }
+}
+
+impl std::ops::Deref for TunerSubscription {
+    type Target = broadcast::Receiver<Bytes>;
+    fn deref(&self) -> &Self::Target {
+        &self.rx
+    }
+}
+
+impl std::ops::DerefMut for TunerSubscription {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rx
+    }
+}
+
+impl Drop for TunerSubscription {
+    fn drop(&mut self) {
+        // Plain fetch_sub: unlike the old manual `unsubscribe()`, there is no
+        // way to construct a `TunerSubscription` without a matching earlier
+        // increment in `subscribe()`, so underflow cannot happen here by
+        // construction — no `fetch_update`/wraparound guard needed.
+        let prev = self.tuner.subscriber_count.fetch_sub(1, Ordering::SeqCst);
+        debug!(
+            "Subscriber removed from {:?}, remaining: {}",
+            self.tuner.key,
+            prev - 1
+        );
+    }
+}
+
+/// A subscription to a [`SharedTuner`]'s TS broadcast that deliberately does
+/// **not** count toward `subscriber_count` — see
+/// [`SharedTuner::subscribe_untracked`]'s doc comment. `Drop` intentionally
+/// does nothing (there is no count to release); this type exists purely so
+/// the "does not count" contract is visible at the call site's type instead
+/// of only in a doc comment.
+pub(crate) struct UntrackedSubscription {
+    rx: broadcast::Receiver<Bytes>,
+}
+
+impl UntrackedSubscription {
+    pub(crate) async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
+        self.rx.recv().await
     }
 }
 
@@ -810,6 +1106,55 @@ impl SharedTuner {
     /// from a tuner into a `SharedEncoder`'s feeder task.
     pub(crate) fn test_broadcast(&self, data: Bytes) {
         let _ = self.tx.send(data);
+    }
+
+    /// Drive `run_bondriver_reader_with_tuner` with a [`crate::tuner::ts_source::FakeTsSource`]
+    /// on a real `spawn_blocking` thread, exactly like `start_bondriver_reader`
+    /// does for a real `BonDriverTuner` — the only difference being the `T:
+    /// TsSource` implementation and that the caller supplies the source
+    /// (so it can pre-configure delays/errors/chunks) instead of this
+    /// function opening a DLL itself.
+    ///
+    /// Returns the task handle (already stashed into `self.reader_handle` so
+    /// `stop_reader()` works exactly as it would for a real reader) and the
+    /// ready-signal receiver.
+    pub(crate) async fn spawn_fake_reader(
+        self: &Arc<Self>,
+        source: crate::tuner::ts_source::FakeTsSource,
+        space: u32,
+        channel: u32,
+        startup_config: ReaderStartupConfig,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        // Mirrors `start_bondriver_reader`'s synchronous Starting transition
+        // (see that function's comment) — set before scheduling the blocking
+        // task, not inside it.
+        self.set_state(ReaderState::Starting);
+
+        let shared = Arc::clone(self);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let handle = tokio::task::spawn_blocking(move || {
+            SharedTuner::run_bondriver_reader_with_tuner(
+                shared,
+                source,
+                "fake://test".to_string(),
+                space,
+                channel,
+                startup_config,
+                ready_tx,
+            );
+        });
+        *self.reader_handle.lock().await = Some(handle);
+        ready_rx
+    }
+}
+
+#[cfg(test)]
+fn test_startup_config() -> ReaderStartupConfig {
+    ReaderStartupConfig {
+        set_channel_retry_interval_ms: 5,
+        set_channel_retry_timeout_ms: 50,
+        signal_poll_interval_ms: 5,
+        signal_wait_timeout_ms: 50,
     }
 }
 
@@ -825,14 +1170,16 @@ mod tests {
         assert_eq!(shared.subscriber_count(), 0);
         assert!(!shared.has_subscribers());
 
-        let _rx1 = shared.subscribe();
+        let rx1 = shared.subscribe();
         assert_eq!(shared.subscriber_count(), 1);
         assert!(shared.has_subscribers());
 
         let _rx2 = shared.subscribe();
         assert_eq!(shared.subscriber_count(), 2);
 
-        shared.unsubscribe();
+        // Dropping a `TunerSubscription` (the RAII replacement for the old
+        // manual `unsubscribe()`) decrements the count exactly once.
+        drop(rx1);
         assert_eq!(shared.subscriber_count(), 1);
     }
 
@@ -843,5 +1190,182 @@ mod tests {
 
         shared.set_signal_level(23.5);
         assert!((shared.signal_level() - 23.5).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------
+    // TunerSubscription RAII (P1a item 2)
+    // -----------------------------------------------------------------
+
+    /// Double-drop safety: two subscriptions dropped in either order each
+    /// decrement exactly once, never underflowing (there is no
+    /// wraparound-guard branch to even exercise anymore — construction
+    /// guarantees a matching decrement).
+    #[test]
+    fn tuner_subscription_drop_never_underflows_with_multiple_subscribers() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let a = shared.subscribe();
+        let b = shared.subscribe();
+        let c = shared.subscribe();
+        assert_eq!(shared.subscriber_count(), 3);
+
+        drop(b);
+        assert_eq!(shared.subscriber_count(), 2);
+        drop(a);
+        assert_eq!(shared.subscriber_count(), 1);
+        drop(c);
+        assert_eq!(shared.subscriber_count(), 0);
+        assert!(!shared.has_subscribers());
+    }
+
+    /// `subscribe_untracked` (used by the shared encoder pool) must never
+    /// move `subscriber_count` — only the tracked `TunerSubscription` does.
+    #[test]
+    fn untracked_subscription_does_not_affect_subscriber_count() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let _untracked = shared.subscribe_untracked();
+        assert_eq!(shared.subscriber_count(), 0);
+        assert!(!shared.has_subscribers());
+    }
+
+    // -----------------------------------------------------------------
+    // ReaderState transitions (P1a item 1), driven end-to-end through
+    // `run_bondriver_reader_with_tuner` via `FakeTsSource` (P1a item 3).
+    // -----------------------------------------------------------------
+
+    use crate::tuner::ts_source::FakeTsSource;
+
+    #[tokio::test]
+    async fn reader_state_transitions_idle_starting_running_stopped_on_success() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+        assert_eq!(shared.state(), ReaderState::Idle);
+
+        // A startup delay keeps `set_channel` (and thus the `Starting`
+        // window) open long enough for the assertion below to reliably land
+        // inside it rather than racing the real OS thread to `Running`.
+        let source = FakeTsSource::new()
+            .with_startup_delay(std::time::Duration::from_millis(150))
+            .with_chunk(vec![0u8; 188]);
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+
+        // `spawn_fake_reader` sets Starting synchronously, before the
+        // blocking task is even scheduled.
+        assert_eq!(shared.state(), ReaderState::Starting);
+
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_ok(), "expected successful startup, got {:?}", ready);
+        assert_eq!(shared.state(), ReaderState::Running);
+        assert!(shared.is_running());
+
+        shared.stop_reader().await;
+        assert_eq!(shared.state(), ReaderState::Stopped);
+        assert!(!shared.is_running());
+    }
+
+    #[tokio::test]
+    async fn reader_state_goes_straight_to_stopped_on_set_channel_failure() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_err(), "expected startup failure");
+        assert_eq!(shared.state(), ReaderState::Stopped);
+        assert!(shared.is_reclaimable(), "a failed startup with no subscribers must be reclaimable");
+
+        // The blocking task has already returned by this point (it sends
+        // `ready_tx` right before its final `return`), but every test that
+        // spawns one is required to explicitly join it — `stop_reader()` is
+        // safe to call on an already-stopped reader and guarantees the
+        // `spawn_blocking` task is awaited before the test ends.
+        shared.stop_reader().await;
+    }
+
+    /// `AddrNotAvailable` is the one error kind `run_bondriver_reader_with_tuner`
+    /// retries before giving up (network-latency BonDrivers) — with
+    /// `set_channel_retry_timeout_ms` short (see `test_startup_config`), it
+    /// still ends in `Stopped` once the retry budget is exhausted.
+    #[tokio::test]
+    async fn reader_state_stopped_after_retry_budget_exhausted() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::AddrNotAvailable);
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_err());
+        assert_eq!(shared.state(), ReaderState::Stopped);
+        shared.stop_reader().await;
+    }
+
+    /// A panic inside `set_channel` is caught by the reader's own
+    /// `catch_unwind` (CLAUDE.md: panics must never cross the FFI-adjacent
+    /// boundary) and must still land the tuner in `Stopped`, not leave it
+    /// stuck `Starting` forever.
+    #[tokio::test]
+    async fn reader_state_stopped_after_panic_in_set_channel() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let source = FakeTsSource::new().with_panic_on_set_channel();
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_err(), "expected the panic to surface as a startup failure");
+        assert_eq!(shared.state(), ReaderState::Stopped);
+        assert!(shared.is_reclaimable());
+        shared.stop_reader().await;
+    }
+
+    /// A `stop_reader()` call that lands while the reader is still
+    /// `Starting` (mid-`set_channel`) must win: the reader must never
+    /// resurrect itself to `Running` once its startup delay elapses. This
+    /// pins down the fix for a regression caught during review — an earlier
+    /// version of `run_bondriver_reader_with_tuner` set `Running`
+    /// unconditionally right before entering the read loop, silently
+    /// clobbering a concurrent `Stopping`, which left the fake reader
+    /// spinning forever with nothing able to stop it (hanging
+    /// `cargo test -p recisdb-proxy` at shutdown).
+    #[tokio::test]
+    async fn reader_state_stop_during_starting_is_not_clobbered() {
+        let key = ChannelKey::simple("/dev/test", 1);
+        let shared = SharedTuner::new(key, 2);
+
+        let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        assert_eq!(shared.state(), ReaderState::Starting);
+
+        // Request a stop while still inside the fake's 200ms `set_channel`
+        // delay, well before it would naturally reach `Running`.
+        shared.stop_reader().await;
+        assert_eq!(shared.state(), ReaderState::Stopped);
+
+        // The reader must report failure-to-become-ready rather than
+        // silently succeeding after the fact.
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_ok(), "ready_tx still fires (startup itself succeeded); the state, not this value, is authoritative");
+        assert_eq!(shared.state(), ReaderState::Stopped, "must not have been resurrected to Running");
     }
 }

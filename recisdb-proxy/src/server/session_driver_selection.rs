@@ -1,7 +1,12 @@
 //! Group-driver candidate ordering and selection helpers.
 //!
-//! Pure functions so the heuristics can be reviewed independently of the async
-//! session/tuner-pool plumbing.
+//! The pure ordering/selection functions that used to live here (and their
+//! unit tests) moved to `tuner::policy` as part of
+//! docs/TUNER_PIPELINE_REDESIGN.md P0 — that module now owns the
+//! `decide()` decision logic and needed these as building blocks. They are
+//! re-exported below under their old names/visibility so
+//! `select_group_driver_for_channel` (the async DB/pool orchestration that
+//! stays here — it isn't pure) keeps compiling unchanged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,156 +18,13 @@ use crate::server::listener::DatabaseHandle;
 use crate::server::session_channel_candidates::collect_group_channel_candidates;
 use crate::tuner::{ChannelKey, TunerPool};
 
-pub(super) type DriverCandidate = (String, u32, u32);
-
-/// Sort candidates by rarity-aware load balancing.
-pub(super) fn sort_candidate_drivers(
-    candidate_drivers: &mut [DriverCandidate],
-    exclusive_map: &HashMap<String, i64>,
-    instances_map: &HashMap<String, i32>,
-    score_map: &HashMap<String, f64>,
-) {
-    candidate_drivers.sort_by(|a, b| {
-        let excl_a = exclusive_map.get(&a.0).copied().unwrap_or(0);
-        let excl_b = exclusive_map.get(&b.0).copied().unwrap_or(0);
-        excl_a
-            .cmp(&excl_b)
-            .then_with(|| {
-                let load_a = instances_map.get(&a.0).copied().unwrap_or(0);
-                let load_b = instances_map.get(&b.0).copied().unwrap_or(0);
-                load_a.cmp(&load_b)
-            })
-            .then_with(|| {
-                let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
-                let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
-                score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-}
-
-/// Prefer a driver already running the requested physical channel.
-pub(super) fn select_running_driver(
-    candidate_drivers: &[DriverCandidate],
-    running_channels: &[(String, ChannelKeySpec)],
-) -> Option<DriverCandidate> {
-    for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
-        let wanted = ChannelKeySpec::SpaceChannel {
-            space: *driver_space,
-            channel: *driver_bon_channel,
-        };
-        if running_channels
-            .iter()
-            .any(|(path, key)| path == driver_path && *key == wanted)
-        {
-            return Some((driver_path.clone(), *driver_space, *driver_bon_channel));
-        }
-    }
-    None
-}
-
-/// Otherwise choose the first driver with free capacity.
-pub(super) fn select_driver_with_capacity(
-    candidate_drivers: &[DriverCandidate],
-    instances_map: &HashMap<String, i32>,
-    max_instances_map: &HashMap<String, i32>,
-) -> Option<DriverCandidate> {
-    for (driver_path, driver_space, driver_bon_channel) in candidate_drivers.iter() {
-        let driver_instances = instances_map.get(driver_path).copied().unwrap_or(0);
-        let max_instances = max_instances_map.get(driver_path).copied().unwrap_or(1);
-        if driver_instances < max_instances {
-            return Some((driver_path.clone(), *driver_space, *driver_bon_channel));
-        }
-    }
-    None
-}
-
+pub(super) use crate::tuner::policy::{
+    select_driver_with_capacity, select_running_driver, sort_candidate_drivers, DriverCandidate,
+};
 
 pub(super) struct GroupDriverSelection {
     pub selected_driver: DriverCandidate,
     pub nid_tsid_channel_keys: Vec<(String, ChannelKeySpec)>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Basic priority order: fewer exclusive channels wins first; ties
-    /// broken by fewer running instances; ties broken by higher quality
-    /// score (descending).
-    #[test]
-    fn sort_candidate_drivers_orders_by_exclusive_then_load_then_score() {
-        let mut candidates: Vec<DriverCandidate> = vec![
-            ("Busy.dll".to_string(), 0, 1),
-            ("Exclusive.dll".to_string(), 0, 2),
-            ("Idle.dll".to_string(), 0, 3),
-        ];
-        let mut exclusive_map = HashMap::new();
-        exclusive_map.insert("Exclusive.dll".to_string(), 3i64);
-        exclusive_map.insert("Busy.dll".to_string(), 0i64);
-        exclusive_map.insert("Idle.dll".to_string(), 0i64);
-
-        let mut instances_map = HashMap::new();
-        instances_map.insert("Busy.dll".to_string(), 2i32);
-        instances_map.insert("Idle.dll".to_string(), 0i32);
-
-        let score_map = HashMap::new();
-
-        sort_candidate_drivers(&mut candidates, &exclusive_map, &instances_map, &score_map);
-
-        // Idle.dll (0 exclusive, 0 load) and Busy.dll (0 exclusive, 2 load)
-        // both beat Exclusive.dll (3 exclusive) on the primary key; between
-        // Idle and Busy, lower load wins.
-        assert_eq!(
-            candidates.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
-            vec!["Idle.dll", "Busy.dll", "Exclusive.dll"]
-        );
-    }
-
-    #[test]
-    fn sort_candidate_drivers_breaks_ties_by_higher_quality_score() {
-        let mut candidates: Vec<DriverCandidate> = vec![
-            ("Low.dll".to_string(), 0, 1),
-            ("High.dll".to_string(), 0, 2),
-        ];
-        let exclusive_map = HashMap::new();
-        let instances_map = HashMap::new();
-        let mut score_map = HashMap::new();
-        score_map.insert("Low.dll".to_string(), 0.5);
-        score_map.insert("High.dll".to_string(), 0.9);
-
-        sort_candidate_drivers(&mut candidates, &exclusive_map, &instances_map, &score_map);
-
-        assert_eq!(
-            candidates.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
-            vec!["High.dll", "Low.dll"]
-        );
-    }
-
-    #[test]
-    fn select_running_driver_prefers_same_physical_channel_already_streaming() {
-        let candidates: Vec<DriverCandidate> = vec![
-            ("A.dll".to_string(), 0, 27),
-            ("B.dll".to_string(), 0, 5),
-        ];
-        // B.dll is already running the (space=0, ch=5) physical channel.
-        let running = vec![(
-            "B.dll".to_string(),
-            ChannelKeySpec::SpaceChannel { space: 0, channel: 5 },
-        )];
-
-        let selected = select_running_driver(&candidates, &running);
-        assert_eq!(selected, Some(("B.dll".to_string(), 0, 5)));
-    }
-
-    #[test]
-    fn select_running_driver_returns_none_when_nothing_matches() {
-        let candidates: Vec<DriverCandidate> = vec![("A.dll".to_string(), 0, 27)];
-        let running = vec![(
-            "A.dll".to_string(),
-            ChannelKeySpec::SpaceChannel { space: 1, channel: 99 },
-        )];
-        assert_eq!(select_running_driver(&candidates, &running), None);
-    }
 }
 
 pub(super) async fn select_group_driver_for_channel(
@@ -248,7 +110,10 @@ pub(super) async fn select_group_driver_for_channel(
                 continue;
             }
             if let Some(tuner) = tuner_pool.get(key).await {
-                if tuner.is_running() {
+                // Slot occupancy, not "TS flowing" — a reader still opening
+                // the DLL already holds the slot (see
+                // `session_capacity::count_running_instances_on_driver`).
+                if tuner.occupies_slot() {
                     running_instances += 1;
                 }
             }
@@ -266,7 +131,10 @@ pub(super) async fn select_group_driver_for_channel(
     let mut running_channels: Vec<(String, ChannelKeySpec)> = Vec::new();
     for key in keys.iter() {
         if let Some(tuner) = tuner_pool.get(key).await {
-            if tuner.is_running() {
+            // A driver mid-startup on this exact channel is still the right
+            // one to prefer — joining it avoids opening a second instance
+            // for a channel that is already being tuned.
+            if tuner.occupies_slot() {
                 running_channels.push((key.tuner_path.clone(), key.channel.clone()));
             }
         }

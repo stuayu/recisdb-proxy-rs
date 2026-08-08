@@ -42,7 +42,7 @@ use tokio::sync::broadcast;
 use crate::database::Database;
 use crate::server::channel_resolve::{self, ChannelResolveError};
 use crate::tuner::encoder_pool::{self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
-use crate::tuner::{EncoderPool, SharedTuner, TunerPool};
+use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::state::WebState;
 
 /// Query parameters for `GET /api/stream/service/:sid`.
@@ -61,6 +61,31 @@ struct EncoderCleanup {
     encoder: Arc<SharedEncoder>,
 }
 
+/// The receiver actually polled for each yielded chunk of a stream body.
+///
+/// Raw passthrough polls the tracked [`TunerSubscription`] directly — which
+/// conveniently means dropping it (when the body stream itself is dropped)
+/// also releases the tracked subscription automatically, no separate cleanup
+/// step needed for that half of the RAII story. The `?profile=preview`
+/// pipeline instead polls the [`SharedEncoder`]'s own (non-RAII, unrelated to
+/// `SharedTuner`) broadcast receiver directly; in that mode the tracked
+/// tuner subscription is kept alive separately — see
+/// `StreamCleanup::parked_tuner_sub` — deliberately unread, purely to hold
+/// the refcount for the response's lifetime.
+pub(crate) enum BodyReceiver {
+    Tuner(TunerSubscription),
+    Encoder(broadcast::Receiver<Bytes>),
+}
+
+impl BodyReceiver {
+    async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
+        match self {
+            BodyReceiver::Tuner(sub) => sub.recv().await,
+            BodyReceiver::Encoder(rx) => rx.recv().await,
+        }
+    }
+}
+
 /// RAII guard tying an HTTP response body's lifetime to a tuner subscription
 /// (and, for `?profile=preview`, a shared-encoder subscription).
 ///
@@ -69,19 +94,26 @@ struct EncoderCleanup {
 /// disconnect, the connection resetting, or (never, in practice, since these
 /// are unbounded live broadcasts) the stream ending on its own — `Drop` runs
 /// and releases both subscriptions, mirroring what `server::session::Session`
-/// does explicitly on every exit path (`tuner.unsubscribe()` +
-/// `tuner_pool.schedule_idle_close(..)`, and `encoder_pool.release(..)` from
-/// `stop_tsreplace_pipeline`). There is no synchronous "session loop exiting"
-/// hook to hang that cleanup off here — the stream's lifetime *is* the
-/// subscription's lifetime — so `Drop` spawns a short detached task to do the
-/// (necessarily `async`) release work. This is the one part of P5 that
-/// cannot be exercised by an integration test in this environment (no real
-/// client to disconnect mid-stream); see the unit test below for the
-/// closest available proxy: dropping the guard decrements
-/// `SharedTuner`'s subscriber_count.
+/// does explicitly on every exit path (dropping its `ts_receiver`
+/// `TunerSubscription` + `tuner_pool.schedule_idle_close(..)`, and
+/// `encoder_pool.release(..)` from `stop_tsreplace_pipeline`). There is no
+/// synchronous "session loop exiting" hook to hang that cleanup off here —
+/// the stream's lifetime *is* the subscription's lifetime — so `Drop` spawns
+/// a short detached task to do the (necessarily `async`) `schedule_idle_close`
+/// / encoder-release work. This is the one part of P5 that cannot be
+/// exercised by an integration test in this environment (no real client to
+/// disconnect mid-stream); see the unit test below for the closest available
+/// proxy: dropping the guard decrements `SharedTuner`'s subscriber_count.
 pub(crate) struct StreamCleanup {
     tuner: Arc<SharedTuner>,
     tuner_pool: Arc<TunerPool>,
+    /// Present only in `?profile=preview` mode, where the actual data comes
+    /// from [`BodyReceiver::Encoder`] rather than from a `TunerSubscription`
+    /// — this field is what keeps the tracked tuner subscription (and thus
+    /// `subscriber_count`) alive for the whole response lifetime in that
+    /// case. `None` when `BodyReceiver::Tuner` already owns the (only)
+    /// tracked subscription.
+    parked_tuner_sub: Option<TunerSubscription>,
     encoder: Option<EncoderCleanup>,
 }
 
@@ -89,19 +121,27 @@ impl StreamCleanup {
     /// Build a cleanup guard for a plain tuner subscription with no shared
     /// encoder involved — what every Mirakurun-compatible passthrough stream
     /// uses (`web/mirakurun.rs`, STREAMING_DESIGN.md §7.1: "passthrough
-    /// (無変換) が既定").
+    /// (無変換) が既定"). The subscription itself is expected to live in the
+    /// sibling `BodyReceiver::Tuner`, not here.
     pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
-        Self { tuner, tuner_pool, encoder: None }
+        Self { tuner, tuner_pool, parked_tuner_sub: None, encoder: None }
     }
 }
 
 impl Drop for StreamCleanup {
     fn drop(&mut self) {
+        // Drop any parked subscription synchronously, *before* spawning the
+        // async cleanup task below: a type with a custom `Drop` impl runs
+        // that impl's body first and only auto-drops its own fields
+        // afterward, so without this explicit `take()` the `has_subscribers()`
+        // check below could run (in the spawned task) before this decrement
+        // actually happens.
+        let _ = self.parked_tuner_sub.take();
+
         let tuner = Arc::clone(&self.tuner);
         let tuner_pool = Arc::clone(&self.tuner_pool);
         let encoder = self.encoder.take();
         tokio::spawn(async move {
-            tuner.unsubscribe();
             if !tuner.has_subscribers() {
                 tuner_pool
                     .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
@@ -115,15 +155,20 @@ impl Drop for StreamCleanup {
 }
 
 /// State owned by the `stream::unfold` powering the response body: the
-/// broadcast receiver being forwarded, plus the cleanup guard that must
-/// outlive every yielded chunk and only run once the stream itself is
-/// dropped.
+/// receiver being forwarded, plus the cleanup guard that must outlive every
+/// yielded chunk and only run once the stream itself is dropped.
+///
+/// Field order matters: `rx` must be declared (and thus dropped) before
+/// `_cleanup` so that, in raw-passthrough mode where `rx` is
+/// `BodyReceiver::Tuner`, the tracked subscription's decrement has already
+/// happened by the time `_cleanup`'s `Drop` runs its `has_subscribers()`
+/// check (Rust drops a struct's fields in declaration order).
 struct StreamState {
-    rx: broadcast::Receiver<Bytes>,
+    rx: BodyReceiver,
     _cleanup: StreamCleanup,
 }
 
-/// Adapt a `broadcast::Receiver<Bytes>` into a `Stream` suitable for
+/// Adapt a [`BodyReceiver`] into a `Stream` suitable for
 /// `axum::body::Body::from_stream`.
 ///
 /// `Lagged` is treated the same way `server/session.rs` treats it for
@@ -133,7 +178,7 @@ struct StreamState {
 /// stopped, or shared encoder chain stopped) ends the HTTP response body
 /// normally, which the browser/mpegts.js/ffmpeg observes as EOF.
 pub(crate) fn broadcast_to_body_stream(
-    rx: broadcast::Receiver<Bytes>,
+    rx: BodyReceiver,
     cleanup: StreamCleanup,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     stream::unfold(StreamState { rx, _cleanup: cleanup }, |mut state| async move {
@@ -179,12 +224,15 @@ pub(crate) fn channel_resolve_error_response(
 
 /// Release a tracked tuner subscription taken speculatively, before any
 /// response stream was built (i.e. on an error path after `subscribe()` but
-/// before handing the receiver to [`broadcast_to_body_stream`]).
-pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tuner: &Arc<SharedTuner>) {
-    tuner.unsubscribe();
+/// before handing the subscription to [`broadcast_to_body_stream`]). Takes
+/// the subscription by value and drops it explicitly so the
+/// `has_subscribers()` check below observes the post-release count.
+pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tuner_sub: TunerSubscription) {
+    let tuner = Arc::clone(tuner_sub.tuner());
+    drop(tuner_sub);
     if !tuner.has_subscribers() {
         tuner_pool
-            .schedule_idle_close(tuner.key.clone(), Arc::clone(tuner))
+            .schedule_idle_close(tuner.key.clone(), tuner)
             .await;
     }
 }
@@ -305,13 +353,14 @@ async fn stream_resolved(
         let cleanup = StreamCleanup {
             tuner: Arc::clone(&tuner),
             tuner_pool: Arc::clone(&web_state.tuner_pool),
+            parked_tuner_sub: None,
             encoder: None,
         };
-        return respond_with_stream(broadcast_to_body_stream(tuner_rx, cleanup));
+        return respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup));
     }
 
     if profile != "preview" {
-        release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+        release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("unknown profile '{}': only 'preview' is supported", profile),
@@ -323,7 +372,7 @@ async fn stream_resolved(
         match load_preview_encoder_config(&db) {
             Ok(v) => v,
             Err(msg) => {
-                release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+                release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
                 warn!("[HTTP stream] service {} preview unavailable: {}", sid, msg);
                 return error_response(StatusCode::SERVICE_UNAVAILABLE, msg);
             }
@@ -354,16 +403,21 @@ async fn stream_resolved(
             let cleanup = StreamCleanup {
                 tuner: Arc::clone(&tuner),
                 tuner_pool: Arc::clone(&web_state.tuner_pool),
+                // The actual data comes from `enc_rx` below; this is only
+                // here to keep `tuner_rx`'s refcount alive for the response's
+                // lifetime (see `StreamCleanup::parked_tuner_sub`'s doc
+                // comment) — deliberately never read.
+                parked_tuner_sub: Some(tuner_rx),
                 encoder: Some(EncoderCleanup {
                     pool: Arc::clone(&web_state.encoder_pool),
                     key,
                     encoder,
                 }),
             };
-            respond_with_stream(broadcast_to_body_stream(enc_rx, cleanup))
+            respond_with_stream(broadcast_to_body_stream(BodyReceiver::Encoder(enc_rx), cleanup))
         }
         Err(EncoderPoolError::Saturated) => {
-            release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+            release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
             warn!(
                 "[HTTP stream] service {} preview unavailable: encoder pool saturated \
                  (max_concurrent_encoders reached)",
@@ -375,7 +429,7 @@ async fn stream_resolved(
             )
         }
         Err(EncoderPoolError::SpawnFailed(e)) => {
-            release_tuner_subscription(&web_state.tuner_pool, &tuner).await;
+            release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
             warn!("[HTTP stream] service {} preview encoder spawn failed: {}", sid, e);
             error_response(StatusCode::SERVICE_UNAVAILABLE, e)
         }
@@ -424,21 +478,23 @@ mod tests {
     async fn dropping_stream_cleanup_releases_tuner_subscription() {
         let tuner = crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2);
         let tuner_pool = Arc::new(TunerPool::new(4));
-        let _rx = tuner.subscribe();
+        let sub = tuner.subscribe();
         assert!(tuner.has_subscribers());
 
+        // Exercises the `parked_tuner_sub` path (the `?profile=preview`
+        // shape): the subscription lives in `StreamCleanup`, not in a
+        // sibling `BodyReceiver::Tuner`.
         let cleanup = StreamCleanup {
             tuner: Arc::clone(&tuner),
             tuner_pool: Arc::clone(&tuner_pool),
+            parked_tuner_sub: Some(sub),
             encoder: None,
         };
         drop(cleanup);
 
-        // Drop spawns a detached task to do the actual unsubscribe; give it
-        // a chance to run.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
+        // The parked subscription is dropped synchronously inside
+        // `StreamCleanup::drop`, so this is already true with no yield
+        // needed — asserted immediately to prove that.
         assert!(!tuner.has_subscribers(), "dropping StreamCleanup must release the tracked subscription");
     }
 

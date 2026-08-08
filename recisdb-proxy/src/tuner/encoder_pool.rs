@@ -46,7 +46,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot, RwLock, Semaphore};
 
 use crate::tuner::channel_key::ChannelKey;
-use crate::tuner::shared::{SharedTuner, BROADCAST_CAPACITY};
+use crate::tuner::shared::{SharedTuner, UntrackedSubscription, BROADCAST_CAPACITY};
 
 /// Grace period between the last subscriber leaving and the encoder chain
 /// actually being killed. Mirrors `TunerPool`'s keep-alive idea, but the
@@ -591,7 +591,7 @@ impl SharedEncoder {
         Ok(shared)
     }
 
-    async fn run_feeder(shared: Arc<Self>, mut tuner_rx: broadcast::Receiver<Bytes>, mut stdin: ChildStdin) {
+    async fn run_feeder(shared: Arc<Self>, mut tuner_rx: UntrackedSubscription, mut stdin: ChildStdin) {
         loop {
             match tuner_rx.recv().await {
                 Ok(data) => {

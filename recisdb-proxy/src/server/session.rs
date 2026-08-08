@@ -18,7 +18,7 @@ use recisdb_protocol::{
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
-use crate::tuner::{ChannelKey, SharedTuner, TunerPool, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
+use crate::tuner::{ChannelKey, SharedTuner, TunerPool, TunerSubscription, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
 use crate::tuner::encoder_pool::{
     self, EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
 };
@@ -124,8 +124,9 @@ pub struct Session {
     current_group_name: Option<String>,
     /// Group drivers (paths for all drivers in the group).
     group_driver_paths: Vec<String>,
-    /// TS data receiver (when streaming).
-    ts_receiver: Option<broadcast::Receiver<Bytes>>,
+    /// TS data receiver (when streaming). RAII: dropping releases the
+    /// tracked subscription automatically (see `TunerSubscription`).
+    ts_receiver: Option<TunerSubscription>,
     // Session struct に追加
     ts_bytes_sent: u64,
     ts_msgs_sent: u64,
@@ -554,7 +555,10 @@ impl Session {
             for k in &keys {
                 if k.tuner_path == tuner_path {
                     if let Some(t) = self.tuner_pool.get(k).await {
-                        if t.is_running() {
+                        // Slot occupancy: prewarming a DLL that another task
+                        // is already opening is exactly the double-open this
+                        // guard exists to prevent.
+                        if t.occupies_slot() {
                             found = true;
                             break;
                         }
@@ -633,8 +637,9 @@ impl Session {
 
             match self.tuner_pool.get_or_create(fallback_key.clone(), 2, || async { Ok(()) }).await {
                 Ok(fb_tuner) => {
-                    if fb_tuner.is_running() {
-                        // Already running the same channel — reuse it directly
+                    if !fb_tuner.needs_reader_start() {
+                        // Already running (or being started by someone else)
+                        // on the same channel — reuse it directly
                         info!("[Session {}] Fallback driver {} already running same channel, reusing", self.id, fallback_path);
                         return Some((fb_tuner, fallback_path.clone()));
                     }
@@ -652,9 +657,10 @@ impl Session {
                         Err(e) => {
                             warn!("[Session {}] Fallback driver {} reader start failed: {}", self.id, fallback_path, e);
                             // ★ Bug G fix: get_or_create inserted this tuner into the pool.
-                            // Remove the orphaned (not-running, no-subscriber) entry so it
-                            // doesn't persist indefinitely.
-                            if !fb_tuner.is_running() && !fb_tuner.has_subscribers() {
+                            // Remove the orphaned (reclaimable) entry so it doesn't persist
+                            // indefinitely. `start_reader_with_warm`'s failure above already
+                            // left the reader in `ReaderState::Stopped`.
+                            if fb_tuner.is_orphanable() {
                                 self.tuner_pool.remove(&fallback_key).await;
                             }
                             continue;
@@ -1431,8 +1437,11 @@ impl Session {
                     self.tuner_pool.schedule_idle_close(old.key.clone(), old).await;
                 }
                 return self.finish_set_channel_success(&pool_tuner).await;
-            } else if !pool_tuner.has_subscribers() {
-                // Stale entry — remove so get_or_create below creates a fresh one
+            } else if pool_tuner.is_reclaimable() {
+                // Stale entry — remove so get_or_create below creates a fresh one.
+                // (A `Starting` entry — another session's in-flight open of
+                // this same channel — is deliberately left alone here: it is
+                // not stale, just not ready yet. See M8, SYSTEM_REVIEW_2026-07.md.)
                 warn!("[Session {}] Found stale (not running) v1 tuner for {:?}, removing from pool",
                       self.id, key);
                 self.tuner_pool.remove(&key).await;
@@ -1455,7 +1464,7 @@ impl Session {
             .await
         {
             Ok(tuner) => {
-                if !tuner.is_running() {
+                if tuner.needs_reader_start() {
                     // ★ Capacity guard (same as v2): verify the DLL is not already
                     // at max_instances before starting a new reader.
                     let guard_max = driver_max_instances(&self.database, &tuner_path).await;
@@ -1473,7 +1482,7 @@ impl Session {
                 }
 
                 // Start the BonDriver reader
-                if !tuner.is_running() {
+                if tuner.needs_reader_start() {
                     if let Err(e) = self.start_reader_with_warm(
                         Arc::clone(&tuner),
                         tuner_path.clone(),
@@ -1518,9 +1527,7 @@ impl Session {
         log_prefix: &str,
     ) {
         if let Some(tuner) = self.current_tuner.take() {
-            if self.ts_receiver.is_some() {
-                tuner.unsubscribe();
-                self.ts_receiver = None;
+            if self.ts_receiver.take().is_some() {
                 debug!(
                     "[Session {}] {} unsubscribed from old tuner, remaining subscribers: {}",
                     self.id,
@@ -1580,7 +1587,11 @@ impl Session {
         key: &ChannelKey,
         tuner: &Arc<SharedTuner>,
     ) {
-        if !tuner.is_running() && !tuner.has_subscribers() {
+        // `is_orphanable()`, not `is_reclaimable()`: this is *our* entry, and
+        // the common case here is a `Reserved` one we asked `get_or_create`
+        // for and then bailed on (capacity conflict / start failure). Leaving
+        // it behind would hold its driver slot forever.
+        if tuner.is_orphanable() {
             self.tuner_pool.remove(key).await;
         }
     }
@@ -1713,7 +1724,7 @@ impl Session {
         old_tuner_key: &Option<ChannelKey>,
         key: &ChannelKey,
     ) -> Option<std::io::Result<()>> {
-        if !tuner.is_running() {
+        if tuner.needs_reader_start() {
             let guard_max = driver_max_instances(&self.database, actual_tuner_path).await;
             let same_dll_running = count_running_instances_on_driver(
                 &self.tuner_pool,
@@ -1927,7 +1938,10 @@ impl Session {
                     continue;
                 }
                 if let Some(t) = self.tuner_pool.get(k).await {
-                    if t.is_running() {
+                    // Slot occupancy (see
+                    // `session_capacity::count_running_instances_on_driver`):
+                    // a reader still opening the DLL already holds a slot.
+                    if t.occupies_slot() {
                         running_on_dll += 1;
                     }
                 }
@@ -1951,7 +1965,11 @@ impl Session {
                     };
                     if is_match {
                         if let Some(t) = self.tuner_pool.get(k).await {
-                            if t.is_running() {
+                            // A reader mid-startup on the requested channel
+                            // counts as "already running" for this check:
+                            // evicting to make room for a channel that is
+                            // already being tuned would just thrash the DLL.
+                            if t.occupies_slot() {
                                 found = true;
                                 break;
                             }
@@ -2047,10 +2065,21 @@ impl Session {
             }
 
             if let Some(existing_tuner) = self.tuner_pool.get(existing_key).await {
-                if !existing_tuner.is_running() {
+                if existing_tuner.is_reclaimable() {
                     warn!("[Session {}] Found stale (not running) tuner for {:?}, removing from pool",
                           self.id, existing_key);
                     self.tuner_pool.remove(existing_key).await;
+                    continue;
+                }
+                if !existing_tuner.is_running() {
+                    // Occupying a slot but not ready yet (ReaderState::Starting
+                    // or ::Stopping — another session's in-flight open/close of
+                    // this same physical channel). Not stale: leave the pool
+                    // entry alone and fall through to the caller's other
+                    // candidates / new-tuner path rather than reusing it
+                    // (SYSTEM_REVIEW_2026-07.md M8).
+                    debug!("[Session {}] {:?} is occupying its slot but not yet running (state={:?}); skipping reuse for now",
+                           self.id, existing_key, existing_tuner.state());
                     continue;
                 }
 
@@ -2173,7 +2202,7 @@ impl Session {
         let existing_for_key = self.tuner_pool.get(&key).await;
         let reuse_existing = existing_for_key
             .as_ref()
-            .map_or(false, |t| t.is_running());
+            .map_or(false, |t| !t.needs_reader_start());
 
         if !reuse_existing && (running_instances + 1) > max_instances {
             info!(
@@ -2202,7 +2231,7 @@ impl Session {
 
         self.tuner_pool.cancel_idle_close(&key).await;
 
-        if !tuner.is_running() {
+        if tuner.needs_reader_start() {
             if let Err(e) = self.start_reader_with_warm(
                 Arc::clone(&tuner),
                 tuner_id.to_string(),
@@ -2661,7 +2690,6 @@ impl Session {
                 warn!("[Session {}] tsreplace unavailable, fallback to raw TS: {}", self.id, e);
                 self.stop_tsreplace_pipeline().await;
             } else {
-                tuner.unsubscribe();
                 self.ts_receiver = None;
                 self.state = SessionState::TunerOpen;
                 return self
@@ -2691,14 +2719,15 @@ impl Session {
     async fn handle_stop_stream(&mut self) -> std::io::Result<()> {
         info!("[Session {}] Stopping stream", self.id);
 
-        // Unsubscribe from the broadcast — only if we actually have an active subscription.
-        // Without this guard, a redundant StopStream (or StopStream in TunerOpen state) would
-        // call unsubscribe() with no matching subscribe(), causing AtomicU32 to wrap to u32::MAX
-        // and permanently disabling idle-close detection.
-        if self.ts_receiver.is_some() {
+        // Release the tracked subscription — only if we actually have an
+        // active one. `TunerSubscription`'s `Drop` performs the decrement
+        // that used to be a manual, guarded `tuner.unsubscribe()` call (the
+        // guard existed to avoid double-releasing on a redundant StopStream;
+        // RAII makes that structurally impossible instead — there is simply
+        // nothing to drop a second time).
+        if let Some(sub) = self.ts_receiver.take() {
+            drop(sub);
             if let Some(tuner) = &self.current_tuner {
-                tuner.unsubscribe();
-
                 // ★ Check if this was the last subscriber
                 // If so, automatically stop the reader
                 if tuner.subscriber_count() == 0 {
@@ -2709,7 +2738,6 @@ impl Session {
                 }
             }
         }
-        self.ts_receiver = None;
         self.stop_tsreplace_pipeline().await;
         self.state = SessionState::TunerOpen;
 
@@ -3421,16 +3449,15 @@ impl Session {
         }
 
         self.stop_warm_tuner().await;
-        // Unsubscribe from tuner and check if we should stop reader
+        // Release the tracked subscription (if any) first — dropping it
+        // performs the decrement that used to be a manual `tuner.unsubscribe()`
+        // call gated on `ts_receiver.is_some()`.
+        self.ts_receiver = None;
         if let Some(tuner) = self.current_tuner.take() {
-            // Unsubscribe only if we have an active subscription
-            if self.ts_receiver.is_some() {
-                tuner.unsubscribe();
-            }
-
             // ★ Always check if we should stop the reader
             // This handles the case where StopStream was called before disconnect
-            // (ts_receiver is None but tuner may still have no subscribers)
+            // (the subscription was already released above, but tuner may
+            // still have no subscribers)
             if tuner.subscriber_count() == 0 {
                 info!("[Session {}] No more subscribers, scheduling keep-alive close for {:?}", self.id, tuner.key);
                 self.tuner_pool
@@ -3438,7 +3465,6 @@ impl Session {
                     .await;
             }
         }
-        self.ts_receiver = None;
         self.stop_tsreplace_pipeline().await;
         let final_tuner_path = self.current_tuner_path.clone();
         self.current_tuner_path = None;
