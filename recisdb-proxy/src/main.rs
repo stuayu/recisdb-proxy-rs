@@ -490,13 +490,33 @@ async fn run_server(
         manager.run().await;
     });
 
+    // Fan-out channel for `GET /mirakurun/api/events/stream`
+    // (`web/mirakurun_events.rs`, `docs/EPGSTATION_COMPAT.md` §3/§6):
+    // `EpgWriter` broadcasts every successfully-UPSERTed program row here,
+    // `WebState` hands out `subscribe()`s to HTTP clients. Created once here
+    // (not inside either `EpgWriter::new` or `WebState::new`) so both sides
+    // share the exact same channel. Capacity 1024: `EpgWriter::flush` fires
+    // at most every `FLUSH_INTERVAL` (10s) or `FLUSH_BATCH_SIZE` (500)
+    // records, whichever comes first, so 1024 comfortably covers two full
+    // batches of backlog for a subscriber that is briefly slow to drain —
+    // beyond that, `RecvError::Lagged` is the correct outcome (handled by
+    // logging and continuing, see `mirakurun_events.rs`), not a bigger
+    // buffer.
+    // The initial `Receiver` is dropped immediately (`_`, not `_rx`): holding
+    // it would keep a subscriber alive for the whole process lifetime, so
+    // every broadcast event would be retained in the ring buffer even when no
+    // client has `/events/stream` open. With no subscribers, `send` returns
+    // `Err` and the record is simply not buffered — which is what we want.
+    let (epg_events_tx, _) = tokio::sync::broadcast::channel::<database::ProgramUpsert>(1024);
+
     // Start the EPG writer: batches EIT events collected by every live
     // tuner (`tuner/epg_collector.rs`) into the `programs` table. Must be
     // started before any tuner reader thread can run, since `EpgWriter::new`
     // installs the process-wide sender the collectors send into.
     let epg_db = db.clone();
+    let epg_writer_events_tx = epg_events_tx.clone();
     tokio::spawn(async move {
-        let writer = epg_writer::EpgWriter::new(epg_db);
+        let writer = epg_writer::EpgWriter::new(epg_db, epg_writer_events_tx);
         writer.run().await;
     });
 
@@ -546,6 +566,7 @@ async fn run_server(
     };
     let web_log_buffer = Arc::clone(&log_buffer);
     let web_log_dir = log_dir.clone();
+    let web_epg_events_tx = epg_events_tx.clone();
     tokio::spawn(async move {
         match web::start_web_server(
             web_listen_addr,
@@ -561,6 +582,7 @@ async fn run_server(
             mirakurun_enabled,
             Some(listen_addr),
             config_path_for_web,
+            web_epg_events_tx,
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

@@ -5,6 +5,9 @@ pub mod auth;
 pub mod channel_files;
 pub mod dashboard;
 pub mod mirakurun;
+pub mod mirakurun_docs;
+mod mirakurun_events;
+mod mirakurun_program_stream;
 pub mod state;
 pub mod stream;
 
@@ -129,13 +132,25 @@ fn build_api_router() -> Router<Arc<WebState>> {
 /// (`main.rs`, default `false`).
 fn build_mirakurun_router() -> Router<Arc<WebState>> {
     Router::new()
+        // `/docs` — must come first conceptually (not order-sensitive for
+        // axum's router, but see mirakurun_docs.rs module doc comment for
+        // why every other route below is unreachable to a real `mirakurun`
+        // client until this one works).
+        .route("/docs", get(mirakurun_docs::get_docs))
         .route("/version", get(mirakurun::get_version))
         .route("/status", get(mirakurun::get_status))
         .route("/channels", get(mirakurun::get_channels))
         .route("/services", get(mirakurun::get_services))
         .route("/programs", get(mirakurun::get_programs))
+        .route("/tuners", get(mirakurun::get_tuners))
+        .route("/config/server", get(mirakurun::get_server_config))
         .route("/services/:id/stream", get(mirakurun::stream_service_by_mirakurun_id))
+        .route("/services/:id/logo", get(mirakurun::get_logo_stub))
         .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
+        .route("/programs/:id/stream", get(mirakurun::stream_program_by_mirakurun_id))
+        // Incremental EPG update stream — see `mirakurun_events.rs` module
+        // doc comment for the wire format EPGStation requires.
+        .route("/events/stream", get(mirakurun_events::stream_events))
 }
 
 /// HTTP access-log middleware, layered over the whole router in
@@ -246,8 +261,18 @@ pub async fn start_web_server(
     mirakurun_enabled: bool,
     proxy_listen_addr: Option<SocketAddr>,
     config_path: Option<PathBuf>,
+    epg_events_tx: tokio::sync::broadcast::Sender<crate::database::ProgramUpsert>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth, log_buffer, log_dir);
+    let mut web_state = WebState::new(
+        database,
+        tuner_pool,
+        encoder_pool,
+        session_registry,
+        auth,
+        log_buffer,
+        log_dir,
+        epg_events_tx,
+    );
     web_state.proxy_listen_addr = proxy_listen_addr;
     web_state.config_path = config_path;
     if let Some(config) = scan_config {
@@ -312,6 +337,7 @@ mod tests {
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(SessionRegistry::new());
         let log_buffer = crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY);
+        let (epg_events_tx, _epg_events_rx) = tokio::sync::broadcast::channel(16);
         Arc::new(WebState::new(
             database,
             tuner_pool,
@@ -320,6 +346,7 @@ mod tests {
             auth,
             log_buffer,
             std::path::PathBuf::from("logs"),
+            epg_events_tx,
         ))
     }
 
@@ -749,6 +776,72 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "GET {} should be 200", path);
         }
+    }
+
+    /// EPGStation-compat pass 1: `/docs`, `/tuners`, `/config/server` must be
+    /// reachable and unauthenticated like the rest of the Mirakurun router
+    /// (`docs/EPGSTATION_COMPAT.md` §1/§3/§6). `/docs` additionally must
+    /// come back as `application/json` — see `mirakurun_docs.rs` module doc
+    /// comment for why the client silently breaks otherwise — and its
+    /// `paths` must resolve the id EPGStation's `mirakurun` client uses for
+    /// `GET /services/:id/stream` to the exact route this router mounts, so
+    /// a real client's resolved request actually lands somewhere.
+    #[tokio::test]
+    async fn mirakurun_docs_tuners_and_config_server_are_reachable_without_auth_when_enabled() {
+        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let app = build_app(state, true);
+
+        for path in ["/mirakurun/api/tuners", "/mirakurun/api/config/server"] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "GET {} should be 200", path);
+        }
+
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/mirakurun/api/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let content_type = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(content_type.starts_with("application/json"), "{content_type}");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let docs: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stream_path = &docs["paths"]["/services/{id}/stream"];
+        assert_eq!(stream_path["get"]["operationId"], "getServiceStream");
+
+        // `/events/stream` is now implemented (`mirakurun_events.rs`): it
+        // must answer 200 with a JSON content type and never touch the body
+        // — the body is an intentionally-unbounded stream (real Mirakurun
+        // clients keep this connection open indefinitely), so awaiting it
+        // to completion here would hang the test forever. `oneshot` already
+        // returns as soon as the response *headers* are ready (same
+        // property `access_log`'s doc comment relies on), so checking only
+        // status/headers and dropping the response (which drops the body
+        // stream) is both correct and sufficient.
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/mirakurun/api/events/stream").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET /events/stream should be 200");
+        let content_type = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(content_type.starts_with("application/json"), "{content_type}");
+
+        // `/programs/:id/stream` is now implemented — with no matching
+        // program in the (empty, in-memory) test DB, it must resolve
+        // routing-wise (not 404-because-unmounted) and answer 404 because
+        // the program itself is not found, distinguishing "not implemented"
+        // from "implemented, nothing to stream".
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/mirakurun/api/programs/1/stream").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "GET /programs/1/stream should be 404 (no such program)");
     }
 
     #[tokio::test]

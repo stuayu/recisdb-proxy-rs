@@ -463,6 +463,7 @@ mod tests {
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(crate::web::SessionRegistry::new());
         let log_buffer = crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY);
+        let (epg_events_tx, _epg_events_rx) = broadcast::channel(16);
         Arc::new(WebState::new(
             database,
             tuner_pool,
@@ -471,6 +472,7 @@ mod tests {
             AuthConfig { enabled: false, token: String::new() },
             log_buffer,
             std::path::PathBuf::from("logs"),
+            epg_events_tx,
         ))
     }
 

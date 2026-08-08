@@ -5,12 +5,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use serde::Serialize;
 use dns_lookup::lookup_addr;
 
 use recisdb_protocol::StreamClass;
 
+use crate::database::ProgramUpsert;
 use crate::logging::LogBuffer;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
@@ -439,10 +440,21 @@ pub struct WebState {
     /// `[preview]` の実行ファイルパスを書き戻す先。`None` のときは書き戻せない
     /// (= 次回起動で設定が巻き戻る) ので、その旨を警告として返す。
     pub config_path: Option<PathBuf>,
+    /// Fan-out for `GET /mirakurun/api/events/stream`
+    /// (`web/mirakurun_events.rs`, `docs/EPGSTATION_COMPAT.md` §3/§6): every
+    /// handler call does `.subscribe()` on this to get its own receiver.
+    /// This is the *same* `broadcast::Sender` handle `main.rs` also gives to
+    /// `crate::epg_writer::EpgWriter`, which is the only thing that ever
+    /// sends on it (after each successful `programs` UPSERT) — created once
+    /// in `main.rs`, not here, so both sides share one channel instead of
+    /// each independently creating a dead one. See `main.rs` for the
+    /// capacity-1024 rationale.
+    pub epg_events_tx: broadcast::Sender<ProgramUpsert>,
 }
 
 impl WebState {
     /// Create a new web state.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         database: DatabaseHandle,
         tuner_pool: Arc<TunerPool>,
@@ -451,6 +463,7 @@ impl WebState {
         auth: AuthConfig,
         log_buffer: Arc<LogBuffer>,
         log_dir: PathBuf,
+        epg_events_tx: broadcast::Sender<ProgramUpsert>,
     ) -> Self {
         Self {
             database,
@@ -464,6 +477,7 @@ impl WebState {
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,
             log_dir,
+            epg_events_tx,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

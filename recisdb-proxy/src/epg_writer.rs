@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
 use crate::database::ProgramUpsert;
@@ -45,6 +45,14 @@ const PRUNE_EVERY_N_FLUSHES: u32 = 30;
 pub struct EpgWriter {
     database: DatabaseHandle,
     rx: mpsc::UnboundedReceiver<ProgramUpsert>,
+    /// Fan-out for `GET /mirakurun/api/events/stream`
+    /// (`web/mirakurun_events.rs`) — every record that is successfully
+    /// UPSERTed is also broadcast here so EPGStation's incremental EPG
+    /// updater sees it without waiting for its next full `/programs` poll.
+    /// The `Sender` is created once in `main.rs` and shared with
+    /// `web::state::WebState` so both sides hold the same channel; see that
+    /// field's doc comment for the capacity rationale.
+    events_tx: broadcast::Sender<ProgramUpsert>,
 }
 
 impl EpgWriter {
@@ -54,7 +62,11 @@ impl EpgWriter {
     /// A second call is logged as a warning (not a panic: a programming
     /// mistake here must never bring down the server) and its `EpgWriter`
     /// will simply receive no events.
-    pub fn new(database: DatabaseHandle) -> Self {
+    ///
+    /// `events_tx` is the same `broadcast::Sender` handed to
+    /// `web::state::WebState` (wired up in `main.rs`) — see
+    /// [`Self::flush`] for what gets sent through it and when.
+    pub fn new(database: DatabaseHandle, events_tx: broadcast::Sender<ProgramUpsert>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         if !epg_collector::set_global_sender(tx) {
             warn!(
@@ -62,7 +74,7 @@ impl EpgWriter {
                  instance will receive no events (EpgWriter::new called more than once?)"
             );
         }
-        Self { database, rx }
+        Self { database, rx, events_tx }
     }
 
     /// Run the batching/UPSERT loop. Never returns during normal operation
@@ -124,7 +136,30 @@ impl EpgWriter {
 
         let mut db = self.database.lock().await;
         match db.upsert_programs(&records) {
-            Ok(_) => debug!("[EpgWriter] flushed {} program row(s)", count),
+            Ok(_) => {
+                debug!("[EpgWriter] flushed {} program row(s)", count);
+                // Fan out to `/mirakurun/api/events/stream` subscribers only
+                // *after* the UPSERT actually succeeded — a subscriber must
+                // never observe an event for a row that failed to persist.
+                // `name.is_none()` rows are dropped here (not upstream in
+                // `EpgCollector`): EPGStation discards any `program` event
+                // whose `data.name` is `undefined`
+                // (`EPGUpdateManageModel.ts:554`, see `mirakurun_events.rs`
+                // module doc comment), so forwarding them would be pure
+                // waste. `type` is always `"update"` — this project's UPSERT
+                // does not distinguish "new row" from "existing row changed"
+                // (see `mirakurun_events.rs` for the full rationale), and
+                // EPGStation treats `create`/`update` identically anyway.
+                // `broadcast::Sender::send` errors only when there are zero
+                // subscribers (nobody has opened `/events/stream`); that is
+                // the common case, not a failure, so the `Result` is
+                // deliberately ignored.
+                for record in &records {
+                    if record.name.is_some() {
+                        let _ = self.events_tx.send(record.clone());
+                    }
+                }
+            }
             Err(e) => error!("[EpgWriter] failed to upsert {} program row(s): {}", count, e),
         }
 

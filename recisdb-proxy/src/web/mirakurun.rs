@@ -31,6 +31,29 @@
 //!   etc.) remain unimplemented. `isFree` is always reported `true` — the
 //!   `programs` table does not store `free_CA_mode` (see `web/mirakurun.rs`
 //!   `get_programs` doc comment for why).
+//! - `GET /docs` ([`crate::web::mirakurun_docs`]) IS implemented: the
+//!   `mirakurun` npm client used by EPGStation resolves every API call
+//!   through this OpenAPI (Swagger 2.0) document (operationId → method/path/
+//!   parameters), so without it none of the other endpoints below are ever
+//!   reachable from that client, even though their HTTP routes exist. See
+//!   `docs/EPGSTATION_COMPAT.md` §1.
+//! - `GET /tuners` and `GET /config/server` ARE implemented ([`get_tuners`],
+//!   [`get_server_config`]), but with several fields hardcoded to
+//!   type-appropriate defaults where this project has no equivalent concept
+//!   (per-tuner `pid`/`command`, `ConfigServer`'s job-scheduler/log-history
+//!   knobs, ...) — see each function's doc comment for exactly which fields.
+//! - `GET /programs/:id/stream` ([`stream_program_by_mirakurun_id`]) IS
+//!   implemented — EPG-reservation recording (`docs/EPGSTATION_COMPAT.md`
+//!   §3/§5) depends on it. It waits to emit TS data until the target event
+//!   is observed as EIT[p/f] "present" on its service
+//!   ([`crate::web::mirakurun_program_stream::ProgramGate`]), then streams
+//!   raw passthrough (same convention as every other stream endpoint here)
+//!   until a different event becomes present. `GET /events/stream`
+//!   ([`crate::web::mirakurun_events`]) IS implemented: incremental
+//!   `program` UPSERT notifications only (no `service`/`tuner` events — see
+//!   that module's doc comment for why), sourced from
+//!   `crate::epg_writer::EpgWriter` via a `broadcast` channel wired up in
+//!   `main.rs`.
 //! - No tuner/recording-process introspection beyond `/status`'s coarse
 //!   tuner counts (real Mirakurun's `/status` reports process RSS, EPG gather
 //!   progress, RPC/stream/error counters, etc. — none of that exists here).
@@ -42,6 +65,11 @@
 //!   not implemented; `hasLogoData` is always reported `false`. This
 //!   project's own `/logos/:file` convention (`<nid>_<sid>.png`) is not
 //!   wired up to the Mirakurun logo endpoint.
+//! - `X-Mirakurun-Priority` (sent on both stream endpoints, real and EPG-
+//!   Station-specific: `recPriority`/`conflictPriority`/`streamingPriority`)
+//!   is accepted and parsed but **not** fed into tuner-contention decisions
+//!   (`tuner/policy.rs::decide()`) — that requires a design decision outside
+//!   this pass's scope. See [`stream_service_by_mirakurun_id`].
 //!
 //! # Data mapping
 //!
@@ -79,20 +107,22 @@
 //! actual client. Coverage is limited to unit/integration tests against an
 //! in-memory database and `tower::ServiceExt::oneshot`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use log::debug;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::database::{ChannelRecord, Database, ProgramRecord};
+use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
+use crate::web::mirakurun_program_stream;
 use crate::web::state::WebState;
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
@@ -229,7 +259,16 @@ pub struct MirakurunService {
     /// also named `type` and is this same numeric ARIB value.
     #[serde(rename = "type")]
     pub service_type: i32,
-    pub channel: MirakurunChannelRef,
+    /// **Array**, not a single object — matches real Mirakurun (both the
+    /// stuayu fork this project targets and upstream): `ServiceItem.export()`
+    /// puts `this._channel` (a `ChannelItem[]`) straight into this field, and
+    /// `api.d.ts` declares `channel?: Channel[]`. This project only ever
+    /// resolves one physical channel per service, so the array always has
+    /// exactly one element — but the *shape* must be an array for
+    /// EPGStation's `ChannelDB` to parse it without relying on its
+    /// (unreleased, as of 2026-08-09) single-object fallback. See
+    /// `docs/EPGSTATION_COMPAT.md` §1/§4.
+    pub channel: Vec<MirakurunChannelRef>,
     pub has_logo_data: bool,
 }
 
@@ -288,9 +327,40 @@ fn mirakurun_program_id(nid: u16, sid: u16, event_id: u16) -> u64 {
     mirakurun_service_id(nid, sid) * 100_000 + event_id as u64
 }
 
-fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
-    let genres = r
-        .genre
+/// Inverse of [`mirakurun_program_id`], same shape as
+/// [`split_mirakurun_service_id`]: returns `None` if `id` does not decode
+/// back into three `u16`s, so callers can reject it as a 400 rather than
+/// querying the database with truncated/garbage values.
+fn split_mirakurun_program_id(id: u64) -> Option<(u16, u16, u16)> {
+    let event_id = id % 100_000;
+    let service_id_part = id / 100_000;
+    let (nid, sid) = split_mirakurun_service_id(service_id_part)?;
+    if event_id > u16::MAX as u64 {
+        return None;
+    }
+    Some((nid, sid, event_id as u16))
+}
+
+/// Shared field mapping into [`MirakurunProgram`], used by both
+/// [`program_record_to_mirakurun`] (`GET /programs`, a durably-stored
+/// [`ProgramRecord`]) and [`program_upsert_to_mirakurun`]
+/// (`GET /events/stream`, a [`ProgramUpsert`] broadcast the moment it is
+/// written — see `web/mirakurun_events.rs`) so the two representations are
+/// never mapped to the wire shape via two independently-maintained field
+/// lists that could drift apart.
+#[allow(clippy::too_many_arguments)]
+fn build_mirakurun_program(
+    nid: u16,
+    sid: u16,
+    tsid: u16,
+    event_id: u16,
+    start_at: i64,
+    duration_secs: i64,
+    name: Option<String>,
+    description: Option<String>,
+    genre: Option<i64>,
+) -> MirakurunProgram {
+    let genres = genre
         .map(|g| {
             let g = g as u8;
             vec![MirakurunGenre { lv1: (g >> 4) & 0x0F, lv2: g & 0x0F }]
@@ -298,18 +368,50 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
         .unwrap_or_default();
 
     MirakurunProgram {
-        id: mirakurun_program_id(r.nid, r.sid, r.event_id),
-        event_id: r.event_id,
-        service_id: r.sid,
-        network_id: r.nid,
-        transport_stream_id: r.tsid,
-        start_at: r.start_at * 1000,
-        duration: r.duration_secs * 1000,
+        id: mirakurun_program_id(nid, sid, event_id),
+        event_id,
+        service_id: sid,
+        network_id: nid,
+        transport_stream_id: tsid,
+        start_at: start_at * 1000,
+        duration: duration_secs * 1000,
         is_free: true,
-        name: r.name,
-        description: r.description,
+        name,
+        description,
         genres,
     }
+}
+
+fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
+    build_mirakurun_program(
+        r.nid,
+        r.sid,
+        r.tsid,
+        r.event_id,
+        r.start_at,
+        r.duration_secs,
+        r.name,
+        r.description,
+        r.genre,
+    )
+}
+
+/// Same mapping as [`program_record_to_mirakurun`], but off a not-yet-stored
+/// [`ProgramUpsert`] (`GET /events/stream`, `web/mirakurun_events.rs`) rather
+/// than a `programs` table row. `pub(crate)` so `mirakurun_events.rs` can
+/// reuse it instead of re-deriving `MirakurunProgram`'s field list.
+pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram {
+    build_mirakurun_program(
+        u.nid,
+        u.sid,
+        u.tsid,
+        u.event_id,
+        u.start_at,
+        u.duration_secs,
+        u.name.clone(),
+        u.description.clone(),
+        u.genre,
+    )
 }
 
 // ============================================================================
@@ -445,10 +547,12 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
                 network_id: c.nid,
                 name: c.channel_name.clone().unwrap_or_default(),
                 service_type: c.service_type.map(|v| v as i32).unwrap_or(0),
-                channel: MirakurunChannelRef {
+                // Single-element array — see `MirakurunService::channel` doc
+                // comment.
+                channel: vec![MirakurunChannelRef {
                     channel_type: band_type_to_mirakurun(bt).to_string(),
                     channel: ch_str,
-                },
+                }],
                 has_logo_data: false,
             })
         })
@@ -482,6 +586,28 @@ pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
     Json(result).into_response()
 }
 
+/// Parse the `X-Mirakurun-Priority` header EPGStation (and real Mirakurun
+/// clients generally) attach to both stream endpoints — `recPriority` /
+/// `conflictPriority` / `streamingPriority` depending on which reservation
+/// path sent the request (`docs/EPGSTATION_COMPAT.md` §5). Real Mirakurun
+/// treats a missing/unparseable value as `0` (lowest), so this does the
+/// same rather than rejecting the request — a malformed header should not
+/// break streaming.
+///
+/// The parsed value is presently only logged, **not** wired into
+/// `tuner/policy.rs::decide()`: feeding stream priority into tuner
+/// contention is a policy decision (which stream loses when tuners are
+/// full) that belongs in a dedicated design pass, not folded into this
+/// EPGStation-compat task. Until then, a recording request and a live-view
+/// request compete for tuners exactly as any two ordinary clients do.
+fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
+    headers
+        .get("X-Mirakurun-Priority")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
 /// `GET /mirakurun/api/services/:id/stream`.
 ///
 /// `:id` is the Mirakurun service id (`networkId * 100000 + serviceId`, see
@@ -494,10 +620,17 @@ pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
 /// (STREAMING_DESIGN.md §7.1), and query params other than none are ignored
 /// by design (a `?decode=1`-style param some clients send is simply not
 /// read).
+///
+/// `X-Mirakurun-Priority` is parsed and logged (see
+/// [`parse_mirakurun_priority`]) but not otherwise acted on.
 pub async fn stream_service_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
 ) -> Response {
+    let priority = parse_mirakurun_priority(&headers);
+    debug!("mirakurun: GET /services/{}/stream (X-Mirakurun-Priority={})", id, priority);
+
     let Some((nid, sid)) = split_mirakurun_service_id(id) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -584,6 +717,201 @@ pub async fn stream_channel_by_type(
     respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
 }
 
+/// `GET /mirakurun/api/tuners`.
+///
+/// EPGStation only reads this for its `/api/status` display (`docs/
+/// EPGSTATION_COMPAT.md` §3), so it does not need to be exact — but the
+/// shape must match `TunerDevice` (`api.d.ts`). One element per
+/// `bon_drivers` row (this project's closest equivalent of a "tuner
+/// device"), `index` assigned by enumeration order (this project has no
+/// separate stable tuner index — real Mirakurun's comes from `tuners.yml`
+/// position, which has no analogue here).
+///
+/// Fields with no equivalent concept in this project, hardcoded to a
+/// type-appropriate default:
+/// - `types`: always `[]`. Real Mirakurun reports which `ChannelType`s a
+///   tuner can receive (from `tuners.yml`); this project's BonDriver rows
+///   are not statically typed to a band until channels are scanned onto
+///   them, and a single BonDriver can carry multiple bands, so there is no
+///   single honest static answer here without querying scanned channels
+///   per driver — left empty rather than guessed.
+/// - `pid`: always `0`. BonDriver DLLs run in-process (loaded by
+///   `tuner/shared.rs`, not spawned as a subprocess), so there is no
+///   separate OS process to report.
+/// - `users`: always `[]`. Real Mirakurun lists active `TunerUser`s
+///   (id/priority/agent/url); mapping this project's session/subscriber
+///   model onto that shape is not needed for EPGStation's `/status` display
+///   and is left for a future pass if a client actually needs it.
+/// - `isRemote`: always `false` (no remote-tuner concept here).
+/// - `isFault`: always `false` (this project has no persisted "this tuner
+///   is broken" flag distinct from "currently failing to stream").
+///
+/// Fields derived from real state:
+/// - `isUsing`/`isFree`: `true`/`false` if any [`crate::tuner::pool::TunerPool`]
+///   key whose `tuner_path` equals this driver's `dll_path` currently has a
+///   running [`crate::tuner::shared::SharedTuner`] — same signal
+///   [`get_status`] already aggregates into `runningTunerCount`.
+/// - `isAvailable`: always `true` — this project does not track a
+///   driver-level "administratively disabled" state distinct from
+///   `is_enabled` on individual channels, and a driver with no channels
+///   enabled is still a usable tuner slot.
+pub async fn get_tuners(State(web_state): State<Arc<WebState>>) -> Response {
+    let drivers = {
+        let db = web_state.database.lock().await;
+        match db.get_all_bon_drivers() {
+            Ok(d) => d,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+
+    // Which dll_paths currently have a running reader, per the same signal
+    // `get_status` uses for `runningTunerCount`.
+    let running_dll_paths: HashSet<String> = {
+        let mut set = HashSet::new();
+        for key in web_state.tuner_pool.keys().await {
+            if let Some(tuner) = web_state.tuner_pool.get(&key).await {
+                if tuner.is_running() {
+                    set.insert(key.tuner_path.clone());
+                }
+            }
+        }
+        set
+    };
+
+    let tuners: Vec<serde_json::Value> = drivers
+        .iter()
+        .enumerate()
+        .map(|(index, d)| {
+            let is_using = running_dll_paths.contains(&d.dll_path);
+            json!({
+                "index": index,
+                "name": d.driver_name.clone().unwrap_or_else(|| d.dll_path.clone()),
+                "types": [],
+                "command": d.dll_path,
+                "pid": 0,
+                "users": [],
+                "isAvailable": true,
+                "isRemote": false,
+                "isFree": !is_using,
+                "isUsing": is_using,
+                "isFault": false,
+            })
+        })
+        .collect();
+
+    Json(tuners).into_response()
+}
+
+/// `GET /mirakurun/api/config/server`.
+///
+/// Per `docs/EPGSTATION_COMPAT.md` §3, EPGStation's own `tunerServerType:
+/// mirakurun` config setting (if the operator sets it) lets it skip calling
+/// this endpoint entirely — so this handler's main job is simply to exist
+/// and return `200` for the `auto`-detection path, not to be a faithful
+/// `ConfigServer`. Only the two fields `api.d.ts`'s `ConfigServer` marks
+/// non-optional (`allowOrigins`, `allowPNA`) are populated with real
+/// (empty/permissive-off) values; every other field on that type is
+/// optional and intentionally omitted rather than guessed.
+pub async fn get_server_config() -> Response {
+    Json(json!({
+        "allowOrigins": [],
+        "allowPNA": false,
+    }))
+    .into_response()
+}
+
+/// `GET /mirakurun/api/services/:id/logo` — **placeholder, not
+/// implemented**.
+///
+/// Declared in `/docs` (`getLogoImage`) for completeness, but every service
+/// this API reports has `hasLogoData: false` ([`get_services`]) — real
+/// Mirakurun clients, including EPGStation's `ChannelApiModel.ts:101`, only
+/// call this when a service's `hasLogoData` is `true`, so in practice this
+/// route is never hit. Answers `404` rather than `501`: unlike the
+/// programs/events endpoints, this one has a well-defined "correct" empty
+/// answer ("this service has no logo") rather than "not built yet".
+pub async fn get_logo_stub(Path(id): Path<u64>) -> Response {
+    error_response(StatusCode::NOT_FOUND, format!("service {} has no logo", id))
+}
+
+/// `GET /mirakurun/api/programs/:id/stream`.
+///
+/// This is the endpoint EPGStation's EPG-reservation recording depends on
+/// (`docs/EPGSTATION_COMPAT.md` §3/§5): it must wait to emit data until the
+/// target event becomes EIT[p/f] "present", and recording ends when the
+/// stream itself ends (not `reserve.endAt`, which real Mirakurun also
+/// ignores for this same reason — a program can run long). The
+/// present/following gating itself is
+/// [`crate::web::mirakurun_program_stream::ProgramGate`]; this handler's job
+/// is: decode `:id` -> look up the program row -> resolve/start the tuner
+/// (identical path to [`stream_service_by_mirakurun_id`]) -> hand the tuner
+/// subscription to the gate.
+///
+/// `:id` is looked up against the `programs` table (populated by
+/// `tuner/epg_collector.rs` via `crate::epg_writer::EpgWriter`) purely to
+/// learn the target `(sid, event_id)` and the program's scheduled end (for
+/// the give-up deadline, see
+/// `mirakurun_program_stream::PRESENT_WAIT_GRACE`) — the row is not
+/// otherwise consulted (in particular, the *content* of the recording comes
+/// live off the tuner, not from anything stored about the program).
+///
+/// `X-Mirakurun-Priority` is parsed and logged (see
+/// [`parse_mirakurun_priority`]) but not otherwise acted on, same as
+/// [`stream_service_by_mirakurun_id`].
+pub async fn stream_program_by_mirakurun_id(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let priority = parse_mirakurun_priority(&headers);
+    debug!("mirakurun: GET /programs/{}/stream (X-Mirakurun-Priority={})", id, priority);
+
+    let Some((nid, sid, event_id)) = split_mirakurun_program_id(id) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not a valid Mirakurun program id", id),
+        );
+    };
+
+    let program = {
+        let db = web_state.database.lock().await;
+        let programs = match db.get_programs(i64::MIN, i64::MAX, Some(nid), Some(sid)) {
+            Ok(p) => p,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        programs.into_iter().find(|p| p.event_id == event_id)
+    };
+    let Some(program) = program else {
+        return error_response(StatusCode::NOT_FOUND, format!("program {} not found", id));
+    };
+
+    // See `mirakurun_program_stream::PRESENT_WAIT_GRACE` doc comment: give up
+    // waiting for "present" this long past the program's own scheduled end.
+    let deadline = chrono::DateTime::from_timestamp(program.start_at + program.duration_secs, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        + mirakurun_program_stream::PRESENT_WAIT_GRACE;
+
+    let resolved = {
+        let db = web_state.database.lock().await;
+        channel_resolve::resolve_service_by_nid_sid(&db, nid, sid)
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => return channel_resolve_error_response(id, &e),
+    };
+
+    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
+        Ok(t) => t,
+        Err(e) => return channel_resolve_error_response(id, &e),
+    };
+
+    let tuner_rx = tuner.subscribe();
+    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
+    respond_with_stream(mirakurun_program_stream::gated_program_stream(
+        tuner_rx, cleanup, sid, event_id, deadline,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +939,40 @@ mod tests {
         // nid would be 65536 (out of u16 range) for this id.
         let bogus = 65536u64 * 100_000;
         assert_eq!(split_mirakurun_service_id(bogus), None);
+    }
+
+    // ------------------------------------------------------------------
+    // program id <-> (nid, sid, event_id) round trip
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn program_id_round_trips() {
+        for (nid, sid, event_id) in [
+            (1u16, 100u16, 1u16),
+            (0x7fe8, 1024, 0xffff),
+            (0, 0, 0),
+            (65535, 65535, 65535),
+        ] {
+            let id = mirakurun_program_id(nid, sid, event_id);
+            assert_eq!(split_mirakurun_program_id(id), Some((nid, sid, event_id)));
+        }
+    }
+
+    #[test]
+    fn program_id_matches_documented_formula() {
+        assert_eq!(mirakurun_program_id(1, 100, 5), mirakurun_service_id(1, 100) * 100_000 + 5);
+    }
+
+    #[test]
+    fn split_program_id_rejects_ids_that_decode_out_of_u16_range() {
+        // nid would be 65536 (out of u16 range) for the embedded service id.
+        let bogus_nid = (65536u64 * 100_000) * 100_000;
+        assert_eq!(split_mirakurun_program_id(bogus_nid), None);
+
+        // event_id would be 70000 (out of u16 range, but still < 100_000 so
+        // it doesn't wrap into the service-id portion).
+        let bogus_event = mirakurun_service_id(1, 100) * 100_000 + 70_000;
+        assert_eq!(split_mirakurun_program_id(bogus_event), None);
     }
 
     // ------------------------------------------------------------------
@@ -708,5 +1070,47 @@ mod tests {
     fn missing_physical_assignment_has_no_channel_string() {
         let record = make_channel_record(Some(0), None, None);
         assert_eq!(channel_string(&record), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Service.channel serializes as an array (docs/EPGSTATION_COMPAT.md §1/§4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn service_channel_serializes_as_a_single_element_array() {
+        let service = MirakurunService {
+            id: mirakurun_service_id(1, 100),
+            service_id: 100,
+            network_id: 1,
+            name: "Test".to_string(),
+            service_type: 1,
+            channel: vec![MirakurunChannelRef { channel_type: "GR".to_string(), channel: "27".to_string() }],
+            has_logo_data: false,
+        };
+        let value = serde_json::to_value(&service).unwrap();
+        let channel = value["channel"].as_array().expect("channel must serialize as a JSON array");
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel[0]["type"], "GR");
+        assert_eq!(channel[0]["channel"], "27");
+    }
+
+    // ------------------------------------------------------------------
+    // X-Mirakurun-Priority parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn priority_header_parses_a_valid_integer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Mirakurun-Priority", "3".parse().unwrap());
+        assert_eq!(parse_mirakurun_priority(&headers), 3);
+    }
+
+    #[test]
+    fn priority_header_defaults_to_zero_when_missing_or_unparseable() {
+        assert_eq!(parse_mirakurun_priority(&HeaderMap::new()), 0);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Mirakurun-Priority", "not-a-number".parse().unwrap());
+        assert_eq!(parse_mirakurun_priority(&headers), 0);
     }
 }
