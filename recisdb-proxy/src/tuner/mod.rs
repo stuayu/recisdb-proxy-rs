@@ -23,7 +23,7 @@ pub mod epg_collector;
 
 pub use channel_key::ChannelKey;
 pub use encoder_pool::{EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
-pub use pool::{CarriedSlotPermit, SlotPermit, TunerPool, TunerPoolConfig};
+pub use pool::{CarriedSlotPermit, ScanReservation, SlotPermit, TunerPool, TunerPoolConfig};
 pub use shared::{ReaderState, SharedTuner, TunerSubscription};
 pub use warm::WarmTunerHandle;
 pub use quality_scorer::{BonDriverWithScore, QualityScorer};

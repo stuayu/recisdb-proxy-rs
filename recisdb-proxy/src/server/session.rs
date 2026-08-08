@@ -688,7 +688,25 @@ impl Session {
     }
 
     /// Run the session, processing messages until disconnection.
+    /// Run the session to completion, releasing its tuner whichever way it
+    /// ends.
+    ///
+    /// The loop propagates socket errors with `?`, and a client that simply
+    /// goes away produces one (`Connection reset by peer`) rather than a
+    /// clean EOF. That used to return straight out of `run`, skipping
+    /// `cleanup` — so the session's reader kept running with nobody
+    /// subscribed and no keep-alive close scheduled. Since P1b that also
+    /// means its slot permit is never released: the driver stays occupied
+    /// for the life of the process, invisible to everyone (an entry with no
+    /// subscribers *and* no pending idle-close is not reclaimable by design,
+    /// because that shape normally means "being set up right now").
     pub async fn run(&mut self) -> std::io::Result<()> {
+        let result = self.run_loop().await;
+        self.cleanup().await;
+        result
+    }
+
+    async fn run_loop(&mut self) -> std::io::Result<()> {
         // Insert session start record
         let started_at = chrono::Utc::now().timestamp();
         if let Ok(db) = self.database.lock().await.insert_session_start(
@@ -945,8 +963,6 @@ impl Session {
             }
         }
 
-        // Cleanup
-        self.cleanup().await;
         Ok(())
     }
 
@@ -2899,6 +2915,13 @@ impl Session {
         // performs the decrement that used to be a manual `tuner.unsubscribe()`
         // call gated on `ts_receiver.is_some()`.
         self.ts_receiver = None;
+        if self.current_tuner.is_none() {
+            // Nothing to hand back. If a reader is still running for this
+            // session's last channel, nobody will schedule its keep-alive
+            // close and its slot never comes back — so this branch being
+            // taken while a reader is alive is a leak, and worth seeing.
+            info!("[Session {}] cleanup: no current tuner to release", self.id);
+        }
         if let Some(tuner) = self.current_tuner.take() {
             // ★ Always check if we should stop the reader
             // This handles the case where StopStream was called before disconnect
@@ -2909,6 +2932,13 @@ impl Session {
                 self.tuner_pool
                     .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
                     .await;
+            } else {
+                info!(
+                    "[Session {}] Leaving {:?} to its remaining {} subscriber(s)",
+                    self.id,
+                    tuner.key,
+                    tuner.subscriber_count()
+                );
             }
         }
         self.stop_tsreplace_pipeline().await;

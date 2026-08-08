@@ -96,8 +96,17 @@ function cellText(row: JsonRecord, key: string): string {
   }
 }
 
+const tunerSummary = computed(() => {
+  const active = store.stats.active_tuners
+  if (active === undefined || active === null) return '—'
+  const scanning = Number(store.stats.scanning_tuners ?? 0)
+  return scanning > 0 ? `${active} (+スキャン ${scanning})` : String(active)
+})
 const cards = computed(() => [
-  ['アクティブチューナー', store.stats.active_tuners ?? '—'],
+  // スキャンもチューナー枠を1つ占有するので、視聴中のチューナーとは別に
+  // 見えるようにしておく (合計が max_instances に対して何本埋まっているかを
+  // 利用者が把握できるようにするため)。
+  ['アクティブチューナー', tunerSummary.value],
   ['接続クライアント', store.stats.active_sessions ?? store.clients.length],
   ['総セッション', store.stats.total_sessions ?? '—'],
   ['登録チャンネル', store.stats.total_channels ?? '—'],

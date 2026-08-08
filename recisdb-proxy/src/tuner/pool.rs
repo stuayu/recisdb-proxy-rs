@@ -125,6 +125,26 @@ impl std::fmt::Debug for SlotPermit {
     }
 }
 
+/// A driver claimed by a running channel scan.
+///
+/// Holds the same [`SlotPermit`] a reader would, so the scan counts against
+/// `max_instances`, and registers the driver as "scanning" so the dashboard
+/// and API can say what the hardware is doing. Both are released on drop —
+/// including when the scan fails or times out.
+pub struct ScanReservation {
+    _permit: SlotPermit,
+    dll_path: String,
+    scanning: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+}
+
+impl Drop for ScanReservation {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.scanning.lock() {
+            m.remove(&self.dll_path);
+        }
+    }
+}
+
 /// One DLL path's capacity tracking: the `Semaphore` callers acquire permits
 /// from, plus the `max_instances` value it was last sized for (needed to
 /// compute the add/forget delta on the next resize — a `Semaphore` itself
@@ -223,6 +243,14 @@ pub struct TunerPool {
     /// Per-logical-channel single-flight locks. See
     /// [`Self::acquire_channel_lock`].
     channel_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Drivers currently held by a channel scan, and when it started.
+    ///
+    /// A scan does not create a pool entry (it drives its own
+    /// `BonDriverTuner` directly), so without this it would be invisible to
+    /// everything that reports what the hardware is doing. `std::sync::Mutex`
+    /// because [`ScanReservation`]'s `Drop` has to clear it, and `Drop`
+    /// cannot await.
+    scanning: Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
 
 struct IdleHandle {
@@ -245,6 +273,7 @@ impl TunerPool {
             dll_init_locks: Mutex::new(HashMap::new()),
             driver_slots: DriverSlots::new(),
             channel_locks: Mutex::new(HashMap::new()),
+            scanning: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -364,6 +393,45 @@ impl TunerPool {
                 .clone()
         };
         mutex.lock_owned().await
+    }
+
+    /// Claim a driver for a channel scan.
+    ///
+    /// A scan sweeps every channel on one driver for minutes. It needs the
+    /// hardware exclusively, but it used to take it *outside* the pool: it
+    /// opened its own `BonDriverTuner` directly, held no slot permit, and
+    /// appeared in no accounting. On a driver whose device allows a single
+    /// open that races a viewer — and even where it does not, a scan and a
+    /// viewer would silently exceed `max_instances`.
+    ///
+    /// Scans now reserve a slot like everything else. Returning `None` means
+    /// the driver is busy and the scan must yield: scanning is the lowest
+    /// priority work there is (DESIGN.md §4.4), so it waits for the next
+    /// scheduler tick rather than displacing anyone.
+    pub async fn begin_scan(&self, dll_path: &str, max_instances: i32) -> Option<ScanReservation> {
+        let permit = self.acquire_slot(dll_path, max_instances).await?;
+        self.scanning
+            .lock()
+            .ok()?
+            .insert(dll_path.to_string(), chrono::Utc::now().timestamp());
+        Some(ScanReservation {
+            _permit: permit,
+            dll_path: dll_path.to_string(),
+            scanning: Arc::clone(&self.scanning),
+        })
+    }
+
+    /// Drivers a scan is holding right now, with the timestamp it started.
+    pub fn scanning_drivers(&self) -> Vec<(String, i64)> {
+        self.scanning
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Is this driver currently being scanned?
+    pub fn is_scanning(&self, dll_path: &str) -> bool {
+        self.scanning.lock().map(|m| m.contains_key(dll_path)).unwrap_or(false)
     }
 
     /// Cancel an idle-close timer if it exists.
@@ -1282,6 +1350,66 @@ mod tests {
         )
         .await;
         assert!(same.is_err(), "candidate order must not create a second lock");
+    }
+
+    // -----------------------------------------------------------------
+    // Scans take a slot like everything else
+    // -----------------------------------------------------------------
+
+    /// A scan occupies one of the driver's slots, so a viewer cannot also
+    /// take the last one — and the scan is visible while it holds it.
+    #[tokio::test]
+    async fn a_scan_reserves_a_slot_and_is_reported_while_it_holds_it() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/px4video0";
+
+        assert!(!pool.is_scanning(path));
+
+        let reservation = pool.begin_scan(path, 1).await.expect("a free driver can be scanned");
+        assert!(pool.is_scanning(path), "a running scan must be visible");
+        assert_eq!(pool.scanning_drivers().len(), 1);
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "the scan holds the driver's only slot, so a viewer must not get one"
+        );
+
+        drop(reservation);
+        assert!(!pool.is_scanning(path), "the marker must clear when the scan ends");
+        assert!(
+            pool.acquire_slot(path, 1).await.is_some(),
+            "the slot must come back when the scan ends"
+        );
+    }
+
+    /// Scanning is the lowest-priority work there is: when the driver is
+    /// already in use, the scan yields instead of taking it.
+    #[tokio::test]
+    async fn a_scan_yields_when_the_driver_is_busy() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/px4video0";
+
+        let _viewer = pool.acquire_slot(path, 1).await.expect("viewer takes the slot");
+
+        assert!(
+            pool.begin_scan(path, 1).await.is_none(),
+            "a scan must not displace a viewer, nor exceed max_instances"
+        );
+        assert!(!pool.is_scanning(path), "a scan that never started must not be reported");
+    }
+
+    /// A driver with room serves both at once.
+    #[tokio::test]
+    async fn a_scan_and_a_viewer_coexist_on_a_multi_instance_driver() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/multi";
+
+        let _viewer = pool.acquire_slot(path, 2).await.expect("first slot");
+        let scan = pool.begin_scan(path, 2).await;
+        assert!(scan.is_some(), "a second slot exists, so the scan may use it");
+        assert!(
+            pool.acquire_slot(path, 2).await.is_none(),
+            "both slots are now taken (one viewer, one scan)"
+        );
     }
 
     /// §5: a warm tuner reserves a real slot for as long as it holds the DLL

@@ -29,6 +29,11 @@ pub struct BonDriverInfo {
     pub next_scan_at: Option<i64>,
     pub passive_scan_enabled: bool,
     pub max_instances: i32,
+    /// Whether a channel scan is holding this driver right now. The scan
+    /// reserves a real tuner slot, so this is also why the driver may look
+    /// unavailable to viewers.
+    #[serde(default)]
+    pub is_scanning: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -92,6 +97,7 @@ pub async fn get_bondrivers(
             next_scan_at: d.next_scan_at,
             passive_scan_enabled: d.passive_scan_enabled,
             max_instances: d.max_instances,
+            is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
             created_at: d.created_at,
             updated_at: d.updated_at,
         })
@@ -127,6 +133,7 @@ pub async fn get_bondriver(
                 next_scan_at: d.next_scan_at,
                 passive_scan_enabled: d.passive_scan_enabled,
                 max_instances: d.max_instances,
+                is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
                 created_at: d.created_at,
                 updated_at: d.updated_at,
             }

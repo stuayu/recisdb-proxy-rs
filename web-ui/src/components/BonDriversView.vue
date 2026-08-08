@@ -19,6 +19,7 @@ const listColumns: ColumnDef[] = [
   { key: 'name', label: '名前' },
   { key: 'group', label: 'グループ' },
   { key: 'max_instances', label: '最大数' },
+  { key: 'state', label: '状態' },
 ]
 const {
   visibleKeys: listVisibleKeys,
@@ -170,6 +171,7 @@ onMounted(load)
               <th v-if="listIsVisible('name')">名前</th>
               <th v-if="listIsVisible('group')">グループ</th>
               <th v-if="listIsVisible('max_instances')">最大数</th>
+              <th v-if="listIsVisible('state')">状態</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -190,6 +192,13 @@ onMounted(load)
                 data-label="最大数"
                 v-text="String(row.max_instances ?? 1)"
               />
+              <!-- スキャンは視聴と同じくチューナー枠を1つ占有する。
+                   占有されている理由が分からないと、視聴できない原因を
+                   利用者が追えないため状態として出す。 -->
+              <td v-if="listIsVisible('state')" data-label="状態">
+                <span v-if="row.is_scanning" class="badge badge-scanning">スキャン中</span>
+                <span v-else>—</span>
+              </td>
               <td data-label="操作">
                 <div class="actions">
                   <button class="button small secondary" @click="edit(row)">編集</button

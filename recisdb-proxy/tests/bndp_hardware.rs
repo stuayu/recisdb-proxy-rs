@@ -573,6 +573,20 @@ fn a_session_switches_between_terrestrial_and_satellite() {
     }
 }
 
+/// Number of tuners the pool currently has open, from the web API.
+fn active_tuners(web: &str) -> u32 {
+    let out = std::process::Command::new("curl")
+        .args(["-s", &format!("{web}/api/stats")])
+        .output()
+        .expect("query /api/stats");
+    let body = String::from_utf8_lossy(&out.stdout);
+    body.split("\"active_tuners\":")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty()))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
 /// `bon_drivers.last_scan` for one driver, or 0 — used to prove a scan
 /// really happened during the window a test was watching.
 fn last_scan_of(web: &str, driver_id: &str) -> i64 {
@@ -671,6 +685,128 @@ fn a_running_scan_neither_displaces_nor_blocks_viewers() {
     assert!(
         last_scan_after > last_scan_before,
         "no scan ran during the window — this test proved nothing"
+    );
+}
+
+/// A scan must yield to a viewer already on that driver.
+///
+/// Scans now reserve a tuner slot like everything else
+/// (docs/TUNER_PIPELINE_REDESIGN.md). Before that they opened the BonDriver
+/// directly, so a scan aimed at a driver a viewer was using would fight it
+/// for the hardware — on a single-open device, one of them simply loses.
+///
+/// This pins the driver the viewer will land on by asking for a channel only
+/// that driver carries, then requests a scan of the *same* driver and
+/// confirms the viewer is untouched and the scan does not run while it is
+/// there.
+#[test]
+#[ignore = "requires a running proxy with real hardware"]
+fn a_scan_yields_to_a_viewer_already_on_that_driver() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
+
+    let mut viewer = open_tuned_session(space, 0).expect("viewer");
+    assert!(viewer.drain_ts(Duration::from_secs(20)) > 188 * 200, "viewer never streamed");
+
+    // Whichever driver it landed on, ask for a scan of exactly that one.
+    let out = std::process::Command::new("curl")
+        .args(["-s", &format!("{web}/api/clients")])
+        .output()
+        .expect("query /api/clients");
+    let clients = String::from_utf8_lossy(&out.stdout).to_string();
+    let driver_path = clients
+        .split("\"tuner_path\":")
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .map(|s| s.to_string())
+        .expect("the viewer's driver should be reported by /api/clients");
+    println!("viewer is on {driver_path}");
+
+    let ids = std::process::Command::new("curl")
+        .args(["-s", &format!("{web}/api/bondrivers")])
+        .output()
+        .expect("query /api/bondrivers");
+    let body = String::from_utf8_lossy(&ids.stdout).to_string();
+    let driver_id = body
+        .split('{')
+        .find(|chunk| chunk.contains(&driver_path))
+        .and_then(|chunk| chunk.split("\"id\":").nth(1))
+        .map(|rest| {
+            rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .expect("driver id for the viewer's path");
+    println!("requesting a scan of driver {driver_id} ({driver_path})");
+
+    let status = std::process::Command::new("curl")
+        .args([
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            &format!("{web}/api/bondriver/{driver_id}/scan"),
+        ])
+        .output()
+        .expect("trigger the scan");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "200");
+
+    // Across a window that spans several scheduler ticks: the viewer keeps
+    // its stream, and the scan never claims the busy driver.
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while Instant::now() < deadline {
+        let got = viewer.drain_ts_until(188 * 200, Duration::from_secs(10));
+        assert!(got > 188 * 200, "the scan took the tuner from a viewer ({got} bytes)");
+
+        let stats = std::process::Command::new("curl")
+            .args(["-s", &format!("{web}/api/stats")])
+            .output()
+            .expect("query /api/stats");
+        let body = String::from_utf8_lossy(&stats.stdout);
+        assert!(
+            !body.contains(&format!("\"{driver_path}\"")),
+            "the scan claimed a driver a viewer is using: {body}"
+        );
+    }
+    println!("viewer survived; the scan never claimed the busy driver");
+}
+
+/// A client that vanishes must still give its tuner back.
+///
+/// Dropping the socket produces `Connection reset by peer` on the server,
+/// which the session loop propagates with `?`. That used to return straight
+/// out of `run`, skipping the cleanup that schedules the keep-alive close —
+/// so the reader kept going with nobody subscribed, holding its slot permit
+/// for the life of the process. Nothing could reclaim it either: an entry
+/// with no subscribers *and* no pending idle-close is deliberately not
+/// reclaimable, since that shape normally means "being set up right now".
+///
+/// The tuner must be gone once the keep-alive window passes.
+#[test]
+#[ignore = "requires a running proxy with real hardware; waits out the keep-alive window"]
+fn an_abandoned_session_releases_its_tuner() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
+    // Must exceed the server's `keep_alive_secs` (default 60).
+    let wait_s: u64 =
+        std::env::var("BNDP_KEEPALIVE_WAIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+
+    let before = active_tuners(&web);
+    let mut viewer = open_tuned_session(space, 0).expect("viewer");
+    assert!(viewer.drain_ts(Duration::from_secs(20)) > 188 * 200, "viewer never streamed");
+    assert!(active_tuners(&web) > before, "the viewer should have opened a tuner");
+
+    // Vanish without StopStream or CloseTuner, the way a killed client does.
+    drop(viewer);
+
+    let deadline = Instant::now() + Duration::from_secs(wait_s);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(5));
+        if active_tuners(&web) <= before {
+            println!("tuner released after the keep-alive window");
+            return;
+        }
+    }
+    panic!(
+        "the tuner was still held {wait_s}s after the client vanished — its slot is leaked \
+         (active_tuners={}, was {before})",
+        active_tuners(&web)
     );
 }
 

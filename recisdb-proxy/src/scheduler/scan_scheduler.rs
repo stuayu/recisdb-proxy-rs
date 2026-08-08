@@ -200,10 +200,31 @@ impl ScanScheduler {
             }
         };
 
+        // Claim the driver the same way a viewer would, before committing to
+        // the scan (docs/TUNER_PIPELINE_REDESIGN.md). A scan used to open the
+        // BonDriver directly, holding no slot: it could collide with a viewer
+        // on a single-open device, and it exceeded `max_instances` anywhere
+        // else. Scanning is the lowest-priority work there is, so if the
+        // driver is busy we simply yield and try again on the next tick.
+        let max_instances = {
+            let db = self.database.lock().await;
+            db.get_max_instances_for_path(&driver.dll_path).unwrap_or(1)
+        };
+        let Some(reservation) = tuner_pool.begin_scan(&driver.dll_path, max_instances).await else {
+            info!(
+                "ScanScheduler: {} is in use; deferring its scan to a later tick",
+                driver.dll_path
+            );
+            return;
+        };
+
         // Increment active scan count
         active_scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         tokio::spawn(async move {
+            // Held for the whole scan; dropping it frees the slot and clears
+            // the "scanning" marker, including on failure or timeout.
+            let _reservation = reservation;
             info!("ScanScheduler: Starting scan for {}", driver.dll_path);
 
             // Perform the scan with timeout

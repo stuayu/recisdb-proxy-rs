@@ -27,6 +27,12 @@ pub struct ServerStats {
     pub active_sessions: u64,
     pub total_tuners: usize,
     pub active_tuners: usize,
+    /// Drivers a channel scan is holding right now. A scan occupies a tuner
+    /// slot exactly like a viewer does, but has no pool entry, so it would
+    /// otherwise be missing from every count the dashboard shows.
+    pub scanning_tuners: usize,
+    /// The `dll_path`s behind `scanning_tuners`, for the driver list.
+    pub scanning_drivers: Vec<String>,
     pub uptime_seconds: u64,
     pub total_sessions_db: u64,
     pub total_channels: u64,
@@ -113,6 +119,13 @@ pub async fn get_stats(
         }
     }
 
+    let scanning: Vec<String> = web_state
+        .tuner_pool
+        .scanning_drivers()
+        .into_iter()
+        .map(|(path, _started)| path)
+        .collect();
+
     let (total_sessions_db, total_channels) = {
         let db = web_state.database.lock().await;
         (
@@ -126,6 +139,8 @@ pub async fn get_stats(
         active_sessions: active_sessions as u64,
         total_tuners,
         active_tuners,
+        scanning_tuners: scanning.len(),
+        scanning_drivers: scanning,
         uptime_seconds: 0,
         total_sessions_db,
         total_channels,

@@ -1353,6 +1353,25 @@ textarea:focus-visible,
   gap: 8px;
 }
 
+/* スキャン中など、チューナーの占有理由を一覧で示すバッジ。 */
+.badge {
+  padding: 2px 8px;
+  border: 2px solid var(--muted);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.badge-scanning {
+  border-color: #d08700;
+  color: #d08700;
+}
+
+.app.dark .badge-scanning {
+  border-color: #f0b429;
+  color: #f0b429;
+}
+
 .genre-badge {
   padding: 2px 8px;
   border: 2px solid var(--muted);
