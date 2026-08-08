@@ -401,16 +401,150 @@ P2b に残した (下記)。
     切り替えを行い、(1) エラーが返る、(2) 同じ DLL パスへの後続リクエストが
     ブロックされず成功する (permit が残っていないこと) を確認する。
 
-### P2b — 選局経路の一本化 (残タスク)
+### P2b-1 — executor の導入と HTTP 経路の配線 (実装済み)
 
-- 新規 `recisdb-proxy/src/tuner/acquire.rs` に唯一の executor を置く。
-  4 経路 (BNDP v1/v2/論理チャンネル/HTTP) すべてがここを通る。
+副作用を実行する唯一の場所として新規 `recisdb-proxy/src/tuner/acquire.rs` を追加し、
+まず HTTP/Mirakurun 経路 (`channel_resolve::start_tuner_for_service`) だけをそこへ
+載せ替えた。セッション経路 (`session.rs`) の配線は P2b-2、eviction ポリシーの
+一本化は P2b-3 に残る。
+
+- **`snapshot()`**: `tuner::policy::TunerSnapshot` を実プール + DB から 1 回だけ
+  組み立てる。`tuner_pool.keys()`/`tuner_pool.get()` の await をすべて終えてから
+  `database.lock()` を 1 回だけ取り、そのガードのスコープ内は `rusqlite` の
+  同期呼び出し (`get_max_instances_for_path` / `get_driver_quality_score_by_path` /
+  `get_exclusive_channel_counts` / 各 entry の `get_channel_priority`) だけで
+  await を一切挟まない構造にした。これは SYSTEM_REVIEW_2026-07.md H3
+  (「DB ロックを保持したまま tuner_pool を await してはならない」) を
+  レビューではなく構造で保証するための順序で、`snapshot()` の doc comment に
+  明記している。`dll_paths` 引数は候補に登場するドライバのみに絞り込む
+  ―― 関係ない entry/driver 行は最初から取得しない。
+
+- **`acquire()` の API**:
+
+  ```rust
+  pub(crate) struct AcquireRequest {
+      pub candidates: Vec<ChannelKey>,
+      pub priority: i32,
+      pub exclusive: bool,
+      pub bondriver_version: u8,
+      pub carried_permit: Option<SlotPermit>,
+      pub warm: Option<WarmTunerHandle>,
+  }
+
+  pub(crate) struct AcquireOutcome {
+      pub tuner: Arc<SharedTuner>,
+      pub key: ChannelKey,
+      pub reused: bool,
+      pub unused_permit: Option<SlotPermit>,
+      pub unused_warm: Option<WarmTunerHandle>,
+  }
+
+  pub(crate) async fn acquire(
+      pool: &Arc<TunerPool>,
+      database: &DatabaseHandle,
+      request: AcquireRequest,
+  ) -> Result<AcquireOutcome, AcquireError>;
+  ```
+
+  `AcquireRequest` は意図的に `own_key`/`own_key_will_free_slot`
+  (`policy::TuneRequest` が持つ、同一セッションの手放し予定キー) を持たない ――
+  P2b-1 で配線した HTTP 経路はそもそも自分の tuner を保持したまま次を要求する
+  ことがないため。P2b-2 で session.rs を配線する際に追加される想定。
+
+  `AcquireError` (`thiserror`) は `NoCandidates` / `AtCapacity { lowest_idle_priority }`
+  (`policy::RejectReason` をそのまま写す) / `Conflict(u32)` (下記の再試行上限
+  超過) / `ReaderStart(#[from] io::Error)` / `Pool(#[from] TunerPoolError)`
+  の 5 種類を区別する。
+
+- **`acquire()` の処理**: 候補の DLL パスで `snapshot()` → `policy::decide()` →
+  `Decision` の実行、の 1 ラウンド。
+  - `Reuse { key }`: `pool.get(&key)` で取得して返すだけ ―― permit は一切
+    取得しない。P1b §6 の「再利用は permit 取得より先」が構造的に保証される
+    (このブランチにコードとして `acquire_slot` 呼び出しが存在しない)。
+  - `Create { key, evict }`: まず `evict` を停止・除去する
+    (`SharedTuner::stop_reader()` が戻り値を返す時点で permit を確定的に
+    解放しているため、`server::session_capacity::stop_and_remove_tuner` が
+    P1b 以前に必要としていた「解放待ちポーリング」は不要 ―― `acquire.rs`
+    内に `stop_and_remove_tuner` 相当の `evict_tuner()` を独自実装した。
+    `session_capacity` 側の関数は `pub(super)` で `server` モジュール限定の
+    ため、そのまま import はできない)。次に permit を
+    `carried_permit`(パス一致時) → `warm` ハンドルの permit(パス一致時) →
+    `pool.acquire_slot` の優先順で取得し (`take_permit_for_path` ヘルパ。
+    `carried_permit` が勝った場合、同じパスの `warm` は用済みとして
+    shutdown する ―― 両方を要求時に活性化する経路は無いため)、
+    `pool.get_or_create` → `tuner.take_slot_permit()` →
+    `tuner.start_reader(...)` と進む。起動失敗時は `is_orphanable()` を
+    見て entry を後始末する。
+  - `Reject { reason }`: 対応する `AcquireError` に変換して返す。
+
+- **競合検知時の再試行**: 1 ラウンドの途中で以下のいずれかを検知したら、
+  新しい `snapshot()` からやり直す (`MAX_ACQUIRE_ATTEMPTS = 3` 回まで、
+  超えたら `AcquireError::Conflict(3)`):
+  1. `Decision::Reuse` が指した entry が `pool.get()` 時点で消えていた
+     (concurrent stop/evict と競合)。
+  2. `Decision::Create` の永続的な permit 取得元 (`carried_permit`/`warm`/
+     `pool.acquire_slot`) がすべて失敗した (snapshot が「空きがある」と
+     見たのに実際のセマフォには無かった)。
+  3. `pool.get_or_create` が `Decision::Create` にもかかわらず
+     `needs_reader_start() == false` な entry (他タスクが同じキーを
+     先に作って起動済み/起動中) を返した。
+  これは `policy.rs` の doc comment にある「executor は競合を検知したら
+  decide を呼び直す」の実装であり、`decide` 自身は複数ラウンドの I/O を
+  シミュレートしない (モジュール doc comment参照)。
+
+- **HTTP 経路 (`channel_resolve::start_tuner_for_service`) が `acquire()` に
+  委ねた処理と、残した処理**:
+  - 委ねた: 容量判定そのもの (permit 取得の成否)、`decide()` による
+    idle 優先度ベースの eviction、reader 起動、失敗時の entry 後始末。
+  - 残した: Unix の単一 open 制約 (px4 系デバイス) 対策である
+    `evict_idle_on_path` の proactive (容量到達時に `acquire()` を呼ぶ前に
+    先回りで idle reader を退避) と reactive (`AcquireError::ReaderStart`
+    が `EALREADY` のときに退避して 1 回だけ `acquire()` をやり直す) の
+    両方 ―― これは `max_instances` とは独立な物理デバイス制約で、
+    `decide()` のポリシーが知る話ではない。
+  - `AcquireError` → `ChannelResolveError` の変換 (`map_acquire_error`):
+    `ReaderStart`/`Pool` はそのまま同名 variant へ、`AtCapacity`/`Conflict`
+    は既存の `Busy { id, running, max }` へ (`running`/`max` の診断値は
+    `acquire()` が知る必要のない HTTP 固有の情報なのでここで計算する)。
+  - `AcquireRequest` の組み立て: 候補は `resolved.channel_key` の 1 つのみ
+    (フォールバック探索なし)、`exclusive: false` (HTTP 視聴要求は他セッションの
+    ライブ購読者と競合しない、という既存の保証を「`exclusive` 分岐が
+    到達しない」という構造で維持)、`carried_permit`/`warm` は常に `None`
+    (HTTP 経路はどちらも保持したことがない)。
+  - `priority` には `resolved.channel.priority` (このチャンネル自身の DB
+    優先度) を採用する。`session.rs` の `SetChannelSpace` がクライアント
+    優先度未指定時に使う「DB デフォルト」分岐と同じ値であり、退避可否の
+    比較が「DB 優先度どうし」で対称になる。
+
+    HTTP 経路は P2b-1 以前、`decide()` の優先度付き eviction を通っておらず
+    優先度という概念を持っていなかったため、これは経路の挙動追加にあたる。
+    ただし**旧挙動は完全に包含されており、退行はない**:
+    - パス単位の無条件 idle 退避 (`evict_idle_on_path`) は `acquire()` の
+      **前**に従来どおり実行される。Unix 単一 open 制約への対処なので、
+      優先度で条件付けてはならない。
+    - その後に走る `decide()` の容量制限 eviction は、旧経路が
+      `Busy` を返して諦めていた場面に**追加の**退避機会を与えるだけ。
+    - `exclusive: false` なので、購読者のいるリーダーを奪う分岐
+      (`decide_exclusive_at_capacity`) には到達しない。「HTTP リクエストが
+      他セッションのライブ視聴を止めることはない」という既存の保証は
+      構造で維持されている。
+
+    P2b-3 で優先度比較を `>=` から `>` に変える際、この経路も同じ規則に
+    従う (同値では退避しない)。
+
+### P2b-2/P2b-3 — セッション経路の配線と eviction ポリシー統一 (残タスク)
+
 - `session.rs` から選局系ヘルパ 8 個
-  (`try_reuse_existing_set_channel_space_tuner` 等) を削除。`Session` は
-  要求の組み立てと `apply_channel_metadata` 相当の後処理のみ持つ。
+  (`try_reuse_existing_set_channel_space_tuner` 等) を削除し、
+  `AcquireRequest`/`acquire()` 呼び出しに置き換える。`Session` は要求の
+  組み立てと `apply_channel_metadata` 相当の後処理のみ持つ。この際
+  `AcquireRequest` に `own_key`/`own_key_will_free_slot`
+  (`policy::TuneRequest` 相当) を追加する必要がある。
 - **eviction ポリシーの統一** (§2.1-8): 「idle を優先、購読者ありの退避は
   `exclusive` かつ要求優先度が厳密に上回る場合のみ」に一本化し、優先度比較を
-  `>` にする。
+  `>` にする。この変更は HTTP 経路にも波及する (`decide()` を共有している
+  ため) ―― 上記「要判断・要レビュー」の優先度セマンティクスと合わせて
+  再確認すること。
 - 検証: `cargo test -p recisdb-proxy` + 実機での連続チャンネル切り替え。
 
 ### P3 — 配信経路の高速化

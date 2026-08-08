@@ -514,7 +514,7 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(id, &e),
     };
@@ -574,7 +574,7 @@ pub async fn stream_channel_by_type(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(id, &e),
     };

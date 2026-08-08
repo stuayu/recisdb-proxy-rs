@@ -4,6 +4,7 @@
 //! - [`TunerPool`]: Pool of shared tuner instances with channel sharing
 //! - [`SharedTuner`]: Wrapper for tuner with broadcast capability
 
+pub(crate) mod acquire;
 pub mod channel_key;
 pub mod encoder_pool;
 pub mod lock;

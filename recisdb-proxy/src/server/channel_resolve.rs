@@ -59,13 +59,13 @@
 
 use std::sync::Arc;
 
-use log::{error, info, warn};
+use log::{info, warn};
 
 use crate::database::{ChannelRecord, Database};
+use crate::server::listener::DatabaseHandle;
 use crate::server::session_capacity::count_running_instances_on_driver;
-use crate::tuner::channel_key::ChannelKeySpec;
+use crate::tuner::acquire::{self, AcquireError, AcquireRequest};
 use crate::tuner::pool::TunerPoolError;
-use crate::tuner::shared::ReaderStartupConfig;
 use crate::tuner::timing;
 use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
 
@@ -209,178 +209,155 @@ fn is_ealready(e: &std::io::Error) -> bool {
 /// Get-or-create the `SharedTuner` for `resolved` and ensure its BonDriver
 /// reader is running, starting it if needed.
 ///
-/// Does not take a `Database` lock (all inputs are already resolved) so a
-/// caller need not hold the DB mutex across the (potentially several-second)
-/// BonDriver open — mirrors how `session.rs` only holds the DB lock for
-/// quick lookups and never across `start_reader`.
+/// docs/TUNER_PIPELINE_REDESIGN.md P2b-1: the actual selection/eviction/
+/// start sequence now goes entirely through `tuner::acquire::acquire` (the
+/// single executor also used by every other selection path once P2b-2/-3
+/// land) — this function is left with exactly the two things that are
+/// genuinely specific to HTTP/Mirakurun streaming and are *not* part of
+/// `decide`'s policy (see module doc comment above):
 ///
-/// Does not increment `resolved`'s subscriber count — callers must call
-/// `tuner.subscribe()` themselves once they decide to hold a live
-/// subscription (see `web/stream.rs`).
+/// 1. The Unix single-open-per-device-path idle eviction
+///    (`evict_idle_on_path`), both proactively (here, before ever calling
+///    `acquire`) and reactively (on `EALREADY`, after `acquire` fails).
+/// 2. Translating [`crate::tuner::acquire::AcquireError`] into this module's
+///    own [`ChannelResolveError`] (in particular, `Busy`'s `running`/`max`
+///    diagnostic fields, which `AcquireError` has no reason to know about).
+///
+/// The request built for `acquire` always has exactly one candidate (no
+/// group-mode fallback search — see module doc comment), `exclusive: false`
+/// (an HTTP viewer never preempts another session's live reader — same
+/// guarantee as before this refactor, now enforced structurally by
+/// `decide`'s exclusive-eviction branch simply never being reachable with
+/// `exclusive: false`), and `priority: resolved.channel.priority` (this
+/// channel's own DB-configured priority — the same value a session's
+/// `SetChannelSpace` uses when the client did not explicitly override it;
+/// HTTP has no equivalent of a client-supplied priority to plumb through).
+/// No `carried_permit`/`warm`: an HTTP request never already holds either.
 pub async fn start_tuner_for_service(
     tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
     resolved: &ResolvedService,
 ) -> Result<Arc<SharedTuner>, ChannelResolveError> {
     let key = resolved.channel_key.clone();
 
-    // docs/TUNER_PIPELINE_REDESIGN.md P1b §6: check reuse *before* touching
-    // the slot semaphore — an exact-key entry that already occupies its slot
-    // (another session/request's in-flight or live reader on this exact
-    // channel) is joinable via `get_or_create`'s own fast path without a
-    // permit at all; asking for one first could wrongly 503 a request that
-    // only wants to join an already-open stream on a
-    // `max_instances`-constrained driver.
-    let already_occupied = tuner_pool.get(&key).await
-        .map(|t| !t.is_reclaimable())
-        .unwrap_or(false);
-
-    let tuner = if already_occupied {
-        tuner_pool.get(&key).await.ok_or_else(|| {
-            ChannelResolveError::Pool(TunerPoolError::OpenFailed(
-                "raced with a concurrent removal".to_string(),
-            ))
-        })?
-    } else {
-        // §7: `acquire_slot`'s success/failure is the `max_instances`
-        // enforcement now, in place of the old post-creation
-        // `count_running_instances_on_driver`/`evict_idle_on_path` proactive
-        // check. If the driver is full, try the same idle-eviction this
-        // used to do proactively, then retry once before giving up as `Busy`
-        // — evicting only ever touches subscriber-less readers (module doc
-        // comment above), so this never preempts another *viewer*.
-        let permit = match tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await {
-            Some(p) => p,
-            None => {
-                let evicted = tuner_pool
-                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
-                    .await;
-                if evicted > 0 {
-                    info!(
-                        "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for service id={}",
-                        evicted, resolved.dll_path, resolved.channel.id
-                    );
-                }
-                match tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await {
-                    Some(p) => p,
-                    None => {
-                        let running = count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
-                        return Err(ChannelResolveError::Busy {
-                            id: resolved.channel.id,
-                            running,
-                            max: resolved.max_instances,
-                        });
-                    }
-                }
-            }
-        };
-
-        // No-op factory: mirrors every `get_or_create` call site in session.rs
-        // (e.g. `try_fallback_drivers`) — the actual BonDriver open happens via
-        // `start_reader` below, not inside the pool's factory closure.
-        tuner_pool
-            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit, || async { Ok(()) })
-            .await?
-    };
-
-    // `needs_reader_start()`, not `!is_running()`: a `Starting` entry has
-    // another task's BonDriver open + SetChannel already in flight, and a
-    // `Reserved` one is the entry `get_or_create` just handed us.
-    if tuner.needs_reader_start() {
-        let pool_config = tuner_pool.config().await;
-        let startup_config = ReaderStartupConfig::from(&pool_config);
-
-        let (space, channel) = match key.channel {
-            ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
-            ChannelKeySpec::Simple(c) => (0, c as u32),
-        };
-
-        let Some(start_permit) = tuner.take_slot_permit() else {
-            error!(
-                "[HTTP stream] {:?} needs a reader start but holds no slot permit (service id={})",
-                key, resolved.channel.id
+    // Proactive idle eviction: if the driver already looks at/over
+    // `max_instances`, free up any subscriber-less reader on this exact
+    // device path *before* asking `acquire` to do anything. This is the
+    // Unix single-open-per-device-path workaround (module doc comment) and
+    // is independent of `decide`'s own (priority-gated) capacity-limit
+    // eviction below `acquire` — a request for a channel that is already
+    // running still joins it for free via `acquire`'s `Reuse` path
+    // regardless of what happens here.
+    let running = count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
+    if running >= resolved.max_instances {
+        let evicted = tuner_pool.evict_idle_on_path(&resolved.dll_path, Some(&key)).await;
+        if evicted > 0 {
+            info!(
+                "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for service id={}",
+                evicted, resolved.dll_path, resolved.channel.id
             );
-            if tuner.is_orphanable() {
-                tuner_pool.remove(&key).await;
-            }
-            return Err(ChannelResolveError::Pool(TunerPoolError::OpenFailed(
-                "missing slot permit".to_string(),
-            )));
-        };
-
-        info!(
-            "[HTTP stream] starting BonDriver reader for {:?} (service id={})",
-            key, resolved.channel.id
-        );
-        // `start_reader` re-checks `needs_reader_start()`-equivalent state
-        // internally (it only ever stops an existing reader on *this same*
-        // `SharedTuner`, which cannot have gone from `Reserved`/`Stopped` to
-        // `Starting`/`Running` without going through this same call path) —
-        // no separate re-check under the DLL lock is needed here anymore,
-        // since `start_reader` itself now acquires that lock
-        // (docs/TUNER_PIPELINE_REDESIGN.md P2a item 3) before doing anything
-        // else, closing the window a caller-side re-check used to cover.
-        // No warm handle is available on the HTTP path (unlike session.rs),
-        // so this is always a cold open.
-        let start_result = tuner
-            .start_reader(tuner_pool, resolved.dll_path.clone(), space, channel, startup_config, start_permit, None)
-            .await;
-
-        match start_result {
-            Ok(()) => {}
-            #[cfg(unix)]
-            Err(e) if is_ealready(&e) => {
-                // Last-resort insurance: the capacity check above is
-                // keyed off `max_instances`, which is a *configured*
-                // slot count independent of the physical
-                // single-open-per-device-path constraint some Unix
-                // character-device BonDrivers enforce (see module doc
-                // comment). If the driver open still raced against an
-                // idle reader that hadn't been counted as "at capacity"
-                // (e.g. max_instances > 1 but the device itself only
-                // tolerates one open), evict any idle reader on this
-                // path unconditionally and retry once.
-                //
-                // The failed `start_reader` above already released
-                // `tuner`'s slot permit (`SharedTuner::stop_and_release_slot`
-                // runs on every failure path), so a retry needs a fresh one.
-                warn!(
-                    "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
-                     evicting idle readers on {} and retrying once",
-                    key, resolved.channel.id, resolved.dll_path
-                );
-                tuner_pool
-                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_millis(timing::EALREADY_RETRY_SLEEP_MS)).await;
-                let Some(retry_permit) = tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await else {
-                    if tuner.is_orphanable() {
-                        tuner_pool.remove(&key).await;
-                    }
-                    return Err(ChannelResolveError::Busy {
-                        id: resolved.channel.id,
-                        running: resolved.max_instances,
-                        max: resolved.max_instances,
-                    });
-                };
-                tuner
-                    .start_reader(
-                        tuner_pool,
-                        resolved.dll_path.clone(),
-                        space,
-                        channel,
-                        startup_config,
-                        retry_permit,
-                        None,
-                    )
-                    .await?;
-            }
-            Err(e) => return Err(e.into()),
         }
     }
 
-    tuner_pool.cancel_idle_close(&key).await;
+    match try_acquire(tuner_pool, database, resolved).await {
+        Ok(outcome) => {
+            tuner_pool.cancel_idle_close(&key).await;
+            Ok(finish_outcome(outcome, resolved))
+        }
+        #[cfg(unix)]
+        Err(AcquireError::ReaderStart(e)) if is_ealready(&e) => {
+            // Last-resort insurance: the capacity check above is keyed off
+            // `max_instances`, a *configured* slot count independent of the
+            // physical single-open-per-device-path constraint some Unix
+            // character-device BonDrivers enforce (module doc comment). If
+            // the driver open still raced against an idle reader that
+            // hadn't been counted as "at capacity" (e.g. `max_instances` > 1
+            // but the device itself only tolerates one open), evict any
+            // idle reader on this path unconditionally and retry once.
+            warn!(
+                "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
+                 evicting idle readers on {} and retrying once",
+                key, resolved.channel.id, resolved.dll_path
+            );
+            tuner_pool.evict_idle_on_path(&resolved.dll_path, Some(&key)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(timing::EALREADY_RETRY_SLEEP_MS)).await;
+            match try_acquire(tuner_pool, database, resolved).await {
+                Ok(outcome) => {
+                    tuner_pool.cancel_idle_close(&key).await;
+                    Ok(finish_outcome(outcome, resolved))
+                }
+                Err(e) => Err(map_acquire_error(tuner_pool, resolved, e).await),
+            }
+        }
+        Err(e) => Err(map_acquire_error(tuner_pool, resolved, e).await),
+    }
+}
 
-    Ok(tuner)
+/// Log and unpack a successful [`AcquireOutcome`].
+///
+/// HTTP requests never pass `acquire` a `carried_permit`/`warm` handle (see
+/// [`start_tuner_for_service`]'s doc comment), so both are always `None`
+/// here — asserted rather than silently dropped via `outcome.tuner` alone,
+/// so a future change that starts threading either of them through this
+/// module is forced to notice and decide what to do with the "unused" case
+/// instead of it leaking unnoticed.
+fn finish_outcome(outcome: acquire::AcquireOutcome, resolved: &ResolvedService) -> Arc<SharedTuner> {
+    if outcome.reused {
+        info!("[HTTP stream] joined existing reader for {:?} (service id={})", outcome.key, resolved.channel.id);
+    } else {
+        info!("[HTTP stream] started BonDriver reader for {:?} (service id={})", outcome.key, resolved.channel.id);
+    }
+    debug_assert!(outcome.unused_permit.is_none(), "HTTP requests never carry a permit into acquire()");
+    debug_assert!(outcome.unused_warm.is_none(), "HTTP requests never carry a warm handle into acquire()");
+    outcome.tuner
+}
+
+/// Build and run the `acquire` request for `resolved` (see
+/// [`start_tuner_for_service`]'s doc comment for the field choices).
+async fn try_acquire(
+    tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    resolved: &ResolvedService,
+) -> Result<acquire::AcquireOutcome, AcquireError> {
+    acquire::acquire(
+        tuner_pool,
+        database,
+        AcquireRequest {
+            candidates: vec![resolved.channel_key.clone()],
+            priority: resolved.channel.priority,
+            exclusive: false,
+            bondriver_version: HTTP_BONDRIVER_VERSION,
+            carried_permit: None,
+            warm: None,
+        },
+    )
+    .await
+}
+
+/// Translate an [`AcquireError`] into this module's own error type, adding
+/// the `running`/`max` diagnostic context `Busy` carries (which `acquire`
+/// itself has no reason to compute, since it is generic over every
+/// selection path, not just this HTTP-specific error shape).
+async fn map_acquire_error(
+    tuner_pool: &Arc<TunerPool>,
+    resolved: &ResolvedService,
+    e: AcquireError,
+) -> ChannelResolveError {
+    match e {
+        AcquireError::ReaderStart(io_err) => ChannelResolveError::ReaderStart(io_err),
+        AcquireError::Pool(pool_err) => ChannelResolveError::Pool(pool_err),
+        // Never actually reached from this module — `try_acquire` always
+        // supplies exactly one candidate — but handled rather than
+        // `unreachable!()` since `AcquireError` is a shared, generic type
+        // whose variants this match must stay exhaustive over.
+        AcquireError::NoCandidates => {
+            ChannelResolveError::Pool(TunerPoolError::OpenFailed("no candidates supplied".to_string()))
+        }
+        AcquireError::AtCapacity { .. } | AcquireError::Conflict(_) => {
+            let running = count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&resolved.channel_key)).await;
+            ChannelResolveError::Busy { id: resolved.channel.id, running, max: resolved.max_instances }
+        }
+    }
 }
 
 #[cfg(test)]
