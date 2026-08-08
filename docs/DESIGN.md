@@ -231,6 +231,168 @@ TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
 切断され得る**。退避された側は状態 watch で即座に検知し、理由 (`Evicted`) を
 ログとセッション履歴に残して切断する。クライアントへのプロトコル通知は未実装。
 
+### 4.4.1 図解: チューナーを取り合う全経路
+
+実機検証 (`docs/TUNER_PIPELINE_REDESIGN.md` §4.5〜§4.6) で確定した挙動を図にする。
+
+#### 誰がチューナーを要求し、どこで一本化されるか
+
+```mermaid
+flowchart TD
+    V1["BNDP v1<br/>SetChannel"]
+    V2["BNDP v2<br/>SetChannelSpace"]
+    V3["SelectLogicalChannel<br/>(NID/TSID)"]
+    V4["HTTP / Mirakurun<br/>ストリーム"]
+    SC["チャンネルスキャン<br/>(ScanScheduler)"]
+
+    V1 --> ACQ
+    V2 --> ACQ
+    V3 -->|"1候補ずつ<br/>DB優先度順を保つため"| ACQ
+    V4 --> ACQ
+
+    ACQ["tuner/acquire.rs::acquire()<br/>副作用の唯一の実行者"]
+    ACQ --> LOCK["チャンネル単位の single-flight ロック<br/>同一チャンネルの同時要求を直列化"]
+    LOCK --> SNAP["snapshot()<br/>プール走査 → DBロック1回<br/>(ロック中に await しない)"]
+    SNAP --> DEC["policy::decide()<br/>純関数・I/Oなし"]
+
+    DEC -->|Reuse| REUSE["既存リーダーに合流<br/>permit を取りに行かない"]
+    DEC -->|Reject| REJ["AtCapacity / NoCandidates"]
+    DEC -->|"Create (key, evict)"| EVICT["evict 対象を停止<br/>StopReason=Evicted"]
+
+    EVICT --> PERM{"permit 取得<br/>carried → warm → acquire_slot"}
+    PERM -->|失敗| RETRY["そのドライバを候補から外して<br/>再スナップショット"]
+    RETRY --> SNAP
+    PERM -->|成功| START["SharedTuner::start_reader()<br/>DLLロック取得・旧リーダー停止確認"]
+
+    SC --> BEGIN{"TunerPool::begin_scan()<br/>= acquire_slot と同じ枠"}
+    BEGIN -->|取れない| DEFER["譲る。次の tick で再試行<br/>(next_scan_at は据え置き)"]
+    BEGIN -->|取れた| SCANRUN["ScanReservation 保持<br/>BonDriver を直接開いて全ch走査"]
+```
+
+要点:
+
+- 選局 4 経路はすべて `acquire()` を通る。**新しい選局経路をここを迂回して書かない。**
+- スキャンは `acquire()` は通らない (プールのエントリを作らず自前で全 ch を走査する) が、
+  **スロット予約だけは同じ枠を通す**。だから視聴とスキャンが同じドライバを取り合わない。
+- `SelectLogicalChannel` だけは候補を 1 件ずつ渡す。この経路の候補順 (DB 優先度) に
+  意味があり、`decide()` の並べ替えで潰したくないため。
+
+#### スロットの持ち主
+
+`max_instances` はハードウェアの事実なので、超過は選択肢にしない。「数える」のではなく
+`SlotPermit` を「取る」。
+
+```mermaid
+flowchart LR
+    SEM["DriverSlots<br/>dll_path 毎の Semaphore<br/>permit 数 = max_instances"]
+
+    SEM --> P1["視聴/録画リーダー<br/>SharedTuner が保持"]
+    SEM --> P2["warm tuner<br/>WarmTunerHandle が保持"]
+    SEM --> P3["チャンネルスキャン<br/>ScanReservation が保持"]
+
+    P1 -->|"stop_reader / 異常終了"| SEM
+    P2 -->|"activate で移譲 / shutdown"| P1
+    P3 -->|"Drop (失敗・timeout 含む)"| SEM
+
+    P1 -->|"同一DLL上のチャンネル切替<br/>take_slot_permit で移譲"| P1
+```
+
+移譲が要る理由: 旧リーダーは切り替え成功まで止めないので、`max_instances=1` では
+「解放してから取得」も「取得してから解放」も成立しない。
+
+#### リーダーの状態
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Reserved: get_or_create<br/>(プールが枠を確保)
+    Reserved --> Starting: start_reader<br/>(起動が実行中)
+    Starting --> Running: ready 受信
+    Starting --> Stopped: 起動失敗 / 呼び出し元が消えた
+    Running --> Stopping: stop_reader
+    Running --> Stopped: 読み取り失敗 / panic
+    Stopping --> Stopped
+    Stopped --> [*]
+```
+
+| 述語 | 真になる状態 | 用途 |
+|---|---|---|
+| `occupies_slot()` | Reserved / Starting / Running / Stopping | 容量計上・prewarm 抑止 |
+| `needs_reader_start()` | Starting / Running **以外** | リーダー起動の要否 |
+| `is_reclaimable()` | (Idle / Stopped) かつ購読者なし | **プール内部**の stale 掃除 |
+| `is_orphanable()` | Starting / Running 以外 かつ購読者なし | **所有者**による返却 |
+
+`Reserved` と `Starting` を分けないと「起動すべきか」の判定が必ず誤る
+(起動をサボる、または他タスクの起動に重ねて二重オープンする)。
+
+#### 満杯のときに誰を退避するか
+
+```mermaid
+flowchart TD
+    F["ドライバが満杯"] --> I{"idle な<br/>リーダーがある?"}
+    I -->|"ある"| IK{"keep-alive 待ち?<br/>(idle_close 予約済み)"}
+    IK -->|"はい"| TAKE["奪う<br/>優先度に関わらず"]
+    IK -->|"いいえ<br/>= 選局直後で未購読"| PROTECT["奪わない<br/>要求元が壊れる"]
+    I -->|"ない"| L{"最も優先度の低い<br/>視聴中リーダー"}
+    PROTECT --> L
+    L --> C{"要求優先度 > 相手<br/>または exclusive?"}
+    C -->|"はい"| TAKE2["奪う<br/>視聴者は切断される"]
+    C -->|"いいえ<br/>(同値含む)"| NEXT["別の候補ドライバへ"]
+    NEXT --> NONE{"候補が尽きた?"}
+    NONE -->|"はい"| REJECT["拒否<br/>上限超過では作らない"]
+```
+
+- **同値では奪わない。** 同順位が先着を蹴散らしても得るものがない。
+- **`exclusive` はタイに勝つ。** ハードウェアそのものを要求しているため。
+- **keep-alive の残骸は優先度に関わらず譲る。** 誰も見ていないため。ただし
+  「購読者ゼロ」だけで判断してはいけない ―― `SetChannelSpace` と `StartStream` の
+  間のエントリも購読者ゼロで、これを奪うと要求元が壊れる。
+
+#### 同時に同じチャンネルが要求されたとき
+
+```mermaid
+sequenceDiagram
+    participant A as セッションA
+    participant B as セッションB
+    participant P as TunerPool
+    participant T as SharedTuner
+
+    A->>P: acquire(ch5)
+    B->>P: acquire(ch5)
+    Note over P: チャンネル単位ロック<br/>B は待たされる
+    P->>T: decide=Create → permit → start_reader
+    T-->>A: 受信開始
+    Note over P: A がロックを解放
+    P->>P: B が再スナップショット
+    Note over P: 既存エントリが見えるので decide=Reuse
+    P-->>B: 同じ SharedTuner に合流 (permit 不要)
+```
+
+直列化していないと、両者とも「合流先なし」と判断して別々のドライバに 1 本ずつ開く。
+チューナーは有限なので、これは実害のある無駄遣いになる。
+
+#### スキャンと視聴の競合
+
+```mermaid
+sequenceDiagram
+    participant V as 視聴者
+    participant S as ScanScheduler
+    participant P as TunerPool
+
+    V->>P: acquire → permit 取得 (driverX)
+    Note over V,P: 視聴中
+    S->>P: begin_scan(driverX)
+    P-->>S: None (満杯)
+    Note over S: 「deferring its scan」<br/>next_scan_at は据え置き
+    V->>P: 切断 → keep-alive 満了 → permit 解放
+    S->>P: begin_scan(driverX)
+    P-->>S: ScanReservation
+    Note over S: 走査開始<br/>/api/stats の scanning_drivers に出る
+```
+
+スキャンは最も優先度の低い作業なので、退避はせず待つ。逆に走査中はそのドライバが
+満杯として扱われ、視聴要求は別ドライバへ回る。
+
 ### 4.5 グループ選局と仮想チューナー空間
 
 - `bon_drivers.group_name` (DLL 名から自動推測、例: BonDriver_MLT1.dll → "PX-MLT") で複数 DLL を束ねる。
