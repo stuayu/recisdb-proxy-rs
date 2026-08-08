@@ -1,6 +1,97 @@
 extern crate pkg_config;
 
 use std::env::var;
+use std::path::{Path, PathBuf};
+
+/// libaribb25 のソースは submodule (upstream tsukumijima/libaribb25) なので
+/// リポジトリ内では直せない。ビルド時に OUT_DIR へコピーしてから、下記2件の
+/// 不具合を潰したものを cmake に食わせる。
+///
+/// 1. **PC/SC の出力引数の型** — `b_cas_card.c` は `SCardListReaders` /
+///    `SCardTransmit` の長さ引数に `unsigned long` のアドレスを渡している。
+///    Linux の pcsclite と Windows では `DWORD == unsigned long` なので正しいが、
+///    **macOS の PCSC.framework は `DWORD == uint32_t`**。64bit 変数のアドレスを
+///    渡すと下位32bitしか書かれず、上位32bitはスタックのゴミが残る。結果
+///    `len` が巨大値になり `prv->sbuf = prv->pool + len` がワイルドポインタと
+///    なって、カードリーダー接続時に SIGSEGV で落ちる (実機で確認)。
+///    `DWORD` に直せば3プラットフォームとも正しい型になる。
+///
+/// 2. **`pattern` が const** — `override_card_reader_name_pattern`
+///    (= `b25_sys::set_card_reader_name`) は `static const TCHAR pattern[1024]`
+///    に `_tcscpy` で書き込む。const オブジェクトへの書き込みは UB で、macOS では
+///    読み取り専用セクションに置かれるため SIGBUS で落ちる (実機で確認)。
+///    カードリーダーを名前で選ぶ機能そのものが使えないので const を外す。
+///
+/// 置換対象が見つからない場合は **panic する**。upstream が構造を変えたのに
+/// 黙って未修正のままビルドが通ると、また実行時に落ちるため。
+fn patched_libaribb25_dir() -> PathBuf {
+    let src = Path::new("./externals/libaribb25");
+    let dst = PathBuf::from(var("OUT_DIR").expect("OUT_DIR")).join("libaribb25-patched");
+
+    if dst.exists() {
+        std::fs::remove_dir_all(&dst).expect("failed to clear the patched libaribb25 copy");
+    }
+    copy_dir(src, &dst);
+
+    let target = dst.join("aribb25").join("b_cas_card.c");
+    let original = std::fs::read_to_string(&target).expect("failed to read b_cas_card.c");
+    let mut patched = original.clone();
+
+    // 1. PC/SC 出力引数を DWORD にする。宣言だけを対象にするため行全体で照合する。
+    let mut retyped = 0usize;
+    for decl in [
+        "\tunsigned long len;",
+        "\tunsigned long slen;",
+        "\tunsigned long rlen;",
+        "\tunsigned long rlen,protocol;",
+    ] {
+        let replacement = decl.replace("unsigned long", "DWORD");
+        let hits = patched.matches(decl).count();
+        if hits > 0 {
+            retyped += hits;
+            patched = patched.replace(decl, &replacement);
+        }
+    }
+    assert!(
+        retyped >= 10,
+        "libaribb25 の PC/SC 長さ変数の宣言が想定と違う (置換できたのは {retyped} 箇所)。\
+         upstream の b_cas_card.c を確認して build.rs のパッチを更新すること。"
+    );
+
+    // 2. カードリーダー名パターンを書き込み可能にする。
+    let const_pattern = "static const TCHAR pattern[1024]";
+    assert!(
+        patched.contains(const_pattern),
+        "libaribb25 の pattern 宣言が想定と違う。build.rs のパッチを更新すること。"
+    );
+    patched = patched.replace(const_pattern, "static TCHAR pattern[1024]");
+    // 引数側も const のままだと _tcscpy の第1引数で型が合わなくなるため、
+    // 代入先だけ書き換える (関数シグネチャの const は入力側なので触らない)。
+
+    std::fs::write(&target, patched).expect("failed to write the patched b_cas_card.c");
+
+    println!("cargo:rerun-if-changed=externals/libaribb25");
+    dst
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("failed to create the patched source directory");
+    for entry in std::fs::read_dir(src).expect("failed to read the libaribb25 source directory") {
+        let entry = entry.expect("failed to walk the libaribb25 source directory");
+        let name = entry.file_name();
+        // .git は submodule のメタデータ (ファイル)。ビルドには不要。
+        if name == ".git" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if entry.file_type().expect("file_type").is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap_or_else(|e| panic!("failed to copy {from:?}: {e}"));
+        }
+    }
+}
 
 #[derive(Clone)]
 struct TargetVar {
@@ -26,7 +117,7 @@ impl Default for TargetVar {
 }
 
 fn prep_cmake(cx: TargetVar) -> cmake::Config {
-    let mut cm = cmake::Config::new("./externals/libaribb25");
+    let mut cm = cmake::Config::new(patched_libaribb25_dir());
     cm.very_verbose(true);
     cm.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
 

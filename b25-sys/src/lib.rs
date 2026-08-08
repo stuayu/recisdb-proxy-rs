@@ -22,10 +22,30 @@ pub fn set_keys(key0: Vec<u64>, key1: Vec<u64>) {
     KEY1.lock().unwrap().extend(key1);
 }
 
+/// Tell libaribb25 which card reader to use, by exact name.
+///
+/// Without this, libaribb25 walks every reader the PC/SC daemon reports and
+/// tries to talk to each one in turn. On a machine with a non-B-CAS reader
+/// attached (a bank-card/EMV reader, say) that costs several seconds per
+/// decoder start, and the first reader to answer wins even if it is the wrong
+/// one. Pass a name from [`list_card_readers`] to skip straight to it.
+///
+/// The name must match what PC/SC reports exactly; `false` means libaribb25
+/// rejected it (empty, or 1024 characters or longer).
+///
+/// Takes `&str` but hands C a NUL-terminated copy — the C side runs `strlen`
+/// on it, and a bare `str::as_ptr()` is not NUL-terminated. An interior NUL
+/// makes this return `false` rather than silently truncating.
 #[cfg(feature = "prioritized_card_reader")]
 pub fn set_card_reader_name(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
     unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr() as *const _) == 0 }
 }
+
+pub use crate::pcsc_readers::list_card_readers;
+mod pcsc_readers;
 
 /// Decode ARIB-STD-B25 stream with libaribb25. Both `Read` and `Write` are implemented.
 pub struct StreamDecoder {
