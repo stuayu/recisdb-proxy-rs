@@ -9,7 +9,7 @@ use b25_sys::DecoderOptions; // 鍵が必要な場合
 
 use bytes::Bytes;
 use log::{debug, error, info, warn};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
@@ -92,6 +92,51 @@ impl TryFrom<u8> for ReaderState {
     }
 }
 
+/// Why a reader stopped, recorded so a session that loses its tuner can say
+/// *what happened* instead of just dropping the client
+/// (docs/TUNER_PIPELINE_REDESIGN.md §2.1-7 / P4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Not set (or the reader is still running).
+    Unspecified = 0,
+    /// Displaced to free a driver slot for a higher-priority (or exclusive)
+    /// request — see `policy::may_evict`.
+    Evicted = 1,
+    /// The reader itself failed: BonDriver open/SetChannel error, a caught
+    /// panic, or too many consecutive read errors.
+    ReaderFailed = 2,
+    /// Stopped on purpose because nothing was subscribed any more
+    /// (keep-alive expiry, or an explicit close).
+    Released = 3,
+}
+
+impl TryFrom<u8> for StopReason {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, ()> {
+        match value {
+            0 => Ok(StopReason::Unspecified),
+            1 => Ok(StopReason::Evicted),
+            2 => Ok(StopReason::ReaderFailed),
+            3 => Ok(StopReason::Released),
+            _ => Err(()),
+        }
+    }
+}
+
+impl StopReason {
+    /// Short, stable token for logs and the session-history
+    /// `disconnect_reason` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Unspecified => "reader_stopped",
+            StopReason::Evicted => "evicted",
+            StopReason::ReaderFailed => "reader_failed",
+            StopReason::Released => "reader_released",
+        }
+    }
+}
+
 /// Capacity of the broadcast channel for TS data.
 /// Increased to 4096 (256MB of 64KB chunks) to support multiple simultaneous subscribers
 /// without buffer overflow when subscriber read speeds vary significantly.
@@ -141,6 +186,12 @@ pub struct SharedTuner {
     subscriber_count: AtomicU32,
     /// Lifecycle state of the background reader task. See [`ReaderState`].
     reader_state: AtomicU8,
+    /// Broadcasts every [`ReaderState`] transition so subscribers learn that
+    /// their reader died *when it dies*, rather than on the next poll tick
+    /// (docs/TUNER_PIPELINE_REDESIGN.md §2.1-7).
+    state_tx: watch::Sender<ReaderState>,
+    /// Why the reader stopped. See [`StopReason`].
+    stop_reason: AtomicU8,
     /// Handle to the reader task (if running).
     reader_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Signal level (updated periodically).
@@ -180,6 +231,8 @@ impl SharedTuner {
             channel_change_tx,
             subscriber_count: AtomicU32::new(0),
             reader_state: AtomicU8::new(ReaderState::Idle as u8),
+            state_tx: watch::channel(ReaderState::Idle).0,
+            stop_reason: AtomicU8::new(StopReason::Unspecified as u8),
             reader_handle: tokio::sync::Mutex::new(None),
             signal_level: AtomicU32::new(0),
             bondriver_version,
@@ -349,9 +402,41 @@ impl SharedTuner {
         ReaderState::try_from(self.reader_state.load(Ordering::Acquire)).unwrap_or(ReaderState::Stopped)
     }
 
-    /// Transition the reader lifecycle state.
+    /// Transition the reader lifecycle state and publish it to watchers.
     pub(crate) fn set_state(&self, state: ReaderState) {
         self.reader_state.store(state as u8, Ordering::Release);
+        // `send_replace`, not `send`: with no receivers attached, `send`
+        // returns an error *and leaves the stored value untouched*, so a
+        // watcher that subscribes later would see whatever the state was
+        // when the last receiver went away rather than the current one.
+        // Readers spend most of their life with nobody watching (a session
+        // only subscribes once it has selected this tuner), so that is the
+        // normal case, not an edge case.
+        self.state_tx.send_replace(state);
+    }
+
+    /// Watch this reader's lifecycle state.
+    ///
+    /// A session holds one of these for its current tuner so an eviction or
+    /// a driver failure wakes it immediately; before P4 the only signal was
+    /// a 2-second poll, so a displaced viewer sat on a dead stream for up to
+    /// two seconds before being disconnected without explanation.
+    pub fn subscribe_state(&self) -> watch::Receiver<ReaderState> {
+        self.state_tx.subscribe()
+    }
+
+    /// Record why this reader is stopping. Set by whoever initiates the stop
+    /// (the evictor, the reader's own failure paths, or the idle-close
+    /// timer) *before* the state reaches `Stopped`, so a watcher that wakes
+    /// on the transition already sees the reason.
+    pub fn set_stop_reason(&self, reason: StopReason) {
+        self.stop_reason.store(reason as u8, Ordering::Release);
+    }
+
+    /// Why this reader stopped, if it has.
+    pub fn stop_reason(&self) -> StopReason {
+        StopReason::try_from(self.stop_reason.load(Ordering::Acquire))
+            .unwrap_or(StopReason::Unspecified)
     }
 
     /// Transition to `Stopped` and release this entry's driver-slot permit
@@ -645,6 +730,7 @@ impl SharedTuner {
                         error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
                                space, channel, e, e.kind());
                     }
+                    shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
 
                     let err_msg = match e.kind() {
@@ -660,6 +746,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
+                    shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
                     let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
                     return;
@@ -987,6 +1074,7 @@ impl SharedTuner {
                         let max_attempts = if reader_first_read { 40000 } else { 1000 };
                         if consecutive_empty > max_attempts {
                             error!("[SharedTuner] Too many WouldBlock errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
+                            shared.set_stop_reason(StopReason::ReaderFailed);
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1004,12 +1092,14 @@ impl SharedTuner {
                     consecutive_empty = consecutive_empty.saturating_add(1);
                     if consecutive_empty > 1000 {
                         error!("[SharedTuner] Too many consecutive errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
+                        shared.set_stop_reason(StopReason::ReaderFailed);
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
+                    shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
                     break;
                 }
@@ -1215,6 +1305,7 @@ impl SharedTuner {
                     Err(e) => {
                         error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})",
                                tuner_path, e, e.kind());
+                        shared.set_stop_reason(StopReason::ReaderFailed);
                         shared.stop_and_release_slot();
                         let err_msg = match e.kind() {
                             std::io::ErrorKind::NotFound =>
@@ -1245,6 +1336,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] CRITICAL PANIC in reader task: {:?}", panic_err);
+                    shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
                 }
             }

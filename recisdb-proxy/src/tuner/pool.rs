@@ -335,6 +335,7 @@ impl TunerPool {
         let keep_alive_secs = self.config.read().await.keep_alive_secs;
         if keep_alive_secs == 0 {
             info!("Keep-alive disabled, stopping reader for {:?}", key);
+            tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
             tuner.stop_reader().await;
             let _ = self.remove(&key).await;
             return;
@@ -368,6 +369,7 @@ impl TunerPool {
                     if let Some(pool) = pool.upgrade() {
                         if !tuner.has_subscribers() {
                             info!("Keep-alive timeout reached, stopping reader for {:?}", key);
+                            tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
                             tuner.stop_reader().await;
                             // ★ Bug F revised fix: Always remove the pool entry after stop_reader().
                             // stop_reader() is async and yields; a concurrent subscribe() +
@@ -654,6 +656,7 @@ impl TunerPool {
                 key, tuner_path
             );
             self.cancel_idle_close(&key).await;
+            tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
             // stop_reader() is async and yields; a concurrent subscribe() may
             // have raced in during that await window, so re-check identity
             // (not just presence) before removing the pool entry — mirrors
@@ -683,6 +686,7 @@ impl Default for TunerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuner::shared::StopReason;
     use crate::tuner::shared::{ReaderStartupConfig, ReaderState};
     use crate::tuner::ts_source::FakeTsSource;
 
@@ -1106,6 +1110,69 @@ mod tests {
             pool.acquire_slot("/dev/px4video0", 1).await.is_none(),
             "shrinking must claw back the returned permits, not hand them out again"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // P4: stop notification (docs/TUNER_PIPELINE_REDESIGN.md §2.1-7)
+    // -----------------------------------------------------------------
+
+    /// A watcher sees every reader-state transition and can read back *why*
+    /// the reader stopped — the two things a displaced session needs in
+    /// order to report something better than a silent disconnect.
+    ///
+    /// Driven through `set_state` directly rather than a fake reader: this
+    /// is a test of the notification channel, and keeping a background
+    /// reader out of it keeps the test free of blocking-pool lifetime
+    /// concerns.
+    #[tokio::test]
+    async fn a_state_watcher_sees_transitions_and_the_stop_reason() {
+        let tuner = SharedTuner::new(ChannelKey::simple("/dev/px4video0", 1), 2);
+
+        // Transitions made before anyone subscribes must not be lost:
+        // `set_state` uses `send_replace`, since `watch::Sender::send`
+        // leaves the stored value untouched when there are no receivers —
+        // and a reader spends most of its life unwatched (a session only
+        // subscribes once it has selected this tuner).
+        tuner.set_state(ReaderState::Starting);
+        tuner.set_state(ReaderState::Running);
+
+        let mut watch = tuner.subscribe_state();
+        assert_eq!(*watch.borrow_and_update(), ReaderState::Running);
+        assert_eq!(tuner.stop_reason(), StopReason::Unspecified);
+
+        // What an evictor does (see `tuner::acquire::evict_tuner`).
+        tuner.set_stop_reason(StopReason::Evicted);
+        tuner.set_state(ReaderState::Stopping);
+
+        assert!(watch.has_changed().unwrap(), "the stop must be observable through the watch channel");
+        assert_eq!(*watch.borrow_and_update(), ReaderState::Stopping);
+        assert!(!tuner.is_running());
+        assert_eq!(
+            tuner.stop_reason(),
+            StopReason::Evicted,
+            "the reason is set before the transition, so a watcher woken by it already sees why"
+        );
+    }
+
+    /// A reader that dies on its own is distinguishable from one that was
+    /// displaced, so the session can say which happened.
+    #[tokio::test]
+    async fn a_failed_startup_is_reported_as_reader_failed_not_evicted() {
+        let pool = Arc::new(TunerPool::new(10));
+        let key = ChannelKey::simple("/dev/px4video0", 1);
+
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+
+        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
+        assert!(ready_rx.await.unwrap().is_err());
+
+        assert_eq!(tuner.state(), ReaderState::Stopped);
+        assert_eq!(tuner.stop_reason(), StopReason::ReaderFailed);
     }
 
     /// §5: a warm tuner reserves a real slot for as long as it holds the DLL

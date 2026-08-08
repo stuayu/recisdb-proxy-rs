@@ -18,6 +18,7 @@ use recisdb_protocol::{
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
+use crate::tuner::shared::{ReaderState, StopReason};
 use crate::tuner::{ChannelKey, SharedTuner, SlotPermit, TunerPool, TunerSubscription, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
 use crate::tuner::encoder_pool::{
     self, EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
@@ -107,6 +108,10 @@ pub struct Session {
     database: DatabaseHandle,
     /// Currently open tuner.
     current_tuner: Option<Arc<SharedTuner>>,
+    /// Watches `current_tuner`'s reader lifecycle so the run loop learns of
+    /// an eviction or driver failure the moment it happens (P4). Refreshed
+    /// by `finalize_tuner_switch`.
+    reader_state_rx: Option<tokio::sync::watch::Receiver<ReaderState>>,
     /// Warm tuner handle for pre-opened BonDriver.
     warm_tuner: Option<WarmTunerHandle>,
     /// Warm tuner path.
@@ -246,6 +251,7 @@ impl Session {
             tuner_pool,
             database,
             current_tuner: None,
+            reader_state_rx: None,
             warm_tuner: None,
             warm_tuner_path: None,
             current_tuner_path: None,
@@ -698,16 +704,17 @@ impl Session {
             warn!("[Session {}] Failed to insert session history start", self.id);
         }
 
-        // Periodic timer to detect when the tuner reader stops externally
-        // (exclusive eviction, DLL crash, hardware error, etc.).
-        // Without this, broadcast::Receiver::recv() blocks forever when the
-        // reader dies but the SharedTuner Arc is still alive, leaving the
-        // session hanging with no data and no error.
-        let mut reader_alive_check = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(2),
-        );
-        reader_alive_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Detects a tuner reader that stops out from under us: displaced to
+        // free a slot for a higher-priority request, a DLL crash, a hardware
+        // error. Without it, `broadcast::Receiver::recv()` blocks forever
+        // when the reader dies but the `SharedTuner` Arc is still alive,
+        // leaving the session hanging with no data and no error.
+        //
+        // P4: this used to be a 2-second poll of `is_running()`, so a
+        // displaced viewer sat on a dead stream for up to two seconds and
+        // was then dropped with a generic "reader_stopped". Watching the
+        // state channel wakes the session on the transition itself and
+        // carries `StopReason` with it, so the disconnect says *why*.
 
         loop {
             // Process any complete messages in the buffer first
@@ -738,15 +745,36 @@ impl Session {
                         break;
                     }
 
-                    // Periodic check: is the tuner reader still alive?
-                    // This catches cases where another session's exclusive eviction,
-                    // a BonDriver crash, or hardware failure stopped our reader.
-                    _ = reader_alive_check.tick() => {
-                        if let Some(tuner) = &self.current_tuner {
+                    // Our tuner's reader changed state. Anything that is not
+                    // `Running` while we are streaming means the stream is
+                    // over — react immediately rather than on a poll tick.
+                    changed = async {
+                        match self.reader_state_rx.as_mut() {
+                            Some(rx) => rx.changed().await.is_ok(),
+                            None => std::future::pending::<bool>().await,
+                        }
+                    } => {
+                        if !changed {
+                            // Sender dropped: the SharedTuner is gone.
+                            self.reader_state_rx = None;
+                        } else if let Some(tuner) = self.current_tuner.clone() {
                             if !tuner.is_running() {
-                                warn!("[Session {}] Tuner reader for {:?} stopped externally (is_running=false), disconnecting",
-                                      self.id, tuner.key);
-                                self.disconnect_reason = Some("reader_stopped".to_string());
+                                let reason = tuner.stop_reason();
+                                match reason {
+                                    StopReason::Evicted => warn!(
+                                        "[Session {}] Tuner {:?} was displaced to free a slot for a higher-priority request; disconnecting",
+                                        self.id, tuner.key
+                                    ),
+                                    StopReason::ReaderFailed => warn!(
+                                        "[Session {}] Tuner {:?} reader failed (driver or hardware error); disconnecting",
+                                        self.id, tuner.key
+                                    ),
+                                    _ => warn!(
+                                        "[Session {}] Tuner {:?} stopped externally (state={:?}); disconnecting",
+                                        self.id, tuner.key, tuner.state()
+                                    ),
+                                }
+                                self.disconnect_reason = Some(reason.as_str().to_string());
                                 break;
                             }
                         }
@@ -1403,6 +1431,10 @@ impl Session {
 
     async fn finalize_tuner_switch(&mut self, tuner: &Arc<SharedTuner>) {
         tuner.notify_channel_change();
+        // Re-point the reader-state watch at whatever tuner we just settled
+        // on, so the run loop notices *this* reader dying (P4). Every
+        // successful selection funnels through here.
+        self.reader_state_rx = self.current_tuner.as_ref().map(|t| t.subscribe_state());
         self.ts_quality_analyzer.reset();
         self.restart_tsreplace_pipeline_if_streaming().await;
     }

@@ -40,6 +40,8 @@
 //! [`MAX_ACQUIRE_ATTEMPTS`] times before giving up with
 //! [`AcquireError::Conflict`].
 
+use log::{info, warn};
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -47,7 +49,7 @@ use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::pool::TunerPoolError;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
-use crate::tuner::shared::ReaderStartupConfig;
+use crate::tuner::shared::{ReaderStartupConfig, StopReason};
 use crate::tuner::{CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle};
 
 /// A caller's request to have some physical channel tuned in and its
@@ -303,6 +305,20 @@ async fn take_permit_for_path(
 /// nothing left for a caller-side wait-for-slot-release poll loop to do.
 async fn evict_tuner(pool: &Arc<TunerPool>, key: &ChannelKey) {
     let Some(tuner) = pool.get(key).await else { return };
+    // Record *why* before stopping: a session watching this tuner's state
+    // wakes on the transition to `Stopped` and reads the reason to report a
+    // displacement rather than a bare disconnect
+    // (docs/TUNER_PIPELINE_REDESIGN.md §2.1-7 / P4).
+    tuner.set_stop_reason(StopReason::Evicted);
+    if tuner.has_subscribers() {
+        warn!(
+            "[acquire] evicting {:?} with {} live subscriber(s) to free a slot",
+            key,
+            tuner.subscriber_count()
+        );
+    } else {
+        info!("[acquire] evicting idle {:?} to free a slot", key);
+    }
     pool.cancel_idle_close(key).await;
     tuner.stop_reader().await;
     pool.remove(key).await;
@@ -325,7 +341,7 @@ pub(crate) async fn acquire(
     let mut carried_permit = request.carried_permit;
     let mut warm = request.warm;
 
-    for _attempt in 0..MAX_ACQUIRE_ATTEMPTS {
+    for attempt in 0..MAX_ACQUIRE_ATTEMPTS {
         let snap = snapshot(pool, database, &dll_paths).await;
         let tune_req = policy::TuneRequest {
             candidates: request.candidates.clone(),
@@ -335,7 +351,28 @@ pub(crate) async fn acquire(
             own_key_will_free_slot: request.own_key_will_free_slot,
         };
 
-        match policy::decide(&snap, &tune_req) {
+        let decision = policy::decide(&snap, &tune_req);
+
+        // One line per decision, with the inputs that produced it. This is
+        // the trace that used to be impossible to reconstruct: the old
+        // selection helpers logged fragments from eight different places,
+        // none of which knew the whole picture (P4).
+        match &decision {
+            Decision::Reuse { key } => info!(
+                "[acquire] decision=reuse key={:?} attempt={} priority={} exclusive={}",
+                key, attempt + 1, request.priority, request.exclusive
+            ),
+            Decision::Create { key, evict } => info!(
+                "[acquire] decision=create key={:?} evict={:?} attempt={} priority={} exclusive={} candidates={}",
+                key, evict, attempt + 1, request.priority, request.exclusive, request.candidates.len()
+            ),
+            Decision::Reject { reason } => info!(
+                "[acquire] decision=reject reason={:?} attempt={} priority={} exclusive={} candidates={}",
+                reason, attempt + 1, request.priority, request.exclusive, request.candidates.len()
+            ),
+        }
+
+        match decision {
             Decision::Reuse { key } => {
                 // `decide` returning `Reuse` is itself the guarantee that no
                 // permit may be taken here (docs/TUNER_PIPELINE_REDESIGN.md
