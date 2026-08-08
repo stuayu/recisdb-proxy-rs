@@ -15,7 +15,6 @@ use log::debug;
 use crate::tuner::channel_key::ChannelKeySpec;
 
 use crate::server::listener::DatabaseHandle;
-use crate::server::session_channel_candidates::collect_group_channel_candidates;
 use crate::tuner::TunerPool;
 
 pub(super) use crate::tuner::policy::{
@@ -24,29 +23,21 @@ pub(super) use crate::tuner::policy::{
 
 pub(super) struct GroupDriverSelection {
     pub selected_driver: DriverCandidate,
-    pub nid_tsid_channel_keys: Vec<(String, ChannelKeySpec)>,
 }
 
+/// Pick which group driver should serve a logical channel.
+///
+/// `candidate_drivers` is collected by the caller (P2b-2) so the same list
+/// feeds both this heuristic and the `acquire` candidate list — it used to be
+/// queried once here and once again for the fallback chain
+/// (docs/TUNER_PIPELINE_REDESIGN.md §2.2-14).
 pub(super) async fn select_group_driver_for_channel(
     database: &DatabaseHandle,
     tuner_pool: &Arc<TunerPool>,
     session_id: u64,
     group_driver_paths: &[String],
-    entry_nid: u16,
-    entry_tsid: u16,
+    mut candidate_drivers: Vec<DriverCandidate>,
 ) -> Option<GroupDriverSelection> {
-    debug!(
-        "[Session {}] SetChannelSpace: In group mode, searching for NID=0x{:04X} TSID=0x{:04X}",
-        session_id, entry_nid, entry_tsid
-    );
-
-    let mut candidate_drivers = collect_group_channel_candidates(
-        database,
-        session_id,
-        group_driver_paths,
-        entry_nid,
-        entry_tsid,
-    ).await;
     let mut max_instances_map: HashMap<String, i32> = HashMap::new();
     let mut score_map: HashMap<String, f64> = HashMap::new();
     let mut exclusive_map: HashMap<String, i64> = HashMap::new();
@@ -79,19 +70,6 @@ pub(super) async fn select_group_driver_for_channel(
     if candidate_drivers.is_empty() {
         return None;
     }
-
-    let nid_tsid_channel_keys: Vec<(String, ChannelKeySpec)> = candidate_drivers
-        .iter()
-        .map(|(driver_path, space, channel)| {
-            (
-                driver_path.clone(),
-                ChannelKeySpec::SpaceChannel {
-                    space: *space,
-                    channel: *channel,
-                },
-            )
-        })
-        .collect();
 
     let keys = tuner_pool.keys().await;
     let mut instances_map: HashMap<String, i32> = HashMap::new();
@@ -185,8 +163,5 @@ pub(super) async fn select_group_driver_for_channel(
         }
     }
 
-    selected_driver.map(|selected_driver| GroupDriverSelection {
-        selected_driver,
-        nid_tsid_channel_keys,
-    })
+    selected_driver.map(|selected_driver| GroupDriverSelection { selected_driver })
 }

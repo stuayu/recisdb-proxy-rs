@@ -326,6 +326,11 @@ async fn try_acquire(
             candidates: vec![resolved.channel_key.clone()],
             priority: resolved.channel.priority,
             exclusive: false,
+            // HTTP requests are stateless: there is no "the tuner this
+            // caller was already on" to exclude from capacity, and nothing
+            // to hand a permit down from.
+            own_key: None,
+            own_key_will_free_slot: false,
             bondriver_version: HTTP_BONDRIVER_VERSION,
             carried_permit: None,
             warm: None,

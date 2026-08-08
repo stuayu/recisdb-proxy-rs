@@ -532,7 +532,61 @@ P2b に残した (下記)。
     P2b-3 で優先度比較を `>=` から `>` に変える際、この経路も同じ規則に
     従う (同値では退避しない)。
 
-### P2b-2/P2b-3 — セッション経路の配線と eviction ポリシー統一 (残タスク)
+### P2b-2 — SetChannelSpace を acquire へ載せ替え (実装済み)
+
+BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替え、
+そこにぶら下がっていた選局ヘルパ 8 個を削除した。
+
+削除したヘルパと責務の移動先:
+
+| 削除したヘルパ | 移動先 |
+|---|---|
+| `try_reuse_existing_set_channel_space_tuner` | `decide()` の `Reuse` 分岐 |
+| `handle_set_channel_space_exclusive_access` | `decide()` の排他分岐 |
+| `handle_set_channel_space_capacity_limit` | `decide()` の容量分岐 + `acquire` の permit 取得 |
+| `try_fallback_drivers` | `acquire` の候補リスト (`decide` が再ソートして選ぶ) |
+| `try_finish_set_channel_space_via_fallback` | 同上 |
+| `finish_set_channel_space_with_new_tuner` | `acquire` |
+| `try_start_set_channel_space_new_tuner` | `acquire` (起動前の再競合チェックは再試行ループへ) |
+| `finalize_set_channel_space_new_tuner` | `acquire` (起動後の排他再チェックは再試行ループへ) |
+| `finish_set_channel_space_fallback_success` | `finish_set_channel_space_success` に統合 |
+
+`session.rs` は 3613 行 → 3210 行。`session_capacity.rs` からも
+`find_lowest_priority_idle_tuner` / `ensure_driver_capacity_with_idle_eviction` /
+`evict_interlopers_until_capacity` が不要になり削除した。
+
+セッションが組み立てるもの:
+
+- **候補リスト**: 選択したドライバを先頭に、同じ (NID, TSID) を持つグループ
+  兄弟ドライバを続ける。これが旧 `fallback_candidates` チェーンの置き換え。
+  `collect_group_channel_candidates` は**1 回だけ**呼ばれるようになった
+  (従来は選局 1 回につき 2 回。§2.2-14)。
+- **`carried_permit`**: P1b の permit 移譲。`own_key` /
+  `own_key_will_free_slot` と対で `AcquireRequest` に渡す。
+- **`warm`**: セッションの warm ハンドル。`AcquireOutcome::unused_warm` で
+  返ってきたらフィールドへ戻す。
+
+順序について 2 点、意図的に維持したもの:
+
+- **旧チューナーの停止は acquire の前** ―― ただし permit を移譲する場合
+  (同一 DLL かつ自セッションが唯一の購読者) に限る。単一 open のキャラクタ
+  デバイス (px4 系) では、旧リーダーが握ったままの DLL を新リーダーが開こうと
+  すると EALREADY になるため。別 DLL への切り替えでは従来どおり切り替え後に
+  後始末する (失敗時に旧チャンネルへ戻れる)。
+- **合流する場合は旧チューナーに触れない** ―― `acquire` が `Reuse` を返す
+  ケース (候補の中に自分が今使っているチューナーが含まれ、かつ稼働中) では
+  上記の事前停止をスキップする。旧実装で再利用チェックが後始末より前に
+  あったのと同じ理由で、これをやらないと「これから合流するリーダー」を
+  自分で止めてしまう。
+
+`AcquireOutcome::unused_permit` は、旧チューナーがまだ同一 DLL 上で稼働中なら
+そこへ戻す (`return_unused_permit`)。単に drop すると、デバイスが開いたままなのに
+プールがスロットを空きと見なす。
+
+### P2b-2(残) / P2b-3 — v1・論理選局の配線と eviction ポリシー統一 (残タスク)
+
+- `handle_set_channel` (BNDP v1) と `handle_select_logical_channel` /
+  `try_select_logical_channel_candidate` を同様に `acquire()` へ載せ替える。
 
 - `session.rs` から選局系ヘルパ 8 個
   (`try_reuse_existing_set_channel_space_tuner` 等) を削除し、

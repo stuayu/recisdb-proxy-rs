@@ -7,9 +7,9 @@
 //! comes back: joining an existing reader, evicting incumbents and starting
 //! a new one, or rejecting. This is the only place besides `decide` itself
 //! that is allowed to reason about "which tuner/channel do we open" — every
-//! call site (today: `server::channel_resolve::start_tuner_for_service`;
-//! `server::session.rs`'s eight selection helpers move here in P2b-2) is
-//! expected to become a thin translation from its own inputs to
+//! call site (`server::channel_resolve::start_tuner_for_service` and
+//! `server::session.rs`'s `SetChannelSpace`, whose eight selection helpers
+//! this replaced in P2b-2) is a thin translation from its own inputs to
 //! [`AcquireRequest`] and back from [`AcquireOutcome`]/[`AcquireError`] to
 //! its own error type.
 //!
@@ -56,12 +56,8 @@ use crate::tuner::{CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, Tuner
 /// resources the caller already holds that could satisfy it without going
 /// back to the pool.
 ///
-/// Deliberately does not carry `own_key`/`own_key_will_free_slot`
-/// (`policy::TuneRequest` fields used by the same-session channel-switch
-/// case) yet — no caller wired through `acquire` in this phase (P2b-1, the
-/// HTTP/Mirakurun path only) ever already holds a tuner of its own. P2b-2
-/// (`session.rs`'s wiring) is expected to add them here once a caller that
-/// does exists.
+/// Stateless callers (the HTTP/Mirakurun path) leave `carried_permit`,
+/// `warm` and `own_key` empty; a session switching channels fills all three.
 pub(crate) struct AcquireRequest {
     /// Physical candidates, unordered — `decide` re-sorts them.
     pub candidates: Vec<ChannelKey>,
@@ -77,6 +73,19 @@ pub(crate) struct AcquireRequest {
     /// way (only if its `path()` matches the winning `Create` key's DLL).
     /// Returned unconsumed via [`AcquireOutcome::unused_warm`] otherwise.
     pub warm: Option<WarmTunerHandle>,
+    /// The tuner this caller is currently on, if it is switching away from
+    /// one, and whether that switch will actually free the slot (this caller
+    /// is its only subscriber).
+    ///
+    /// Both are needed even though P1b made slot permits the real capacity
+    /// gate: enforcement is the permit, but the choice between `Create` and
+    /// `Reject` is `decide`'s, and `decide` reasons off the snapshot's
+    /// *counts*. Without excluding the caller's own about-to-be-vacated
+    /// entry, a switch on a `max_instances = 1` driver is rejected before
+    /// `carried_permit` — the very permit that makes the switch possible —
+    /// ever gets a chance to be used.
+    pub own_key: Option<ChannelKey>,
+    pub own_key_will_free_slot: bool,
 }
 
 /// What `acquire` did and handed back.
@@ -322,8 +331,8 @@ pub(crate) async fn acquire(
             candidates: request.candidates.clone(),
             priority: request.priority,
             exclusive: request.exclusive,
-            own_key: None,
-            own_key_will_free_slot: false,
+            own_key: request.own_key.clone(),
+            own_key_will_free_slot: request.own_key_will_free_slot,
         };
 
         match policy::decide(&snap, &tune_req) {
@@ -499,6 +508,8 @@ mod tests {
             bondriver_version: 2,
             carried_permit: None,
             warm: None,
+            own_key: None,
+            own_key_will_free_slot: false,
         }
     }
 
