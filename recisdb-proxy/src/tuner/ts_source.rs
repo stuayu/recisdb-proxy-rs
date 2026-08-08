@@ -91,6 +91,71 @@ pub(crate) struct FakeTsSource {
     /// If set, `set_channel` panics instead of returning — exercises the
     /// same `catch_unwind` path a corrupted BonDriver DLL would hit.
     panic_on_set_channel: bool,
+    /// If set, `get_ts_stream` blocks (polling every 5 ms) until the gate is
+    /// released — simulates a hung DLL call that never respects the reader
+    /// loop's stop-flag poll cadence, so tests can force `stop_reader()`'s
+    /// own join timeout to actually fire (docs/TUNER_PIPELINE_REDESIGN.md
+    /// P2a item 5).
+    get_ts_stream_gate: Option<BlockingGate>,
+}
+
+/// Two-way rendezvous a test uses to know a fake `get_ts_stream` call has
+/// actually started blocking before the test acts on that assumption (e.g.
+/// calling `stop_reader()` and asserting it times out).
+///
+/// A test-controlled gate rather than a fixed sleep duration on either side:
+/// without `wait_until_entered`, a test that simply "sleeps a bit, then
+/// calls `stop_reader()`" races the reader loop's own setup work (buffer
+/// allocation, collector construction, an `Initial signal level` log call)
+/// between transitioning to `Running` and reaching its first `get_ts_stream`
+/// call — if `stop_reader()` sets `Stopping` before the loop's first
+/// stop-flag check, the reader exits immediately without ever calling
+/// `get_ts_stream` at all, which is *correct* fast-stop behavior but defeats
+/// a test that specifically wants to exercise "the reader is stuck inside a
+/// blocking call and ignores the stop flag". This was caught as a genuinely
+/// flaky (not just occasionally-slow) test during review — occurring on
+/// roughly 1 in 4-5 runs even single-threaded.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct BlockingGate {
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl BlockingGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            release: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Block (polling every 5 ms) until [`Self::release`] is called. Called
+    /// from the fake reader's blocking thread; marks `entered` on the way
+    /// in so a test's `wait_until_entered` can observe it.
+    fn block_until_released(&self) {
+        self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Await (polling every 5 ms via `tokio::time::sleep`, so this does not
+    /// block the calling task's runtime thread) until the fake reader has
+    /// actually entered [`Self::block_until_released`]. Call this before
+    /// assuming the reader is stuck and acting on that (e.g. calling
+    /// `stop_reader()`).
+    pub(crate) async fn wait_until_entered(&self) {
+        while !self.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Let a blocked `get_ts_stream` call return.
+    pub(crate) fn release(&self) {
+        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +167,20 @@ impl FakeTsSource {
             chunks: std::sync::Mutex::new(std::collections::VecDeque::new()),
             signal_level: 0.0,
             panic_on_set_channel: false,
+            get_ts_stream_gate: None,
         }
+    }
+
+    /// Make `get_ts_stream` block on `gate` until released, simulating a DLL
+    /// call that never returns in time for `stop_reader()`'s own timeout —
+    /// so the "existing reader must actually stop before a restart
+    /// proceeds" path (docs/TUNER_PIPELINE_REDESIGN.md §2.1-3) can be
+    /// exercised deterministically. See [`BlockingGate`]'s doc comment for
+    /// why a test must call `gate.wait_until_entered()` before assuming the
+    /// reader is actually stuck.
+    pub(crate) fn with_get_ts_stream_gate(mut self, gate: BlockingGate) -> Self {
+        self.get_ts_stream_gate = Some(gate);
+        self
     }
 
     /// Make `set_channel` panic instead of returning.
@@ -159,6 +237,9 @@ impl TsSource for FakeTsSource {
     }
 
     fn get_ts_stream(&self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
+        if let Some(gate) = &self.get_ts_stream_gate {
+            gate.block_until_released();
+        }
         let mut chunks = self.chunks.lock().unwrap();
         match chunks.pop_front() {
             Some(chunk) => {

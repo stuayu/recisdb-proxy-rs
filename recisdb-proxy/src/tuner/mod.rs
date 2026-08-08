@@ -10,6 +10,7 @@ pub mod lock;
 pub mod policy;
 pub mod pool;
 pub mod shared;
+pub(crate) mod timing;
 pub(crate) mod ts_source;
 pub mod ts_parser;
 pub mod ts_analyzer;

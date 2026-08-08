@@ -287,25 +287,127 @@ pub enum Decision {
 - 検証: `cargo test -p recisdb-proxy`。フェイク reader を使った競合テスト
   (生成中 evict / idle-close と subscribe の競合 / 容量超過の同時要求) を追加。
 
-### P2 — 選局経路の一本化
+### P2a — リーダー起動経路の一本化 (実装済み)
+
+P2 のうち「リーダー起動経路」のみを対象にした最初の区切り。選局ポリシー
+(退避・優先度・排他・フォールバック) と `tuner/acquire.rs` の抽出は
+P2b に残した (下記)。
+
+- **孤児リーダーの根絶 (§2.1-1)**: 両側から塞いだ。
+  - 待ち側: ready 待ちのタイムアウトを固定 10 秒ではなく
+    `tuner/timing.rs::reader_ready_timeout(set_channel_retry_timeout_ms)`
+    (`= set_channel_retry_timeout_ms + READY_TIMEOUT_MARGIN_MS(5000)`) から
+    算出するようにした。SetChannel 再試行の予算より必ず長くなる。cold open
+    (`SharedTuner::start_reader_cold`) と warm 活性化
+    (`WarmTunerHandle::activate`) の両方がこの一つの関数を使う。
+  - リーダー側: `run_bondriver_reader_with_tuner` の成功パスで
+    `ready_tx.send(Ok(()))` の**戻り値を見る**ようにした。送信に失敗した
+    (= 受信側がタイムアウトして消えた) 場合は読み取りループへ入らず
+    その場で `stop_and_release_slot()` して終了する。失敗パスは元々
+    `stop_and_release_slot()` を送信より先に呼んでいたため対称になっていた
+    が、成功パスだけこの確認が抜けていたのが本丸だった。
+- **リーダー起動 API の一本化**: `SharedTuner::start_reader(tuner_pool,
+  tuner_path, space, channel, startup_config, permit, warm: Option<WarmTunerHandle>)
+  -> io::Result<()>` を新設し、cold/warm の分岐をこの関数の内部
+  (`start_reader_cold` / `start_reader_warm` という非公開メソッド) に閉じ込めた。
+  旧 `SharedTuner::start_bondriver_reader` (pub) と `WarmTunerHandle::activate` (pub)
+  は前者は削除、後者は `pub(crate)` に降格し、どちらも `start_reader` からのみ
+  呼ばれる。`session.rs::start_reader_with_warm` はセッション固有の
+  warm ハンドル持ち回り (`self.warm_tuner`/`warm_tuner_path`) だけを残した
+  薄いラッパになった。`channel_resolve::start_tuner_for_service` は
+  `warm: None` で同じ `start_reader` を呼ぶ (HTTP 経路には warm ハンドルが
+  存在しないため)。
+  - 失敗時の後始末を 1 箇所に集約: `activate()` の途中失敗
+    (`ensure_ready()` 失敗 / コマンド送信失敗 / 応答チャネルが理由不明に
+    閉じた) は、それまで `SharedTuner::stop_and_release_slot()` を呼ばずに
+    permit を握ったままにしていたリークがあったので、`activate()` 自身が
+    releaseするよう修正した (`ready` 待ちタイムアウトの一系統だけは、まだ
+    SetChannel 中かもしれないリーダー側の送信失敗に委ねるため意図的に
+    release しない — cold open と同じ理屈)。
+  - warm 起動スレッド (`WarmTunerHandle::spawn`) のトップレベル
+    `catch_unwind` も、`WarmCommand::Start` 実行中の panic では permit を
+    解放していなかった (cold open 側の同等ハンドラは元から解放していた)。
+    `started_shared` に実行対象を控えておき、panic 時に解放するよう揃えた。
+  - **warm 失敗時の cold フォールバックは維持する。** 旧 `session.rs` は
+    warm 活性化に失敗すると permit を回収して cold open へ切り替えていた。
+    これを落とすと、`prewarm_timeout_secs` (既定 30 秒) が切れて warm
+    スレッドが終了した後の選局 — クライアントがチャンネル一覧を眺めてから
+    選局するという日常的な操作 — が、cold で開けば済むのに失敗する。
+    フォールバックの可否は「warm スレッドがもう DLL を掴んでいないか」で
+    決まるため、`WarmTunerHandle::activate` は次のように区別する:
+    - `ErrorKind::NotConnected` … warm スレッドは既に終了 (open 失敗、または
+      コマンド待ちタイムアウトで終了)。DLL は解放済みなので、**permit を
+      `SharedTuner` に残したまま**返す。`start_reader_warm` はこのエラー種別
+      のときだけ、同じスロットで cold open に切り替える。
+    - ready 待ちタイムアウト … warm スレッドがまだ SetChannel 中で DLL を
+      掴んでいる可能性があるため、cold で開くと二重オープンになる。permit は
+      残すが (リーダー側が自分で解放する)、フォールバックはしない。
+    - それ以外 … 既に `run_bondriver_reader_with_tuner` が走っており、
+      その内部の失敗経路が permit を解放済み。
+- **DLL init ロックの内部化**: `tuner_pool.acquire_dll_init_lock()` の取得を
+  `start_reader` の内部に移し、`session.rs`/`channel_resolve.rs` の呼び出し元
+  からは撤去した (取り忘れが構造的に起きなくなった)。`stop_reader()` 側は
+  引き続きこのロックを取らない — P1b のスロット permit により旧リーダーが
+  `Stopped` になるまで permit が解放されないため、新しいオープンが旧ハンドルと
+  重なることはもう起きないという判断はそのまま踏襲した。
+- **再起動待ちの是正 (§2.1-3)**: `start_reader` の冒頭、`self` に既存の
+  reader (Starting/Running/Stopping) がある場合は新設の
+  `stop_existing_reader_before_restart()` で `stop_reader()` を確実に待ち、
+  戻り値 (`bool`) が `false` (タイムアウト) ならエラーを返して新規オープンに
+  進まない。旧実装の「500ms 待って諦めて続行」は撤去した。`stop_reader()` 自体
+  も `bool` を返すよう変更 (`true`=確認できた停止、`false`=タイムアウト) —
+  既存の呼び出し元は戻り値を無視するだけで済むため後方互換。
+- **時定数の集約 (`tuner/timing.rs`)**:
+
+  | 定数 | 値 | 根拠 |
+  |---|---|---|
+  | `SET_CHANNEL_STABILIZATION_SLEEP_MS` | 500ms | SetChannel 直後、新規ドライバのバッファに何か溜まるまでの安定化待ち |
+  | `STOP_READER_TIMEOUT_MS` | 1000ms | `stop_reader()` の handle ロック取得・join の各タイムアウト。読み取りループの stop チェック間隔 (100ms) の約5倍のマージン |
+  | `WAIT_TS_STREAM_POLL_MS` | 100ms | 読み取りループの `wait_ts_stream` ポーリング間隔 |
+  | `WAIT_FIRST_DATA_POLL_MS` | 50ms | `wait_first_data` のポーリング間隔 |
+  | `EALREADY_RETRY_SLEEP_MS` | 300ms | `channel_resolve` の EALREADY 再試行前、evict した idle リーダーの fd が実際に閉じるまでの猶予 |
+  | `READY_TIMEOUT_MARGIN_MS` | 5000ms | ready 待ちタイムアウト = `set_channel_retry_timeout_ms + この値`。BonDriver オープン自体 (再試行ループの外側) の所要時間とスケジューリング余裕を見込む |
+
+  **DB (`tuner_config` テーブル) には追加しなかった**: これらはユーザーが
+  デバイス/ネットワークの事情に応じて調整する `set_channel_retry_timeout_ms`
+  等とは性質が異なり、(a) 読み取りループ自身のポーリング間隔から導出される
+  内部マージン、または (b) プロトコル上決め打ちでよい固定値であり、
+  「触る理由がある値」ではない。DB 化すると `TunerPoolConfig` へのフィールド
+  追加 → マイグレーション → ダッシュボード改修まで波及するが、それに見合う
+  運用上の必要性がない。
+
+- 追加したテスト (`tuner/shared.rs`, `tuner/timing.rs`, `tuner/ts_source.rs`):
+  - `tuner::timing::tests::reader_ready_timeout_*`: ready タイムアウトが
+    常に `set_channel_retry_timeout_ms` を上回ることの単体テスト。
+  - `tuner::shared::tests::ready_send_failure_after_success_releases_slot_without_entering_read_loop`:
+    §2.1-1 の核心 — 呼び出し元が ready を待たずに消えた場合、読み取り
+    ループへ入らず permit が解放されることを確認 (`FakeTsSource` + 実際の
+    `TunerPool::acquire_slot`)。
+  - `tuner::shared::tests::stop_existing_reader_before_restart_waits_for_a_healthy_reader` /
+    `..._errors_if_reader_does_not_stop_in_time`: §2.1-3 —
+    健全なリーダーは確実に停止してから restart 扱いになること、
+    詰まったリーダー (`FakeTsSource::with_get_ts_stream_gate` で
+    `stop_reader()` のタイムアウトを決定的に発火させる) はエラーになる
+    ことを確認。
+  - 既存の P1a/P1b テストは全て green (計 338 件、macOS 既知の setup_gui
+    1 件のみ ignore)。
+  - **テスト不能な範囲**: `start_reader_cold` の `BonDriverTuner::new(...)`
+    (実 FFI) 経路と `WarmTunerHandle::spawn` の同経路は実機 DLL が無いと
+    到達できない。cold/warm 起動 API 自体の「open 失敗時に Stopped +
+    permit 解放」は、両者が最終的に共有する
+    `run_bondriver_reader_with_tuner`/`stop_and_release_slot` のレベルでは
+    既存テストが検証しているが、`BonDriverTuner::new` 自体の失敗パスは
+    実機確認が必要。手動検証: 実在しない DLL パスを指定してチャンネル
+    切り替えを行い、(1) エラーが返る、(2) 同じ DLL パスへの後続リクエストが
+    ブロックされず成功する (permit が残っていないこと) を確認する。
+
+### P2b — 選局経路の一本化 (残タスク)
 
 - 新規 `recisdb-proxy/src/tuner/acquire.rs` に唯一の executor を置く。
-  4 経路すべてがここを通る。`channel_resolve::start_tuner_for_service` も
-  薄いラッパにする。
-- `session.rs` から選局系ヘルパ 8 個を削除。`Session` は要求の組み立てと
-  `apply_channel_metadata` 相当の後処理のみ持つ。
-- **DLL init ロックの適用範囲を拡大**: 取得を `start_bondriver_reader` 内部へ
-  移し、stop / evict も同じロックを取る (§2.1-3)。
-- **リーダー起動 API の一本化**: cold / warm を単一の
-  `start_reader(target, warm: Option<WarmTunerHandle>)` に統合し、失敗時の
-  後始末を 1 箇所にする。
-- **タイムアウトの整合**: ready 待ちを
-  `set_channel_retry_timeout_ms + マージン` から算出する。加えて blocking 側は
-  ready 送信に失敗した (= 受信側が消えた) 場合、リーダーループへ入らず即座に
-  終了する (§2.1-1)。
-- ハードコード時定数 (安定化 sleep 500ms / stop タイムアウト 1s /
-  EALREADY 再試行 300ms / `wait_first_data` の 50ms ポーリング) を
-  `TunerPoolConfig` に集約し、`recisdb-proxy.toml.example` に追記する。
+  4 経路 (BNDP v1/v2/論理チャンネル/HTTP) すべてがここを通る。
+- `session.rs` から選局系ヘルパ 8 個
+  (`try_reuse_existing_set_channel_space_tuner` 等) を削除。`Session` は
+  要求の組み立てと `apply_channel_metadata` 相当の後処理のみ持つ。
 - **eviction ポリシーの統一** (§2.1-8): 「idle を優先、購読者ありの退避は
   `exclusive` かつ要求優先度が厳密に上回る場合のみ」に一本化し、優先度比較を
   `>` にする。

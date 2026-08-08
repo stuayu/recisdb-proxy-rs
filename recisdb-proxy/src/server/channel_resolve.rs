@@ -29,7 +29,7 @@
 //! resolution: `channels.id` → that channel's own driver/space/channel,
 //! then the exact same `TunerPool`/`SharedTuner` calls session.rs's
 //! single-tuner-mode branch uses (`get_or_create` with a no-op factory,
-//! followed by `SharedTuner::start_bondriver_reader` if not already
+//! followed by `SharedTuner::start_reader` if not already
 //! running). No fallback-driver search, no exclusive-priority preemption of
 //! *other sessions'* actively-subscribed readers — an HTTP preview/stream
 //! request never competes for a DLL slot against another *session's live
@@ -50,7 +50,7 @@
 //! idle (`is_running() && !has_subscribers()`) readers on the same
 //! `dll_path` before opening — via `TunerPool::evict_idle_on_path` — first
 //! proactively when the driver is at/over `max_instances` capacity, and
-//! then reactively (as a last-resort retry) if `start_bondriver_reader`
+//! then reactively (as a last-resort retry) if `start_reader`
 //! still fails with `EALREADY`. This only ever touches readers with zero
 //! current subscribers; a reader another session/request is actively
 //! viewing is never stopped by this path — that distinction is what keeps
@@ -66,6 +66,7 @@ use crate::server::session_capacity::count_running_instances_on_driver;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::pool::TunerPoolError;
 use crate::tuner::shared::ReaderStartupConfig;
+use crate::tuner::timing;
 use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
 
 /// `bondriver_version` passed to `TunerPool::get_or_create`. HTTP streaming
@@ -193,7 +194,7 @@ fn resolve_channel_record(
     })
 }
 
-/// Detect `EALREADY` from `start_bondriver_reader`, which does NOT preserve
+/// Detect `EALREADY` from `start_reader`, which does NOT preserve
 /// `raw_os_error`: the blocking open thread stringifies the original
 /// `io::Error` into the `ready_tx` channel and the awaiting side rebuilds it
 /// as `io::Error::new(kind, String)` (see `tuner/shared.rs`), so only the
@@ -211,7 +212,7 @@ fn is_ealready(e: &std::io::Error) -> bool {
 /// Does not take a `Database` lock (all inputs are already resolved) so a
 /// caller need not hold the DB mutex across the (potentially several-second)
 /// BonDriver open — mirrors how `session.rs` only holds the DB lock for
-/// quick lookups and never across `start_bondriver_reader`.
+/// quick lookups and never across `start_reader`.
 ///
 /// Does not increment `resolved`'s subscriber count — callers must call
 /// `tuner.subscribe()` themselves once they decide to hold a live
@@ -275,7 +276,7 @@ pub async fn start_tuner_for_service(
 
         // No-op factory: mirrors every `get_or_create` call site in session.rs
         // (e.g. `try_fallback_drivers`) — the actual BonDriver open happens via
-        // `start_bondriver_reader` below, not inside the pool's factory closure.
+        // `start_reader` below, not inside the pool's factory closure.
         tuner_pool
             .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit, || async { Ok(()) })
             .await?
@@ -288,89 +289,92 @@ pub async fn start_tuner_for_service(
         let pool_config = tuner_pool.config().await;
         let startup_config = ReaderStartupConfig::from(&pool_config);
 
-        // Serializes CreateBonDriver+OpenTuner+SetChannel against any other
-        // task (session or HTTP) opening the same DLL path concurrently —
-        // same lock session.rs's `start_reader_with_warm` takes.
-        let _dll_guard = tuner_pool.acquire_dll_init_lock(&resolved.dll_path).await;
+        let (space, channel) = match key.channel {
+            ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
+            ChannelKeySpec::Simple(c) => (0, c as u32),
+        };
 
-        // Re-check after acquiring the lock: another task may have started
-        // the reader for this exact key while we awaited the guard.
-        if tuner.needs_reader_start() {
-            let (space, channel) = match key.channel {
-                ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
-                ChannelKeySpec::Simple(c) => (0, c as u32),
-            };
-
-            let Some(start_permit) = tuner.take_slot_permit() else {
-                error!(
-                    "[HTTP stream] {:?} needs a reader start but holds no slot permit (service id={})",
-                    key, resolved.channel.id
-                );
-                if tuner.is_orphanable() {
-                    tuner_pool.remove(&key).await;
-                }
-                return Err(ChannelResolveError::Pool(TunerPoolError::OpenFailed(
-                    "missing slot permit".to_string(),
-                )));
-            };
-
-            info!(
-                "[HTTP stream] starting BonDriver reader for {:?} (service id={})",
+        let Some(start_permit) = tuner.take_slot_permit() else {
+            error!(
+                "[HTTP stream] {:?} needs a reader start but holds no slot permit (service id={})",
                 key, resolved.channel.id
             );
-            let start_result = tuner
-                .start_bondriver_reader(resolved.dll_path.clone(), space, channel, startup_config, start_permit)
-                .await;
-
-            match start_result {
-                Ok(()) => {}
-                #[cfg(unix)]
-                Err(e) if is_ealready(&e) => {
-                    // Last-resort insurance: the capacity check above is
-                    // keyed off `max_instances`, which is a *configured*
-                    // slot count independent of the physical
-                    // single-open-per-device-path constraint some Unix
-                    // character-device BonDrivers enforce (see module doc
-                    // comment). If the driver open still raced against an
-                    // idle reader that hadn't been counted as "at capacity"
-                    // (e.g. max_instances > 1 but the device itself only
-                    // tolerates one open), evict any idle reader on this
-                    // path unconditionally and retry once.
-                    //
-                    // The failed `start_bondriver_reader` above already
-                    // released `tuner`'s slot permit (`SharedTuner::stop_and_release_slot`
-                    // runs on every failure path), so a retry needs a fresh one.
-                    warn!(
-                        "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
-                         evicting idle readers on {} and retrying once",
-                        key, resolved.channel.id, resolved.dll_path
-                    );
-                    tuner_pool
-                        .evict_idle_on_path(&resolved.dll_path, Some(&key))
-                        .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    let Some(retry_permit) = tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await else {
-                        if tuner.is_orphanable() {
-                            tuner_pool.remove(&key).await;
-                        }
-                        return Err(ChannelResolveError::Busy {
-                            id: resolved.channel.id,
-                            running: resolved.max_instances,
-                            max: resolved.max_instances,
-                        });
-                    };
-                    tuner
-                        .start_bondriver_reader(
-                            resolved.dll_path.clone(),
-                            space,
-                            channel,
-                            startup_config,
-                            retry_permit,
-                        )
-                        .await?;
-                }
-                Err(e) => return Err(e.into()),
+            if tuner.is_orphanable() {
+                tuner_pool.remove(&key).await;
             }
+            return Err(ChannelResolveError::Pool(TunerPoolError::OpenFailed(
+                "missing slot permit".to_string(),
+            )));
+        };
+
+        info!(
+            "[HTTP stream] starting BonDriver reader for {:?} (service id={})",
+            key, resolved.channel.id
+        );
+        // `start_reader` re-checks `needs_reader_start()`-equivalent state
+        // internally (it only ever stops an existing reader on *this same*
+        // `SharedTuner`, which cannot have gone from `Reserved`/`Stopped` to
+        // `Starting`/`Running` without going through this same call path) —
+        // no separate re-check under the DLL lock is needed here anymore,
+        // since `start_reader` itself now acquires that lock
+        // (docs/TUNER_PIPELINE_REDESIGN.md P2a item 3) before doing anything
+        // else, closing the window a caller-side re-check used to cover.
+        // No warm handle is available on the HTTP path (unlike session.rs),
+        // so this is always a cold open.
+        let start_result = tuner
+            .start_reader(tuner_pool, resolved.dll_path.clone(), space, channel, startup_config, start_permit, None)
+            .await;
+
+        match start_result {
+            Ok(()) => {}
+            #[cfg(unix)]
+            Err(e) if is_ealready(&e) => {
+                // Last-resort insurance: the capacity check above is
+                // keyed off `max_instances`, which is a *configured*
+                // slot count independent of the physical
+                // single-open-per-device-path constraint some Unix
+                // character-device BonDrivers enforce (see module doc
+                // comment). If the driver open still raced against an
+                // idle reader that hadn't been counted as "at capacity"
+                // (e.g. max_instances > 1 but the device itself only
+                // tolerates one open), evict any idle reader on this
+                // path unconditionally and retry once.
+                //
+                // The failed `start_reader` above already released
+                // `tuner`'s slot permit (`SharedTuner::stop_and_release_slot`
+                // runs on every failure path), so a retry needs a fresh one.
+                warn!(
+                    "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
+                     evicting idle readers on {} and retrying once",
+                    key, resolved.channel.id, resolved.dll_path
+                );
+                tuner_pool
+                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(timing::EALREADY_RETRY_SLEEP_MS)).await;
+                let Some(retry_permit) = tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await else {
+                    if tuner.is_orphanable() {
+                        tuner_pool.remove(&key).await;
+                    }
+                    return Err(ChannelResolveError::Busy {
+                        id: resolved.channel.id,
+                        running: resolved.max_instances,
+                        max: resolved.max_instances,
+                    });
+                };
+                tuner
+                    .start_reader(
+                        tuner_pool,
+                        resolved.dll_path.clone(),
+                        space,
+                        channel,
+                        startup_config,
+                        retry_permit,
+                        None,
+                    )
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -468,7 +472,7 @@ mod tests {
         assert!(matches!(err, ChannelResolveError::Disabled(_)));
     }
 
-    /// `start_bondriver_reader` loses `raw_os_error` (the open error is
+    /// `start_reader` loses `raw_os_error` (the open error is
     /// stringified through the ready channel — see `is_ealready`'s doc), so
     /// the retry guard must match the stringified form too.
     #[cfg(unix)]
@@ -497,7 +501,7 @@ mod tests {
         // We can't actually open a BonDriver DLL in this test environment, so
         // exercise only the pool bookkeeping half: get_or_create with the
         // same no-op factory `start_tuner_for_service` uses, without calling
-        // the function itself (which would try `start_bondriver_reader` and
+        // the function itself (which would try `start_reader` and
         // fail/timeout waiting on a real DLL).
         let key = resolved.channel_key.clone();
         let permit_a = pool

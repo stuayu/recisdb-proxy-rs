@@ -153,6 +153,18 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - **prewarm**: OpenTuner 時に DLL 未使用ならウォームチューナーを起動して初回選局を高速化。
 - **選局シーケンス (Round 3 確定仕様)**: `SetChannel → Purge → 短い sleep → ACK 送信 → (シグナルはログのみ)`。
   シグナルロック待ちで ACK を遅らせてはならない。停止応答は `wait_ts_stream(100ms)`、stop_reader タイムアウト 1s。
+  これらの時定数は `tuner/timing.rs` に集約 (docs/TUNER_PIPELINE_REDESIGN.md P2a)。
+- **リーダー起動 API**: cold open (新規 BonDriver オープン) と warm 起動 (prewarm 済みハンドルの
+  活性化) は `SharedTuner::start_reader(tuner_pool, tuner_path, space, channel, startup_config,
+  permit, warm: Option<WarmTunerHandle>)` に一本化 (docs/TUNER_PIPELINE_REDESIGN.md P2a)。
+  DLL 初期化ロックの取得・既存リーダー停止の確認・スロット permit の格納は全てこの関数内で完結し、
+  呼び出し元 (`session.rs` / `channel_resolve.rs`) はここを呼ぶだけでよい。
+  ready 待ちのタイムアウトは `set_channel_retry_timeout_ms + 5000ms` (`tuner/timing.rs` の
+  `reader_ready_timeout`) から算出し、SetChannel 再試行の予算より必ず長くする —
+  ready 側が先にタイムアウトして立ち去ると、後から SetChannel に成功したリーダーが
+  誰にも参照されないまま DLL スロットを占有し続ける (孤児リーダー) ため。
+  リーダー側も `ready_tx.send()` の戻り値を見て、送信失敗 (= 呼び出し元が待ちをあきらめた) なら
+  読み取りループへ入らずその場でスロットを解放して終了する。
 
 ### 4.4 優先度・排他・容量制御
 

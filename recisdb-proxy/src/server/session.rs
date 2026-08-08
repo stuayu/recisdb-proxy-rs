@@ -760,6 +760,12 @@ impl Session {
     /// `tuner_path` — see `acquire_slot_preferring_warm`/
     /// `SharedTuner::take_slot_permit`), preferring an already-open warm
     /// BonDriver on the same path over a fresh cold open.
+    ///
+    /// Thin wrapper around `SharedTuner::start_reader`
+    /// (docs/TUNER_PIPELINE_REDESIGN.md P2a item 2) — this session's own
+    /// `warm_tuner`/`warm_tuner_path` bookkeeping is the only thing left
+    /// here; the DLL-init-lock acquisition, permit storage, and cold/warm
+    /// dispatch all moved into `start_reader` itself.
     async fn start_reader_with_warm(
         &mut self,
         tuner: Arc<SharedTuner>,
@@ -771,68 +777,21 @@ impl Session {
         let config = self.tuner_pool.config().await;
         let startup_config = crate::tuner::shared::ReaderStartupConfig::from(&config);
 
-        // ★ Acquire per-DLL initialization lock.
-        // Many BonDriver DLLs use global/static state (singleton IBonDriver*)
-        // inside CreateBonDriver().  Concurrent LoadLibrary + CreateBonDriver +
-        // OpenTuner + SetChannel from two spawn_blocking threads can corrupt
-        // that state, causing the second instance to "steal" the first one's
-        // channel.  Serializing the init phase per DLL path prevents this.
-        // The guard is held until the reader signals ready (channel set, TS
-        // data flowing), then dropped — the reader loop runs without it.
-        let _dll_guard = self.tuner_pool.acquire_dll_init_lock(&tuner_path).await;
-
-        if !config.prewarm_enabled {
-            self.stop_warm_tuner().await;
-            return tuner
-                .start_bondriver_reader(tuner_path, space, channel, startup_config, permit)
-                .await;
-        }
-
-        if let Some(mut warm) = self.warm_tuner.take() {
-            if self.warm_tuner_path.as_deref() == Some(tuner_path.as_str()) {
-                match warm
-                    .activate(
-                        Arc::clone(&tuner),
-                        tuner_path.clone(),
-                        space,
-                        channel,
-                        startup_config,
-                        permit,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.warm_tuner_path = None;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("[Session {}] Warm tuner activation failed: {}", self.id, e);
-                        warm.shutdown().await;
-                        self.warm_tuner_path = None;
-                        // `activate` stores its permit argument onto `tuner`
-                        // before attempting anything fallible (see that
-                        // method's doc comment), so it is recoverable here
-                        // for the cold-start fallback below even though the
-                        // local `permit` binding was moved into `activate`.
-                        let Some(recovered) = tuner.take_slot_permit() else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "warm activation failed and its slot permit was lost",
-                            ));
-                        };
-                        return tuner
-                            .start_bondriver_reader(tuner_path, space, channel, startup_config, recovered)
-                            .await;
-                    }
-                }
-            } else {
-                warm.shutdown().await;
-                self.warm_tuner_path = None;
-            }
-        }
+        // Only hand off a warm handle that's actually on this exact path and
+        // that prewarming is still enabled for; any other warm handle this
+        // session happens to be holding is stale for this request and must
+        // still be shut down (releasing its own slot permit) rather than
+        // left to linger.
+        let warm = if config.prewarm_enabled && self.warm_tuner_path.as_deref() == Some(tuner_path.as_str()) {
+            self.warm_tuner_path = None;
+            self.warm_tuner.take()
+        } else {
+            None
+        };
+        self.stop_warm_tuner().await;
 
         tuner
-            .start_bondriver_reader(tuner_path, space, channel, startup_config, permit)
+            .start_reader(&self.tuner_pool, tuner_path, space, channel, startup_config, permit, warm)
             .await
     }
 
