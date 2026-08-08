@@ -320,6 +320,10 @@ async fn run_server(
             db_guard.get_card_reader_name().unwrap_or_default()
         };
         recisdb_proxy::apply_card_reader_selection(&name);
+        // B25デコーダが使えるかを裏で判定しておく。最初の視聴要求のときに
+        // 初めて調べると、応答しないカードリーダー相手では選局が
+        // タイムアウトして視聴自体できなくなる。
+        recisdb_proxy::tuner::shared::probe_b25_availability();
     }
 
     // Web API authentication (REVIEW_2026-07.md S2). Resolution order:

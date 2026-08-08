@@ -151,6 +151,110 @@ pub(crate) const BROADCAST_CAPACITY: usize = 4096;
 /// data in larger chunks than standard 64KB.
 const TS_CHUNK_SIZE: usize = 262144; // 256KB buffer
 
+/// B25 デコーダの初期化を待つ上限。
+///
+/// libaribb25 の初期化は、見つかったカードリーダーへ順に接続を試みる。
+/// 応答しないカード / 相性の悪いリーダーが挿さっていると、この中の
+/// `SCardTransmit` が1台あたり5秒ほどかけて失敗する (macOS 実機で計測)。
+/// リーダー起動全体のタイムアウトは15秒しかないため、そのまま待つと
+/// **スクランブル解除ができないどころか、生TSの配信すら開始できずに
+/// 503 になる**。カードが無い/使えないことは「復号できない」で済むべきで、
+/// 「視聴できない」に格上げしてはいけない。
+const B25_INIT_BUDGET: Duration = Duration::from_secs(3);
+
+/// B25 デコーダが使えるかどうかの判定結果。
+///
+/// `None` = まだ調べていない。判定は [`probe_b25_availability`] が別スレッドで
+/// 行い、ここに書き戻す。
+static B25_AVAILABLE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// B25 デコーダが使えるかを別スレッドで調べ、結果を [`B25_AVAILABLE`] に残す。
+///
+/// `B25Pipe` は `Send` ではない (中に生ポインタを持つ) ので、スレッド境界を
+/// 越えられるのは **可否の bool だけ**。デコーダはこのスレッドの中で作って
+/// そのまま捨てる。
+///
+/// 起動時に一度呼んでおけば、最初の視聴要求が来るころには答えが出ている。
+/// 判定にかかる時間はカードリーダー次第で、応答しないカードだと十数秒かかる。
+pub fn probe_b25_availability() {
+    // 既に判定済み、または判定中なら何もしない。
+    {
+        let guard = B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return;
+        }
+    }
+
+    std::thread::spawn(|| {
+        let opt = DecoderOptions {
+            strip: true,
+            emm: true,
+            simd: true,
+            round: 4,
+            enable_working_key: false,
+        };
+        let started = std::time::Instant::now();
+        let available = match B25Pipe::new(opt) {
+            Ok(_decoder) => true, // ここで drop され、カードとの接続も閉じる
+            Err(e) => {
+                error!("[B25] デコーダを初期化できませんでした: {}", e);
+                false
+            }
+        };
+        let elapsed = started.elapsed();
+
+        if available && elapsed > B25_INIT_BUDGET {
+            warn!(
+                "[B25] デコーダの初期化に {:?} かかりました。カードリーダーの応答が遅く、\
+                 選局のたびに同じだけ待たされます。ダッシュボードの設定タブで\
+                 B-CASカードを入れたリーダーを選んでください",
+                elapsed
+            );
+        } else if !available {
+            warn!("[B25] スクランブル解除なしで配信します (生TS)");
+        }
+
+        *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(available);
+    });
+}
+
+/// B25 デコーダを作る。ただし**まだ使えると分かっていない間は作らない**。
+///
+/// libaribb25 の初期化は、見つかったカードリーダーへ順に接続を試みる。応答しない
+/// カードや相性の悪いリーダーが挿さっていると1台あたり5秒ほどかかり、リーダー
+/// 起動全体のタイムアウト(15秒)を食い潰して**生TSの配信すら始められずに503**に
+/// なる。カードが使えないことは「復号できない」で済むべきで、「視聴できない」に
+/// 格上げしてはいけない。
+///
+/// そのため、判定が済んでいなければこの回は生TSで配信し、判定を裏で走らせる。
+/// 次のリーダー起動からは答えが出ている。
+fn init_b25_with_deadline(opt: DecoderOptions) -> Option<B25Pipe> {
+    let known = *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
+    match known {
+        Some(true) => match B25Pipe::new(opt) {
+            Ok(decoder) => {
+                info!("[SharedTuner] B25 decoder enabled");
+                Some(decoder)
+            }
+            Err(e) => {
+                // 判定後にカードが抜かれた等。次回の判定をやり直させる。
+                error!("[SharedTuner] Failed to init B25 decoder: {}", e);
+                *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                None
+            }
+        },
+        Some(false) => None,
+        None => {
+            warn!(
+                "[SharedTuner] B25デコーダの可否を判定中です。この配信は生TS \
+                 (スクランブル解除なし) になります"
+            );
+            probe_b25_availability();
+            None
+        }
+    }
+}
+
 /// Runtime startup tuning parameters for delayed network-backed drivers.
 #[derive(Debug, Clone, Copy)]
 pub struct ReaderStartupConfig {
@@ -769,17 +873,7 @@ impl SharedTuner {
             enable_working_key: false,
         };
 
-        let mut b25 = match B25Pipe::new(b25_opt) {
-            Ok(d) => {
-                info!("[SharedTuner] B25 decoder enabled");
-                Some(d)
-            }
-            Err(e) => {
-                error!("[SharedTuner] Failed to init B25 decoder: {}", e);
-                error!("[SharedTuner] Falling back to raw TS streaming");
-                None
-            }
-        };
+        let mut b25 = init_b25_with_deadline(b25_opt);
 
         // Track decoder state
         let mut b25_needs_reset = false;
