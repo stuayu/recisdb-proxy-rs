@@ -228,6 +228,12 @@ pub fn probe_b25_availability() {
 ///
 /// そのため、判定が済んでいなければこの回は生TSで配信し、判定を裏で走らせる。
 /// 次のリーダー起動からは答えが出ている。
+/// 判定が済んでいて、かつ「使える」だったか。読み取りループが作り直しの
+/// 要否を判断するのに使う。
+fn b25_known_available() -> bool {
+    matches!(*B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()), Some(true))
+}
+
 fn init_b25_with_deadline(opt: DecoderOptions) -> Option<B25Pipe> {
     let known = *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
     match known {
@@ -874,6 +880,9 @@ impl SharedTuner {
         };
 
         let mut b25 = init_b25_with_deadline(b25_opt);
+        // 判定中に起動した場合の作り直しは1回だけ。毎チャンク試すと、
+        // カードが遅い環境で読み取りループが止まり続ける。
+        let mut b25_init_retried = false;
 
         // Track decoder state
         let mut b25_needs_reset = false;
@@ -1053,6 +1062,22 @@ impl SharedTuner {
                     // (P3 §2.2-10). They now run in their own task fed by the
                     // same broadcast — see `spawn_si_collector`.
                     let raw = &buf[..n];
+
+                    // 起動時はB25の可否がまだ分かっていないことがある
+                    // (`init_b25_with_deadline` 参照)。判定が「使える」で
+                    // 確定したら、ここで一度だけデコーダを作る。これをやらないと、
+                    // 判定中に始まったリーダーは以後ずっとスクランブルされたままの
+                    // TSを流し続ける (視聴者には「映像が出ない」としか見えない)。
+                    if b25.is_none() && !b25_init_retried && b25_known_available() {
+                        b25_init_retried = true;
+                        b25 = init_b25_with_deadline(DecoderOptions {
+                            strip: true,
+                            emm: true,
+                            simd: true,
+                            round: 4,
+                            enable_working_key: false,
+                        });
+                    }
 
                     // Data validation before B25 decode (log only on first packet)
                     if reader_first_read && n > 0 {
