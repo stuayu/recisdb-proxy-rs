@@ -515,6 +515,165 @@ fn selection_after_prewarm_expiry_falls_back_to_a_cold_open() {
     assert!(got > 188 * 200, "cold fallback streamed only {got} bytes");
 }
 
+/// Switching a session between terrestrial and satellite.
+///
+/// Crossing `SystemType` is the one case where the backend cannot retune in
+/// place: a receiver is opened for one system at a time, so the tuner has to
+/// be closed and reopened (and its data socket rebuilt) — see
+/// `bondriver/px4_daemon.rs`. That path is exercised here end-to-end through
+/// a session rather than against the backend alone.
+///
+/// `BNDP_CROSS_PLAN` is `space:channel` pairs (default `0:0,1:0,0:2,2:0`).
+/// Satellite entries need an antenna and, on this backend, a receiver whose
+/// path carries `+lnb`.
+#[test]
+#[ignore = "requires a running proxy, real hardware, and both terrestrial and satellite antennas"]
+fn a_session_switches_between_terrestrial_and_satellite() {
+    let plan: Vec<(u32, u32)> = std::env::var("BNDP_CROSS_PLAN")
+        .unwrap_or_else(|_| "0:0,1:0,0:2,2:0".to_string())
+        .split(',')
+        .filter_map(|pair| {
+            let (s, c) = pair.trim().split_once(':')?;
+            Some((s.parse().ok()?, c.parse().ok()?))
+        })
+        .collect();
+
+    let mut ts = 0usize;
+    let mut c = Client::connect();
+    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
+    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+
+    let mut started = false;
+    for (round, &(space, channel)) in plan.iter().enumerate() {
+        c.send(ClientMessage::SetChannelSpace { space, channel, priority: 0, exclusive: false });
+        let mut sink = 0usize;
+        match c.recv_control(&mut sink) {
+            ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
+            other => panic!("round {round}: space {space} channel {channel} failed: {other:?}"),
+        }
+
+        if !started {
+            c.send(ClientMessage::StartStream);
+            assert!(matches!(
+                c.recv_control(&mut sink),
+                ServerMessage::StartStreamAck { success: true, .. }
+            ));
+            started = true;
+        }
+
+        let got = c.drain_ts(Duration::from_secs(25));
+        println!("round {round}: space={space} channel={channel} → {got} bytes");
+        assert!(
+            got > 188 * 200,
+            "round {round} (space={space} channel={channel}) delivered only {got} bytes — \
+             the stream did not survive the system change"
+        );
+    }
+}
+
+/// `bon_drivers.last_scan` for one driver, or 0 — used to prove a scan
+/// really happened during the window a test was watching.
+fn last_scan_of(web: &str, driver_id: &str) -> i64 {
+    let out = std::process::Command::new("curl")
+        .args(["-s", &format!("{web}/api/bondrivers")])
+        .output()
+        .expect("query /api/bondrivers");
+    let body = String::from_utf8_lossy(&out.stdout);
+    // Each driver object carries "id": N ... "last_scan": M. Find the object
+    // for `driver_id` and read the value that follows it.
+    for chunk in body.split("{") {
+        if chunk.contains(&format!("\"id\": {driver_id}"))
+            || chunk.contains(&format!("\"id\":{driver_id}"))
+        {
+            if let Some(rest) = chunk.split("\"last_scan\":").nth(1) {
+                let digits: String =
+                    rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                return digits.parse().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+/// A channel scan must not cost a viewer its stream, and must not stop a
+/// viewer from tuning in.
+///
+/// The scan walks every channel on one driver, holding that driver for
+/// minutes, and it runs at the lowest priority by convention (scan = 0).
+///
+/// Note the scan opens its `BonDriverTuner` **directly**, not through
+/// `TunerPool` — so it holds no slot permit and never shows up in the pool's
+/// tuner count. That is why this test cannot watch for "an extra open tuner"
+/// to know the scan is running: it asserts continuously across a window that
+/// the scheduler is certain to run the scan in (its tick is a minute by
+/// default), then confirms afterwards from `last_scan` that a scan really
+/// did happen in that window — `last_scan` is only written when a scan
+/// *completes*, so the window has to outlast a full scan (~3 min here).
+/// An earlier version waited 8 s and passed against a scan that had not
+/// started; a second version watched for an extra open tuner, which a scan
+/// never produces.
+///
+/// Set `BNDP_SCAN_DRIVER` to the `bon_drivers.id` to scan (default 5, the
+/// last of the five so the earlier ones stay free for viewers).
+#[test]
+#[ignore = "requires a running proxy with real hardware; drives a real channel scan (~3 min)"]
+fn a_running_scan_neither_displaces_nor_blocks_viewers() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let scan_driver = std::env::var("BNDP_SCAN_DRIVER").unwrap_or_else(|_| "5".to_string());
+    let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
+    let window_s: u64 =
+        std::env::var("BNDP_SCAN_WINDOW_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+
+    let mut before = open_tuned_session(space, 0).expect("viewer before the scan");
+    assert!(
+        before.drain_ts(Duration::from_secs(20)) > 188 * 200,
+        "the pre-scan viewer never streamed"
+    );
+
+    let last_scan_before = last_scan_of(&web, &scan_driver);
+    let status = std::process::Command::new("curl")
+        .args([
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            &format!("{web}/api/bondriver/{scan_driver}/scan"),
+        ])
+        .output()
+        .expect("trigger the scan");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "200", "scan trigger failed");
+    println!("scan requested on driver {scan_driver} (last_scan was {last_scan_before})");
+
+    // Hold the assertions across the whole window the scan can occur in.
+    let deadline = Instant::now() + Duration::from_secs(window_s);
+    let mut joins = 0;
+    while Instant::now() < deadline {
+        let still = before.drain_ts_until(188 * 200, Duration::from_secs(10));
+        assert!(
+            still > 188 * 200,
+            "the pre-scan viewer stopped receiving ({still} bytes) while a scan was pending/running"
+        );
+
+        let mut during = open_tuned_session(space, 1)
+            .unwrap_or_else(|e| panic!("a viewer could not be admitted while scanning: {e}"));
+        let got = during.drain_ts(Duration::from_secs(20));
+        assert!(got > 188 * 200, "a viewer admitted during the scan got only {got} bytes");
+        joins += 1;
+        drop(during);
+
+        // Pace the joins. Hammering the pool with a new session every second
+        // is not the scenario under test, and it starves the scan of the
+        // idle moment it needs to claim a driver.
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    let last_scan_after = last_scan_of(&web, &scan_driver);
+    println!("viewer survived, {joins} new viewers admitted; last_scan {last_scan_before} → {last_scan_after}");
+    assert!(
+        last_scan_after > last_scan_before,
+        "no scan ran during the window — this test proved nothing"
+    );
+}
+
 /// A session must be able to switch channels on a `max_instances = 1`
 /// driver. The old reader is not stopped until after the new one is in
 /// place, so the switch only works if the session's own slot permit is
