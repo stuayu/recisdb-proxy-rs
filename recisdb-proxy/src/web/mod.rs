@@ -103,6 +103,8 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/tsreplace-config", post(api::update_tsreplace_config))
         // Browser-preview encoder configuration API (`preview_encoder_config`,
         // fully separate from tsreplace-config)
+        .route("/card-reader", get(api::get_card_readers))
+        .route("/card-reader", post(api::update_card_reader))
         .route("/preview-config", get(api::get_preview_config))
         .route("/preview-config", post(api::update_preview_config))
         // Encode profile catalogue API (STREAMING_DESIGN.md §5.3/§9 P5)

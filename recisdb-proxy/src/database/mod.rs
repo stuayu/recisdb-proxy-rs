@@ -175,7 +175,17 @@ impl Database {
             "016_reclassify_band_region_from_nid",
             Database::migration_016_reclassify_band_region_from_nid,
         ),
+        ("017_card_reader_name", Database::migration_017_card_reader_name),
     ];
+
+    /// Migration 017: which PC/SC card reader libaribb25 should talk to.
+    ///
+    /// Empty string = 未選択 (libaribb25 が全リーダーを順に試す従来動作)。
+    /// B-CAS 以外のリーダー (EMV 等) が挿さっていると、その1台あたり十数秒
+    /// 待たされたうえ先に応答した方が採用されてしまうため、選べるようにする。
+    fn migration_017_card_reader_name(&self) -> Result<()> {
+        self.add_column_if_not_exists("tuner_config", "card_reader_name", "TEXT DEFAULT ''")
+    }
 
     // Migration 016: re-derive band_type / region_id / terrestrial_region
     // from NID using the protocol crate as the single source of truth.
@@ -1013,6 +1023,42 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// 選択中の PC/SC カードリーダー名。空文字列 = 未選択。
+    ///
+    /// 未選択のとき libaribb25 は見つかったリーダーへ順に接続を試み、最初に
+    /// 応答したものを使う。B-CAS 以外のリーダーが挿さっていると 1 台あたり
+    /// 十数秒待たされ、しかも間違った方が採用されうる (macOS 実機で確認)。
+    fn ensure_card_reader_column(&self) -> Result<()> {
+        self.add_column_if_not_exists("tuner_config", "card_reader_name", "TEXT DEFAULT ''")?;
+        // tuner_config の1行目は `get_tuner_config` が初回アクセス時に既定値で
+        // 作る。それより先にここへ来ると UPDATE が0行に当たって黙って捨てられる
+        // ため、行の存在を先に確かめる。
+        self.get_tuner_config()?;
+        Ok(())
+    }
+
+    pub fn get_card_reader_name(&self) -> Result<String> {
+        self.ensure_card_reader_column()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COALESCE(card_reader_name, '') FROM tuner_config WHERE id = 1")?;
+        // tuner_config は1行固定だが、初期化直後などで行が無い場合に
+        // エラーにせず「未選択」として扱う。
+        let name = stmt
+            .query_row([], |row| row.get::<_, String>(0))
+            .unwrap_or_default();
+        Ok(name)
+    }
+
+    pub fn set_card_reader_name(&self, name: &str) -> Result<()> {
+        self.ensure_card_reader_column()?;
+        self.conn.execute(
+            "UPDATE tuner_config SET card_reader_name = ?1 WHERE id = 1",
+            rusqlite::params![name],
+        )?;
+        Ok(())
+    }
 }
 
 /// Web API authentication token storage (REVIEW_2026-07.md S2).
@@ -1295,5 +1341,26 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(final_version, target);
+    }
+}
+
+#[cfg(test)]
+mod card_reader_tests {
+    use super::Database;
+
+    #[test]
+    fn card_reader_name_defaults_to_unselected_and_roundtrips() {
+        let db = Database::open_in_memory().unwrap();
+
+        // 既定は「自動」。ここが空でないと、まだ何も選んでいない利用者の環境で
+        // 存在しないリーダーを名指ししてしまう。
+        assert_eq!(db.get_card_reader_name().unwrap(), "");
+
+        db.set_card_reader_name("SCM Microsystems Inc. SCR3310").unwrap();
+        assert_eq!(db.get_card_reader_name().unwrap(), "SCM Microsystems Inc. SCR3310");
+
+        // 空文字列で「自動」に戻せること。
+        db.set_card_reader_name("").unwrap();
+        assert_eq!(db.get_card_reader_name().unwrap(), "");
     }
 }

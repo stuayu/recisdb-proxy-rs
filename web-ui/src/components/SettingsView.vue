@@ -147,12 +147,63 @@ async function restartServer() {
   if (back) await loadService()
 }
 
+// --- B-CASカードリーダーの選択 --------------------------------------
+// 未選択だと libaribb25 が見つかったリーダーへ順に接続を試すため、B-CAS以外の
+// リーダー(EMV等)が挿さっているとリーダー起動が十数秒待たされ、しかも間違った
+// 方が採用されうる。接続されているものから名指しで選べるようにする。
+type CardReaderResponse = {
+  readers: string[]
+  selected: string
+  selected_present: boolean
+}
+
+const cardReaders = ref<CardReaderResponse | null>(null)
+const cardReaderChoice = ref('')
+const cardReaderMessage = ref('')
+const cardReaderError = ref('')
+const cardReaderBusy = ref(false)
+
+async function loadCardReaders() {
+  cardReaderBusy.value = true
+  try {
+    const response = await api<CardReaderResponse>('/card-reader')
+    cardReaders.value = response
+    cardReaderChoice.value = response.selected
+    cardReaderError.value = ''
+  } catch (cause) {
+    cardReaderError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    cardReaderBusy.value = false
+  }
+}
+
+async function saveCardReader() {
+  cardReaderBusy.value = true
+  try {
+    await api('/card-reader', {
+      method: 'POST',
+      body: JSON.stringify({ name: cardReaderChoice.value }),
+    })
+    cardReaderMessage.value = cardReaderChoice.value
+      ? '保存しました。次にチューナーを開いたときから使われます。'
+      : '自動選択に戻しました。次にチューナーを開いたときから有効になります。'
+    cardReaderError.value = ''
+    await loadCardReaders()
+  } catch (cause) {
+    cardReaderError.value = cause instanceof Error ? cause.message : String(cause)
+    cardReaderMessage.value = ''
+  } finally {
+    cardReaderBusy.value = false
+  }
+}
+
 function updateNumber(key: string, event: Event) {
   config.value[key] = Number((event.target as HTMLInputElement).value)
 }
 onMounted(() => {
   void load()
   void loadService()
+  void loadCardReaders()
 })
 </script>
 <template>
@@ -205,6 +256,49 @@ onMounted(() => {
       <button class="button secondary" type="button" :disabled="restarting" @click="restartServer">
         {{ restarting ? '再起動中…' : 'サーバーを再起動' }}
       </button>
+    </div>
+    <div class="panel">
+      <h3>B-CASカードリーダー</h3>
+      <p class="muted">
+        カードリーダーが複数つながっている場合は、B-CASカードを挿しているものを選んでください。
+        「自動」のままだと見つかった順に接続を試すため、B-CAS以外のリーダー（銀行カード用など）が
+        あると視聴開始が数十秒遅くなったり、間違ったリーダーが選ばれることがあります。
+      </p>
+      <p v-if="cardReaderError" class="notice error" role="alert" v-text="cardReaderError" />
+      <p v-if="cardReaderMessage" class="notice success" v-text="cardReaderMessage" />
+      <p
+        v-if="cardReaders && !cardReaders.selected_present"
+        class="notice error"
+        role="alert"
+      >
+        選択中の「{{ cardReaders.selected }}」は現在つながっていません。
+      </p>
+      <p v-if="cardReaders && cardReaders.readers.length === 0" class="muted">
+        カードリーダーが見つかりません。接続とPC/SCサービスの状態を確認してください。
+      </p>
+      <label v-else class="field"
+        ><span>使用するカードリーダー</span
+        ><select v-model="cardReaderChoice" :disabled="cardReaderBusy">
+          <option value="">自動（見つかった順に試す）</option>
+          <option v-for="name in cardReaders?.readers ?? []" :key="name" :value="name">
+            {{ name }}
+          </option>
+        </select></label
+      >
+      <div class="actions">
+        <button
+          class="button secondary"
+          type="button"
+          :disabled="cardReaderBusy"
+          @click="loadCardReaders"
+        >
+          再検出
+        </button>
+        <button class="button" type="button" :disabled="cardReaderBusy" @click="saveCardReader">
+          保存
+        </button>
+      </div>
+      <p class="muted">変更は次にチューナーを開いたときから反映されます。</p>
     </div>
     <p v-if="message" class="notice success" v-text="message" />
     <p v-if="error" class="notice error" role="alert" v-text="error" />

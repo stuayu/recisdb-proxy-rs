@@ -29,3 +29,21 @@ pub mod ts_analyzer;
 pub mod tuner;
 pub mod aribb24;
 pub mod web;
+
+/// 選択された PC/SC カードリーダー名を libaribb25 に反映する。
+///
+/// 空文字列なら何もしない = libaribb25 の既定動作 (全リーダーを順に試す) の
+/// まま。libaribb25 側はプロセス全体の状態なので、既に動いているデコーダには
+/// 影響せず、**次にリーダーを起動したときから**効く。
+pub fn apply_card_reader_selection(name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    if b25_sys::set_card_reader_name(name) {
+        log::info!("B-CAS card reader pinned to {:?}", name);
+    } else {
+        // 1024文字以上か内部にNULがある場合のみ。DBに入る経路では起きないが、
+        // 黙って「自動」に落ちると原因が追えなくなるので必ず残す。
+        log::warn!("libaribb25 rejected the card reader name {:?}; falling back to probing every reader", name);
+    }
+}

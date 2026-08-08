@@ -711,3 +711,90 @@ pub async fn update_scan_config(
         }
     })))
 }
+
+// ============================================================================
+// PC/SC card reader selection (`GET`/`POST /api/card-reader`)
+// ============================================================================
+//
+// libaribb25 は「見つかったカードリーダーへ片っ端から接続を試し、最初に応答した
+// ものを使う」実装しか持たない。B-CAS 以外のリーダー (銀行カード用の EMV など)
+// が挿さっていると、そのリーダー1台につき十数秒待たされたうえ、間違った方が
+// 選ばれることがある (macOS 実機で確認)。名前で名指しできるようにする。
+//
+// # Security
+// ここで受け取るのは PC/SC が報告するリーダー名であって、実行ファイルのパスでは
+// ない (libaribb25 はこの文字列をリーダー名の比較にしか使わず、プロセス起動には
+// 一切関与しない)。それでも任意の文字列は受け付けず、**列挙結果に完全一致する
+// 名前だけ**を通す。これは `[preview] command_path` 等がTOML専用である
+// REVIEW S1 の趣旨 (APIから実行対象を差し込ませない) と同じ方向の制限。
+
+/// 現在接続されている PC/SC カードリーダーと、選択中のリーダー名を返す。
+pub async fn get_card_readers(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let selected = {
+        let db = web_state.database.lock().await;
+        db.get_card_reader_name()?
+    };
+
+    // PC/SC への問い合わせはブロッキング。
+    let readers = tokio::task::spawn_blocking(b25_sys::list_card_readers)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to enumerate card readers: {e}")))?;
+
+    // 選択済みのリーダーが今は外れている、という状態を UI が出せるようにする。
+    let selected_present = selected.is_empty() || readers.iter().any(|r| r == &selected);
+
+    Ok(Json(json!({
+        "success": true,
+        "readers": readers,
+        "selected": selected,
+        "selected_present": selected_present,
+    })))
+}
+
+/// カードリーダー選択の更新リクエスト。
+#[derive(Debug, Deserialize)]
+pub struct UpdateCardReaderRequest {
+    /// 空文字列 = 自動 (libaribb25 に全リーダーを試させる従来動作へ戻す)。
+    pub name: String,
+}
+
+/// 使用するカードリーダーを選択する (`POST /api/card-reader`)。
+///
+/// 反映されるのは**次にリーダーを起動したとき**から。libaribb25 の
+/// `override_card_reader_name_pattern` はプロセス全体の状態で、既に開いている
+/// デコーダを作り直しはしないため。
+pub async fn update_card_reader(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdateCardReaderRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let name = payload.name.trim().to_string();
+
+    if !name.is_empty() {
+        let readers = tokio::task::spawn_blocking(b25_sys::list_card_readers)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to enumerate card readers: {e}")))?;
+        if !readers.iter().any(|r| r == &name) {
+            return Err(ApiError::bad_request(format!(
+                "card reader {name:?} is not connected; pick one of {readers:?}"
+            )));
+        }
+    }
+
+    {
+        let db = web_state.database.lock().await;
+        db.set_card_reader_name(&name)?;
+    }
+    crate::apply_card_reader_selection(&name);
+
+    Ok(Json(json!({
+        "success": true,
+        "message": if name.is_empty() {
+            "card reader selection cleared (all readers will be tried)"
+        } else {
+            "card reader selected"
+        },
+        "selected": name,
+    })))
+}

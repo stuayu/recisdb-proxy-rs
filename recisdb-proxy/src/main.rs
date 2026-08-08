@@ -309,6 +309,18 @@ async fn run_server(
         }
     }
 
+    // 使用する B-CAS カードリーダーの指定。未選択 (空文字列) なら libaribb25 の
+    // 既定動作のまま、見つかったリーダーへ順に接続を試す。B-CAS 以外のリーダーが
+    // 挿さっている環境では、その1台につきリーダー起動が十数秒待たされ、しかも
+    // 先に応答した方が採用されてしまうため、ダッシュボードから選べるようにしている。
+    {
+        let name = {
+            let db_guard = db.lock().await;
+            db_guard.get_card_reader_name().unwrap_or_default()
+        };
+        recisdb_proxy::apply_card_reader_selection(&name);
+    }
+
     // Web API authentication (REVIEW_2026-07.md S2). Resolution order:
     // 1. TOML `[web] auth_token` (explicit override, persisted to DB too so
     //    the DB stays a consistent record of "what's currently valid").
