@@ -1548,6 +1548,7 @@ impl SharedTuner {
         tokio::spawn(async move {
             let mut logo_collector = ChannelLogoCollector::new();
             let mut epg_collector = EpgCollector::new();
+            let mut scramble_watch = ScrambleWatch::new();
 
             loop {
                 tokio::select! {
@@ -1555,6 +1556,7 @@ impl SharedTuner {
                         Ok(data) => {
                             logo_collector.process_ts_chunk(&data);
                             epg_collector.process_ts_chunk(&data);
+                            scramble_watch.observe(&key, &data);
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // SI tables repeat, so a gap costs at most a
@@ -2139,5 +2141,159 @@ mod tests {
         // ends — otherwise the runtime's own shutdown would block on it
         // indefinitely instead of just until the gate opens.
         gate.release();
+    }
+}
+
+/// 配信しているTSが実際にスクランブル解除できているかを見張る。
+///
+/// 「B25 decoder enabled」のログは**初期化が通った**ことしか意味しない。
+/// libaribb25 はデータを受け取り続けるが、ECM (数秒ごとに更新される鍵情報) の
+/// 処理がカードとの APDU に依存しており、カードリーダーが遅い/相性が悪いと
+/// そこだけ失敗する。結果、デコーダは「有効」でバイト数も流れているのに、
+/// 出ていくTSはスクランブルされたまま — 利用者からは「映像が出ない」としか
+/// 見えず、原因の切り分けに TS を取得してビットを数える必要があった。
+///
+/// 判定は配信されるデータそのものから行う。TSヘッダ4バイト目の上位2ビット
+/// (transport_scrambling_control) が 0 以外なら、そのパケットは暗号化されている。
+///
+/// 読み取りループではなく broadcast の購読側で動かす (CLAUDE.md の不変条件:
+/// 読み取りループに毎チャンクの処理を足さない)。
+struct ScrambleWatch {
+    started: std::time::Instant,
+    scrambled: u64,
+    clear: u64,
+    reported: bool,
+}
+
+/// 判定を出すまでの猶予。選局直後は鍵の取得が済んでいないので、しばらくは
+/// スクランブルされたパケットが流れるのが正常。
+const SCRAMBLE_WATCH_GRACE: Duration = Duration::from_secs(20);
+
+/// この割合以上が暗号化されたままなら「復号できていない」とみなす。
+/// 有料放送の一部だけが暗号化されている構成もあるため、多数決ではなく
+/// 明らかに大半が暗号化されている場合だけを対象にする。
+const SCRAMBLE_WATCH_THRESHOLD: f64 = 0.8;
+
+impl ScrambleWatch {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            scrambled: 0,
+            clear: 0,
+            reported: false,
+        }
+    }
+
+    fn observe(&mut self, key: &ChannelKey, chunk: &[u8]) {
+        if self.reported {
+            return;
+        }
+
+        // チャンク全体を舐める必要はない。先頭の数パケットで十分に代表できる。
+        for packet in chunk.chunks_exact(188).take(32) {
+            if packet[0] != 0x47 {
+                continue; // 同期がずれているチャンクは判定材料にしない
+            }
+            if (packet[3] >> 6) & 0x3 == 0 {
+                self.clear += 1;
+            } else {
+                self.scrambled += 1;
+            }
+        }
+
+        let total = self.scrambled + self.clear;
+        if self.started.elapsed() < SCRAMBLE_WATCH_GRACE || total < 1000 {
+            return;
+        }
+
+        self.reported = true;
+        let ratio = self.scrambled as f64 / total as f64;
+        if ratio >= SCRAMBLE_WATCH_THRESHOLD {
+            warn!(
+                "[B25] {:?}: 配信中のTSの {:.0}% がスクランブルされたままです。\
+                 B-CASカードの鍵処理が効いていません (カードリーダーの相性や応答速度が原因のことが多い)。\
+                 このままではブラウザでの再生や録画後の視聴で映像が出ません",
+                key,
+                ratio * 100.0
+            );
+        } else {
+            debug!(
+                "[B25] {:?}: スクランブル解除は機能しています (暗号化されたまま {:.1}%)",
+                key,
+                ratio * 100.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scramble_watch_tests {
+    use super::*;
+
+    fn packet(scrambling_control: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 188];
+        p[0] = 0x47;
+        p[3] = scrambling_control << 6;
+        p
+    }
+
+    fn chunk(scrambled: usize, clear: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..scrambled {
+            out.extend_from_slice(&packet(3));
+        }
+        for _ in 0..clear {
+            out.extend_from_slice(&packet(0));
+        }
+        out
+    }
+
+    #[test]
+    fn stays_quiet_until_enough_data_and_time_have_passed() {
+        // 選局直後は鍵の取得前でスクランブルされたパケットが流れるのが正常。
+        // ここで警告を出すと毎回の選局で誤検知になる。
+        let mut watch = ScrambleWatch::new();
+        let key = ChannelKey::simple("/dev/test", 1);
+        for _ in 0..100 {
+            watch.observe(&key, &chunk(32, 0));
+        }
+        assert!(!watch.reported, "猶予時間内に判定してはいけない");
+    }
+
+    #[test]
+    fn reports_once_and_then_stops_counting() {
+        let mut watch = ScrambleWatch::new();
+        watch.started = std::time::Instant::now() - SCRAMBLE_WATCH_GRACE - Duration::from_secs(1);
+        let key = ChannelKey::simple("/dev/test", 1);
+        for _ in 0..40 {
+            watch.observe(&key, &chunk(32, 0));
+        }
+        assert!(watch.reported);
+
+        // 判定後は数えない (ログを繰り返さないし、無駄な走査もしない)。
+        let counted = watch.scrambled;
+        watch.observe(&key, &chunk(32, 0));
+        assert_eq!(watch.scrambled, counted);
+    }
+
+    #[test]
+    fn a_clear_broadcast_is_not_flagged() {
+        let mut watch = ScrambleWatch::new();
+        watch.started = std::time::Instant::now() - SCRAMBLE_WATCH_GRACE - Duration::from_secs(1);
+        let key = ChannelKey::simple("/dev/test", 1);
+        for _ in 0..40 {
+            watch.observe(&key, &chunk(0, 32));
+        }
+        assert!(watch.reported);
+        assert_eq!(watch.scrambled, 0);
+    }
+
+    #[test]
+    fn ignores_packets_that_lost_sync() {
+        // 同期バイトが無いチャンクを数えると、比率がでたらめになる。
+        let mut watch = ScrambleWatch::new();
+        let key = ChannelKey::simple("/dev/test", 1);
+        watch.observe(&key, &vec![0u8; 188 * 4]);
+        assert_eq!(watch.scrambled + watch.clear, 0);
     }
 }
