@@ -798,3 +798,57 @@ pub async fn update_card_reader(
         "selected": name,
     })))
 }
+
+// ============================================================================
+// Browser-preview auto-setup (`POST /api/preview-config/auto-setup`)
+// ============================================================================
+//
+// プレビューを使うには、これまで利用者が自分でエンコーダと tsreadex を用意し、
+// recisdb-proxy.toml にパスを2つ書く必要があった。用意できていないと
+// `?profile=preview` は 503 を返すだけで、何をすればいいのかは分からない。
+// それを1操作で済ませる。
+//
+// # Security
+// **このエンドポイントはリクエストボディを一切受け取らない。** 実行ファイルの
+// パスは検出結果かダウンロード結果しか使わず、外から差し込めない。
+// `[preview] command_path` が TOML 専用である理由 (REVIEW S1: APIから任意の
+// プログラムを起動させない) をそのまま維持している。
+
+/// エンコーダと前段処理を用意してプレビューを有効化する。
+///
+/// 検出 → (無ければ) ダウンロード → DB と TOML を更新 → 有効化。
+/// ネットワークアクセスとプロセス起動を伴うため、完了までに時間がかかる。
+pub async fn auto_setup_preview(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config_path = web_state.config_path.clone();
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let database = web_state.database.clone();
+
+    // ダウンロード・展開・ビルド・テストエンコードはすべてブロッキング。
+    // DB ロックもこの中で完結させる (blocking の中で await できないため、
+    // 非同期 Mutex ではなく blocking_lock を使う)。
+    let report = tokio::task::spawn_blocking(move || {
+        let db = database.blocking_lock();
+        crate::preview_setup::ensure_preview_ready(&db, &install_dir, config_path.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("auto-setup task panicked: {e}")))?
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "report": {
+            "enabled": report.enabled,
+            "encoder_path": report.encoder_path,
+            "encoder_source": report.encoder_source,
+            "video_encoder": report.video_encoder,
+            "preprocessor_path": report.preprocessor_path,
+            "warnings": report.warnings,
+        }
+    })))
+}

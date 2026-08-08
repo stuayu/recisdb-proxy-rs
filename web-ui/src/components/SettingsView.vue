@@ -147,6 +147,46 @@ async function restartServer() {
   if (back) await loadService()
 }
 
+// --- ブラウザプレビューの自動セットアップ ----------------------------
+// エンコーダ(ffmpeg)と前段処理(tsreadex)を検出、無ければ取得して有効化する。
+// 実行ファイルのパスはサーバー側の検出結果しか使わないため、ここからは何も送らない。
+type PreviewSetupReport = {
+  enabled: boolean
+  encoder_path: string
+  encoder_source: string
+  video_encoder: string
+  preprocessor_path: string
+  warnings: string[]
+}
+
+const previewSetup = ref<PreviewSetupReport | null>(null)
+const previewSetupBusy = ref(false)
+const previewSetupError = ref('')
+
+const encoderSourceLabel: Record<string, string> = {
+  detected: 'インストール済みのものを検出',
+  downloaded: '自動ダウンロード',
+  homebrew: 'Homebrewでインストール',
+}
+
+async function runPreviewAutoSetup() {
+  previewSetupBusy.value = true
+  previewSetupError.value = ''
+  previewSetup.value = null
+  try {
+    const response = await api<{ report: PreviewSetupReport }>('/preview-config/auto-setup', {
+      method: 'POST',
+    })
+    previewSetup.value = response.report
+    // 「ブラウザプレビュー」を表示中なら、有効化された結果を反映する。
+    if (selected.value === '/preview-config') await load()
+  } catch (cause) {
+    previewSetupError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    previewSetupBusy.value = false
+  }
+}
+
 // --- B-CASカードリーダーの選択 --------------------------------------
 // 未選択だと libaribb25 が見つかったリーダーへ順に接続を試すため、B-CAS以外の
 // リーダー(EMV等)が挿さっているとリーダー起動が十数秒待たされ、しかも間違った
@@ -255,6 +295,44 @@ onMounted(() => {
       <p v-if="restartMessage" class="notice" v-text="restartMessage" />
       <button class="button secondary" type="button" :disabled="restarting" @click="restartServer">
         {{ restarting ? '再起動中…' : 'サーバーを再起動' }}
+      </button>
+    </div>
+    <div class="panel">
+      <h3>ブラウザプレビュー</h3>
+      <p class="muted">
+        ブラウザで映像を確認するには、エンコーダー（ffmpeg）と前段処理（tsreadex）が必要です。
+        ボタンを押すと、すでに入っていればそれを使い、無ければ自動で用意して有効にします。
+        ダウンロードとビルドを行うため、環境によっては数分かかります。
+      </p>
+      <p v-if="previewSetupError" class="notice error" role="alert" v-text="previewSetupError" />
+      <dl v-if="previewSetup" class="service-status">
+        <dt>エンコーダー</dt>
+        <dd>
+          {{ previewSetup.encoder_path }}（{{
+            encoderSourceLabel[previewSetup.encoder_source] ?? previewSetup.encoder_source
+          }}）
+        </dd>
+        <dt>映像エンコード</dt>
+        <dd v-text="previewSetup.video_encoder" />
+        <dt>前段処理</dt>
+        <dd v-text="previewSetup.preprocessor_path || '（なし）'" />
+      </dl>
+      <p v-if="previewSetup && previewSetup.warnings.length === 0" class="notice success">
+        プレビューを有効にしました。
+      </p>
+      <p
+        v-for="warning in previewSetup?.warnings ?? []"
+        :key="warning"
+        class="notice"
+        v-text="warning"
+      />
+      <button
+        class="button"
+        type="button"
+        :disabled="previewSetupBusy"
+        @click="runPreviewAutoSetup"
+      >
+        {{ previewSetupBusy ? '準備中…（数分かかることがあります）' : 'プレビューを使えるようにする' }}
       </button>
     </div>
     <div class="panel">

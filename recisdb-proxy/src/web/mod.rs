@@ -107,6 +107,7 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/card-reader", post(api::update_card_reader))
         .route("/preview-config", get(api::get_preview_config))
         .route("/preview-config", post(api::update_preview_config))
+        .route("/preview-config/auto-setup", post(api::auto_setup_preview))
         // Encode profile catalogue API (STREAMING_DESIGN.md §5.3/§9 P5)
         .route("/encode-profiles", get(api::get_encode_profiles))
         .route("/encode-profiles", post(api::create_encode_profile))
@@ -244,9 +245,11 @@ pub async fn start_web_server(
     log_dir: PathBuf,
     mirakurun_enabled: bool,
     proxy_listen_addr: Option<SocketAddr>,
+    config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(database, tuner_pool, encoder_pool, session_registry, auth, log_buffer, log_dir);
     web_state.proxy_listen_addr = proxy_listen_addr;
+    web_state.config_path = config_path;
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
     }

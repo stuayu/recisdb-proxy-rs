@@ -37,6 +37,101 @@ const LEGACY_PREVIEW_ENCODE_ARGS: &str =
      -c h264 --vbr 2000 --max-bitrate 3000 --gop-len 60 \
      --output-format mpegts -o -";
 
+/// ffmpeg 用のプレビュー引数を組み立てる。
+///
+/// `DEFAULT_PREVIEW_ENCODE_ARGS` は rigaya 系 (QSVEncC 等) の方言で、ffmpeg では
+/// 一切通らない。自動セットアップ (`preview_setup`) は ffmpeg を使うため、
+/// そちらで選ばれた映像エンコーダ名を埋め込んだ引数をここで作る。
+///
+/// stdin から mpegts を読み stdout へ mpegts を書く。前段 tsreadex
+/// (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` の `-d 13`) が字幕を ID3
+/// timed-metadata に変換して data ストリームに載せるので、`-map 0:d?` +
+/// `-c:d copy` でそれを通す (aribb24.js が受け取る)。`?` はデータストリームが
+/// 無い放送でも失敗させないため。
+///
+/// 引数は `encoder_pool` が `split_whitespace` で分割する (シェル解釈なし) ので、
+/// **1トークンの中に空白を入れてはいけない**。
+pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
+    format!(
+        "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+         -analyzeduration 600000 -probesize 1000000 \
+         -f mpegts -i pipe:0 \
+         -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+         -vf yadif=0:-1:1 \
+         -c:v {video_encoder} {tuning} -b:v 2000k -maxrate 3000k -bufsize 4000k \
+         -g 60 -aspect 16:9 \
+         -c:a aac -b:a 192k -ar 48000 -ac 2 \
+         -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 \
+         -c:d copy \
+         -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
+        tuning = video_encoder_tuning(video_encoder)
+    )
+}
+
+/// エンコーダごとの最適化オプション。
+///
+/// ここで渡すものは [`preview_encode_args_ffmpeg`] が組み立てる本番の引数と
+/// **完全に同じもの**を、`preview_setup` の選定時のテストエンコードでも使う。
+/// `-c:v <名前>` だけ試して本番で別のオプションを足すと、そのオプションが
+/// 効かないビルドだったときに「選定は通ったのに視聴開始で落ちる」ことになる。
+///
+/// 共通の狙いは**低遅延**。プレビューは「今映っているものを確認する」用途で、
+/// 数秒の先読みバッファを積んで画質を稼ぐ意味がない。
+///
+/// - `libx264`: `veryfast` + `zerolatency` (Bフレームと先読みを止める)
+/// - `h264_videotoolbox`: `-realtime 1` でリアルタイム優先、`-allow_sw 1` で
+///   ハードウェアが埋まっているときにソフトウェアへ落として止まらないようにする
+/// - `h264_qsv`: `-look_ahead 0` と `-async_depth 1`。先読みは遅延に直結する
+/// - `h264_nvenc`: `-preset p4 -tune ll` (低遅延プリセット) + `-rc vbr`
+/// - `h264_amf`: `-usage lowlatency -quality speed`
+/// - `h264_vaapi`: `-vaapi_device` と `hwupload` フィルタの用意が要り、この
+///   テンプレートの形では動かせない。オプションは足さず、選定時のテスト
+///   エンコードで落ちて `libx264` にフォールバックさせる
+pub fn video_encoder_tuning(video_encoder: &str) -> &'static str {
+    match video_encoder {
+        "libx264" => "-preset veryfast -tune zerolatency -profile:v high",
+        "h264_videotoolbox" => "-realtime 1 -allow_sw 1 -profile:v high",
+        "h264_qsv" => "-preset veryfast -look_ahead 0 -async_depth 1 -profile:v high",
+        "h264_nvenc" => "-preset p4 -tune ll -rc vbr -profile:v high",
+        "h264_amf" => "-usage lowlatency -quality speed -profile:v high",
+        _ => "",
+    }
+}
+
+/// この値は「利用者が自分で書いたもの」か、それとも「こちらが自動で入れた
+/// ものか」。自動セットアップは後者しか上書きしない — 手で調整した引数を
+/// 黙って踏み潰すのが一番やってはいけないことなので。
+///
+/// 自動生成とみなすのは、QSVEncC の初期シード、その前のレガシーテンプレート、
+/// そして過去に自動セットアップが入れた ffmpeg テンプレート (どのエンコーダで
+/// 生成されたものでも)。
+pub fn preview_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool {
+    let Some(args) = extra_args else {
+        // 未設定はそのまま入れてよい。
+        return true;
+    };
+    let args = args.trim();
+    if args.is_empty() {
+        return true;
+    }
+    if args == DEFAULT_PREVIEW_ENCODE_ARGS || args == LEGACY_PREVIEW_ENCODE_ARGS {
+        return true;
+    }
+    // 過去の自動生成 ffmpeg テンプレートかどうかは、エンコーダ名を差し替えた
+    // 全候補と突き合わせて判定する。エンコーダが増えたらここに足すこと。
+    const KNOWN_ENCODERS: &[&str] = &[
+        "libx264",
+        "h264_videotoolbox",
+        "h264_qsv",
+        "h264_nvenc",
+        "h264_amf",
+        "h264_vaapi",
+    ];
+    KNOWN_ENCODERS
+        .iter()
+        .any(|enc| args == preview_encode_args_ffmpeg(enc))
+}
+
 impl Database {
     fn row_to_encode_profile_record(row: &rusqlite::Row) -> rusqlite::Result<EncodeProfileRecord> {
         Ok(EncodeProfileRecord {

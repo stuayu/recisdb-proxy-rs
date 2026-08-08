@@ -140,15 +140,26 @@ fn parse_config_file(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::E
 ///
 /// Uses `eprintln!` rather than the `log` macros: this runs before
 /// `logging::init_logging`, matching the original `main.rs` order.
-pub fn load_file_config(args: &Args) -> Result<ConfigFile, Box<dyn std::error::Error>> {
-    let config_path = args.config.clone().or_else(|| {
+/// 実際に読み込む設定ファイルのパス。`-f` があればそれ、無ければ作業フォルダの
+/// `recisdb-proxy.toml` (存在する場合のみ)。
+///
+/// プレビュー自動セットアップ (`preview_setup`) が `[preview]` セクションを
+/// 書き戻す先を知る必要があるため、`load_file_config` から切り出して公開している。
+/// 書き戻さないと、起動時に TOML が DB を上書きする経路 (main.rs) で設定が
+/// 巻き戻ってしまう。
+pub fn resolve_config_path(args: &Args) -> Option<PathBuf> {
+    args.config.clone().or_else(|| {
         let default_path = PathBuf::from("recisdb-proxy.toml");
         if default_path.exists() {
             Some(default_path)
         } else {
             None
         }
-    });
+    })
+}
+
+pub fn load_file_config(args: &Args) -> Result<ConfigFile, Box<dyn std::error::Error>> {
+    let config_path = resolve_config_path(args);
     if let Some(config_path) = &config_path {
         match parse_config_file(config_path) {
             Ok(c) => {

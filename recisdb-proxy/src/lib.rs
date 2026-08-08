@@ -20,6 +20,7 @@ pub mod database;
 pub mod logging;
 pub mod alert;
 pub mod epg_writer;
+pub mod preview_setup;
 pub mod px4_installer;
 pub mod scheduler;
 pub mod server;

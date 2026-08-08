@@ -170,6 +170,8 @@ struct SetupApp {
     // OSサービス登録 (service/mod.rs)。既定でON: 常時稼働させるのが
     // 想定利用形態のため。
     register_service: bool,
+    /// ブラウザプレビューを使えるようにする (エンコーダと前段処理を自動で用意)。
+    setup_preview: bool,
     service_name: String,
     /// サービスとしての登録に成功したか。完了画面での「起動する」ボタンを
     /// 「ダッシュボードを開く」に切り替えるのに使う (サービスが既に
@@ -213,6 +215,7 @@ impl SetupApp {
             overwrite_config: false,
             recreate_db: false,
             register_service: true,
+            setup_preview: true,
             service_name: recisdb_proxy::service::DEFAULT_SERVICE_NAME.to_string(),
             service_registered: false,
             service_user_scope: false,
@@ -495,11 +498,44 @@ impl SetupApp {
             }
         }
 
+        if self.setup_preview {
+            self.setup_browser_preview(&db, &install_dir);
+        }
+
         if self.register_service && recisdb_proxy::service::is_supported() {
             self.register_os_service(&install_dir);
         }
 
         self.step = Step::Done;
+    }
+
+    /// ブラウザプレビュー (Webダッシュボードでの映像確認) を使えるようにする。
+    ///
+    /// エンコーダ (ffmpeg) と前段処理 (tsreadex) を検出し、無ければ取得して
+    /// 設定ファイルとDBに書き込む。ダウンロードやビルドを伴うため失敗しうるが、
+    /// **失敗してもセットアップ全体は続行する** — プレビューが無くても
+    /// TVTest からの視聴という主目的には影響しないため。理由はログに残し、
+    /// あとからダッシュボードの「プレビューを使えるようにする」で再試行できる。
+    fn setup_browser_preview(&mut self, db: &recisdb_proxy::database::Database, install_dir: &Path) {
+        let config_path = install_dir.join("recisdb-proxy.toml");
+        self.log_lines
+            .push("ブラウザプレビューの準備中... (ダウンロードを伴うため時間がかかります)".to_string());
+        match recisdb_proxy::preview_setup::ensure_preview_ready(db, install_dir, Some(&config_path)) {
+            Ok(report) => {
+                self.log_lines.push(format!(
+                    "ブラウザプレビューを有効にしました (エンコーダ: {} / 映像: {})",
+                    report.encoder_path, report.video_encoder
+                ));
+                if report.preprocessor_path.is_empty() {
+                    self.log_lines
+                        .push("前段処理 (tsreadex) は未設定です。字幕が表示されない場合があります。".to_string());
+                }
+                self.log_lines.extend(report.warnings);
+            }
+            Err(e) => self.log_lines.push(format!(
+                "ブラウザプレビューの準備に失敗しました (視聴・録画には影響しません): {e}"
+            )),
+        }
     }
 
     /// セットアップ本体の最後に、インストールした実行ファイルをOSの
@@ -987,6 +1023,16 @@ impl SetupApp {
                 &mut self.recreate_db,
                 "既存のデータベースを作り直す(元のファイルは自動でバックアップされます)",
             );
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.checkbox(
+            &mut self.setup_preview,
+            "ブラウザで映像を確認できるようにする(エンコーダーを自動で用意します)",
+        );
+        if self.setup_preview {
+            ui.label("※ 必要なプログラムをインターネットから取得するため、数分かかることがあります。");
         }
 
         if recisdb_proxy::service::is_supported() {

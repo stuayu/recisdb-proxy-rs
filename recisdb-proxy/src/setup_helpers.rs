@@ -464,7 +464,7 @@ pub fn detect_tuners(install_dir: &Path) -> Vec<DetectedTuner> {
 /// `\D` が不正なエスケープシーケンスとして扱われて設定ファイルが壊れ、
 /// recisdb-proxy本体が起動できなくなる(`\r`のように偶然有効なエスケープに
 /// 化けて経路が化けるケースもある)。
-fn escape_toml_basic_string(s: &str) -> String {
+pub(crate) fn escape_toml_basic_string(s: &str) -> String {
     s.replace('\\', "\\\\")
 }
 
@@ -481,7 +481,7 @@ const CONFIG_TEMPLATE: &str = include_str!("../recisdb-proxy.toml.example");
 /// テンプレート側の構造が変わってキーが見つからなかった場合、値が反映されない
 /// まま古い既定値が黙って使われる事故を防ぐため panic する(セットアップ時に
 /// すぐ気付けるように)。
-fn replace_scalar_in_section(template: &str, section: &str, key: &str, new_value: &str) -> String {
+pub(crate) fn replace_scalar_in_section(template: &str, section: &str, key: &str, new_value: &str) -> String {
     let key_prefix = format!("{key} = ");
     let mut current_section = String::new();
     let mut replaced = false;

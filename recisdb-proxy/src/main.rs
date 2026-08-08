@@ -235,6 +235,7 @@ async fn run_server(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load config file: explicit path > auto-detect > default
+    let config_path_for_web = app_config::resolve_config_path(&args);
     let file_config = app_config::load_file_config(&args)?;
 
     // Merge logging configs (command line takes precedence)
@@ -555,6 +556,7 @@ async fn run_server(
             web_log_dir,
             mirakurun_enabled,
             Some(listen_addr),
+            config_path_for_web,
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

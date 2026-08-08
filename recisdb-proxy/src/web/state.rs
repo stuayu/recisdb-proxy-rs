@@ -435,6 +435,10 @@ pub struct WebState {
     /// — `[logging] log_dir` resolved in `main.rs`/`app_config.rs`. Used by
     /// `GET /api/logs/files` and `GET /api/logs/files/:name`.
     pub log_dir: PathBuf,
+    /// 起動時に読み込んだ設定ファイルのパス。プレビュー自動セットアップが
+    /// `[preview]` の実行ファイルパスを書き戻す先。`None` のときは書き戻せない
+    /// (= 次回起動で設定が巻き戻る) ので、その旨を警告として返す。
+    pub config_path: Option<PathBuf>,
 }
 
 impl WebState {
@@ -455,6 +459,7 @@ impl WebState {
             session_registry,
             auth,
             proxy_listen_addr: None,
+            config_path: None,
             update_check_cache: RwLock::new(None),
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,
