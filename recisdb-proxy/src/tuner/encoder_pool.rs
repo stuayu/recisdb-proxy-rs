@@ -309,7 +309,40 @@ fn spawn_process(
         .stdout(stdout_cfg)
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    // 実際に起動したコマンドラインをそのまま残す。プレビューが映らないときに
+    // 「同じものを手で実行して確かめる」ができるかどうかで、切り分けの手間が
+    // まるで変わる。引数はDBのプロファイルから来るので、ログを見ないと
+    // 何が渡ったのか分からない。
+    info!("[SharedEncoder] spawn: {} {}", command_path, args.join(" "));
+
     cmd.spawn()
+}
+
+/// stderr の1行がエラーを報せているか。
+///
+/// ffmpeg は `-loglevel error` を付けていれば本当に問題があるときしか喋らない
+/// が、利用者がプロファイルを書き換えれば冗長にもなりうる。エラーらしい行だけ
+/// `warn!` に上げ、残りは `debug!` に置くことで、既定のログレベルでも
+/// 「映らない理由」が見えて、かつ大量出力でログを埋めない。
+fn stderr_line_looks_like_an_error(line: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "error",
+        "Error",
+        "ERROR",
+        "failed",
+        "Failed",
+        "Invalid",
+        "invalid",
+        "Unrecognized",
+        "not found",
+        "No such",
+        "Unable to",
+        "Could not",
+        "Conversion failed",
+        "Permission denied",
+    ];
+    NEEDLES.iter().any(|needle| line.contains(needle))
 }
 
 /// Forward a chain member's stderr to the log, tagged with the encode key
@@ -319,10 +352,17 @@ fn spawn_stderr_logger(label: String, sid: Option<u16>, stderr: tokio::process::
         let mut lines = BufReader::new(stderr).lines();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => match sid {
-                    Some(sid) => debug!("[SharedEncoder {} SID={}] {}", label, sid, line),
-                    None => debug!("[SharedEncoder {}] {}", label, line),
-                },
+                Ok(Some(line)) => {
+                    let tagged = match sid {
+                        Some(sid) => format!("[SharedEncoder {} SID={}] {}", label, sid, line),
+                        None => format!("[SharedEncoder {}] {}", label, line),
+                    };
+                    if stderr_line_looks_like_an_error(&line) {
+                        warn!("{}", tagged);
+                    } else {
+                        debug!("{}", tagged);
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => {
                     warn!("[SharedEncoder {}] stderr read failed: {}", label, e);
@@ -689,8 +729,28 @@ impl SharedEncoder {
 
         if let Some(mut tasks) = self.tasks.lock().await.take() {
             for mut child in tasks.children.drain(..).rev() {
-                if let Err(e) = child.start_kill() {
-                    debug!("[SharedEncoder {:?}] kill skipped: {}", self.key.channel_key, e);
+                // 先に「もう自分で終わっていないか」を見る。エンコーダが自分から
+                // 落ちた場合の終了コードは、こちらが kill した後では取れず、
+                // 「なぜ映らないのか」を追う手がかりが消える。
+                let already_exited = match child.try_wait() {
+                    Ok(Some(status)) => {
+                        warn!(
+                            "[SharedEncoder {:?}] チェーンのプロセスが自分で終了していました: {} \
+                             (直前の stderr を確認してください)",
+                            self.key.channel_key, status
+                        );
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        debug!("[SharedEncoder {:?}] try_wait failed: {}", self.key.channel_key, e);
+                        false
+                    }
+                };
+                if !already_exited {
+                    if let Err(e) = child.start_kill() {
+                        debug!("[SharedEncoder {:?}] kill skipped: {}", self.key.channel_key, e);
+                    }
                 }
                 let _ = child.wait().await;
             }
@@ -1413,5 +1473,39 @@ mod tests {
             other => panic!("expected watchdog to close the broadcast channel, got {:?}", other),
         }
         assert!(!encoder.is_running());
+    }
+}
+
+#[cfg(test)]
+mod stderr_classification_tests {
+    use super::stderr_line_looks_like_an_error;
+
+    #[test]
+    fn real_ffmpeg_failures_are_surfaced() {
+        // 実際にこの環境で出たもの / 出うるもの。既定のログレベルで
+        // 見えないと「映らない」の原因が追えない。
+        for line in [
+            "Unrecognized option 'foo'.",
+            "Error splitting the argument list: Option not found",
+            "pipe:0: Invalid data found when processing input",
+            "Conversion failed!",
+            "[h264_videotoolbox @ 0x1] Error encoding frame: -12902",
+            "tsreadex: Error: not enough arguments.",
+            "/opt/homebrew/bin/ffmpeg: No such file or directory",
+        ] {
+            assert!(stderr_line_looks_like_an_error(line), "見逃している: {line}");
+        }
+    }
+
+    #[test]
+    fn routine_chatter_stays_out_of_the_way() {
+        // プロファイルを冗長なログレベルに書き換えられてもログを埋めない。
+        for line in [
+            "frame=  120 fps= 30 q=-1.0 size=    1024kB time=00:00:04.00 bitrate=2097.2kbits/s speed=1.0x",
+            "  Stream #0:0[0x111]: Video: h264 (High), yuv420p, 1440x1080",
+            "Press [q] to stop, [?] for help",
+        ] {
+            assert!(!stderr_line_looks_like_an_error(line), "誤検知: {line}");
+        }
     }
 }
