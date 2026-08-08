@@ -314,6 +314,18 @@ impl TunerPool {
         mutex.lock_owned().await
     }
 
+    /// Keys with a pending keep-alive (idle-close) timer.
+    ///
+    /// This is what separates "still running only because of the keep-alive
+    /// window" from "just created, its subscriber is about to attach": both
+    /// have zero subscribers, but only the former has a timer counting down.
+    /// The selection policy needs the difference — a keep-alive leftover may
+    /// be taken over, a reader whose caller is still setting up must not be
+    /// (docs/TUNER_PIPELINE_REDESIGN.md).
+    pub async fn keys_pending_idle_close(&self) -> Vec<ChannelKey> {
+        self.idle_tasks.lock().await.keys().cloned().collect()
+    }
+
     /// Cancel an idle-close timer if it exists.
     pub async fn cancel_idle_close(&self, key: &ChannelKey) {
         let mut idle_tasks = self.idle_tasks.lock().await;

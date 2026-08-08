@@ -119,6 +119,126 @@ impl Client {
     }
 }
 
+/// Open a session, join `group`, tune to `(space, channel)` and start
+/// streaming. Returns the live client, or the first failure as a string.
+fn open_tuned_session(space: u32, channel: u32) -> Result<Client, String> {
+    let mut ts = 0usize;
+    let mut c = Client::connect();
+
+    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    match c.recv_control(&mut ts) {
+        ServerMessage::HelloAck { success: true, .. } => {}
+        other => return Err(format!("Hello: {other:?}")),
+    }
+
+    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    match c.recv_control(&mut ts) {
+        ServerMessage::OpenTunerAck { success: true, .. } => {}
+        ServerMessage::OpenTunerAck { error_code, .. } => {
+            return Err(format!("OpenTuner error_code={error_code}"))
+        }
+        other => return Err(format!("OpenTuner: {other:?}")),
+    }
+
+    c.send(ClientMessage::SetChannelSpace { space, channel, priority: 0, exclusive: false });
+    match c.recv_control(&mut ts) {
+        ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
+        ServerMessage::SetChannelSpaceAck { error_code, .. } => {
+            return Err(format!("SetChannelSpace error_code={error_code}"))
+        }
+        other => return Err(format!("SetChannelSpace: {other:?}")),
+    }
+
+    c.send(ClientMessage::StartStream);
+    match c.recv_control(&mut ts) {
+        ServerMessage::StartStreamAck { success: true, .. } => {}
+        ServerMessage::StartStreamAck { error_code, .. } => {
+            return Err(format!("StartStream error_code={error_code}"))
+        }
+        other => return Err(format!("StartStream: {other:?}")),
+    }
+
+    Ok(c)
+}
+
+/// Concurrent-session matrix. `BNDP_MATRIX` is a comma-separated list of
+/// client-view channel indices, one per session, all started together:
+///
+/// - `0,1,2,3,4` — five distinct channels; each needs its own tuner, so this
+///   is the "every receiver in use" case on a five-receiver group.
+/// - `0,1,2,3,4,5` — one more than there are receivers; the last must fail
+///   rather than push a driver over `max_instances`.
+/// - `0,0,0,0,0` — one channel, five viewers; all must succeed by joining a
+///   single reader (P1b §6).
+///
+/// Prints a per-session table and asserts only that *successes stream* and
+/// that the count of successes matches `BNDP_MATRIX_EXPECT_OK` when set.
+#[test]
+#[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
+fn matrix_concurrent_sessions() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let plan: Vec<u32> = std::env::var("BNDP_MATRIX")
+        .unwrap_or_else(|_| "0,1,2,3,4".to_string())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let expect_ok: Option<usize> =
+        std::env::var("BNDP_MATRIX_EXPECT_OK").ok().and_then(|v| v.parse().ok());
+
+    // Start every session at once: staggering them would hide races in the
+    // selection path, which is exactly what a matrix run is for.
+    let handles: Vec<_> = plan
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, ch)| std::thread::spawn(move || (i, ch, open_tuned_session(space, ch))))
+        .collect();
+
+    let mut live = Vec::new();
+    let mut results: Vec<(usize, u32, Result<(), String>)> = Vec::new();
+    for h in handles {
+        let (i, ch, r) = h.join().expect("session thread");
+        match r {
+            Ok(c) => {
+                results.push((i, ch, Ok(())));
+                live.push((i, ch, c));
+            }
+            Err(e) => results.push((i, ch, Err(e))),
+        }
+    }
+
+    // Confirm the ones that got in actually receive.
+    let mut streamed = Vec::new();
+    for (i, ch, c) in live.iter_mut() {
+        let got = c.drain_ts(Duration::from_secs(4));
+        streamed.push((*i, *ch, got));
+    }
+
+    results.sort_by_key(|(i, _, _)| *i);
+    println!("\n--- session matrix (space={space}) ---");
+    for (i, ch, r) in &results {
+        let bytes = streamed.iter().find(|(j, _, _)| j == i).map(|(_, _, b)| *b);
+        match (r, bytes) {
+            (Ok(()), Some(b)) => println!("  session {i}: channel {ch} → OK, {b} bytes"),
+            (Ok(()), None) => println!("  session {i}: channel {ch} → OK (no drain)"),
+            (Err(e), _) => println!("  session {i}: channel {ch} → REJECTED ({e})"),
+        }
+    }
+
+    let ok = results.iter().filter(|(_, _, r)| r.is_ok()).count();
+    println!("  → {ok}/{} sessions admitted", results.len());
+
+    for (i, ch, got) in &streamed {
+        assert!(
+            *got > 188 * 200,
+            "session {i} (channel {ch}) was admitted but delivered only {got} bytes"
+        );
+    }
+    if let Some(expect) = expect_ok {
+        assert_eq!(ok, expect, "expected exactly {expect} sessions to be admitted");
+    }
+}
+
 /// A session must be able to switch channels on a `max_instances = 1`
 /// driver. The old reader is not stopped until after the new one is in
 /// place, so the switch only works if the session's own slot permit is

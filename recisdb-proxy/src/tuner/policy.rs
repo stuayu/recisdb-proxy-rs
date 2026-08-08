@@ -235,6 +235,11 @@ pub struct EntryState {
     /// channel (already resolved to a plain `i32`, matching every call
     /// site's `.unwrap_or(Some(0)).unwrap_or(0)` pattern).
     pub priority: i32,
+    /// Whether a keep-alive (idle-close) timer is counting down on this
+    /// entry. Only meaningful when nothing is subscribed, and it is what
+    /// distinguishes a keep-alive leftover (takeable) from an entry whose
+    /// caller has tuned it but not yet subscribed (not takeable).
+    pub idle_close_pending: bool,
 }
 
 impl EntryState {
@@ -243,8 +248,33 @@ impl EntryState {
     }
 
     /// Equivalent to the old `running: bool` field / `SharedTuner::is_running()`.
+    ///
+    /// Only true once TS is actually flowing. Use it to decide whether an
+    /// entry is *usable*, never whether its driver has room — for that see
+    /// [`Self::occupies_slot`].
     pub fn is_running(&self) -> bool {
         self.state == crate::tuner::shared::ReaderState::Running
+    }
+
+    /// Whether this entry is holding a slot on its driver — mirrors
+    /// [`crate::tuner::SharedTuner::occupies_slot`].
+    ///
+    /// Capacity questions must use this, not [`Self::is_running`]. An entry
+    /// that is `Reserved`/`Starting` has a driver slot reserved and a
+    /// BonDriver open in flight, but is not `Running` yet; counting only
+    /// `Running` made a driver look free for the whole (multi-second) open
+    /// window. Concurrent group selections then all picked the *same*
+    /// driver, and every one but the winner failed — including on `acquire`'s
+    /// retries, since each fresh snapshot repeated the same mistake.
+    pub fn occupies_slot(&self) -> bool {
+        use crate::tuner::shared::ReaderState;
+        matches!(
+            self.state,
+            ReaderState::Reserved
+                | ReaderState::Starting
+                | ReaderState::Running
+                | ReaderState::Stopping
+        )
     }
 }
 
@@ -262,14 +292,17 @@ impl TunerSnapshot {
     fn running_count_excluding(&self, dll_path: &str, exclude: Option<&ChannelKey>) -> i32 {
         self.entries
             .iter()
-            .filter(|e| e.is_running() && e.key.tuner_path == dll_path && exclude != Some(&e.key))
+            .filter(|e| e.occupies_slot() && e.key.tuner_path == dll_path && exclude != Some(&e.key))
             .count() as i32
     }
 
     fn running_channel_specs(&self) -> Vec<(String, ChannelKeySpec)> {
         self.entries
             .iter()
-            .filter(|e| e.is_running())
+            // `occupies_slot`, not `is_running`: a driver already opening
+            // this exact channel is the right one to join rather than open a
+            // second instance for.
+            .filter(|e| e.occupies_slot())
             .map(|e| (e.key.tuner_path.clone(), e.key.channel.clone()))
             .collect()
     }
@@ -371,7 +404,7 @@ fn build_max_instances_map(snapshot: &TunerSnapshot) -> HashMap<String, i32> {
 fn build_instances_map(snapshot: &TunerSnapshot, exclude: Option<&ChannelKey>) -> HashMap<String, i32> {
     let mut map: HashMap<String, i32> = HashMap::new();
     for e in &snapshot.entries {
-        if !e.is_running() || exclude == Some(&e.key) {
+        if !e.occupies_slot() || exclude == Some(&e.key) {
             continue;
         }
         *map.entry(e.key.tuner_path.clone()).or_insert(0) += 1;
@@ -441,15 +474,32 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
     )
 }
 
-/// May `req` take the slot currently held by an incumbent at
-/// `victim_priority`?
+/// May `req` take the slot currently held by this incumbent?
 ///
-/// Strictly greater, not `>=`: a request that merely ties the incumbent does
-/// not get to displace it (P2b-3; before that, an equal-priority request
-/// evicted, which made a second viewer of an equally-ranked channel able to
-/// bump the first for no gain). An `exclusive` request is the one exception —
-/// it is asking for the hardware outright, and wins ties.
-fn may_evict(req: &TuneRequest, victim_priority: i32) -> bool {
+/// Two different questions, depending on whether anyone is actually watching
+/// the incumbent:
+///
+/// - **idle** (no subscribers) — always yes. It is only alive because of the
+///   keep-alive window.
+/// - **live viewer** — only if `req` strictly outranks it, or is `exclusive`.
+///   Strictly greater, not `>=`: a request that merely ties does not get to
+///   displace a working stream (P2b-3; before that `>=` let an
+///   equal-priority request bump whoever got there first for no gain). An
+///   `exclusive` request is the exception — it is asking for the hardware
+///   outright, and wins ties.
+fn may_evict(req: &TuneRequest, victim_priority: i32, victim_is_keep_alive: bool) -> bool {
+    if victim_is_keep_alive {
+        // Nobody is watching it and its keep-alive timer is already running.
+        // That window exists to make zapping back cheap — an optimisation,
+        // not a claim on the hardware — so it yields even on a tie. On a
+        // fully-booked group, letting it win would reject a real viewer.
+        //
+        // Note this is *not* "zero subscribers": an entry that was just
+        // tuned and whose caller has not subscribed yet also has none, and
+        // taking that one away would break the request that created it.
+        return true;
+    }
+    // Displacing a live viewer is the case the priority rule is for.
     req.priority > victim_priority || req.exclusive
 }
 
@@ -470,6 +520,17 @@ fn eviction_options(snapshot: &TunerSnapshot, dll_path: &str) -> (Option<Evictio
     let idle: Vec<EvictionCandidate> = all.iter().filter(|(_, _, subs)| !subs).cloned().collect();
 
     (choose_eviction_target(&idle), choose_eviction_target(&all))
+}
+
+/// Is this key a keep-alive leftover — running, unsubscribed, and already
+/// counting down to idle-close?
+fn is_keep_alive_leftover(snapshot: &TunerSnapshot, key: &ChannelKey) -> bool {
+    snapshot
+        .entries
+        .iter()
+        .find(|e| &e.key == key)
+        .map(|e| !e.has_subscribers() && e.idle_close_pending)
+        .unwrap_or(false)
 }
 
 /// Capacity handling for a driver that has no free slot, unified across the
@@ -502,7 +563,7 @@ fn decide_at_capacity(
 
     for option in [idle_victim, any_victim].into_iter().flatten() {
         let (victim, victim_priority, _) = option;
-        if may_evict(req, victim_priority) {
+        if may_evict(req, victim_priority, is_keep_alive_leftover(snapshot, &victim)) {
             return Decision::Create {
                 key: primary,
                 evict: vec![victim],
@@ -557,7 +618,7 @@ fn decide_fallback(
                 // Never evict the very entry we are about to (re)use.
                 continue;
             }
-            if may_evict(req, victim_priority) {
+            if may_evict(req, victim_priority, is_keep_alive_leftover(snapshot, &victim)) {
                 return Decision::Create { key, evict: vec![victim] };
             }
         }
@@ -709,6 +770,10 @@ mod tests {
             state: if running { ReaderState::Running } else { ReaderState::Stopped },
             subscribers,
             priority,
+            // Most tests are about live-vs-idle and priority; a
+            // subscriber-less entry stands in for a keep-alive leftover
+            // unless a test says otherwise.
+            idle_close_pending: subscribers == 0,
         }
     }
 
@@ -797,21 +862,45 @@ mod tests {
         );
     }
 
-    /// P2b-3: a tie does **not** displace the incumbent. Previously `>=`
+    /// P2b-3: a tie does **not** displace a *live viewer*. Previously `>=`
     /// let an equally-ranked request bump whoever got there first, which
     /// gains nothing and interrupts a working stream.
     #[test]
-    fn equal_priority_does_not_evict_the_incumbent() {
+    fn equal_priority_does_not_evict_a_live_viewer() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
-            entries: vec![entry("A.dll", 0, 1, true, 0, 7)],
+            entries: vec![entry("A.dll", 0, 1, true, 1, 7)],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 7; // exactly equal, not strictly greater.
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: Some(7) } }
+            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
+        );
+    }
+
+    /// ...but an *idle* incumbent yields even on a tie. It is only still
+    /// running because of the keep-alive window, and letting that block a
+    /// real viewer would reject the request outright on a fully-booked
+    /// group. (Found by the concurrent-session matrix on real hardware: a
+    /// keep-alive reader left over from a previous run kept turning away a
+    /// new viewer.)
+    #[test]
+    fn an_idle_incumbent_yields_even_on_a_priority_tie() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 0, 7)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 7;
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create {
+                key: ChannelKey::space_channel("A.dll", 0, 9),
+                evict: vec![ChannelKey::space_channel("A.dll", 0, 1)],
+            }
         );
     }
 
@@ -821,7 +910,7 @@ mod tests {
     fn exclusive_request_wins_a_priority_tie() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
-            entries: vec![entry("A.dll", 0, 1, true, 0, 7)],
+            entries: vec![entry("A.dll", 0, 1, true, 1, 7)],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 7;
@@ -836,19 +925,20 @@ mod tests {
         );
     }
 
-    /// Rule: insufficient priority with no fallback candidate rejects.
+    /// Rule: insufficient priority against a live viewer, with no fallback
+    /// candidate, rejects.
     #[test]
     fn capacity_limit_rejects_when_priority_insufficient_and_no_fallback() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
-            entries: vec![entry("A.dll", 0, 1, true, 0, 100)],
+            entries: vec![entry("A.dll", 0, 1, true, 2, 100)],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 1;
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: Some(100) } }
+            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
         );
     }
 
@@ -859,7 +949,7 @@ mod tests {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1), driver("B.dll", 2)],
             entries: vec![
-                entry("A.dll", 0, 1, true, 0, 100),
+                entry("A.dll", 0, 1, true, 3, 100), // live viewers, outranks us
                 entry("B.dll", 0, 1, true, 1, 0),
             ],
         };
@@ -984,6 +1074,99 @@ mod tests {
         );
     }
 
+    /// A driver whose only entry is still *opening* is not free. Counting
+    /// just `Running` made concurrent group selections all pick the same
+    /// driver — every one of them saw it idle for the whole BonDriver-open
+    /// window, and all but the winner failed (including on retry, since each
+    /// fresh snapshot repeated the mistake).
+    #[test]
+    fn a_starting_reader_makes_its_driver_count_as_occupied() {
+        let mut starting = entry("A.dll", 0, 1, true, 0, 0);
+        starting.state = crate::tuner::shared::ReaderState::Starting;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 1)],
+            entries: vec![starting],
+        };
+        let req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] },
+            "the second requester must move to the free driver, not pile onto the one mid-open"
+        );
+    }
+
+    /// The same goes for `Reserved`: the pool has handed the entry out and a
+    /// caller owes it a reader start.
+    #[test]
+    fn a_reserved_entry_makes_its_driver_count_as_occupied() {
+        let mut reserved = entry("A.dll", 0, 1, true, 0, 0);
+        reserved.state = crate::tuner::shared::ReaderState::Reserved;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 1)],
+            entries: vec![reserved],
+        };
+        let req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+        );
+    }
+
+    /// Joining wins over opening a second instance even while the first is
+    /// still coming up: a request for the channel a driver is *opening*
+    /// reuses that entry.
+    #[test]
+    fn a_request_for_a_channel_being_opened_joins_it() {
+        let mut starting = entry("A.dll", 0, 9, true, 0, 0);
+        starting.state = crate::tuner::shared::ReaderState::Starting;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 1)],
+            entries: vec![starting],
+        };
+        let req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Reuse { key: ChannelKey::space_channel("A.dll", 0, 9) }
+        );
+    }
+
+    /// A tuner that has been tuned but not yet subscribed to must not be
+    /// taken away: its caller is between `SetChannelSpace` and
+    /// `StartStream`. Only a *keep-alive leftover* (idle-close already
+    /// counting down) yields on a tie.
+    ///
+    /// Found on hardware: with "no subscribers" alone as the test, five
+    /// sessions starting at once evicted each other's freshly-tuned readers
+    /// and every one of them ended up with zero bytes.
+    #[test]
+    fn a_tuned_but_not_yet_subscribed_reader_is_not_taken_over() {
+        let mut fresh = entry("A.dll", 0, 1, true, 0, 0);
+        fresh.idle_close_pending = false; // nobody scheduled a keep-alive: it is still being set up
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![fresh],
+        };
+        let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: Some(0) } },
+            "a reader whose subscriber has not attached yet must survive"
+        );
+    }
+
     /// Rule 8: this session's own slot, when it will be freed by the
     /// switch, is excluded from the driver's running count — so a driver
     /// that looks "full" by raw count still has capacity once the caller's
@@ -998,6 +1181,7 @@ mod tests {
                 state: crate::tuner::shared::ReaderState::Running,
                 subscribers: 0,
                 priority: 0,
+                idle_close_pending: true,
             }],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
@@ -1025,6 +1209,7 @@ mod tests {
                 state: crate::tuner::shared::ReaderState::Running,
                 subscribers: 0,
                 priority: 42,
+                idle_close_pending: true,
             }],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);

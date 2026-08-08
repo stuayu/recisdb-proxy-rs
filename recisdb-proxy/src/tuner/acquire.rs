@@ -37,7 +37,8 @@
 //! I/O (which would stop it being a pure function reasoning about one
 //! instant), `acquire` detects these two situations and reruns the whole
 //! `snapshot` → `decide` → act sequence against fresh state, up to
-//! [`MAX_ACQUIRE_ATTEMPTS`] times before giving up with
+//! a candidate-count-derived number of times (see `max_attempts`) before
+//! giving up with
 //! [`AcquireError::Conflict`].
 
 use log::{info, warn};
@@ -120,7 +121,7 @@ pub(crate) enum AcquireError {
     /// eviction — mirrors [`policy::RejectReason::AtCapacity`].
     #[error("all tuner slot(s) on the requested driver are in use (lowest idle priority observed: {lowest_idle_priority:?})")]
     AtCapacity { lowest_idle_priority: Option<i32> },
-    /// [`MAX_ACQUIRE_ATTEMPTS`] snapshot→decide→act rounds all lost a race
+    /// Every snapshot→decide→act round lost a race
     /// against concurrent pool activity (see this module's doc comment).
     #[error("gave up after {0} attempt(s) racing a concurrent tuner-pool change")]
     Conflict(u32),
@@ -146,13 +147,18 @@ impl From<RejectReason> for AcquireError {
     }
 }
 
-/// Upper bound on `snapshot` → `decide` → act rounds within one [`acquire`]
-/// call (see the module doc comment). Kept small and fixed rather than
-/// configurable: every retry means this call already lost a race against
-/// another task's pool mutation, which is inherently rare, so a handful of
-/// attempts either resolves it or signals a genuinely stuck situation (e.g.
-/// the driver is permanently oversubscribed) that more retries would not fix.
-const MAX_ACQUIRE_ATTEMPTS: u32 = 3;
+/// Upper bound on `snapshot` → `decide` → act rounds within one [`acquire`].
+///
+/// Scales with the candidate count rather than being a small constant.
+/// Concurrent requesters are perfectly synchronised: they all snapshot the
+/// same state, all rank the same driver first, and exactly one wins its
+/// permit — so N simultaneous requests need up to N rounds to spread across
+/// N drivers. A fixed budget of 3 silently capped a five-receiver group at
+/// three concurrent viewers. The `+ 2` covers races that are not
+/// self-inflicted (another process taking a slot, an entry vanishing).
+fn max_attempts(candidates: usize) -> usize {
+    candidates + 2
+}
 
 /// Build a [`TunerSnapshot`] of `dll_paths`' driver rows plus every pool
 /// entry currently sitting on one of them.
@@ -188,6 +194,8 @@ pub(crate) async fn snapshot(
         space: u32,
         channel: u32,
     }
+
+    let pending_idle_close = pool.keys_pending_idle_close().await;
 
     let mut raw_entries = Vec::new();
     for key in pool.keys().await {
@@ -239,6 +247,7 @@ pub(crate) async fn snapshot(
         .into_iter()
         .zip(priorities)
         .map(|(e, priority)| EntryState {
+            idle_close_pending: pending_idle_close.contains(&e.key),
             key: e.key,
             state: e.state,
             subscribers: e.subscribers,
@@ -345,10 +354,30 @@ pub(crate) async fn acquire(
     let mut carried_permit = request.carried_permit;
     let mut warm = request.warm;
 
-    for attempt in 0..MAX_ACQUIRE_ATTEMPTS {
+    let attempts = max_attempts(request.candidates.len());
+    let mut exhausted: Vec<String> = Vec::new();
+
+    for attempt in 0..attempts {
         let snap = snapshot(pool, database, &dll_paths).await;
+
+        // Drop drivers whose permit we already failed to get in this call.
+        // Without this the retry is pointless under contention: every loser
+        // re-derives the same ranking from the same fresh state and picks the
+        // same driver again, so each round admits exactly one requester.
+        // Excluding what we just found full turns the retry into "try the
+        // next driver" and bounds progress at one round per candidate.
+        let candidates: Vec<ChannelKey> = request
+            .candidates
+            .iter()
+            .filter(|k| !exhausted.iter().any(|p| p == &k.tuner_path))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Err(AcquireError::AtCapacity { lowest_idle_priority: None });
+        }
+
         let tune_req = policy::TuneRequest {
-            candidates: request.candidates.clone(),
+            candidates,
             priority: request.priority,
             exclusive: request.exclusive,
             own_key: request.own_key.clone(),
@@ -419,8 +448,10 @@ pub(crate) async fn acquire(
                             None => {
                                 // The snapshot said this driver would have
                                 // (or would gain, via `evict`) a free slot,
-                                // but a fresh ask still failed — another
-                                // task raced us. Stale snapshot, try again.
+                                // but a fresh ask still failed — someone took
+                                // it first. Remember that so the next round
+                                // moves on instead of choosing it again.
+                                exhausted.push(key.tuner_path.clone());
                                 continue;
                             }
                         },
@@ -500,7 +531,7 @@ pub(crate) async fn acquire(
         }
     }
 
-    Err(AcquireError::Conflict(MAX_ACQUIRE_ATTEMPTS))
+    Err(AcquireError::Conflict(attempts as u32))
 }
 
 // Test-only: neither `SharedTuner` nor `WarmTunerHandle` implement `Debug`
@@ -781,20 +812,23 @@ mod tests {
 
         // Hold the driver's only slot *outside* the pool entirely (no
         // `SharedTuner`/pool entry backs it) — `decide` will see zero
-        // running entries in every snapshot (since nothing is in the pool)
-        // and keep choosing `Create` with no eviction needed, but
-        // `TunerPool::acquire_slot` will keep failing for real. This is
-        // exactly the "snapshot says there's room, reality disagrees"
-        // condition `acquire`'s retry loop exists for — and here reality
-        // never catches up, so it must hit the cap rather than loop forever.
+        // running entries in the snapshot (since nothing is in the pool) and
+        // choose `Create` with no eviction needed, but
+        // `TunerPool::acquire_slot` fails for real. This is exactly the
+        // "snapshot says there's room, reality disagrees" condition the
+        // retry loop exists for, and here reality never catches up.
         let _held_forever = pool.acquire_slot(path, 1).await.unwrap();
 
         let key = ChannelKey::space_channel(path, 0, 1);
         let result = acquire(&pool, &database, empty_request(vec![key])).await;
 
+        // With a single candidate, the first failed permit exhausts the only
+        // driver there is, so the honest answer is "at capacity" rather than
+        // "gave up racing" — and it is reached without burning the whole
+        // retry budget on a driver already known to be full.
         assert!(
-            matches!(&result, Err(AcquireError::Conflict(n)) if *n == MAX_ACQUIRE_ATTEMPTS),
-            "expected a bounded Conflict, got {result:?}"
+            matches!(&result, Err(AcquireError::AtCapacity { .. })),
+            "expected AtCapacity once the only candidate is known full, got {result:?}"
         );
         assert_eq!(pool.count().await, 0, "no entry should have been left behind by the abandoned attempts");
     }
