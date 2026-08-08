@@ -35,12 +35,16 @@ tsreplace 複数ストリームの高速化、ブラウザプレビュー、お�
 BonDriver DLL / char device
    │  spawn_blocking 内の読み取りループ (SharedTuner)
    │  256KB チャンク (TS_CHUNK_SIZE = 262144)
+   │  読む → B25 デコード → 配る だけ (SI 収集はここではやらない)
    ▼
 broadcast::channel(4096)               ← 全購読セッションへファンアウト (BROADCAST_CAPACITY)
    │  遅い購読者は RecvError::Lagged(n) → packets_dropped += n、carry クリア
+   ├─→ SI 収集タスク (spawn_si_collector): SDT/CDT → ロゴ、EIT → EPG
+   │     subscribe_untracked (購読数に計上しない) + Weak
    ▼
 Session (単一 async タスク)
    │  ts_send_carry で 188 バイト境界に再アライメント (0x47 同期)
+   │  ただし「残りなし・188 の倍数・先頭が同期バイト」なら carry を迂回して素通し
    │  [任意] tsreplace パイプ (SID 毎に連鎖、OS パイプ)
    ▼
 mpsc::channel(256)  TS 用 (TS_WRITE_BUFFER_CAPACITY)

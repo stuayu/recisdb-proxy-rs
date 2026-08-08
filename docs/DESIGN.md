@@ -148,9 +148,26 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
 - `ChannelKey = (tuner_path, ChannelKeySpec)`。同一チャンネル要求は既存 SharedTuner に**合流** (subscriber += 1)。
 - SharedTuner は `tokio::sync::broadcast` で TS チャンクを全購読者へ配布。
   読み取りループは `spawn_blocking` 内 (BonDriver が Send 非対応のため)。
+- **購読は RAII**: `subscribe()` が返す `TunerSubscription` の `Drop` で購読数が減る。
+  手動 `unsubscribe()` は廃止。エンコーダ等の寄生的な消費者は
+  `subscribe_untracked()` (`UntrackedSubscription`) を使い、購読数に計上しない。
+- **リーダーの状態機械**: `ReaderState = Idle | Reserved | Starting | Running | Stopping | Stopped`。
+  `Reserved` (プールが entry を作ったが起動はまだ) と `Starting` (起動実行中) を分けているのは、
+  「リーダーを起動すべきか」の判定がこの 2 つを混ぜると必ず誤る (起動をサボるか、
+  他タスクの起動に重ねて二重オープンするか) ため。導出述語:
+  - `occupies_slot()` … Reserved/Starting/Running/Stopping。容量計上・prewarm 抑止
+  - `needs_reader_start()` … Starting/Running 以外。リーダー起動の要否
+  - `is_reclaimable()` … (Idle/Stopped) かつ購読者なし。**プール内部**の stale 掃除
+  - `is_orphanable()` … Starting/Running 以外かつ購読者なし。**entry 所有者**による返却
+- **停止の理由**: `StopReason = Unspecified | Evicted | ReaderFailed | Released` を停止の起点で記録し、
+  状態変化は `tokio::sync::watch` で配信する。セッションは自分のチューナーの状態を購読し、
+  退避やドライバ障害を即座に検知して理由付きで切断する (旧: 2 秒周期のポーリング)。
 - **keep-alive**: subscriber が 0 になっても `keep_alive_secs` (既定 60s、DB `tuner_config` で変更可) は
   リーダーを維持し、ザッピング戻りを即応させる。`cancel_idle_close()` で復帰。
-- **prewarm**: OpenTuner 時に DLL 未使用ならウォームチューナーを起動して初回選局を高速化。
+- **prewarm**: OpenTuner 時に DLL に空きスロットがあればウォームチューナーを起動して初回選局を高速化。
+  warm ハンドルもスロット permit を保持する (開いている以上、容量を占有しているため)。
+- **SI 収集は別タスク**: SDT/CDT (ロゴ) と EIT (EPG) の収集は、クライアントと同じ broadcast を
+  購読する専用タスク (`spawn_si_collector`) が行う。読み取りスレッド上では走らせない。
 - **選局シーケンス (Round 3 確定仕様)**: `SetChannel → Purge → 短い sleep → ACK 送信 → (シグナルはログのみ)`。
   シグナルロック待ちで ACK を遅らせてはならない。停止応答は `wait_ts_stream(100ms)`、stop_reader タイムアウト 1s。
   これらの時定数は `tuner/timing.rs` に集約 (docs/TUNER_PIPELINE_REDESIGN.md P2a)。
@@ -166,15 +183,53 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   リーダー側も `ready_tx.send()` の戻り値を見て、送信失敗 (= 呼び出し元が待ちをあきらめた) なら
   読み取りループへ入らずその場でスロットを解放して終了する。
 
-### 4.4 優先度・排他・容量制御
+### 4.4 選局ポリシー (優先度・排他・容量)
 
-- 優先度の決定順: `exclusive=true → i32::MAX` > `クライアント指定 (>0)` > `channels.priority (DB)` > `0`。
-- 目安: 録画(排他)=255 / 録画=200 / 視聴=10 / スキャン=0。
-  **サーバー側でクライアント申告値を制限する仕組みは未実装 (REVIEW S3)。**
-- 容量: `bon_drivers.max_instances` が DLL 毎の同時チャンネル数上限。
-  超過時は「要求チャンネルが既に稼働中なら合流を優先し、退避しない」チェックの後、
-  優先度最低 (idle 優先) のチューナーを退避する。共通ポリシーは `server/session_capacity.rs` に分離済み。
-- 排他 (`exclusive=true`): 同一 DLL 上の他チューナーを停止して独占。要求チャンネル稼働中なら合流にフォールバック。
+**決定は純関数、副作用は executor 1 箇所** (docs/TUNER_PIPELINE_REDESIGN.md)。
+
+```
+TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
+                                                                 │
+                                          tuner/acquire.rs::acquire() が実行
+                                                                 │
+        SetChannel(v1) / SetChannelSpace / SelectLogical / HTTP・Mirakurun
+```
+
+- `decide()` は I/O も async もログも持たない純関数。プールと DB の状態を
+  **1 回だけ**スナップショットし、以降の判断はそれだけを見る。
+- `acquire()` が `Decision` を実行する唯一の場所 (予約取得・退避・リーダー起動)。
+  スナップショットが古くなっていた場合は新しいスナップショットで `decide` からやり直す (上限 3 回)。
+- 選局 4 経路はすべて `acquire()` を通る。各経路は「要求の組み立て」と
+  「成功後のメタデータ適用」だけを持つ。**新しい選局経路を session/web に直接書かない。**
+
+**優先度**: `exclusive=true → i32::MAX` > `クライアント指定 (>0)` > `channels.priority (DB)` > `0`。
+目安は 録画(排他)=255 / 録画=200 / 視聴=10 / スキャン=0。
+**サーバー側でクライアント申告値を制限する仕組みは未実装 (REVIEW S3)。**
+
+**容量**: `bon_drivers.max_instances` が DLL 毎の同時チャンネル数上限。
+数えるのではなく**取る** — `TunerPool::acquire_slot(dll_path, max_instances)` が返す
+`SlotPermit` を持たないとリーダーを起動できない (型で強制)。permit は
+`SharedTuner` が保持し、`stop_reader` とリーダーの全異常終了経路で明示的に解放する。
+満杯なら待たずに `None` を返し、退避・フォールバック・失敗の判断は呼び出し元に残す。
+
+**同一 DLL 上のチャンネル切り替えは permit を移譲する。** 旧リーダーは切り替え成功まで
+停止されないため、`max_instances=1` では「解放してから取得」も「取得してから解放」も成立しない。
+
+**退避規則** (`policy::decide_at_capacity`、全経路共通):
+
+1. そのドライバの **idle** (購読者なし) リーダー
+2. idle が居なければ**購読者のいるリーダー**でも最も優先度の低いもの
+3. どれも退避できなければ別の候補ドライバ
+4. それでも駄目なら拒否
+
+1・2 の可否は `may_evict = 要求優先度 > 相手の優先度 || exclusive`。
+**同値では奪わない**。`exclusive` はハードウェアそのものの要求なのでタイに勝つ。
+**`max_instances` を超えて作ることはない** — 上限はハードウェアの事実なので、
+超過するくらいなら稼働中のリーダーを停止して作り直す。
+
+その結果、優先度が上回る要求 (例: 録画 200 が視聴 10 を退避) で**視聴中のセッションが
+切断され得る**。退避された側は状態 watch で即座に検知し、理由 (`Evicted`) を
+ログとセッション履歴に残して切断する。クライアントへのプロトコル通知は未実装。
 
 ### 4.5 グループ選局と仮想チューナー空間
 
@@ -183,8 +238,13 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   地上波(都道府県毎に分割) → BS → CS → 4K → その他 の順で空間を割当て、存在しない帯域は詰める。
   帯域は `BandType::from_nid()`、都道府県は `get_prefecture_name(nid)` (TVTest 互換) で判定。
 - `GroupSpaceInfo` がグループ内全ドライバーの空間を統合し、`(仮想space, ch)` → 配信可能ドライバー群を解決。
-  選択は selector のスコア (信号強度・購読数・優先度・空き) 順。グループ内でチャンネル可用性が
-  ドライバー毎に異なることは仕様として許容 (ベストエフォート)。
+  同じ (NID, TSID) を持つ候補ドライバー群は `acquire()` にまとめて渡され、
+  `decide()` が「排他チャンネル数 → 稼働インスタンス数 → 品質スコア」の順で並べ替えて選ぶ。
+  既に同じ物理チャンネルを稼働中のドライバーがあれば最優先で合流する。
+  グループ内でチャンネル可用性がドライバー毎に異なることは仕様として許容 (ベストエフォート)。
+- ただし `SelectLogicalChannel` の候補は DB 優先度順 (`get_channels_by_nid_tsid_ordered`) に
+  意味があるため、この経路だけは外側でループし 1 候補ずつ `acquire()` を呼ぶ。
+  順序規則の統一は未着手。
 
 ### 4.6 チャンネルスキャン
 

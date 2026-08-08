@@ -105,16 +105,26 @@ TVTest / EDCB
 ### Phase 2 — 大規模 (工数: 大, 要計画)
 
 16. **共有クレート化** (H7) — `ts_analyzer` を独立クレート (または recisdb-protocol へ) に切り出し proxy/recisdb-rs 双方から参照。database はプロキシ側がスーパーセットのため共通コア+拡張の段階分離。
-17. **SetChannel ポリシーエンジン抽出** (H2) — 選局決定を純関数 `decide(プール状態スナップショット, DB候補) → Decision{reuse/create/evict/fallback/fail}` に分離し、3経路 (SetChannel/SetChannelSpace/SelectLogicalChannel) を1本化。実機検証が難しいホットパスのため、Phase 0-4 の後処理共通化とテスト整備を先行させてから着手。
-18. **Session 状態機械の型による強制** — `TunerOpen{tuner}` / `Streaming{tuner, rx}` のようにリソースを状態に内包し、不変条件を型で保証。
+17. ✅ **SetChannel ポリシーエンジン抽出** (H2) — 完了 (2026-08、`docs/TUNER_PIPELINE_REDESIGN.md`)。選局決定を純関数 `tuner/policy.rs::decide(TunerSnapshot, TuneRequest) → Decision{Reuse/Create{evict}/Reject}` に分離し、副作用の実行を `tuner/acquire.rs::acquire()` 1 箇所に集約。**4 経路** (SetChannel v1 / SetChannelSpace / SelectLogicalChannel / HTTP・Mirakurun) すべてがここを通る。`session.rs` の選局ヘルパ 8 個を削除し 3613 → 3028 行。付随して、容量を permit 予約制に (TOCTOU 解消)、`ReaderState` 状態機械の導入 (M8 解消)、孤児リーダーの根絶、退避ポリシーの一本化を実施。**実機 BonDriver での検証は未実施。**
+18. **Session 状態機械の型による強制** — `TunerOpen{tuner}` / `Streaming{tuner, rx}` のようにリソースを状態に内包し、不変条件を型で保証。**部分的に前進** (2026-08): 購読は `TunerSubscription` の RAII 化で手動対応付けを廃止、DLL スロットは `SlotPermit` を `start_reader` の必須引数にすることで「permit なしにリーダーを起動できない」ことを型で保証、リーダーの生存は `ReaderState` で表現。`Session` 自体の状態機械 (`SessionState` + 60 フィールド) は未着手。
 19. **ダッシュボードの静的アセット化** (M4) — HTML/JS/CSS をファイルに分離し `include_str!`/rust-embed フォールバック + 開発時ディスク配信。ESLint/型検査/JSテストを可能に。H1 の恒久対策もここで完結。
 20. **DBアクセス戦略の刷新** (H4) — 計測の上で、読み取り専用コネクション分離 (WAL前提) or r2d2 プール or spawn_blocking ラッパの段階導入。
 21. **セットアップ系の別クレート化** — setup_gui/helpers/px4_installer をクレート分離しサーバ本体のビルドを軽量化。
 
 ### 推奨着手順 (残 = Phase 2 のみ)
 
+**進捗 (2026-08 更新)**: 17 完了、18 は部分的に前進。残りは 16 / 18 (Session 本体) / 19 / 20 / 21。
+
 Phase 2 は 16 (共有クレート化) が他の前提になりやすいため最初に計画する。
-17/18 はホットパスで実機検証が必要なため、変更前にテスト整備を先行させること。
+
+17 の実施内容と設計判断は `docs/TUNER_PIPELINE_REDESIGN.md` を参照。実機 BonDriver が
+無い環境で進めたため、**連続チャンネル切り替え・複数同時視聴・単一 open デバイス
+(px4 系) での挙動は実機確認が必要**。特に確認したいのは:
+
+- 同一 DLL 上でのチャンネル切り替え (permit 移譲が効いているか)
+- `max_instances=1` のドライバへ 2 人目が同じチャンネルで来たときの合流
+- 優先度が上回る要求による視聴中セッションの退避 (意図的な挙動変更)
+- prewarm がタイムアウトした後の選局 (warm 失敗 → cold フォールバック)
 
 ---
 

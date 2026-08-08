@@ -42,8 +42,25 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - 関東広域(NHK等)と県域局(テレ玉等)は**同じ「関東」スペース**に入り、県域局のNIDの方が小さいので先頭側に並ぶ。
 - インデックスはDBの channels テーブルの内容から導出されるため、**スキャンでDBが変わると既存クライアント(.ch2/TVTestスキャン結果)のインデックスとズレる**。チャンネル列挙順に影響する変更をしたら .ch2/ChSet の再生成が必要な旨を必ず告知すること。
 
+### 選局(チューナー選択)
+- 選局の**決定**は `tuner/policy.rs::decide()` の純関数のみ。I/O・async・ログを持ち込まない。
+- 決定の**実行**(スロット予約・退避・リーダー起動)は `tuner/acquire.rs::acquire()` のみ。
+  BNDP v1/v2・論理チャンネル選局・HTTP/Mirakurun の4経路すべてがここを通る。
+  **新しい選局経路を `session.rs` や `web/` に直接書かない。** 経路が持ってよいのは
+  「要求の組み立て」と「成功後のメタデータ適用」だけ。
+- 容量(`max_instances`)は数えずに**取る**。`TunerPool::acquire_slot` が返す `SlotPermit`
+  なしにリーダーを起動できない(`start_reader` の必須引数)。計数関数は診断用。
+- 同一DLL上のチャンネル切り替えは permit を**移譲**する(解放→再取得は `max_instances=1` で破綻)。
+- `ReaderState` の `Reserved`(作られたが起動前)と `Starting`(起動実行中)を混同しない。
+  混ぜると「起動すべきか」の判定が必ず誤る(起動をサボる/二重オープン)。
+- 詳細と設計判断: `docs/TUNER_PIPELINE_REDESIGN.md`。
+
 ### ストリーミング
 - TS配信は tokio broadcast channel(容量4096)。`RecvError::Lagged` は必ず明示的に処理する。
+- リーダーの読み取りループは「読む・B25デコード・配る」のみ。SI解析(ロゴ/EPG)など
+  チャンク毎の処理を追加しない(`spawn_si_collector` のように broadcast の購読側でやる)。
+- `SharedTuner::set_state` は `watch::Sender::send` ではなく `send_replace` を使う。
+  `send` は購読者0のとき値を更新せずエラーを返し、後から購読した側が古い状態を見る。
 
 ## 設定・ログ
 
@@ -56,6 +73,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/ARCHITECTURE.md` — recisdb-rs本体の設計
 - `docs/DESIGN.md` / `docs/STREAMING_DESIGN.md` — プロキシ設計・ストリーミング設計(§番号がコード内コメントから参照される)
 - `docs/EPG_DESIGN.md` — 番組表(EIT)収集・保存・配信の設計
+- `docs/TUNER_PIPELINE_REDESIGN.md` — チューナー選択・配信・切り替え経路の再設計(2026-08)
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)
