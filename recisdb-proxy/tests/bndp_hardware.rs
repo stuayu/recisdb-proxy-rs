@@ -70,23 +70,73 @@ impl Client {
         }
     }
 
-    /// Pull TS for `dur`, returning how many payload bytes arrived.
-    fn drain_ts(&mut self, dur: Duration) -> usize {
+    /// Pull TS until `min_bytes` have arrived, or `max_wait` elapses.
+    ///
+    /// Waiting for a byte count rather than for a fixed slice of wall clock
+    /// matters on a cold start: `StartStreamAck` comes back as soon as the
+    /// reader is *ready*, but the first bytes only appear after the BonDriver
+    /// open settles and the session's prefill window (default 1 s) releases.
+    /// A fixed 4 s drain measured zero on a freshly opened tuner while the
+    /// server was demonstrably sending — the test was just looking too early.
+    fn drain_ts(&mut self, max_wait: Duration) -> usize {
+        self.drain_ts_until(188 * 500, max_wait)
+    }
+
+    fn drain_ts_until(&mut self, min_bytes: usize, max_wait: Duration) -> usize {
         let mut ts = 0usize;
-        let deadline = Instant::now() + dur;
+        let deadline = Instant::now() + max_wait;
         self.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        while Instant::now() < deadline {
+        let mut reads = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        let mut eof = false;
+        while Instant::now() < deadline && ts < min_bytes {
             while self.try_take(&mut ts).is_some() {}
             let mut tmp = [0u8; 65536];
             match self.sock.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
-                Err(_) => {} // read timeout: just keep waiting until `deadline`
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    reads += 1;
+                    self.buf.extend_from_slice(&tmp[..n]);
+                }
+                Err(e) => {
+                    if errs.len() < 3 {
+                        errs.push(format!("{:?}", e.kind()));
+                    }
+                }
             }
+        }
+        if ts == 0 {
+            eprintln!(
+                "    drain diagnostics: reads={reads} eof={eof} buffered={} errs={errs:?}",
+                self.buf.len()
+            );
         }
         while self.try_take(&mut ts).is_some() {}
         self.sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         ts
+    }
+
+    /// Has the server hung up? Drains anything still queued first: a session
+    /// whose tuner was taken away still has frames sitting in the socket
+    /// buffer, so "did bytes arrive" cannot tell a live stream from a dead
+    /// one — only the EOF can.
+    fn is_closed(&mut self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        self.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut sink = 0usize;
+        while Instant::now() < deadline {
+            while self.try_take(&mut sink).is_some() {}
+            let mut tmp = [0u8; 65536];
+            match self.sock.read(&mut tmp) {
+                Ok(0) => return true,
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(_) => {}
+            }
+        }
+        false
     }
 
     /// Decode one buffered frame. TS frames are counted into `ts_bytes` and
@@ -122,6 +172,14 @@ impl Client {
 /// Open a session, join `group`, tune to `(space, channel)` and start
 /// streaming. Returns the live client, or the first failure as a string.
 fn open_tuned_session(space: u32, channel: u32) -> Result<Client, String> {
+    open_tuned_session_with_priority(space, channel, 0)
+}
+
+fn open_tuned_session_with_priority(
+    space: u32,
+    channel: u32,
+    priority: i32,
+) -> Result<Client, String> {
     let mut ts = 0usize;
     let mut c = Client::connect();
 
@@ -140,7 +198,7 @@ fn open_tuned_session(space: u32, channel: u32) -> Result<Client, String> {
         other => return Err(format!("OpenTuner: {other:?}")),
     }
 
-    c.send(ClientMessage::SetChannelSpace { space, channel, priority: 0, exclusive: false });
+    c.send(ClientMessage::SetChannelSpace { space, channel, priority, exclusive: false });
     match c.recv_control(&mut ts) {
         ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
         ServerMessage::SetChannelSpaceAck { error_code, .. } => {
@@ -185,13 +243,29 @@ fn matrix_concurrent_sessions() {
     let expect_ok: Option<usize> =
         std::env::var("BNDP_MATRIX_EXPECT_OK").ok().and_then(|v| v.parse().ok());
 
-    // Start every session at once: staggering them would hide races in the
+    // Start every session at once by default: staggering hides races in the
     // selection path, which is exactly what a matrix run is for.
+    // `BNDP_MATRIX_STAGGER_MS` introduces a delay between starts, which is
+    // what distinguishes "arrived together, nothing to join yet" from
+    // "arrived after someone already tuned this channel".
+    let stagger_ms: u64 = std::env::var("BNDP_MATRIX_STAGGER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let handles: Vec<_> = plan
         .iter()
         .copied()
         .enumerate()
-        .map(|(i, ch)| std::thread::spawn(move || (i, ch, open_tuned_session(space, ch))))
+        .map(|(i, ch)| {
+            let delay = Duration::from_millis(stagger_ms * i as u64);
+            std::thread::spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                (i, ch, open_tuned_session(space, ch))
+            })
+        })
         .collect();
 
     let mut live = Vec::new();
@@ -210,7 +284,7 @@ fn matrix_concurrent_sessions() {
     // Confirm the ones that got in actually receive.
     let mut streamed = Vec::new();
     for (i, ch, c) in live.iter_mut() {
-        let got = c.drain_ts(Duration::from_secs(4));
+        let got = c.drain_ts(Duration::from_secs(20));
         streamed.push((*i, *ch, got));
     }
 
@@ -237,6 +311,65 @@ fn matrix_concurrent_sessions() {
     if let Some(expect) = expect_ok {
         assert_eq!(ok, expect, "expected exactly {expect} sessions to be admitted");
     }
+}
+
+/// A recording-grade request must be able to take a receiver from a live
+/// viewer once every receiver is busy — the deliberate consequence of
+/// "never exceed `max_instances`" plus "a strictly higher priority wins"
+/// (docs/TUNER_PIPELINE_REDESIGN.md P2b-3).
+///
+/// Fills the group with `BNDP_PRIO_FILL` (default `0,1,2,3,4`) viewers at
+/// priority 0, then asks for `BNDP_PRIO_CHANNEL` (default `5`) at
+/// `BNDP_PRIO` (default 200, recording-grade).
+#[test]
+#[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
+fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let fill: Vec<u32> = std::env::var("BNDP_PRIO_FILL")
+        .unwrap_or_else(|_| "0,1,2,3,4".to_string())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let target: u32 =
+        std::env::var("BNDP_PRIO_CHANNEL").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let priority: i32 = std::env::var("BNDP_PRIO").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+
+    // Fill every receiver with ordinary viewers, staggered so they settle on
+    // distinct tuners rather than racing.
+    let mut viewers = Vec::new();
+    for &ch in &fill {
+        match open_tuned_session(space, ch) {
+            Ok(mut c) => {
+                let got = c.drain_ts(Duration::from_secs(20));
+                println!("viewer on channel {ch}: {got} bytes");
+                assert!(got > 188 * 200, "filler viewer on channel {ch} never streamed");
+                viewers.push(c);
+            }
+            Err(e) => panic!("could not fill the group: channel {ch}: {e}"),
+        }
+    }
+    println!("group filled with {} viewers at priority 0", viewers.len());
+
+    // Now the recording-grade request for a channel nobody is on.
+    let mut rec = open_tuned_session_with_priority(space, target, priority)
+        .unwrap_or_else(|e| panic!("priority {priority} request was refused: {e}"));
+    let got = rec.drain_ts(Duration::from_secs(20));
+    println!("priority {priority} request on channel {target}: {got} bytes");
+    assert!(got > 188 * 200, "the displacing request was admitted but never streamed");
+
+    // One of the viewers must have lost its tuner. The server drops such a
+    // session as soon as the reader stops (P4), so its socket reports EOF.
+    let mut displaced = 0;
+    for (i, v) in viewers.iter_mut().enumerate() {
+        if v.is_closed(Duration::from_secs(5)) {
+            println!("viewer {i} was disconnected (its tuner was taken)");
+            displaced += 1;
+        }
+    }
+    assert!(
+        displaced >= 1,
+        "a receiver had to come from somewhere, but every viewer is still streaming"
+    );
 }
 
 /// A session must be able to switch channels on a `max_instances = 1`
@@ -294,7 +427,7 @@ fn session_switches_channels_on_a_single_instance_driver() {
         other => panic!("expected StartStreamAck, got {other:?}"),
     }
 
-    let first = c.drain_ts(Duration::from_secs(4));
+    let first = c.drain_ts(Duration::from_secs(20));
     println!("channel {} → {} bytes", channels[0], first);
     assert!(first > 188 * 500, "no TS on the first channel ({first} bytes)");
 
@@ -312,7 +445,7 @@ fn session_switches_channels_on_a_single_instance_driver() {
             other => panic!("expected SetChannelSpaceAck, got {other:?}"),
         }
 
-        let got = c.drain_ts(Duration::from_secs(5));
+        let got = c.drain_ts(Duration::from_secs(20));
         println!("channel {ch} → {got} bytes");
         assert!(got > 188 * 500, "no TS after switching to channel {ch} ({got} bytes)");
     }

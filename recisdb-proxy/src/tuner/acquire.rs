@@ -373,6 +373,16 @@ pub(crate) async fn acquire(
             .cloned()
             .collect();
         if candidates.is_empty() {
+            // Every candidate driver turned out to be full when actually
+            // asked. Logged here because it is a decision like any other and
+            // otherwise leaves no trace at all (P4).
+            info!(
+                "[acquire] decision=reject reason=all {} candidate driver(s) full attempt={} priority={} exclusive={}",
+                request.candidates.len(),
+                attempt + 1,
+                request.priority,
+                request.exclusive
+            );
             return Err(AcquireError::AtCapacity { lowest_idle_priority: None });
         }
 
