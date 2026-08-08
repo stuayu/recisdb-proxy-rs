@@ -178,12 +178,12 @@ pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Opt
 /// Whether the given `(os, arch)` pair (as reported by `std::env::consts::OS`
 /// / `std::env::consts::ARCH`) has a self-update-capable release asset.
 /// Kept as a function of explicit strings (rather than `#[cfg(...)]`) so it
-/// compiles and is testable identically on every host, including macOS dev
-/// machines where the real answer is always `false`.
+/// compiles and is testable identically on every host.
 fn platform_supports_self_update(os: &str, arch: &str) -> bool {
     match os {
         "linux" => matches!(arch, "x86_64" | "aarch64"),
         "windows" => matches!(arch, "x86_64" | "x86"),
+        "macos" => matches!(arch, "x86_64" | "aarch64"),
         _ => false,
     }
 }
@@ -199,6 +199,7 @@ fn self_update_supported() -> bool {
 /// Release-CI asset filename for `(tag, os, arch)` — must match
 /// `.github/workflows/release.yml`'s naming exactly:
 /// - `recisdb-proxy-{tag}-linux-amd64.tar.gz` / `-linux-arm64.tar.gz`
+/// - `recisdb-proxy-{tag}-macos-amd64.tar.gz` / `-macos-arm64.tar.gz`
 /// - `recisdb-{tag}-win-x64.zip` / `-win-x86.zip`
 ///
 /// `None` for any platform without a self-update asset.
@@ -206,6 +207,8 @@ fn asset_filename(tag: &str, os: &str, arch: &str) -> Option<String> {
     match (os, arch) {
         ("linux", "x86_64") => Some(format!("recisdb-proxy-{tag}-linux-amd64.tar.gz")),
         ("linux", "aarch64") => Some(format!("recisdb-proxy-{tag}-linux-arm64.tar.gz")),
+        ("macos", "x86_64") => Some(format!("recisdb-proxy-{tag}-macos-amd64.tar.gz")),
+        ("macos", "aarch64") => Some(format!("recisdb-proxy-{tag}-macos-arm64.tar.gz")),
         ("windows", "x86_64") => Some(format!("recisdb-{tag}-win-x64.zip")),
         ("windows", "x86") => Some(format!("recisdb-{tag}-win-x86.zip")),
         _ => None,
@@ -237,12 +240,23 @@ fn is_target_binary_entry(entry_name: &str, os: &str) -> bool {
 const MIN_BINARY_SIZE: u64 = 1_000_000;
 
 /// Checks the leading bytes of an extracted binary against the expected
-/// magic for `os` (`MZ` for Windows PE, `\x7fELF` for Linux ELF).
+/// magic for `os`: `MZ` for Windows PE, `\x7fELF` for Linux ELF, Mach-O for
+/// macOS.
+///
+/// macOS accepts three magics because the release CI could plausibly ship
+/// any of them: 64-bit Mach-O in either endianness (`feedfacf`), and the
+/// universal/"fat" wrapper (`cafebabe`, always big-endian) if the two
+/// per-arch builds are ever `lipo`-merged into one asset. 32-bit Mach-O
+/// (`feedface`) is not accepted — no supported target produces it.
 fn has_valid_magic(magic: &[u8], os: &str) -> bool {
-    if os == "windows" {
-        magic.starts_with(b"MZ")
-    } else {
-        magic.starts_with(b"\x7fELF")
+    match os {
+        "windows" => magic.starts_with(b"MZ"),
+        "macos" => {
+            magic.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])  // Mach-O 64, LE
+                || magic.starts_with(&[0xfe, 0xed, 0xfa, 0xcf]) // Mach-O 64, BE
+                || magic.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) // universal
+        }
+        _ => magic.starts_with(b"\x7fELF"),
     }
 }
 
@@ -776,10 +790,11 @@ mod tests {
         assert!(platform_supports_self_update("linux", "aarch64"));
         assert!(platform_supports_self_update("windows", "x86_64"));
         assert!(platform_supports_self_update("windows", "x86"));
-        assert!(!platform_supports_self_update("macos", "x86_64"));
-        assert!(!platform_supports_self_update("macos", "aarch64"));
+        assert!(platform_supports_self_update("macos", "x86_64"));
+        assert!(platform_supports_self_update("macos", "aarch64"));
         assert!(!platform_supports_self_update("linux", "arm")); // 32-bit ARM: no release asset
         assert!(!platform_supports_self_update("windows", "aarch64")); // no win-arm64 asset in CI
+        assert!(!platform_supports_self_update("freebsd", "x86_64"));
     }
 
     #[test]
@@ -788,7 +803,9 @@ mod tests {
         assert_eq!(asset_filename("v1.2.3", "linux", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-linux-arm64.tar.gz"));
         assert_eq!(asset_filename("v1.2.3", "windows", "x86_64").as_deref(), Some("recisdb-v1.2.3-win-x64.zip"));
         assert_eq!(asset_filename("v1.2.3", "windows", "x86").as_deref(), Some("recisdb-v1.2.3-win-x86.zip"));
-        assert_eq!(asset_filename("v1.2.3", "macos", "x86_64"), None);
+        assert_eq!(asset_filename("v1.2.3", "macos", "x86_64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-amd64.tar.gz"));
+        assert_eq!(asset_filename("v1.2.3", "macos", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-arm64.tar.gz"));
+        assert_eq!(asset_filename("v1.2.3", "freebsd", "x86_64"), None);
     }
 
     #[test]
@@ -798,6 +815,9 @@ mod tests {
         assert!(!is_target_binary_entry("recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy-setup", "linux"));
         assert!(is_target_binary_entry("recisdb-v1.2.3-win-x64\\recisdb-proxy.exe", "windows"));
         assert!(!is_target_binary_entry("recisdb-v1.2.3-win-x64\\recisdb.exe", "windows"));
+        // macOS ships the same tarball layout as Linux.
+        assert!(is_target_binary_entry("recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy", "macos"));
+        assert!(!is_target_binary_entry("recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy-setup", "macos"));
     }
 
     #[test]
@@ -807,6 +827,17 @@ mod tests {
         assert!(has_valid_magic(b"MZ\x90\x00", "windows"));
         assert!(!has_valid_magic(b"\x7fELF", "windows"));
         assert!(!has_valid_magic(b"<htm", "linux"), "an HTML error page must never pass validation");
+
+        // Mach-O 64-bit (both endiannesses) and the universal wrapper.
+        assert!(has_valid_magic(&[0xcf, 0xfa, 0xed, 0xfe], "macos"));
+        assert!(has_valid_magic(&[0xfe, 0xed, 0xfa, 0xcf], "macos"));
+        assert!(has_valid_magic(&[0xca, 0xfe, 0xba, 0xbe], "macos"));
+        // Cross-platform binaries must not pass as macOS ones.
+        assert!(!has_valid_magic(b"\x7fELF", "macos"));
+        assert!(!has_valid_magic(b"MZ\x90\x00", "macos"));
+        assert!(!has_valid_magic(b"<htm", "macos"));
+        // 32-bit Mach-O: no supported target produces it.
+        assert!(!has_valid_magic(&[0xce, 0xfa, 0xed, 0xfe], "macos"));
     }
 
     // -- status_json -----------------------------------------------------

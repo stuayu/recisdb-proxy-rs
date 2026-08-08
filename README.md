@@ -133,11 +133,16 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 
 ### インストール
 
-[Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から実行ファイルを取得してください。  
-Windows では x64 向け実行ファイルが提供されています。
+[Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から実行ファイルを取得してください。
 
-Linux / macOS 向けの実行ファイルは配布していないため、ソースからビルドしてください
-(手順は後述の [ビルド](#ビルド) と [docs/BUILD.md](docs/BUILD.md))。
+| プラットフォーム | アセット |
+| --- | --- |
+| Windows x64 / x86 | `recisdb-{tag}-win-x64.zip` / `-win-x86.zip` |
+| Linux amd64 / arm64 | `recisdb-proxy-{tag}-linux-amd64.tar.gz` / `-linux-arm64.tar.gz` |
+| macOS Intel / Apple Silicon | `recisdb-proxy-{tag}-macos-amd64.tar.gz` / `-macos-arm64.tar.gz` |
+
+上記以外の環境ではソースからビルドしてください (後述の [ビルド](#ビルド) と
+[docs/BUILD.md](docs/BUILD.md))。
 
 ### かんたんセットアップ (はじめての方はこちら)
 
@@ -283,6 +288,29 @@ recisdb-proxy.exe service install --name recisdb-proxy
 
 自分でユニットファイルを書きたい場合は、下記のテンプレートも参考にしてください。  
 `recisdb-proxy\recisdb-proxy-rs.service`
+
+### 最新版への更新 (ワンクリック)
+
+GitHub に新しいリリースが出ると、Web ダッシュボードに更新の通知が表示されます。
+**「更新」ボタンを押すだけで最新版に差し替わります。** ファイルの手動ダウンロード・
+展開・上書きは不要です。
+
+サーバー側で次の順に処理します。
+
+1. 自分のプラットフォーム向けのリリースアセットをダウンロード
+2. アーカイブから `recisdb-proxy` 本体だけを取り出す
+3. **検証** — サイズが小さすぎないか、実行ファイルの署名バイト (ELF / PE / Mach-O) が
+   正しいかを確認します。HTML のエラーページなどを掴んだ場合はここで中止し、
+   動作中のバイナリには一切触れません
+4. 実行中のバイナリを置き換えて再起動 (systemd / launchd / Windows サービスの配下なら
+   サービスマネージャー経由、そうでなければ元の引数で起動し直します)
+
+進捗はダッシュボード上に表示されます。対応プラットフォームは Windows x64 / x86、
+Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境では更新の通知のみ
+行い、「更新」ボタンは表示されません。
+
+> **注意:** 視聴・録画中に更新するとサーバーが再起動され、接続中のクライアントは切断されます
+> (クライアントは自動再接続しますが、録画は途切れます)。録画予約のない時間帯に実行してください。
 
 
 

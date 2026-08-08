@@ -100,6 +100,66 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           upload_url: ${{ needs.create_release.outputs.upload_url }}
 
+  release_macos_executable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26-intel
+            label: macos-amd64
+          - runner: macos-26
+            label: macos-arm64
+    runs-on: ${{ matrix.runner }}
+    needs: create_release
+    steps:
+      - name: Install dependencies
+        run: brew install cmake ninja
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Setup Node.js (latest LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+      - name: Build Web UI
+        working-directory: web-ui
+        run: |
+          npm ci
+          npm run build
+      - name: Build proxy binaries
+        env:
+          # See the Linux job's "Build proxy binaries" step for why the tag is
+          # passed explicitly instead of relying on build.rs's `git describe`.
+          RECISDB_PROXY_VERSION: ${{ github.ref_name }}
+        run: cargo build --release -p recisdb-proxy
+      - name: Package proxy tarball
+        run: |
+          # The archive layout must match what the self-update endpoint
+          # expects: a single top-level directory containing `recisdb-proxy`.
+          # See `is_target_binary_entry` in web/api/update.rs.
+          STAGE="recisdb-proxy-${{ github.ref_name }}-${{ matrix.label }}"
+          mkdir -p artifacts "$STAGE"
+          cp target/release/recisdb-proxy "$STAGE/"
+          cp target/release/recisdb-proxy-setup "$STAGE/"
+          cp recisdb-proxy/recisdb-proxy.toml.example "$STAGE/"
+          tar czf "artifacts/$STAGE.tar.gz" "$STAGE"
+          ls -la artifacts/
+      - name: Upload packages to release channel
+        uses: shogo82148/actions-upload-release-asset@v1
+        with:
+          asset_path: "./artifacts/*"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
+
   release_windows_exe:
     runs-on: windows-latest
     needs: create_release
