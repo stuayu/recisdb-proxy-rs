@@ -1319,12 +1319,9 @@ impl Session {
         let request = AcquireRequest {
             candidates: vec![key.clone()],
             priority: channel_priority_for_class,
-            // v1 has no exclusive-eviction behaviour to preserve: the legacy
-            // path never evicted a subscribed reader, it just reported a
-            // conflict. Keeping `exclusive: false` means `decide` can only
-            // ever pick an *idle* victim here. Unifying this with v2 is
-            // P2b-3's call, not a side effect of the wiring.
-            exclusive: false,
+            // P2b-3: v1 carries a real exclusive flag, so it gets the same
+            // policy as v2 — an exclusive request wins a priority tie.
+            exclusive: effective_exclusive,
             bondriver_version: 2,
             carried_permit: inherited_permit,
             warm,
@@ -1517,9 +1514,10 @@ impl Session {
         let request = AcquireRequest {
             candidates: vec![key.clone()],
             priority: 0,
-            // Group members are assumed to hard-exclusive the underlying
-            // hardware, but this path never evicted a *subscribed* reader
-            // either — it just moved on to the next candidate. Keep that.
+            // The BNDP `SelectLogicalChannel` message carries no exclusive
+            // flag, so there is nothing to propagate here. Displacing a
+            // live viewer still happens when this request outranks it
+            // (P2b-3's unified rule) — `exclusive` only decides ties.
             exclusive: false,
             bondriver_version: 2,
             carried_permit: carried_permit.take(),

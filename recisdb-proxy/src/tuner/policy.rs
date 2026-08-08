@@ -274,17 +274,6 @@ impl TunerSnapshot {
             .collect()
     }
 
-    fn first_idle_entry(&self, dll_path: &str, exclude: Option<&ChannelKey>) -> Option<ChannelKey> {
-        self.entries
-            .iter()
-            .find(|e| {
-                e.key.tuner_path == dll_path
-                    && e.is_running()
-                    && !e.has_subscribers()
-                    && exclude != Some(&e.key)
-            })
-            .map(|e| e.key.clone())
-    }
 }
 
 /// A single logical channel request, expressed as a caller-priority-ordered
@@ -441,45 +430,65 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
         return Decision::Create { key: primary, evict: vec![] };
     }
 
-    if req.exclusive {
-        decide_exclusive_at_capacity(snapshot, &path, primary)
-    } else {
-        decide_capacity_at_limit(snapshot, req, &candidate_tuples, &path, primary, &max_instances_map, exclude_own)
-    }
+    decide_at_capacity(
+        snapshot,
+        req,
+        &candidate_tuples,
+        &path,
+        primary,
+        &max_instances_map,
+        exclude_own,
+    )
 }
 
-/// Rule 7: exclusive-access eviction. Only reached once already-at-capacity
-/// (checked by the caller) and once the requested channel is confirmed not
-/// already running (checked by the caller via the global reuse
-/// short-circuit — this is what "skip eviction, requested already running"
-/// collapses into). Evicts a tuner on `dll_path` even if it currently has
-/// subscribers — see the module doc comment's "faithfulness" note; this is
-/// current behavior, fixed in P2 (redesign doc §2.1-8).
-fn decide_exclusive_at_capacity(snapshot: &TunerSnapshot, dll_path: &str, primary: ChannelKey) -> Decision {
-    let candidates: Vec<EvictionCandidate> = snapshot
+/// May `req` take the slot currently held by an incumbent at
+/// `victim_priority`?
+///
+/// Strictly greater, not `>=`: a request that merely ties the incumbent does
+/// not get to displace it (P2b-3; before that, an equal-priority request
+/// evicted, which made a second viewer of an equally-ranked channel able to
+/// bump the first for no gain). An `exclusive` request is the one exception —
+/// it is asking for the hardware outright, and wins ties.
+fn may_evict(req: &TuneRequest, victim_priority: i32) -> bool {
+    req.priority > victim_priority || req.exclusive
+}
+
+/// Pick a victim on `dll_path`, preferring an idle (subscriber-less) reader
+/// and, within each group, the lowest configured priority.
+///
+/// Returns the idle choice first; the second element is the lowest-priority
+/// choice across *all* running readers on the driver, subscribed ones
+/// included. Callers try them in that order, so a live viewer is only ever
+/// displaced when no idle reader could be taken instead.
+fn eviction_options(snapshot: &TunerSnapshot, dll_path: &str) -> (Option<EvictionCandidate>, Option<EvictionCandidate>) {
+    let all: Vec<EvictionCandidate> = snapshot
         .entries
         .iter()
         .filter(|e| e.key.tuner_path == dll_path && e.is_running())
         .map(|e| (e.key.clone(), e.priority, e.has_subscribers()))
         .collect();
+    let idle: Vec<EvictionCandidate> = all.iter().filter(|(_, _, subs)| !subs).cloned().collect();
 
-    match choose_eviction_target(&candidates) {
-        Some((victim, _, _)) => Decision::Create {
-            key: primary,
-            evict: vec![victim],
-        },
-        // Over capacity per the running count but nothing found to evict —
-        // shouldn't happen in practice (running >= max implies at least one
-        // running entry), but mirrors `handle_set_channel_space_exclusive_access`
-        // which has no other fallback in this branch either.
-        None => Decision::Create { key: primary, evict: vec![] },
-    }
+    (choose_eviction_target(&idle), choose_eviction_target(&all))
 }
 
-/// Rule 6: non-exclusive capacity-limit handling. Only ever considers idle
-/// (no-subscriber) tuners for eviction — deliberately narrower than the
-/// exclusive path above (current behavior, see module doc comment).
-fn decide_capacity_at_limit(
+/// Capacity handling for a driver that has no free slot, unified across the
+/// exclusive and non-exclusive paths (P2b-3, redesign doc §2.1-8).
+///
+/// Before P2b-3 these were two different policies: the exclusive path evicted
+/// whatever `choose_eviction_target` returned — including a reader with live
+/// subscribers — while the non-exclusive path only ever considered idle
+/// readers and, finding none, went ahead and created an *extra* reader over
+/// `max_instances`. The single rule now is:
+///
+/// 1. idle reader on this driver, if [`may_evict`] allows it;
+/// 2. otherwise the lowest-priority reader on this driver even if it has
+///    subscribers, again subject to [`may_evict`] — the driver limit is a
+///    hardware fact, so exceeding it is never an option (a client asking for
+///    a channel it outranks gets it; the incumbent is stopped);
+/// 3. otherwise another candidate driver ([`decide_fallback`]);
+/// 4. otherwise reject.
+fn decide_at_capacity(
     snapshot: &TunerSnapshot,
     req: &TuneRequest,
     candidate_tuples: &[DriverCandidate],
@@ -488,56 +497,46 @@ fn decide_capacity_at_limit(
     max_instances_map: &HashMap<String, i32>,
     exclude_own: Option<&ChannelKey>,
 ) -> Decision {
-    let idle_candidates: Vec<EvictionCandidate> = snapshot
-        .entries
-        .iter()
-        .filter(|e| e.key.tuner_path == dll_path && e.is_running() && !e.has_subscribers())
-        .map(|e| (e.key.clone(), e.priority, false))
-        .collect();
+    let (idle_victim, any_victim) = eviction_options(snapshot, dll_path);
+    let lowest_idle_priority = idle_victim.as_ref().map(|(_, p, _)| *p);
 
-    match choose_eviction_target(&idle_candidates) {
-        Some((victim, lowest_priority, _)) => {
-            // `>=`, not `>`: a same-priority request still evicts the
-            // incumbent. Current behavior, preserved as-is (§2.1-8).
-            if req.priority >= lowest_priority {
-                Decision::Create {
-                    key: primary,
-                    evict: vec![victim],
-                }
-            } else {
-                decide_fallback(
-                    snapshot,
-                    candidate_tuples,
-                    dll_path,
-                    max_instances_map,
-                    exclude_own,
-                    lowest_priority,
-                )
-            }
+    for option in [idle_victim, any_victim].into_iter().flatten() {
+        let (victim, victim_priority, _) = option;
+        if may_evict(req, victim_priority) {
+            return Decision::Create {
+                key: primary,
+                evict: vec![victim],
+            };
         }
-        // At/over capacity but no idle tuner exists to evict: current code
-        // does not try another candidate here and does not reject — it
-        // proceeds to create the tuner anyway, over capacity. Documented
-        // quirk, preserved as-is (§2.1-8 / module doc comment).
-        None => Decision::Create { key: primary, evict: vec![] },
     }
+
+    decide_fallback(
+        snapshot,
+        req,
+        candidate_tuples,
+        dll_path,
+        max_instances_map,
+        exclude_own,
+        lowest_idle_priority,
+    )
 }
 
-/// Walk the remaining candidates (mirrors `try_fallback_drivers` /
-/// `ensure_driver_capacity_with_idle_eviction`): each fallback candidate is
-/// used if it has spare capacity, or if an idle tuner can be evicted from
-/// it — note this eviction picks the *first* idle entry found, not the
-/// lowest-priority one, unlike the primary-driver path above. That
-/// asymmetry is current behavior (`ensure_driver_capacity_with_idle_eviction`
-/// picks the first idle candidate encountered while scanning pool keys, and
-/// never consults DB priority at all).
+/// Walk the remaining candidate drivers, applying the same rule as
+/// [`decide_at_capacity`] to each: free slot, else an evictable victim.
+///
+/// Before P2b-3 this path picked the *first* idle entry it came across and
+/// never consulted priority at all (the old
+/// `ensure_driver_capacity_with_idle_eviction`), which meant a fallback
+/// driver could lose a higher-priority idle reader that the primary driver
+/// would have protected.
 fn decide_fallback(
     snapshot: &TunerSnapshot,
+    req: &TuneRequest,
     candidate_tuples: &[DriverCandidate],
     skip_path: &str,
     max_instances_map: &HashMap<String, i32>,
     exclude_own: Option<&ChannelKey>,
-    lowest_priority_at_primary: i32,
+    lowest_idle_priority_at_primary: Option<i32>,
 ) -> Decision {
     for (path, space, channel) in candidate_tuples.iter() {
         if path == skip_path {
@@ -550,17 +549,23 @@ fn decide_fallback(
         if has_capacity(running, max) {
             return Decision::Create { key, evict: vec![] };
         }
-        if let Some(victim) = snapshot.first_idle_entry(path, Some(&key)) {
-            return Decision::Create {
-                key,
-                evict: vec![victim],
-            };
+
+        let (idle_victim, any_victim) = eviction_options(snapshot, path);
+        for option in [idle_victim, any_victim].into_iter().flatten() {
+            let (victim, victim_priority, _) = option;
+            if victim == key {
+                // Never evict the very entry we are about to (re)use.
+                continue;
+            }
+            if may_evict(req, victim_priority) {
+                return Decision::Create { key, evict: vec![victim] };
+            }
         }
     }
 
     Decision::Reject {
         reason: RejectReason::AtCapacity {
-            lowest_idle_priority: Some(lowest_priority_at_primary),
+            lowest_idle_priority: lowest_idle_priority_at_primary,
         },
     }
 }
@@ -768,10 +773,11 @@ mod tests {
         );
     }
 
-    /// Rule 6: at capacity, non-exclusive, sufficient priority evicts the
-    /// lowest-priority *idle* tuner.
+    /// At capacity, non-exclusive: a strictly higher priority evicts the
+    /// lowest-priority *idle* tuner, leaving the subscribed one alone even
+    /// though it also outranks the request's own priority.
     #[test]
-    fn capacity_limit_evicts_lowest_priority_idle_tuner_when_priority_sufficient() {
+    fn capacity_limit_evicts_lowest_priority_idle_tuner_when_priority_is_higher() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 2)],
             entries: vec![
@@ -780,7 +786,7 @@ mod tests {
             ],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
-        req.priority = 5; // equal to the lowest — see the `>=` test below too.
+        req.priority = 6;
 
         assert_eq!(
             decide(&snapshot, &req),
@@ -791,17 +797,35 @@ mod tests {
         );
     }
 
-    /// Current-behavior fixed. P2 will change `>=` to `>` (redesign doc
-    /// §2.1-8 / §4 P2): a request whose priority exactly *equals* the
-    /// lowest incumbent's priority still evicts it.
+    /// P2b-3: a tie does **not** displace the incumbent. Previously `>=`
+    /// let an equally-ranked request bump whoever got there first, which
+    /// gains nothing and interrupts a working stream.
     #[test]
-    fn capacity_limit_priority_comparison_uses_gte_current_behavior_fixed_for_p2() {
+    fn equal_priority_does_not_evict_the_incumbent() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
             entries: vec![entry("A.dll", 0, 1, true, 0, 7)],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 7; // exactly equal, not strictly greater.
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: Some(7) } }
+        );
+    }
+
+    /// ...but an `exclusive` request wins ties: it is asking for the
+    /// hardware outright (P2b-3).
+    #[test]
+    fn exclusive_request_wins_a_priority_tie() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 0, 7)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 7;
+        req.exclusive = true;
 
         assert_eq!(
             decide(&snapshot, &req),
@@ -851,12 +875,12 @@ mod tests {
         );
     }
 
-    /// Rule 7: exclusive access at capacity evicts to make room even though
-    /// the incumbent has an active subscriber (current behavior — the
-    /// capacity-limit path, tested above, would never touch a subscribed
-    /// tuner). Fixed for now; P2 unifies this (redesign doc §2.1-8).
+    /// Exclusive access at capacity evicts to make room even though the
+    /// incumbent has an active subscriber. Since P2b-3 the non-exclusive
+    /// path can do this too (subject to a strictly higher priority) — what
+    /// stays exclusive-only is winning a tie.
     #[test]
-    fn exclusive_access_evicts_subscribed_tuner_current_behavior_fixed_for_p2() {
+    fn exclusive_access_evicts_a_subscribed_tuner_when_nothing_idle_is_left() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
             entries: vec![entry("A.dll", 0, 1, true, 3, 0)], // has 3 subscribers
@@ -897,12 +921,12 @@ mod tests {
         );
     }
 
-    /// Current-behavior fixed. When at capacity and no *idle* tuner exists
-    /// on the primary driver, the non-exclusive path does not evict, does
-    /// not fall back, and does not reject — it just creates over capacity
-    /// (§2.1-8 / module doc comment).
+    /// P2b-3: `max_instances` is a hardware fact, so a driver is never
+    /// pushed past it. With no idle victim and nothing this request
+    /// outranks, the answer is a rejection — previously it silently created
+    /// an extra reader over the limit (§2.1-8).
     #[test]
-    fn capacity_limit_creates_over_capacity_when_no_idle_victim_current_behavior_fixed_for_p2() {
+    fn never_creates_over_capacity_when_nothing_can_be_evicted() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
             entries: vec![entry("A.dll", 0, 1, true, 1, 0)], // only entry has a subscriber
@@ -911,7 +935,52 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("A.dll", 0, 9), evict: vec![] }
+            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
+        );
+    }
+
+    /// P2b-3: with no idle reader left, a higher-priority request stops a
+    /// *subscribed* one rather than exceed the driver limit. This is the
+    /// deliberate consequence of "never over capacity": a live viewer can be
+    /// displaced by a recording-grade request.
+    #[test]
+    fn higher_priority_evicts_a_subscribed_reader_rather_than_exceed_capacity() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 2, 10)], // two live viewers, priority 10
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 200; // recording-grade
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create {
+                key: ChannelKey::space_channel("A.dll", 0, 9),
+                evict: vec![ChannelKey::space_channel("A.dll", 0, 1)],
+            }
+        );
+    }
+
+    /// Idle first: a subscribed reader is only displaced when there is no
+    /// idle one to take instead, even if the subscribed one ranks lower.
+    #[test]
+    fn an_idle_reader_is_preferred_over_a_lower_priority_subscribed_one() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 2)],
+            entries: vec![
+                entry("A.dll", 0, 1, true, 0, 50), // idle, higher priority
+                entry("A.dll", 0, 2, true, 1, 1),  // subscribed, lower priority
+            ],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 200;
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create {
+                key: ChannelKey::space_channel("A.dll", 0, 9),
+                evict: vec![ChannelKey::space_channel("A.dll", 0, 1)],
+            }
         );
     }
 
