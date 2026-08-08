@@ -136,6 +136,9 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 [Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から実行ファイルを取得してください。  
 Windows では x64 向け実行ファイルが提供されています。
 
+Linux / macOS 向けの実行ファイルは配布していないため、ソースからビルドしてください
+(手順は後述の [ビルド](#ビルド) と [docs/BUILD.md](docs/BUILD.md))。
+
 ### かんたんセットアップ (はじめての方はこちら)
 
 プログラムに慣れていない方は、`recisdb-proxy-setup.exe` をダブルクリックして起動してください。  
@@ -173,6 +176,75 @@ Windowsの場合は、下記をダブルクリックして実行します。
 
 Linuxの場合は、下記のコマンドを実行します。(Linuxは/dev/px4**にアクセスする場合システム権限が必要です)  
 `sudo ./recisdb-proxy`
+
+macOSの場合は、先に px4_drv のデーモンを起動してから `./recisdb-proxy` を実行します
+(管理者権限は不要です)。手順は次のとおりです。
+
+### macOS で PX4 系チューナーを使う
+
+macOS はカーネル拡張なしに `/dev/px4video*` のようなデバイスファイルを作れないため、
+px4_drv の macOS 版は**ユーザー空間のデーモン `DriverHost_PX4`** として動作します。
+recisdb-proxy はこのデーモンに接続してチューナーを操作します。
+
+**1. px4_drv (macOS 版) をビルドしてデーモンを起動する**
+
+```bash
+# px4_drv の macOS 版を用意し、デーモンを起動しておく
+cd /path/to/px4_drv/macos/build
+./DriverHost_PX4 &
+```
+
+デーモンは最後のクライアントが切断してから約 15 秒で自動終了します。常時稼働させる場合は
+launchd に登録してください。**recisdb-proxy はデーモンを自動起動しません** —
+ハードウェアを占有するプロセスをサーバーが黙って立ち上げるべきではないためです。
+
+**2. チューナーを登録する**
+
+Web ダッシュボードの「BonDriver」タブ、または `recisdb-proxy.toml` から、チューナーパスに
+次の書式で登録します (Windows の DLL パスにあたる位置です)。
+
+| 書式 | 意味 |
+| --- | --- |
+| `px4daemon:0` | 受信系統インデックス 0 |
+| `px4daemon:any` | 空いている系統をデーモンに選ばせる |
+| `px4daemon:0+lnb` | LNB 給電を有効化 (**BS/CS を受信するなら必須**) |
+| `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更する場合 |
+
+- PX-MLT5PE なら `px4daemon:0` 〜 `px4daemon:4` の 5 本を、それぞれ
+  **`max_instances = 1`** で登録します。1 系統 = 1 チャンネルというハードウェアの
+  実態と一致します。
+- `+lnb` は opt-in です。別の機器が既にアンテナ線へ給電している構成を壊さないよう、
+  既定では給電しません。**付けないと BS/CS は一切受信できません**
+  (他に給電装置がある場合を除く)。
+
+**3. 起動する**
+
+```bash
+./recisdb-proxy
+```
+
+デバイスファイルを使わないため `sudo` は不要です。起動後は Windows / Linux と同じく
+Web ダッシュボード (http://localhost:40080) からチャンネルスキャンを実行してください。
+
+**4. 動作確認 (任意)**
+
+```bash
+# デーモンを起動した状態で
+cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
+```
+
+`PX4_TEST_RECEIVER` (既定 `px4daemon:0`) と `PX4_TEST_CHANNEL` (既定 `0` = UHF 13) で
+対象を変更できます。CNR と、読み出した TS が壊れていないかを表示します。
+
+**制約**
+
+- B-CAS カードリーダーは PCSC.framework 経由で利用します。libaribb25 が初期化できない
+  環境では、スクランブルされたままの TS が流れます。
+- サービスとして常時稼働させる場合は、recisdb-proxy より先に `DriverHost_PX4` が
+  起動している必要があります。
+
+より詳しい説明は [docs/BUILD.md](docs/BUILD.md) の
+「macOS で PX4 系チューナーを使う (px4_drv デーモン経由)」を参照してください。
 
 ### サービスとして常時稼働させる
 
@@ -333,6 +405,14 @@ cd recisdb-proxy-rs
 # ビルド
 cargo build -p recisdb-proxy
 ```
+
+OS ごとに次のものが追加で必要です。
+
+- **Windows**: MSVC ビルドツール
+- **Linux**: gcc/g++ と `libpcsclite-dev` (ヘッダのみ使用。実行時に PC/SC ライブラリを
+  dlopen するため、リンクはしません)
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`)。カードリーダーは
+  OS 標準の PCSC.framework を使うため、追加インストールは不要です
 
 ビルドすると以下の 2 つのバイナリが生成されます:
 
