@@ -372,6 +372,149 @@ fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
     );
 }
 
+/// `exclusive = true` must win a priority tie: it asks for the hardware
+/// outright (docs/TUNER_PIPELINE_REDESIGN.md P2b-3). Same setup as the
+/// priority test, but the newcomer matches the incumbents' priority and
+/// relies on the exclusive flag alone.
+#[test]
+#[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
+fn an_exclusive_request_wins_a_tie_when_every_receiver_is_busy() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let fill: Vec<u32> = vec![0, 1, 2, 3, 4];
+
+    let mut viewers = Vec::new();
+    for &ch in &fill {
+        let mut c = open_tuned_session(space, ch).unwrap_or_else(|e| panic!("fill {ch}: {e}"));
+        assert!(c.drain_ts(Duration::from_secs(20)) > 188 * 200, "filler {ch} never streamed");
+        viewers.push(c);
+    }
+
+    // Same priority as the incumbents (0); only `exclusive` distinguishes it.
+    let mut c = Client::connect();
+    let mut ts = 0usize;
+    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
+    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+    c.send(ClientMessage::SetChannelSpace { space, channel: 5, priority: 0, exclusive: true });
+    match c.recv_control(&mut ts) {
+        ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
+        other => panic!("exclusive request refused: {other:?}"),
+    }
+    c.send(ClientMessage::StartStream);
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+    let got = c.drain_ts(Duration::from_secs(20));
+    println!("exclusive request: {got} bytes");
+    assert!(got > 188 * 200, "the exclusive request was admitted but never streamed");
+
+    let mut displaced = 0usize;
+    for v in viewers.iter_mut() {
+        if v.is_closed(Duration::from_secs(5)) {
+            displaced += 1;
+        }
+    }
+    println!("displaced viewers: {displaced}");
+    assert!(displaced >= 1, "exclusive must take a receiver from someone");
+}
+
+/// The `SelectLogicalChannel` path (tune by NID/TSID rather than by a
+/// client-view index). It keeps its own candidate loop rather than handing
+/// the whole list to `decide`, so it is worth exercising separately from
+/// `SetChannelSpace`.
+#[test]
+#[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
+fn select_logical_channel_tunes_and_streams() {
+    let nid: u16 = std::env::var("BNDP_NID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x7EE0);
+    let tsid: u16 = std::env::var("BNDP_TSID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x7EE0);
+
+    let mut ts = 0usize;
+    let mut c = Client::connect();
+    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
+    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+
+    c.send(ClientMessage::SelectLogicalChannel { nid, tsid, sid: None });
+    match c.recv_control(&mut ts) {
+        ServerMessage::SelectLogicalChannelAck { success: true, tuner_id, space, channel, .. } => {
+            println!("SelectLogicalChannel → tuner={tuner_id:?} space={space:?} channel={channel:?}");
+        }
+        other => panic!("SelectLogicalChannel failed: {other:?}"),
+    }
+
+    c.send(ClientMessage::StartStream);
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+    let got = c.drain_ts(Duration::from_secs(20));
+    println!("logical selection: {got} bytes");
+    assert!(got > 188 * 200, "logical channel selection streamed only {got} bytes");
+}
+
+/// A viewer that disconnects leaves its reader in the keep-alive window; the
+/// next viewer of that channel must join it rather than open a second one.
+#[test]
+#[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
+fn a_reconnecting_viewer_joins_the_kept_alive_reader() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let mut first = open_tuned_session(space, 0).expect("first viewer");
+    assert!(first.drain_ts(Duration::from_secs(20)) > 188 * 200, "first viewer never streamed");
+    drop(first); // disconnect; the reader stays warm
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut second = open_tuned_session(space, 0).expect("second viewer");
+    let got = second.drain_ts(Duration::from_secs(20));
+    println!("viewer after reconnect: {got} bytes");
+    assert!(got > 188 * 200, "the reconnecting viewer got only {got} bytes");
+}
+
+/// After `prewarm_timeout_secs` the warm tuner's thread has exited, and the
+/// selection must fall back to a cold open instead of failing
+/// (docs/TUNER_PIPELINE_REDESIGN.md P2a — the fallback was briefly removed
+/// during that phase and restored on review; this is the case it protects).
+///
+/// `OpenTuner` spawns the warm handle; the wait lets it expire before the
+/// first `SetChannelSpace`. `BNDP_PREWARM_WAIT_S` (default 35) must exceed
+/// the server's `prewarm_timeout_secs` (default 30).
+#[test]
+#[ignore = "requires a running proxy with real tuner hardware; takes ~40s by design"]
+fn selection_after_prewarm_expiry_falls_back_to_a_cold_open() {
+    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let wait_s: u64 = std::env::var("BNDP_PREWARM_WAIT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(35);
+
+    let mut ts = 0usize;
+    let mut c = Client::connect();
+    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
+
+    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+
+    println!("waiting {wait_s}s for the warm tuner to expire...");
+    std::thread::sleep(Duration::from_secs(wait_s));
+
+    c.send(ClientMessage::SetChannelSpace { space, channel: 0, priority: 0, exclusive: false });
+    match c.recv_control(&mut ts) {
+        ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
+        other => panic!("selection after prewarm expiry failed ({other:?}) — the cold fallback is gone"),
+    }
+    c.send(ClientMessage::StartStream);
+    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+
+    let got = c.drain_ts(Duration::from_secs(25));
+    println!("after prewarm expiry: {got} bytes");
+    assert!(got > 188 * 200, "cold fallback streamed only {got} bytes");
+}
+
 /// A session must be able to switch channels on a `max_instances = 1`
 /// driver. The old reader is not stopped until after the new one is in
 /// place, so the switch only works if the session's own slot permit is

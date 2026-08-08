@@ -220,6 +220,9 @@ pub struct TunerPool {
     /// Per-DLL `max_instances` enforcement (docs/TUNER_PIPELINE_REDESIGN.md P1b).
     /// See [`DriverSlots`]/[`SlotPermit`].
     driver_slots: DriverSlots,
+    /// Per-logical-channel single-flight locks. See
+    /// [`Self::acquire_channel_lock`].
+    channel_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 struct IdleHandle {
@@ -241,6 +244,7 @@ impl TunerPool {
             config: RwLock::new(config),
             dll_init_locks: Mutex::new(HashMap::new()),
             driver_slots: DriverSlots::new(),
+            channel_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -324,6 +328,42 @@ impl TunerPool {
     /// (docs/TUNER_PIPELINE_REDESIGN.md).
     pub async fn keys_pending_idle_close(&self) -> Vec<ChannelKey> {
         self.idle_tasks.lock().await.keys().cloned().collect()
+    }
+
+    /// Serialize requests for the *same logical channel*.
+    ///
+    /// Two viewers of one channel should share one reader. That works as
+    /// soon as an entry exists to join — but requests that arrive together
+    /// all snapshot an empty pool, all conclude "nothing to join", and each
+    /// opens its own tuner on a different driver. With five receivers, five
+    /// simultaneous viewers of one channel burned all five.
+    ///
+    /// Holding this lock across snapshot→decide→act makes the second
+    /// requester wait for the first to create its entry, then find it and
+    /// reuse. The wait is not wasted: they need that tuner either way.
+    /// Different channels never contend — the key is the request's candidate
+    /// set, which is what "the same logical channel" means once it has been
+    /// resolved to physical targets.
+    ///
+    /// Ordering note: this is always taken *before* the per-DLL init lock
+    /// (which `SharedTuner::start_reader` takes internally), never the other
+    /// way round, so the two cannot deadlock against each other.
+    pub async fn acquire_channel_lock(&self, candidates: &[ChannelKey]) -> tokio::sync::OwnedMutexGuard<()> {
+        let mut ids: Vec<String> = candidates
+            .iter()
+            .map(|k| format!("{}#{:?}", k.tuner_path, k.channel))
+            .collect();
+        ids.sort();
+        let key = ids.join("|");
+
+        let mutex = {
+            let mut locks = self.channel_locks.lock().await;
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        mutex.lock_owned().await
     }
 
     /// Cancel an idle-close timer if it exists.
@@ -1185,6 +1225,63 @@ mod tests {
 
         assert_eq!(tuner.state(), ReaderState::Stopped);
         assert_eq!(tuner.stop_reason(), StopReason::ReaderFailed);
+    }
+
+    /// Identical requests serialise; different channels do not.
+    #[tokio::test]
+    async fn the_channel_lock_serialises_only_matching_candidate_sets() {
+        let pool = Arc::new(TunerPool::new(10));
+        let a = vec![ChannelKey::space_channel("/dev/x", 0, 1)];
+        let b = vec![ChannelKey::space_channel("/dev/x", 0, 2)];
+
+        let held = pool.acquire_channel_lock(&a).await;
+
+        // A different channel must not be blocked by it.
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            pool.acquire_channel_lock(&b),
+        )
+        .await;
+        assert!(other.is_ok(), "a different channel must not wait on this one");
+
+        // The same channel must wait.
+        let same = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            pool.acquire_channel_lock(&a),
+        )
+        .await;
+        assert!(same.is_err(), "the same channel must serialise behind the holder");
+
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire_channel_lock(&a))
+                .await
+                .is_ok(),
+            "releasing must let the next requester through"
+        );
+    }
+
+    /// Candidate order must not matter: the same logical channel resolved on
+    /// the same drivers is the same channel however the list is arranged.
+    #[tokio::test]
+    async fn the_channel_lock_ignores_candidate_ordering() {
+        let pool = Arc::new(TunerPool::new(10));
+        let forward = vec![
+            ChannelKey::space_channel("/dev/a", 0, 1),
+            ChannelKey::space_channel("/dev/b", 0, 1),
+        ];
+        let reversed = vec![
+            ChannelKey::space_channel("/dev/b", 0, 1),
+            ChannelKey::space_channel("/dev/a", 0, 1),
+        ];
+
+        let _held = pool.acquire_channel_lock(&forward).await;
+        let same = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            pool.acquire_channel_lock(&reversed),
+        )
+        .await;
+        assert!(same.is_err(), "candidate order must not create a second lock");
     }
 
     /// §5: a warm tuner reserves a real slot for as long as it holds the DLL

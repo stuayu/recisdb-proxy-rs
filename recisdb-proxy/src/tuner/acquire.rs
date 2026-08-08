@@ -351,6 +351,12 @@ pub(crate) async fn acquire(
 
     let dll_paths: Vec<String> = request.candidates.iter().map(|k| k.tuner_path.clone()).collect();
 
+    // Serialize identical requests so a burst of viewers for one channel
+    // shares a reader instead of opening one each — see
+    // `TunerPool::acquire_channel_lock`. Held for the whole
+    // snapshot→decide→act sequence, including the reader start.
+    let _channel_guard = pool.acquire_channel_lock(&request.candidates).await;
+
     let mut carried_permit = request.carried_permit;
     let mut warm = request.warm;
 
