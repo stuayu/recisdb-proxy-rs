@@ -856,8 +856,6 @@ impl SharedTuner {
         let mut reader_first_read = true;
         let reader_start_time = std::time::Instant::now();
         let mut broadcast_send_errors: u64 = 0;
-        let mut logo_collector = ChannelLogoCollector::new();
-        let mut epg_collector = EpgCollector::new();
 
         loop {
             // Check if we should stop due to explicit stop signal
@@ -954,15 +952,13 @@ impl SharedTuner {
                     consecutive_empty = 0;
                     total_bytes_read += n as u64;
 
-                    // Broadcast to all subscribers
+                    // Broadcast to all subscribers.
+                    //
+                    // Logo (SDT/CDT) and EPG (EIT) collection used to run
+                    // here, on the read-rate-limiting thread, once per chunk
+                    // (P3 §2.2-10). They now run in their own task fed by the
+                    // same broadcast — see `spawn_si_collector`.
                     let raw = &buf[..n];
-
-                    // Best-effort logo extraction from SDT/CDT stream.
-                    logo_collector.process_ts_chunk(raw);
-                    // Best-effort EPG (EIT) collection, forwarded to the
-                    // process-wide EpgWriter if one is installed (see
-                    // `tuner/epg_collector.rs` module doc comment).
-                    epg_collector.process_ts_chunk(raw);
 
                     // Data validation before B25 decode (log only on first packet)
                     if reader_first_read && n > 0 {
@@ -1189,6 +1185,26 @@ impl SharedTuner {
 
         let ready_timeout = timing::reader_ready_timeout(startup_config.set_channel_retry_timeout_ms);
 
+        let started = self.dispatch_reader_start(warm, tuner_path, space, channel, startup_config, ready_timeout).await;
+        if started.is_ok() {
+            // Fed by the same broadcast the clients read; see its doc comment.
+            self.spawn_si_collector();
+        }
+        started
+    }
+
+    /// Cold-open or warm-activate, whichever `warm` allows. Split out of
+    /// [`Self::start_reader`] purely so that function has one success point
+    /// to hang post-start work off.
+    async fn dispatch_reader_start(
+        self: &Arc<Self>,
+        warm: Option<WarmTunerHandle>,
+        tuner_path: String,
+        space: u32,
+        channel: u32,
+        startup_config: ReaderStartupConfig,
+        ready_timeout: Duration,
+    ) -> Result<(), std::io::Error> {
         match warm {
             Some(warm) if warm.path() == tuner_path => {
                 self.start_reader_warm(warm, tuner_path, space, channel, startup_config, ready_timeout).await
@@ -1383,6 +1399,68 @@ impl SharedTuner {
                 Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout waiting for reader"))
             }
         }
+    }
+
+    /// Run SDT/CDT (logo) and EIT (EPG) collection for this tuner in its own
+    /// task, fed by the same broadcast the clients read
+    /// (docs/TUNER_PIPELINE_REDESIGN.md P3 §2.2-10).
+    ///
+    /// This used to run inline in the reader loop, on the very thread whose
+    /// throughput determines whether TS data is read fast enough — every
+    /// chunk paid a full PSI scan before it could be broadcast. Moving it to
+    /// a consumer keeps the read path to "read, decode, broadcast".
+    ///
+    /// Subscribes *untracked*: this is a parasitic consumer, and must not
+    /// keep the tuner alive or perturb the session-driven keep-alive
+    /// accounting. It holds a `Weak`, so the task falls out as soon as the
+    /// tuner is dropped, and stops as soon as the reader leaves `Running`.
+    ///
+    /// Note that it now sees the *decoded* stream rather than the raw one.
+    /// SI tables (SDT/CDT/EIT) are never scrambled, and B25 `strip` only
+    /// drops null packets, so the tables this collects are unaffected — and
+    /// on the fallback path where B25 is unavailable the bytes are the raw
+    /// ones anyway.
+    pub(crate) fn spawn_si_collector(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let mut rx = self.subscribe_untracked();
+        let mut state_rx = self.subscribe_state();
+        let key = self.key.clone();
+
+        tokio::spawn(async move {
+            let mut logo_collector = ChannelLogoCollector::new();
+            let mut epg_collector = EpgCollector::new();
+
+            loop {
+                tokio::select! {
+                    chunk = rx.recv() => match chunk {
+                        Ok(data) => {
+                            logo_collector.process_ts_chunk(&data);
+                            epg_collector.process_ts_chunk(&data);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // SI tables repeat, so a gap costs at most a
+                            // delayed table; never worth slowing the reader.
+                            debug!("[SI collector] {:?}: lagged {} chunk(s)", key, skipped);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *state_rx.borrow_and_update() != ReaderState::Running {
+                            break;
+                        }
+                    }
+                }
+
+                if weak.upgrade().is_none() {
+                    break;
+                }
+            }
+
+            debug!("[SI collector] {:?}: stopped", key);
+        });
     }
 
     /// Check if the reader is running.

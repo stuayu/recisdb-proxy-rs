@@ -852,25 +852,30 @@ impl Session {
                         }
                     }
 
-                    // Check for incoming TS data
+                    // Check for incoming TS data.
+                    //
+                    // While a shared encoder is active the session's output
+                    // comes from the encoder branch above, so this branch is
+                    // parked entirely (P3 §2.2-12) instead of waking once per
+                    // chunk only to drop it. The `ts_receiver` subscription
+                    // itself is kept: it is what makes the tuner's keep-alive
+                    // / idle-close accounting session-driven. An unpolled
+                    // broadcast receiver simply falls behind — the ring holds
+                    // one copy of each chunk regardless of how many receivers
+                    // there are, so nothing accumulates per session.
                     ts_result = async {
-                        if let Some(rx) = &mut self.ts_receiver {
-                            Some(rx.recv().await)
-                        } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            None
+                        match (&mut self.ts_receiver, self.current_encoder.is_some()) {
+                            (_, true) => std::future::pending::<Option<Result<Bytes, broadcast::error::RecvError>>>().await,
+                            (Some(rx), false) => Some(rx.recv().await),
+                            (None, false) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                None
+                            }
                         }
                     } => {
                         match ts_result {
                             Some(Ok(data)) => {
-                                if self.current_encoder.is_some() {
-                                    // A shared encoder is active: it consumes
-                                    // the tuner broadcast itself, so the raw
-                                    // copy is dropped here. We stay subscribed
-                                    // so the tuner's keep-alive / idle-close
-                                    // accounting remains session-driven.
-                                    let _ = data;
-                                } else if self.send_ts_data(data).await? {
+                                if self.send_ts_data(data).await? {
                                     break;
                                 }
                             }
@@ -2466,6 +2471,18 @@ impl Session {
     /// runs and the reason is recorded in `session_history`.
     async fn send_ts_data(&mut self, data: Bytes) -> std::io::Result<bool> {
         // ---- 1) Align outgoing TS to 188-byte packets ----
+        //
+        // Fast path (P3 §2.2-9): a chunk that is already 188-aligned, starts
+        // on a sync byte, and arrives with nothing left over from last time
+        // needs no realignment at all — which is the steady state for a
+        // healthy stream. Taking it avoids two full copies of every chunk
+        // (into `ts_send_carry`, then back out of it) for every session.
+        // Anything irregular falls through to the carry-buffer path below,
+        // which is unchanged.
+        if is_aligned_passthrough(self.ts_send_carry.is_empty(), &data) {
+            return self.send_aligned_ts_data(data).await;
+        }
+
         self.ts_send_carry.extend_from_slice(&data);
 
         // Best-effort resync if head is not sync byte (0x47)
@@ -2505,6 +2522,16 @@ impl Session {
         let send_data = Bytes::copy_from_slice(&self.ts_send_carry[..send_len]);
         self.ts_send_carry.drain(0..send_len);
 
+        self.send_aligned_ts_data(send_data).await
+    }
+
+    /// Everything `send_ts_data` does once the payload is known to be a whole
+    /// number of 188-byte TS packets: service filtering, quality accounting,
+    /// stats, and handing the frame to the writer.
+    ///
+    /// Split out so the aligned fast path and the carry-buffer path share it
+    /// verbatim rather than duplicating ~120 lines of accounting.
+    async fn send_aligned_ts_data(&mut self, send_data: Bytes) -> std::io::Result<bool> {
         // ---- 2) Apply single-service filter if enabled ----
         let send_data = if let Some(ref mut filter) = self.ts_service_filter {
             let filtered = filter.filter(&send_data);
@@ -2970,6 +2997,19 @@ impl Session {
     }
 }
 
+/// Whether `data` can go straight out without passing through the
+/// realignment carry buffer (P3 §2.2-9).
+///
+/// True only when there is nothing pending from the previous chunk and the
+/// chunk itself is a whole number of TS packets starting on a sync byte —
+/// the steady state of a healthy stream. Anything else (a partial packet, a
+/// chunk that starts mid-packet, or leftover bytes still waiting to be
+/// re-synced) has to go through the carry buffer, so that the packet
+/// boundaries the client sees stay correct across chunk edges.
+fn is_aligned_passthrough(carry_is_empty: bool, data: &[u8]) -> bool {
+    carry_is_empty && !data.is_empty() && data.len() % 188 == 0 && data[0] == 0x47
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         debug!("[Session {}] Session dropped", self.id);
@@ -2990,6 +3030,39 @@ mod tests {
         assert!(should_auto_promote_to_record(200)); // 録画(通常) 目安
         assert!(should_auto_promote_to_record(255)); // 録画(排他) 目安
         assert!(should_auto_promote_to_record(i32::MAX));
+    }
+
+    // ---- P3 §2.2-9: outgoing alignment fast path ----
+
+    #[test]
+    fn aligned_chunk_with_empty_carry_skips_the_realignment_buffer() {
+        let mut chunk = vec![0u8; 188 * 3];
+        chunk[0] = 0x47;
+        chunk[188] = 0x47;
+        chunk[376] = 0x47;
+        assert!(is_aligned_passthrough(true, &chunk));
+    }
+
+    #[test]
+    fn leftover_carry_forces_the_slow_path() {
+        let mut chunk = vec![0u8; 188];
+        chunk[0] = 0x47;
+        assert!(
+            !is_aligned_passthrough(false, &chunk),
+            "bytes pending from the previous chunk must be prepended, not bypassed"
+        );
+    }
+
+    #[test]
+    fn misaligned_or_unsynced_chunks_force_the_slow_path() {
+        let mut partial = vec![0u8; 200]; // not a whole number of packets
+        partial[0] = 0x47;
+        assert!(!is_aligned_passthrough(true, &partial));
+
+        let unsynced = vec![0u8; 188]; // right length, wrong first byte
+        assert!(!is_aligned_passthrough(true, &unsynced));
+
+        assert!(!is_aligned_passthrough(true, &[]));
     }
 
     // ---- STREAMING_DESIGN.md §3.2: class-specific TS send backpressure ----
