@@ -18,8 +18,7 @@ use recisdb_protocol::{
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
-use crate::tuner::{CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, TunerSubscription, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
-use crate::tuner::pool::TunerPoolError;
+use crate::tuner::{ChannelKey, SharedTuner, SlotPermit, TunerPool, TunerSubscription, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
 use crate::tuner::encoder_pool::{
     self, EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
 };
@@ -620,66 +619,6 @@ impl Session {
         }
     }
 
-
-    /// Obtain a slot permit for `dll_path`, preferring a matching warm
-    /// tuner's already-held reservation over a fresh `acquire_slot` call.
-    ///
-    /// docs/TUNER_PIPELINE_REDESIGN.md P1b §5: prewarming reserves a slot at
-    /// spawn time (`maybe_start_warm_tuner`), and that same reservation must
-    /// be reused — not duplicated — when the warm handle is actually
-    /// activated. On a `max_instances=1` driver a fresh `acquire_slot` here
-    /// would always fail (the warm handle itself already holds the driver's
-    /// only permit), so warm-activation could never succeed for exactly the
-    /// single-instance devices prewarming exists to help most.
-    async fn acquire_slot_preferring_warm(&mut self, dll_path: &str, max_instances: i32) -> Option<SlotPermit> {
-        if self.warm_tuner_path.as_deref() == Some(dll_path) {
-            if let Some(warm) = self.warm_tuner.as_mut() {
-                if let Some(permit) = warm.take_permit() {
-                    return Some(permit);
-                }
-            }
-        }
-        self.tuner_pool.acquire_slot(dll_path, max_instances).await
-    }
-
-    /// Start `tuner`'s reader using `permit` (a slot already reserved for
-    /// `tuner_path` — see `acquire_slot_preferring_warm`/
-    /// `SharedTuner::take_slot_permit`), preferring an already-open warm
-    /// BonDriver on the same path over a fresh cold open.
-    ///
-    /// Thin wrapper around `SharedTuner::start_reader`
-    /// (docs/TUNER_PIPELINE_REDESIGN.md P2a item 2) — this session's own
-    /// `warm_tuner`/`warm_tuner_path` bookkeeping is the only thing left
-    /// here; the DLL-init-lock acquisition, permit storage, and cold/warm
-    /// dispatch all moved into `start_reader` itself.
-    async fn start_reader_with_warm(
-        &mut self,
-        tuner: Arc<SharedTuner>,
-        tuner_path: String,
-        space: u32,
-        channel: u32,
-        permit: SlotPermit,
-    ) -> std::io::Result<()> {
-        let config = self.tuner_pool.config().await;
-        let startup_config = crate::tuner::shared::ReaderStartupConfig::from(&config);
-
-        // Only hand off a warm handle that's actually on this exact path and
-        // that prewarming is still enabled for; any other warm handle this
-        // session happens to be holding is stale for this request and must
-        // still be shut down (releasing its own slot permit) rather than
-        // left to linger.
-        let warm = if config.prewarm_enabled && self.warm_tuner_path.as_deref() == Some(tuner_path.as_str()) {
-            self.warm_tuner_path = None;
-            self.warm_tuner.take()
-        } else {
-            None
-        };
-        self.stop_warm_tuner().await;
-
-        tuner
-            .start_reader(&self.tuner_pool, tuner_path, space, channel, startup_config, permit, warm)
-            .await
-    }
 
     /// Get channel map for a specific space and region (for virtual space filtering).
     /// Cached per region_key: TVTest calls EnumChannelName once per channel,
@@ -1345,142 +1284,90 @@ impl Session {
         };
         self.maybe_promote_stream_class(channel_priority_for_class).await;
 
-        // Create channel key
         let key = ChannelKey::simple(&tuner_path, channel);
-
-        // ★ Same-channel reuse: if we already have a running tuner for this
-        // exact key, just refresh the subscription without restarting.
-        if let Some(existing) = self.current_tuner.as_ref().cloned() {
-            if existing.key == key && existing.is_running() {
-                self.tuner_pool.cancel_idle_close(&key).await;
-                let _ = handoff_current_tuner(
-                    self.id,
-                    &mut self.ts_receiver,
-                    &mut self.current_tuner,
-                    existing.clone(),
-                    self.state == SessionState::Streaming,
-                    "SetChannel same-key reuse:",
-                ).await;
-                return self.finish_set_channel_success(&existing).await;
-            }
-        }
-
-        // ★ Check if another session already has this channel running in the pool.
-        if let Some(pool_tuner) = self.tuner_pool.get(&key).await {
-            if pool_tuner.is_running() {
-                self.tuner_pool.cancel_idle_close(&key).await;
-                self.stop_warm_tuner().await;
-                let cleanup_old = handoff_current_tuner(
-                    self.id,
-                    &mut self.ts_receiver,
-                    &mut self.current_tuner,
-                    pool_tuner.clone(),
-                    self.state == SessionState::Streaming,
-                    "SetChannel pool reuse:",
-                ).await;
-                if let Some(old) = cleanup_old {
-                    self.tuner_pool.schedule_idle_close(old.key.clone(), old).await;
-                }
-                return self.finish_set_channel_success(&pool_tuner).await;
-            } else if pool_tuner.is_reclaimable() {
-                // Stale entry — remove so get_or_create below creates a fresh one.
-                // (A `Starting` entry — another session's in-flight open of
-                // this same channel — is deliberately left alone here: it is
-                // not stale, just not ready yet. See M8, SYSTEM_REVIEW_2026-07.md.)
-                warn!("[Session {}] Found stale (not running) v1 tuner for {:?}, removing from pool",
-                      self.id, key);
-                self.tuner_pool.remove(&key).await;
-            }
-        }
-
-        // ★ Clean up old tuner BEFORE creating new one (same order as v2).
-        // This frees the DLL slot so the new reader can open it.
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
-        // ★ Capacity-aware cleanup (same logic as v2 old-tuner-cleanup).
-        // Only stop the old reader if the DLL is at capacity; otherwise
-        // schedule idle-close so other subscribers can keep streaming.
-        self.take_and_cleanup_current_tuner_for_switch(&tuner_path, "v1 cleanup:")
-            .await;
 
-        // Get or create shared tuner.
-        //
-        // docs/TUNER_PIPELINE_REDESIGN.md P1b §6: check reuse *before*
-        // acquiring a slot permit — an exact-key entry left in the pool by
-        // the `is_reclaimable()`/`is_running()` checks above (i.e. a
-        // `Starting` in-flight open by another session) is joinable via
-        // `get_or_create`'s own fast path without needing a permit; asking
-        // for one here would wrongly fail this attempt on a
-        // `max_instances`-constrained driver whose sole slot is held by
-        // that very entry.
-        let already_occupied = self.tuner_pool.get(&key).await
-            .map(|t| !t.is_reclaimable())
-            .unwrap_or(false);
+        // Permit handoff, same as the v2 path: extract the current tuner's
+        // slot before anything can stop it, so a same-DLL switch on a
+        // `max_instances = 1` driver keeps its reservation instead of
+        // releasing and re-acquiring (docs/TUNER_PIPELINE_REDESIGN.md P1b §4).
+        let inherited_permit: Option<SlotPermit> = self.current_tuner.as_ref().and_then(|old| {
+            if old.key.tuner_path != tuner_path {
+                return None;
+            }
+            let sub_count = old.subscriber_count();
+            let will_free = (sub_count == 1 && self.ts_receiver.is_some())
+                || (sub_count == 0 && self.ts_receiver.is_none());
+            if will_free { old.take_slot_permit() } else { None }
+        });
 
-        let tuner_result: Result<Arc<SharedTuner>, TunerPoolError> = if already_occupied {
-            self.tuner_pool.get(&key).await
-                .ok_or_else(|| TunerPoolError::OpenFailed("raced with a concurrent removal".to_string()))
-        } else {
-            // §7: `acquire_slot`'s success/failure *is* the `max_instances`
-            // enforcement now — the old separate post-creation
-            // `count_running_instances_on_driver`/`has_capacity` guard below
-            // this block is gone; a full driver simply never gets a permit.
-            let guard_max = driver_max_instances(&self.database, &tuner_path).await;
-            match self.acquire_slot_preferring_warm(&tuner_path, guard_max).await {
-                Some(permit) => self.tuner_pool.get_or_create(key.clone(), 2, permit, || async { Ok(()) }).await,
-                None => {
-                    warn!("[Session {}] v1: CONFLICT: driver {} already at {} instance(s)",
-                          self.id, tuner_path, guard_max);
-                    Err(TunerPoolError::OpenFailed(format!("driver {} at capacity", tuner_path)))
-                }
+        // Rejoining the reader we are already on? Then it must not be torn
+        // down by the pre-switch cleanup below (see the same guard in
+        // `handle_set_channel_space`).
+        let will_rejoin_current = self
+            .current_tuner
+            .as_ref()
+            .is_some_and(|cur| cur.key == key && !cur.needs_reader_start());
+
+        if inherited_permit.is_some() && !will_rejoin_current {
+            self.take_and_cleanup_current_tuner_for_switch(&tuner_path, "v1 cleanup:")
+                .await;
+        }
+
+        let own_key_will_free_slot = inherited_permit.is_some();
+        let warm = self.warm_tuner.take();
+        let request = AcquireRequest {
+            candidates: vec![key.clone()],
+            priority: channel_priority_for_class,
+            // v1 has no exclusive-eviction behaviour to preserve: the legacy
+            // path never evicted a subscribed reader, it just reported a
+            // conflict. Keeping `exclusive: false` means `decide` can only
+            // ever pick an *idle* victim here. Unifying this with v2 is
+            // P2b-3's call, not a side effect of the wiring.
+            exclusive: false,
+            bondriver_version: 2,
+            carried_permit: inherited_permit,
+            warm,
+            own_key: old_tuner_key.clone(),
+            own_key_will_free_slot,
+        };
+
+        let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                error!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                return self.fail_set_channel(&old_tuner_key).await;
             }
         };
 
-        match tuner_result {
-            Ok(tuner) => {
-                // Start the BonDriver reader
-                if tuner.needs_reader_start() {
-                    let Some(start_permit) = tuner.take_slot_permit() else {
-                        error!("[Session {}] v1: {:?} needs a reader start but holds no slot permit", self.id, key);
-                        self.remove_orphaned_tuner_if_unused(&key, &tuner).await;
-                        return self.fail_set_channel(&old_tuner_key).await;
-                    };
-                    if let Err(e) = self.start_reader_with_warm(
-                        Arc::clone(&tuner),
-                        tuner_path.clone(),
-                        0,  // v1 style uses space=0
-                        channel as u32,
-                        start_permit,
-                    ).await {
-                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                            warn!("[Session {}] Channel unavailable on {}: {}", self.id, tuner_path, e);
-                        } else {
-                            error!("[Session {}] Failed to start BonDriver reader for {}: {} (kind: {:?})",
-                                   self.id, tuner_path, e, e.kind());
-                        }
-                        // ★ Clean up orphaned pool entry
-                        self.remove_orphaned_tuner_if_unused(&key, &tuner).await;
-                        return self.fail_set_channel(&old_tuner_key).await;
-                    }
-                } else {
-                    info!("[Session {}] v1: BonDriver reader already running, reusing", self.id);
-                }
-
-                let _ = handoff_current_tuner(
-                    self.id,
-                    &mut self.ts_receiver,
-                    &mut self.current_tuner,
-                    tuner.clone(),
-                    self.state == SessionState::Streaming,
-                    "SetChannel new tuner:",
-                ).await;
-
-                self.finish_set_channel_success(&tuner).await
-            }
-            Err(e) => {
-                error!("[Session {}] Failed to set channel: {}", self.id, e);
-                self.fail_set_channel(&old_tuner_key).await
-            }
+        self.absorb_acquire_leftovers(outcome.unused_permit.is_some(), outcome.unused_warm);
+        if let Some(permit) = outcome.unused_permit {
+            self.return_unused_permit(permit).await;
         }
+
+        self.tuner_pool.cancel_idle_close(&outcome.key).await;
+
+        let cleanup_old = handoff_current_tuner(
+            self.id,
+            &mut self.ts_receiver,
+            &mut self.current_tuner,
+            outcome.tuner.clone(),
+            self.state == SessionState::Streaming,
+            "SetChannel:",
+        ).await;
+        if let Some(old) = cleanup_old {
+            cleanup_unused_tuner_after_switch(
+                &self.database,
+                &self.tuner_pool,
+                self.id,
+                old,
+                Some(outcome.key.tuner_path.as_str()),
+                false,
+                "SetChannel cleanup:",
+            ).await;
+        }
+
+        self.finish_set_channel_success(&outcome.tuner).await
     }
 
     async fn take_and_cleanup_current_tuner_for_switch(
@@ -1544,20 +1431,6 @@ impl Session {
         .await
     }
 
-    async fn remove_orphaned_tuner_if_unused(
-        &self,
-        key: &ChannelKey,
-        tuner: &Arc<SharedTuner>,
-    ) {
-        // `is_orphanable()`, not `is_reclaimable()`: this is *our* entry, and
-        // the common case here is a `Reserved` one we asked `get_or_create`
-        // for and then bailed on (capacity conflict / start failure). Leaving
-        // it behind would hold its driver slot forever.
-        if tuner.is_orphanable() {
-            self.tuner_pool.remove(key).await;
-        }
-    }
-
     async fn fail_set_channel(
         &mut self,
         old_tuner_key: &Option<ChannelKey>,
@@ -1615,6 +1488,15 @@ impl Session {
     }
 
 
+    /// Try one candidate driver for a logical (NID, TSID) selection.
+    ///
+    /// The outer loop in `handle_select_logical_channel` walks candidates in
+    /// the DB's own priority order and calls this once per candidate, rather
+    /// than handing the whole list to `acquire` at once: `decide` re-sorts a
+    /// candidate list by (exclusive count, load, quality score), which would
+    /// discard the DB ordering this path deliberately relies on. Unifying
+    /// the two ordering rules is P2b-3's call
+    /// (docs/TUNER_PIPELINE_REDESIGN.md).
     async fn try_select_logical_channel_candidate(
         &mut self,
         candidate_idx: usize,
@@ -1624,116 +1506,55 @@ impl Session {
         carried_permit: &mut Option<SlotPermit>,
     ) -> Option<std::io::Result<()>> {
         let key = ChannelKey::space_channel(tuner_id, space, channel);
-
-        // docs/TUNER_PIPELINE_REDESIGN.md P1b §6: check reuse before
-        // touching the slot semaphore.
-        let already_occupied = self.tuner_pool.get(&key).await
-            .map(|t| !t.is_reclaimable())
-            .unwrap_or(false);
+        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
 
         self.set_selected_tuner_path(tuner_id).await;
 
-        let tuner = if already_occupied {
-            match self.tuner_pool.get(&key).await {
-                Some(t) => t,
-                None => return None, // raced away between the check and here
-            }
-        } else {
-            // §4/§7: `acquire_slot` is the capacity enforcement now, and this
-            // session's own about-to-be-vacated tuner hands its permit down
-            // through `carried_permit` rather than being subtracted from a
-            // count (the old `old_tuner_will_free_slot` exclusion). Without
-            // that transfer, switching channels on a `max_instances = 1`
-            // driver could never acquire a slot: the session's own still-
-            // running old reader holds the only permit, and it is not stopped
-            // until after a candidate succeeds.
-            let permit = match carried_permit.take_if_on_path(tuner_id) {
-                Some(p) => {
-                    info!(
-                        "[Session {}] SelectLogicalChannel: reusing this session's own slot permit for {} (same-DLL switch)",
-                        self.id, tuner_id
-                    );
-                    p
-                }
-                None => {
-                    let max_instances = driver_max_instances(&self.database, tuner_id).await;
-                    match self.acquire_slot_preferring_warm(tuner_id, max_instances).await {
-                        Some(p) => p,
-                        None => {
-                            info!(
-                                "[Session {}] SelectLogicalChannel: skipping candidate {} '{}' — at capacity ({} instance(s))",
-                                self.id, candidate_idx, tuner_id, max_instances
-                            );
-                            return None;
-                        }
-                    }
-                }
-            };
+        let own_key_will_free_slot = carried_permit
+            .as_ref()
+            .is_some_and(|p| p.dll_path() == tuner_id);
+        let warm = self.warm_tuner.take();
+        let request = AcquireRequest {
+            candidates: vec![key.clone()],
+            priority: 0,
+            // Group members are assumed to hard-exclusive the underlying
+            // hardware, but this path never evicted a *subscribed* reader
+            // either — it just moved on to the next candidate. Keep that.
+            exclusive: false,
+            bondriver_version: 2,
+            carried_permit: carried_permit.take(),
+            warm,
+            own_key: old_tuner_key.clone(),
+            own_key_will_free_slot,
+        };
 
-            match self.tuner_pool.get_or_create(key.clone(), 2, permit, || async { Ok(()) }).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        "[Session {}] SelectLogicalChannel: candidate {} '{}' pool creation failed: {}",
-                        self.id, candidate_idx, tuner_id, e
-                    );
-                    return None;
-                }
+        let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                info!(
+                    "[Session {}] SelectLogicalChannel: candidate {} '{}' unavailable: {}",
+                    self.id, candidate_idx, tuner_id, e
+                );
+                return None;
             }
         };
 
-        // Any failure below abandons `tuner`; reclaim whatever permit it is
-        // holding into `carried_permit` first, so a later candidate on the
-        // same DLL — or the caller's restore path — still has it. Without
-        // this, a failed candidate would silently release a slot that this
-        // session's still-running old reader is physically occupying.
-        macro_rules! reclaim_and_bail {
-            () => {{
-                if carried_permit.is_none() {
-                    *carried_permit = tuner.take_slot_permit();
-                }
-                self.remove_orphaned_tuner_if_unused(&key, &tuner).await;
-                return None;
-            }};
+        self.absorb_acquire_leftovers(outcome.unused_permit.is_some(), outcome.unused_warm);
+        // Unconsumed permit goes back into the carrier so the next candidate
+        // (or the caller's restore path) can still use it — releasing it here
+        // would hand the slot away while this session's old reader still
+        // holds the device open.
+        if carried_permit.is_none() {
+            *carried_permit = outcome.unused_permit;
         }
 
-        self.tuner_pool.cancel_idle_close(&key).await;
-
-        if tuner.needs_reader_start() {
-            let Some(start_permit) = tuner.take_slot_permit() else {
-                warn!(
-                    "[Session {}] SelectLogicalChannel: candidate {} '{}' needs a reader start but holds no slot permit",
-                    self.id, candidate_idx, tuner_id
-                );
-                reclaim_and_bail!();
-            };
-            if let Err(e) = self.start_reader_with_warm(
-                Arc::clone(&tuner),
-                tuner_id.to_string(),
-                space,
-                channel,
-                start_permit,
-            ).await {
-                if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                    warn!(
-                        "[Session {}] SelectLogicalChannel: candidate {} '{}' channel unavailable: {}",
-                        self.id, candidate_idx, tuner_id, e
-                    );
-                } else {
-                    error!(
-                        "[Session {}] SelectLogicalChannel: candidate {} '{}' failed to start reader: {}",
-                        self.id, candidate_idx, tuner_id, e
-                    );
-                }
-                reclaim_and_bail!();
-            }
-        }
+        self.tuner_pool.cancel_idle_close(&outcome.key).await;
 
         let cleanup_old = handoff_current_tuner(
             self.id,
             &mut self.ts_receiver,
             &mut self.current_tuner,
-            tuner,
+            outcome.tuner.clone(),
             self.state == SessionState::Streaming,
             "SelectLogicalChannel:",
         ).await;
@@ -1753,19 +1574,16 @@ impl Session {
             ).await;
         }
 
-        if let Some(tuner) = self.current_tuner.clone() {
-            return Some(
-                self.finish_logical_channel_selection_success(
-                    &tuner,
-                    candidate_idx,
-                    tuner_id,
-                    space,
-                    channel,
-                ).await,
-            );
-        }
-
-        None
+        let tuner = self.current_tuner.clone()?;
+        Some(
+            self.finish_logical_channel_selection_success(
+                &tuner,
+                candidate_idx,
+                tuner_id,
+                space,
+                channel,
+            ).await,
+        )
     }
 
     async fn finish_logical_channel_selection_success(

@@ -583,10 +583,36 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
 そこへ戻す (`return_unused_permit`)。単に drop すると、デバイスが開いたままなのに
 プールがスロットを空きと見なす。
 
-### P2b-2(残) / P2b-3 — v1・論理選局の配線と eviction ポリシー統一 (残タスク)
+### P2b-2 (続き) — v1 選局・論理チャンネル選局の配線 (実装済み)
 
-- `handle_set_channel` (BNDP v1) と `handle_select_logical_channel` /
-  `try_select_logical_channel_candidate` を同様に `acquire()` へ載せ替える。
+`handle_set_channel` (BNDP v1) と `try_select_logical_channel_candidate`
+(論理チャンネル選局) も `acquire()` に載せ替えた。これで**選局 4 経路すべてが
+`acquire()` を通る**。
+
+- リーダー起動が `acquire` の中だけになったため、`session.rs` の
+  `start_reader_with_warm` / `acquire_slot_preferring_warm` /
+  `remove_orphaned_tuner_if_unused` が不要になり削除した。warm ハンドルの
+  permit を優先して使う仕組みは `acquire::take_permit_for_path`
+  (carried → warm → `acquire_slot`) が担う。
+- `session.rs` は 3613 行 → 3028 行 (合計 -585 行)。
+
+**論理チャンネル選局の候補ループは残した。** この経路の候補は
+`get_channels_by_nid_tsid_ordered` が返す DB 優先度順で、その順序自体に
+意味がある。一方 `decide()` は候補を「排他チャンネル数 → 稼働数 → 品質
+スコア」で再ソートするため、候補リストをまとめて渡すと順序の意味が変わる。
+外側のループを保ち、1 候補ずつ `acquire()` を呼ぶ形にした。permit は
+`&mut Option<SlotPermit>` として候補間で持ち回り、消費されなければ次の候補へ、
+全候補が失敗したら旧チューナーへ返す。順序規則の統一は P2b-3 の判断事項。
+
+**挙動を保つために `exclusive: false` を渡している経路が 2 つある**:
+- v1 選局 … 旧実装は購読者のいるリーダーを退避したことがなく、容量不足なら
+  単に CONFLICT を返していた。
+- 論理チャンネル選局 … 同様に、退避せず次の候補へ移っていた。
+
+どちらも `decide()` の非排他分岐しか通らないため、退避対象は idle のみに
+限られる。v2 と揃えるかどうかは P2b-3 で判断する。
+
+### P2b-3 — eviction ポリシーの一本化 (残タスク)
 
 - `session.rs` から選局系ヘルパ 8 個
   (`try_reuse_existing_set_channel_space_tuner` 等) を削除し、
