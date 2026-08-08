@@ -766,6 +766,32 @@ P2b-3 で「優先度が上回れば視聴中のリーダーも停止する」�
 
 ---
 
+## 4.5 実機検証 (2026-08-08, PX-MLT5PE / macOS)
+
+macOS 用バックエンド (`bondriver/px4_daemon.rs`) を追加して、実機で確認した結果。
+環境: PX-MLT5PE 5 系統、地上波 8 波 + BS 9 波 + CS 12 波受信可、仙台。
+`max_instances = 1` × 5 ドライバとして登録 (1 系統 = 1 チャンネルという
+ハードウェアの実態と一致)。
+
+| 検証項目 | 結果 | 根拠 |
+|---|---|---|
+| チャンネルスキャン完走 | OK | 29 物理チャンネルから 106 サービス取得 |
+| 単一スロットでの合流 (P1b §6) | OK | 同一サービスへの 2 本目が `decision=reuse`、両方 200 で受信 |
+| 同値優先度では奪わない (P2b-3) | OK | 別チャンネル要求が `reject reason=AtCapacity{lowest_idle_priority: None}` → 503 |
+| 上限超過で作らない (P2b-3) | OK | 同上。超過生成は発生しない |
+| idle 退避 → 別チャンネル可 | OK | 1 本目終了後、`evict_idle_on_path` が idle リーダーを退避し `decision=create` |
+| permit 移譲 (P1b §4) | OK | セッションが `max_instances=1` 上でチャンネル切替、`using the caller's own slot permit (same-DLL handoff)` を確認、TS 継続 |
+| 決定トレース (P4) | OK | `decision=reuse/create/reject` が 1 判断 1 行で追える |
+
+**未検証**: prewarm タイムアウト後の cold フォールバック (P2a)。再現には
+`prewarm_timeout_secs` 経過後の選局という時間依存の条件が要る。
+
+実機テストは常設した:
+- `cargo test -p recisdb-proxy --lib px4_daemon -- --ignored` (バックエンド単体)
+- `cargo test -p recisdb-proxy --test bndp_hardware -- --ignored` (セッション経路)
+
+---
+
 ## 5. 影響範囲と非影響範囲
 
 - **チャンネル列挙順は変更しない**。`server/client_view.rs` と channels テーブルの

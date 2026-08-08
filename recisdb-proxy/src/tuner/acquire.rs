@@ -269,6 +269,10 @@ async fn take_permit_for_path(
     warm: &mut Option<WarmTunerHandle>,
 ) -> Option<(SlotPermit, Option<WarmTunerHandle>)> {
     if let Some(permit) = carried_permit.take_if_on_path(dll_path) {
+        info!(
+            "[acquire] using the caller's own slot permit for {} (same-DLL handoff)",
+            dll_path
+        );
         if let Some(w) = warm.take() {
             if w.path() == dll_path {
                 w.shutdown().await;
