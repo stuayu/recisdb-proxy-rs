@@ -16,7 +16,7 @@ use crate::tuner::channel_key::ChannelKeySpec;
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::session_channel_candidates::collect_group_channel_candidates;
-use crate::tuner::{ChannelKey, TunerPool};
+use crate::tuner::TunerPool;
 
 pub(super) use crate::tuner::policy::{
     select_driver_with_capacity, select_running_driver, sort_candidate_drivers, DriverCandidate,
@@ -34,8 +34,6 @@ pub(super) async fn select_group_driver_for_channel(
     group_driver_paths: &[String],
     entry_nid: u16,
     entry_tsid: u16,
-    old_tuner_key: Option<&ChannelKey>,
-    old_tuner_will_free_slot: bool,
 ) -> Option<GroupDriverSelection> {
     debug!(
         "[Session {}] SetChannelSpace: In group mode, searching for NID=0x{:04X} TSID=0x{:04X}",
@@ -106,13 +104,22 @@ pub(super) async fn select_group_driver_for_channel(
             if key.tuner_path != *driver_path {
                 continue;
             }
-            if old_tuner_will_free_slot && old_tuner_key == Some(key) {
-                continue;
-            }
             if let Some(tuner) = tuner_pool.get(key).await {
                 // Slot occupancy, not "TS flowing" — a reader still opening
                 // the DLL already holds the slot (see
                 // `session_capacity::count_running_instances_on_driver`).
+                //
+                // docs/TUNER_PIPELINE_REDESIGN.md P1b §4: this used to
+                // exclude this session's own about-to-be-vacated tuner
+                // (`old_tuner_will_free_slot`) from the count, as a stand-in
+                // for capacity it hadn't actually reserved yet. That
+                // exclusion is gone — actual capacity enforcement is now the
+                // slot permit acquired in `server/session.rs`'s
+                // `finish_set_channel_space_with_new_tuner` (with the old
+                // tuner's own permit transferred there directly when
+                // eligible), so this count is purely a same-channel /
+                // least-loaded *selection* heuristic among group drivers,
+                // not a capacity gate.
                 if tuner.occupies_slot() {
                     running_instances += 1;
                 }

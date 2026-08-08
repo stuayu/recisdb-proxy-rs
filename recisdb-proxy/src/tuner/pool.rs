@@ -60,6 +60,142 @@ impl Default for TunerPoolConfig {
     }
 }
 
+/// A held reservation against one DLL path's `max_instances` capacity
+/// (docs/TUNER_PIPELINE_REDESIGN.md P1b).
+///
+/// Obtained from [`TunerPool::acquire_slot`] and required by
+/// [`crate::tuner::shared::SharedTuner::start_bondriver_reader`] and
+/// [`crate::tuner::warm::WarmTunerHandle::activate`] — a reader cannot be
+/// started without one, which is what turns capacity enforcement from
+/// "count how many readers look active right now" (a TOCTOU snapshot that
+/// can be stale by the time a slow BonDriver open finishes) into "hold a
+/// permit for the entire time this slot is occupied". Dropping a
+/// `SlotPermit` releases the reservation back to the driver's semaphore —
+/// this is a thin wrapper around [`tokio::sync::OwnedSemaphorePermit`]
+/// purely so the "this represents one DLL slot" contract is visible in the
+/// type instead of only in a doc comment (and so callers can ask which path
+/// a permit belongs to, e.g. when deciding whether it can be transferred to
+/// a different [`SharedTuner`](crate::tuner::shared::SharedTuner) instance
+/// on the same DLL — see `server/session.rs`'s permit-handoff on channel
+/// switch).
+pub struct SlotPermit {
+    // Never read; kept alive purely for its `Drop` side effect (returning
+    // the permit to the `Semaphore` in `DriverSlots`).
+    #[allow(dead_code)]
+    permit: tokio::sync::OwnedSemaphorePermit,
+    dll_path: String,
+}
+
+impl SlotPermit {
+    /// The DLL path this permit reserves a slot on. A permit is only valid
+    /// to transfer to another `SharedTuner` opening the *same* path — the
+    /// underlying `Semaphore` is per-path, so handing a permit to a
+    /// different DLL's reader would silently under-count that other DLL's
+    /// capacity while leaking a slot on this one.
+    pub fn dll_path(&self) -> &str {
+        &self.dll_path
+    }
+}
+
+/// Helper for carrying "a permit this session already owns" through a
+/// selection loop that may try several DLLs (see
+/// `server/session.rs`'s `SelectLogicalChannel` candidate walk).
+///
+/// A permit is only valid on the DLL path it was acquired for, so a carried
+/// permit must be consumed **only** by a candidate on that same path and left
+/// untouched otherwise — hence take-if-matching rather than a plain `take()`.
+pub trait CarriedSlotPermit {
+    /// Take the permit only if it reserves a slot on `dll_path`.
+    fn take_if_on_path(&mut self, dll_path: &str) -> Option<SlotPermit>;
+}
+
+impl CarriedSlotPermit for Option<SlotPermit> {
+    fn take_if_on_path(&mut self, dll_path: &str) -> Option<SlotPermit> {
+        if self.as_ref().is_some_and(|p| p.dll_path() == dll_path) {
+            self.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Debug for SlotPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotPermit").field("dll_path", &self.dll_path).finish()
+    }
+}
+
+/// One DLL path's capacity tracking: the `Semaphore` callers acquire permits
+/// from, plus the `max_instances` value it was last sized for (needed to
+/// compute the add/forget delta on the next resize — a `Semaphore` itself
+/// only exposes *available* permits, not how many it was originally
+/// constructed with).
+struct DriverSlotEntry {
+    semaphore: Arc<Semaphore>,
+    capacity: i32,
+}
+
+/// Per-DLL-path semaphores enforcing `max_instances` (docs/TUNER_PIPELINE_REDESIGN.md
+/// P1b §1). One permit = one occupied slot on that DLL, held for the entire
+/// lifetime of a `SharedTuner`'s reader (from the moment a caller commits to
+/// starting one, via `start_bondriver_reader`/`WarmTunerHandle::activate`,
+/// until `stop_reader()` or the `SharedTuner`/`WarmTunerHandle` is dropped).
+///
+/// Deliberately *not* keyed off `TunerPool`'s own `tuners` map: a warm tuner
+/// reserves a slot before any `SharedTuner`/pool entry exists for it at all
+/// (docs/TUNER_PIPELINE_REDESIGN.md §2.1-4), so capacity has to be tracked
+/// independently of pool membership.
+struct DriverSlots {
+    entries: Mutex<HashMap<String, DriverSlotEntry>>,
+}
+
+impl DriverSlots {
+    fn new() -> Self {
+        Self { entries: Mutex::new(HashMap::new()) }
+    }
+
+    /// Get (creating if needed) the semaphore for `dll_path`, resizing it to
+    /// `max_instances` if that has changed since the last call.
+    ///
+    /// Resizing is a plain `add_permits`/`forget_permits` delta against the
+    /// previously recorded `capacity` — increases take effect immediately;
+    /// decreases only remove *currently available* permits. If `max_instances`
+    /// is lowered while every existing permit is checked out, the excess
+    /// capacity is not clawed back until those permits are naturally returned
+    /// (each returned permit hands one slot back to whoever is waiting/next
+    /// to ask, rather than shrinking the pool further) — acceptable per
+    /// docs/TUNER_PIPELINE_REDESIGN.md P1b §1 ("減少しきれない分は次の解放時に
+    /// 自然に吸収される形でよい"): this is a rare admin reconfiguration, not a
+    /// safety property `acquire_slot` depends on.
+    async fn semaphore_for(&self, dll_path: &str, max_instances: i32) -> Arc<Semaphore> {
+        let max_instances = max_instances.max(0);
+        let mut entries = self.entries.lock().await;
+        match entries.get_mut(dll_path) {
+            Some(entry) => {
+                match max_instances.cmp(&entry.capacity) {
+                    std::cmp::Ordering::Greater => {
+                        entry.semaphore.add_permits((max_instances - entry.capacity) as usize);
+                    }
+                    std::cmp::Ordering::Less => {
+                        entry.semaphore.forget_permits((entry.capacity - max_instances) as usize);
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+                entry.capacity = max_instances;
+                Arc::clone(&entry.semaphore)
+            }
+            None => {
+                let semaphore = Arc::new(Semaphore::new(max_instances as usize));
+                entries.insert(
+                    dll_path.to_string(),
+                    DriverSlotEntry { semaphore: Arc::clone(&semaphore), capacity: max_instances },
+                );
+                semaphore
+            }
+        }
+    }
+}
+
 /// Pool of shared tuner instances.
 ///
 /// Manages tuner lifecycle and enables channel sharing between clients.
@@ -81,6 +217,9 @@ pub struct TunerPool {
     /// "steal" another's channel.  The lock is held only during the init phase
     /// (up to ~10 s); the reader loop runs without it.
     dll_init_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-DLL `max_instances` enforcement (docs/TUNER_PIPELINE_REDESIGN.md P1b).
+    /// See [`DriverSlots`]/[`SlotPermit`].
+    driver_slots: DriverSlots,
 }
 
 struct IdleHandle {
@@ -101,6 +240,27 @@ impl TunerPool {
             max_tuners,
             config: RwLock::new(config),
             dll_init_locks: Mutex::new(HashMap::new()),
+            driver_slots: DriverSlots::new(),
+        }
+    }
+
+    /// Try to reserve one of `dll_path`'s `max_instances` slots.
+    ///
+    /// Returns `None` immediately (never waits) if the driver is already at
+    /// capacity — docs/TUNER_PIPELINE_REDESIGN.md P1b deliberately does not
+    /// offer a blocking variant: callers must fall back to eviction/fallback
+    /// drivers/failure through the same paths they already use for a
+    /// capacity-exceeded outcome, not queue behind an unrelated reader.
+    ///
+    /// `max_instances` is supplied by the caller (not looked up here) because
+    /// `TunerPool` has no `Database` handle — see this type's module doc.
+    /// Passing a different `max_instances` than the last call for the same
+    /// `dll_path` resizes that path's semaphore (see [`DriverSlots::semaphore_for`]).
+    pub async fn acquire_slot(&self, dll_path: &str, max_instances: i32) -> Option<SlotPermit> {
+        let semaphore = self.driver_slots.semaphore_for(dll_path, max_instances).await;
+        match semaphore.try_acquire_owned() {
+            Ok(permit) => Some(SlotPermit { permit, dll_path: dll_path.to_string() }),
+            Err(_) => None,
         }
     }
 
@@ -266,10 +426,25 @@ impl TunerPool {
     ///
     /// If a tuner for this key already exists, it is returned.
     /// Otherwise, the factory function is called to create a new tuner.
+    ///
+    /// `permit` is a [`SlotPermit`] the caller must already hold for this
+    /// entry's DLL (via [`Self::acquire_slot`]) — docs/TUNER_PIPELINE_REDESIGN.md
+    /// P1b §3/§6. Every return path here either consumes it (stores it into
+    /// the freshly-created `SharedTuner`, on the create path below) or drops
+    /// it (every reuse path — the caller's permit is redundant once an
+    /// existing, still-occupying entry is found, so it is released back to
+    /// the driver's slot count rather than held uselessly by the returned
+    /// `Arc<SharedTuner>`, which already has its own from whenever *it* was
+    /// created). Callers that can already tell from a plain [`Self::get`]
+    /// peek that reuse is likely should skip [`Self::acquire_slot`] entirely
+    /// rather than needing a permit just to ask — see the P1b design note's
+    /// §6 ordering requirement, honored by every call site in `server/session.rs`
+    /// and `server/channel_resolve.rs`.
     pub async fn get_or_create<F, Fut>(
         &self,
         key: ChannelKey,
         bondriver_version: u8,
+        permit: SlotPermit,
         factory: F,
     ) -> Result<Arc<SharedTuner>, TunerPoolError>
     where
@@ -302,6 +477,10 @@ impl TunerPool {
                 } else {
                     self.cancel_idle_close(&key).await;
                     debug!("Reusing existing tuner for {:?}", key);
+                    // `permit` is the caller's own reservation, redundant now
+                    // that we're reusing an entry that already holds its own
+                    // — drop releases it back to the driver's slot count.
+                    drop(permit);
                     return Ok(Arc::clone(tuner));
                 }
             }
@@ -320,6 +499,7 @@ impl TunerPool {
             } else {
                 self.cancel_idle_close(&key).await;
                 debug!("Reusing existing tuner for {:?} (after lock)", key);
+                drop(permit);
                 return Ok(Arc::clone(tuner));
             }
         }
@@ -344,6 +524,9 @@ impl TunerPool {
                     tuners.len(),
                     self.max_tuners
                 );
+                // `permit` drops here too (implicitly), releasing it back —
+                // this is the pool-wide `max_tuners` cap, unrelated to the
+                // per-DLL `max_instances` the permit itself enforces.
                 return Err(TunerPoolError::OpenFailed(
                     "Tuner pool at capacity".to_string(),
                 ));
@@ -364,8 +547,21 @@ impl TunerPool {
         // caller still has to start one — see `ReaderState::Reserved`. A
         // caller that gives up instead (capacity conflict, error) owns the
         // job of removing the entry again (`SharedTuner::is_orphanable`).
+        //
+        // The `permit` is stored on the entry now, not merely held by this
+        // function's caller, so that an abandoned `Reserved` entry releases
+        // its slot the moment the `SharedTuner` (or its stored permit) is
+        // dropped — whether that happens via explicit pool removal
+        // (`is_orphanable`) or simply by every `Arc` reference going away.
+        // This is P1b's replacement for `ReaderState::Reserved`'s doc comment
+        // promise ("this hand-managed reservation will be replaced by an RAII
+        // slot permit"): callers that go on to actually start a reader must
+        // retrieve it again via `SharedTuner::take_slot_permit` and pass it to
+        // `start_bondriver_reader`/`WarmTunerHandle::activate`, which is what
+        // makes starting a reader without holding a permit a type error.
         let shared = SharedTuner::new(key.clone(), bondriver_version);
         shared.set_state(crate::tuner::shared::ReaderState::Reserved);
+        shared.set_slot_permit(permit);
         info!("Created new shared tuner for {:?}", key);
 
         tuners.insert(key, Arc::clone(&shared));
@@ -502,14 +698,25 @@ mod tests {
         }
     }
 
+    /// Test helper: acquire a slot permit for `dll_path` with a generous
+    /// capacity, for tests that only care about pool bookkeeping (not slot
+    /// exhaustion) and would otherwise have to thread `acquire_slot` through
+    /// every `get_or_create` call.
+    async fn test_permit(pool: &TunerPool, dll_path: &str) -> SlotPermit {
+        pool.acquire_slot(dll_path, 10)
+            .await
+            .expect("test permit pool should never be exhausted")
+    }
+
     #[tokio::test]
     async fn test_pool_cleanup() {
         let pool = TunerPool::new(10);
         let key = ChannelKey::simple("/dev/test", 1);
 
         // Create a tuner
+        let permit = test_permit(&pool, "/dev/test").await;
         let tuner = pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
             .unwrap();
 
@@ -554,8 +761,9 @@ mod tests {
         let pool = TunerPool::new(4);
         let key = ChannelKey::simple("/dev/test", 1);
 
+        let permit = test_permit(&pool, "/dev/test").await;
         let tuner = pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
             .unwrap();
 
@@ -576,8 +784,9 @@ mod tests {
     async fn starting_and_running_entries_do_not_need_another_reader_start() {
         let pool = TunerPool::new(4);
         let key = ChannelKey::simple("/dev/test", 1);
+        let permit = test_permit(&pool, "/dev/test").await;
         let tuner = pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
             .unwrap();
 
@@ -601,8 +810,9 @@ mod tests {
         let key_a = ChannelKey::simple("/dev/test-a", 1);
         let key_b = ChannelKey::simple("/dev/test-b", 1);
 
+        let permit_a = test_permit(&pool, "/dev/test-a").await;
         let tuner_a = pool
-            .get_or_create(key_a.clone(), 2, || async { Ok(()) })
+            .get_or_create(key_a.clone(), 2, permit_a, || async { Ok(()) })
             .await
             .unwrap();
         assert_eq!(tuner_a.state(), ReaderState::Reserved);
@@ -612,7 +822,8 @@ mod tests {
         // capacity-retain pass runs. Before the M8 fix this would have
         // dropped tuner_a (no subscribers, and `is_running()` was `false`
         // for a not-yet-started entry too) purely because it "looked" idle.
-        let result = pool.get_or_create(key_b.clone(), 2, || async { Ok(()) }).await;
+        let permit_b = test_permit(&pool, "/dev/test-b").await;
+        let result = pool.get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) }).await;
         assert!(result.is_err(), "still at capacity: Reserved entry must count as occupying its slot");
         assert_eq!(pool.count().await, 1, "tuner_a must not have been evicted while Reserved");
         assert!(pool.get(&key_a).await.is_some());
@@ -627,8 +838,9 @@ mod tests {
         let pool = Arc::new(TunerPool::new(10));
         let key = ChannelKey::simple("/dev/px4video0", 1);
 
+        let permit = test_permit(&pool, "/dev/px4video0").await;
         let tuner = pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
             .unwrap();
         let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
@@ -662,8 +874,9 @@ mod tests {
         let pool = Arc::new(TunerPool::new(10));
         let key = ChannelKey::simple("/dev/px4video0", 1);
 
+        let permit = test_permit(&pool, "/dev/px4video0").await;
         let tuner = pool
-            .get_or_create(key.clone(), 2, || async { Ok(()) })
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
             .unwrap();
         let ready_rx = tuner
@@ -692,8 +905,9 @@ mod tests {
         let key_a = ChannelKey::simple("/dev/px4video0", 1);
         let key_b = ChannelKey::simple("/dev/px4video1", 1);
 
+        let permit_a = test_permit(&pool, "/dev/px4video0").await;
         let tuner_a = pool
-            .get_or_create(key_a.clone(), 2, || async { Ok(()) })
+            .get_or_create(key_a.clone(), 2, permit_a, || async { Ok(()) })
             .await
             .unwrap();
         // Keep tuner_a alive across get_or_create's own stale-entry eviction
@@ -702,8 +916,9 @@ mod tests {
         // existing `test_pool_cleanup` test above uses.
         let _sub_a = tuner_a.subscribe();
 
+        let permit_b = test_permit(&pool, "/dev/px4video1").await;
         let tuner_b = pool
-            .get_or_create(key_b.clone(), 2, || async { Ok(()) })
+            .get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) })
             .await
             .unwrap();
         let _sub_b = tuner_b.subscribe();
@@ -722,5 +937,199 @@ mod tests {
         let evicted = pool.evict_idle_on_path("/dev/px4video0", Some(&key_a)).await;
         assert_eq!(evicted, 0);
         assert_eq!(pool.count().await, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // P1b: driver slot reservation (docs/TUNER_PIPELINE_REDESIGN.md §4 P1b)
+    // -----------------------------------------------------------------
+
+    /// §1: capacity is now *taken*, not counted. A second slot on a
+    /// `max_instances = 1` driver is simply unavailable — no snapshot, no
+    /// window between "looks free" and "reader actually opened".
+    #[tokio::test]
+    async fn second_slot_on_single_instance_driver_is_unavailable() {
+        let pool = TunerPool::new(10);
+
+        let first = pool.acquire_slot("/dev/px4video0", 1).await;
+        assert!(first.is_some());
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_none(),
+            "max_instances=1 must not hand out a second permit"
+        );
+
+        // A different DLL has its own semaphore.
+        assert!(pool.acquire_slot("/dev/px4video1", 1).await.is_some());
+
+        // Releasing returns the slot.
+        drop(first);
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_some());
+    }
+
+    /// §6: joining a channel that is already running must not require a free
+    /// slot — otherwise a second viewer of the only channel a
+    /// `max_instances = 1` driver can serve would be rejected instead of
+    /// sharing the existing reader.
+    #[tokio::test]
+    async fn joining_an_existing_channel_needs_no_free_slot() {
+        let pool = TunerPool::new(10);
+        let key = ChannelKey::simple("/dev/px4video0", 1);
+
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let _sub = tuner.subscribe();
+
+        // The driver is now saturated...
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_none());
+
+        // ...but the existing entry is still reachable without one, which is
+        // what every caller checks (`TunerPool::get`) before asking for a
+        // permit at all.
+        let joined = pool.get(&key).await.expect("existing entry must be joinable");
+        assert!(Arc::ptr_eq(&joined, &tuner));
+    }
+
+    /// §2: a failed reader start releases the slot, so the next attempt on
+    /// that driver can proceed. Driven through the real reader body via
+    /// `FakeTsSource` configured to fail `set_channel`.
+    #[tokio::test]
+    async fn failed_reader_start_releases_its_slot() {
+        let pool = Arc::new(TunerPool::new(10));
+        let key = ChannelKey::simple("/dev/px4video0", 1);
+
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+
+        // Hand the permit to the reader the same way the real start paths do.
+        let start_permit = tuner.take_slot_permit().expect("get_or_create stored the permit");
+        tuner.set_slot_permit(start_permit);
+
+        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
+        assert!(ready_rx.await.unwrap().is_err(), "set_channel was configured to fail");
+        assert_eq!(tuner.state(), ReaderState::Stopped);
+
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_some(),
+            "a failed start must not strand its slot"
+        );
+    }
+
+    /// §3 leak guard: an entry abandoned while still `Reserved` (its caller
+    /// hit a capacity conflict and never started a reader) releases its slot
+    /// when it is dropped, without anyone having to remember to do it.
+    #[tokio::test]
+    async fn dropping_a_reserved_entry_releases_its_slot() {
+        let pool = TunerPool::new(10);
+        let key = ChannelKey::simple("/dev/px4video0", 1);
+
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(tuner.state(), ReaderState::Reserved);
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_none());
+
+        // Abandon it: drop the pool entry and the last handle.
+        pool.remove(&key).await;
+        drop(tuner);
+
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_some(),
+            "an abandoned Reserved entry must return its slot on drop"
+        );
+    }
+
+    /// §4: a session switching channels on a `max_instances = 1` driver
+    /// hands its own permit to the replacement entry. Without the transfer
+    /// this sequence is impossible — the old reader still holds the driver's
+    /// only permit at the moment the new one has to be created.
+    #[tokio::test]
+    async fn own_permit_transfers_to_the_replacement_entry_on_channel_switch() {
+        let pool = TunerPool::new(10);
+        let old_key = ChannelKey::simple("/dev/px4video0", 1);
+        let new_key = ChannelKey::simple("/dev/px4video0", 2);
+
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+        let old = pool
+            .get_or_create(old_key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+
+        // Driver saturated: a fresh acquire for the new channel cannot work.
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_none());
+
+        // Transfer instead (what `session.rs` does on a same-DLL switch).
+        let carried = old.take_slot_permit().expect("old entry holds the permit");
+        assert_eq!(carried.dll_path(), "/dev/px4video0");
+        let new = pool
+            .get_or_create(new_key.clone(), 2, carried, || async { Ok(()) })
+            .await
+            .unwrap();
+
+        assert_eq!(new.state(), ReaderState::Reserved);
+        assert!(new.occupies_slot());
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_none(),
+            "the transferred permit is still exactly one slot — not two"
+        );
+    }
+
+    /// §1: `max_instances` is read from the DB per call, so the semaphore has
+    /// to follow it up and down when an admin reconfigures the driver.
+    #[tokio::test]
+    async fn slot_capacity_follows_max_instances_changes() {
+        let pool = TunerPool::new(10);
+
+        let a = pool.acquire_slot("/dev/px4video0", 1).await;
+        assert!(a.is_some());
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_none());
+
+        // Raised to 3: two more become available.
+        let b = pool.acquire_slot("/dev/px4video0", 3).await;
+        let c = pool.acquire_slot("/dev/px4video0", 3).await;
+        assert!(b.is_some() && c.is_some());
+        assert!(pool.acquire_slot("/dev/px4video0", 3).await.is_none());
+
+        // Lowered back to 1 while all three are checked out: the excess is
+        // reclaimed as permits come back, so releasing two must not make new
+        // ones available (capacity is 1, and `a` still holds it).
+        drop(b);
+        drop(c);
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_none(),
+            "shrinking must claw back the returned permits, not hand them out again"
+        );
+    }
+
+    /// §5: a warm tuner reserves a real slot for as long as it holds the DLL
+    /// open, and gives it back on shutdown. Before P1b, prewarm was invisible
+    /// to capacity accounting entirely (docs/TUNER_PIPELINE_REDESIGN.md §2.1-4).
+    #[tokio::test]
+    async fn warm_tuner_holds_and_releases_a_slot() {
+        let pool = TunerPool::new(10);
+        let permit = pool.acquire_slot("/dev/px4video0", 1).await.unwrap();
+
+        // `WarmTunerHandle::spawn` would try to open a real BonDriver, which
+        // is impossible here; the accounting half is the permit ownership
+        // itself, so exercise that directly.
+        let mut held = Some(permit);
+        assert!(
+            pool.acquire_slot("/dev/px4video0", 1).await.is_none(),
+            "a warm tuner's reservation must count against the driver"
+        );
+
+        // `WarmTunerHandle::take_permit` on activation, or a plain drop on
+        // shutdown/timeout — either way the slot comes back.
+        let taken = held.take();
+        assert_eq!(taken.as_ref().map(|p| p.dll_path()), Some("/dev/px4video0"));
+        drop(taken);
+        assert!(pool.acquire_slot("/dev/px4video0", 1).await.is_some());
     }
 }

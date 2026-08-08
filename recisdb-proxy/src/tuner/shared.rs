@@ -16,7 +16,7 @@ use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
 use crate::tuner::epg_collector::EpgCollector;
-use crate::tuner::pool::TunerPoolConfig;
+use crate::tuner::pool::{SlotPermit, TunerPoolConfig};
 use crate::tuner::ts_source::TsSource;
 
 /// Lifecycle state of a [`SharedTuner`]'s background reader
@@ -149,6 +149,22 @@ pub struct SharedTuner {
     lock: TunerLock,
     /// Counter for received TS packets.
     packets_received: AtomicU64,
+    /// This entry's reservation against its DLL's `max_instances` capacity
+    /// (docs/TUNER_PIPELINE_REDESIGN.md P1b), if it currently holds one.
+    ///
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex`: every access is a plain
+    /// `take()`/`replace()` with no `.await` in between, so a blocking
+    /// std mutex avoids the async-mutex overhead for what is always an
+    /// uncontended, momentary critical section (see `take_slot_permit`/
+    /// `set_slot_permit`).
+    ///
+    /// Populated by `TunerPool::get_or_create` on creation (so an abandoned
+    /// `Reserved` entry still releases its slot via this field's `Drop` even
+    /// if nobody ever calls `start_bondriver_reader`), taken back out by
+    /// whichever caller is about to start a reader (`take_slot_permit`) and
+    /// handed to `start_bondriver_reader`/`WarmTunerHandle::activate`, which
+    /// store it back here for the reader's lifetime.
+    slot: std::sync::Mutex<Option<SlotPermit>>,
 }
 
 impl SharedTuner {
@@ -167,7 +183,39 @@ impl SharedTuner {
             bondriver_version,
             lock: TunerLock::new(),
             packets_received: AtomicU64::new(0),
+            slot: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Store `permit` as this entry's driver-slot reservation.
+    ///
+    /// Called by [`crate::tuner::TunerPool::get_or_create`] on creation and,
+    /// after `take_slot_permit` retrieves it again, by
+    /// `start_bondriver_reader`/`WarmTunerHandle::activate` once they commit
+    /// to actually starting a reader. Overwrites (and thus drops/releases)
+    /// any previously stored permit — callers must not call this while a
+    /// permit for a *different* DLL path is already stored, or that other
+    /// path's slot would leak; see the doc comments on the call sites for
+    /// why that can't happen in practice.
+    pub(crate) fn set_slot_permit(&self, permit: SlotPermit) {
+        *self.slot.lock().unwrap() = Some(permit);
+    }
+
+    /// Take this entry's driver-slot reservation, if it currently holds one.
+    ///
+    /// Used for two distinct purposes (docs/TUNER_PIPELINE_REDESIGN.md P1b):
+    /// (1) by whichever caller is about to start a reader on this
+    /// `SharedTuner`, to retrieve the permit `get_or_create` stored on
+    /// creation and pass it into `start_bondriver_reader`/
+    /// `WarmTunerHandle::activate` (both require one as a parameter — a
+    /// reader cannot be started without holding a permit, enforced by the
+    /// type signature); and (2) by a session switching channels on the same
+    /// DLL, to transfer this tuner's slot directly to its replacement
+    /// instead of releasing and re-acquiring (which could lose a race to an
+    /// unrelated task on a `max_instances`-constrained driver) — see
+    /// `server/session.rs`'s permit-handoff on channel switch.
+    pub fn take_slot_permit(&self) -> Option<SlotPermit> {
+        self.slot.lock().unwrap().take()
     }
 
     /// Get a reference to the tuner lock.
@@ -304,6 +352,25 @@ impl SharedTuner {
         self.reader_state.store(state as u8, Ordering::Release);
     }
 
+    /// Transition to `Stopped` and release this entry's driver-slot permit
+    /// (if any) in the same step (docs/TUNER_PIPELINE_REDESIGN.md P1b).
+    ///
+    /// Every place that moves a reader to `Stopped` must free its slot right
+    /// then — not rely solely on `stop_reader()`'s own explicit release,
+    /// which several of these call sites race past: a reader can fail its
+    /// own startup (`SetChannel` error, BonDriver open error, a caught
+    /// panic) or die inside its read loop without anyone ever calling
+    /// `stop_reader()`. Taking the permit is a plain `Option::take`, so
+    /// calling this more than once for the same stop (e.g. once from inside
+    /// the reader thread when it dies on its own, and again from a
+    /// concurrent `stop_reader()` that also reaches its own final
+    /// `Stopped` transition) is harmless: only the first caller actually
+    /// holds anything to release.
+    pub(crate) fn stop_and_release_slot(&self) {
+        self.set_state(ReaderState::Stopped);
+        let _ = self.take_slot_permit();
+    }
+
     /// Transition `Starting -> Running`, but only if the state is still
     /// `Starting`. Returns `false` (and leaves the state untouched) if a
     /// concurrent `stop_reader()` already advanced it to `Stopping` — e.g. a
@@ -435,8 +502,14 @@ impl SharedTuner {
         }
 
         // Final ensure: mark as stopped, even if the reader task never got a
-        // chance to set this itself (timeout/abort above).
-        self.set_state(ReaderState::Stopped);
+        // chance to set this itself (timeout/abort above). Also releases the
+        // driver-slot permit explicitly here (docs/TUNER_PIPELINE_REDESIGN.md
+        // P1b item 2) rather than waiting on this `SharedTuner`'s `Arc` to
+        // drop — a caller that immediately reopens the same DLL (permit
+        // handoff during a channel switch) needs the slot freed
+        // deterministically at this point, not whenever the last reference
+        // happens to go away.
+        self.stop_and_release_slot();
 
         info!("[SharedTuner] Reader stopped for {:?}", self.key);
     }
@@ -507,7 +580,7 @@ impl SharedTuner {
                         error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
                                space, channel, e, e.kind());
                     }
-                    shared.set_state(ReaderState::Stopped);
+                    shared.stop_and_release_slot();
 
                     let err_msg = match e.kind() {
                         std::io::ErrorKind::AddrNotAvailable =>
@@ -522,7 +595,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
-                    shared.set_state(ReaderState::Stopped);
+                    shared.stop_and_release_slot();
                     let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
                     return;
                 }
@@ -585,7 +658,7 @@ impl SharedTuner {
                 shared.key
             );
             let _ = ready_tx.send(Ok(()));
-            shared.set_state(ReaderState::Stopped);
+            shared.stop_and_release_slot();
             return;
         }
         info!("[SharedTuner] BonDriver ready, signaling...");
@@ -848,13 +921,13 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] PANIC during get_ts_stream: {:?}", panic_err);
-                    shared.set_state(ReaderState::Stopped);
+                    shared.stop_and_release_slot();
                     break;
                 }
             }
         }
 
-        shared.set_state(ReaderState::Stopped);
+        shared.stop_and_release_slot();
         info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
     }
 
@@ -863,12 +936,26 @@ impl SharedTuner {
     /// This opens the BonDriver, sets the channel, and starts a background task
     /// that reads TS data and broadcasts it to all subscribers.
     /// If the reader is already running, it will stop it and restart with new channel.
+    ///
+    /// `permit` is this entry's [`SlotPermit`] (docs/TUNER_PIPELINE_REDESIGN.md
+    /// P1b) — a reader cannot be started without one, enforced here at the
+    /// type level. In the common case it is the very permit
+    /// `TunerPool::get_or_create` stored on this same `SharedTuner` when it
+    /// was created, handed back in by the caller via `take_slot_permit()`
+    /// (see that method's doc comment); when this call is instead an
+    /// in-place channel restart on an already-`Running` tuner (the
+    /// `is_running()` branch just below), `permit` is that same still-live
+    /// reservation being passed straight back through — this entry never
+    /// stopped occupying its slot, so there is nothing new to reserve.
+    /// Either way, this function always stores `permit` onto `self` via
+    /// `set_slot_permit` before starting the reader.
     pub async fn start_bondriver_reader(
         self: &Arc<Self>,
         tuner_path: String,
         space: u32,
         channel: u32,
         startup_config: ReaderStartupConfig,
+        permit: SlotPermit,
     ) -> Result<(), std::io::Error> {
         // Check if reader is already running and stop it properly
         if self.is_running() {
@@ -888,10 +975,18 @@ impl SharedTuner {
                     }
                 }
             }
+            // Plain `set_state`, not `stop_and_release_slot`: this is an
+            // in-place restart of the *same* DLL instance for a new channel,
+            // not a real close — the slot stays reserved throughout (`self.slot`
+            // is empty here regardless, since the caller already took it out
+            // via `take_slot_permit()` before calling this function; it is
+            // restored immediately below).
             self.set_state(ReaderState::Stopped);
 
             info!("[SharedTuner] Old reader fully stopped, starting new reader for {:?}", self.key);
         }
+
+        self.set_slot_permit(permit);
 
         // Mark this entry as occupied *synchronously*, before `spawn_blocking`
         // even schedules the background thread — closes the window
@@ -927,7 +1022,7 @@ impl SharedTuner {
                     Err(e) => {
                         error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})",
                                tuner_path, e, e.kind());
-                        shared.set_state(ReaderState::Stopped);
+                        shared.stop_and_release_slot();
                         let err_msg = match e.kind() {
                             std::io::ErrorKind::NotFound => 
                                 format!("BonDriver not found or cannot load: {}", e),
@@ -957,7 +1052,7 @@ impl SharedTuner {
                 }
                 Err(panic_err) => {
                     error!("[SharedTuner] CRITICAL PANIC in reader task: {:?}", panic_err);
-                    shared.set_state(ReaderState::Stopped);
+                    shared.stop_and_release_slot();
                 }
             }
         });

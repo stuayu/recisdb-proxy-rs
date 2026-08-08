@@ -247,11 +247,37 @@ pub enum Decision {
   wraparound 防御を撤去する。encoder の `subscribe_untracked` は
   「カウントしない購読」であることを型で表す (`UntrackedSubscription`)。
 
-- **スロット予約**: `TunerPool` に `DriverSlots` (dll_path → `Semaphore`、
-  permit 数 = `max_instances`) を追加。reader 起動と warm tuner の双方が
-  permit を取得し、`SharedTuner` / `WarmTunerHandle` の生存期間だけ保持する。
-  これにより §2.1-2 の TOCTOU と §2.1-4 の warm 計上漏れが同時に解消する。
-  `max_instances` の変更時は permit 数を増減させる (`add_permits` / forget)。
+### P1b — スロット予約 (実装済み)
+
+`TunerPool` に `DriverSlots` (dll_path → `Semaphore`、permit 数 =
+`max_instances`) を追加し、容量を**数えるのではなく取る**方式へ変えた。
+これにより §2.1-2 の TOCTOU と §2.1-4 の warm 計上漏れが解消した。
+
+- `TunerPool::acquire_slot(dll_path, max_instances) -> Option<SlotPermit>`。
+  プールは DB を持たないので `max_instances` は引数で受け取り、値が変わって
+  いれば `add_permits` / `forget_permits` で追随する。**満杯なら待たずに
+  `None`** を返し、退避・フォールバック・失敗の判断は呼び出し元に委ねる。
+- `SlotPermit` は `Drop` で解放される。`SharedTuner` が保持し、
+  `stop_reader()` とリーダーの全異常終了経路 (`stop_and_release_slot`) で
+  明示的に解放する (Arc の drop 待ちにしない)。
+- **`start_bondriver_reader` / `WarmTunerHandle::activate` の引数に
+  `SlotPermit` を必須化**した。permit なしにリーダーを起動できないことを
+  型で保証している。
+- **permit 移譲**: 同一セッションが同じ DLL 上でチャンネルを切り替えるとき、
+  旧チューナーから permit を取り出して新しいエントリへ直接渡す。旧リーダーは
+  候補が成功するまで停止されないため、`max_instances=1` では「解放してから
+  取得」も「取得してから解放」も成立しない。これが `old_tuner_will_free_slot`
+  (自セッション分を容量計数から除外する仕掛け) の置き換えであり、同フラグは
+  撤去した。`SelectLogicalChannel` の候補ループでは、候補が失敗したときに
+  permit を回収して次の候補へ持ち回り、全候補が失敗したら旧チューナーへ
+  返却する (旧リーダーは動き続けるため)。
+- **再利用は permit 取得より先**に判定する。順序を誤ると、`max_instances=1`
+  のドライバーで既存チャンネルへ合流できるはずのリクエストが容量不足として
+  弾かれる。
+- `count_running_instances_on_driver` などの計数は**診断・選択ヒューリスティック
+  専用**に降格した。容量の強制は `DriverSlots` のみが行う。
+- P1a の `Reserved` 状態と `is_orphanable()` による手動返却は、permit の
+  `Drop` があるため保険の位置づけになった。
 
 - **テスト可能化**: reader をトレイト (`TsReader`) で抽象化し、テスト用の
   フェイク実装を注入できるようにする。現状 `is_running` は実 reader からしか

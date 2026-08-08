@@ -7,6 +7,7 @@ use log::{error, info, warn};
 use tokio::sync::oneshot;
 
 use crate::bondriver::BonDriverTuner;
+use crate::tuner::pool::SlotPermit;
 use crate::tuner::shared::{ReaderStartupConfig, SharedTuner};
 
 pub enum WarmCommand {
@@ -27,10 +28,25 @@ pub struct WarmTunerHandle {
     ready_rx: Option<oneshot::Receiver<Result<(), String>>>,
     ready_result: Option<Result<(), String>>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
+    /// This warm tuner's reservation against `path`'s `max_instances`
+    /// capacity (docs/TUNER_PIPELINE_REDESIGN.md P1b §5), acquired by the
+    /// caller (`Session::maybe_start_warm_tuner`) *before* `spawn` — prewarm
+    /// must not even open the BonDriver if the driver has no spare slot,
+    /// since an idle-but-open warm instance occupies one exactly like a live
+    /// reader does (§2.1-4: this used to be invisible to capacity
+    /// accounting entirely). Held for as long as this handle sits warm;
+    /// `take_permit` moves it out for `activate` to transfer onto the target
+    /// `SharedTuner`, and simply dropping this handle (`shutdown`, or losing
+    /// the race against `cmd_rx`'s timeout) releases it back automatically.
+    permit: Option<SlotPermit>,
 }
 
 impl WarmTunerHandle {
-    pub fn spawn(path: String, timeout_secs: u64) -> Self {
+    /// `permit` must already be held for `path` (see this type's `permit`
+    /// field doc) — callers get one via `TunerPool::acquire_slot` and skip
+    /// spawning entirely if that returns `None` (docs/TUNER_PIPELINE_REDESIGN.md
+    /// P1b §5, first bullet).
+    pub fn spawn(path: String, timeout_secs: u64, permit: SlotPermit) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WarmCommand>();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
@@ -90,11 +106,24 @@ impl WarmTunerHandle {
             ready_rx: Some(ready_rx),
             ready_result: None,
             join_handle: Some(join_handle),
+            permit: Some(permit),
         }
     }
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Take this handle's slot permit, if it still holds one.
+    ///
+    /// Called by whoever is about to `activate` this warm tuner, to move the
+    /// permit onto the target `SharedTuner` and then pass it into `activate`
+    /// as an explicit argument — mirroring `SharedTuner::take_slot_permit`'s
+    /// own "extract, then hand back in" pattern so both the cold and warm
+    /// start paths require a permit at the same call boundary (`activate`/
+    /// `start_bondriver_reader`), not one implicitly and the other not.
+    pub fn take_permit(&mut self) -> Option<SlotPermit> {
+        self.permit.take()
     }
 
     async fn ensure_ready(&mut self) -> Result<(), String> {
@@ -115,6 +144,18 @@ impl WarmTunerHandle {
         }
     }
 
+    /// Activate this warm (already-open) BonDriver against `shared`, tuning
+    /// it to `space`/`channel` and starting its reader loop.
+    ///
+    /// `permit` is required (docs/TUNER_PIPELINE_REDESIGN.md P1b §3/§5) — in
+    /// the normal flow it is this same handle's own reservation, retrieved
+    /// by the caller via `take_permit()` immediately before this call (see
+    /// that method's doc comment for why it is an explicit argument here
+    /// rather than read directly off `self`). It is stored onto `shared`
+    /// before the warm thread is signaled to start, so a failure inside
+    /// `run_bondriver_reader_with_tuner` (wrong-thread SetChannel error,
+    /// etc.) releases it the same way a cold `start_bondriver_reader`
+    /// failure does — via `SharedTuner::stop_and_release_slot`.
     pub async fn activate(
         &mut self,
         shared: Arc<SharedTuner>,
@@ -122,7 +163,10 @@ impl WarmTunerHandle {
         space: u32,
         channel: u32,
         startup_config: ReaderStartupConfig,
+        permit: SlotPermit,
     ) -> Result<(), std::io::Error> {
+        shared.set_slot_permit(permit);
+
         self.ensure_ready().await.map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::Other, err)
         })?;

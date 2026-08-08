@@ -59,7 +59,7 @@
 
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::{error, info, warn};
 
 use crate::database::{ChannelRecord, Database};
 use crate::server::session_capacity::count_running_instances_on_driver;
@@ -222,12 +222,64 @@ pub async fn start_tuner_for_service(
 ) -> Result<Arc<SharedTuner>, ChannelResolveError> {
     let key = resolved.channel_key.clone();
 
-    // No-op factory: mirrors every `get_or_create` call site in session.rs
-    // (e.g. `try_fallback_drivers`) — the actual BonDriver open happens via
-    // `start_bondriver_reader` below, not inside the pool's factory closure.
-    let tuner = tuner_pool
-        .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, || async { Ok(()) })
-        .await?;
+    // docs/TUNER_PIPELINE_REDESIGN.md P1b §6: check reuse *before* touching
+    // the slot semaphore — an exact-key entry that already occupies its slot
+    // (another session/request's in-flight or live reader on this exact
+    // channel) is joinable via `get_or_create`'s own fast path without a
+    // permit at all; asking for one first could wrongly 503 a request that
+    // only wants to join an already-open stream on a
+    // `max_instances`-constrained driver.
+    let already_occupied = tuner_pool.get(&key).await
+        .map(|t| !t.is_reclaimable())
+        .unwrap_or(false);
+
+    let tuner = if already_occupied {
+        tuner_pool.get(&key).await.ok_or_else(|| {
+            ChannelResolveError::Pool(TunerPoolError::OpenFailed(
+                "raced with a concurrent removal".to_string(),
+            ))
+        })?
+    } else {
+        // §7: `acquire_slot`'s success/failure is the `max_instances`
+        // enforcement now, in place of the old post-creation
+        // `count_running_instances_on_driver`/`evict_idle_on_path` proactive
+        // check. If the driver is full, try the same idle-eviction this
+        // used to do proactively, then retry once before giving up as `Busy`
+        // — evicting only ever touches subscriber-less readers (module doc
+        // comment above), so this never preempts another *viewer*.
+        let permit = match tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await {
+            Some(p) => p,
+            None => {
+                let evicted = tuner_pool
+                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
+                    .await;
+                if evicted > 0 {
+                    info!(
+                        "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for service id={}",
+                        evicted, resolved.dll_path, resolved.channel.id
+                    );
+                }
+                match tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await {
+                    Some(p) => p,
+                    None => {
+                        let running = count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
+                        return Err(ChannelResolveError::Busy {
+                            id: resolved.channel.id,
+                            running,
+                            max: resolved.max_instances,
+                        });
+                    }
+                }
+            }
+        };
+
+        // No-op factory: mirrors every `get_or_create` call site in session.rs
+        // (e.g. `try_fallback_drivers`) — the actual BonDriver open happens via
+        // `start_bondriver_reader` below, not inside the pool's factory closure.
+        tuner_pool
+            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit, || async { Ok(()) })
+            .await?
+    };
 
     // `needs_reader_start()`, not `!is_running()`: a `Starting` entry has
     // another task's BonDriver open + SetChannel already in flight, and a
@@ -249,47 +301,25 @@ pub async fn start_tuner_for_service(
                 ChannelKeySpec::Simple(c) => (0, c as u32),
             };
 
-            // Proactive capacity check: if this driver is already at/over
-            // `max_instances`, evict idle (no-subscriber) readers on the
-            // same path first — see the module doc comment above for why
-            // this differs from session.rs's priority-based eviction.
-            let running =
-                count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
-            if running >= resolved.max_instances {
-                let evicted = tuner_pool
-                    .evict_idle_on_path(&resolved.dll_path, Some(&key))
-                    .await;
-                if evicted > 0 {
-                    info!(
-                        "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for service id={}",
-                        evicted, resolved.dll_path, resolved.channel.id
-                    );
+            let Some(start_permit) = tuner.take_slot_permit() else {
+                error!(
+                    "[HTTP stream] {:?} needs a reader start but holds no slot permit (service id={})",
+                    key, resolved.channel.id
+                );
+                if tuner.is_orphanable() {
+                    tuner_pool.remove(&key).await;
                 }
-                let running_after =
-                    count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&key)).await;
-                if running_after >= resolved.max_instances {
-                    // We are giving up without ever starting a reader, so the
-                    // `Reserved` entry `get_or_create` created for us above
-                    // would otherwise sit in the pool holding this driver's
-                    // slot forever (`occupies_slot()` counts `Reserved`).
-                    // Hand it back before returning.
-                    if tuner.is_orphanable() {
-                        tuner_pool.remove(&key).await;
-                    }
-                    return Err(ChannelResolveError::Busy {
-                        id: resolved.channel.id,
-                        running: running_after,
-                        max: resolved.max_instances,
-                    });
-                }
-            }
+                return Err(ChannelResolveError::Pool(TunerPoolError::OpenFailed(
+                    "missing slot permit".to_string(),
+                )));
+            };
 
             info!(
                 "[HTTP stream] starting BonDriver reader for {:?} (service id={})",
                 key, resolved.channel.id
             );
             let start_result = tuner
-                .start_bondriver_reader(resolved.dll_path.clone(), space, channel, startup_config)
+                .start_bondriver_reader(resolved.dll_path.clone(), space, channel, startup_config, start_permit)
                 .await;
 
             match start_result {
@@ -306,6 +336,10 @@ pub async fn start_tuner_for_service(
                     // (e.g. max_instances > 1 but the device itself only
                     // tolerates one open), evict any idle reader on this
                     // path unconditionally and retry once.
+                    //
+                    // The failed `start_bondriver_reader` above already
+                    // released `tuner`'s slot permit (`SharedTuner::stop_and_release_slot`
+                    // runs on every failure path), so a retry needs a fresh one.
                     warn!(
                         "[HTTP stream] BonDriver open for {:?} failed with EALREADY (service id={}); \
                          evicting idle readers on {} and retrying once",
@@ -315,12 +349,23 @@ pub async fn start_tuner_for_service(
                         .evict_idle_on_path(&resolved.dll_path, Some(&key))
                         .await;
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let Some(retry_permit) = tuner_pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await else {
+                        if tuner.is_orphanable() {
+                            tuner_pool.remove(&key).await;
+                        }
+                        return Err(ChannelResolveError::Busy {
+                            id: resolved.channel.id,
+                            running: resolved.max_instances,
+                            max: resolved.max_instances,
+                        });
+                    };
                     tuner
                         .start_bondriver_reader(
                             resolved.dll_path.clone(),
                             space,
                             channel,
                             startup_config,
+                            retry_permit,
                         )
                         .await?;
                 }
@@ -455,19 +500,36 @@ mod tests {
         // the function itself (which would try `start_bondriver_reader` and
         // fail/timeout waiting on a real DLL).
         let key = resolved.channel_key.clone();
+        let permit_a = pool
+            .acquire_slot(&resolved.dll_path, resolved.max_instances)
+            .await
+            .expect("first slot on an empty driver must be available");
         let tuner_a = pool
-            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, || async { Ok(()) })
+            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_a, || async { Ok(()) })
             .await
             .unwrap();
-        // `TunerPool::get_or_create` treats a not-running, no-subscriber
-        // entry as a stale leftover from an idle-close race and evicts it
-        // (see pool.rs) — correct for real usage, where `start_tuner_for_service`
-        // always calls `start_bondriver_reader` (setting is_running=true)
-        // before anyone else can observe the pool entry. Simulate that here
-        // with a subscription rather than a real reader.
         let _sub = tuner_a.subscribe();
+
+        // Rejoining the *same* channel must not need a free slot of its own:
+        // `start_tuner_for_service` checks for a reusable entry before it ever
+        // asks for a permit (docs/TUNER_PIPELINE_REDESIGN.md P1b §6), which is
+        // what lets a second viewer join a `max_instances = 1` driver instead
+        // of getting a 503. Here the driver is already saturated by
+        // `permit_a`, so a permit is genuinely unavailable...
+        assert!(
+            pool.acquire_slot(&resolved.dll_path, resolved.max_instances).await.is_none(),
+            "precondition: the driver is saturated by tuner_a's permit"
+        );
+
+        // ...yet the pool still hands back the very same `SharedTuner` when a
+        // permit is offered for the same key (`get_or_create` releases the
+        // surplus permit itself on the reuse path).
+        let permit_b = pool
+            .acquire_slot(&resolved.dll_path, resolved.max_instances + 1)
+            .await
+            .expect("widened capacity for the sake of constructing a spare permit");
         let tuner_b = pool
-            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, || async { Ok(()) })
+            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_b, || async { Ok(()) })
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&tuner_a, &tuner_b), "same channel key must share one SharedTuner");
