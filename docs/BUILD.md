@@ -166,3 +166,53 @@ $R -V $T/recisdb | grep -oE "GLIBC_2\.[0-9]+" | sort -Vu | tail -1   # 2.28 以�
 | openssl-sys の "Header expansion error" | `usr/include/x86_64-linux-gnu/openssl/` の arch 固有ヘッダを共通 include にコピーし忘れ |
 | `undefined reference to 'g_rgSCardT1Pci'` | スタブ .so にデータシンボル3つ(T0/T1/Raw)が足りていない |
 | ホストの Homebrew ライブラリを誤検出 | `PKG_CONFIG_LIBDIR` を sysroot 内に固定できていない(`PKG_CONFIG_PATH` の追加だけでは不十分) |
+
+## macOS で PX4 系チューナーを使う (px4_drv デーモン経由)
+
+macOS はカーネル拡張なしにユーザー空間から `/dev/*` を作れないため、px4_drv の
+macOS 版はキャラクタデバイスではなくユーザー空間デーモン `DriverHost_PX4` として
+動作する。recisdb-proxy はこれを `px4daemon:` バックエンド
+(`bondriver/px4_daemon.rs`) で扱う。
+
+### 1. デーモンを起動しておく
+
+```bash
+cd /path/to/px4_drv/macos/build
+./DriverHost_PX4 &
+```
+
+デーモンは最後のクライアントが切断してから約 15 秒で自動終了する。常駐させたい
+場合は launchd などを使う。**recisdb-proxy は意図的にデーモンを自動起動しない** —
+ハードウェアを占有するプロセスをサーバーが黙って立ち上げるのは、運用者が選ぶべき
+副作用であるため。
+
+### 2. チューナーパスの書式
+
+`bon_drivers.dll_path` に以下を設定する。
+
+| 書式 | 意味 |
+|---|---|
+| `px4daemon:0` | 受信系統インデックス 0 |
+| `px4daemon:any` | 空いている系統を daemon に選ばせる |
+| `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更 (データソケットは `ctrl`→`data` 置換で導出) |
+
+PX-MLT5PE なら `px4daemon:0` 〜 `px4daemon:4` の 5 本を、それぞれ
+`max_instances = 1` で登録する。1 系統 = 1 チャンネルなので、これがハードウェアの
+実態と一致する。
+
+### 3. 動作確認
+
+```bash
+# デーモンを起動した状態で
+cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
+```
+
+`PX4_TEST_RECEIVER` (既定 `px4daemon:0`) と `PX4_TEST_CHANNEL`
+(既定 `0` = UHF 13) で対象を変えられる。CNR と、読み出した TS の同期バイト
+ストライドが保たれているかを表示する。
+
+### 制約
+
+- B25 デスクランブルは recisdb-proxy 側の `b25-sys` (libaribb25) を使う。
+  macOS で libaribb25 が初期化できない場合はスクランブル済みの生 TS が流れる。
+- `SET_LNB_VOLTAGE` は未配線 (BS/CS の LNB 給電が要る構成では要追加)。

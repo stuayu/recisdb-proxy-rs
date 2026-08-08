@@ -1,4 +1,4 @@
-//! Unix character device implementation of BonDriverTuner.
+//! Unix character device implementation of the tuner backend.
 //!
 //! Supports physical tuners at /dev/px4video*, /dev/pt3video*, etc.
 //! Uses ioctl interface compatible with px4-drv and pt3-drv kernel drivers.
@@ -90,9 +90,9 @@ fn space_channel_to_ioctl_freq(space: u32, channel: u32) -> Result<IoctlFreq, io
 
 /// BonDriver-compatible wrapper for Unix character device tuners.
 ///
-/// Provides the same interface as the Windows BonDriverTuner to allow
+/// Provides the same interface as the Windows CharDevTuner to allow
 /// transparent usage in recisdb-proxy on Unix systems.
-pub struct BonDriverTuner {
+pub struct CharDevTuner {
     /// File handle for TS data reading.
     file: File,
     /// Duplicated fd for ioctl operations (avoids borrowing conflicts with reader).
@@ -105,7 +105,7 @@ pub struct BonDriverTuner {
     current_space: AtomicI32,
 }
 
-impl BonDriverTuner {
+impl CharDevTuner {
     pub fn new(path: &str) -> Result<Self, io::Error> {
         // Canonicalize to resolve symlinks (e.g. /dev/px4video0 → real device node)
         let path = std::fs::canonicalize(path)?;
@@ -329,7 +329,7 @@ impl BonDriverTuner {
     }
 }
 
-impl Drop for BonDriverTuner {
+impl Drop for CharDevTuner {
     fn drop(&mut self) {
         if self.recording.load(Ordering::Acquire) {
             // Disable LNB first (matches recisdb-rs PowerOffHandle drop order),
