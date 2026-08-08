@@ -194,7 +194,12 @@ cd /path/to/px4_drv/macos/build
 |---|---|
 | `px4daemon:0` | 受信系統インデックス 0 |
 | `px4daemon:any` | 空いている系統を daemon に選ばせる |
+| `px4daemon:0+lnb` | LNB 給電を有効化 (BS/CS を受信するなら必須) |
 | `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更 (データソケットは `ctrl`→`data` 置換で導出) |
+
+`+lnb` は opt-in。px4_drv 自身の BonDriver も `LNBPower` 設定の裏に置いており、
+別の機器が既に給電している線に電圧を乗せるのは既定にすべきでないため同じ扱いに
+した。**付けないと BS/CS は一切ロックしない** (他に給電装置がある構成を除く)。
 
 PX-MLT5PE なら `px4daemon:0` 〜 `px4daemon:4` の 5 本を、それぞれ
 `max_instances = 1` で登録する。1 系統 = 1 チャンネルなので、これがハードウェアの
@@ -215,4 +220,6 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 
 - B25 デスクランブルは recisdb-proxy 側の `b25-sys` (libaribb25) を使う。
   macOS で libaribb25 が初期化できない場合はスクランブル済みの生 TS が流れる。
-- `SET_LNB_VOLTAGE` は未配線 (BS/CS の LNB 給電が要る構成では要追加)。
+- 再選局は capture を止めずに SET_PARAMS + TUNE + PURGE で行う。daemon 側は
+  `SET_CAPTURE(false)` でストリームスレッドを終了させ、`SET_DATA_ID` は接続あたり
+  1 回しか効かないため、capture を止めるとデータソケットが二度と復活しない。

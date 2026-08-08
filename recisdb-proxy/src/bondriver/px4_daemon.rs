@@ -43,7 +43,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -69,6 +69,7 @@ mod cmd {
     pub const SET_PARAMS: u32 = 17;
     pub const TUNE: u32 = 19;
     pub const CHECK_LOCK: u32 = 20;
+    pub const SET_LNB_VOLTAGE: u32 = 24;
     pub const READ_STATS: u32 = 32;
 }
 
@@ -87,6 +88,9 @@ mod system {
     pub const ISDB_S: u32 = 0x20;
 }
 
+/// Sentinel for "no `data_id` yet"; outside the `u32` range the wire uses.
+const NO_DATA_ID: u64 = u64::MAX;
+
 /// `StatType::CNR`.
 const STAT_CNR: u32 = 2;
 
@@ -104,12 +108,20 @@ const CAPTURE_CMD_SIZE: usize = 12;
 const PARAMS_CMD_SIZE: usize = 28;
 const TUNE_CMD_SIZE: usize = 12;
 const CHECK_LOCK_CMD_SIZE: usize = 12;
+const LNB_CMD_SIZE: usize = 12;
 const STATS_CMD_SIZE: usize = 20;
 const DATA_CMD_SIZE: usize = 8;
 
 /// How long the daemon may spend acquiring a lock before `TUNE` gives up.
-/// Same value px4rec uses.
-const TUNE_TIMEOUT_MS: u32 = 30_000;
+///
+/// px4rec uses 30 s, which suits a CLI that was told exactly which channel to
+/// record. A server spends most of its `TUNE` calls on channels that are not
+/// receivable at all — a channel scan walks every UHF channel plus BS/CS
+/// whether or not an antenna is attached — and there the timeout is pure
+/// dead time. A real lock completes well inside a second; 5 s leaves ample
+/// margin for a weak signal while keeping a 74-channel scan minutes rather
+/// than half an hour.
+const TUNE_TIMEOUT_MS: u32 = 5_000;
 
 fn put_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -184,7 +196,7 @@ pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u3
 
 /// Parse `px4daemon:<index>` (or `px4daemon:any`), optionally followed by
 /// `@<ctrl_sock>` for a non-default socket path.
-fn parse_path(path: &str) -> Result<(i32, String, String), io::Error> {
+fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
     let rest = path.strip_prefix(PATH_PREFIX).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("not a px4daemon path: {}", path))
     })?;
@@ -192,6 +204,16 @@ fn parse_path(path: &str) -> Result<(i32, String, String), io::Error> {
     let (index_part, ctrl_sock) = match rest.split_once('@') {
         Some((i, sock)) => (i, sock.to_string()),
         None => (rest, DEFAULT_CTRL_SOCK.to_string()),
+    };
+
+    // `+lnb` opts this receiver into supplying LNB power on satellite
+    // channels. Opt-in for the same reason px4_drv's own BonDriver keeps it
+    // behind an `LNBPower` setting: feeding voltage onto a line that another
+    // device already powers is not something to do by default. Without it,
+    // BS/CS simply never lock on a setup that has no other power injector.
+    let (index_part, lnb_power) = match index_part.strip_suffix("+lnb") {
+        Some(stripped) => (stripped, true),
+        None => (index_part, false),
     };
 
     let index = if index_part.eq_ignore_ascii_case("any") || index_part.is_empty() {
@@ -213,7 +235,7 @@ fn parse_path(path: &str) -> Result<(i32, String, String), io::Error> {
         ctrl_sock.replace("ctrl", "data")
     };
 
-    Ok((index, ctrl_sock, data_sock))
+    Ok((index, lnb_power, ctrl_sock, data_sock))
 }
 
 // ---------------------------------------------------------------------
@@ -228,9 +250,22 @@ pub struct Px4DaemonTuner {
     data_sock_path: String,
     /// Receiver index requested (-1 = any).
     index: i32,
+    /// Whether this receiver may supply LNB power for satellite channels
+    /// (`+lnb` in the path).
+    lnb_power: bool,
+    /// Whether we currently have LNB power switched on. The daemon
+    /// reference-counts it and asserts the on/off calls balance, so this must
+    /// track our own state exactly — including on drop.
+    lnb_on: AtomicBool,
     /// `data_id` from `OPEN`; identifies which stream to claim on the data
     /// socket.
-    data_id: AtomicI32,
+    ///
+    /// Held as a `u64` with [`NO_DATA_ID`] as the "unset" sentinel because the
+    /// wire value is a full `u32`: the daemon hands out ids with the high bit
+    /// set, so anything that squeezes it into an `i32` and treats negatives as
+    /// "unset" breaks for half the id space (it did — intermittently, since
+    /// whether an id happens to be large is pure luck).
+    data_id: AtomicU64,
     /// Which `SystemType` the current `OPEN` was made for. Switching between
     /// terrestrial and satellite needs a fresh `OPEN`.
     opened_system: AtomicI32,
@@ -240,7 +275,7 @@ pub struct Px4DaemonTuner {
 
 impl Px4DaemonTuner {
     pub fn new(path: &str) -> Result<Self, io::Error> {
-        let (index, ctrl_sock, data_sock) = parse_path(path)?;
+        let (index, lnb_power, ctrl_sock, data_sock) = parse_path(path)?;
 
         let ctrl = UnixStream::connect(&ctrl_sock).map_err(|e| {
             io::Error::new(
@@ -260,7 +295,9 @@ impl Px4DaemonTuner {
             data: Mutex::new(None),
             data_sock_path: data_sock,
             index,
-            data_id: AtomicI32::new(-1),
+            lnb_power,
+            lnb_on: AtomicBool::new(false),
+            data_id: AtomicU64::new(NO_DATA_ID),
             opened_system: AtomicI32::new(0),
             capturing: AtomicBool::new(false),
             current_space: AtomicI32::new(0),
@@ -326,11 +363,12 @@ impl Px4DaemonTuner {
         }
 
         let data_id = get_u32(&buf, HEADER_SIZE + RI_DATA_ID_OFF);
-        self.data_id.store(data_id as i32, Ordering::Release);
+        let reported_index = get_i32(&buf, HEADER_SIZE + RI_INDEX_OFF);
+        self.data_id.store(data_id as u64, Ordering::Release);
         self.opened_system.store(sys as i32, Ordering::Release);
-        debug!(
-            "[px4daemon] OPEN ok: index={} system=0x{:02x} data_id={}",
-            self.index, sys, data_id
+        info!(
+            "[px4daemon] OPEN ok: requested index={} → receiver index={} system=0x{:02x} data_id={}",
+            self.index, reported_index, sys, data_id
         );
         Ok(())
     }
@@ -342,7 +380,7 @@ impl Px4DaemonTuner {
             warn!("[px4daemon] CLOSE failed: {}", e);
         }
         self.opened_system.store(0, Ordering::Release);
-        self.data_id.store(-1, Ordering::Release);
+        self.data_id.store(NO_DATA_ID, Ordering::Release);
     }
 
     fn set_capture(&self, on: bool) -> Result<(), io::Error> {
@@ -351,6 +389,26 @@ impl Px4DaemonTuner {
         buf[8] = on as u8;
         self.transact_checked(&mut buf, if on { "SET_CAPTURE(true)" } else { "SET_CAPTURE(false)" })?;
         self.capturing.store(on, Ordering::Release);
+        Ok(())
+    }
+
+    /// Switch LNB power to match `sys`: 15 V for satellite, off otherwise.
+    /// Mirrors px4_drv's own BonDriver (`bon_driver.cpp`).
+    fn apply_lnb_power(&self, sys: u32) -> Result<(), io::Error> {
+        if !self.lnb_power {
+            return Ok(());
+        }
+        let want = sys == system::ISDB_S;
+        if want == self.lnb_on.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut buf = vec![0u8; LNB_CMD_SIZE];
+        buf[..HEADER_SIZE].copy_from_slice(&header(cmd::SET_LNB_VOLTAGE));
+        put_u32(&mut buf, 8, if want { 15 } else { 0 });
+        self.transact_checked(&mut buf, "SET_LNB_VOLTAGE")?;
+        self.lnb_on.store(want, Ordering::Release);
+        info!("[px4daemon] LNB power {}", if want { "on (15V)" } else { "off" });
         Ok(())
     }
 
@@ -383,10 +441,10 @@ impl Px4DaemonTuner {
     /// Connect the data socket and claim this receiver's stream.
     fn attach_data_socket(&self) -> Result<(), io::Error> {
         let data_id = self.data_id.load(Ordering::Acquire);
-        if data_id < 0 {
+        if data_id == NO_DATA_ID {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "px4daemon: no data_id (receiver not open)",
+                "px4daemon: no data_id; the receiver is not open",
             ));
         }
 
@@ -422,34 +480,59 @@ impl Px4DaemonTuner {
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
         let (sys, freq_khz) = space_channel_to_freq(space, channel)?;
 
-        if self.capturing.load(Ordering::Acquire) {
-            let _ = self.set_capture(false);
-        }
+        // Deliberately *not* stopping capture here when the receiver stays
+        // open. Capture toggling is what makes re-tuning fragile on this
+        // daemon:
+        //
+        // - `SET_CAPTURE(false)` calls `StreamBuffer::Stop()`, which ends the
+        //   data connection's `HandleRead` and retires its streaming thread
+        //   for good. That thread is only started by `SET_DATA_ID`, and a
+        //   second `SET_DATA_ID` on the same connection is ignored
+        //   (`if (receiver) break;` in `stream_server.cpp`), so re-enabling
+        //   capture leaves the socket permanently silent.
+        // - Reconnecting the data socket instead does not help either: when
+        //   the *old* connection finishes tearing down it calls
+        //   `StopRequest()` on the receiver's (shared) stream buffer, which
+        //   kills the stream the new connection just started.
+        //
+        // Retuning in place — SET_PARAMS + TUNE while capture stays on, then
+        // a purge to drop the previous channel's bytes — keeps one stream
+        // thread alive for the whole life of the receiver. This matches what
+        // a BonDriver `SetChannel` does anyway.
 
         // A receiver is opened for one system at a time; crossing between
-        // terrestrial and satellite means re-opening it.
+        // terrestrial and satellite means re-opening it, and that *does*
+        // invalidate the data socket (a new `OPEN` yields a new `data_id`).
         let opened = self.opened_system.load(Ordering::Acquire) as u32;
         if opened != sys {
             if opened != 0 {
+                if self.capturing.load(Ordering::Acquire) {
+                    let _ = self.set_capture(false);
+                }
                 self.drop_data_socket();
                 self.close_receiver();
             }
             self.open_receiver(sys)?;
         }
 
+        self.apply_lnb_power(sys)?;
         self.set_params(sys, freq_khz)?;
         self.tune()?;
-        self.set_capture(true)?;
+        if !self.capturing.load(Ordering::Acquire) {
+            self.set_capture(true)?;
+        }
 
-        // The data socket is per-`OPEN`; reconnect only when we re-opened.
-        let needs_data = self
-            .data
-            .lock()
-            .map(|g| g.is_none())
-            .unwrap_or(true);
+        // Always reconnect when we do not already hold a socket — which,
+        // after the capture stop above, is every re-tune. See that comment
+        // for why an existing socket cannot be reused across a capture stop.
+        let needs_data = self.data.lock().map(|g| g.is_none()).unwrap_or(true);
         if needs_data {
             self.attach_data_socket()?;
         }
+
+        // Drop whatever the previous channel left in the daemon's ring so the
+        // caller does not start the new channel by reading the old one.
+        self.purge_ts_stream();
 
         self.current_space.store(space as i32, Ordering::Release);
         info!(
@@ -580,10 +663,31 @@ impl Px4DaemonTuner {
 
 impl Drop for Px4DaemonTuner {
     fn drop(&mut self) {
-        if self.capturing.load(Ordering::Acquire) {
-            let _ = self.set_capture(false);
-        }
+        // Deliberately *not* stopping capture here when the receiver stays
+        // open. Capture toggling is what makes re-tuning fragile on this
+        // daemon:
+        //
+        // - `SET_CAPTURE(false)` calls `StreamBuffer::Stop()`, which ends the
+        //   data connection's `HandleRead` and retires its streaming thread
+        //   for good. That thread is only started by `SET_DATA_ID`, and a
+        //   second `SET_DATA_ID` on the same connection is ignored
+        //   (`if (receiver) break;` in `stream_server.cpp`), so re-enabling
+        //   capture leaves the socket permanently silent.
+        // - Reconnecting the data socket instead does not help either: when
+        //   the *old* connection finishes tearing down it calls
+        //   `StopRequest()` on the receiver's (shared) stream buffer, which
+        //   kills the stream the new connection just started.
+        //
+        // Retuning in place — SET_PARAMS + TUNE while capture stays on, then
+        // a purge to drop the previous channel's bytes — keeps one stream
+        // thread alive for the whole life of the receiver. This matches what
+        // a BonDriver `SetChannel` does anyway.
         self.drop_data_socket();
+        if self.lnb_on.load(Ordering::Acquire) {
+            // The daemon reference-counts LNB power and asserts the calls
+            // balance, so this must not be skipped.
+            let _ = self.apply_lnb_power(system::ISDB_T);
+        }
         if self.opened_system.load(Ordering::Acquire) != 0 {
             self.close_receiver();
         }
@@ -599,12 +703,17 @@ mod tests {
     fn parses_index_and_socket_overrides() {
         assert_eq!(
             parse_path("px4daemon:3").unwrap(),
-            (3, DEFAULT_CTRL_SOCK.to_string(), DEFAULT_DATA_SOCK.to_string())
+            (3, false, DEFAULT_CTRL_SOCK.to_string(), DEFAULT_DATA_SOCK.to_string())
         );
         assert_eq!(parse_path("px4daemon:any").unwrap().0, -1);
         assert_eq!(parse_path("px4daemon:").unwrap().0, -1);
 
-        let (idx, ctrl, data) = parse_path("px4daemon:1@/run/px4_ctrl.sock").unwrap();
+        // LNB power is opt-in per receiver.
+        let (idx, lnb, _, _) = parse_path("px4daemon:2+lnb").unwrap();
+        assert_eq!((idx, lnb), (2, true));
+        assert!(!parse_path("px4daemon:2").unwrap().1);
+
+        let (idx, _, ctrl, data) = parse_path("px4daemon:1@/run/px4_ctrl.sock").unwrap();
         assert_eq!(idx, 1);
         assert_eq!(ctrl, "/run/px4_ctrl.sock");
         assert_eq!(
@@ -703,6 +812,98 @@ mod tests {
             sync_ok,
             sync_seen
         );
+    }
+
+    /// Re-tuning must keep TS flowing. Requires hardware; see
+    /// [`hardware_smoke_test_tunes_and_streams`] for how to run it.
+    ///
+    /// `PX4_TEST_CHANNELS` is a comma-separated list of GR channel indices
+    /// (default `0,6,8` = UHF 13/19/21). Each is tuned in turn on the *same*
+    /// tuner instance and must deliver data — the scan that first exercised
+    /// this backend stalled after several channel changes, so this pins the
+    /// switching path specifically rather than a single tune.
+    #[test]
+    #[ignore = "requires a running DriverHost_PX4 and connected tuner hardware"]
+    fn hardware_retune_keeps_streaming() {
+        let path = std::env::var("PX4_TEST_RECEIVER").unwrap_or_else(|_| "px4daemon:0".to_string());
+        let channels: Vec<u32> = std::env::var("PX4_TEST_CHANNELS")
+            .unwrap_or_else(|_| "0,6,8".to_string())
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+
+        for (round, &ch) in channels.iter().enumerate() {
+            tuner.set_channel(0, ch).unwrap_or_else(|e| panic!("tune round {round} ch {ch}: {e}"));
+
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0usize;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline && total < 512 * 1024 {
+                if !tuner.wait_ts_stream(200) {
+                    continue;
+                }
+                match tuner.get_ts_stream(&mut buf) {
+                    Ok((n, _)) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("round {round} ch {ch}: read failed: {e}"),
+                }
+            }
+            println!("round {round}: UHF {} → {} bytes", ch + 13, total);
+            assert!(
+                total > 188 * 500,
+                "round {round} (UHF {}): only {} bytes after re-tune — the stream did not survive the channel change",
+                ch + 13,
+                total
+            );
+        }
+    }
+
+    /// Crossing between terrestrial and satellite forces a fresh `OPEN`
+    /// (a receiver is opened for one `SystemType` at a time), which is the
+    /// branch that also has to rebuild the data socket. Requires hardware
+    /// with both antennas; override with `PX4_TEST_PLAN` as
+    /// `space:channel` pairs.
+    #[test]
+    #[ignore = "requires a running DriverHost_PX4, and both terrestrial and satellite antennas"]
+    fn hardware_retune_across_systems_keeps_streaming() {
+        let path = std::env::var("PX4_TEST_RECEIVER").unwrap_or_else(|_| "px4daemon:0".to_string());
+        let plan: Vec<(u32, u32)> = std::env::var("PX4_TEST_PLAN")
+            .unwrap_or_else(|_| "0:0,1:0,0:6,1:2".to_string())
+            .split(',')
+            .filter_map(|pair| {
+                let (s, c) = pair.trim().split_once(':')?;
+                Some((s.parse().ok()?, c.parse().ok()?))
+            })
+            .collect();
+
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+
+        for (round, &(space, ch)) in plan.iter().enumerate() {
+            tuner
+                .set_channel(space, ch)
+                .unwrap_or_else(|e| panic!("round {round} space {space} ch {ch}: {e}"));
+
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0usize;
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            while std::time::Instant::now() < deadline && total < 512 * 1024 {
+                if !tuner.wait_ts_stream(200) {
+                    continue;
+                }
+                match tuner.get_ts_stream(&mut buf) {
+                    Ok((n, _)) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("round {round}: read failed: {e}"),
+                }
+            }
+            println!("round {round}: space={space} ch={ch} → {total} bytes");
+            assert!(
+                total > 188 * 500,
+                "round {round} (space={space} ch={ch}): only {total} bytes — the stream did not survive the system change"
+            );
+        }
     }
 
     #[test]
