@@ -56,6 +56,11 @@ extern "system" {
         context: *mut ScardContext,
     ) -> Long;
     fn SCardReleaseContext(context: ScardContext) -> Long;
+    // Windows の winscard.h では `SCardListReaders` はマクロで、実体は
+    // `SCardListReadersA` / `SCardListReadersW` しか export されていない。
+    // プレーン名で宣言すると unresolved external になるので ANSI 版へ張る
+    // (返る名前は表示用なので ANSI で十分)。
+    #[cfg_attr(windows, link_name = "SCardListReadersA")]
     fn SCardListReaders(
         context: ScardContext,
         groups: *const u8,
