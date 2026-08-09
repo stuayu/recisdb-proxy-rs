@@ -309,10 +309,25 @@ impl DvbV5Tuner {
         // for well over a second after DTV_TUNE while their firmware works,
         // so cutting off at a few hundred ms would report "empty channel"
         // for every channel including the real ones.
+        //
+        // SETTLE_MS exists because FE_READ_STATUS does not become meaningless
+        // the instant DTV_TUNE is issued — it keeps reporting the *previous*
+        // channel's status until the driver has actually retuned. Reading it
+        // right away therefore returns 0x1f (full lock) for a channel that is
+        // in fact empty, and the whole scan goes wrong from there: the empty
+        // channel is treated as found, get_signal_level reports the old
+        // channel's CNR, the demux filter is installed, and the scanner then
+        // waits out its entire TS read timeout for a stream that will never
+        // arrive. Observed directly on a PX-Q1UD: every other channel logged
+        // "locked after 0 ms" and then stalled. Waiting before the first read
+        // costs nothing in practice, since a real lock takes ~750-900 ms on
+        // this hardware anyway.
         const LOCK_POLL_INTERVAL_MS: u64 = 50;
         const LOCK_TIMEOUT_MS: u64 = 3000;
         const NO_SIGNAL_TIMEOUT_MS: u64 = 1500;
-        let mut waited_ms = 0u64;
+        const SETTLE_MS: u64 = 300;
+        std::thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
+        let mut waited_ms = SETTLE_MS;
         let mut locked = false;
         let mut last_status = 0u32;
         let mut status_readable = false;
