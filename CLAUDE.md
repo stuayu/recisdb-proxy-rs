@@ -29,6 +29,8 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 
 ### BonDriver FFI(Windows)
 - GetTsStreamは必ず **`C_GetTsStream2`(BYTE**ゼロコピー版)** を使う。BYTE*コピー版は未実装/バグ持ちのDLLが多く、リリースビルドのみクラッシュするUBの原因。
+- **GetTsStreamが返した `size` は全バイト受け取る。** DLLは返した時点で内部バッファを消費済み。呼び出し側バッファに入らない分を切り捨てると、そのTSは永久に失われ、しかも切れ目が188境界に乗らないので以降の同期も壊れる。入らなかった分は `IBon::pending` に退避し次回返す(`bondriver/windows.rs`)。プロキシ系DLL(BonDriver_NetworkProxy / BonDriverProxyEx)はハードウェアDLLよりずっと大きいチャンクを返すため、多段構成で顕在化する。
+- **クライアントDLLは `CreateBonDriver()` ごとに独立インスタンスを返す。** 接続・リングバッファ・選局状態をプロセス共有にしない(詳細と理由: `docs/DESIGN.md` §5)。
 - C++側FFIラッパーは必ず `try { } catch (...) { }` で包む。Rustの `catch_unwind` はC++/SEH例外を捕まえられない。SEHには `/EHa`。
 - Rust panic がFFI境界(`extern "system"`)を越えるとプロセスabort(TVTestが無言で落ちる)。クライアントDLL内では panic し得るコード(unwrap/添字)を書かない。
 - `from_wide_ptr` は最大長キャップ(32768)+ `?` 必須(`.unwrap()` 禁止)。

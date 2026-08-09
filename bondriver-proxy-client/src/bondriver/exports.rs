@@ -4,6 +4,7 @@
 //! This module implements the BonDriver interface functions that are called
 //! by the host application (e.g., TVTest).
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 #[cfg(windows)]
@@ -21,7 +22,15 @@ use crate::client::buffer::TS_PACKET_SIZE;
 use crate::client::{Connection, ConnectionConfig, ConnectionState};
 use crate::file_log;
 
-/// Global state for the BonDriver instance.
+/// Per-instance state for one BonDriver object.
+///
+/// **One state per `CreateBonDriver()` object — never a process-wide
+/// singleton.**  A host may create several BonDriver objects from the same DLL
+/// (recisdb-proxy does exactly this when a driver's `max_instances > 1`, and
+/// EDCB does it for multiple tuners).  Sharing one `Connection`/`TsRingBuffer`
+/// between them makes each object consume TS bytes belonging to the other:
+/// the streams interleave, continuity counters break and PMT/ECM packets go
+/// missing — which the viewer reports as Drop / Error / Scramble.
 struct BonDriverState {
     /// Connection to the proxy server.
     connection: Arc<Connection>,
@@ -31,10 +40,10 @@ struct BonDriverState {
     cur_channel: u32,
     /// Cached tuner name.
     tuner_name: Option<Vec<u16>>,
-    /// Cached space names.
-    space_names: Vec<Option<Vec<u16>>>,
-    /// Cached channel names (space -> channels).
-    channel_names: Vec<Vec<Option<Vec<u16>>>>,
+    /// Cached space names (interned, see [`intern_wide`]).
+    space_names: Vec<Option<&'static [u16]>>,
+    /// Cached channel names (space -> channels), interned.
+    channel_names: Vec<Vec<Option<&'static [u16]>>>,
 
     // ★追加：ポインタ版 GetTsStream 用の保持バッファ
     ts_out: Vec<u8>,
@@ -54,35 +63,109 @@ impl BonDriverState {
     }
 }
 
-/// Global instance.
-static INSTANCE: OnceCell<Mutex<BonDriverState>> = OnceCell::new();
+/// A BonDriver object as the host application sees it.
+///
+/// `#[repr(C)]` with `vtbl` first so a `*mut BonDriverInstance` is a valid
+/// `IBonDriver*` for C++ virtual dispatch: every exported method receives this
+/// pointer as `this` and resolves its own state from it.
+#[repr(C)]
+pub struct BonDriverInstance {
+    /// vtable pointer — MUST stay the first field.
+    vtbl: *const IBonDriver3Vtbl,
+    /// State belonging to this object alone.
+    state: Mutex<BonDriverState>,
+}
 
-/// Get or create the global instance.
-fn get_instance() -> &'static Mutex<BonDriverState> {
-    INSTANCE.get_or_init(|| {
-        // Load log level first (before any logging calls)
+// Safety: the vtable is static and the state is behind a mutex.
+unsafe impl Send for BonDriverInstance {}
+unsafe impl Sync for BonDriverInstance {}
+
+/// Addresses of the instances that are currently alive.
+///
+/// Every exported method validates its `this` against this set before
+/// dereferencing it, so a stale pointer (a host calling into an instance it
+/// already released, or a null `this`) turns into a benign failure return
+/// instead of undefined behaviour.  A panic must never cross the
+/// `extern "system"` boundary, so the FFI surface can afford no unchecked
+/// dereference.
+static LIVE_INSTANCES: OnceCell<Mutex<HashSet<usize>>> = OnceCell::new();
+
+fn live_instances() -> &'static Mutex<HashSet<usize>> {
+    LIVE_INSTANCES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Process-wide intern table for the wide strings handed back by
+/// `EnumTuningSpace` / `EnumChannelName`.
+///
+/// Those functions return a raw `LPCTSTR` into our own storage, and the host
+/// decides when to read it.  EDCB in particular enumerates spaces/channels
+/// during a channel scan and may keep the pointers past `Release` (and may
+/// `CreateBonDriver` again afterwards).  Since `Release` now frees the
+/// instance, per-instance storage would dangle — so the strings live for the
+/// process instead.  Interning by content bounds the cost: the table holds one
+/// entry per *distinct* name no matter how many instances are created and
+/// destroyed, and the name space is already capped by `MAX_SPACES` /
+/// `MAX_CHANNELS_PER_SPACE`.
+static NAME_INTERN: OnceCell<Mutex<std::collections::HashMap<String, &'static [u16]>>> =
+    OnceCell::new();
+
+fn intern_wide(s: &str) -> &'static [u16] {
+    let table = NAME_INTERN.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut table = table.lock();
+    if let Some(existing) = table.get(s) {
+        return existing;
+    }
+    let leaked: &'static [u16] = Box::leak(to_wide_string(s).into_boxed_slice());
+    table.insert(s.to_string(), leaked);
+    leaked
+}
+
+/// One-time process setup (logging + log level).  Shared by every instance;
+/// only the *session* state is per-instance.
+fn init_process_once() {
+    static PROCESS_INIT: OnceCell<()> = OnceCell::new();
+    PROCESS_INIT.get_or_init(|| {
         let log_level = crate::config::load_log_level();
-
-        // Apply log level to the file logger
         crate::logging::set_file_log_level(log_level);
+        let _ = env_logger::Builder::new().filter_level(log_level).try_init();
+        file_log!(info, "init_process_once: logging initialized (log_level={:?})", log_level);
+    });
+}
 
-        // Initialize env_logger with the configured level
-        let _ = env_logger::Builder::new()
-            .filter_level(log_level)
-            .try_init();
+/// Create a new, independent BonDriver instance and return it as an
+/// `IBonDriver*`.  Each call yields its own connection, ring buffer and
+/// channel state.
+pub fn create_instance() -> *mut IBonDriver {
+    init_process_once();
 
-        file_log!(info, "get_instance: Initializing global state (log_level={:?})...", log_level);
+    let config = load_config();
+    info!("BonDriver_NetworkProxy instance created");
+    file_log!(info, "create_instance: server address: {}", config.server_addr);
+    debug!("Server: {}", config.server_addr);
 
-        // Load configuration from INI file
-        file_log!(info, "get_instance: Loading configuration...");
-        let config = load_config();
-        info!("BonDriver_NetworkProxy initialized");
-        file_log!(info, "get_instance: Server address: {}", config.server_addr);
-        debug!("Server: {}", config.server_addr);
+    let instance = Box::new(BonDriverInstance {
+        vtbl: get_vtable_ptr(),
+        state: Mutex::new(BonDriverState::new(config)),
+    });
+    let ptr = Box::into_raw(instance);
+    live_instances().lock().insert(ptr as usize);
+    file_log!(info, "create_instance: new instance at {:p}", ptr);
 
-        file_log!(info, "get_instance: Creating BonDriverState...");
-        Mutex::new(BonDriverState::new(config))
-    })
+    ptr as *mut IBonDriver
+}
+
+/// Resolve the instance a call belongs to, or `None` if `this` is null or no
+/// longer alive.
+unsafe fn instance_of<'a>(this: *mut c_void) -> Option<&'a BonDriverInstance> {
+    if this.is_null() {
+        file_log!(error, "FFI call with null `this`; ignoring");
+        return None;
+    }
+    if !live_instances().lock().contains(&(this as usize)) {
+        file_log!(error, "FFI call on released/unknown instance {:p}; ignoring", this);
+        return None;
+    }
+    Some(&*(this as *const BonDriverInstance))
 }
 
 /// Load configuration from INI file or environment.
@@ -95,12 +178,13 @@ fn load_config() -> ConnectionConfig {
 // =============================================================================
 
 /// Open the tuner.
-pub unsafe extern "system" fn open_tuner(_this: *mut c_void) -> BOOL {
+pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
     file_log!(info, "OpenTuner called");
     debug!("OpenTuner called");
 
+    let Some(instance) = instance_of(this) else { return 0 };
     file_log!(debug, "OpenTuner: Getting instance lock...");
-    let state = get_instance().lock();
+    let state = instance.state.lock();
     file_log!(debug, "OpenTuner: Got instance lock");
 
     // Connect to server if not connected
@@ -131,19 +215,21 @@ pub unsafe extern "system" fn open_tuner(_this: *mut c_void) -> BOOL {
 }
 
 /// Close the tuner.
-pub unsafe extern "system" fn close_tuner(_this: *mut c_void) {
+pub unsafe extern "system" fn close_tuner(this: *mut c_void) {
     file_log!(info, "CloseTuner called");
     debug!("CloseTuner called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return };
+    let state = instance.state.lock();
     state.connection.close_tuner();
     file_log!(info, "CloseTuner: Tuner closed");
     info!("Tuner closed");
 }
 
 /// Set channel (IBonDriver v1).
-pub unsafe extern "system" fn set_channel(_this: *mut c_void, channel: BYTE) -> BOOL {
+pub unsafe extern "system" fn set_channel(this: *mut c_void, channel: BYTE) -> BOOL {
     debug!("SetChannel called: channel={}", channel);
-    let mut state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0 };
+    let mut state = instance.state.lock();
 
     if state.connection.set_channel(channel, false) {
         state.cur_channel = channel as u32;
@@ -155,10 +241,14 @@ pub unsafe extern "system" fn set_channel(_this: *mut c_void, channel: BYTE) -> 
 }
 
 /// Get signal level.
-pub unsafe extern "system" fn get_signal_level(_this: *mut c_void) -> f32 {
+pub unsafe extern "system" fn get_signal_level(this: *mut c_void) -> f32 {
     trace!("GetSignalLevel called");
-    let state = get_instance().lock();
-    state.connection.get_signal_level()
+    let Some(instance) = instance_of(this) else { return 0.0 };
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
+    connection.get_signal_level()
 }
 
 /// Wait for TS stream to become available.
@@ -166,12 +256,14 @@ pub unsafe extern "system" fn get_signal_level(_this: *mut c_void) -> f32 {
 /// Mirrors the `WaitForMultipleObjects` call in BonDriverProxy(Ex):
 /// instead of spinning with `Sleep(2)`, we block on the ring buffer's
 /// Condvar and are woken immediately when the network receiver writes data.
-pub unsafe extern "system" fn wait_ts_stream(_this: *mut c_void, timeout_ms: DWORD) -> DWORD {
+pub unsafe extern "system" fn wait_ts_stream(this: *mut c_void, timeout_ms: DWORD) -> DWORD {
     file_log!(debug, "WaitTsStream called: timeout={}ms", timeout_ms);
+
+    let Some(instance) = instance_of(this) else { return 0 };
 
     // ロックは短く、connection を clone して使う
     let connection = {
-        let state = get_instance().lock();
+        let state = instance.state.lock();
         state.connection.clone()
     };
 
@@ -202,10 +294,12 @@ pub unsafe extern "system" fn wait_ts_stream(_this: *mut c_void, timeout_ms: DWO
 }
 
 /// Get the number of ready TS packets.
-pub unsafe extern "system" fn get_ready_count(_this: *mut c_void) -> DWORD {
+pub unsafe extern "system" fn get_ready_count(this: *mut c_void) -> DWORD {
+    let Some(instance) = instance_of(this) else { return 0 };
+
     // connection を clone してロックを短くする
     let connection = {
-        let state = get_instance().lock();
+        let state = instance.state.lock();
         state.connection.clone()
     };
 
@@ -227,7 +321,7 @@ const MAX_TS_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 /// TVTest passes 0 or garbage for size, so we use a default read size.
 
 pub unsafe extern "system" fn get_ts_stream(
-    _this: *mut c_void,
+    this: *mut c_void,
     dst: *mut BYTE,
     size: *mut DWORD,
     remain: *mut DWORD,
@@ -241,6 +335,12 @@ pub unsafe extern "system" fn get_ts_stream(
         return FALSE;
     }
 
+    let Some(instance) = instance_of(this) else {
+        *size = 0;
+        *remain = 0;
+        return FALSE;
+    };
+
     // ログ間引き用カウンタ
     static LOG_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -252,7 +352,7 @@ pub unsafe extern "system" fn get_ts_stream(
 
     // connection を clone（ロック時間短縮）
     let connection = {
-        let state = get_instance().lock();
+        let state = instance.state.lock();
         state.connection.clone()
     };
     let buffer = connection.buffer();
@@ -354,7 +454,7 @@ pub unsafe extern "system" fn get_ts_stream(
 /// Get TS stream data - pointer version (second overload).
 /// Returns a pointer to internal buffer instead of copying.
 pub unsafe extern "system" fn get_ts_stream_ptr(
-    _this: *mut c_void,
+    this: *mut c_void,
     dst: *mut *mut BYTE,
     size: *mut DWORD,
     remain: *mut DWORD,
@@ -367,6 +467,13 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
         crate::file_log!(error, "GetTsStream(ptr): invalid args dst/size/remain is null");
         return FALSE;
     }
+
+    let Some(instance) = instance_of(this) else {
+        *dst = std::ptr::null_mut();
+        *size = 0;
+        *remain = 0;
+        return FALSE;
+    };
 
     // TVTest は *size を 0 で呼ぶので「入力値」としては使わない
     // 1回に返す最大サイズ（TVTest側 DataBuffer=0x10000 に合わせるのが無難）
@@ -383,7 +490,7 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
     // connection, then again to access ts_out), causing two lock/unlock
     // round-trips per GetTsStream call.  Now we hold it once and access both
     // the ring buffer (via the Arc inside state) and ts_out together.
-    let mut state = get_instance().lock();
+    let mut state = instance.state.lock();
     let buffer = Arc::clone(state.connection.buffer());
 
     let avail = buffer.available();
@@ -484,20 +591,39 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
 }
 
 /// Purge the TS stream buffer.
-pub unsafe extern "system" fn purge_ts_stream(_this: *mut c_void) {
+pub unsafe extern "system" fn purge_ts_stream(this: *mut c_void) {
     debug!("PurgeTsStream called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return };
+    let state = instance.state.lock();
     state.connection.purge_stream();
 }
 
 /// Release the BonDriver instance.
-pub unsafe extern "system" fn release(_this: *mut c_void) {
+///
+/// Per the BonDriver contract this destroys the object, so the instance is
+/// deregistered and freed here.  Deregistering first means a second `Release`
+/// (or any late call on the same pointer) is rejected by `instance_of` instead
+/// of touching freed memory.
+pub unsafe extern "system" fn release(this: *mut c_void) {
     file_log!(info, "Release called");
     debug!("Release called");
-    let state = get_instance().lock();
+
+    if this.is_null() {
+        file_log!(error, "Release with null `this`; ignoring");
+        return;
+    }
+    if !live_instances().lock().remove(&(this as usize)) {
+        file_log!(error, "Release on released/unknown instance {:p}; ignoring", this);
+        return;
+    }
+
+    let instance = Box::from_raw(this as *mut BonDriverInstance);
     file_log!(info, "Release: Disconnecting...");
-    state.connection.disconnect();
-    file_log!(info, "Release: Disconnected");
+    // `Connection::drop` also disconnects, but do it explicitly so the server
+    // sees the teardown before the allocation goes away.
+    instance.state.lock().connection.disconnect();
+    drop(instance);
+    file_log!(info, "Release: Disconnected and instance freed");
 }
 
 // =============================================================================
@@ -516,9 +642,10 @@ pub unsafe extern "system" fn get_tuner_name(_this: *mut c_void) -> LPCTSTR {
 }
 
 /// Check if the tuner is open.
-pub unsafe extern "system" fn is_tuner_opening(_this: *mut c_void) -> BOOL {
+pub unsafe extern "system" fn is_tuner_opening(this: *mut c_void) -> BOOL {
     trace!("IsTunerOpening called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0 };
+    let state = instance.state.lock();
     match state.connection.state() {
         ConnectionState::TunerOpen | ConnectionState::Streaming => 1,
         _ => 0,
@@ -532,7 +659,7 @@ const MAX_SPACES: usize = 256;
 const MAX_CHANNELS_PER_SPACE: usize = 1024;
 
 /// Enumerate tuning space names.
-pub unsafe extern "system" fn enum_tuning_space(_this: *mut c_void, space: DWORD) -> LPCTSTR {
+pub unsafe extern "system" fn enum_tuning_space(this: *mut c_void, space: DWORD) -> LPCTSTR {
     file_log!(debug, "EnumTuningSpace called: space={}", space);
     debug!("EnumTuningSpace called: space={}", space);
 
@@ -543,11 +670,12 @@ pub unsafe extern "system" fn enum_tuning_space(_this: *mut c_void, space: DWORD
         return std::ptr::null();
     }
 
-    let mut state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return std::ptr::null() };
+    let mut state = instance.state.lock();
 
     // Check cache first
     if (space as usize) < state.space_names.len() {
-        if let Some(ref name) = state.space_names[space as usize] {
+        if let Some(name) = state.space_names[space as usize] {
             file_log!(debug, "EnumTuningSpace: returning cached value for space {}", space);
             return name.as_ptr();
         }
@@ -558,13 +686,13 @@ pub unsafe extern "system" fn enum_tuning_space(_this: *mut c_void, space: DWORD
     match state.connection.enum_tuning_space(space) {
         Some(name) => {
             file_log!(debug, "EnumTuningSpace: got name '{}' for space {}", name, space);
-            let wide = to_wide_string(&name);
+            let wide = intern_wide(&name);
             // Extend cache if needed
             while state.space_names.len() <= space as usize {
                 state.space_names.push(None);
             }
             state.space_names[space as usize] = Some(wide);
-            state.space_names[space as usize].as_ref().unwrap().as_ptr()
+            wide.as_ptr()
         }
         None => {
             file_log!(debug, "EnumTuningSpace: no name for space {}", space);
@@ -575,7 +703,7 @@ pub unsafe extern "system" fn enum_tuning_space(_this: *mut c_void, space: DWORD
 
 /// Enumerate channel names.
 pub unsafe extern "system" fn enum_channel_name(
-    _this: *mut c_void,
+    this: *mut c_void,
     space: DWORD,
     channel: DWORD,
 ) -> LPCTSTR {
@@ -591,12 +719,13 @@ pub unsafe extern "system" fn enum_channel_name(
         return std::ptr::null();
     }
 
-    let mut state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return std::ptr::null() };
+    let mut state = instance.state.lock();
 
     // Check cache first
     if (space as usize) < state.channel_names.len() {
         if (channel as usize) < state.channel_names[space as usize].len() {
-            if let Some(ref name) = state.channel_names[space as usize][channel as usize] {
+            if let Some(name) = state.channel_names[space as usize][channel as usize] {
                 return name.as_ptr();
             }
         }
@@ -605,7 +734,7 @@ pub unsafe extern "system" fn enum_channel_name(
     // Query server
     match state.connection.enum_channel_name(space, channel) {
         Some(name) => {
-            let wide = to_wide_string(&name);
+            let wide = intern_wide(&name);
             // Extend cache if needed
             while state.channel_names.len() <= space as usize {
                 state.channel_names.push(Vec::new());
@@ -614,10 +743,7 @@ pub unsafe extern "system" fn enum_channel_name(
                 state.channel_names[space as usize].push(None);
             }
             state.channel_names[space as usize][channel as usize] = Some(wide);
-            state.channel_names[space as usize][channel as usize]
-                .as_ref()
-                .unwrap()
-                .as_ptr()
+            wide.as_ptr()
         }
         None => std::ptr::null(),
     }
@@ -625,13 +751,14 @@ pub unsafe extern "system" fn enum_channel_name(
 
 /// Set channel by space (IBonDriver2).
 pub unsafe extern "system" fn set_channel2(
-    _this: *mut c_void,
+    this: *mut c_void,
     space: DWORD,
     channel: DWORD,
 ) -> BOOL {
     file_log!(info, "SetChannel2 called: space={}, channel={}", space, channel);
     debug!("SetChannel2 called: space={}, channel={}", space, channel);
-    let mut state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0 };
+    let mut state = instance.state.lock();
 
     file_log!(debug, "SetChannel2: Calling connection.set_channel_space...");
 
@@ -658,16 +785,18 @@ pub unsafe extern "system" fn set_channel2(
 }
 
 /// Get current tuning space.
-pub unsafe extern "system" fn get_cur_space(_this: *mut c_void) -> DWORD {
+pub unsafe extern "system" fn get_cur_space(this: *mut c_void) -> DWORD {
     trace!("GetCurSpace called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0xFFFFFFFF };
+    let state = instance.state.lock();
     state.cur_space
 }
 
 /// Get current channel.
-pub unsafe extern "system" fn get_cur_channel(_this: *mut c_void) -> DWORD {
+pub unsafe extern "system" fn get_cur_channel(this: *mut c_void) -> DWORD {
     trace!("GetCurChannel called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0xFFFFFFFF };
+    let state = instance.state.lock();
     state.cur_channel
 }
 
@@ -683,9 +812,10 @@ pub unsafe extern "system" fn get_total_device_num(_this: *mut c_void) -> DWORD 
 }
 
 /// Get active device count.
-pub unsafe extern "system" fn get_active_device_num(_this: *mut c_void) -> DWORD {
+pub unsafe extern "system" fn get_active_device_num(this: *mut c_void) -> DWORD {
     debug!("GetActiveDeviceNum called");
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0 };
+    let state = instance.state.lock();
     match state.connection.state() {
         ConnectionState::TunerOpen | ConnectionState::Streaming => 1,
         _ => 0,
@@ -693,9 +823,10 @@ pub unsafe extern "system" fn get_active_device_num(_this: *mut c_void) -> DWORD
 }
 
 /// Set LNB power.
-pub unsafe extern "system" fn set_lnb_power(_this: *mut c_void, enable: BOOL) -> BOOL {
+pub unsafe extern "system" fn set_lnb_power(this: *mut c_void, enable: BOOL) -> BOOL {
     debug!("SetLnbPower called: enable={}", enable);
-    let state = get_instance().lock();
+    let Some(instance) = instance_of(this) else { return 0 };
+    let state = instance.state.lock();
 
     if state.connection.set_lnb_power(enable != 0) {
         1
@@ -1053,4 +1184,98 @@ pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
 #[cfg(not(windows))]
 pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
     &IBONDRIVER3_VTBL as *const _
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// EDCB opens one BonDriver object per tuner and scans channels on each of
+    /// them concurrently.  Every object must carry its own channel state — a
+    /// shared one makes the scan record whatever the *other* tuner last tuned.
+    #[test]
+    fn instances_do_not_share_channel_state() {
+        let a = create_instance() as *mut c_void;
+        let b = create_instance() as *mut c_void;
+        assert_ne!(a, b);
+
+        unsafe {
+            // Nothing tuned yet on either object.
+            assert_eq!(get_cur_space(a), 0xFFFFFFFF);
+            assert_eq!(get_cur_channel(a), 0xFFFFFFFF);
+
+            // Write state directly: set_channel2 would need a live server, and
+            // what matters here is that the two objects address different
+            // storage.
+            {
+                let mut st = instance_of(a).unwrap().state.lock();
+                st.cur_space = 3;
+                st.cur_channel = 11;
+            }
+
+            assert_eq!(get_cur_space(a), 3);
+            assert_eq!(get_cur_channel(a), 11);
+            assert_eq!(get_cur_space(b), 0xFFFFFFFF, "instance B must be untouched");
+            assert_eq!(get_cur_channel(b), 0xFFFFFFFF, "instance B must be untouched");
+
+            release(a);
+            release(b);
+        }
+    }
+
+    /// A scan ends when enumeration returns null.  Out-of-range indices must
+    /// terminate locally (without a server round-trip) so a host that keeps
+    /// walking cannot loop forever.
+    #[test]
+    fn enumeration_terminates_at_the_bounds() {
+        let inst = create_instance() as *mut c_void;
+        unsafe {
+            assert!(enum_tuning_space(inst, MAX_SPACES as DWORD).is_null());
+            assert!(enum_channel_name(inst, MAX_SPACES as DWORD, 0).is_null());
+            assert!(
+                enum_channel_name(inst, 0, MAX_CHANNELS_PER_SPACE as DWORD).is_null()
+            );
+            release(inst);
+        }
+    }
+
+    /// Calls arriving after `Release` (or with a null `this`) must fail
+    /// benignly.  A panic or a use-after-free here would take the host process
+    /// down — EDCB tears tuners down and rebuilds them between scans.
+    #[test]
+    fn calls_after_release_and_on_null_this_are_rejected() {
+        let inst = create_instance() as *mut c_void;
+        unsafe {
+            release(inst);
+
+            // Same pointer, now dead.
+            assert_eq!(open_tuner(inst), 0);
+            assert_eq!(is_tuner_opening(inst), 0);
+            assert_eq!(get_cur_space(inst), 0xFFFFFFFF);
+            assert!(enum_tuning_space(inst, 0).is_null());
+            assert_eq!(get_ready_count(inst), 0);
+            release(inst); // double release is ignored
+
+            let null = std::ptr::null_mut();
+            assert_eq!(open_tuner(null), 0);
+            assert_eq!(get_signal_level(null), 0.0);
+            assert_eq!(get_active_device_num(null), 0);
+            release(null);
+        }
+    }
+
+    /// Enumeration hands the host a raw pointer whose lifetime it does not
+    /// control.  Interning keeps it valid for the whole process, so a name read
+    /// after the instance that produced it was released is still sound, and
+    /// re-interning the same name does not grow the table.
+    #[test]
+    fn interned_names_are_stable_and_outlive_their_instance() {
+        let first = intern_wide("関東");
+        let again = intern_wide("関東");
+        assert_eq!(first.as_ptr(), again.as_ptr(), "same name must intern once");
+
+        let expected: Vec<u16> = to_wide_string("関東");
+        assert_eq!(first, expected.as_slice());
+        assert_eq!(*first.last().unwrap(), 0, "must stay NUL-terminated");
+    }
 }

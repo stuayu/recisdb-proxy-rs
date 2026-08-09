@@ -538,8 +538,26 @@ impl Connection {
         *self.state.lock() = ConnectionState::Connected;
     }
 
+    /// Drop the cached signal level so the next `GetSignalLevel` refetches.
+    ///
+    /// Must be called whenever the tuned channel changes.  The cache exists to
+    /// spare a round-trip per poll, but a value measured on the *previous*
+    /// channel is worse than no value at all: a channel scan (EDCB, TVTest)
+    /// reads the level right after `SetChannel` to decide whether the channel
+    /// exists, so a stale reading makes it record dead channels as present and
+    /// live ones as absent — the client-side twin of the server-side
+    /// "FE_READ_STATUS returns the previous channel's lock" bug.
+    fn invalidate_signal_cache(&self) {
+        *self.signal_level.lock() = (0.0, None);
+    }
+
     /// Set channel (IBonDriver v1).
     pub fn set_channel(&self, channel: u8, _force: bool) -> bool {
+        // Invalidate before the request: the tuner starts moving as soon as the
+        // server acts on it, so anything cached from here on describes the old
+        // channel regardless of whether the ack ends up succeeding.
+        self.invalidate_signal_cache();
+
         let resp = self.send_request(ClientMessage::SetChannel {
             channel,
             priority: self.config.client_priority,
@@ -559,6 +577,8 @@ impl Connection {
 
     /// Set channel by space (IBonDriver v2).
     pub fn set_channel_space(&self, space: u32, channel: u32, priority: i32, exclusive: bool) -> bool {
+        self.invalidate_signal_cache();
+
         let resp = self.send_request(ClientMessage::SetChannelSpace { space, channel, priority, exclusive });
 
         match resp {
@@ -1333,6 +1353,33 @@ mod tests {
         }
         // Large attempt numbers must not panic (overflow) and stay clamped.
         assert_eq!(backoff_delay(u32::MAX), cap);
+    }
+
+    #[test]
+    fn changing_channel_invalidates_the_signal_cache() {
+        // A scan reads the level straight after SetChannel to decide whether
+        // the channel exists. Serving the previous channel's reading out of the
+        // 2 s cache makes the scan result wrong in both directions.
+        let conn = Connection::new(ConnectionConfig::default());
+        *conn.signal_level.lock() = (24.5, Some(Instant::now()));
+        assert_eq!(conn.signal_level(), 24.5, "cache primed");
+
+        conn.invalidate_signal_cache();
+        assert!(
+            conn.signal_level.lock().1.is_none(),
+            "cache must be empty so the next read refetches"
+        );
+
+        // The public entry points must do it too. There is no server here, so
+        // the request fails fast (link is DOWN) — the cache state is what
+        // matters.
+        *conn.signal_level.lock() = (24.5, Some(Instant::now()));
+        conn.set_channel_space(0, 1, 0, false);
+        assert!(conn.signal_level.lock().1.is_none(), "SetChannel2 must invalidate");
+
+        *conn.signal_level.lock() = (24.5, Some(Instant::now()));
+        conn.set_channel(7, false);
+        assert!(conn.signal_level.lock().1.is_none(), "SetChannel must invalidate");
     }
 
     #[test]

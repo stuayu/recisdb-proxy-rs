@@ -116,12 +116,29 @@ impl DynamicCast<IBonDriver3> for IBonDriver2 {
     }
 }
 
+/// Upper bound on the carry-over buffer (see [`IBon::pending`]).  Far above any
+/// plausible single-call overshoot; exists only so a pathological driver cannot
+/// grow it without limit.
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 /// Internal BonDriver interface wrapper.
 struct IBon {
     version: u8,
     ibon1: NonNull<IBonDriver>,
     ibon2: Option<NonNull<IBonDriver2>>,
     ibon3: Option<NonNull<IBonDriver3>>,
+    /// TS bytes handed over by `GetTsStream` that did not fit in the caller's
+    /// buffer, kept for the next call.
+    ///
+    /// `GetTsStream` *consumes* the driver's internal buffer: whatever it
+    /// reports in `pdwSize` is gone from the driver whether or not we copied it
+    /// all.  Truncating to the caller's buffer therefore does not defer the
+    /// tail, it destroys it — and the cut lands wherever the buffer happens to
+    /// end, mid-TS-packet, so the reader also loses packet alignment.  Proxy
+    /// drivers (BonDriver_NetworkProxy, BonDriverProxyEx) hand back far larger
+    /// chunks than a hardware driver, which is why this only bites in a
+    /// cascaded setup.
+    pending: std::sync::Mutex<Vec<u8>>,
 }
 
 impl Drop for IBon {
@@ -197,6 +214,20 @@ impl IBon {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, usize), io::Error> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Anything left over from the previous call goes out first, so the byte
+        // order of the stream is preserved.
+        if !pending.is_empty() {
+            let n = pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&pending[..n]);
+            pending.drain(..n);
+            return Ok((n, pending.len()));
+        }
+
         let mut ptr: *mut u8 = std::ptr::null_mut();
         let mut size: u32 = 0;
         let mut remaining: u32 = 0;
@@ -223,12 +254,33 @@ impl IBon {
             let copy_len = size_usize.min(buf.len());
             std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
 
-            Ok((copy_len, remaining as usize))
+            // The driver considers all `size` bytes delivered, so keep whatever
+            // did not fit instead of dropping it mid-packet.
+            if size_usize > copy_len {
+                let tail = std::slice::from_raw_parts(ptr.add(copy_len), size_usize - copy_len);
+                if pending.len() + tail.len() > MAX_PENDING_BYTES {
+                    error!(
+                        "[BonDriver] GetTsStream carry-over exceeded {} bytes; discarding {} buffered bytes",
+                        MAX_PENDING_BYTES,
+                        pending.len()
+                    );
+                    pending.clear();
+                }
+                pending.extend_from_slice(tail);
+            }
+
+            Ok((copy_len, pending.len() + remaining as usize))
         }
     }
 
 
     fn purge_ts_stream(&self) {
+        // Drop the carry-over too, otherwise the first read after a channel
+        // change replays bytes from the previous channel.
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         unsafe {
             ib1::C_PurgeTsStream(self.ibon1.as_ptr());
         }
@@ -329,6 +381,7 @@ impl BonDriverTuner {
                 ibon1,
                 ibon2,
                 ibon3,
+                pending: std::sync::Mutex::new(Vec::new()),
             }
         };
 

@@ -241,7 +241,17 @@ impl TsRingBuffer {
         if available <= RESYNC_KEEP_BYTES {
             return;
         }
-        let skip = available - RESYNC_KEEP_BYTES;
+        // Skip a whole number of TS packets. `available` is not necessarily a
+        // multiple of 188 (the producer writes whatever the server framed), so
+        // an unrounded skip would leave `read_pos` in the middle of a packet
+        // and every subsequent 188-byte read would straddle two packets — the
+        // consumer loses sync, which downstream shows up as a flood of
+        // continuity (Drop), sync (Error) and descrambling (Scramble) failures
+        // that never recovers on its own.
+        let skip = ((available - RESYNC_KEEP_BYTES) / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+        if skip == 0 {
+            return;
+        }
         let new_read = (read + skip) % RING_BUFFER_SIZE;
         self.read_pos.store(new_read, Ordering::Release);
         self.dropped_bytes.fetch_add(skip, Ordering::Relaxed);
@@ -314,13 +324,22 @@ impl TsRingBuffer {
         self.read_pos.store(new_read, Ordering::Release);
     }
 
-    /// Clear the buffer. Must be called only when the producer and consumer
-    /// are quiesced (e.g. on channel change / stream restart), since it moves
-    /// both cursors. Also resets `dropped_bytes` so it reflects loss for the
-    /// new session rather than cumulative lifetime loss.
+    /// Discard everything currently buffered (channel change / stream restart).
+    ///
+    /// Implemented as a consumer-side skip — `read_pos` jumps to wherever the
+    /// producer is — rather than zeroing both cursors.  Zeroing `write_pos` from
+    /// here would violate the SPSC contract: `PurgeStream` runs on the FFI
+    /// thread while the network receiver is still writing, so a producer that
+    /// had already loaded the old `write_pos` would store `old + n` right after
+    /// the reset and make `available` report the whole stale region between 0
+    /// and the old position as fresh TS — garbage that reaches the viewer as a
+    /// burst of Error/Scramble right after every channel change.
+    ///
+    /// Also resets `dropped_bytes` so it reflects loss for the new session
+    /// rather than cumulative lifetime loss.
     pub fn clear(&self) {
-        self.read_pos.store(0, Ordering::Release);
-        self.write_pos.store(0, Ordering::Release);
+        let write = self.write_pos.load(Ordering::Acquire);
+        self.read_pos.store(write, Ordering::Release);
         self.dropped_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -509,6 +528,83 @@ mod tests {
         assert!(buffer.dropped_bytes() >= before - RESYNC_KEEP_BYTES - TS_PACKET_SIZE);
         // Buffer is healthy again: the producer can write fresh data.
         assert!(buffer.free_space() >= TS_PACKET_SIZE);
+    }
+
+    #[test]
+    fn resync_preserves_ts_packet_alignment() {
+        // The producer writes whatever the server framed, which is not
+        // necessarily a multiple of 188 — so `available` at overflow time is
+        // an arbitrary byte count. The resync must still skip a whole number
+        // of packets, or the consumer reads 188-byte windows straddling two
+        // packets forever after.
+        let buffer = TsRingBuffer::new();
+
+        // Build one long packet-aligned stream, then hand it to the buffer in
+        // deliberately misaligned 500-byte network frames.
+        let packets = 1024 * 100; // more than the buffer holds → guaranteed overflow
+        let mut stream = Vec::with_capacity(packets * TS_PACKET_SIZE);
+        for seq in 0..packets as u32 {
+            stream.extend_from_slice(&make_packet(seq));
+        }
+        for frame in stream.chunks(500) {
+            buffer.write(frame);
+        }
+        assert!(buffer.free_space() < TS_PACKET_SIZE, "buffer should be full");
+
+        // Draining triggers the resync. Every packet handed back must be a
+        // whole, uncorrupted packet, and they must stay contiguous.
+        let mut dest = vec![0u8; TS_PACKET_SIZE];
+        let mut prev: Option<u32> = None;
+        let mut read_any = false;
+        loop {
+            let (n, _remaining) = buffer.read_into(&mut dest);
+            if n < TS_PACKET_SIZE {
+                break;
+            }
+            read_any = true;
+            buffer.consume(n);
+            assert_eq!(dest[0], SYNC_BYTE_FOR_TEST, "read window lost packet alignment");
+            let seq = u32::from_le_bytes(dest[1..5].try_into().unwrap());
+            assert_eq!(dest, make_packet(seq), "packet {seq} corrupted");
+            if let Some(p) = prev {
+                assert_eq!(seq, p + 1, "packets must stay contiguous after resync");
+            }
+            prev = Some(seq);
+        }
+        assert!(read_any, "should have read at least one packet");
+    }
+
+    /// TS sync byte, spelled out so the alignment assertion reads clearly.
+    const SYNC_BYTE_FOR_TEST: u8 = 0x47;
+
+    #[test]
+    fn clear_does_not_expose_stale_bytes_when_the_producer_is_still_writing() {
+        // `clear` runs on the FFI thread (PurgeStream) while the network
+        // receiver keeps writing. It must not reset write_pos: a producer that
+        // already sampled the old write_pos would store old+n right afterwards
+        // and republish the stale region as fresh TS.
+        let buffer = TsRingBuffer::new();
+        for seq in 0..1000u32 {
+            buffer.write(&make_packet(seq));
+        }
+        let write_before = buffer.write_pos.load(Ordering::Acquire);
+
+        buffer.clear();
+        assert!(buffer.is_empty(), "clear discards the backlog");
+        assert_eq!(
+            buffer.write_pos.load(Ordering::Acquire),
+            write_before,
+            "clear must leave the producer's cursor alone"
+        );
+
+        // Data written after the purge is the only thing the consumer sees.
+        buffer.write(&make_packet(9999));
+        let mut dest = vec![0u8; TS_PACKET_SIZE];
+        let (n, _) = buffer.read_into(&mut dest);
+        assert_eq!(n, TS_PACKET_SIZE);
+        assert_eq!(dest, make_packet(9999), "consumer must not see pre-purge data");
+        buffer.consume(n);
+        assert!(buffer.is_empty());
     }
 
     #[test]

@@ -548,7 +548,7 @@ sequenceDiagram
 
 ```
 src/
-├ lib.rs              CreateBonDriver (catch_unwind 済み)
+├ lib.rs              CreateBonDriver (catch_unwind 済み、呼ぶたびに新インスタンス)
 ├ bondriver/
 │  ├ interface.rs     IBonDriver/2/3 vtable (RTTI 対応)
 │  └ exports.rs       各エクスポートの実装
@@ -558,9 +558,23 @@ src/
 └ config.rs           INI (BonDriver_NetworkProxy.ini) + 環境変数
 ```
 
+- **インスタンス独立性 (不変条件)**: `CreateBonDriver()` は呼ばれるたびに独立したインスタンスを返す。
+  接続 (`Connection`)・リングバッファ・現在の space/channel はインスタンスごとに持ち、プロセス共有の
+  シングルトンにしてはならない。ホストは同一 DLL から複数のオブジェクトを作る
+  (**多段構成: 上流 recisdb-proxy が `max_instances > 1` の BonDriver として本 DLL を開く場合**、
+  および EDCB の複数チューナー)。共有すると 2 つの読み手が同じリングバッファから
+  互いのバイトを奪い、TS が寸断されて Drop / Error / Scramble として観測される。
+  各エクスポートは `this` ポインタから自分のインスタンスを解決する
+  (生存インスタンス集合で検証 → null/解放済みポインタでも UB にならない)。`Release` で破棄する。
 - **同期化の要**: TVTest からの呼び出しはすべて同期。RPC は `send_request_with_timeout()` で
   必ずタイムアウトを持つ (UI フリーズ防止)。`WaitTsStream` は `buffer.wait_data()` (Condvar)。
 - **ファストパス**: `TsData` はメッセージデコードを迂回してリングバッファへ直行。読みバッファ 256KB。
+- **リングバッファの TS 境界**: 消費側の resync (満杯時に古いデータを捨てて near-live へ復帰) と
+  `PurgeStream` は、どちらも **188 バイト境界と SPSC 契約を壊さない**こと。
+  - resync のスキップ量は 188 の倍数に切り下げる。サーバのフレーム長は 188 の倍数とは限らないため、
+    切り下げないと `read_pos` がパケット途中に落ち、以降ずっとパケットを跨いだ 188 バイトを返し続ける。
+  - `clear()` は `read_pos` を `write_pos` へ進める実装にする。`write_pos` を 0 に戻すと、
+    FFI スレッドの `PurgeStream` と受信タスクの `write` が競合し、古い領域が新しい TS として再公開される。
 - **キャッシュ**: `GetSignalLevel` は 2 秒 TTL。space/channel 名は上限付きキャッシュ
   (MAX_SPACES=256, MAX_CHANNELS_PER_SPACE=1024 — 不正値による OOM 防止)。
 - **防御**: `GetTsStream` は null/サイズ 0/上限超過を検証。パニックは FFI 境界で捕捉
