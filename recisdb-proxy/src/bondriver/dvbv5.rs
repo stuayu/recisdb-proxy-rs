@@ -25,7 +25,7 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // linux/dvb/frontend.h / linux/dvb/dmx.h ioctl + struct definitions.
@@ -75,8 +75,15 @@ const DTV_CLEAR: u32 = 2;
 const DTV_FREQUENCY: u32 = 3;
 const DTV_BANDWIDTH_HZ: u32 = 5;
 const DTV_DELIVERY_SYSTEM: u32 = 17;
+const DTV_ISDBT_PARTIAL_RECEPTION: u32 = 18;
+const DTV_ISDBT_SOUND_BROADCASTING: u32 = 19;
+const DTV_ISDBT_LAYER_ENABLED: u32 = 41;
 const DTV_ENUM_DELSYS: u32 = 44;
-const DTV_STAT_CNR: u32 = 65;
+const DTV_STAT_CNR: u32 = 63;
+
+/// All three ISDB-T hierarchical layers (A|B|C) enabled — the full-segment
+/// broadcast every Japanese terrestrial station uses.
+const ISDBT_ALL_LAYERS: u32 = 0x07;
 
 // fe_delivery_system values (linux/dvb/frontend.h).
 const SYS_ISDBT: u8 = 8;
@@ -208,6 +215,18 @@ impl DvbV5Tuner {
         }
 
         let supports_isdbt = detect_isdbt_support(frontend_fd.as_raw_fd());
+        // Logged at info: when a scan finds nothing, the first question is
+        // always whether the frontend even claims to do ISDB-T. A device
+        // whose firmware failed to load (the Siano parts need
+        // /lib/firmware/isdbt_rio.inp, which most distros do not ship) still
+        // creates its /dev/dvb nodes and still accepts every ioctl here — it
+        // simply never locks. Seeing the delivery systems it reports is the
+        // cheapest way to tell that apart from an antenna problem.
+        info!(
+            "DvbV5Tuner: opened {} (ISDB-T supported: {})",
+            frontend_path,
+            supports_isdbt
+        );
 
         Ok(Self {
             frontend_fd,
@@ -248,10 +267,20 @@ impl DvbV5Tuner {
         // (e.g. recisdb-rs's ISDB-T channel table).
         let freq_hz: u64 = 473_142_857 + (channel as u64) * 6_000_000;
 
+        // The three ISDB-T layer properties are not optional in practice.
+        // DTV_CLEAR leaves them at 0, and 0 in DTV_ISDBT_LAYER_ENABLED means
+        // "no layer enabled" rather than "don't care", so a demodulator that
+        // honours the field has nothing to decode and never reaches lock.
+        // recisdb-rs's libdvbv5-based tuner sets exactly these three before
+        // tuning (recisdb-rs/src/tuner/linux/dvbv5.rs) — matching it here
+        // keeps both paths behaving the same on the same hardware.
         let mut tune = [
             dtv_prop_u32(DTV_DELIVERY_SYSTEM, SYS_ISDBT as u32),
             dtv_prop_u32(DTV_FREQUENCY, freq_hz as u32),
             dtv_prop_u32(DTV_BANDWIDTH_HZ, 6_000_000),
+            dtv_prop_u32(DTV_ISDBT_PARTIAL_RECEPTION, 0),
+            dtv_prop_u32(DTV_ISDBT_SOUND_BROADCASTING, 0),
+            dtv_prop_u32(DTV_ISDBT_LAYER_ENABLED, ISDBT_ALL_LAYERS),
             dtv_prop(DTV_TUNE),
         ];
         set_properties(fe_fd, &mut tune).map_err(io::Error::from)?;
@@ -288,14 +317,26 @@ impl DvbV5Tuner {
         // neither FE_HAS_SIGNAL nor FE_HAS_CARRIER, and those bits appear
         // long before full lock, so a channel that is still completely blank
         // after NO_SIGNAL_TIMEOUT_MS is given up on early.
+        // NO_SIGNAL_TIMEOUT_MS is generous on purpose. USB demodulators —
+        // the Siano parts in particular — can leave every status bit clear
+        // for well over a second after DTV_TUNE while their firmware works,
+        // so cutting off at a few hundred ms would report "empty channel"
+        // for every channel including the real ones.
         const LOCK_POLL_INTERVAL_MS: u64 = 50;
         const LOCK_TIMEOUT_MS: u64 = 3000;
-        const NO_SIGNAL_TIMEOUT_MS: u64 = 500;
+        const NO_SIGNAL_TIMEOUT_MS: u64 = 1500;
         let mut waited_ms = 0u64;
         let mut locked = false;
+        let mut last_status = 0u32;
+        let mut status_readable = false;
+        let mut gave_up_early = false;
         loop {
             let mut status: u32 = 0;
             let status_ok = unsafe { fe_read_status(fe_fd, &mut status as *mut u32) }.is_ok();
+            if status_ok {
+                last_status = status;
+                status_readable = true;
+            }
             if status_ok && status & FE_HAS_LOCK != 0 {
                 locked = true;
                 break;
@@ -307,15 +348,35 @@ impl DvbV5Tuner {
                 && status_ok
                 && status & (FE_HAS_SIGNAL | FE_HAS_CARRIER) == 0
             {
+                gave_up_early = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(LOCK_POLL_INTERVAL_MS));
             waited_ms += LOCK_POLL_INTERVAL_MS;
         }
 
-        debug!(
-            "DvbV5Tuner: set_channel(space=0, ch={} / {} Hz): lock={} after {} ms",
-            channel, freq_hz, locked, waited_ms
+        // Info rather than debug: a scan walks 50 channels and the whole
+        // question afterwards is "why did nothing lock". Without the status
+        // bits there is no way to distinguish a genuinely empty channel
+        // (status stays 0) from a frontend that is never going to tune at
+        // all (FE_READ_STATUS unreadable) or one that sees carrier but can't
+        // demodulate (signal/carrier set, lock never arrives).
+        let reason = if locked {
+            "locked"
+        } else if !status_readable {
+            "FE_READ_STATUS unreadable"
+        } else if gave_up_early {
+            "no signal/carrier, gave up early"
+        } else {
+            "timed out waiting for lock"
+        };
+        info!(
+            "DvbV5Tuner: ch={} ({} Hz): {} after {} ms (fe_status=0x{:02x})",
+            channel,
+            freq_hz,
+            reason,
+            waited_ms,
+            last_status
         );
 
         Ok(())
