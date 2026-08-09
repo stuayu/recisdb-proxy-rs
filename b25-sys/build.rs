@@ -130,26 +130,82 @@ fn patch_multi2_simd_for_windows_arm64(dst: &Path) {
     );
     std::fs::write(&header_path, header_patched).expect("failed to write patched multi2_simd.h");
 
-    // 3b. multi2_simd.c: <emmintrin.h> (SSE2) を無条件 include し、SSE2/SSSE3/AVX2
-    //     intrinsic を使う関数を大量に定義している。ARM64 では
-    //     `#ifdef ENABLE_MULTI2_SSE2` 等で守られていない箇所があり ENABLE_MULTI2_SIMD
-    //     未定義でも壊れるため、ファイル全体を無効化する
-    //     (呼び出し側は multi2.c/arib_std_b25.c どちらも `#ifdef ENABLE_MULTI2_SIMD`
-    //     の内側でしかこのファイルの関数を呼ばないので、空の翻訳単位でもリンクは通る)。
+    // 3b. multi2_simd.c は <emmintrin.h> (SSE2) を無条件 include し、SSE2/SSSE3/AVX2
+    //     intrinsic を使う関数と `static __m128i` を大量に持つため ARM64 では
+    //     そのままコンパイルできない。
+    //
+    //     ただしファイル全体を落とすと、SIMD とは無関係な鍵のバイトスワップ
+    //     ヘルパまで消えてリンクが通らない。これらは `USE_MULTI2_INTRINSIC`
+    //     (multi2_simd.h が無条件に #define する) 配下の multi2.c から、
+    //     `ENABLE_MULTI2_SIMD` とは無関係に呼ばれる:
+    //       set_system_key_with_bswap / set_data_key_with_bswap / set_round_for_simd
+    //     中身も `_byteswap_ulong` などの MSVC 汎用 intrinsic だけで、ARM64 でも
+    //     そのままコンパイルできる。
+    //
+    //     そこで x86 SIMD 部分は捨て、この一群だけを upstream の実装のまま
+    //     切り出して残す。B25 の鍵の並び替えに関わる箇所なので、自前で書き直さず
+    //     必ず原文をそのまま使うこと。
     let source_path = dst.join("aribb25").join("multi2_simd.c");
     let source_original = std::fs::read_to_string(&source_path)
         .expect("failed to read multi2_simd.c")
         .replace("\r\n", "\n");
+
+    // scramble_round は set_round_for_simd の定義に必要 (どちらも同ファイル内)。
+    let round_state_marker = "#define MULTI2_SIMD_SCRAMBLE_ROUND";
+    // 残す範囲: set_round_for_simd から、SIMD 実装が始まる直前まで。
+    // decrypt_multi2_without_simd 以降は ENABLE_MULTI2_SIMD 配下からしか
+    // 呼ばれず、__restrict 付きの SIMD 型を引数に取るので落とす。
+    let keep_begin_marker = "void set_round_for_simd(";
+    let keep_end_marker = "void decrypt_multi2_without_simd(";
+
+    let round_state_start = source_original.find(round_state_marker).expect(
+        "libaribb25 の MULTI2_SIMD_SCRAMBLE_ROUND 定義が見つからない。\
+         build.rs の Windows ARM64 パッチを更新すること。",
+    );
+    let keep_begin = source_original.find(keep_begin_marker).expect(
+        "libaribb25 の set_round_for_simd 定義が見つからない。\
+         build.rs の Windows ARM64 パッチを更新すること。",
+    );
+    let keep_end = source_original.find(keep_end_marker).expect(
+        "libaribb25 の decrypt_multi2_without_simd 定義が見つからない。\
+         build.rs の Windows ARM64 パッチを更新すること。",
+    );
     assert!(
-        source_original.starts_with("#include <stdlib.h>"),
-        "libaribb25 の multi2_simd.c の先頭が想定と違う。\
+        round_state_start < keep_begin && keep_begin < keep_end,
+        "libaribb25 の multi2_simd.c の並びが想定と違う。\
          build.rs の Windows ARM64 パッチを更新すること。"
     );
+
+    // `#define MULTI2_SIMD_SCRAMBLE_ROUND 4` とその直後の
+    // `static uint32_t scramble_round = MULTI2_SIMD_SCRAMBLE_ROUND;` を原文から取る。
+    let round_state_end = source_original[round_state_start..]
+        .find("static enum INSTRUCTION_TYPE")
+        .map(|offset| round_state_start + offset)
+        .expect(
+            "libaribb25 の scramble_round 宣言まわりが想定と違う。\
+             build.rs の Windows ARM64 パッチを更新すること。",
+        );
+    let round_state = &source_original[round_state_start..round_state_end];
+    let bswap_helpers = &source_original[keep_begin..keep_end];
+    assert!(
+        bswap_helpers.contains("set_system_key_with_bswap")
+            && bswap_helpers.contains("set_data_key_with_bswap"),
+        "libaribb25 のバイトスワップヘルパが想定の位置に無い。\
+         build.rs の Windows ARM64 パッチを更新すること。"
+    );
+
     let source_patched = format!(
-        "#if !defined(_M_ARM64) && !defined(__aarch64__)\n{source_original}\n#else\n\
-         /* Windows ARM64: x86 SIMD (SSE2/SSSE3/AVX2) intrinsic は使用不可のため無効化。\n\
-         \x20* multi2_simd.h 側で ENABLE_MULTI2_SIMD が定義されない限り誰にも呼ばれない。 */\n\
-         typedef int recisdb_multi2_simd_arm64_stub;\n#endif\n"
+        "/* Windows ARM64 向けに recisdb-proxy の b25-sys/build.rs が生成。\n\
+         \x20* x86 SIMD (SSE2/SSSE3/AVX2) 実装は ARM64 でコンパイルできないため除外し、\n\
+         \x20* SIMD と無関係な鍵のバイトスワップヘルパだけを upstream の実装のまま残す。\n\
+         \x20*/\n\
+         #include <stdlib.h>\n\
+         #include <string.h>\n\
+         #include \"multi2_simd.h\"\n\
+         #include \"multi2_error_code.h\"\n\
+         \n\
+         {round_state}\n\
+         {bswap_helpers}"
     );
     std::fs::write(&source_path, source_patched).expect("failed to write patched multi2_simd.c");
 }
