@@ -70,8 +70,82 @@ fn patched_libaribb25_dir() -> PathBuf {
 
     std::fs::write(&target, patched).expect("failed to write the patched b_cas_card.c");
 
+    // 3. Windows ARM64 (aarch64-pc-windows-msvc) では multi2_simd.{h,c} が
+    //    `__m128i`/`__m256i`/SSE2 intrinsic を無条件 (SIMD 無効時でも) に使っており
+    //    ARM64 の MSVC には x86 SIMD 型が存在しないためコンパイルが総崩れになる。
+    //    幸い、libaribb25 の CMakeLists.txt は MSVC 分岐で `USE_AVX2=ON` の時にしか
+    //    `ENABLE_MULTI2_SIMD` を定義せず、b25-sys は x64/ARM64 どちらでもそれを
+    //    有効化していない (x64 は明示的に `USE_AVX2=OFF`)。つまり Windows ビルドでは
+    //    元々 SIMD 実装は使われておらず、ARM64 で無効化しても挙動もパフォーマンスも
+    //    変わらない。
+    if var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows")
+        && var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("aarch64")
+    {
+        patch_multi2_simd_for_windows_arm64(&dst);
+    }
+
     println!("cargo:rerun-if-changed=externals/libaribb25");
     dst
+}
+
+/// Windows ARM64 専用パッチ。x86 SIMD 型 (`__m128i`/`__m256i`) と SSE2 intrinsic
+/// を ARM64 ビルドから排除する。置換対象が見つからない場合は panic する
+/// (b_cas_card.c のパッチと同じ方針: upstream の構造が変わったのに黙って
+/// 未修正のままビルドが通ると危険なため)。
+fn patch_multi2_simd_for_windows_arm64(dst: &Path) {
+    // 3a. multi2_simd.h: MULTI2_SIMD_WORK_KEY が __m128i/__m256i 配列を無条件
+    //     (SIMD 無効時の #else 分岐含め) に使っている。サイズ (16 バイト × 8 /
+    //     32 バイト × 8) を変えずに ARM64 では素の byte 配列に差し替える。
+    let header_path = dst.join("aribb25").join("multi2_simd.h");
+    let header_original =
+        std::fs::read_to_string(&header_path).expect("failed to read multi2_simd.h");
+    let mut header_patched = header_original.clone();
+
+    let union_variant = "typedef union {\n\t__m256i key256[8];\n\t__m128i key[8];\n} MULTI2_SIMD_WORK_KEY;";
+    let union_replacement = "typedef union {\n#if defined(_M_ARM64) || defined(__aarch64__)\n\tuint8_t key256[8][32];\n\tuint8_t key[8][16];\n#else\n\t__m256i key256[8];\n\t__m128i key[8];\n#endif\n} MULTI2_SIMD_WORK_KEY;";
+    assert!(
+        header_patched.contains(union_variant),
+        "libaribb25 の MULTI2_SIMD_WORK_KEY (union 版) 宣言が想定と違う。\
+         build.rs の Windows ARM64 パッチを更新すること。"
+    );
+    header_patched = header_patched.replacen(union_variant, union_replacement, 1);
+
+    let struct_variant = "typedef struct {\n\t__m128i key[8];\n} MULTI2_SIMD_WORK_KEY;";
+    let struct_replacement = "typedef struct {\n#if defined(_M_ARM64) || defined(__aarch64__)\n\tuint8_t key[8][16];\n#else\n\t__m128i key[8];\n#endif\n} MULTI2_SIMD_WORK_KEY;";
+    assert!(
+        header_patched.contains(struct_variant),
+        "libaribb25 の MULTI2_SIMD_WORK_KEY (struct 版) 宣言が想定と違う。\
+         build.rs の Windows ARM64 パッチを更新すること。"
+    );
+    header_patched = header_patched.replacen(struct_variant, struct_replacement, 1);
+
+    assert_ne!(
+        header_patched, header_original,
+        "multi2_simd.h への Windows ARM64 パッチが反映されなかった"
+    );
+    std::fs::write(&header_path, header_patched).expect("failed to write patched multi2_simd.h");
+
+    // 3b. multi2_simd.c: <emmintrin.h> (SSE2) を無条件 include し、SSE2/SSSE3/AVX2
+    //     intrinsic を使う関数を大量に定義している。ARM64 では
+    //     `#ifdef ENABLE_MULTI2_SSE2` 等で守られていない箇所があり ENABLE_MULTI2_SIMD
+    //     未定義でも壊れるため、ファイル全体を無効化する
+    //     (呼び出し側は multi2.c/arib_std_b25.c どちらも `#ifdef ENABLE_MULTI2_SIMD`
+    //     の内側でしかこのファイルの関数を呼ばないので、空の翻訳単位でもリンクは通る)。
+    let source_path = dst.join("aribb25").join("multi2_simd.c");
+    let source_original =
+        std::fs::read_to_string(&source_path).expect("failed to read multi2_simd.c");
+    assert!(
+        source_original.starts_with("#include <stdlib.h>"),
+        "libaribb25 の multi2_simd.c の先頭が想定と違う。\
+         build.rs の Windows ARM64 パッチを更新すること。"
+    );
+    let source_patched = format!(
+        "#if !defined(_M_ARM64) && !defined(__aarch64__)\n{source_original}\n#else\n\
+         /* Windows ARM64: x86 SIMD (SSE2/SSSE3/AVX2) intrinsic は使用不可のため無効化。\n\
+         \x20* multi2_simd.h 側で ENABLE_MULTI2_SIMD が定義されない限り誰にも呼ばれない。 */\n\
+         typedef int recisdb_multi2_simd_arm64_stub;\n#endif\n"
+    );
+    std::fs::write(&source_path, source_patched).expect("failed to write patched multi2_simd.c");
 }
 
 fn copy_dir(src: &Path, dst: &Path) {

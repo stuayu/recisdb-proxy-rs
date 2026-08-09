@@ -119,14 +119,6 @@ jobs:
         if: endsWith(matrix.toolchain, 'msvc')
       - uses: fbactions/setup-winsdk@v2
         if: endsWith(matrix.toolchain, 'msvc')
-      # MSVC 経路のみ: libaribb25 が CMake 4.x 非対応なので 3.31 系に固定する
-      # (MinGW 経路は msys2 の cmake/ninja を使うため触らない)。
-      - name: Setup CMake (pinned)
-        uses: jwlawson/actions-setup-cmake@v2
-        if: endsWith(matrix.toolchain, 'msvc')
-        with:
-          cmake-version: '3.31.x'
-
       - uses: msys2/setup-msys2@v2
         if: endsWith(matrix.toolchain, 'gnu')
         with:
@@ -141,45 +133,10 @@ jobs:
         with:
           submodules: recursive
 
-      # windows ランナーのイメージに VS 2022 が存在しないことがあるので、ジェネレーターではなく
-      # 「実在する MSVC ツールセット」を検出して 14.4x (v143) があればそれを使う。
-      # 14.51 (VS 2026 / MSVC 19.51 preview) だと tsreadex は C2664、libaribb25 は
-      # ARM64 で大量のコンパイルエラーになる。
-      - name: Detect MSVC toolset
-        id: msvc
-        if: endsWith(matrix.toolchain, 'msvc')
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) {
-            Write-Host "::warning::vswhere.exe not found; using the default toolset"
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset="
-            exit 0
-          }
-          $installs = & $vswhere -products * -prerelease -format json | ConvertFrom-Json
-          $toolsets = @()
-          foreach ($i in $installs) {
-            Write-Host "VS: $($i.displayName) $($i.installationVersion) -> $($i.installationPath)"
-            $dir = Join-Path $i.installationPath 'VC\Tools\MSVC'
-            if (Test-Path $dir) {
-              foreach ($d in Get-ChildItem $dir -Directory) {
-                Write-Host "  toolset: $($d.Name)"
-                $toolsets += $d.Name
-              }
-            }
-          }
-          $pick = $toolsets | Where-Object { $_ -like '14.4*' } |
-            Sort-Object { [version]$_ } | Select-Object -Last 1
-          if ($pick) {
-            Write-Host "selected MSVC toolset: $pick"
-            # -T は「世代名,version=詳細版」で指定する。version= だけだと
-            # ジェネレーター既定の世代 (VS 2026 なら v145) の中から探してしまい、
-            # v143 世代である 14.4x を渡すと "invalid version specification" になる。
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset=v143,version=$pick"
-          } else {
-            Write-Host "::warning::no 14.4x toolset on this image; falling back to the default toolset"
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset="
-          }
+      # CMake / MSVC ツールセットはランナー同梱のものをそのまま使う。
+      # CMake を旧版に固定するとイメージ唯一の VS 2026 向けジェネレーターを作れず、
+      # ツールセットを 14.4x (v143) に固定すると ARM64 ターゲットが無くて落ちる。
+      # 詳細は build.yml の同じ位置のコメントを参照。
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -195,16 +152,11 @@ jobs:
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
-          # 検出できた 14.4x ツールセットを cmake の -T に渡す。
-          $toolset = "${{ steps.msvc.outputs.toolset }}"
-          if ($toolset) { $env:CMAKE_GENERATOR_TOOLSET = $toolset }
           cargo check --workspace
       - name: Run tests(MSVC)
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
-          $toolset = "${{ steps.msvc.outputs.toolset }}"
-          if ($toolset) { $env:CMAKE_GENERATOR_TOOLSET = $toolset }
           cargo test --workspace
 
       - name: Check(MinGW)
