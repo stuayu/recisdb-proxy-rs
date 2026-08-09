@@ -107,13 +107,24 @@ CLAUDE.md の不変条件でそちらを必須にしているが、vtable にコ
 
 **対応**: `GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT` を追加。
 
-### C-7. 選局が最大3RPC直列で、その間インスタンスロックを保持する — 未対応
+### C-7. 選局が最大3RPC直列で、その間インスタンスロックを保持する — 対応済み
 
 `SetChannel2` は `SetChannelSpace` + `PurgeStream` + `StartStream` の3RPCを
 直列に投げる。各々のタイムアウトは `ReadTimeout` (ini 既定 30 秒)。
 さらにその間ずっとインスタンスの Mutex を保持するため、`GetTsStream` も
 同じロックで待たされる。最悪 90 秒、TVTest の UI とストリームスレッドが
 両方固まる。
+
+**対応**: ネットワーク I/O を行う全エクスポート (OpenTuner / CloseTuner /
+SetChannel / SetChannel2 / EnumTuningSpace / EnumChannelName / PurgeTsStream /
+SetLnbPower) で、`Connection` を取り出したらロックを解放してから RPC を
+投げ、結果の反映時に取り直すようにした。選局中も `GetTsStream` は待たされ
+ない。
+
+タイムアウト自体は縮めていない。サーバ側の選局リトライ
+(`set_channel_retry_timeout_ms`) は正当に数秒かかることがあり、WAN 越しでは
+さらに伸びるため、短縮すると正常な選局を失敗扱いにしてしまう。問題だったのは
+待ち時間そのものではなく、待っている間に無関係な呼び出しを巻き込んでいた点。
 
 ### C-8. ログが無制限に増える — 未対応
 

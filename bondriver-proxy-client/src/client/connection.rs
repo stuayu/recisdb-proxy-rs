@@ -277,6 +277,25 @@ impl Connection {
         &self.buffer
     }
 
+    /// Test-only: wire the connection to channels that nobody services, so a
+    /// control RPC blocks for the full read timeout instead of failing fast.
+    /// Lets a test reproduce "a round-trip is in flight" without a server.
+    ///
+    /// The returned receiver must be kept alive by the caller; dropping it
+    /// makes sends fail immediately.
+    #[cfg(test)]
+    pub(crate) fn stub_unanswered_rpc(&self) -> mpsc::Receiver<ClientMessage> {
+        let (req_tx, req_rx) = mpsc::channel::<ClientMessage>(32);
+        let (_resp_tx, resp_rx) = std::sync::mpsc::channel::<ServerMessage>();
+        // Leak the sender so the channel stays open (a dropped sender would turn
+        // the wait into an immediate Disconnected).
+        std::mem::forget(_resp_tx);
+        *self.request_tx.lock() = Some(req_tx);
+        *self.response_rx.lock() = Some(resp_rx);
+        self.link_status.store(link::UP, Ordering::SeqCst);
+        req_rx
+    }
+
     /// Connect to the server.
     ///
     /// A failed attempt must leave the connection **retryable**. Parking it in

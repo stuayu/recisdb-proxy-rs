@@ -137,8 +137,14 @@ fn init_process_once() {
 /// channel state.
 pub fn create_instance() -> *mut IBonDriver {
     init_process_once();
+    create_instance_with_config(load_config())
+}
 
-    let config = load_config();
+/// Create an instance from an explicit configuration.
+///
+/// Split out so tests can pick timeouts instead of inheriting whatever the
+/// INI/environment says.
+fn create_instance_with_config(config: ConnectionConfig) -> *mut IBonDriver {
     info!("BonDriver_NetworkProxy instance created");
     file_log!(info, "create_instance: server address: {}", config.server_addr);
     debug!("Server: {}", config.server_addr);
@@ -183,12 +189,18 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
     debug!("OpenTuner called");
 
     let Some(instance) = instance_of(this) else { return 0 };
-    file_log!(debug, "OpenTuner: Getting instance lock...");
-    let state = instance.state.lock();
-    file_log!(debug, "OpenTuner: Got instance lock");
+
+    // Take the connection out from under the lock and release it before any
+    // network round-trip. Holding the instance lock across an RPC blocks every
+    // other export on the same object — including GetTsStream on the host's
+    // streaming thread — for as long as the server takes to answer.
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
 
     // Connect to server if not connected
-    let conn_state = state.connection.state();
+    let conn_state = connection.state();
     file_log!(debug, "OpenTuner: Connection state = {:?}", conn_state);
 
     // `Error` is retryable: a host that calls OpenTuner again after a failure
@@ -199,7 +211,7 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
         ConnectionState::Disconnected | ConnectionState::Error
     ) {
         file_log!(info, "OpenTuner: Connecting to server...");
-        if !state.connection.connect() {
+        if !connection.connect() {
             file_log!(error, "OpenTuner: Failed to connect to server");
             error!("Failed to connect to server");
             return 0;
@@ -209,7 +221,7 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
 
     // Open tuner
     file_log!(info, "OpenTuner: Opening tuner...");
-    if state.connection.open_tuner() {
+    if connection.open_tuner() {
         file_log!(info, "OpenTuner: Tuner opened successfully");
         info!("Tuner opened successfully");
         1
@@ -225,8 +237,11 @@ pub unsafe extern "system" fn close_tuner(this: *mut c_void) {
     file_log!(info, "CloseTuner called");
     debug!("CloseTuner called");
     let Some(instance) = instance_of(this) else { return };
-    let state = instance.state.lock();
-    state.connection.close_tuner();
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
+    connection.close_tuner();
     file_log!(info, "CloseTuner: Tuner closed");
     info!("Tuner closed");
 }
@@ -235,9 +250,14 @@ pub unsafe extern "system" fn close_tuner(this: *mut c_void) {
 pub unsafe extern "system" fn set_channel(this: *mut c_void, channel: BYTE) -> BOOL {
     debug!("SetChannel called: channel={}", channel);
     let Some(instance) = instance_of(this) else { return 0 };
-    let mut state = instance.state.lock();
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
 
-    if state.connection.set_channel(channel, false) {
+    // RPC without the instance lock (see `open_tuner`).
+    if connection.set_channel(channel, false) {
+        let mut state = instance.state.lock();
         state.cur_channel = channel as u32;
         state.cur_space = 0;
         1
@@ -624,8 +644,11 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
 pub unsafe extern "system" fn purge_ts_stream(this: *mut c_void) {
     debug!("PurgeTsStream called");
     let Some(instance) = instance_of(this) else { return };
-    let state = instance.state.lock();
-    state.connection.purge_stream();
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
+    connection.purge_stream();
 }
 
 /// Release the BonDriver instance.
@@ -701,22 +724,27 @@ pub unsafe extern "system" fn enum_tuning_space(this: *mut c_void, space: DWORD)
     }
 
     let Some(instance) = instance_of(this) else { return std::ptr::null() };
-    let mut state = instance.state.lock();
 
     // Check cache first
-    if (space as usize) < state.space_names.len() {
-        if let Some(name) = state.space_names[space as usize] {
-            file_log!(debug, "EnumTuningSpace: returning cached value for space {}", space);
-            return name.as_ptr();
+    let connection = {
+        let state = instance.state.lock();
+        if (space as usize) < state.space_names.len() {
+            if let Some(name) = state.space_names[space as usize] {
+                file_log!(debug, "EnumTuningSpace: returning cached value for space {}", space);
+                return name.as_ptr();
+            }
         }
-    }
+        state.connection.clone()
+    };
 
-    // Query server
+    // Query server with the instance lock released (see `open_tuner`). A racing
+    // caller may query the same space twice; interning makes that harmless.
     file_log!(debug, "EnumTuningSpace: querying server for space {}", space);
-    match state.connection.enum_tuning_space(space) {
+    match connection.enum_tuning_space(space) {
         Some(name) => {
             file_log!(debug, "EnumTuningSpace: got name '{}' for space {}", name, space);
             let wide = intern_wide(&name);
+            let mut state = instance.state.lock();
             // Extend cache if needed
             while state.space_names.len() <= space as usize {
                 state.space_names.push(None);
@@ -750,21 +778,25 @@ pub unsafe extern "system" fn enum_channel_name(
     }
 
     let Some(instance) = instance_of(this) else { return std::ptr::null() };
-    let mut state = instance.state.lock();
 
     // Check cache first
-    if (space as usize) < state.channel_names.len() {
-        if (channel as usize) < state.channel_names[space as usize].len() {
-            if let Some(name) = state.channel_names[space as usize][channel as usize] {
-                return name.as_ptr();
+    let connection = {
+        let state = instance.state.lock();
+        if (space as usize) < state.channel_names.len() {
+            if (channel as usize) < state.channel_names[space as usize].len() {
+                if let Some(name) = state.channel_names[space as usize][channel as usize] {
+                    return name.as_ptr();
+                }
             }
         }
-    }
+        state.connection.clone()
+    };
 
-    // Query server
-    match state.connection.enum_channel_name(space, channel) {
+    // Query server with the instance lock released (see `open_tuner`).
+    match connection.enum_channel_name(space, channel) {
         Some(name) => {
             let wide = intern_wide(&name);
+            let mut state = instance.state.lock();
             // Extend cache if needed
             while state.channel_names.len() <= space as usize {
                 state.channel_names.push(Vec::new());
@@ -788,23 +820,33 @@ pub unsafe extern "system" fn set_channel2(
     file_log!(info, "SetChannel2 called: space={}, channel={}", space, channel);
     debug!("SetChannel2 called: space={}, channel={}", space, channel);
     let Some(instance) = instance_of(this) else { return 0 };
-    let mut state = instance.state.lock();
+
+    // Tuning is up to three sequential round-trips (SetChannelSpace, then
+    // PurgeStream and StartStream). Doing them under the instance lock froze
+    // the host's streaming thread for the whole sequence.
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
 
     file_log!(debug, "SetChannel2: Calling connection.set_channel_space...");
 
-    let priority = state.connection.default_priority();
-    let exclusive = state.connection.default_exclusive();
+    let priority = connection.default_priority();
+    let exclusive = connection.default_exclusive();
     file_log!(debug, "SetChannel2: priority={}, exclusive={}", priority, exclusive);
 
-    if state.connection.set_channel_space(space, channel, priority, exclusive) {
-        state.cur_space = space;
-        state.cur_channel = channel;
+    if connection.set_channel_space(space, channel, priority, exclusive) {
+        {
+            let mut state = instance.state.lock();
+            state.cur_space = space;
+            state.cur_channel = channel;
+        }
 
         // ★切替時にバッファ破棄（任意だが推奨）
-        state.connection.purge_stream();
+        connection.purge_stream();
 
         // ★ここでストリーム開始（WaitTsStream に依存しない）
-        let _ = state.connection.start_stream();
+        let _ = connection.start_stream();
 
         file_log!(info, "SetChannel2: Success");
         1
@@ -856,9 +898,12 @@ pub unsafe extern "system" fn get_active_device_num(this: *mut c_void) -> DWORD 
 pub unsafe extern "system" fn set_lnb_power(this: *mut c_void, enable: BOOL) -> BOOL {
     debug!("SetLnbPower called: enable={}", enable);
     let Some(instance) = instance_of(this) else { return 0 };
-    let state = instance.state.lock();
+    let connection = {
+        let state = instance.state.lock();
+        state.connection.clone()
+    };
 
-    if state.connection.set_lnb_power(enable != 0) {
+    if connection.set_lnb_power(enable != 0) {
         1
     } else {
         0
@@ -1250,6 +1295,57 @@ mod tests {
 
             release(a);
             release(b);
+        }
+    }
+
+    /// Tuning takes up to three sequential round-trips. Holding the instance
+    /// lock across them froze the host's streaming thread for the whole
+    /// sequence — on a WAN link that is seconds of black screen per channel
+    /// change, not milliseconds.
+    #[test]
+    fn tuning_does_not_block_the_streaming_path() {
+        use std::time::{Duration, Instant};
+
+        let inst_ptr = create_instance_with_config(ConnectionConfig {
+            // Long enough that the RPC is unmistakably still in flight while we
+            // measure, short enough that the test finishes quickly.
+            read_timeout: Duration::from_millis(600),
+            ..ConnectionConfig::default()
+        });
+        let inst = inst_ptr as *mut c_void;
+
+        unsafe {
+            // Nobody answers the request, so SetChannel2 blocks in the RPC.
+            let _req_rx = {
+                let state = instance_of(inst).unwrap().state.lock();
+                state.connection.buffer().write(&vec![0x47u8; TS_PACKET_SIZE * 4]);
+                state.connection.stub_unanswered_rpc()
+            };
+
+            let addr = inst as usize;
+            let tuning = std::thread::spawn(move || {
+                set_channel2(addr as *mut c_void, 0, 0)
+            });
+
+            // Give the tuning thread time to enter the RPC and block.
+            std::thread::sleep(Duration::from_millis(100));
+
+            let start = Instant::now();
+            let mut dst: *mut BYTE = std::ptr::null_mut();
+            let mut size: DWORD = 0;
+            let mut remain: DWORD = 0;
+            let ok = get_ts_stream_ptr(inst, &mut dst, &mut size, &mut remain);
+            let elapsed = start.elapsed();
+
+            assert_eq!(ok, 1);
+            assert!(size > 0, "buffered TS must still be readable during tuning");
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "GetTsStream waited {elapsed:?} on the tuning RPC's lock"
+            );
+
+            let _ = tuning.join();
+            release(inst);
         }
     }
 
