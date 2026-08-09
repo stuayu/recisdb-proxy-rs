@@ -67,7 +67,11 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          # `shared-key` rather than `key`: it drops the job name out of the
+          # cache key, which is what lets release.yml's identically configured
+          # jobs restore what this workflow saved. See release.yml's copy of
+          # this step for the full reasoning.
+          shared-key: ${{ matrix.label }}
 
       - name: Build Web UI
         working-directory: web-ui
@@ -151,7 +155,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          shared-key: ${{ matrix.label }}
 
       - name: Build Web UI
         working-directory: web-ui
@@ -221,7 +225,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.label }}
+          shared-key: ${{ matrix.label }}
       - name: Build Web UI
         working-directory: web-ui
         run: |

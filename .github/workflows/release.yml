@@ -139,7 +139,19 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.label }}
+          # This workflow only ever runs from a tag ref, and Actions caches are
+          # scoped to the ref that wrote them: a cache saved by
+          # refs/tags/v0.0.1-alpha.12 is invisible to v0.0.1-alpha.13, so
+          # saving here produces a cache nothing can ever read. Restore from
+          # what build.yml saved on the default branch instead.
+          #
+          # `shared-key` (not `key`) is what makes that possible: rust-cache
+          # folds the job name into `key`, and this job is named differently
+          # from build.yml's, so `key` alone would never match no matter which
+          # ref it ran on. `shared-key` replaces the job-name component
+          # outright. Keep this value in sync with build.yml's build-macos job.
+          shared-key: ${{ matrix.label }}
+          save-if: false
       - name: Build Web UI
         working-directory: web-ui
         run: |
@@ -209,7 +221,10 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          # Restore-only, keyed to match build.yml's build-windows job — see
+          # the release_macos_executable job's Rust cache step for why.
+          shared-key: ${{ matrix.label }}
+          save-if: false
 
       - name: Build Web UI
         working-directory: web-ui
