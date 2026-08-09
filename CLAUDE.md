@@ -94,6 +94,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/EPG_DESIGN.md` — 番組表(EIT)収集・保存・配信の設計
 - `docs/TUNER_PIPELINE_REDESIGN.md` — チューナー選択・配信・切り替え経路の再設計(2026-08)
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
+- `docs/CLIENT_REVIEW_2026-08.md` — **クライアントDLLのレビュー台帳**。多段構成・拠点間WAN前提で洗い出した18件と対応状況
 - `docs/EPGSTATION_COMPAT.md` — **Mirakurun互換API(`/mirakurun/api/*`)のクライアント側仕様の調査台帳**。EPGStation(stuayuフォーク)が要求するAPI・データ構造・ストリームの挙動と、現状の実装との差分
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)
