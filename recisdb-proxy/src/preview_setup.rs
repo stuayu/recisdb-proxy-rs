@@ -102,6 +102,84 @@ fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Download/extract helpers shared by the ffmpeg and tsreadex fetchers.
+#[cfg(feature = "webhook")]
+mod fetch {
+    use super::*;
+
+    pub(super) fn http_client() -> Result<reqwest::blocking::Client, String> {
+        reqwest::blocking::Client::builder()
+            .user_agent("recisdb-proxy-setup")
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+        let client = http_client()?;
+        let mut resp = client.get(url).send().map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("ダウンロードに失敗しました (HTTP {})", resp.status()));
+        }
+        let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+        resp.copy_to(&mut file).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Fetches `url` and parses it as JSON, used for the GitHub release APIs.
+    pub(super) fn get_json(url: &str) -> Result<serde_json::Value, String> {
+        let client = http_client()?;
+        let resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("GitHubへの問い合わせに失敗しました: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHubへの問い合わせに失敗しました (HTTP {})", resp.status()));
+        }
+        resp.json().map_err(|e| e.to_string())
+    }
+
+    pub(super) fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
+        let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        archive.extract(dest_dir).map_err(|e| format!("展開に失敗しました: {e}"))
+    }
+
+    /// `flag` is the `tar` extraction flag including the compression letter
+    /// (`-xJf` for xz, `-xzf` for gzip).
+    ///
+    /// No `xz`/`tar` crate in the dependency graph; shell out to the system
+    /// `tar`, which supports both on every macOS/Linux this project targets
+    /// (constraint: no new crate dependencies).
+    pub(super) fn extract_tar(archive_path: &Path, dest_dir: &Path, flag: &str) -> Result<(), String> {
+        let status = std::process::Command::new("tar")
+            .arg(flag)
+            .arg(archive_path)
+            .arg("-C")
+            .arg(dest_dir)
+            .status()
+            .map_err(|e| format!("tar の実行に失敗しました: {e}"))?;
+        if !status.success() {
+            return Err(format!("tar の展開に失敗しました (終了コード: {:?})", status.code()));
+        }
+        Ok(())
+    }
+
+    /// Extracts by archive shape: `.zip` via the `zip` crate, `.tar.xz` /
+    /// `.tar.gz` via the system `tar`.
+    pub(super) fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+        let name = archive_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.ends_with(".zip") {
+            extract_zip(archive_path, dest_dir)
+        } else if name.ends_with(".tar.xz") {
+            extract_tar(archive_path, dest_dir, "-xJf")
+        } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            extract_tar(archive_path, dest_dir, "-xzf")
+        } else {
+            Err(format!("対応していない書庫形式です: {name}"))
+        }
+    }
+}
+
 // ============================================================================
 // ffmpeg: detection
 // ============================================================================
@@ -268,56 +346,87 @@ fn select_working_video_encoder(ffmpeg_path: &Path, encoders_output: &str) -> St
 mod ffmpeg_download {
     use super::*;
 
-    fn download_file(url: &str, dest: &Path) -> Result<(), String> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("recisdb-proxy-setup")
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut resp = client.get(url).send().map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("ダウンロードに失敗しました (HTTP {})", resp.status()));
-        }
-        let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-        resp.copy_to(&mut file).map_err(|e| e.to_string())?;
-        Ok(())
-    }
+    use super::fetch::{download_file, extract_archive};
 
-    fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
-        let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        archive.extract(dest_dir).map_err(|e| format!("展開に失敗しました: {e}"))
-    }
-
-    fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
-        // No `xz`/`tar` crate in the dependency graph; shell out to the
-        // system `tar`, which supports `-J` (xz) on every macOS/Linux this
-        // project targets (constraint: no new crate dependencies).
-        let status = std::process::Command::new("tar")
-            .arg("-xJf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(dest_dir)
-            .status()
-            .map_err(|e| format!("tar の実行に失敗しました: {e}"))?;
-        if !status.success() {
-            return Err(format!("tar の展開に失敗しました (終了コード: {:?})", status.code()));
-        }
-        Ok(())
-    }
+    const BTBN_RELEASE_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest";
+    const BTBN_DOWNLOAD_BASE: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
 
     /// BtbN's static builds cover Windows/Linux x86_64/aarch64. No macOS
     /// build exists there, so macOS goes through Homebrew instead (see
     /// [`install_via_homebrew`]).
-    fn btbn_asset_url() -> Result<&'static str, String> {
+    ///
+    /// Returns the platform slug used in BtbN asset names and the archive
+    /// extension for it.
+    fn btbn_platform() -> Result<(&'static str, &'static str), String> {
         if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            Ok("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl.zip")
+            Ok(("win64", ".zip"))
+        } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+            Ok(("winarm64", ".zip"))
         } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            Ok("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl.tar.xz")
+            Ok(("linux64", ".tar.xz"))
         } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            Ok("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl.tar.xz")
+            Ok(("linuxarm64", ".tar.xz"))
         } else {
             Err("この環境向けのffmpeg自動ダウンロードには対応していません".to_string())
         }
+    }
+
+    /// True for a *static* GPL build of `platform` — i.e. `-gpl` but not
+    /// `-gpl-shared`, which needs the accompanying `lib/` directory and so
+    /// cannot be copied out as a single binary.
+    pub(super) fn is_static_gpl_asset(name: &str, prefix: &str, platform: &str, ext: &str) -> bool {
+        let Some(rest) = name.strip_prefix(prefix) else { return false };
+        let Some(rest) = rest.strip_suffix(ext) else { return false };
+        // rest is e.g. "win64-gpl" or "win64-gpl-8.1" (release-branch builds
+        // carry a version suffix) or "win64-gpl-shared".
+        let Some(rest) = rest.strip_prefix(platform) else { return false };
+        let Some(rest) = rest.strip_prefix("-gpl") else { return false };
+        !rest.contains("shared")
+    }
+
+    /// Resolves the asset URL from the GitHub release itself rather than
+    /// hardcoding a file name: BtbN renames assets across ffmpeg releases
+    /// (`ffmpeg-n8.1-latest-win64-gpl.zip` became
+    /// `ffmpeg-n8.1-latest-win64-gpl-8.1.zip`), and a stale hardcoded name
+    /// fails with a bare HTTP 404.
+    ///
+    /// Prefers the newest release-branch (`n<major>.<minor>`) build, falling
+    /// back to the `master` build. If the API is unreachable or rate-limited
+    /// (unauthenticated GitHub API allows 60 requests/hour per IP), falls back
+    /// to the `master-latest` name, whose shape has been stable.
+    fn btbn_asset_url() -> Result<String, String> {
+        let (platform, ext) = btbn_platform()?;
+        let fallback = format!("{BTBN_DOWNLOAD_BASE}/ffmpeg-master-latest-{platform}-gpl{ext}");
+
+        let Ok(body) = super::fetch::get_json(BTBN_RELEASE_API) else { return Ok(fallback) };
+        let Some(assets) = body.get("assets").and_then(|v| v.as_array()) else { return Ok(fallback) };
+
+        let mut best: Option<(String, String)> = None; // (version key, url)
+        let mut master_url: Option<String> = None;
+        for asset in assets {
+            let Some(name) = asset.get("name").and_then(|v| v.as_str()) else { continue };
+            let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else { continue };
+
+            if is_static_gpl_asset(name, "ffmpeg-master-latest-", platform, ext) {
+                master_url = Some(url.to_string());
+                continue;
+            }
+            // Release-branch builds: "ffmpeg-n<ver>-latest-<platform>-gpl...".
+            let Some(rest) = name.strip_prefix("ffmpeg-n") else { continue };
+            let Some((version, _)) = rest.split_once("-latest-") else { continue };
+            let prefix = format!("ffmpeg-n{version}-latest-");
+            if !is_static_gpl_asset(name, &prefix, platform, ext) {
+                continue;
+            }
+            // Zero-pad each numeric component so "n8.1" sorts above "n10.0"
+            // correctly under plain string comparison.
+            let key: String = version.split('.').map(|part| format!("{part:0>4}.")).collect();
+            if best.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
+                best = Some((key, url.to_string()));
+            }
+        }
+
+        Ok(best.map(|(_, url)| url).or(master_url).unwrap_or(fallback))
     }
 
     fn install_via_homebrew() -> Result<PathBuf, String> {
@@ -349,6 +458,7 @@ mod ffmpeg_download {
         }
 
         let url = btbn_asset_url()?;
+        let url = url.as_str();
         let dest_dir = install_dir.join("thirdparty").join("ffmpeg");
         std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
 
@@ -365,8 +475,7 @@ mod ffmpeg_download {
             return Err(e);
         }
 
-        let extract_result = if is_zip { extract_zip(&archive_path, &tmp_dir) } else { extract_tar_xz(&archive_path, &tmp_dir) };
-        if let Err(e) = extract_result {
+        if let Err(e) = extract_archive(&archive_path, &tmp_dir) {
             cleanup();
             return Err(e);
         }
@@ -452,7 +561,15 @@ fn detect_tsreadex(install_dir: &Path) -> Option<PathBuf> {
 mod tsreadex_setup {
     use super::*;
 
+    use super::fetch::{download_file, extract_archive, extract_zip, get_json};
+
     const RELEASES_API: &str = "https://api.github.com/repos/xtne6f/tsreadex/releases?per_page=5";
+
+    /// This project's own releases, which carry tsreadex builds for every
+    /// platform we support (see `.github/workflows/tsreadex.yml`). Preferred
+    /// over upstream because upstream ships Windows x86/x64 binaries only —
+    /// every other platform would otherwise need a local C++ toolchain.
+    const OWN_RELEASES_API: &str = "https://api.github.com/repos/stuayu/recisdb-proxy-rs/releases?per_page=15";
 
     struct ReleaseAsset {
         tag_name: String,
@@ -460,36 +577,10 @@ mod tsreadex_setup {
         asset_url: String,
     }
 
-    fn http_client() -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
-            .user_agent("recisdb-proxy-setup")
-            .build()
-            .map_err(|e| e.to_string())
-    }
-
-    fn download_file(url: &str, dest: &Path) -> Result<(), String> {
-        let client = http_client()?;
-        let mut resp = client.get(url).send().map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("ダウンロードに失敗しました (HTTP {})", resp.status()));
-        }
-        let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-        resp.copy_to(&mut file).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     /// Finds the most recent release that ships a `tsreadex-*.zip` asset
     /// (the known real-world shape: `tsreadex-master-YYMMDD.zip`).
     fn fetch_latest_release_with_asset() -> Result<ReleaseAsset, String> {
-        let client = http_client()?;
-        let resp = client
-            .get(RELEASES_API)
-            .send()
-            .map_err(|e| format!("GitHubへの問い合わせに失敗しました: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GitHubへの問い合わせに失敗しました (HTTP {})", resp.status()));
-        }
-        let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+        let body = get_json(RELEASES_API)?;
         let releases = body.as_array().ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
 
         for release in releases {
@@ -516,10 +607,63 @@ mod tsreadex_setup {
         Err("tsreadexの配布ファイルが見つかりませんでした".to_string())
     }
 
-    fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
-        let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        archive.extract(dest_dir).map_err(|e| format!("展開に失敗しました: {e}"))
+    /// Asset label + archive extension this build looks for in our own
+    /// releases. Must stay in sync with the matrix in
+    /// `.github/workflows/tsreadex.yml`.
+    ///
+    /// Takes `(os, arch)` as reported by `std::env::consts` so the mapping
+    /// stays unit-testable for platforms other than the host's.
+    pub(super) fn own_asset_suffix(os: &str, arch: &str) -> Option<String> {
+        let label = match (os, arch) {
+            ("windows", "x86_64") => "win-x64",
+            ("windows", "x86") => "win-x86",
+            ("windows", "aarch64") => "win-arm64",
+            ("linux", "x86_64") => "linux-amd64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "x86_64") => "macos-amd64",
+            ("macos", "aarch64") => "macos-arm64",
+            _ => return None,
+        };
+        let ext = if os == "windows" { ".zip" } else { ".tar.gz" };
+        Some(format!("-{label}{ext}"))
+    }
+
+    /// Newest `tsreadex-<tag>-<label>.<ext>` asset for this platform across
+    /// our own releases. The API returns releases newest-first, so the first
+    /// match wins.
+    fn find_own_asset() -> Result<(String, String), String> {
+        let suffix = own_asset_suffix(std::env::consts::OS, std::env::consts::ARCH)
+            .ok_or_else(|| "この環境向けのtsreadexビルドは配布されていません".to_string())?;
+        let body = get_json(OWN_RELEASES_API)?;
+        let releases = body.as_array().ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
+
+        for release in releases {
+            let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else { continue };
+            for asset in assets {
+                let Some(name) = asset.get("name").and_then(|n| n.as_str()) else { continue };
+                if !name.starts_with("tsreadex-") || !name.ends_with(&suffix) {
+                    continue;
+                }
+                let Some(url) = asset.get("browser_download_url").and_then(|u| u.as_str()) else { continue };
+                return Ok((name.to_string(), url.to_string()));
+            }
+        }
+        Err(format!("tsreadexの配布ファイル (*{suffix}) が見つかりませんでした"))
+    }
+
+    /// Installs from our own prebuilt asset — a single archive holding
+    /// `tsreadex-<tag>-<label>/tsreadex[.exe]` plus its license.
+    fn install_from_own_release(tmp_dir: &Path, dest_file: &Path) -> Result<(), String> {
+        let (asset_name, asset_url) = find_own_asset()?;
+        let archive_path = tmp_dir.join(&asset_name);
+        download_file(&asset_url, &archive_path)?;
+        extract_archive(&archive_path, tmp_dir)?;
+
+        let file_name = exe_file_name("tsreadex");
+        let extracted =
+            find_file_named(tmp_dir, &file_name).ok_or_else(|| format!("展開後に {file_name} が見つかりませんでした"))?;
+        std::fs::copy(&extracted, dest_file).map_err(|e| e.to_string())?;
+        make_executable(dest_file)
     }
 
     /// Windows: the release zip already contains prebuilt `tsreadex.exe`
@@ -530,9 +674,11 @@ mod tsreadex_setup {
         download_file(&release.asset_url, &zip_path)?;
         extract_zip(&zip_path, tmp_dir)?;
 
+        // The zip holds both `x64/tsreadex.exe` and `x86/tsreadex.exe`;
+        // `find_file_named` walks in unspecified order, so scan for the
+        // matching bitness explicitly before falling back to any copy.
         let bitness_dir = if cfg!(target_pointer_width = "64") { "x64" } else { "x86" };
-        let extracted = find_file_named(tmp_dir, "tsreadex.exe")
-            .filter(|p| p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()) == Some(bitness_dir))
+        let extracted = find_file_named(&tmp_dir.join(bitness_dir), "tsreadex.exe")
             .or_else(|| find_file_named(tmp_dir, "tsreadex.exe"))
             .ok_or_else(|| format!("展開後に {bitness_dir}/tsreadex.exe が見つかりませんでした"))?;
         std::fs::copy(&extracted, dest_file).map_err(|e| e.to_string())?;
@@ -572,23 +718,38 @@ mod tsreadex_setup {
         make_executable(dest_file)
     }
 
-    /// Fetches (Windows: prebuilt binary / Unix: source + `make`) tsreadex
-    /// into `<install_dir>/thirdparty/tsreadex/`.
+    /// Fetches upstream's own distribution: Windows gets the prebuilt
+    /// `tsreadex.exe` out of the release zip, every other platform has to
+    /// build the tagged source with `make` (upstream ships Windows binaries
+    /// only). Used only when our own prebuilt asset can't be had.
+    fn install_from_upstream(tmp_dir: &Path, dest_file: &Path) -> Result<(), String> {
+        let release = fetch_latest_release_with_asset()?;
+        if cfg!(target_os = "windows") {
+            install_windows(&release, tmp_dir, dest_file)
+        } else {
+            install_unix(&release, tmp_dir, dest_file)
+        }
+    }
+
+    /// Fetches tsreadex into `<install_dir>/thirdparty/tsreadex/`.
+    ///
+    /// Our own release asset comes first: it covers every supported platform
+    /// with a prebuilt binary, so no local C++ toolchain is needed. Upstream
+    /// is the fallback for when this project hasn't published a matching
+    /// asset (or GitHub is unreachable for that repo) — on Unix that path
+    /// compiles from source and therefore needs `make` and a C++ compiler.
     pub fn resolve_tsreadex(install_dir: &Path) -> Result<PathBuf, String> {
         let dest_dir = install_dir.join("thirdparty").join("tsreadex");
         std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
         let dest_file = dest_dir.join(exe_file_name("tsreadex"));
 
-        let release = fetch_latest_release_with_asset()?;
-
         let tmp_dir = std::env::temp_dir().join(format!("recisdb-proxy-tsreadex-dl-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
-        let result = if cfg!(target_os = "windows") {
-            install_windows(&release, &tmp_dir, &dest_file)
-        } else {
-            install_unix(&release, &tmp_dir, &dest_file)
-        };
+        let result = install_from_own_release(&tmp_dir, &dest_file).or_else(|own_err| {
+            install_from_upstream(&tmp_dir, &dest_file)
+                .map_err(|upstream_err| format!("{own_err} / 上流からの取得も失敗しました: {upstream_err}"))
+        });
         let _ = std::fs::remove_dir_all(&tmp_dir);
         result?;
         Ok(dest_file)
@@ -774,6 +935,68 @@ pub fn ensure_preview_ready(db: &Database, install_dir: &Path, config_path: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- BtbN asset name matching (pure, no network) -----------------------
+    //
+    // Regression guard: the previously hardcoded
+    // `ffmpeg-n8.1-latest-win64-gpl.zip` 404s because release-branch assets
+    // carry a version suffix (`...-gpl-8.1.zip`).
+
+    #[cfg(feature = "webhook")]
+    #[test]
+    fn btbn_asset_matching_accepts_versioned_static_gpl_names() {
+        use ffmpeg_download::is_static_gpl_asset as m;
+
+        // Release-branch build, with and without the version suffix.
+        assert!(m("ffmpeg-n8.1-latest-win64-gpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(m("ffmpeg-n8.1-latest-win64-gpl.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(m(
+            "ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz",
+            "ffmpeg-n8.1-latest-",
+            "linuxarm64",
+            ".tar.xz"
+        ));
+        // master build (the offline fallback's shape).
+        assert!(m("ffmpeg-master-latest-win64-gpl.zip", "ffmpeg-master-latest-", "win64", ".zip"));
+
+        // Shared builds need an accompanying lib/ dir -> must be rejected.
+        assert!(!m("ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(!m("ffmpeg-master-latest-win64-gpl-shared.zip", "ffmpeg-master-latest-", "win64", ".zip"));
+        // LGPL builds lack libx264, which verify_ffmpeg_binary requires.
+        assert!(!m("ffmpeg-n8.1-latest-win64-lgpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        // Wrong platform / wrong extension.
+        assert!(!m("ffmpeg-n8.1-latest-winarm64-gpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(!m("ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz", "ffmpeg-n8.1-latest-", "linux64", ".zip"));
+    }
+
+    // -- tsreadex asset naming (pure, no network) --------------------------
+    //
+    // These suffixes must match the artifact names produced by the matrix in
+    // `.github/workflows/tsreadex.yml`; a mismatch silently degrades every
+    // platform to the upstream fallback (source + `make` on Unix).
+
+    #[cfg(feature = "webhook")]
+    #[test]
+    fn tsreadex_asset_suffix_covers_every_released_platform() {
+        use tsreadex_setup::own_asset_suffix as s;
+
+        assert_eq!(s("windows", "x86_64").as_deref(), Some("-win-x64.zip"));
+        assert_eq!(s("windows", "x86").as_deref(), Some("-win-x86.zip"));
+        assert_eq!(s("windows", "aarch64").as_deref(), Some("-win-arm64.zip"));
+        assert_eq!(s("linux", "x86_64").as_deref(), Some("-linux-amd64.tar.gz"));
+        assert_eq!(s("linux", "aarch64").as_deref(), Some("-linux-arm64.tar.gz"));
+        assert_eq!(s("macos", "x86_64").as_deref(), Some("-macos-amd64.tar.gz"));
+        assert_eq!(s("macos", "aarch64").as_deref(), Some("-macos-arm64.tar.gz"));
+
+        // Unreleased platforms must fall through to the upstream path
+        // instead of fetching a wrong-architecture binary.
+        assert_eq!(s("linux", "arm"), None);
+        assert_eq!(s("freebsd", "x86_64"), None);
+
+        // The host this binary runs on must resolve to *some* asset — the
+        // whole point is that no platform needs a local C++ toolchain.
+        assert!(s(std::env::consts::OS, std::env::consts::ARCH).is_some());
+    }
 
     // -- hardware encoder selection (pure, no ffmpeg binary needed) --------
 

@@ -13,3 +13,12 @@ recisdb-proxy/static/vue/*
 !recisdb-proxy/static/vue/.gitkeep
 *.tsbuildinfo
 dist-linux-amd64/*
+logs/*
+/recisdb-proxy.db
+/recisdb-proxy.db-shm
+/recisdb-proxy.db-wal
+/recisdb-proxy.toml
+/recisdb-proxy.db.bak-*
+logos/*
+# ffmpeg / tsreadex fetched by the preview auto-setup
+/thirdparty

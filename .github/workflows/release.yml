@@ -26,6 +26,16 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+  build_tsreadex:
+    needs: create_release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/tsreadex.yml
+    with:
+      upload_url: ${{ needs.create_release.outputs.upload_url }}
+      asset_version: ${{ github.ref_name }}
+    secrets: inherit
+
   release_deb_executable:
     strategy:
       fail-fast: false
@@ -171,6 +181,8 @@ jobs:
             label: win-x64
           - arch: i686-pc-windows-msvc
             label: win-x86
+          - arch: aarch64-pc-windows-msvc
+            label: win-arm64
     steps:
       - uses: actions/checkout@v6
         with:

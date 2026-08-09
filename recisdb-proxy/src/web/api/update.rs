@@ -182,7 +182,7 @@ pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Opt
 fn platform_supports_self_update(os: &str, arch: &str) -> bool {
     match os {
         "linux" => matches!(arch, "x86_64" | "aarch64"),
-        "windows" => matches!(arch, "x86_64" | "x86"),
+        "windows" => matches!(arch, "x86_64" | "x86" | "aarch64"),
         "macos" => matches!(arch, "x86_64" | "aarch64"),
         _ => false,
     }
@@ -200,7 +200,7 @@ fn self_update_supported() -> bool {
 /// `.github/workflows/release.yml`'s naming exactly:
 /// - `recisdb-proxy-{tag}-linux-amd64.tar.gz` / `-linux-arm64.tar.gz`
 /// - `recisdb-proxy-{tag}-macos-amd64.tar.gz` / `-macos-arm64.tar.gz`
-/// - `recisdb-{tag}-win-x64.zip` / `-win-x86.zip`
+/// - `recisdb-{tag}-win-x64.zip` / `-win-x86.zip` / `-win-arm64.zip`
 ///
 /// `None` for any platform without a self-update asset.
 fn asset_filename(tag: &str, os: &str, arch: &str) -> Option<String> {
@@ -211,6 +211,7 @@ fn asset_filename(tag: &str, os: &str, arch: &str) -> Option<String> {
         ("macos", "aarch64") => Some(format!("recisdb-proxy-{tag}-macos-arm64.tar.gz")),
         ("windows", "x86_64") => Some(format!("recisdb-{tag}-win-x64.zip")),
         ("windows", "x86") => Some(format!("recisdb-{tag}-win-x86.zip")),
+        ("windows", "aarch64") => Some(format!("recisdb-{tag}-win-arm64.zip")),
         _ => None,
     }
 }
@@ -790,10 +791,10 @@ mod tests {
         assert!(platform_supports_self_update("linux", "aarch64"));
         assert!(platform_supports_self_update("windows", "x86_64"));
         assert!(platform_supports_self_update("windows", "x86"));
+        assert!(platform_supports_self_update("windows", "aarch64"));
         assert!(platform_supports_self_update("macos", "x86_64"));
         assert!(platform_supports_self_update("macos", "aarch64"));
         assert!(!platform_supports_self_update("linux", "arm")); // 32-bit ARM: no release asset
-        assert!(!platform_supports_self_update("windows", "aarch64")); // no win-arm64 asset in CI
         assert!(!platform_supports_self_update("freebsd", "x86_64"));
     }
 
@@ -803,6 +804,7 @@ mod tests {
         assert_eq!(asset_filename("v1.2.3", "linux", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-linux-arm64.tar.gz"));
         assert_eq!(asset_filename("v1.2.3", "windows", "x86_64").as_deref(), Some("recisdb-v1.2.3-win-x64.zip"));
         assert_eq!(asset_filename("v1.2.3", "windows", "x86").as_deref(), Some("recisdb-v1.2.3-win-x86.zip"));
+        assert_eq!(asset_filename("v1.2.3", "windows", "aarch64").as_deref(), Some("recisdb-v1.2.3-win-arm64.zip"));
         assert_eq!(asset_filename("v1.2.3", "macos", "x86_64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-amd64.tar.gz"));
         assert_eq!(asset_filename("v1.2.3", "macos", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-arm64.tar.gz"));
         assert_eq!(asset_filename("v1.2.3", "freebsd", "x86_64"), None);

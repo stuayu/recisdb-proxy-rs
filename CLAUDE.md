@@ -92,10 +92,21 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/EPG_DESIGN.md` — 番組表(EIT)収集・保存・配信の設計
 - `docs/TUNER_PIPELINE_REDESIGN.md` — チューナー選択・配信・切り替え経路の再設計(2026-08)
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
+- `docs/EPGSTATION_COMPAT.md` — **Mirakurun互換API(`/mirakurun/api/*`)のクライアント側仕様の調査台帳**。EPGStation(stuayuフォーク)が要求するAPI・データ構造・ストリームの挙動と、現状の実装との差分
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)
 
 **ドキュメント更新の義務**: コード変更が上記ドキュメントの記載内容(ビルド手順・設計・API・設定など)に影響する場合は、同じ作業の中で該当ドキュメントも必ず更新すること。ドキュメントに影響しうる変更を委譲する際は、委譲プロンプトに対象ドキュメントの更新も含める。
+
+**Mirakurun互換まわりの記録義務**: 次のいずれかを行ったら、同じ作業の中で `docs/EPGSTATION_COMPAT.md` を必ず更新する。
+
+1. **クライアント側(EPGStation)の仕様を調べたとき** — 呼び出すエンドポイント・要求するJSONの形・ストリームの終了条件・ヘッダなど。**根拠としてEPGStation側のファイルパスと行番号を必ず添える**(例: `src/model/db/ChannelDB.ts:62`)。調べた結果「実装しない」と判断したものも、判断の根拠として残す
+2. **Mirakurun互換APIを追加・変更したとき** — §6の差分表の「状態」を更新する。実装したら「実装済み」にし、着手順の目安も見直す
+3. **実起動で疎通を確認したとき** — 静的解析での推測と実際の挙動が食い違った点を最優先で記録する(現状このファイルは静的解析のみで書かれている)
+
+本家Mirakurunとstuayuフォークで型が違う箇所がある(`ChannelType`の`NW1`〜`NW40`など)。**本家のドキュメントや公開仕様だけを根拠にしないこと**——必ずフォーク側の `node_modules/mirakurun/api.d.ts` と EPGStation の実コードで裏を取る。
+
+さらに、**フォーク同梱の `api.yml`(= `GET /docs` が返すOpenAPI定義)自体が実装と食い違っていた**ことがある(`Service.channel`が実装は配列・`api.yml`は単数)。上流 `/Users/ayumu/prog/Mirakurun` では2026-08-09に `api.yml` を配列へ修正済み(未コミット)だが、EPGStation同梱版への反映は未確定。**`api.yml` を単独の根拠にせず、実装(`src/Mirakurun/**`)・`api.d.ts`・`api.yml` の三者を突き合わせること**。本プロジェクトが `/docs` を実装する際は、宣言と実レスポンスの形を必ず一致させる。
 
 ## マルチエージェント運用ポリシー
 

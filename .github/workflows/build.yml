@@ -25,6 +25,8 @@ jobs:
             label: win-x64
           - arch: i686-pc-windows-msvc
             label: win-x86
+          - arch: aarch64-pc-windows-msvc
+            label: win-arm64
 
     steps:
       - name: Checkout repository

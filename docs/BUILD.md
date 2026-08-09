@@ -223,3 +223,55 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 - 再選局は capture を止めずに SET_PARAMS + TUNE + PURGE で行う。daemon 側は
   `SET_CAPTURE(false)` でストリームスレッドを終了させ、`SET_DATA_ID` は接続あたり
   1 回しか効かないため、capture を止めるとデータソケットが二度と復活しない。
+
+## CI とリリース成果物
+
+`.github/workflows/build.yml` が push ごとの CI ビルド、`release.yml` がタグ push
+時のリリース作成とアセット添付を担当する。
+
+### 本体のプラットフォーム
+
+| プラットフォーム | ラベル | 備考 |
+|---|---|---|
+| Windows x64 | `win-x64` | |
+| Windows x86 | `win-x86` | |
+| Windows arm64 | `win-arm64` | クロスコンパイル。CI 上でテスト実行はしない |
+| Linux amd64 | `linux-amd64` | deb パッケージも生成 |
+| Linux arm64 | `linux-arm64` | deb パッケージも生成 |
+| macOS amd64 | `macos-amd64` | |
+| macOS arm64 | `macos-arm64` | |
+
+リリースアセット名は Web ダッシュボードの自己更新機能
+(`web/api/update.rs` の `asset_filename`) が決め打ちで参照する。**アセット名を
+変えたらそちらも必ず合わせること。**
+
+### tsreadex の同梱ビルド
+
+プレビュー配信の前処理に使う [tsreadex](https://github.com/xtne6f/tsreadex)
+(MIT) は、上流が Windows x86/x64 のバイナリしか配布していない。そのままだと
+Linux/macOS では利用側にビルドツールチェーンを要求することになるため、
+`.github/workflows/tsreadex.yml` で上流のソースから本体と同じ 7 プラットフォーム分を
+ビルドし、本体のリリースに
+`tsreadex-<タグ>-<ラベル>.zip` / `.tar.gz` として添付している。
+
+- Windows は CMake + MSVC (`-A x64` / `-A ARM64`)、それ以外は同梱の `Makefile`。
+- MIT ライセンスの再配布要件を満たすため、`License.txt` を必ず同梱する。
+- `workflow_dispatch` で単体実行もできる (この場合はリリースに添付せず
+  Actions の artifact のみ)。`upstream_ref` を指定すると特定タグをビルドする。
+
+取得側 (`recisdb-proxy/src/preview_setup.rs`) は、
+
+1. 既存の tsreadex を検出 (`thirdparty/`、KonomiTV の同梱、`PATH`)
+2. 本プロジェクトのリリースからこのプラットフォーム向けアセットを取得
+3. 上流のリリース (Windows はプリビルド、Unix はソース + `make`)
+
+の順に解決する。**ワークフローのラベルとアセット名を変えると 2 が黙って失敗して
+3 に落ちる**ので、変更時は `preview_setup.rs` の `own_asset_suffix` も合わせること。
+
+### ffmpeg の自動ダウンロード
+
+プレビュー用 ffmpeg は BtbN/FFmpeg-Builds の静的 GPL ビルドを使う。
+アセット名にバージョンサフィックスが付いたり外れたりする実績があるため、
+ファイル名を決め打ちせず GitHub のリリース API から解決している
+(`preview_setup.rs` の `btbn_asset_url`)。macOS 向けビルドは配布されていないので
+`brew install ffmpeg` にフォールバックする。

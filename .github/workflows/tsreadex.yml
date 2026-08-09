@@ -1,0 +1,177 @@
+name: Build tsreadex
+
+on:
+  workflow_call:
+    inputs:
+      upstream_ref:
+        description: 'xtne6f/tsreadex tag to build. Empty resolves the latest release tag automatically.'
+        type: string
+        required: false
+        default: ''
+      upload_url:
+        description: 'Release upload URL to attach assets to. Empty uploads artifacts only.'
+        type: string
+        required: false
+        default: ''
+      asset_version:
+        description: 'Version string used in the packaged asset names. Empty falls back to the resolved upstream tag.'
+        type: string
+        required: false
+        default: ''
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'xtne6f/tsreadex tag to build. Empty resolves the latest release tag automatically.'
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  resolve_ref:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          if [ -n "$UPSTREAM_REF" ]; then
+            echo "ref=$UPSTREAM_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # No ref given: pick the newest xtne6f/tsreadex release that ships
+          # a source zip (tag naming is not strictly sequential, e.g.
+          # "master-260428", so this can't just sort tag names).
+          TAG=$(curl -sL "https://api.github.com/repos/xtne6f/tsreadex/releases?per_page=5" \
+            | jq -r '[.[] | select(any(.assets[]?.name; startswith("tsreadex-") and endswith(".zip")))][0].tag_name // empty')
+          if [ -z "$TAG" ]; then
+            echo "::error::failed to resolve latest xtne6f/tsreadex release tag"
+            exit 1
+          fi
+          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve_ref
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            label: win-x64
+            os: windows
+            cmake_arch: x64
+          - runner: windows-latest
+            label: win-x86
+            os: windows
+            cmake_arch: Win32
+          - runner: windows-latest
+            label: win-arm64
+            os: windows
+            cmake_arch: ARM64
+          - runner: ubuntu-24.04
+            label: linux-amd64
+            os: linux
+          - runner: ubuntu-24.04-arm
+            label: linux-arm64
+            os: linux
+          - runner: macos-26-intel
+            label: macos-amd64
+            os: macos
+          - runner: macos-26
+            label: macos-arm64
+            os: macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Determine asset version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.asset_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ needs.resolve_ref.outputs.ref }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download tsreadex source
+        shell: bash
+        run: |
+          REF="${{ needs.resolve_ref.outputs.ref }}"
+          curl -sL "https://github.com/xtne6f/tsreadex/archive/refs/tags/$REF.tar.gz" -o tsreadex-src.tar.gz
+          tar xzf tsreadex-src.tar.gz
+          mv "tsreadex-$REF" tsreadex-src
+
+      - name: Build (Unix)
+        if: matrix.os != 'windows'
+        working-directory: tsreadex-src
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            # Avoid depending on the runner's libstdc++ at runtime; macOS's
+            # clang has no equivalent flag (and none is needed there).
+            #
+            # A command-line variable overrides the Makefile's own
+            # `LDFLAGS := -Wl,-s $(LDFLAGS)` outright, so `-Wl,-s` (strip) is
+            # repeated here to keep the binary as small as upstream's.
+            make LDFLAGS="-Wl,-s -static-libstdc++ -static-libgcc"
+          else
+            make
+          fi
+          test -x tsreadex
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        working-directory: tsreadex-src
+        run: |
+          cmake -B build -A ${{ matrix.cmake_arch }} .
+          cmake --build build --config Release
+          # ARM64 is cross-compiled here, so the binary can't be executed for
+          # verification — only its existence is checked.
+          if (-not (Test-Path build/Release/tsreadex.exe)) { throw "tsreadex.exe was not produced" }
+
+      - name: Stage package
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGE="tsreadex-$VERSION-${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp tsreadex-src/build/Release/tsreadex.exe "$STAGE/"
+          else
+            cp tsreadex-src/tsreadex "$STAGE/"
+          fi
+          cp tsreadex-src/License.txt "$STAGE/"
+          cat > "$STAGE/Readme.txt" <<EOF
+          tsreadex (${{ needs.resolve_ref.outputs.ref }}) — https://github.com/xtne6f/tsreadex
+
+          Redistributed under the MIT License. See License.txt for the full
+          license text. This build is not modified from upstream source.
+          EOF
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Archive package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "$env:STAGE" -DestinationPath "$env:STAGE.zip"
+
+      - name: Archive package (Unix)
+        if: matrix.os != 'windows'
+        run: tar czf "$STAGE.tar.gz" "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.STAGE }}
+          path: |
+            ${{ env.STAGE }}.zip
+            ${{ env.STAGE }}.tar.gz
+          if-no-files-found: ignore
+
+      - name: Upload package to release channel
+        if: inputs.upload_url != ''
+        uses: shogo82148/actions-upload-release-asset@v1
+        with:
+          asset_path: "./${{ env.STAGE }}.*"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          upload_url: ${{ inputs.upload_url }}
