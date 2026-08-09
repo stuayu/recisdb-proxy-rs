@@ -95,6 +95,50 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Can `resp` be the answer to `req`?
+///
+/// The protocol has no correlation id, so this type pairing is the only way to
+/// notice that the response channel has slipped out of step (see
+/// [`Connection::send_request_with_timeout`]). `Error` is accepted for every
+/// request because that is how the server refuses any of them.
+fn is_reply_to(req: &ClientMessage, resp: &ServerMessage) -> bool {
+    use ClientMessage as C;
+    use ServerMessage as S;
+
+    if matches!(resp, S::Error { .. }) {
+        return true;
+    }
+
+    matches!(
+        (req, resp),
+        (C::Hello { .. }, S::HelloAck { .. })
+            | (C::Ping, S::Pong)
+            | (
+                C::OpenTuner { .. } | C::OpenTunerWithGroup { .. },
+                S::OpenTunerAck { .. }
+            )
+            | (C::CloseTuner, S::CloseTunerAck { .. })
+            | (C::SetChannel { .. }, S::SetChannelAck { .. })
+            | (
+                C::SetChannelSpace { .. } | C::SetChannelSpaceInGroup { .. },
+                S::SetChannelSpaceAck { .. }
+            )
+            | (C::GetSignalLevel, S::GetSignalLevelAck { .. })
+            | (C::EnumTuningSpace { .. }, S::EnumTuningSpaceAck { .. })
+            | (C::EnumChannelName { .. }, S::EnumChannelNameAck { .. })
+            | (C::StartStream, S::StartStreamAck { .. })
+            | (C::StopStream, S::StopStreamAck { .. })
+            | (C::PurgeStream, S::PurgeStreamAck { .. })
+            | (C::SetLnbPower { .. }, S::SetLnbPowerAck { .. })
+            | (
+                C::SelectLogicalChannel { .. },
+                S::SelectLogicalChannelAck { .. }
+            )
+            | (C::GetChannelList { .. }, S::GetChannelListAck { .. })
+            | (C::SetServiceFilter { .. }, S::SetServiceFilterAck { .. })
+    )
+}
+
 /// Last channel selection, remembered so it can be re-applied after an
 /// automatic reconnect.
 #[derive(Debug, Clone, Copy)]
@@ -386,6 +430,20 @@ impl Connection {
     /// Uses `std::sync::mpsc::Receiver::recv_timeout()` for a true blocking
     /// wait — no spin loop, no sleep().  This mirrors the per-command
     /// `WaitForMultipleObjects` + auto-reset event pattern in BonDriverProxy(Ex).
+    ///
+    /// # Keeping requests and replies paired
+    ///
+    /// The wire protocol carries no correlation id, so a reply is matched to a
+    /// request purely by position in the response channel.  That is fine until
+    /// one request times out: its reply arrives afterwards, stays queued, and
+    /// the *next* request picks it up — from then on every request reads the
+    /// previous request's answer and the caller sees an endless string of
+    /// failures.  One slow round-trip poisons the session permanently.
+    ///
+    /// Two cheap guards make the pairing self-healing without a protocol
+    /// change: drop anything already queued before sending (it can only belong
+    /// to an abandoned request), and skip replies whose type cannot answer the
+    /// request we just sent.
     fn send_request_with_timeout(&self, msg: ClientMessage, timeout: Duration) -> Option<ServerMessage> {
         // Fast-fail while the link is known-down (the supervisor is backing off
         // or re-establishing).  Otherwise a request would sit in the channel
@@ -399,12 +457,36 @@ impl Connection {
             return None;
         }
 
-        // Send the request first (briefly holds request_tx lock).
+        // Hold the response channel across the whole exchange so no other
+        // caller can consume our reply, and so the drain below cannot race a
+        // concurrent send.
+        const SLICE: Duration = Duration::from_millis(200);
+        let rx = self.response_rx.lock();
+        let rx = match rx.as_ref() {
+            Some(rx) => rx,
+            None => {
+                error!("[Connection] Response channel not initialized");
+                return None;
+            }
+        };
+
+        // Anything queued before we send belongs to a request that already gave
+        // up. Leaving it would hand it to us as if it were our own reply.
+        let mut stale = 0usize;
+        while rx.try_recv().is_ok() {
+            stale += 1;
+        }
+        if stale > 0 {
+            warn!("[Connection] Discarded {} stale response(s) before sending", stale);
+            file_log!(warn, "[Connection] Discarded {} stale response(s) before sending", stale);
+        }
+
+        // Send the request (briefly holds request_tx lock).
         {
             let tx = self.request_tx.lock();
             let tx = tx.as_ref()?;
             debug!("[Connection] Sending message: {:?}", std::mem::discriminant(&msg));
-            if tx.blocking_send(msg).is_err() {
+            if tx.blocking_send(msg.clone()).is_err() {
                 error!("[Connection] Failed to send request to server");
                 return None;
             }
@@ -416,16 +498,7 @@ impl Connection {
         // within one slice and release the response_rx lock promptly instead of
         // pinning it — and serializing every other control call — for the full
         // timeout.
-        const SLICE: Duration = Duration::from_millis(200);
         let deadline = Instant::now() + timeout;
-        let rx = self.response_rx.lock();
-        let rx = match rx.as_ref() {
-            Some(rx) => rx,
-            None => {
-                error!("[Connection] Response channel not initialized");
-                return None;
-            }
-        };
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -435,6 +508,17 @@ impl Connection {
             let wait = SLICE.min(deadline - now);
             match rx.recv_timeout(wait) {
                 Ok(resp) => {
+                    if !is_reply_to(&msg, &resp) {
+                        // A late reply to an earlier request. Drop it and keep
+                        // waiting for ours instead of returning it and leaving
+                        // the channel offset by one forever.
+                        warn!(
+                            "[Connection] Ignoring unrelated response {:?} while waiting for a reply to {:?}",
+                            std::mem::discriminant(&resp),
+                            std::mem::discriminant(&msg)
+                        );
+                        continue;
+                    }
                     debug!("[Connection] Received response");
                     return Some(resp);
                 }
@@ -1350,6 +1434,96 @@ fn extract_server_name(addr: &str) -> ServerName<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire up a Connection with hand-made request/response channels so the
+    /// RPC pairing can be exercised without a server.
+    fn rpc_harness(
+        read_timeout: Duration,
+    ) -> (
+        Arc<Connection>,
+        mpsc::Receiver<ClientMessage>,
+        std::sync::mpsc::Sender<ServerMessage>,
+    ) {
+        let conn = Connection::new(ConnectionConfig {
+            read_timeout,
+            ..ConnectionConfig::default()
+        });
+        let (req_tx, req_rx) = mpsc::channel::<ClientMessage>(32);
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<ServerMessage>();
+        *conn.request_tx.lock() = Some(req_tx);
+        *conn.response_rx.lock() = Some(resp_rx);
+        conn.link_status.store(link::UP, Ordering::SeqCst);
+        (conn, req_rx, resp_tx)
+    }
+
+    #[test]
+    fn reply_pairing_accepts_the_matching_ack_and_any_error() {
+        let req = ClientMessage::GetSignalLevel;
+        assert!(is_reply_to(&req, &ServerMessage::GetSignalLevelAck { signal_level: 1.0 }));
+        assert!(!is_reply_to(&req, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
+        // The server answers a refused request of any kind with Error.
+        assert!(is_reply_to(&req, &ServerMessage::Error {
+            error_code: 1,
+            message: "no".to_string()
+        }));
+
+        // v1 and v2 SetChannel have distinct acks and must not cross over.
+        let v1 = ClientMessage::SetChannel { channel: 1, priority: 0, exclusive: false };
+        let v2 = ClientMessage::SetChannelSpace { space: 0, channel: 1, priority: 0, exclusive: false };
+        assert!(is_reply_to(&v1, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
+        assert!(!is_reply_to(&v1, &ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }));
+        assert!(is_reply_to(&v2, &ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }));
+        assert!(!is_reply_to(&v2, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
+    }
+
+    /// A reply that arrived after its request gave up must not be handed to the
+    /// next request — otherwise the channel stays offset by one for the rest of
+    /// the session and every later request reads the previous one's answer.
+    #[test]
+    fn a_stale_queued_reply_does_not_answer_the_next_request() {
+        let (conn, mut req_rx, resp_tx) = rpc_harness(Duration::from_millis(500));
+
+        // Left over from a SetChannel that already timed out.
+        resp_tx
+            .send(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 })
+            .unwrap();
+
+        let sender = resp_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = sender.send(ServerMessage::GetSignalLevelAck { signal_level: 12.5 });
+        });
+
+        let resp = conn.send_request(ClientMessage::GetSignalLevel);
+        assert_eq!(
+            resp,
+            Some(ServerMessage::GetSignalLevelAck { signal_level: 12.5 }),
+            "must wait for its own reply, not consume the stale one"
+        );
+        assert!(req_rx.try_recv().is_ok(), "the request was actually sent");
+    }
+
+    /// Same hazard, but the late reply lands while we are already waiting.
+    #[test]
+    fn an_unrelated_reply_arriving_mid_wait_is_skipped() {
+        let (conn, _req_rx, resp_tx) = rpc_harness(Duration::from_millis(500));
+
+        let sender = resp_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = sender.send(ServerMessage::StopStreamAck { success: true });
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = sender.send(ServerMessage::EnumTuningSpaceAck {
+                name: Some("関東".to_string()),
+            });
+        });
+
+        let resp = conn.send_request(ClientMessage::EnumTuningSpace { space: 0 });
+        assert_eq!(
+            resp,
+            Some(ServerMessage::EnumTuningSpaceAck { name: Some("関東".to_string()) })
+        );
+    }
 
     /// A connection attempt that fails must leave the instance ready to try
     /// again. Parking it in `Error` made the object dead until the host
