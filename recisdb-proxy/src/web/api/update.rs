@@ -260,6 +260,19 @@ fn current_platform_asset_filename(tag: &str) -> Option<String> {
     asset_filename(tag, std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Whether `release` already carries the archive `(os, arch)` would need to
+/// self-update to it.
+///
+/// Platforms with no self-update asset at all (see [`asset_filename`]) return
+/// `true`: they are told about the release so the notification still appears,
+/// they just don't get an update button.
+fn release_has_asset(release: &GithubRelease, os: &str, arch: &str) -> bool {
+    match asset_filename(&release.tag_name, os, arch) {
+        Some(name) => release.assets.iter().any(|a| a.name == name),
+        None => true,
+    }
+}
+
 /// Whether an archive entry name (a tar path or a zip entry name) is the
 /// executable we want to extract, for the given `os` ("windows" wants a
 /// `.exe" suffix; everything else — i.e. our Linux release archives — does
@@ -315,6 +328,16 @@ pub async fn check_update(State(web_state): State<Arc<WebState>>, Query(query): 
     let current_version = crate::VERSION;
 
     let releases = fetch_releases_cached(&web_state, query.force).await;
+    // Hide releases whose asset for this platform hasn't been uploaded yet.
+    // The release CI creates the GitHub release first and then attaches each
+    // platform's archive as its build finishes, so for the first ~15 minutes
+    // after a tag is pushed the release exists but is (for some platforms)
+    // empty. Offering it during that window produces an "Update" button that
+    // can only fail with a 404.
+    let releases: Vec<GithubRelease> = releases
+        .into_iter()
+        .filter(|r| release_has_asset(r, std::env::consts::OS, std::env::consts::ARCH))
+        .collect();
     let (stable, prerelease) = select_updates(current_version, &releases);
 
     Json(json!({
@@ -438,7 +461,15 @@ pub async fn apply_update(
         .assets
         .iter()
         .find(|a| a.name == filename)
-        .ok_or_else(|| ApiError::not_found(format!("release '{}' has no asset named '{filename}'", payload.tag)))?;
+        .ok_or_else(|| {
+            // Most often this means the release CI is still building this
+            // platform's archive rather than that the asset will never exist.
+            ApiError::not_found(format!(
+                "release '{}' has no asset named '{filename}' yet — if the release was just published, \
+                 its build may still be running; try again in a few minutes",
+                payload.tag
+            ))
+        })?;
     let download_url = asset.browser_download_url.clone();
     let tag = payload.tag.clone();
 
@@ -628,6 +659,41 @@ mod tests {
             html_url: format!("https://github.com/stuayu/recisdb-proxy-rs/releases/tag/{tag}"),
             assets: vec![],
         }
+    }
+
+    // -- release_has_asset ---------------------------------------------------
+
+    #[test]
+    fn release_has_asset_requires_this_platforms_archive() {
+        let tag = "v0.0.1-alpha.14";
+        let mut r = release(tag, true, false);
+        assert!(
+            !release_has_asset(&r, "linux", "aarch64"),
+            "a release whose arm64 archive hasn't been uploaded yet must not count as available"
+        );
+
+        // Another platform's asset present, ours still missing.
+        r.assets.push(GithubAsset {
+            name: format!("recisdb-proxy-{tag}-linux-amd64.tar.gz"),
+            browser_download_url: "https://example.invalid/a".to_string(),
+        });
+        assert!(!release_has_asset(&r, "linux", "aarch64"));
+        assert!(release_has_asset(&r, "linux", "x86_64"));
+
+        r.assets.push(GithubAsset {
+            name: format!("recisdb-proxy-{tag}-linux-arm64.tar.gz"),
+            browser_download_url: "https://example.invalid/b".to_string(),
+        });
+        assert!(release_has_asset(&r, "linux", "aarch64"));
+    }
+
+    #[test]
+    fn release_has_asset_is_true_on_platforms_without_self_update() {
+        // No asset naming exists for these, so they should still be notified
+        // about the release even though they can't self-update.
+        let r = release("v0.0.1-alpha.14", true, false);
+        assert!(release_has_asset(&r, "freebsd", "x86_64"));
+        assert!(release_has_asset(&r, "linux", "armv7"));
     }
 
     // -- parse_version / version_key ---------------------------------------
