@@ -97,8 +97,13 @@ fn patch_multi2_simd_for_windows_arm64(dst: &Path) {
     //     (SIMD 無効時の #else 分岐含め) に使っている。サイズ (16 バイト × 8 /
     //     32 バイト × 8) を変えずに ARM64 では素の byte 配列に差し替える。
     let header_path = dst.join("aribb25").join("multi2_simd.h");
-    let header_original =
-        std::fs::read_to_string(&header_path).expect("failed to read multi2_simd.h");
+    // 以下のパターンは複数行にまたがるので、CRLF のままだと照合できない。
+    // Windows ランナーは core.autocrlf が既定で有効でチェックアウト時に CRLF に
+    // なるため、読み込んだ時点で LF に正規化しておく (MSVC は LF のソースを
+    // 問題なく扱う)。b_cas_card.c 側のパターンは単一行なのでこの影響を受けない。
+    let header_original = std::fs::read_to_string(&header_path)
+        .expect("failed to read multi2_simd.h")
+        .replace("\r\n", "\n");
     let mut header_patched = header_original.clone();
 
     let union_variant = "typedef union {\n\t__m256i key256[8];\n\t__m128i key[8];\n} MULTI2_SIMD_WORK_KEY;";
@@ -132,8 +137,9 @@ fn patch_multi2_simd_for_windows_arm64(dst: &Path) {
     //     (呼び出し側は multi2.c/arib_std_b25.c どちらも `#ifdef ENABLE_MULTI2_SIMD`
     //     の内側でしかこのファイルの関数を呼ばないので、空の翻訳単位でもリンクは通る)。
     let source_path = dst.join("aribb25").join("multi2_simd.c");
-    let source_original =
-        std::fs::read_to_string(&source_path).expect("failed to read multi2_simd.c");
+    let source_original = std::fs::read_to_string(&source_path)
+        .expect("failed to read multi2_simd.c")
+        .replace("\r\n", "\n");
     assert!(
         source_original.starts_with("#include <stdlib.h>"),
         "libaribb25 の multi2_simd.c の先頭が想定と違う。\
