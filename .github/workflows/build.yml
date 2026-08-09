@@ -47,12 +47,12 @@ jobs:
       - name: Setup Windows SDK
         uses: fbactions/setup-winsdk@v2
 
-      # libaribb25 の CMakeLists は古く、CMake 4.x では CMP0066/0156/0181 など
-      # の互換警告・破壊的変更を踏む。3.31 系に固定しておく。
-      - name: Setup CMake (pinned)
-        uses: jwlawson/actions-setup-cmake@v2
-        with:
-          cmake-version: '3.31.x'
+      # CMake はランナー同梱のものを使う。イメージに入っているのは VS 2026 のみで、
+      # b25-sys (cmake-rs) はそれを見て "Visual Studio 18 2026" ジェネレーターを
+      # 要求するため、そのジェネレーターを知らない旧版 (3.31 系など) に固定すると
+      # "Could not create named generator" でビルドできない。
+      # libaribb25 の古い CMakeLists と CMake 4.x の非互換は、b25-sys/build.rs が
+      # CMAKE_POLICY_VERSION_MINIMUM=3.5 を渡すことで回避している。
 
       # windows ランナーのイメージに VS 2022 が存在しないことがあるので、ジェネレーターではなく
       # 「実在する MSVC ツールセット」を検出して 14.4x (v143) があればそれを使う。

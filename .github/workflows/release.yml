@@ -196,11 +196,8 @@ jobs:
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
       - uses: fbactions/setup-winsdk@v2
-      # libaribb25 が CMake 4.x 非対応のため 3.31 系に固定する。
-      - name: Setup CMake (pinned)
-        uses: jwlawson/actions-setup-cmake@v2
-        with:
-          cmake-version: '3.31.x'
+      # CMake はランナー同梱のものを使う (build.yml の同じ位置のコメント参照)。
+      # 旧版に固定すると "Visual Studio 18 2026" ジェネレーターを作れずビルドが落ちる。
       # windows ランナーのイメージに VS 2022 が存在しないことがあるので、ジェネレーターではなく
       # 「実在する MSVC ツールセット」を検出して 14.4x (v143) があればそれを使う。
       # 14.51 (VS 2026 / MSVC 19.51 preview) だと tsreadex は C2664、libaribb25 は
