@@ -16,7 +16,12 @@ concurrency:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    env:
+      # b25-sys/build.rs は CMake に VS を自動検出させるが、ランナーに VS 2026
+      # (MSVC 19.51 preview) が入ると libaribb25 の ARM64 ビルドが大量の
+      # コンパイルエラーで落ちる。ツールセットを VS 2022 に固定する。
+      CMAKE_GENERATOR: "Visual Studio 17 2022"
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +51,13 @@ jobs:
 
       - name: Setup Windows SDK
         uses: fbactions/setup-winsdk@v2
+
+      # libaribb25 の CMakeLists は古く、CMake 4.x では CMP0066/0156/0181 など
+      # の互換警告・破壊的変更を踏む。3.31 系に固定しておく。
+      - name: Setup CMake (pinned)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.x'
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable

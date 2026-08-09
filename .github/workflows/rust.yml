@@ -86,7 +86,7 @@ jobs:
         if: matrix.os == 'alpine:latest'
 
   build-windows-non-msys:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: fbactions/setup-winsdk@v2
       - uses: actions/checkout@v6
@@ -105,7 +105,7 @@ jobs:
           cargo test --workspace --release --target x86_64-pc-windows-gnu
 
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -119,6 +119,13 @@ jobs:
         if: endsWith(matrix.toolchain, 'msvc')
       - uses: fbactions/setup-winsdk@v2
         if: endsWith(matrix.toolchain, 'msvc')
+      # MSVC 経路のみ: libaribb25 が CMake 4.x 非対応なので 3.31 系に固定する
+      # (MinGW 経路は msys2 の cmake/ninja を使うため触らない)。
+      - name: Setup CMake (pinned)
+        uses: jwlawson/actions-setup-cmake@v2
+        if: endsWith(matrix.toolchain, 'msvc')
+        with:
+          cmake-version: '3.31.x'
 
       - uses: msys2/setup-msys2@v2
         if: endsWith(matrix.toolchain, 'gnu')
@@ -148,11 +155,15 @@ jobs:
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
+          # VS 2026 (MSVC 19.51 preview) が選ばれると libaribb25 のビルドが
+          # 壊れるため、b25-sys/build.rs が尊重する CMAKE_GENERATOR で固定する。
+          $env:CMAKE_GENERATOR="Visual Studio 17 2022"
           cargo check --workspace
       - name: Run tests(MSVC)
         if: endsWith(matrix.toolchain, 'msvc')
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
+          $env:CMAKE_GENERATOR="Visual Studio 17 2022"
           cargo test --workspace
 
       - name: Check(MinGW)

@@ -171,8 +171,11 @@ jobs:
           upload_url: ${{ needs.create_release.outputs.upload_url }}
 
   release_windows_exe:
-    runs-on: windows-latest
+    runs-on: windows-2025
     needs: create_release
+    env:
+      # build.yml と同じ理由 (VS 2026 では libaribb25 の ARM64 ビルドが壊れる)。
+      CMAKE_GENERATOR: "Visual Studio 17 2022"
     strategy:
       fail-fast: false
       matrix:
@@ -196,6 +199,11 @@ jobs:
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
       - uses: fbactions/setup-winsdk@v2
+      # libaribb25 が CMake 4.x 非対応のため 3.31 系に固定する。
+      - name: Setup CMake (pinned)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.x'
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
