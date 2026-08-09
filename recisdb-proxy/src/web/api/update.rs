@@ -118,13 +118,52 @@ fn parse_version(tag: &str) -> Option<(u64, u64, u64, bool)> {
     Some((major, minor, patch, has_suffix))
 }
 
-/// Sortable key derived from [`parse_version`]: same numeric version, a
-/// stable tag (`has_suffix == false`) always ranks above a prerelease tag
-/// (`has_suffix == true`) — tuple/`bool` `Ord` does this for free since
-/// `false < true`, so we store `!has_suffix` as the last field.
-fn version_key(tag: &str) -> Option<(u64, u64, u64, bool)> {
+/// Ordering key for the prerelease suffix of a tag, i.e. everything after the
+/// first `-`. Returns `("", 0)` for a tag with no suffix.
+///
+/// Needed because our release stream is entirely prereleases so far
+/// (`v0.0.1-alpha.N`): without this, every `alpha.N` collapses to the same
+/// key and no alpha would ever be offered as an update over another alpha.
+///
+/// The suffix is split on both `.` and `-`, then:
+/// - `ordinal` is the first purely numeric token,
+/// - `label` is the first non-numeric token before it.
+///
+/// This also copes with the `git describe` shapes `crate::VERSION` can take
+/// on a development build:
+/// - `alpha.6-1-g05a127c` → `("alpha", 6)` — the tag's own ordinal wins over
+///   the commit distance, which is what makes a dev build compare as "that
+///   prerelease, roughly".
+/// - `1-g05a127c` (commits past a *stable* tag) → `("", 1)`.
+/// - `dirty` → `("dirty", 0)`.
+fn prerelease_key(tag: &str) -> (String, u64) {
+    let stripped = tag.strip_prefix('v').unwrap_or(tag);
+    let Some(suffix) = stripped.splitn(2, '-').nth(1) else {
+        return (String::new(), 0);
+    };
+
+    let mut label = String::new();
+    for token in suffix.split(['.', '-']) {
+        if let Ok(ordinal) = token.parse::<u64>() {
+            return (label, ordinal);
+        }
+        if label.is_empty() {
+            label = token.to_string();
+        }
+    }
+    (label, 0)
+}
+
+/// Sortable key derived from [`parse_version`] + [`prerelease_key`]: same
+/// numeric version, a stable tag (`has_suffix == false`) always ranks above a
+/// prerelease tag (`has_suffix == true`) — tuple/`bool` `Ord` does this for
+/// free since `false < true`, so we store `!has_suffix`. Prereleases at the
+/// same numeric version are then ordered by their suffix label and ordinal,
+/// so `alpha.11 < alpha.12`.
+fn version_key(tag: &str) -> Option<(u64, u64, u64, bool, String, u64)> {
     let (major, minor, patch, has_suffix) = parse_version(tag)?;
-    Some((major, minor, patch, !has_suffix))
+    let (label, ordinal) = if has_suffix { prerelease_key(tag) } else { (String::new(), 0) };
+    Some((major, minor, patch, !has_suffix, label, ordinal))
 }
 
 /// Picks the newest applicable stable and prerelease releases out of a raw
@@ -146,7 +185,7 @@ pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Opt
     // An unparsable "current" version (should not happen for our own crate
     // version, but keep this total) is treated as the lowest possible
     // version so every valid release counts as an update.
-    let current = version_key(current_version).unwrap_or((0, 0, 0, false));
+    let current = version_key(current_version).unwrap_or((0, 0, 0, false, String::new(), 0));
 
     let live = releases.iter().filter(|r| !r.draft);
 
@@ -155,7 +194,7 @@ pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Opt
         .filter(|r| !r.prerelease)
         .filter_map(|r| version_key(&r.tag_name).map(|k| (k, r)))
         .filter(|(k, _)| *k > current)
-        .max_by_key(|(k, _)| *k)
+        .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, r)| ReleaseInfo::from(r));
 
     let stable_key = stable.as_ref().and_then(|s| version_key(&s.tag));
@@ -164,8 +203,8 @@ pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Opt
         .filter(|r| r.prerelease)
         .filter_map(|r| version_key(&r.tag_name).map(|k| (k, r)))
         .filter(|(k, _)| *k > current)
-        .filter(|(k, _)| stable_key.map(|sk| *k > sk).unwrap_or(true))
-        .max_by_key(|(k, _)| *k)
+        .filter(|(k, _)| stable_key.as_ref().map(|sk| k > sk).unwrap_or(true))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, r)| ReleaseInfo::from(r));
 
     (stable, prerelease)
@@ -639,7 +678,61 @@ mod tests {
         assert!(stable > pre, "stable {stable:?} should outrank prerelease {pre:?}");
     }
 
+    #[test]
+    fn prerelease_key_extracts_label_and_ordinal() {
+        assert_eq!(prerelease_key("v0.0.1-alpha.11"), ("alpha".to_string(), 11));
+        assert_eq!(prerelease_key("0.0.1-beta.2"), ("beta".to_string(), 2));
+        // git describe on a commit past a prerelease tag: the tag's own
+        // ordinal must win over the commit distance.
+        assert_eq!(prerelease_key("0.0.1-alpha.6-1-g05a127c"), ("alpha".to_string(), 6));
+        // git describe past a *stable* tag has no label, just a distance.
+        assert_eq!(prerelease_key("0.0.1-1-g05a127c"), (String::new(), 1));
+        assert_eq!(prerelease_key("0.0.1-dirty"), ("dirty".to_string(), 0));
+        assert_eq!(prerelease_key("1.2.3"), (String::new(), 0));
+    }
+
+    #[test]
+    fn version_key_orders_alphas_by_ordinal_not_lexically() {
+        // Regression: every v0.0.1-alpha.N used to collapse to the same key,
+        // so no alpha was ever offered as an update over another alpha —
+        // which is the entire release stream so far.
+        let a11 = version_key("v0.0.1-alpha.11").unwrap();
+        let a12 = version_key("v0.0.1-alpha.12").unwrap();
+        let a9 = version_key("v0.0.1-alpha.9").unwrap();
+        assert!(a12 > a11, "alpha.12 {a12:?} must outrank alpha.11 {a11:?}");
+        assert!(a11 > a9, "alpha.11 {a11:?} must outrank alpha.9 {a9:?} (numeric, not lexical)");
+    }
+
     // -- select_updates ------------------------------------------------------
+
+    #[test]
+    fn select_updates_offers_newer_alpha_over_current_alpha() {
+        let releases = vec![
+            release("v0.0.1-alpha.11", true, false),
+            release("v0.0.1-alpha.12", true, false),
+            release("v0.0.1-alpha.9", true, false),
+        ];
+        let (stable, prerelease) = select_updates("v0.0.1-alpha.11", &releases);
+        assert!(stable.is_none());
+        assert_eq!(prerelease.unwrap().tag, "v0.0.1-alpha.12");
+    }
+
+    #[test]
+    fn select_updates_reports_no_update_when_running_the_newest_alpha() {
+        let releases = vec![release("v0.0.1-alpha.11", true, false), release("v0.0.1-alpha.12", true, false)];
+        let (stable, prerelease) = select_updates("v0.0.1-alpha.12", &releases);
+        assert!(stable.is_none());
+        assert!(prerelease.is_none());
+    }
+
+    #[test]
+    fn select_updates_dev_build_past_alpha_tag_sees_next_alpha() {
+        // Running a locally built binary from a commit after v0.0.1-alpha.11:
+        // v0.0.1-alpha.12 must still be surfaced.
+        let releases = vec![release("v0.0.1-alpha.12", true, false)];
+        let (_, prerelease) = select_updates("0.0.1-alpha.11-3-g05a127c", &releases);
+        assert_eq!(prerelease.unwrap().tag, "v0.0.1-alpha.12");
+    }
 
     #[test]
     fn select_updates_finds_newer_stable() {
