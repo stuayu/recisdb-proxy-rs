@@ -11,6 +11,7 @@ use bytes::Bytes;
 
 use crate::database::Database;
 use crate::server::session::Session;
+use crate::server::ts_queue::{TsQueueShared, TsWriteQueue};
 use crate::tuner::{EncoderPool, TunerPool, TunerPoolConfig};
 use crate::web::SessionRegistry;
 
@@ -161,18 +162,18 @@ async fn handle_connection(
     let (reader, writer) = socket.into_split();
 
     // Per-session write channels.
-    // TS data  :  bounded, uses try_send (no blocking), drops oldest on full.
+    // TS data  :  bounded by a byte budget (see `ts_queue`), sized in seconds
+    //             of stream once the session knows its class and bitrate.
     // Control  :  bounded but generous, uses send().await (low volume).
-    let (ts_write_tx, ts_write_rx) = mpsc::channel::<Bytes>(
-        Session::TS_WRITE_BUFFER_CAPACITY,
-    );
+    let (ts_write_queue, ts_write_rx, ts_queue_shared) =
+        TsWriteQueue::new(crate::server::ts_queue::DEFAULT_BUDGET_BYTES);
     let (ctrl_write_tx, ctrl_write_rx) = mpsc::channel::<Bytes>(
         Session::CTRL_WRITE_BUFFER_CAPACITY,
     );
 
     // Spawn the writer task – it owns the write-half of the socket.
     let writer_handle = tokio::spawn(
-        session_writer(session_id, writer, ts_write_rx, ctrl_write_rx),
+        session_writer(session_id, writer, ts_write_rx, ctrl_write_rx, ts_queue_shared),
     );
 
     // Register the session
@@ -182,7 +183,7 @@ async fn handle_connection(
         session_id,
         addr,
         reader,
-        ts_write_tx,
+        ts_write_queue,
         ctrl_write_tx,
         writer_handle,
         tuner_pool,
@@ -215,7 +216,21 @@ async fn session_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut ts_rx: mpsc::Receiver<Bytes>,
     mut ctrl_rx: mpsc::Receiver<Bytes>,
+    ts_queue: Arc<TsQueueShared>,
 ) {
+    // Every TS frame that leaves this task must give its bytes back to the
+    // queue budget, including on the error paths — otherwise the budget leaks
+    // and the session throttles itself to a standstill.
+    macro_rules! write_ts {
+        ($data:expr) => {{
+            let data = $data;
+            let len = data.len();
+            let result = writer.write_all(&data).await;
+            ts_queue.release(len);
+            result
+        }};
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -237,7 +252,7 @@ async fn session_writer(
                         // ctrl channel closed – session is shutting down.
                         // Drain remaining TS frames before exiting.
                         while let Ok(data) = ts_rx.try_recv() {
-                            if writer.write_all(&data).await.is_err() { return; }
+                            if write_ts!(data).is_err() { return; }
                         }
                         let _ = writer.flush().await;
                         return;
@@ -249,7 +264,7 @@ async fn session_writer(
             msg = ts_rx.recv() => {
                 match msg {
                     Some(data) => {
-                        if let Err(e) = writer.write_all(&data).await {
+                        if let Err(e) = write_ts!(data) {
                             warn!("[Session {} writer] TS write error: {}", session_id, e);
                             return;
                         }
@@ -271,7 +286,7 @@ async fn session_writer(
                             }
                             match ts_rx.try_recv() {
                                 Ok(ts_data) => {
-                                    if let Err(e) = writer.write_all(&ts_data).await {
+                                    if let Err(e) = write_ts!(ts_data) {
                                         warn!("[Session {} writer] TS write error: {}", session_id, e);
                                         return;
                                     }

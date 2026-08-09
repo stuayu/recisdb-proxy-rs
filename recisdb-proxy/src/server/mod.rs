@@ -12,6 +12,7 @@ pub(crate) mod session_driver_selection;
 pub(crate) mod session_capacity;
 pub(crate) mod session_channel_candidates;
 pub(crate) mod session_tuner_handoff;
+pub mod ts_queue;
 
 pub use listener::{Server, ServerConfig};
 #[cfg(feature = "tls")]

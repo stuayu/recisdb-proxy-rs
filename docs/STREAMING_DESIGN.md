@@ -129,7 +129,34 @@ SharedTuner ──chunk──▶ Fanout
   または録画のみ mpsc の専用サブスクライブ経路にする)。
 - RECORD で本当に送出が追いつかない場合は**黙って落とさずエラーにする**。
   「無損失を約束できないなら、約束を破る前に知らせる」。
-- TS 書き込み mpsc(256) (D2) はクラス別容量にする: VIEW=256(現状) / PREVIEW=512 / RECORD=ビットレート×秒数。
+- TS 書き込みキュー (D2) は **フレーム数ではなくバイト予算**で制限する (実装済み: `server/ts_queue.rs`)。
+
+#### TS 書き込みキューのバイト予算 (実装済み)
+
+フレーム数での制限をやめた理由: 1 フレーム = broadcast 1 チャンク = リーダーが 1 回で
+ドライバから読めた量であり、ローカルチューナー直結なら最大 256KB、上流が別の
+recisdb-proxy(多段構成)なら通常 64KB になる。同じ「256 スロット」が構成によって
+8 秒にも 32 秒にもなり、拠点間リンクの設計値として使えない。
+
+```
+budget_bytes = bitrate_bps / 8 × ts_queue_ms / 1000
+```
+
+- `bitrate_bps`: セッションで**実測**した値 (1 秒毎サンプルの EWMA、α=0.3)。
+  未計測の間は `prefill::default_bitrate_bps` の帯域別既定値。
+  ServiceFilter=single やエンコード配信では実レートが既定値を大きく下回るため、
+  実測に寄せないと数倍過大なバッファを確保してしまう。
+- `ts_queue_ms`: クラス別。`tuner_config` の
+  `ts_queue_view_ms` (既定 8000) / `ts_queue_preview_ms` (12000) / `ts_queue_record_ms` (15000)。
+  `GET/PATCH /api/config/tuner` で変更可能 (Web ダッシュボードのフォームには未掲載)。
+- 予算はランタイムで変更される: 選局・クラス確定時と、実測ビットレートが 25% 以上動いたとき。
+- 空キューには予算超過のフレームも 1 つだけ通す。通さないと 1 チャンクが
+  設定窓より大きい構成でストリームが永久に止まる。
+- mpsc のスロット数 (8192) は輸送層の保険であり、実際の「満杯」判定はバイト予算が行う。
+
+拠点間中継 (例: 宮城・福島 ↔ 東京) では、**バッファはジッタしか吸収できない**点に注意する。
+実効帯域がストリームのビットレートを下回る場合は、いくら秒数を伸ばしても遅延が単調増加して
+最後に切れるだけなので、`ServiceFilter=single` かエンコード配信でレート自体を下げること。
 
 ### 3.3 再同期 (VIEW/PREVIEW)
 
@@ -153,8 +180,9 @@ SharedTuner ──chunk──▶ Fanout
 buffer_bytes = target_bitrate_bps / 8 × prefill_seconds × safety_factor
 ```
 
-- `target_bitrate_bps`: チャンネルの実測ビットレート (既に `SessionRegistry` が Mbps を計測済み。
-  未計測時は帯域別デフォルト: 地上波 ~18Mbps / BS ~24Mbps / 4K ~33Mbps)。
+- `target_bitrate_bps`: チャンネルの実測ビットレート。**実装済み**: セッションが 1 秒毎に
+  観測した値を EWMA (α=0.3) で保持し、プリフィルと TS 書き込み予算の両方をこれで換算する。
+  未計測の間だけ帯域別デフォルト (地上波 ~18Mbps / BS ~24Mbps / 4K ~33Mbps) を使う。
 - `prefill_seconds`: クラス別 (VIEW 1s / PREVIEW 2s / RECORD 5–10s)。DB `tuner_config` で調整可能に。
 - `safety_factor`: 1.5 程度。
 
@@ -170,12 +198,15 @@ buffer_bytes = target_bitrate_bps / 8 × prefill_seconds × safety_factor
 
 ### 4.4 設定
 
-`tuner_config` に追加:
+`tuner_config` に追加 (migration 011 / 018、いずれも実装済み):
 ```
 prefill_view_ms       INTEGER DEFAULT 1000
 prefill_preview_ms    INTEGER DEFAULT 2000
 prefill_record_ms     INTEGER DEFAULT 6000
 jitter_safety_factor  REAL    DEFAULT 1.5
+ts_queue_view_ms      INTEGER DEFAULT 8000     -- §3.2 TS 書き込みキュー
+ts_queue_preview_ms   INTEGER DEFAULT 12000
+ts_queue_record_ms    INTEGER DEFAULT 15000
 ```
 
 ---

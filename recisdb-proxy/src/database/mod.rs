@@ -177,7 +177,68 @@ impl Database {
             Database::migration_016_reclassify_band_region_from_nid,
         ),
         ("017_card_reader_name", Database::migration_017_card_reader_name),
+        ("018_ts_queue_duration_columns", Database::migration_018_ts_queue_duration_columns),
     ];
+
+    /// Migration 018: per-class TS write queue durations
+    /// (STREAMING_DESIGN.md §3.2).
+    ///
+    /// The queue used to be bounded by a frame count, which meant the amount
+    /// of slack depended on how large the upstream driver's chunks happened to
+    /// be. These express it as a duration instead; the byte budget is derived
+    /// at runtime from the measured bitrate.
+    ///
+    /// Defaults are chosen to be no tighter than the previous 256-frame
+    /// behaviour on a typical stream, and RECORD gets the most because it is
+    /// the class that must not drop.
+    fn migration_018_ts_queue_duration_columns(&self) -> Result<()> {
+        self.add_column_if_not_exists("tuner_config", "ts_queue_view_ms", "INTEGER DEFAULT 8000")?;
+        self.add_column_if_not_exists("tuner_config", "ts_queue_preview_ms", "INTEGER DEFAULT 12000")?;
+        self.add_column_if_not_exists("tuner_config", "ts_queue_record_ms", "INTEGER DEFAULT 15000")?;
+        Ok(())
+    }
+
+    /// Per-class TS write queue durations, in milliseconds.
+    ///
+    /// Falls back to the migration defaults when the row or the columns are
+    /// missing, so a caller never has to deal with a partially-migrated DB.
+    pub fn get_ts_queue_config(&self) -> Result<(u64, u64, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_queue_view_ms, ts_queue_preview_ms, ts_queue_record_ms
+             FROM tuner_config WHERE id = 1",
+        )?;
+
+        match stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        }) {
+            Ok(config) => Ok(config),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((8000, 12000, 15000)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update the per-class TS write queue durations.
+    ///
+    /// Kept separate from `update_tuner_config` so the already unwieldy
+    /// positional tuple there does not grow further.
+    pub fn update_ts_queue_config(
+        &self,
+        view_ms: u64,
+        preview_ms: u64,
+        record_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tuner_config
+             SET ts_queue_view_ms = ?1, ts_queue_preview_ms = ?2, ts_queue_record_ms = ?3
+             WHERE id = 1",
+            rusqlite::params![view_ms, preview_ms, record_ms],
+        )?;
+        Ok(())
+    }
 
     /// Migration 017: which PC/SC card reader libaribb25 should talk to.
     ///
@@ -1123,6 +1184,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    /// Migration 018 must be idempotent (the whole ledger replays from
+    /// user_version=0 on pre-ledger databases) and must leave a usable config
+    /// behind for both fresh and pre-existing rows.
+    #[test]
+    fn migration_018_adds_ts_queue_columns_idempotently() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Already applied once by `apply_migrations` during open; running it
+        // again must not error on the duplicate columns.
+        db.migration_018_ts_queue_duration_columns().unwrap();
+        db.migration_018_ts_queue_duration_columns().unwrap();
+
+        let (view_ms, preview_ms, record_ms) = db.get_ts_queue_config().unwrap();
+        assert_eq!((view_ms, preview_ms, record_ms), (8000, 12000, 15000));
+    }
+
+    /// The durations are what operators tune for a slow link, so they must
+    /// survive a write and come back out of `get_ts_queue_config`.
+    #[test]
+    fn ts_queue_durations_are_configurable() {
+        let db = Database::open_in_memory().unwrap();
+        // Ensure row 1 exists (get_tuner_config seeds it when missing).
+        let _ = db.get_tuner_config().unwrap();
+
+        db.connection()
+            .execute(
+                "UPDATE tuner_config SET ts_queue_view_ms = 3000,
+                        ts_queue_preview_ms = 4000, ts_queue_record_ms = 30000
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.get_ts_queue_config().unwrap(), (3000, 4000, 30000));
     }
 
     /// Migration 016 must correct terrestrial rows that migration 013's

@@ -39,6 +39,48 @@ impl Default for PrefillRuntimeConfig {
     }
 }
 
+/// Per-class TS write queue durations loaded from `tuner_config`
+/// (STREAMING_DESIGN.md §3.2).
+///
+/// A duration, not a byte count: the byte budget is computed at runtime from
+/// the session's measured bitrate, so one setting means the same thing whether
+/// the stream is a full 18 Mbps multiplex or a 2 Mbps transcode relayed
+/// between sites.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TsQueueRuntimeConfig {
+    pub view_ms: u64,
+    pub preview_ms: u64,
+    pub record_ms: u64,
+}
+
+impl Default for TsQueueRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            view_ms: 8_000,
+            preview_ms: 12_000,
+            record_ms: 15_000,
+        }
+    }
+}
+
+pub(super) async fn load_ts_queue_runtime_config(
+    database: &DatabaseHandle,
+    session_id: u64,
+) -> TsQueueRuntimeConfig {
+    let db = database.lock().await;
+    match db.get_ts_queue_config() {
+        Ok((view_ms, preview_ms, record_ms)) => TsQueueRuntimeConfig {
+            view_ms,
+            preview_ms,
+            record_ms,
+        },
+        Err(e) => {
+            warn!("[Session {}] Failed to load TS queue config: {}", session_id, e);
+            TsQueueRuntimeConfig::default()
+        }
+    }
+}
+
 pub(super) async fn load_tsreplace_runtime_config(
     database: &DatabaseHandle,
     session_id: u64,

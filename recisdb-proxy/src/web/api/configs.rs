@@ -88,6 +88,7 @@ pub async fn get_tuner_config(
         prefill_record_ms,
         jitter_safety_factor,
     ) = db.get_tuner_config()?;
+    let (ts_queue_view_ms, ts_queue_preview_ms, ts_queue_record_ms) = db.get_ts_queue_config()?;
 
     Ok(Json(json!({
         "success": true,
@@ -103,6 +104,9 @@ pub async fn get_tuner_config(
             "prefill_preview_ms": prefill_preview_ms,
             "prefill_record_ms": prefill_record_ms,
             "jitter_safety_factor": jitter_safety_factor,
+            "ts_queue_view_ms": ts_queue_view_ms,
+            "ts_queue_preview_ms": ts_queue_preview_ms,
+            "ts_queue_record_ms": ts_queue_record_ms,
         }
     })))
 }
@@ -122,6 +126,12 @@ pub struct UpdateTunerConfigRequest {
     pub prefill_preview_ms: Option<u64>,
     pub prefill_record_ms: Option<u64>,
     pub jitter_safety_factor: Option<f64>,
+    /// STREAMING_DESIGN.md §3.2: per-class TS write queue duration. The byte
+    /// budget is derived from this and the measured bitrate, so the same value
+    /// means the same amount of slack on any link.
+    pub ts_queue_view_ms: Option<u64>,
+    pub ts_queue_preview_ms: Option<u64>,
+    pub ts_queue_record_ms: Option<u64>,
 }
 
 /// Update tuner optimization configuration.
@@ -209,6 +219,25 @@ pub async fn update_tuner_config(
             if val > 0.0 {
                 jitter_safety_factor = val;
             }
+        }
+
+        {
+            let (mut view_ms, mut preview_ms, mut record_ms) =
+                db.get_ts_queue_config().unwrap_or((8000, 12000, 15000));
+            // 0 is rejected rather than accepted as "no buffering": it would
+            // make every frame collide with the budget and turn a VIEW session
+            // into a drop machine.
+            if let Some(val) = payload.ts_queue_view_ms {
+                if val > 0 { view_ms = val; }
+            }
+            if let Some(val) = payload.ts_queue_preview_ms {
+                if val > 0 { preview_ms = val; }
+            }
+            if let Some(val) = payload.ts_queue_record_ms {
+                if val > 0 { record_ms = val; }
+            }
+            db.update_ts_queue_config(view_ms, preview_ms, record_ms)
+                .map_err(|e| ApiError::internal(format!("Failed to save configuration: {}", e)))?;
         }
 
         db.update_tuner_config(

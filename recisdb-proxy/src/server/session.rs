@@ -46,7 +46,7 @@ enum SessionState {
 use crate::server::client_view::ChannelEntry;
 use crate::server::session_runtime::{
     load_prefill_runtime_config, load_tsreplace_runtime_config, resolve_encode_sids,
-    PrefillRuntimeConfig, TsreplaceRuntimeConfig,
+    PrefillRuntimeConfig, TsreplaceRuntimeConfig, load_ts_queue_runtime_config,
 };
 use crate::server::session_space_cache::{
     clear_caches as clear_session_caches, current_or_default_tuner_path,
@@ -62,12 +62,12 @@ use crate::tuner::acquire::{acquire, AcquireRequest};
 use crate::server::session_tuner_handoff::handoff_current_tuner;
 
 
-/// Capacity of the per-session TS write buffer.
+/// Weight of a new sample in the measured-bitrate EWMA.
 ///
-/// Each slot contains one pre-encoded TS frame (~188 KB–256 KB).
-/// 256 slots ≈ 48–64 MB ≈ 15–25 seconds of buffering at 25 Mbps.
-/// This absorbs short network congestion without dropping data.
-const TS_WRITE_BUFFER_CAPACITY: usize = 256;
+/// The rate is sampled once a second; 0.3 settles within a few seconds while
+/// still ignoring one-off spikes. Used to size the prefill and TS write
+/// buffers in *seconds* rather than in bytes guessed from the band.
+const BITRATE_EWMA_ALPHA: f64 = 0.3;
 
 /// Capacity of the per-session control message write buffer.
 ///
@@ -75,6 +75,7 @@ const TS_WRITE_BUFFER_CAPACITY: usize = 256;
 /// infrequent. 64 slots is more than sufficient.
 const CTRL_WRITE_BUFFER_CAPACITY: usize = 64;
 
+use crate::server::ts_queue::{budget_bytes, TsWriteQueue};
 use crate::server::session_backpressure::{
     send_ts_frame, should_auto_promote_to_record, TsFrameSendOutcome,
     RECORD_OVERFLOW_TIMEOUT, RECORD_PRIORITY_THRESHOLD,
@@ -92,7 +93,7 @@ pub struct Session {
     /// Sender for TS data frames (pre-encoded wire bytes) to the writer task.
     /// `try_send` is used to avoid blocking the select loop; when the buffer
     /// is full, oldest entries are drained to stay close to real-time.
-    ts_write_tx: mpsc::Sender<Bytes>,
+    ts_write_queue: TsWriteQueue,
     /// Sender for control messages (pre-encoded wire bytes) to the writer task.
     /// Control messages have priority in the writer task.
     ctrl_write_tx: mpsc::Sender<Bytes>,
@@ -217,11 +218,20 @@ pub struct Session {
     /// class-specific backpressure policy: while filling, wire frames are
     /// queued here instead of being handed to the writer task.
     prefill_buffer: PrefillBuffer,
+    /// EWMA of the bitrate actually observed on this session, in bits per
+    /// second, or `None` until the first sample lands.
+    ///
+    /// Both the prefill target and the TS write budget are expressed in
+    /// seconds; translating seconds into bytes needs a rate. The per-band
+    /// constants in `prefill::default_bitrate_bps` are a starting guess only —
+    /// a single-service-filtered stream, or a transcoded one, runs at a small
+    /// fraction of the full multiplex, and sizing a buffer for 18 Mbps when the
+    /// link actually carries 2 Mbps overshoots by 9x.
+    measured_bitrate_bps: Option<u64>,
 }
 
 impl Session {
-    /// Capacity constants exposed for `handle_connection` in listener.rs.
-    pub const TS_WRITE_BUFFER_CAPACITY: usize = TS_WRITE_BUFFER_CAPACITY;
+    /// Capacity constant exposed for `handle_connection` in listener.rs.
     pub const CTRL_WRITE_BUFFER_CAPACITY: usize = CTRL_WRITE_BUFFER_CAPACITY;
 
     /// Create a new session.
@@ -229,7 +239,7 @@ impl Session {
         id: u64,
         addr: SocketAddr,
         socket_reader: OwnedReadHalf,
-        ts_write_tx: mpsc::Sender<Bytes>,
+        ts_write_queue: TsWriteQueue,
         ctrl_write_tx: mpsc::Sender<Bytes>,
         writer_handle: tokio::task::JoinHandle<()>,
         tuner_pool: Arc<TunerPool>,
@@ -243,7 +253,7 @@ impl Session {
             id,
             addr,
             socket_reader,
-            ts_write_tx,
+            ts_write_queue,
             ctrl_write_tx,
             writer_handle: Some(writer_handle),
             read_buf: BytesMut::with_capacity(65536),
@@ -302,6 +312,7 @@ impl Session {
             current_sid: None,
             stream_class: StreamClass::View,
             prefill_buffer: PrefillBuffer::new(),
+            measured_bitrate_bps: None,
         }
     }
 
@@ -356,16 +367,85 @@ impl Session {
             StreamClass::Preview => cfg.preview_ms,
             StreamClass::Record => cfg.record_ms,
         };
-        let band = self.current_nid.map(BandType::from_nid);
-        let bitrate_bps = default_bitrate_bps(band);
+        let bitrate_bps = self.sizing_bitrate_bps();
         let target_bytes = prefill_target_bytes(bitrate_bps, prefill_ms, cfg.safety_factor);
 
         debug!(
-            "[Session {}] Prefill buffer reset: class={:?} band={:?} bitrate_bps={} prefill_ms={} safety_factor={} target_bytes={}",
-            self.id, self.stream_class, band, bitrate_bps, prefill_ms, cfg.safety_factor, target_bytes
+            "[Session {}] Prefill buffer reset: class={:?} bitrate_bps={} (measured={:?}) prefill_ms={} safety_factor={} target_bytes={}",
+            self.id, self.stream_class, bitrate_bps, self.measured_bitrate_bps,
+            prefill_ms, cfg.safety_factor, target_bytes
         );
 
         self.prefill_buffer.reset(target_bytes);
+        self.resize_ts_write_budget().await;
+    }
+
+    /// Bitrate to size the time-based buffers with: the measured rate once one
+    /// exists, otherwise the per-band default.
+    ///
+    /// `current_nid` is classified via `BandType::from_nid`; an unresolved NID
+    /// (legacy v1 `SetChannel` clients) falls back to the "unknown" default.
+    fn sizing_bitrate_bps(&self) -> u64 {
+        self.measured_bitrate_bps.unwrap_or_else(|| {
+            default_bitrate_bps(self.current_nid.map(BandType::from_nid))
+        })
+    }
+
+    /// Re-size the TS write queue's byte budget from the configured per-class
+    /// duration and the current bitrate estimate (STREAMING_DESIGN.md §3.2).
+    ///
+    /// Sizing the queue in seconds rather than in frames is what makes one
+    /// configuration behave the same across deployments: a frame is one
+    /// broadcast chunk, and chunk size depends on how much the reader pulled
+    /// from the driver in one go (up to 256 KB direct, typically 64 KB through
+    /// another proxy) — so a fixed frame count bought wildly different amounts
+    /// of slack on a cascaded link than on a local one.
+    async fn resize_ts_write_budget(&mut self) {
+        let cfg = load_ts_queue_runtime_config(&self.database, self.id).await;
+        let queue_ms = match self.stream_class {
+            StreamClass::View => cfg.view_ms,
+            StreamClass::Preview => cfg.preview_ms,
+            StreamClass::Record => cfg.record_ms,
+        };
+        let bitrate_bps = self.sizing_bitrate_bps();
+        let budget = budget_bytes(bitrate_bps, queue_ms);
+
+        debug!(
+            "[Session {}] TS write budget: class={:?} bitrate_bps={} queue_ms={} budget_bytes={} (queued={})",
+            self.id, self.stream_class, bitrate_bps, queue_ms, budget,
+            self.ts_write_queue.shared().queued()
+        );
+
+        self.ts_write_queue.shared().set_budget(budget);
+    }
+
+    /// Fold a freshly measured bitrate into the EWMA and re-size the buffers
+    /// when the estimate has moved enough to matter.
+    ///
+    /// Called from the once-a-second stats path. Re-sizing is throttled by a
+    /// relative threshold so a stream whose rate jitters by a few percent does
+    /// not churn the budget every second.
+    async fn observe_bitrate(&mut self, bitrate_mbps: f64) {
+        if !bitrate_mbps.is_finite() || bitrate_mbps <= 0.0 {
+            return;
+        }
+        let sample_bps = (bitrate_mbps * 1_000_000.0) as u64;
+
+        let (updated, changed_enough) = match self.measured_bitrate_bps {
+            None => (sample_bps, true),
+            Some(prev) => {
+                let ewma = (prev as f64) * (1.0 - BITRATE_EWMA_ALPHA)
+                    + (sample_bps as f64) * BITRATE_EWMA_ALPHA;
+                let ewma = ewma.max(1.0) as u64;
+                let delta = ewma.abs_diff(prev) as f64 / prev.max(1) as f64;
+                (ewma, delta >= 0.25)
+            }
+        };
+        self.measured_bitrate_bps = Some(updated);
+
+        if changed_enough {
+            self.resize_ts_write_budget().await;
+        }
     }
 
     /// Detach from the shared encoder (if any).
@@ -2670,6 +2750,13 @@ impl Session {
                 self.signal_samples += 1;
                 self.signal_level_sum += signal_level as f64;
 
+                // Feed the measurement back into the time-based buffer sizing
+                // (STREAMING_DESIGN.md §4.2): a single-service-filtered or
+                // transcoded stream runs well below the per-band default, and
+                // over a WAN link the difference decides whether "8 seconds of
+                // buffer" means 8 seconds or 1.
+                self.observe_bitrate(bitrate_mbps).await;
+
                 self.bytes_since_last = 0;
                 self.interval_packets_total = 0;
                 self.interval_packets_dropped = 0;
@@ -2736,7 +2823,7 @@ impl Session {
         for frame in frames {
             let data_len = frame.len();
 
-            match send_ts_frame(&self.ts_write_tx, frame, self.stream_class, RECORD_OVERFLOW_TIMEOUT).await {
+            match send_ts_frame(&self.ts_write_queue, frame, self.stream_class, RECORD_OVERFLOW_TIMEOUT).await {
                 TsFrameSendOutcome::Sent => {}
                 TsFrameSendOutcome::DroppedFull => {
                     // The write buffer is full — the writer task can't keep up
@@ -2900,7 +2987,7 @@ impl Session {
         // to drain remaining data and exit.  We then wait for it to finish so
         // that the client receives any final control messages (e.g. error).
         // Use a bounded clone so we can explicitly drop and await.
-        drop(std::mem::replace(&mut self.ts_write_tx, mpsc::channel(1).0));
+        drop(std::mem::replace(&mut self.ts_write_queue, TsWriteQueue::new(1).0));
         drop(std::mem::replace(&mut self.ctrl_write_tx, mpsc::channel(1).0));
         if let Some(handle) = self.writer_handle.take() {
             // Give the writer a few seconds to flush remaining data.
@@ -3101,12 +3188,22 @@ mod tests {
     /// keep the timeout test fast while still exercising the real code path.
     const TEST_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 
-    #[tokio::test]
-    async fn view_class_drops_frame_when_write_buffer_full() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
-        tx.try_send(Bytes::from_static(b"first")).unwrap(); // fill the buffer
+    /// Build a queue whose byte budget admits exactly one 5-byte frame, so the
+    /// "full" branch is reached by *bytes* rather than by slot count.
+    fn tiny_queue() -> (TsWriteQueue, mpsc::Receiver<Bytes>) {
+        let (queue, rx, _shared) = TsWriteQueue::new(5);
+        (queue, rx)
+    }
 
-        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::View, TEST_RECORD_TIMEOUT).await;
+    #[tokio::test]
+    async fn view_class_drops_frame_when_write_budget_is_exhausted() {
+        let (queue, mut rx) = tiny_queue();
+        assert_eq!(
+            send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            TsFrameSendOutcome::Sent
+        );
+
+        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::View, TEST_RECORD_TIMEOUT).await;
         assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
 
         // Only the original frame is queued; the second was dropped, not enqueued.
@@ -3115,47 +3212,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_class_drops_frame_when_write_buffer_full() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
-        tx.try_send(Bytes::from_static(b"first")).unwrap();
+    async fn preview_class_drops_frame_when_write_budget_is_exhausted() {
+        let (queue, mut rx) = tiny_queue();
+        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
 
-        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
+        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
         assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
         assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn record_class_times_out_when_buffer_stays_full() {
-        let (tx, _rx) = mpsc::channel::<Bytes>(1);
-        tx.try_send(Bytes::from_static(b"first")).unwrap(); // fill the buffer, never drained
+    async fn record_class_times_out_when_the_queue_never_drains() {
+        let (queue, _rx) = tiny_queue();
+        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
 
         // RECORD must never drop — it blocks up to the timeout, then
         // reports the overflow instead of silently losing data
         // (STREAMING_DESIGN.md §12-1).
-        let outcome = send_ts_frame(&tx, Bytes::from_static(b"second"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
         assert_eq!(outcome, TsFrameSendOutcome::RecordOverflowTimeout);
     }
 
     #[tokio::test]
-    async fn record_class_sends_once_buffer_has_room() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(1);
-        let outcome = send_ts_frame(&tx, Bytes::from_static(b"data"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+    async fn record_class_sends_once_the_queue_drains() {
+        let (queue, mut rx) = tiny_queue();
+        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+
+        // Simulate the writer task draining the first frame while the sender
+        // waits: the RECORD send must resume and deliver, not time out.
+        let shared = Arc::clone(queue.shared());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            shared.release(5);
+        });
+
+        let outcome = send_ts_frame(
+            &queue,
+            Bytes::from_static(b"secnd"),
+            StreamClass::Record,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(outcome, TsFrameSendOutcome::Sent);
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"data"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"secnd"));
     }
 
     #[tokio::test]
     async fn writer_closed_is_detected_for_view_and_record() {
-        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        let (queue, rx, _shared) = TsWriteQueue::new(1024);
         drop(rx);
         assert_eq!(
-            send_ts_frame(&tx, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(&queue, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
             TsFrameSendOutcome::WriterClosed
         );
         assert_eq!(
-            send_ts_frame(&tx, Bytes::from_static(b"y"), StreamClass::Record, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(&queue, Bytes::from_static(b"y"), StreamClass::Record, TEST_RECORD_TIMEOUT).await,
             TsFrameSendOutcome::WriterClosed
         );
+    }
+
+    /// A failed hand-off must not leave its bytes counted against the budget —
+    /// a leak here throttles the session down to a standstill over time.
+    #[tokio::test]
+    async fn a_failed_handoff_returns_its_bytes_to_the_budget() {
+        let (queue, rx, shared) = TsWriteQueue::new(1024);
+        drop(rx);
+        assert_eq!(
+            send_ts_frame(&queue, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            TsFrameSendOutcome::WriterClosed
+        );
+        assert_eq!(shared.queued(), 0, "reservation must be released on failure");
+    }
+
+    /// The point of the seconds-based budget: the same setting must mean the
+    /// same amount of time regardless of how big the upstream's chunks are.
+    #[test]
+    fn budget_is_a_duration_not_a_frame_count() {
+        // 8 s of an 18 Mbps multiplex vs. 8 s of a 2 Mbps transcode.
+        assert_eq!(budget_bytes(18_000_000, 8_000), 18_000_000);
+        assert_eq!(budget_bytes(2_000_000, 8_000), 2_000_000);
+
+        // Frame size does not enter into it: 64 KB chunks and 256 KB chunks
+        // both get 8 seconds' worth.
+        let full = budget_bytes(18_000_000, 8_000);
+        assert_eq!(full / (64 * 1024), 274, "≈274 frames at 64KB");
+        assert_eq!(full / (256 * 1024), 68, "≈68 frames at 256KB");
     }
 }
