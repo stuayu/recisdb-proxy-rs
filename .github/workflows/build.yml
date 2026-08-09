@@ -84,7 +84,10 @@ jobs:
             Sort-Object { [version]$_ } | Select-Object -Last 1
           if ($pick) {
             Write-Host "selected MSVC toolset: $pick"
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset=version=$pick"
+            # -T は「世代名,version=詳細版」で指定する。version= だけだと
+            # ジェネレーター既定の世代 (VS 2026 なら v145) の中から探してしまい、
+            # v143 世代である 14.4x を渡すと "invalid version specification" になる。
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset=v143,version=$pick"
           } else {
             Write-Host "::warning::no 14.4x toolset on this image; falling back to the default toolset"
             Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset="
