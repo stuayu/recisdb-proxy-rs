@@ -141,6 +141,15 @@ fn prep_cmake(cx: TargetVar) -> cmake::Config {
                     cm.generator(generator);
                 }
 
+                // CI ではランナーに入っている MSVC ツールセットを選びたい。
+                // VS 2026 (MSVC 19.51) だと libaribb25 のビルドが通らないため、
+                // CMAKE_GENERATOR_TOOLSET (例: "version=14.44") を cmake の -T に渡す。
+                if let Ok(toolset) = var("CMAKE_GENERATOR_TOOLSET") {
+                    if !toolset.is_empty() {
+                        cm.generator_toolset(toolset);
+                    }
+                }
+
                 if cx.feat.clone().unwrap_or_default().contains("crt-static") {
                     cm.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded");
                 }

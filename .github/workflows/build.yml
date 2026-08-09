@@ -17,11 +17,6 @@ concurrency:
 jobs:
   build-windows:
     runs-on: windows-2025
-    env:
-      # b25-sys/build.rs は CMake に VS を自動検出させるが、ランナーに VS 2026
-      # (MSVC 19.51 preview) が入ると libaribb25 の ARM64 ビルドが大量の
-      # コンパイルエラーで落ちる。ツールセットを VS 2022 に固定する。
-      CMAKE_GENERATOR: "Visual Studio 17 2022"
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +54,42 @@ jobs:
         with:
           cmake-version: '3.31.x'
 
+      # windows ランナーのイメージに VS 2022 が存在しないことがあるので、ジェネレーターではなく
+      # 「実在する MSVC ツールセット」を検出して 14.4x (v143) があればそれを使う。
+      # 14.51 (VS 2026 / MSVC 19.51 preview) だと tsreadex は C2664、libaribb25 は
+      # ARM64 で大量のコンパイルエラーになる。
+      - name: Detect MSVC toolset
+        id: msvc
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Host "::warning::vswhere.exe not found; using the default toolset"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset="
+            exit 0
+          }
+          $installs = & $vswhere -products * -prerelease -format json | ConvertFrom-Json
+          $toolsets = @()
+          foreach ($i in $installs) {
+            Write-Host "VS: $($i.displayName) $($i.installationVersion) -> $($i.installationPath)"
+            $dir = Join-Path $i.installationPath 'VC\Tools\MSVC'
+            if (Test-Path $dir) {
+              foreach ($d in Get-ChildItem $dir -Directory) {
+                Write-Host "  toolset: $($d.Name)"
+                $toolsets += $d.Name
+              }
+            }
+          }
+          $pick = $toolsets | Where-Object { $_ -like '14.4*' } |
+            Sort-Object { [version]$_ } | Select-Object -Last 1
+          if ($pick) {
+            Write-Host "selected MSVC toolset: $pick"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset=version=$pick"
+          } else {
+            Write-Host "::warning::no 14.4x toolset on this image; falling back to the default toolset"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "toolset="
+          }
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,6 +109,9 @@ jobs:
       - name: Build (Release)
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"
+          # b25-sys/build.rs は CMAKE_GENERATOR_TOOLSET を cmake の -T に渡す。
+          $toolset = "${{ steps.msvc.outputs.toolset }}"
+          if ($toolset) { $env:CMAKE_GENERATOR_TOOLSET = $toolset }
           cargo build --workspace --release --target ${{ matrix.arch }}
 
       - name: Prepare artifacts
