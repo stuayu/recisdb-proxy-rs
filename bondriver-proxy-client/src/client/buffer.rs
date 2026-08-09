@@ -8,7 +8,13 @@ use std::time::Duration;
 /// TS packet size.
 pub const TS_PACKET_SIZE: usize = 188;
 
-/// Size of the ring buffer (100 MB).
+/// Size of the ring buffer: 188 × 1024 × 100 = **18.4 MiB (19.25 MB)**.
+///
+/// Roughly 9 seconds at 16 Mbps, 6 at 24 Mbps. This is how much network
+/// hiccup the client can absorb on its own before the consumer-side resync
+/// starts discarding, so it is the number to size a site-to-site link against.
+/// (The comment here used to claim 100 MB, which is what the packet count
+/// multiplies out to only if you forget the 188.)
 pub const RING_BUFFER_SIZE: usize = TS_PACKET_SIZE * 1024 * 100;
 
 /// When the consumer has fallen so far behind that the buffer is full, it
@@ -364,6 +370,19 @@ unsafe impl Sync for TsRingBuffer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The buffer depth is what a site-to-site link is sized against, so keep
+    /// the constant and its documented value from drifting apart (the comment
+    /// once claimed 100 MB — five times the truth).
+    #[test]
+    fn ring_buffer_depth_is_what_the_docs_claim() {
+        assert_eq!(RING_BUFFER_SIZE, 19_251_200);
+        assert_eq!(RING_BUFFER_SIZE % TS_PACKET_SIZE, 0, "must hold whole packets");
+
+        // ~9.6 s at 16 Mbps.
+        let seconds_at_16mbps = RING_BUFFER_SIZE as f64 / (16_000_000.0 / 8.0);
+        assert!((9.0..10.0).contains(&seconds_at_16mbps), "{seconds_at_16mbps}");
+    }
 
     #[test]
     fn test_write_read() {
