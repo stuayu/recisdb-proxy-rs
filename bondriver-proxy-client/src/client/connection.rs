@@ -234,13 +234,37 @@ impl Connection {
     }
 
     /// Connect to the server.
+    ///
+    /// A failed attempt must leave the connection **retryable**. Parking it in
+    /// `Error` would make the instance permanently dead: `open_tuner` only
+    /// connects from `Disconnected`, and only `disconnect()` (i.e. `Release`)
+    /// clears `Error` — so a transient outage while the host is starting up
+    /// would require reloading the driver. On a site-to-site link that is a
+    /// routine occurrence, not an exceptional one.
     pub fn connect(self: &Arc<Self>) -> bool {
         file_log!(info, "Connection::connect() called");
 
+        {
+            let current = *self.state.lock();
+            file_log!(debug, "connect: Current state = {:?}", current);
+            match current {
+                ConnectionState::Disconnected => {}
+                ConnectionState::Error => {
+                    // Remains of a previous failed attempt (runtime, channels,
+                    // half-open supervisor). Tear them down, then retry.
+                    file_log!(info, "connect: retrying after a previous failed attempt");
+                    self.disconnect();
+                }
+                other => {
+                    file_log!(warn, "connect: Already connected or connecting, state = {:?}", other);
+                    return false;
+                }
+            }
+        }
+
         let mut state = self.state.lock();
-        file_log!(debug, "connect: Current state = {:?}", *state);
         if *state != ConnectionState::Disconnected {
-            file_log!(warn, "connect: Already connected or connecting, state = {:?}", *state);
+            file_log!(warn, "connect: State changed while retrying: {:?}", *state);
             return false;
         }
         *state = ConnectionState::Connecting;
@@ -267,7 +291,8 @@ impl Connection {
             Err(e) => {
                 file_log!(error, "connect: Failed to create runtime: {}", e);
                 error!("Failed to create runtime: {}", e);
-                *self.state.lock() = ConnectionState::Error;
+                // Back to Disconnected, not Error — see `connect`'s doc comment.
+                self.disconnect();
                 return false;
             }
         };
@@ -305,7 +330,9 @@ impl Connection {
         if !self.send_hello() {
             file_log!(error, "connect: Handshake failed");
             error!("Handshake failed");
-            *self.state.lock() = ConnectionState::Error;
+            // Tear the failed attempt down so the next OpenTuner can retry
+            // instead of finding the instance parked in Error forever.
+            self.disconnect();
             return false;
         }
 
@@ -1323,6 +1350,34 @@ fn extract_server_name(addr: &str) -> ServerName<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection attempt that fails must leave the instance ready to try
+    /// again. Parking it in `Error` made the object dead until the host
+    /// reloaded the driver — a transient outage at startup should not cost a
+    /// TVTest restart.
+    #[test]
+    fn a_failed_connect_leaves_the_instance_retryable() {
+        let conn = Connection::new(ConnectionConfig {
+            // Nothing listening: port 1 refuses immediately on every platform
+            // we support, so this stays fast.
+            server_addr: "127.0.0.1:1".to_string(),
+            connect_timeout: Duration::from_millis(300),
+            read_timeout: Duration::from_millis(300),
+            ..ConnectionConfig::default()
+        });
+
+        assert!(!conn.connect(), "connect must report failure");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Disconnected,
+            "a failed attempt must not park the instance in Error"
+        );
+
+        // The second call must actually attempt again rather than short-circuit
+        // on a leftover state.
+        assert!(!conn.connect());
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+    }
 
     #[test]
     fn backoff_starts_at_initial() {

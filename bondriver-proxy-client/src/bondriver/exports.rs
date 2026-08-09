@@ -191,7 +191,13 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
     let conn_state = state.connection.state();
     file_log!(debug, "OpenTuner: Connection state = {:?}", conn_state);
 
-    if conn_state == ConnectionState::Disconnected {
+    // `Error` is retryable: a host that calls OpenTuner again after a failure
+    // (TVTest's retry button, EDCB rebuilding a tuner between scans) must get a
+    // fresh attempt rather than a permanently dead instance.
+    if matches!(
+        conn_state,
+        ConnectionState::Disconnected | ConnectionState::Error
+    ) {
         file_log!(info, "OpenTuner: Connecting to server...");
         if !state.connection.connect() {
             file_log!(error, "OpenTuner: Failed to connect to server");
