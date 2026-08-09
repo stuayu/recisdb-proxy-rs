@@ -717,6 +717,17 @@ fn analyze_ts_stream(
     let start_time = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(ts_read_timeout_ms);
 
+    // `ts_read_timeout_ms` is the budget for *collecting enough tables*, and
+    // its default is deliberately generous (5 minutes) because SDT/NIT can
+    // take a while to come around on a busy multiplex. It is the wrong
+    // budget for "is this channel producing any TS at all": when a tuner
+    // locks but never delivers a byte, spending the full timeout — three
+    // times over, since the caller retries — burns a quarter hour on a
+    // single channel and makes a 50-channel scan effectively never finish.
+    // So bail out early if nothing at all has arrived, while still allowing
+    // the full timeout once the stream is flowing.
+    const NO_DATA_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(10);
+
     let mut total_bytes_read = 0usize;
     let mut reads = 0usize;
     let mut attempts = 0usize;
@@ -725,6 +736,15 @@ fn analyze_ts_stream(
     let mut backoff_ms: u64 = 1;
 
     while !analyzer.is_complete() && start_time.elapsed() < timeout {
+        if total_bytes_read == 0 && start_time.elapsed() >= NO_DATA_GIVE_UP {
+            warn!(
+                "analyze_ts_stream: No TS data at all after {:?} ({} attempts) — giving up on this channel",
+                start_time.elapsed(),
+                attempts
+            );
+            break;
+        }
+
         // 1) WaitTsStream は “ヒント”。ゲートにしない（実装差吸収）[2](https://support.rockwellautomation.com/app/answers/answer_view/a_id/1153049/~/studio-5000-logix-designer-error-0xc0000005-on-windows-11-24h2-)
         let waited = tuner.wait_ts_stream(TS_WAIT_MS);
 

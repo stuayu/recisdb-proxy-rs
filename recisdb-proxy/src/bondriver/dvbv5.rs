@@ -285,19 +285,6 @@ impl DvbV5Tuner {
         ];
         set_properties(fe_fd, &mut tune).map_err(io::Error::from)?;
 
-        // Full TS tap: pass every PID through to the dvr device.
-        let filter = DmxPesFilterParams {
-            pid: FULL_TS_PID,
-            input: DMX_IN_FRONTEND,
-            output: DMX_OUT_TS_TAP,
-            pes_type: DMX_PES_OTHER,
-            flags: DMX_IMMEDIATE_START,
-        };
-        unsafe {
-            dmx_set_pes_filter(self.demux_fd.as_raw_fd(), &filter as *const DmxPesFilterParams)
-        }
-        .map_err(io::Error::from)?;
-
         // Poll for lock, but deliberately do not fail set_channel if it
         // never locks: of the 50 ISDB-T UHF channels the scanner walks, only
         // a handful are actually broadcasting in any given region, and an
@@ -353,6 +340,37 @@ impl DvbV5Tuner {
             }
             std::thread::sleep(std::time::Duration::from_millis(LOCK_POLL_INTERVAL_MS));
             waited_ms += LOCK_POLL_INTERVAL_MS;
+        }
+
+        // Start the demux only once the frontend has settled, and only if it
+        // locked at all.
+        //
+        // Order matters here in a way it doesn't for a plain PCI demodulator.
+        // Installing the filter is what makes the kernel call the driver's
+        // start_feed, and for USB parts that is when the driver asks the
+        // device to begin streaming — smsdvb, for instance, sends a PID
+        // filter request to the Siano firmware at that moment. Issuing it
+        // while the frontend is still hunting can leave the device never
+        // actually streaming, which shows up as a channel that locks and
+        // then delivers zero bytes forever. libdvbv5 (and therefore
+        // recisdb-rs, and dvbv5-zap) tunes, waits for lock, and only then
+        // sets the PES filter; this follows the same order.
+        //
+        // Skipping the filter entirely when there is no lock also avoids
+        // leaving a feed running on an empty channel between scan steps.
+        if locked {
+            // Full TS tap: pass every PID through to the dvr device.
+            let filter = DmxPesFilterParams {
+                pid: FULL_TS_PID,
+                input: DMX_IN_FRONTEND,
+                output: DMX_OUT_TS_TAP,
+                pes_type: DMX_PES_OTHER,
+                flags: DMX_IMMEDIATE_START,
+            };
+            unsafe {
+                dmx_set_pes_filter(self.demux_fd.as_raw_fd(), &filter as *const DmxPesFilterParams)
+            }
+            .map_err(io::Error::from)?;
         }
 
         // Info rather than debug: a scan walks 50 channels and the whole
