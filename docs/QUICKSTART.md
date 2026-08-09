@@ -4,14 +4,29 @@
 
 ### Windows
 
-1. [Releases](https://github.com/kazuki0824/recisdb-rs/releases) から最新のリリースをダウンロード
-2. 適当なフォルダに `recisdb-proxy.exe` と `recisdb-proxy-setup.exe` を配置
+1. [Releases](https://github.com/stuayu/recisdb-proxy-rs/releases) から
+   `recisdb-{tag}-win-x64.zip` をダウンロードして展開
+2. 展開先の `recisdb-proxy.exe` と `recisdb-proxy-setup.exe` をそのまま使います
 
-### Linux (Ubuntu 20.04+)
+### Linux / macOS
+
+コピー&ペーストだけで完了する手順を README にまとめています
+(ダウンロード・展開・pcscd・udev ルール・サービス登録まで)。
+
+- [Linux へのインストール](../README.md#linux-へのインストール-コピペで完了)
+- [macOS へのインストール](../README.md#macos-へのインストール-コピペで完了)
+
+要点だけ書くと、リリースの tar.gz は 1 階層のフォルダに
+`recisdb-proxy` / `recisdb-proxy-setup` / `recisdb-proxy.toml.example` を含むので、
+次のように展開します。
 
 ```bash
-wget https://github.com/kazuki0824/recisdb-rs/releases/download/<VERSION>/recisdb-proxy
-chmod +x recisdb-proxy
+REPO=stuayu/recisdb-proxy-rs
+TAG=$(wget -qO- "https://api.github.com/repos/$REPO/releases" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+wget -O /tmp/recisdb-proxy.tar.gz \
+  "https://github.com/$REPO/releases/download/$TAG/recisdb-proxy-$TAG-linux-amd64.tar.gz"
+sudo mkdir -p /opt/recisdb-proxy
+sudo tar xzf /tmp/recisdb-proxy.tar.gz -C /opt/recisdb-proxy --strip-components=1
 ```
 
 ## はじめての方: かんたんセットアップ (GUI)
@@ -34,7 +49,8 @@ recisdb-proxy
 
 デフォルト設定で起動します：
 - **プロキシサーバー**: `0.0.0.0:40070`
-- **Webダッシュボード**: `http://0.0.0.0:40080`
+- **Webダッシュボード**: `http://127.0.0.1:40080` (既定はループバックのみ。別PCから開くには
+  `--web-listen 0.0.0.0:40080` か、設定ファイルの `web_listen` を指定)
 - **DB**: `./recisdb-proxy.db`
 
 ### 2. BonDriverを指定して起動
@@ -58,7 +74,10 @@ recisdb-proxy --config recisdb-proxy.toml
 ## サービスとして常時稼働させる
 
 PC起動時に自動で開始させるには、OSのサービスとして登録します (Linux: systemd / macOS: launchd /
-Windows: サービスコントロールマネージャー)。
+Windows: サービスコントロールマネージャー)。生成されるユニット/plist の中身、ログの見方、
+ユーザースコープの注意点 (linger・udev) までは
+[README の「サービスとして常時稼働させる」](../README.md#サービスとして常時稼働させる)
+に詳しく書いています。
 
 ```bash
 # システム全体に登録する (Linux/macOSは root 権限、Windowsは管理者権限が必要)

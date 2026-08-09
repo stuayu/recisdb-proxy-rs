@@ -144,6 +144,10 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 上記以外の環境ではソースからビルドしてください (後述の [ビルド](#ビルド) と
 [docs/BUILD.md](docs/BUILD.md))。
 
+Linux / macOS はコマンドをコピー&ペーストするだけで導入できます
+([Linux へのインストール](#linux-へのインストール-コピペで完了) /
+[macOS へのインストール](#macos-へのインストール-コピペで完了))。
+
 ### かんたんセットアップ (はじめての方はこちら)
 
 プログラムに慣れていない方は、`recisdb-proxy-setup.exe` をダブルクリックして起動してください。  
@@ -162,6 +166,182 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 [tsukumijima/DTV-Builds](https://github.com/tsukumijima/DTV-Builds) からダウンロードして
 ドライバ・BonDriverのインストールまで行います。ドライバインストール時のみ管理者権限の確認 (UAC) が表示されます。
 
+### Linux へのインストール (コピペで完了)
+
+以下のコマンドは順に貼り付けるだけで動きます (Debian / Ubuntu 系を想定。他のディストリ
+ではパッケージ名だけ読み替えてください)。インストール先は `/opt/recisdb-proxy` とします。
+
+**動作要件 (配布バイナリを使う場合)**
+
+| 項目 | 要件 |
+| --- | --- |
+| CPU | x86_64 または aarch64 (**64bit OS のみ**。32bit の armhf / armv7l 版バイナリは配布していません) |
+| glibc | **2.34 以上** — Ubuntu 22.04+ / Debian 12 (bookworm) 以降。Debian 11 (bullseye) では動きません |
+| OpenSSL | **3.x** (`libssl.so.3` / `libcrypto.so.3` を動的リンク)。bookworm / 22.04 なら標準で入っています |
+
+要件を満たさない環境 (Debian 11、32bit OS など) では、[ビルド](#ビルド) の手順で
+ソースからビルドしてください。glibc は `ldd --version`、アーキテクチャは `uname -m`
+で確認できます。
+
+> **Raspberry Pi の場合**: **64bit 版の Raspberry Pi OS (bookworm 以降)** または
+> Ubuntu Server arm64 を使ってください。`uname -m` が `aarch64` と表示されれば
+> そのまま下の手順が通ります。`armv7l` と表示される場合は 32bit OS なので、
+> 64bit 版を入れ直すかソースからビルドする必要があります。
+> チューナーを複数挿す場合は、USB の給電が不足しやすいのでセルフパワーの
+> USB ハブを使うと安定します。
+
+**1. 最新版をダウンロードして展開する**
+
+```bash
+# アーキテクチャを判定して、最新リリースのtar.gzを取得する
+REPO=stuayu/recisdb-proxy-rs
+case "$(uname -m)" in
+  x86_64)  LABEL=linux-amd64 ;;
+  aarch64) LABEL=linux-arm64 ;;
+  armv7l|armv6l)
+    echo "32bit OS では配布バイナリを利用できません。64bit OS を使うか、ソースからビルドしてください。"
+    return 2>/dev/null || exit 1 ;;
+  *) echo "未対応のアーキテクチャ: $(uname -m)"; return 2>/dev/null || exit 1 ;;
+esac
+TAG=$(wget -qO- "https://api.github.com/repos/$REPO/releases" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+echo "取得するバージョン: $TAG ($LABEL)"
+
+wget -O /tmp/recisdb-proxy.tar.gz \
+  "https://github.com/$REPO/releases/download/$TAG/recisdb-proxy-$TAG-$LABEL.tar.gz"
+
+# /opt/recisdb-proxy へ展開する (アーカイブは1階層のフォルダに入っているので --strip-components=1)
+sudo mkdir -p /opt/recisdb-proxy
+sudo tar xzf /tmp/recisdb-proxy.tar.gz -C /opt/recisdb-proxy --strip-components=1
+sudo chmod +x /opt/recisdb-proxy/recisdb-proxy
+ls -l /opt/recisdb-proxy
+```
+
+> リリースはプレリリース (alpha) を含むため、`releases/latest` ではなく `releases` の
+> 先頭 (= 最新のリリース) を取得しています。特定のバージョンを入れたい場合は
+> `TAG=0.0.1-alpha.6` のように直接指定してください。
+
+**2. 設定ファイルを用意する**
+
+```bash
+sudo cp /opt/recisdb-proxy/recisdb-proxy.toml.example /opt/recisdb-proxy/recisdb-proxy.toml
+```
+
+同じ PC 以外のブラウザからダッシュボードを開く場合は、`recisdb-proxy.toml` の
+`web_listen` が `0.0.0.0:40080` になっていることを確認してください
+(設定ファイルを使わない場合、Web ダッシュボードの既定は `127.0.0.1:40080` =
+そのPCからのみアクセス可能です)。
+
+**3. B-CAS カードリーダーを使う場合 (サーバー側で B25 デコードするなら必須)**
+
+```bash
+sudo apt update
+sudo apt install -y pcscd libpcsclite1 libccid
+sudo systemctl enable --now pcscd
+pcsc_scan   # 任意: カードリーダーが見えるか確認 (pcsc-tools パッケージ)
+```
+
+recisdb-proxy は PC/SC ライブラリを実行時に `dlopen` します
+(`libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so` の順。`B25_PCSC_LIB` で明示指定も可能)。
+どれも見つからない・`pcscd` が動いていない場合はカードリーダー初期化に失敗し、
+スクランブルされたままの TS が流れます。`RUST_LOG=info` で起動すると
+`pcsc_shim: using PC/SC backend ...` として実際に使われたライブラリが出ます。
+
+**4. チューナー (px4_drv) の準備**
+
+Linux では [px4_drv](https://github.com/tsukumijima/px4_drv) が作るキャラクタデバイス
+(`/dev/px4video*`, `/dev/pxmlt5video*`, `/dev/isdb2056video*` など) を直接開きます。
+ドライバの導入は px4_drv 側の手順に従ってください。
+
+既定ではこれらのデバイスは root しか開けないため、`sudo ./recisdb-proxy` で動かすか、
+udev ルールを入れて一般ユーザーでも開けるようにします (**サービス登録して常時稼働
+させる場合は、後者の方が安全です**)。
+
+```bash
+# 一般ユーザー(videoグループ)でチューナーを開けるようにする
+sudo tee /etc/udev/rules.d/99-px4video.rules >/dev/null <<'EOF'
+KERNEL=="px4video*",     GROUP="video", MODE="0660"
+KERNEL=="pxmlt*video*",  GROUP="video", MODE="0660"
+KERNEL=="isdb*video*",   GROUP="video", MODE="0660"
+KERNEL=="pt*video*",     GROUP="video", MODE="0660"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG video "$USER"   # 反映にはログインし直しが必要
+```
+
+> デバイス名はお使いのチューナーとドライバのバージョンで変わります。
+> `ls /dev | grep video` で実際の名前を確認し、必要ならルールを足してください。
+
+**5. 起動して動作を確認する**
+
+```bash
+cd /opt/recisdb-proxy
+sudo ./recisdb-proxy          # udevルールを入れて video グループに入っているなら sudo 不要
+```
+
+ブラウザで `http://<サーバーのIP>:40080` を開き、「BonDriver」タブからチューナーを
+登録 → チャンネルスキャンを実行します (チューナーパスには `/dev/px4video0` のような
+デバイスパスを入力します)。
+
+動作が確認できたら、次の [サービスとして常時稼働させる](#サービスとして常時稼働させる)
+へ進んでください。
+
+> **注意**: データベース (`recisdb-proxy.db`) とログ (`logs/`) は**カレントディレクトリ
+> 基準**で作られます。`sudo ./recisdb-proxy` を別のディレクトリで実行すると、別の DB が
+> できてチャンネル設定が消えたように見えます。必ず `/opt/recisdb-proxy` に `cd` してから
+> 実行してください (サービス登録した場合は `WorkingDirectory` が固定されるので気にする
+> 必要はありません)。
+
+### macOS へのインストール (コピペで完了)
+
+**1. 最新版をダウンロードして展開する**
+
+```bash
+REPO=stuayu/recisdb-proxy-rs
+case "$(uname -m)" in
+  arm64)  LABEL=macos-arm64 ;;   # Apple Silicon
+  x86_64) LABEL=macos-amd64 ;;   # Intel
+esac
+TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+echo "取得するバージョン: $TAG ($LABEL)"
+
+curl -fL -o /tmp/recisdb-proxy.tar.gz \
+  "https://github.com/$REPO/releases/download/$TAG/recisdb-proxy-$TAG-$LABEL.tar.gz"
+
+# ~/Applications/recisdb-proxy へ展開する
+mkdir -p ~/Applications/recisdb-proxy
+tar xzf /tmp/recisdb-proxy.tar.gz -C ~/Applications/recisdb-proxy --strip-components=1
+chmod +x ~/Applications/recisdb-proxy/recisdb-proxy
+
+# Gatekeeperの隔離属性を外す (これをしないと「開発元を検証できません」で起動できません)
+xattr -dr com.apple.quarantine ~/Applications/recisdb-proxy
+```
+
+(`wget` を使いたい場合は `brew install wget` のうえ、`curl -fsSL` を `wget -qO-`、
+`curl -fL -o` を `wget -O` に読み替えてください。)
+
+**2. 設定ファイルを用意する**
+
+```bash
+cd ~/Applications/recisdb-proxy
+cp recisdb-proxy.toml.example recisdb-proxy.toml
+```
+
+**3. px4_drv デーモンを起動する**
+
+macOS ではチューナーをユーザー空間デーモン `DriverHost_PX4` 経由で使います。
+起動方法とチューナーパスの書式 (`px4daemon:0` など) は
+[macOS で PX4 系チューナーを使う](#macos-で-px4-系チューナーを使う) を参照してください。
+**recisdb-proxy より先にデーモンが起動している必要があります。**
+
+**4. 起動する**
+
+```bash
+cd ~/Applications/recisdb-proxy
+./recisdb-proxy       # デバイスファイルを使わないので sudo は不要
+```
+
+`http://localhost:40080` を開いてチューナー登録とチャンネルスキャンを行います。
+
 ### 起動 (手動で設定する場合)
 同梱している`recisdb-proxy.toml.example`と`BonDriver_NetworkProxy.ini.sample`を確認します。  
 .exampleと.sampleを削除して保存します。  
@@ -179,7 +359,8 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 Windowsの場合は、下記をダブルクリックして実行します。  
 `recisdb-proxy.exe`
 
-Linuxの場合は、下記のコマンドを実行します。(Linuxは/dev/px4**にアクセスする場合システム権限が必要です)  
+Linuxの場合は、下記のコマンドを実行します。(Linuxは/dev/px4**にアクセスする場合システム権限が必要です。
+udevルールで一般ユーザーに開放する方法は [Linux へのインストール](#linux-へのインストール-コピペで完了) を参照)  
 `sudo ./recisdb-proxy`
 
 macOSの場合は、先に px4_drv のデーモンを起動してから `./recisdb-proxy` を実行します
@@ -257,41 +438,208 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 
 ### サービスとして常時稼働させる
 
-PC起動時に自動で開始させたい場合は、OSのサービスとして登録します。セットアップウィザード
-(`recisdb-proxy-setup`) の確認画面でも「OSのサービスとして登録する」にチェックを入れるだけで登録でき、
-サービス名もそこで指定できます。
+PC起動時に自動で開始させたい場合は、OSのサービスとして登録します。**ユニットファイルや
+plist を手で書く必要はありません。** `recisdb-proxy service install` が、OS に応じて
+systemd unit / launchd plist / Windows サービスを生成し、自動起動の有効化と開始までを
+まとめて行います。
 
-コマンドラインから登録する場合:
+Windows では、セットアップウィザード (`recisdb-proxy-setup`) の確認画面で
+「OSのサービスとして登録する」にチェックを入れるだけでも登録できます。
+
+#### Linux (systemd)
+
+**システム全体に登録する (推奨)**
 
 ```bash
-# Linux (systemd) / macOS (launchd): システム全体に登録
+cd /opt/recisdb-proxy
 sudo ./recisdb-proxy service install --name recisdb-proxy
-
-# ログインユーザー単位で登録する (管理者権限なし。ログイン後にのみ動作します)
-./recisdb-proxy service install --name recisdb-proxy --user
-
-# 状態確認・停止・開始・再起動・登録解除
-./recisdb-proxy service status
-sudo ./recisdb-proxy service stop
-sudo ./recisdb-proxy service start
-sudo ./recisdb-proxy service restart
-sudo ./recisdb-proxy service uninstall
 ```
 
-Windowsでは、**管理者として実行した**コマンドプロンプト/PowerShellから同じコマンドを使います
+これだけで次が実行されます。
+
+1. `/etc/systemd/system/recisdb-proxy.service` を生成
+2. `systemctl daemon-reload`
+3. `systemctl enable recisdb-proxy` (次回起動時からの自動起動を有効化)
+4. `systemctl start recisdb-proxy` (**その場で起動します**)
+
+生成されるユニットの内容は次のとおりです (パスは実際の値に置き換わります)。
+
+```ini
+[Unit]
+Description=recisdb-proxy: BonDriver network proxy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="/opt/recisdb-proxy/recisdb-proxy" "--run-as-service" "--service-name" "recisdb-proxy" "-f" "/opt/recisdb-proxy/recisdb-proxy.toml"
+WorkingDirectory=/opt/recisdb-proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- **実行ファイル**: `service install` を実行したバイナリ自身の絶対パス
+- **作業ディレクトリ**: 実行ファイルのあるディレクトリ (`--working-dir` で変更可)。
+  データベース `recisdb-proxy.db` とログ `logs/` はここに作られます
+- **設定ファイル**: `--config` > グローバルな `-f` > 作業ディレクトリの
+  `recisdb-proxy.toml` (存在すれば) の順で決まります。どれも無ければ引数を付けず、
+  サーバー側の自動検出に任せます
+- **`Restart=always` / `RestartSec=5`**: 異常終了しても5秒後に自動で起動し直します
+- システムスコープのサービスは **root で動く**ため、`/dev/px4video*` の udev ルールを
+  入れていなくてもチューナーを開けます
+
+**ログインユーザー単位で登録する (root権限なし)**
+
+```bash
+./recisdb-proxy service install --name recisdb-proxy --user
+```
+
+ユニットは `~/.config/systemd/user/recisdb-proxy.service` に置かれます
+(`XDG_CONFIG_HOME` が設定されていればそちら)。ただし次の2点に注意してください。
+
+- **一般ユーザー権限で動く**ため、`/dev/px4video*` に対する udev ルール
+  ([Linux へのインストール](#linux-へのインストール-コピペで完了) の手順4) が必須です
+- 既定では**ログアウトすると停止**します。ログインしていなくても動かすには
+  lingering を有効にします:
+
+  ```bash
+  sudo loginctl enable-linger "$USER"
+  ```
+
+**状態確認・操作**
+
+```bash
+# recisdb-proxy 自身のサブコマンド (--user 付きで登録したなら --user を付ける)
+./recisdb-proxy service status --name recisdb-proxy
+sudo ./recisdb-proxy service restart --name recisdb-proxy
+sudo ./recisdb-proxy service stop    --name recisdb-proxy
+sudo ./recisdb-proxy service start   --name recisdb-proxy
+
+# systemctl / journalctl を直接使ってもかまいません
+systemctl status recisdb-proxy
+sudo journalctl -u recisdb-proxy -f      # ログをリアルタイム表示
+```
+
+`service status` は次のように表示します。
+
+```text
+サービス名 : recisdb-proxy
+スコープ   : システム
+管理方式   : systemd
+登録済み   : はい
+稼働中     : はい
+自動起動   : 有効
+詳細       : ActiveState=active, UnitFileState=enabled
+```
+
+**登録を解除する**
+
+```bash
+sudo ./recisdb-proxy service uninstall --name recisdb-proxy
+```
+
+停止 → 自動起動の無効化 → ユニットファイル削除 → `daemon-reload` まで行います。
+設定ファイル・データベース・ログは消えません。
+
+#### macOS (launchd)
+
+**ログインユーザー単位 (LaunchAgent。管理者権限不要・おすすめ)**
+
+```bash
+cd ~/Applications/recisdb-proxy
+./recisdb-proxy service install --name recisdb-proxy --user
+```
+
+- plist: `~/Library/LaunchAgents/local.recisdb-proxy.plist`
+- ラベル: `local.recisdb-proxy` (サービス名の前に `local.` が付きます)
+- `RunAtLoad` / `KeepAlive` がいずれも有効なので、ログイン時に起動し、落ちても
+  launchd が起動し直します
+- 標準出力・標準エラーは **作業ディレクトリの `logs/service.out` / `logs/service.err`**
+  に書き出されます (アプリ自身のログは同じく `logs/recisdb-proxy.log`)
+
+**システム全体 (LaunchDaemon)**
+
+```bash
+sudo ./recisdb-proxy service install --name recisdb-proxy
+```
+
+plist は `/Library/LaunchDaemons/local.recisdb-proxy.plist` に置かれます。
+
+> **注意**: macOS で PX4 系チューナーを使う場合、recisdb-proxy より先に
+> `DriverHost_PX4` が動いている必要があります。LaunchDaemon としてログイン前から
+> 動かすなら、**デーモン側も launchd に登録**してください。デーモンが無い状態で
+> 起動しても recisdb-proxy 自体は動きますが、チューナーを開けません。
+
+**状態確認・操作**
+
+```bash
+./recisdb-proxy service status  --name recisdb-proxy --user
+./recisdb-proxy service restart --name recisdb-proxy --user
+./recisdb-proxy service stop    --name recisdb-proxy --user
+
+# launchctl を直接使う場合
+launchctl print "gui/$(id -u)/local.recisdb-proxy"
+tail -f ~/Applications/recisdb-proxy/logs/service.err
+```
+
+内部的には `launchctl bootstrap` (失敗時は旧来の `launchctl load -w` にフォールバック)、
+開始・再起動は `launchctl kickstart -k`、停止は `launchctl kill SIGTERM` を使います。
+
+**登録を解除する**
+
+```bash
+./recisdb-proxy service uninstall --name recisdb-proxy --user
+```
+
+#### Windows
+
+**管理者として実行した**コマンドプロンプト/PowerShellから同じコマンドを使います
 (Windowsにユーザースコープはないため `--user` は使えません)。
 
 ```powershell
 recisdb-proxy.exe service install --name recisdb-proxy
+recisdb-proxy.exe service status
+recisdb-proxy.exe service uninstall
 ```
 
-サービス名は英数字と `.` `_` `-` のみ、64文字以内です。設定ファイルは `--config` で明示できます
-(省略時は `-f` の値、それも無ければ作業フォルダの `recisdb-proxy.toml`)。
+#### `service` サブコマンドのオプション
+
+| オプション | 対象 | 説明 |
+| --- | --- | --- |
+| `--name <名前>` | 全操作 | サービス名 (既定 `recisdb-proxy`)。英数字と `.` `_` `-` のみ、64文字以内、先頭は英数字。複数台ぶんを1台に同居させる場合などに変えます |
+| `--user` | 全操作 (Windows除く) | ログインユーザー単位で登録・操作する。Linux は `systemctl --user`、macOS は LaunchAgent |
+| `--config <パス>` | `install` | サービスに渡す設定ファイル。省略時はグローバルな `-f`、それも無ければ作業ディレクトリの `recisdb-proxy.toml` |
+| `--working-dir <パス>` | `install` | 作業ディレクトリ (既定: 実行ファイルのあるディレクトリ)。**DBとログの生成先**になります |
+| `-- <追加引数...>` | `install` | サーバーへ追加で渡す引数。例: `-- --web-listen 0.0.0.0:40080` |
+
+例: 設定ファイルとデータ置き場を分けて登録する
+
+```bash
+sudo /opt/recisdb-proxy/recisdb-proxy service install \
+  --name recisdb-proxy \
+  --config /etc/recisdb-proxy.toml \
+  --working-dir /var/lib/recisdb-proxy \
+  -- --web-listen 0.0.0.0:40080
+```
 
 登録後は、Webダッシュボードの「設定」タブに登録状況が表示され、そこからサーバーを再起動できます。
 
+#### うまくいかないときは
+
+| 症状 | 対処 |
+| --- | --- |
+| `権限が不足しています` と出る | `sudo` を付けて実行するか、`--user` でユーザー単位のサービスとして登録します (Windows は管理者権限のシェルで実行) |
+| 起動はするがチューナーが開けない (`--user` で登録した場合) | 一般ユーザー権限で動いています。udev ルールと `video` グループへの追加を行うか、システムスコープで登録し直してください |
+| チャンネル設定が消えたように見える | DB は作業ディレクトリ基準です。手動起動時のカレントディレクトリと、サービスの `WorkingDirectory` が食い違っていないか確認してください |
+| 起動直後に落ちて再起動を繰り返す | `journalctl -u recisdb-proxy -n 100` (macOS は `logs/service.err`) を確認します。設定ファイルのパス誤りやポート競合が典型です |
+| ログアウトすると止まる (Linux `--user`) | `sudo loginctl enable-linger "$USER"` を実行します |
+| macOS でチューナーが見つからない | `DriverHost_PX4` が起動しているか確認します (recisdb-proxy はデーモンを自動起動しません) |
+
 自分でユニットファイルを書きたい場合は、下記のテンプレートも参考にしてください。  
-`recisdb-proxy\recisdb-proxy-rs.service`
+`recisdb-proxy/recisdb-proxy-rs.service`
 
 ### 最新版への更新 (ワンクリック)
 
@@ -333,7 +681,7 @@ Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境
 | オプション | デフォルト | 説明 |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:40070` | プロキシサーバーの待ち受けアドレス |
-| `--web-listen` | `0.0.0.0:40080` | Web ダッシュボードの待ち受けアドレス |
+| `--web-listen` | `127.0.0.1:40080` | Web ダッシュボードの待ち受けアドレス。既定はループバックのみ (別PCのブラウザから開くには `0.0.0.0:40080` を指定するか、設定ファイルの `web_listen` を使う) |
 | `-t, --tuner` | ― | デフォルトのチューナーパス (DLL パスまたはデバイスパス) |
 | `-d, --database` | `recisdb-proxy.db` | SQLite データベースファイルのパス |
 | `-f, --config` | ― | 設定ファイルのパス |
