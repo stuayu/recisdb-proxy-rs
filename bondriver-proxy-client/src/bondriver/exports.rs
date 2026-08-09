@@ -314,17 +314,30 @@ pub unsafe extern "system" fn get_ready_count(this: *mut c_void) -> DWORD {
     ready.min(DWORD::MAX as usize) as DWORD
 }
 
-/// Default buffer size for GetTsStream copy version.
-/// TVTest typically allocates 200KB+ buffer but doesn't pass the size.
-/// We use 64KB as a safe default that works with most implementations.
-const DEFAULT_TS_READ_SIZE: usize = 65536; // 64KB
-
 /// Maximum buffer size for GetTsStream (16MB limit for safety).
 const MAX_TS_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
-/// Get TS stream data.
-/// Note: In standard BonDriver interface, size is OUTPUT only.
-/// TVTest passes 0 or garbage for size, so we use a default read size.
+/// Most this overload will ever write in one call.
+///
+/// The `BYTE*` overload of `GetTsStream` has no way to learn the caller's
+/// buffer size: `pdwSize` is OUT-only in the BonDriver interface. This
+/// implementation used to read `*pdwSize` as if it were the capacity, while its
+/// own comment admitted that "TVTest passes 0 or garbage" — a large garbage
+/// value meant writing up to 64 KB into a buffer that might be far smaller, i.e.
+/// corrupting the host's heap.
+///
+/// There is no signal that distinguishes a genuine capacity from garbage, so
+/// the only sound bound is one that every plausible caller can hold: a single
+/// TS packet. No host passes a TS buffer smaller than one packet. `pdwRemain`
+/// still reports what is left, so a caller loops and drains at the same rate;
+/// it just needs more calls.
+///
+/// Hosts that want throughput should use the `BYTE**` overload
+/// ([`get_ts_stream_ptr`]), which hands back a pointer into our own buffer and
+/// has no such ambiguity. recisdb-proxy requires it (see CLAUDE.md).
+const COPY_OVERLOAD_MAX_WRITE: usize = TS_PACKET_SIZE;
+
+/// Get TS stream data (`BYTE*` overload — copies into the caller's buffer).
 
 pub unsafe extern "system" fn get_ts_stream(
     this: *mut c_void,
@@ -394,9 +407,10 @@ pub unsafe extern "system" fn get_ts_stream(
         return TRUE;
     }
 
-    // 安全策：読み出し上限（異常に大きい値やゴミ値対策）
-    // ※「呼び出し側容量」in_cap を超えて書くことは絶対にしない
-    let mut cap = in_cap.min(DEFAULT_TS_READ_SIZE);
+    // `in_cap` はゴミの可能性があるので上限としてしか使わない。実際に書く量は
+    // COPY_OVERLOAD_MAX_WRITE (TSパケット1個) で頭打ちにする。理由はその定数の
+    // ドキュメントを参照。
+    let mut cap = in_cap.min(COPY_OVERLOAD_MAX_WRITE);
 
     // TSパケット境界（188の倍数）に揃える（同期しやすくする）
     cap = (cap / TS_PACKET_SIZE) * TS_PACKET_SIZE;
@@ -424,6 +438,16 @@ pub unsafe extern "system" fn get_ts_stream(
         }
         return TRUE; // ★重要：データがなくても TRUE
     }
+
+    // このオーバーロードを使っているホストには一度だけ助言する。
+    static COPY_OVERLOAD_NOTICE: std::sync::Once = std::sync::Once::new();
+    COPY_OVERLOAD_NOTICE.call_once(|| {
+        crate::file_log!(
+            warn,
+            "GetTsStream(copy) in use: this overload cannot learn the caller's buffer size, \
+             so it returns at most one TS packet per call. Use GetTsStream(BYTE**) for throughput."
+        );
+    });
 
     // コピー先スライス作成（to_read だけ確保済み領域に書く）
     let dest = std::slice::from_raw_parts_mut(dst, to_read);
@@ -1226,6 +1250,46 @@ mod tests {
 
             release(a);
             release(b);
+        }
+    }
+
+    /// `pdwSize` is OUT-only in the BonDriver interface, so a value coming in is
+    /// not a capacity — the previous code treated it as one and would write up
+    /// to 64 KB into whatever the host handed over. Nothing may be written past
+    /// one TS packet no matter what the caller claims.
+    #[test]
+    fn the_copy_overload_never_writes_past_one_ts_packet() {
+        let inst = create_instance() as *mut c_void;
+        unsafe {
+            // Put more than one packet in the ring buffer so the read is not
+            // limited by availability.
+            {
+                let state = instance_of(inst).unwrap().state.lock();
+                state.connection.buffer().write(&vec![0x47u8; TS_PACKET_SIZE * 8]);
+            }
+
+            // A generous destination with a canary past the packet boundary, and
+            // a caller claiming a huge capacity.
+            const CANARY: u8 = 0xCD;
+            let mut dest = vec![CANARY; TS_PACKET_SIZE * 8];
+            let mut size: DWORD = DWORD::MAX;
+            let mut remain: DWORD = 0;
+
+            let ok = get_ts_stream(inst, dest.as_mut_ptr(), &mut size, &mut remain);
+            assert_eq!(ok, 1);
+            assert!(
+                size as usize <= TS_PACKET_SIZE,
+                "wrote {size} bytes; must never exceed one TS packet"
+            );
+            assert_eq!(size as usize, TS_PACKET_SIZE, "a full packet was available");
+            assert!(
+                dest[TS_PACKET_SIZE..].iter().all(|&b| b == CANARY),
+                "must not touch anything past what it reported"
+            );
+            // The rest is still queued, so a looping caller drains it.
+            assert!(remain > 0);
+
+            release(inst);
         }
     }
 
