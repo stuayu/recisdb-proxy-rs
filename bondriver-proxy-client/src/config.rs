@@ -227,7 +227,21 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
     };
 
     let sections = parse_ini(&content);
-    let section = sections.get("Server")?;
+    let Some(section) = sections.get("Server") else {
+        // Silently falling through to the defaults here hides a real
+        // misconfiguration: the operator wrote a file, we read it, and then
+        // connected somewhere else entirely.
+        error!(
+            "INI {:?} has no [Server] section; ignoring it and using defaults",
+            path
+        );
+        crate::file_log!(
+            error,
+            "INI {:?} has no [Server] section; ignoring it and using defaults",
+            path
+        );
+        return None;
+    };
 
     let server_addr = section
         .get("Address")
@@ -241,17 +255,19 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .cloned()
         .unwrap_or_default();
 
+    let defaults = ConnectionConfig::default();
+
     let connect_timeout = section
         .get("ConnectTimeout")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(5));
+        .unwrap_or(defaults.connect_timeout);
 
     let read_timeout = section
         .get("ReadTimeout")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(30));
+        .unwrap_or(defaults.read_timeout);
 
     let client_priority = section
         .get("Priority")
@@ -316,17 +332,19 @@ fn load_from_env() -> ConnectionConfig {
     let tuner_path = std::env::var("BONDRIVER_PROXY_TUNER")
         .unwrap_or_default();
 
+    let defaults = ConnectionConfig::default();
+
     let connect_timeout = std::env::var("BONDRIVER_PROXY_CONNECT_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(5));
+        .unwrap_or(defaults.connect_timeout);
 
     let read_timeout = std::env::var("BONDRIVER_PROXY_READ_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(30));
+        .unwrap_or(defaults.read_timeout);
 
     let client_priority = std::env::var("BONDRIVER_PROXY_PRIORITY")
         .ok()

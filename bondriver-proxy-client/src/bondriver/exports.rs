@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use log::{debug, error, info, trace};
 use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::bondriver::interface::*;
 use crate::client::buffer::TS_PACKET_SIZE;
@@ -38,8 +38,6 @@ struct BonDriverState {
     cur_space: u32,
     /// Current channel.
     cur_channel: u32,
-    /// Cached tuner name.
-    tuner_name: Option<Vec<u16>>,
     /// Cached space names (interned, see [`intern_wide`]).
     space_names: Vec<Option<&'static [u16]>>,
     /// Cached channel names (space -> channels), interned.
@@ -55,7 +53,6 @@ impl BonDriverState {
             connection: Connection::new(config),
             cur_space: 0xFFFFFFFF,
             cur_channel: 0xFFFFFFFF,
-            tuner_name: None,
             space_names: Vec::new(),
             channel_names: Vec::new(),
             ts_out: vec![0u8; 0], // 後で reserve でもOK
@@ -88,10 +85,13 @@ unsafe impl Sync for BonDriverInstance {}
 /// instead of undefined behaviour.  A panic must never cross the
 /// `extern "system"` boundary, so the FFI surface can afford no unchecked
 /// dereference.
-static LIVE_INSTANCES: OnceCell<Mutex<HashSet<usize>>> = OnceCell::new();
+/// An `RwLock` rather than a `Mutex`: every FFI call takes this, including
+/// `GetTsStream` on the host's streaming thread, and they are all readers.
+/// Writes happen only on create/release.
+static LIVE_INSTANCES: OnceCell<RwLock<HashSet<usize>>> = OnceCell::new();
 
-fn live_instances() -> &'static Mutex<HashSet<usize>> {
-    LIVE_INSTANCES.get_or_init(|| Mutex::new(HashSet::new()))
+fn live_instances() -> &'static RwLock<HashSet<usize>> {
+    LIVE_INSTANCES.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
 /// Process-wide intern table for the wide strings handed back by
@@ -154,7 +154,7 @@ fn create_instance_with_config(config: ConnectionConfig) -> *mut IBonDriver {
         state: Mutex::new(BonDriverState::new(config)),
     });
     let ptr = Box::into_raw(instance);
-    live_instances().lock().insert(ptr as usize);
+    live_instances().write().insert(ptr as usize);
     file_log!(info, "create_instance: new instance at {:p}", ptr);
 
     ptr as *mut IBonDriver
@@ -167,7 +167,7 @@ unsafe fn instance_of<'a>(this: *mut c_void) -> Option<&'a BonDriverInstance> {
         file_log!(error, "FFI call with null `this`; ignoring");
         return None;
     }
-    if !live_instances().lock().contains(&(this as usize)) {
+    if !live_instances().read().contains(&(this as usize)) {
         file_log!(error, "FFI call on released/unknown instance {:p}; ignoring", this);
         return None;
     }
@@ -665,7 +665,7 @@ pub unsafe extern "system" fn release(this: *mut c_void) {
         file_log!(error, "Release with null `this`; ignoring");
         return;
     }
-    if !live_instances().lock().remove(&(this as usize)) {
+    if !live_instances().write().remove(&(this as usize)) {
         file_log!(error, "Release on released/unknown instance {:p}; ignoring", this);
         return;
     }

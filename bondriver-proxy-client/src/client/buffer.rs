@@ -20,7 +20,7 @@ pub const RING_BUFFER_SIZE: usize = TS_PACKET_SIZE * 1024 * 100;
 /// When the consumer has fallen so far behind that the buffer is full, it
 /// resyncs to near-live by keeping only this many freshest bytes (~3 MB ≈
 /// 1.5 s at 16 Mbps) and skipping the rest. Big enough to stay a jitter
-/// cushion, small enough that latency does not grow to the full 100 MB.
+/// cushion, small enough that latency does not grow to the full buffer depth.
 const RESYNC_KEEP_BYTES: usize = TS_PACKET_SIZE * 1024 * 16;
 
 /// A lock-free ring buffer for TS data.
@@ -263,26 +263,34 @@ impl TsRingBuffer {
         self.dropped_bytes.fetch_add(skip, Ordering::Relaxed);
     }
 
-    /// Read data from the buffer.
+    /// Read data from the buffer **without copying**, returning a borrowed
+    /// slice and the number of bytes still queued behind it.
     ///
-    /// Returns a slice of the data read and the number of remaining bytes.
+    /// Unlike [`read_into`], this can only return a *contiguous* run: at the
+    /// wrap point it stops at the end of the backing array and the caller has
+    /// to come back for the rest. Do not read the returned length as "all that
+    /// is available" — that is what `available()` (or the second return value)
+    /// is for.
+    ///
     /// The returned slice is valid until the next call to `consume`.
     pub fn read(&self, max_len: usize) -> (&[u8], usize) {
         self.resync_if_overflowing();
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
 
-        let available = if write >= read {
+        // Deliberately the *contiguous* run, not `available()`: the slice we
+        // hand back cannot straddle the wrap.
+        let contiguous = if write >= read {
             write - read
         } else {
             RING_BUFFER_SIZE - read
         };
 
-        let to_read = max_len.min(available);
+        let to_read = max_len.min(contiguous);
         let remaining = self.available().saturating_sub(to_read);
 
         if to_read == 0 {
-            return (&[], available);
+            return (&[], contiguous);
         }
 
         let slice = &self.buffer[read..read + to_read];

@@ -177,13 +177,37 @@ ini を見失って既定値 (127.0.0.1) で動いてしまう。`logging.rs` �
 
 | # | 指摘 | 状態 |
 |---|---|---|
-| C-12 | `remain` をバイト数で返す。BonDriver の慣例は残りパケット数。TVTest は非0判定にしか使わないので実害はないが値としては誤り | 未対応 |
-| C-13 | `ConnectTimeout` の既定値が ini 経路 5 秒 / `ConnectionConfig::default()` 10 秒で不一致 | 未対応 |
-| C-14 | `TsRingBuffer::read()` はラップ時に末尾までしか返さず `read_into` と挙動が違う。現在未使用だが誤用しやすい | 未対応 |
-| C-15 | `BonDriverState::tuner_name` は死にフィールド (`GetTunerName` は静的を返す) | 未対応 |
-| C-16 | インスタンスごとに tokio runtime (worker 2)。EDCB 8 チューナーで 16 スレッド + 8×18.4MiB のリングバッファ | 未対応 |
-| C-17 | `instance_of` が毎 FFI コールで Mutex + HashSet を引く。`GetTsStream` もホットパス | 未対応 |
-| C-18 | `load_from_ini` は `[Server]` セクションがないと黙って環境変数/既定値に落ちる。設定ミスに気づけない | 未対応 |
+| C-12 | `remain` をバイト数で返す。BonDriver の慣例は残りパケット数 | **見送り** (下記) |
+| C-13 | `ConnectTimeout` / `ReadTimeout` の既定値が ini 経路と `ConnectionConfig::default()` で不一致 | 対応済み |
+| C-14 | `TsRingBuffer::read()` はラップ時に末尾までしか返さず `read_into` と挙動が違う | 対応済み |
+| C-15 | `BonDriverState::tuner_name` は死にフィールド (`GetTunerName` は静的を返す) | 対応済み |
+| C-16 | インスタンスごとに tokio runtime (worker 2)。EDCB 8 チューナーで 16 スレッド + 8×18.4MiB のリングバッファ | **見送り** (下記) |
+| C-17 | `instance_of` が毎 FFI コールで Mutex + HashSet を引く。`GetTsStream` もホットパス | 対応済み |
+| C-18 | `load_from_ini` は `[Server]` セクションがないと黙って環境変数/既定値に落ちる | 対応済み |
+
+対応の内訳:
+
+- **C-13**: `ConnectionConfig::default()` をサンプル ini が記載する値
+  (接続 5 秒 / 受信 30 秒) に合わせ、ini・環境変数の各ローダーはそこへ
+  フォールバックする。既定値の定義箇所を1つにして乖離しないようにした。
+- **C-14**: `read()` が返すのは「連続領域」であって「利用可能な全量」では
+  ないことをドキュメント化し、変数名も `contiguous` に改めた。挙動は変えて
+  いない (現状の呼び出し側はこの契約で正しい)。
+- **C-15**: フィールドを削除。
+- **C-17**: `RwLock` に変更。全 FFI コールが読み取り、書き込みは
+  生成/解放時のみ。
+- **C-18**: ini はあるが `[Server]` がない場合を error でログに出す。
+
+見送りの理由:
+
+- **C-12**: 単位をパケット数に変えると、サーバ側 `bondriver/windows.rs` が
+  `pending.len()` (バイト) と足している箇所が単位混在になる。値は「まだ残りが
+  あるか」の判定にしか使われておらず、実害がない一方で変更は本体側にも波及
+  するため、現状の単位を明記するに留める。
+- **C-16**: 共有ランタイム化には、インスタンス単位のタスク停止を
+  `disconnect()` から安全に行う仕組みが要る (今は runtime ごと落として
+  いる)。FFI 解放経路の安全性に直結する割に、得られるのはスレッド数の削減
+  だけ。EDCB 8 チューナーでも 16 スレッドで、実害が観測されてから着手する。
 
 ---
 

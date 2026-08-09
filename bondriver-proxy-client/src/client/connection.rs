@@ -81,8 +81,11 @@ impl Default for ConnectionConfig {
         Self {
             server_addr: "127.0.0.1:40070".to_string(),
             tuner_path: String::new(),
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(5),
+            // Same values the sample INI documents — this impl is the single
+            // source of truth and the INI/env loaders fall back to it, so the
+            // documented default and the compiled-in one cannot drift apart.
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(30),
             client_priority: 0,
             client_exclusive: false,
             #[cfg(feature = "tls")]
