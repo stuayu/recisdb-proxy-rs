@@ -99,6 +99,18 @@ mod dispatch {
             }
         }
 
+        /// Whether the last `set_channel` is known to have reached signal
+        /// lock. `None` means the backend cannot report it — callers must
+        /// then assume a channel may be receivable.
+        pub fn last_channel_locked(&self) -> Option<bool> {
+            match self {
+                BonDriverTuner::CharDev(_) => None,
+                BonDriverTuner::Px4Daemon(_) => None,
+                #[cfg(target_os = "linux")]
+                BonDriverTuner::DvbV5(t) => Some(t.last_channel_locked()),
+            }
+        }
+
         pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {
             match self {
                 BonDriverTuner::CharDev(t) => t.wait_ts_stream(timeout_ms),
@@ -183,6 +195,10 @@ mod stub {
 
         pub fn get_signal_level(&self) -> f32 {
             0.0
+        }
+
+        pub fn last_channel_locked(&self) -> Option<bool> {
+            None
         }
 
         pub fn wait_ts_stream(&self, _timeout_ms: u32) -> bool {

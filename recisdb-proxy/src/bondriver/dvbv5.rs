@@ -24,6 +24,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{debug, info, warn};
 
@@ -180,6 +181,11 @@ pub struct DvbV5Tuner {
     dvr_fd: std::fs::File,
     /// Whether `SYS_ISDBT` appeared in `DTV_ENUM_DELSYS` at open time.
     supports_isdbt: bool,
+    /// Whether the frontend reached `FE_HAS_LOCK` during the most recent
+    /// `set_channel`. Lets the scanner tell "this channel is empty, move on"
+    /// apart from "this channel locked, so a momentary 0 dB reading is the
+    /// demodulator settling rather than an empty channel".
+    last_channel_locked: AtomicBool,
 }
 
 impl DvbV5Tuner {
@@ -233,6 +239,7 @@ impl DvbV5Tuner {
             demux_fd,
             dvr_fd,
             supports_isdbt,
+            last_channel_locked: AtomicBool::new(false),
         })
     }
 
@@ -284,6 +291,7 @@ impl DvbV5Tuner {
             dtv_prop(DTV_TUNE),
         ];
         set_properties(fe_fd, &mut tune).map_err(io::Error::from)?;
+        self.last_channel_locked.store(false, Ordering::Release);
 
         // Poll for lock, but deliberately do not fail set_channel if it
         // never locks: of the 50 ISDB-T UHF channels the scanner walks, only
@@ -373,6 +381,8 @@ impl DvbV5Tuner {
         //
         // Skipping the filter entirely when there is no lock also avoids
         // leaving a feed running on an empty channel between scan steps.
+        self.last_channel_locked.store(locked, Ordering::Release);
+
         if locked {
             // Full TS tap: pass every PID through to the dvr device.
             let filter = DmxPesFilterParams {
@@ -413,6 +423,11 @@ impl DvbV5Tuner {
         );
 
         Ok(())
+    }
+
+    /// Whether the last `set_channel` saw `FE_HAS_LOCK` before returning.
+    pub fn last_channel_locked(&self) -> bool {
+        self.last_channel_locked.load(Ordering::Acquire)
     }
 
     pub fn get_signal_level(&self) -> f32 {

@@ -353,6 +353,11 @@ impl BonDriverTuner {
         self.ibon.get_signal_level()
     }
 
+    /// A BonDriver DLL exposes no lock flag, so lock state is unknown here.
+    pub fn last_channel_locked(&self) -> Option<bool> {
+        None
+    }
+
     /// Wait for TS stream data to become available.
     /// Returns true if data is available, false on timeout.
     pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {

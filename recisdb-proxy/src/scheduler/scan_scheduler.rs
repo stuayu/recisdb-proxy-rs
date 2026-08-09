@@ -575,12 +575,59 @@ fn scan_space_blocking(
         // Wait for signal lock (blocking sleep)
         std::thread::sleep(std::time::Duration::from_millis(signal_lock_wait_ms));
 
-        // Check signal level
-        let signal_level = tuner.get_signal_level();
-        debug!("scan_space_blocking: Signal level = {:.2} dB", signal_level);
+        // Check signal level.
+        //
+        // A single reading is not enough. FE_HAS_LOCK can drop back out for a
+        // moment right after set_channel returns (the demodulator is still
+        // settling / re-acquiring), and every backend reports "no signal" —
+        // 0.0 dB — while unlocked. Sampling once therefore discards real
+        // channels at random: observed on a PX-Q1UD, where a physical channel
+        // that had just logged "locked after 850 ms" was skipped with no
+        // "Found channel" line at all. Sample repeatedly and keep the best
+        // reading, so one unlucky instant cannot delete a receivable channel.
+        //
+        // This does not resurrect empty channels: an empty channel never
+        // locks, so every sample reads 0.0 and it is still skipped after the
+        // full window.
+        //
+        // Backends that can report whether the frontend locked during
+        // set_channel skip the extra sampling for channels that never locked:
+        // in a full-band scan ~40 of the 50 UHF channels are empty, and
+        // paying the sample window on each of those would add over a minute
+        // for nothing.
+        const SIGNAL_SAMPLE_INTERVAL_MS: u64 = 200;
+        const SIGNAL_SAMPLE_WINDOW_MS: u64 = 2000;
+        let may_be_receivable = tuner.last_channel_locked().unwrap_or(true);
+        let sample_window_ms = if may_be_receivable { SIGNAL_SAMPLE_WINDOW_MS } else { 0 };
+        let mut signal_level = tuner.get_signal_level();
+        let mut sampled_ms = 0u64;
+        while signal_level < MIN_SIGNAL_LEVEL && sampled_ms < sample_window_ms {
+            std::thread::sleep(std::time::Duration::from_millis(SIGNAL_SAMPLE_INTERVAL_MS));
+            sampled_ms += SIGNAL_SAMPLE_INTERVAL_MS;
+            let level = tuner.get_signal_level();
+            if level > signal_level {
+                signal_level = level;
+            }
+        }
+        debug!("scan_space_blocking: Signal level = {:.2} dB (after {} ms of sampling)", signal_level, sampled_ms);
 
         if signal_level < MIN_SIGNAL_LEVEL {
-            debug!("scan_space_blocking: Signal too weak ({:.2} < {:.2})", signal_level, MIN_SIGNAL_LEVEL);
+            if may_be_receivable {
+                // Info, not debug: a channel that locked and was then dropped
+                // here is exactly the "the scan missed a channel I can watch"
+                // case, and the old debug! left no trace of it at the default
+                // log level. Channels that never locked stay at debug — there
+                // are ~40 of those per scan and they are unremarkable.
+                info!(
+                    "scan_space_blocking: ✗ Skipped Space={} CH={} Name=\"{}\" - locked but signal too weak ({:.2} < {:.2} dB after {} ms)",
+                    space, channel, channel_name, signal_level, MIN_SIGNAL_LEVEL, sampled_ms
+                );
+            } else {
+                debug!(
+                    "scan_space_blocking: Signal too weak ({:.2} < {:.2})",
+                    signal_level, MIN_SIGNAL_LEVEL
+                );
+            }
             continue;
         }
 
