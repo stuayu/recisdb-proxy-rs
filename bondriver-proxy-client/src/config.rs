@@ -92,56 +92,85 @@ pub fn load_config() -> ConnectionConfig {
     load_from_env()
 }
 
-/// Find the INI file path.
-fn find_ini_file() -> Option<PathBuf> {
-    // Get the DLL path
-    #[cfg(windows)]
-    {
-        use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleExW};
-        use winapi::um::libloaderapi::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
+/// Full path of this DLL.
+///
+/// `GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT` is mandatory: without it
+/// `GetModuleHandleExW` increments the module's reference count, and the DLL can
+/// never be unloaded again. This runs once per `CreateBonDriver`, so the leak
+/// would also scale with the number of instances a host opens.
+#[cfg(windows)]
+fn module_path() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleExW};
+    use winapi::um::libloaderapi::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
 
-        unsafe {
-            let mut module = std::ptr::null_mut();
-            let addr = load_config as *const () as *mut std::ffi::c_void;
+    unsafe {
+        let mut module = std::ptr::null_mut();
+        let addr = module_path as *const () as *mut std::ffi::c_void;
 
-            if GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                addr as *const u16,
-                &mut module,
-            ) == 0
-            {
-                warn!("Failed to get module handle");
-                return try_current_dir();
-            }
-
-            let mut path = vec![0u16; 260];
-            let len = GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32);
-            if len == 0 {
-                warn!("Failed to get module file name");
-                return try_current_dir();
-            }
-
-            let path = String::from_utf16_lossy(&path[..len as usize]);
-            let mut dll_path = PathBuf::from(path);
-
-            // Change extension to .ini
-            dll_path.set_extension("ini");
-
-            if dll_path.exists() {
-                return Some(dll_path);
-            }
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const u16,
+            &mut module,
+        ) == 0
+        {
+            warn!("Failed to get module handle");
+            return None;
         }
 
-        try_current_dir()
-    }
+        // MAX_PATH is not a real limit — long paths and \\?\ prefixes exceed it,
+        // and GetModuleFileNameW then silently truncates while returning nSize.
+        // A truncated path yields a wrong .ini name, so detect it instead.
+        let mut path = vec![0u16; 32768];
+        let len = GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32);
+        if len == 0 {
+            warn!("Failed to get module file name");
+            return None;
+        }
+        if len as usize >= path.len() {
+            warn!("Module path exceeds {} chars; ignoring it", path.len());
+            return None;
+        }
 
-    #[cfg(not(windows))]
-    try_current_dir()
+        Some(PathBuf::from(OsString::from_wide(&path[..len as usize])))
+    }
 }
 
-/// Try to find INI file in current directory.
-fn try_current_dir() -> Option<PathBuf> {
-    let ini_name = "BonDriver_NetworkProxy.ini";
+#[cfg(not(windows))]
+fn module_path() -> Option<PathBuf> {
+    None
+}
+
+/// Find the INI file path.
+///
+/// The INI is named after the DLL, so a deployment that runs several copies
+/// (`BonDriver_NetworkProxy_T0.dll`, `_T1`, … — the usual way to give EDCB one
+/// driver per tuner) gets one INI per copy. Falling back to a hard-coded
+/// `BonDriver_NetworkProxy.ini` would make every copy read the *first* tuner's
+/// settings and connect to the wrong place.
+fn find_ini_file() -> Option<PathBuf> {
+    if let Some(dll_path) = module_path() {
+        let ini_path = dll_path.with_extension("ini");
+        if ini_path.exists() {
+            return Some(ini_path);
+        }
+        // Same base name, but next to the process instead of the DLL.
+        if let Some(name) = ini_path.file_name() {
+            if let Some(found) = try_current_dir(&name.to_string_lossy()) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+
+    try_current_dir("BonDriver_NetworkProxy.ini")
+}
+
+/// Try to find the named INI file in the current directory.
+fn try_current_dir(ini_name: &str) -> Option<PathBuf> {
     let current_dir = std::env::current_dir().ok()?;
     let ini_path = current_dir.join(ini_name);
 
