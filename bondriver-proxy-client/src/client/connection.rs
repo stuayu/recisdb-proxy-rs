@@ -1047,6 +1047,14 @@ async fn restore_session(
     writer: &mut BoxWriter,
     buffer: &TsRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Drop whatever the ring buffer still holds from before the outage.
+    // Keeping it would splice pre-drop TS directly onto post-restore TS, and
+    // the consumer sees a continuity break at the seam — a burst of Drop/Error
+    // on every reconnect. On a link that flaps, that is most of the errors the
+    // viewer reports. The server restarts the stream from scratch anyway, so
+    // nothing here is worth preserving.
+    buffer.clear();
+
     let mut buf = BytesMut::with_capacity(262144);
 
     // --- Hello ---
@@ -1491,6 +1499,40 @@ fn extract_server_name(addr: &str) -> ServerName<'static> {
 mod tests {
     use super::*;
 
+    /// Data buffered before an outage must not be spliced onto the stream that
+    /// comes back after it: the seam is a continuity break the viewer counts as
+    /// Drop/Error, on every single reconnect.
+    #[tokio::test]
+    async fn reconnecting_discards_pre_outage_ts() {
+        let conn = Connection::new(ConnectionConfig::default());
+        let buffer = TsRingBuffer::new();
+
+        // TS that arrived just before the link went down.
+        buffer.write(&vec![0x47u8; 188 * 4]);
+        assert!(!buffer.is_empty());
+
+        // The peer never answers the Hello, so restore fails — but the buffer
+        // must already have been cleared by then, since the point is that the
+        // pre-outage bytes never reach the consumer either way.
+        let (client_end, _server_end) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client_end);
+        let mut reader: BoxReader = Box::new(reader);
+        let mut writer: BoxWriter = Box::new(writer);
+
+        let config = conn.config.clone();
+        let restore = restore_session(
+            &conn,
+            &config,
+            &mut reader,
+            &mut writer,
+            &buffer,
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(50), restore).await;
+
+        assert!(buffer.is_empty(), "pre-outage TS must be discarded on reconnect");
+    }
+
+    /// Drive `connection_loop` against a transport that never delivers a byte.
     /// Drive `connection_loop` against a transport that never delivers a byte.
     ///
     /// The peer end of the duplex is kept alive, so this is exactly the
