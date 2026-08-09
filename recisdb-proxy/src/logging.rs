@@ -13,7 +13,10 @@ use chrono::Local;
 use std::fs;
 
 mod buffer;
-pub use buffer::{LogBuffer, LogBufferLayer, LogEntry, LogQuery, LogQueryResult, LOG_BUFFER_CAPACITY};
+pub use buffer::{
+    LogBuffer, LogBufferLayer, LogCategory, LogEntry, LogQuery, LogQueryResult,
+    ACCESS_LOG_TARGET, LOG_BUFFER_CAPACITY,
+};
 
 /// Initialize the logging system with both console and file output.
 ///

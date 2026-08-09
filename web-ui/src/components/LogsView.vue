@@ -25,6 +25,13 @@ interface LogFile {
 const LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE'] as const
 type Level = (typeof LEVELS)[number]
 
+type Category = 'all' | 'server' | 'access'
+const CATEGORIES: { value: Category; label: string }[] = [
+  { value: 'all', label: 'すべて' },
+  { value: 'server', label: 'サーバー' },
+  { value: 'access', label: 'アクセス' },
+]
+
 const props = defineProps<{ active: boolean }>()
 
 const entries = ref<LogEntry[]>([])
@@ -38,6 +45,10 @@ const showNewButton = ref(false)
 const levelFilter = ref<Level | ''>('')
 const targetFilter = ref('')
 const queryText = ref('')
+// アクセスログ(HTTPリクエストごとに出る行)はダッシュボードを開いているだけで
+// 毎秒流れてサーバー側の処理ログを埋もれさせるため、既定は "server"(アクセス
+// ログ以外)にする。
+const categoryFilter = ref<Category>('server')
 
 const files = ref<LogFile[]>([])
 const filesError = ref('')
@@ -53,6 +64,7 @@ function buildQuery(afterSeq: number): string {
   if (levelFilter.value) params.set('level', levelFilter.value)
   if (targetFilter.value.trim()) params.set('target', targetFilter.value.trim())
   if (queryText.value.trim()) params.set('q', queryText.value.trim())
+  if (categoryFilter.value !== 'all') params.set('category', categoryFilter.value)
   if (afterSeq > 0) params.set('after_seq', String(afterSeq))
   params.set('limit', '500')
   return `/logs?${params.toString()}`
@@ -165,7 +177,7 @@ async function download(name: string) {
   }
 }
 
-watch([levelFilter, targetFilter, queryText], () => {
+watch([levelFilter, targetFilter, queryText, categoryFilter], () => {
   void reload()
 })
 
@@ -208,6 +220,21 @@ onUnmounted(() => {
     </div>
 
     <form class="toolbar" @submit.prevent="reload">
+      <div class="field category-field">
+        <span>種別</span>
+        <div class="segmented" role="group" aria-label="ログ種別">
+          <button
+            v-for="cat in CATEGORIES"
+            :key="cat.value"
+            type="button"
+            class="segmented-option"
+            :class="{ active: categoryFilter === cat.value }"
+            :aria-pressed="categoryFilter === cat.value"
+            @click="categoryFilter = cat.value"
+            v-text="cat.label"
+          />
+        </div>
+      </div>
       <label class="field">
         <span>レベル（以上）</span>
         <select v-model="levelFilter">
@@ -279,6 +306,35 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.category-field {
+  min-width: 0;
+}
+
+.segmented {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.segmented-option {
+  flex: 1 1 auto;
+  min-width: 84px;
+  min-height: 44px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.segmented-option.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: #1e6fc0;
+}
+
 .log-viewport {
   position: relative;
 }

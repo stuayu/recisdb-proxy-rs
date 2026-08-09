@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::logging::LogBuffer;
+use crate::logging::{LogBuffer, ACCESS_LOG_TARGET};
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
 use auth::AuthConfig;
@@ -172,6 +172,12 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
 /// - Header values are deliberately NOT logged: `Authorization` carries the
 ///   API bearer token. The query string is safe to log — auth is
 ///   header-only (see `web/auth.rs`), no token ever travels in the URL.
+/// - Logged under [`ACCESS_LOG_TARGET`] rather than this module's default
+///   target (`recisdb_proxy::web`, shared with other log lines from this
+///   module such as startup logging). The dashboard's "ログ" tab uses this
+///   dedicated target to separate the access log (one line per request,
+///   which floods the tab while it's open) from server-side processing logs
+///   (`web/api/logs.rs`'s `category` query parameter).
 async fn access_log(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path_and_query = request
@@ -188,6 +194,7 @@ async fn access_log(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
 
     log::info!(
+        target: ACCESS_LOG_TARGET,
         "{} \"{} {}\" {} {}ms",
         remote.as_deref().unwrap_or("-"),
         method,

@@ -28,6 +28,20 @@ use tracing_subscriber::Layer;
 /// evicted first once this is exceeded.
 pub const LOG_BUFFER_CAPACITY: usize = 5000;
 
+/// `tracing` target used exclusively by the HTTP access-log line
+/// (`web/mod.rs`'s `access_log` middleware). Kept as a single constant
+/// (rather than a string literal repeated at each call site) because both
+/// the emitter (`web/mod.rs`) and the consumers of `LogQuery::category`
+/// (this module, `web/api/logs.rs`) need to agree on the exact string.
+///
+/// This is deliberately *not* the same target as the rest of `web/mod.rs`
+/// (`recisdb_proxy::web`, the module path default): that target is shared
+/// with other log lines from the same module (e.g. startup logging), so it
+/// cannot be used on its own to separate "access log" from "everything
+/// else". Splitting it into its own target is what makes the dashboard's
+/// server/access category filter (`LogQuery::category`) possible.
+pub const ACCESS_LOG_TARGET: &str = "recisdb_proxy::access";
+
 /// One buffered log line as shown by the dashboard's "ログ" tab.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
@@ -69,12 +83,53 @@ pub struct LogQuery<'a> {
     pub target: Option<&'a str>,
     /// Case-insensitive substring match against `message`.
     pub q: Option<&'a str>,
+    /// HTTP access log vs. everything else. Combines with `target` as AND
+    /// (both must pass), so e.g. `category=server` + `target=tuner` narrows
+    /// to non-access-log entries whose target contains "tuner".
+    pub category: LogCategory,
     /// Only entries with `seq > after_seq` are returned. `0` means "from
     /// the start of whatever is still buffered".
     pub after_seq: u64,
     /// Maximum entries to return. The most recent matches are kept when
     /// more than `limit` entries pass the filters.
     pub limit: usize,
+}
+
+/// `category` filter for [`LogQuery`]: separates the HTTP access log
+/// (`ACCESS_LOG_TARGET`) from server-side processing logs (scan, tuner, EPG,
+/// ...), since the two are emitted at very different rates and otherwise
+/// drown each other out in the dashboard's "ログ" tab.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogCategory {
+    /// No category filter — everything passes.
+    #[default]
+    All,
+    /// Everything except the access log.
+    Server,
+    /// Only the access log.
+    Access,
+}
+
+impl LogCategory {
+    /// Parses the `category` query parameter. Unknown/absent values fall
+    /// back to `All` rather than erroring, matching the rest of this API's
+    /// "malformed filter never floods or 400s" convention (see
+    /// `level_rank`'s doc comment).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("server") => LogCategory::Server,
+            Some("access") => LogCategory::Access,
+            _ => LogCategory::All,
+        }
+    }
+
+    fn matches(self, target: &str) -> bool {
+        match self {
+            LogCategory::All => true,
+            LogCategory::Server => target != ACCESS_LOG_TARGET,
+            LogCategory::Access => target == ACCESS_LOG_TARGET,
+        }
+    }
 }
 
 /// Result of a [`LogBuffer::query`] call.
@@ -157,6 +212,7 @@ impl LogBuffer {
             .filter(|e| e.seq > query.after_seq)
             .filter(|e| min_rank.is_none_or(|m| level_rank(&e.level) >= m))
             .filter(|e| target_needle.is_none_or(|t| e.target.contains(t)))
+            .filter(|e| query.category.matches(&e.target))
             .filter(|e| q_needle.as_deref().is_none_or(|kw| e.message.to_lowercase().contains(kw)))
             .cloned()
             .collect();
@@ -343,5 +399,65 @@ mod tests {
         let result = buf.query(LogQuery { limit: 3, ..Default::default() });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![8, 9, 10]);
+    }
+
+    fn access_entry(seq: u64) -> LogEntry {
+        let mut e = entry(seq, "INFO");
+        e.target = ACCESS_LOG_TARGET.to_string();
+        e.message = format!("access {seq}");
+        e
+    }
+
+    #[test]
+    fn category_server_excludes_access_log() {
+        let buf = buffer_with(vec![access_entry(1), entry(2, "INFO"), access_entry(3)]);
+        let result = buf.query(LogQuery { category: LogCategory::Server, limit: 100, ..Default::default() });
+        let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![2]);
+    }
+
+    #[test]
+    fn category_access_returns_only_access_log() {
+        let buf = buffer_with(vec![access_entry(1), entry(2, "INFO"), access_entry(3)]);
+        let result = buf.query(LogQuery { category: LogCategory::Access, limit: 100, ..Default::default() });
+        let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 3]);
+    }
+
+    #[test]
+    fn category_all_by_default_returns_both() {
+        let buf = buffer_with(vec![access_entry(1), entry(2, "INFO")]);
+        let result = buf.query(LogQuery { limit: 100, ..Default::default() });
+        let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn category_combines_with_target_filter_as_and() {
+        let mut tuner_entry = entry(1, "INFO");
+        tuner_entry.target = "recisdb_proxy::tuner".to_string();
+        let mut web_entry = entry(2, "INFO");
+        web_entry.target = "recisdb_proxy::web".to_string();
+        let buf = buffer_with(vec![tuner_entry, web_entry, access_entry(3)]);
+
+        // category=server AND target="tuner": only the non-access entry
+        // whose target also contains "tuner" survives.
+        let result = buf.query(LogQuery {
+            category: LogCategory::Server,
+            target: Some("tuner"),
+            limit: 100,
+            ..Default::default()
+        });
+        let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1]);
+    }
+
+    #[test]
+    fn log_category_parse_treats_unknown_as_all() {
+        assert_eq!(LogCategory::parse(Some("server")), LogCategory::Server);
+        assert_eq!(LogCategory::parse(Some("access")), LogCategory::Access);
+        assert_eq!(LogCategory::parse(Some("all")), LogCategory::All);
+        assert_eq!(LogCategory::parse(Some("bogus")), LogCategory::All);
+        assert_eq!(LogCategory::parse(None), LogCategory::All);
     }
 }

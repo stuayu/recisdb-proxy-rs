@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::logging::LogQuery;
+use crate::logging::{LogCategory, LogQuery};
 use crate::web::state::WebState;
 
 use super::error::ApiError;
@@ -29,6 +29,11 @@ pub struct LogsQuery {
     pub level: Option<String>,
     pub target: Option<String>,
     pub q: Option<String>,
+    /// `"all"` (default when absent) / `"server"` (everything but the HTTP
+    /// access log) / `"access"` (only the access log). Combines with
+    /// `target` as AND — see [`LogCategory`]. Unknown values fall back to
+    /// `"all"` rather than erroring.
+    pub category: Option<String>,
     pub after_seq: Option<u64>,
     pub limit: Option<usize>,
 }
@@ -44,6 +49,7 @@ pub async fn get_logs(
         level: query.level.as_deref(),
         target: query.target.as_deref(),
         q: query.q.as_deref(),
+        category: LogCategory::parse(query.category.as_deref()),
         after_seq: query.after_seq.unwrap_or(0),
         limit,
     });
