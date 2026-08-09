@@ -862,6 +862,46 @@ async fn backoff_wait(conn: &Connection, delay: Duration) -> bool {
     }
 }
 
+/// Idle time after which TCP starts probing a quiet connection.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+/// Interval between keepalive probes.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Number of unanswered probes before the connection is declared dead.
+#[cfg(not(windows))]
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// How long the stream may stay silent before we treat the link as dead.
+///
+/// TCP keepalive alone is not enough: a path can stay "up" while the server has
+/// stopped producing, and on some NAT devices probes are answered by the
+/// middlebox rather than the peer. A tuner that is streaming produces data
+/// continuously, so silence this long means something is wrong regardless of
+/// what TCP believes. Only armed while the client actually expects TS.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Turn on TCP keepalive.
+///
+/// Without it a silently blackholed path (NAT session expiry, route withdrawal)
+/// never produces FIN or RST, so the read loop waits forever, no error surfaces
+/// and the reconnect supervisor is never triggered: the stream stops and never
+/// comes back. Site-to-site links do this routinely.
+///
+/// Best-effort — a failure here degrades to the previous behaviour and must not
+/// abort an otherwise usable connection.
+fn configure_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    // Windows derives the probe count from the other two values.
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
+
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        warn!("Failed to enable TCP keepalive: {}", e);
+        file_log!(warn, "Failed to enable TCP keepalive: {}", e);
+    }
+}
+
 /// Establish a fresh transport (TCP, optionally wrapped in TLS) and return its
 /// boxed read/write halves.
 async fn establish(
@@ -874,6 +914,7 @@ async fn establish(
     )
     .await??;
     stream.set_nodelay(true)?;
+    configure_keepalive(&stream);
     info!("Connected to {}", config.server_addr);
 
     #[cfg(feature = "tls")]
@@ -1143,7 +1184,7 @@ async fn connection_supervisor(
                 // Link is now pumping the socket: requests are processed normally.
                 conn.link_status.store(link::UP, Ordering::SeqCst);
 
-                match connection_loop(&mut req_rx, &resp_tx, &buffer, reader, writer).await {
+                match connection_loop(&conn, &mut req_rx, &resp_tx, &buffer, reader, writer).await {
                     LoopExit::Shutdown => {
                         conn.link_status.store(link::DOWN, Ordering::SeqCst);
                         info!("Connection closed by client");
@@ -1240,6 +1281,7 @@ enum WriterExit {
 /// runtime is reused across reconnects with no leaked task.  `req_rx` stays
 /// borrowed by the supervisor so the request channel survives reconnects.
 async fn connection_loop(
+    conn: &Connection,
     req_rx: &mut mpsc::Receiver<ClientMessage>,
     resp_tx: &std::sync::mpsc::Sender<ServerMessage>,
     buffer: &TsRingBuffer,
@@ -1280,7 +1322,13 @@ async fn connection_loop(
     // `writer_done` guards against polling/awaiting the JoinHandle twice: once
     // the writer branch of the select fires, the handle is already resolved.
     let mut writer_done = false;
+    let mut idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
     let exit = loop {
+        // Only police silence while the client actually expects TS. An idle
+        // tuner legitimately sends nothing for minutes at a time; TCP keepalive
+        // covers that case instead.
+        let expecting_data = conn.session.lock().streaming;
+
         tokio::select! {
             // --- Outgoing requests: hand off to the writer task, non-blocking. ---
             maybe_msg = req_rx.recv() => {
@@ -1311,6 +1359,13 @@ async fn connection_loop(
                 break LoopExit::Dropped(reason);
             }
 
+            // --- Streaming went silent: treat as a dead link ---
+            _ = tokio::time::sleep_until(idle_deadline), if expecting_data => {
+                warn!("No TS data for {:?} while streaming; treating the link as dead", STREAM_IDLE_TIMEOUT);
+                file_log!(warn, "No TS data for {:?} while streaming; reconnecting", STREAM_IDLE_TIMEOUT);
+                break LoopExit::Dropped(format!("idle for {:?} while streaming", STREAM_IDLE_TIMEOUT));
+            }
+
             // --- Incoming frames ---
             res = reader.read_buf(&mut read_buf) => {
                 match res {
@@ -1319,6 +1374,7 @@ async fn connection_loop(
                         break LoopExit::Dropped("server closed (EOF)".to_string());
                     }
                     Ok(_) => {
+                        idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
                         let r = process_frames(&mut read_buf, buffer, |m| {
                             if resp_tx.send(m).is_err() {
                                 debug!("Response channel closed");
@@ -1435,6 +1491,60 @@ fn extract_server_name(addr: &str) -> ServerName<'static> {
 mod tests {
     use super::*;
 
+    /// Drive `connection_loop` against a transport that never delivers a byte.
+    ///
+    /// The peer end of the duplex is kept alive, so this is exactly the
+    /// blackhole case: no FIN, no RST, no data.
+    async fn run_loop_against_a_silent_peer(streaming: bool) -> LoopExit {
+        let conn = Connection::new(ConnectionConfig::default());
+        conn.session.lock().streaming = streaming;
+
+        let (client_end, _server_end) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client_end);
+        // Keep the request sender alive, otherwise the loop exits as Shutdown.
+        let (_req_tx, mut req_rx) = mpsc::channel::<ClientMessage>(4);
+        let (resp_tx, _resp_rx) = std::sync::mpsc::channel::<ServerMessage>();
+        let buffer = TsRingBuffer::new();
+
+        connection_loop(
+            &conn,
+            &mut req_rx,
+            &resp_tx,
+            &buffer,
+            Box::new(reader),
+            Box::new(writer),
+        )
+        .await
+    }
+
+    /// A path that silently blackholes produces neither FIN nor RST, so the
+    /// read loop would wait forever and the reconnect supervisor would never
+    /// run: the stream stops and never returns. While streaming, silence must
+    /// be treated as a dropped link.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_link_is_dropped_while_streaming() {
+        match run_loop_against_a_silent_peer(true).await {
+            LoopExit::Dropped(reason) => {
+                assert!(reason.contains("idle"), "unexpected reason: {reason}");
+            }
+            LoopExit::Shutdown => panic!("must report a drop, not a clean shutdown"),
+        }
+    }
+
+    /// An idle tuner legitimately sends nothing for minutes. The idle timer must
+    /// only be armed when the client is actually expecting TS — TCP keepalive
+    /// covers the quiet case.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_link_is_tolerated_when_not_streaming() {
+        let result = tokio::time::timeout(
+            STREAM_IDLE_TIMEOUT * 100,
+            run_loop_against_a_silent_peer(false),
+        )
+        .await;
+        assert!(result.is_err(), "must keep waiting rather than drop the link");
+    }
+
+    /// Wire up a Connection with hand-made request/response channels so the
     /// Wire up a Connection with hand-made request/response channels so the
     /// RPC pairing can be exercised without a server.
     fn rpc_harness(

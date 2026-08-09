@@ -20,6 +20,9 @@ recisdb-protocol = { path = "../recisdb-protocol" }
 
 tokio = { version = "1.35", features = ["rt-multi-thread", "net", "sync", "io-util", "time", "macros"] }
 bytes = "1.5"
+# TCP keepalive: tokio does not expose it, and a site-to-site link that
+# silently blackholes gives no FIN/RST for the read loop to notice.
+socket2 = { version = "0.5", features = ["all"] }
 futures = "0.3"
 
 log = "0.4"
@@ -33,6 +36,11 @@ tokio-rustls = { version = "0.25", optional = true }
 rustls = { version = "0.22", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-native-certs = { version = "0.7", optional = true }
+
+[dev-dependencies]
+# test-util gives the paused clock, so the idle-timeout tests do not have to
+# spend real seconds waiting.
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "sync", "io-util", "time", "macros", "test-util"] }
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
