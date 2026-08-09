@@ -224,6 +224,57 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
   `SET_CAPTURE(false)` でストリームスレッドを終了させ、`SET_DATA_ID` は接続あたり
   1 回しか効かないため、capture を止めるとデータソケットが二度と復活しない。
 
+## Linux で Linux DVB API (DVBv5) チューナーを使う
+
+px4-drv/pt3-drv の `/dev/px4videoN` 系とは別に、カーネル標準の DVB ドライバ
+(`smsdvb` など。PX-Q1UD のような Siano チップ機がこれに該当する)が生やす
+`/dev/dvb/adapterN` を直接扱うバックエンドが `bondriver/dvbv5.rs` にある。
+`bon_drivers.dll_path` が `/dev/dvb/` で始まるパスなら自動的にこちらが選ばれる
+(`/dev/px4videoN` などそれ以外のパスは従来どおり `unix.rs` の px4-drv/pt3-drv
+ioctl バックエンドに渡る)。
+
+### 追加のビルド依存は不要
+
+このバックエンドは `libdvbv5` などの外部 C ライブラリを一切使わず、
+`linux/dvb/frontend.h` / `linux/dvb/dmx.h` の ioctl 番号・構造体を `nix` の
+ioctl マクロと `#[repr(C)]` 構造体で直接叩く。追加の apt パッケージやクロス
+ビルド sysroot への追加は不要(既存の `nix`/`libc` 依存のみ)。
+
+`recisdb-rs/src/tuner/linux/dvbv5.rs` には `libdvbv5` (dvbv5-sys crate) 経由の
+別実装があるが、recisdb-proxy 側はクロスビルド(本ドキュメント「クロスビルド:
+macOS → Linux amd64」参照)の sysroot 依存を増やしたくないため、あえて別実装
+にしている。
+
+### チューナーパスの書式
+
+| 書式 | 意味 |
+|---|---|
+| `/dev/dvb/adapter0` | adapter 0 の frontend0/demux0/dvr0 を使う |
+| `/dev/dvb/adapter0/frontend1` | adapter 0 の frontend1/demux1/dvr1 を使う(複数フロントエンド機) |
+
+PX-Q1UD のようにチューナーを複数内蔵する機種は、チューナーごとに別々の
+adapter (`/dev/dvb/adapter0` 〜 `/dev/dvb/adapter3`) として現れる。同時に使い
+たい本数だけ `bon_drivers` に別レコードとして登録すること。
+
+### スコープ
+
+- 現状は **地上デジタル (ISDB-T) のみ**。frontend が ISDB-S (BS/CS) に対応して
+  いても、このバックエンドは BS/CS のチューニング空間を一切公開しない
+  (`enum_tuning_space` が space=0 (GR) しか返さない)。BS/CS 対応は未実装。
+- 空きチャンネルへの選局はロックしなくてもエラーにしない(スキャナーが地デジ
+  50 チャンネルを総当たりする都合上、実在しない局で失敗させると
+  `scan_scheduler` の連続失敗カウンタに引っかかりスキャン全体が止まるため)。
+  信号の有無は `get_signal_level()` の値で上位が判断する。
+
+### 実行時要件
+
+- 実行ユーザーが `/dev/dvb/adapterN/*` に読み書きできる必要がある。多くの
+  ディストリでは `video` グループのメンバーであれば十分(udev ルールによる)。
+  グループに入っていないと `open` が permission denied で失敗する。
+- CNR (信号レベル) は `DTV_STAT_CNR` が dB 単位の値を返すドライバではそのまま
+  使うが、`smsdvb` のように相対値 (0..65535) しか返さないドライバでは概算値
+  にスケールしたものを返す。実測 dB ではない点に注意。
+
 ## CI とリリース成果物
 
 `.github/workflows/build.yml` が push ごとの CI ビルド、`release.yml` がタグ push
@@ -244,6 +295,23 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 リリースアセット名は Web ダッシュボードの自己更新機能
 (`web/api/update.rs` の `asset_filename`) が決め打ちで参照する。**アセット名を
 変えたらそちらも必ず合わせること。**
+
+#### Linux 配布バイナリの実行時要件
+
+Linux 版は `ubuntu:22.04` ベースのコンテナ (`.github/workflows/Dockerfile`) でネイティブ
+ビルドしている。そのため配布バイナリの要件は次のとおり (v0.0.1-alpha.11 の arm64 バイナリ
+を実測):
+
+- **glibc 2.34 以上** — Ubuntu 22.04+ / Debian 12 (bookworm) 以降。Debian 11 (bullseye,
+  glibc 2.31) では起動しない
+- **OpenSSL 3.x** — `libssl.so.3` / `libcrypto.so.3` を DT_NEEDED で動的リンクしている
+  (bullseye の 1.1 では不可)
+- `libpcsclite` は **NEEDED に入らない** (`pcsc_shim` が実行時 dlopen するため。上記
+  「Linux の PC/SC バックエンドは実行時選択」を参照)
+- 32bit ARM (armhf / armv7l) 向けのアセットは無い。Raspberry Pi は 64bit OS を使う
+
+ビルド元イメージを上げ下げすると glibc の下限が変わり、古いディストリで動かなくなる。
+`build-args: IMAGE=ubuntu:22.04` を変更する際は README の「動作要件」表も更新すること。
 
 ### tsreadex の同梱ビルド
 
