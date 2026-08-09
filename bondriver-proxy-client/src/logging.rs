@@ -13,9 +13,30 @@ use once_cell::sync::OnceCell;
 
 /// Logger state: buffered file writer and last flush time.
 struct LoggerState {
-    writer: BufWriter<File>,
+    /// `None` only while rotating, or if reopening the file failed.
+    ///
+    /// Rotation has to close this handle before renaming: Windows refuses to
+    /// rename a file that is still open, so a rotation that kept the handle
+    /// would silently never happen.
+    writer: Option<BufWriter<File>>,
     last_flush: Instant,
+    /// Bytes written to the current file, tracked so rotation does not need a
+    /// `metadata()` syscall per line.
+    written: u64,
+    /// Where the log lives, needed to rotate.
+    path: PathBuf,
 }
+
+/// Rotate once the active log reaches this size.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many rotated generations to keep (`.log.1` … `.log.N`).
+///
+/// The client writes next to the DLL on a machine nobody monitors, and at
+/// `LogLevel=debug` it emits a line per `WaitTsStream` call — unbounded growth
+/// would eventually fill the volume. The server has `retention_days` for the
+/// same reason; this is the client's equivalent.
+const MAX_LOG_GENERATIONS: u32 = 3;
 
 /// Global log file handle.
 static LOG_FILE: OnceCell<Mutex<LoggerState>> = OnceCell::new();
@@ -127,9 +148,12 @@ pub fn init_file_logger() -> bool {
         .open(&log_path)
     {
         Ok(file) => {
+            let written = file.metadata().map(|m| m.len()).unwrap_or(0);
             let state = LoggerState {
-                writer: BufWriter::new(file),
+                writer: Some(BufWriter::new(file)),
                 last_flush: Instant::now(),
+                written,
+                path: log_path.clone(),
             };
             let _ = LOG_FILE.set(Mutex::new(state));
 
@@ -150,7 +174,7 @@ pub(crate) fn log_with_level(msg: &str, level: log::Level) {
     if let Some(file_mutex) = LOG_FILE.get() {
         if let Ok(mut state) = file_mutex.lock() {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let _ = writeln!(state.writer, "[{}] {}", timestamp, msg);
+            let line = format!("[{}] {}\n", timestamp, msg);
 
             // Flush immediately for Warn/Error, or on 2-second interval for others
             let should_flush = match level {
@@ -158,11 +182,156 @@ pub(crate) fn log_with_level(msg: &str, level: log::Level) {
                 _ => state.last_flush.elapsed().as_secs() >= FLUSH_INTERVAL_SECS,
             };
 
+            match state.writer.as_mut() {
+                Some(writer) => {
+                    let _ = writer.write_all(line.as_bytes());
+                    if should_flush {
+                        let _ = writer.flush();
+                    }
+                }
+                // Only reachable if reopening after a rotation failed.
+                None => return,
+            }
+
+            state.written += line.len() as u64;
             if should_flush {
-                let _ = state.writer.flush();
                 state.last_flush = Instant::now();
             }
+
+            if state.written >= MAX_LOG_BYTES {
+                rotate(&mut state);
+            }
         }
+    }
+}
+
+/// Move the active log aside and start a fresh one.
+///
+/// Best effort: if any step fails the logger keeps writing to whatever handle
+/// it still has. Losing log rotation is not worth failing a driver call over.
+fn rotate(state: &mut LoggerState) {
+    // Close the active handle before touching the file names.
+    if let Some(mut writer) = state.writer.take() {
+        let _ = writer.flush();
+    }
+
+    let path = state.path.clone();
+    let generation_path = |n: u32| -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".{}", n));
+        PathBuf::from(name)
+    };
+
+    // Drop the oldest, then shift the rest down: .log.2 -> .log.3, etc.
+    let _ = std::fs::remove_file(generation_path(MAX_LOG_GENERATIONS));
+    for n in (1..MAX_LOG_GENERATIONS).rev() {
+        let _ = std::fs::rename(generation_path(n), generation_path(n + 1));
+    }
+    let rotated = std::fs::rename(&path, generation_path(1)).is_ok();
+
+    // Reopen unconditionally: the handle is gone either way, so failing to
+    // reopen after a failed rename would leave the logger silent.
+    state.writer = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+        .map(BufWriter::new);
+    state.last_flush = Instant::now();
+    state.written = if rotated {
+        0
+    } else {
+        // Rename failed, so the file still holds everything. Keep the count so
+        // we retry on the next line rather than spinning on every write.
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bondriver-log-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open_state(path: &PathBuf) -> LoggerState {
+        let file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        LoggerState {
+            writer: Some(BufWriter::new(file)),
+            last_flush: Instant::now(),
+            written: 0,
+            path: path.clone(),
+        }
+    }
+
+    /// The log sits next to the DLL on an unmonitored machine and, at debug
+    /// level, grows by a line per WaitTsStream call. Rotation must actually
+    /// happen (it renames a file the process itself has open) and must cap the
+    /// number of generations kept.
+    #[test]
+    fn rotation_caps_the_number_of_generations() {
+        let dir = scratch_dir("rotate");
+        let path = dir.join("BonDriver_NetworkProxy.log");
+        let mut state = open_state(&path);
+
+        for i in 0..(MAX_LOG_GENERATIONS + 2) {
+            state
+                .writer
+                .as_mut()
+                .unwrap()
+                .write_all(format!("generation {i}\n").as_bytes())
+                .unwrap();
+            rotate(&mut state);
+        }
+
+        assert!(path.exists(), "an active log must exist after rotating");
+        assert!(state.writer.is_some(), "the sink must be usable again");
+        assert_eq!(state.written, 0, "the fresh file starts empty");
+
+        for n in 1..=MAX_LOG_GENERATIONS {
+            assert!(
+                dir.join(format!("BonDriver_NetworkProxy.log.{n}")).exists(),
+                "generation {n} should be kept"
+            );
+        }
+        assert!(
+            !dir.join(format!("BonDriver_NetworkProxy.log.{}", MAX_LOG_GENERATIONS + 1)).exists(),
+            "generations beyond the cap must be discarded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The newest rotated generation must hold what was most recently written,
+    /// i.e. the shuffle goes in the right direction.
+    #[test]
+    fn the_newest_generation_holds_the_most_recent_lines() {
+        let dir = scratch_dir("order");
+        let path = dir.join("app.log");
+        let mut state = open_state(&path);
+
+        state.writer.as_mut().unwrap().write_all(b"older\n").unwrap();
+        rotate(&mut state);
+        state.writer.as_mut().unwrap().write_all(b"newer\n").unwrap();
+        rotate(&mut state);
+
+        let gen1 = std::fs::read_to_string(dir.join("app.log.1")).unwrap();
+        let gen2 = std::fs::read_to_string(dir.join("app.log.2")).unwrap();
+        assert!(gen1.contains("newer"), ".1 must be the most recent");
+        assert!(gen2.contains("older"), ".2 must be the previous one");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
