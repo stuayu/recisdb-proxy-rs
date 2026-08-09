@@ -21,6 +21,7 @@ use chrono::Local;
 use serde::Serialize;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
@@ -235,8 +236,20 @@ struct MessageVisitor {
     extra: Vec<(String, String)>,
 }
 
+/// Fields `tracing-log` synthesizes when bridging a `log` record into a
+/// `tracing` event: `log.target`, `log.module_path`, `log.file`, `log.line`.
+/// They are bookkeeping, not part of what the line says — and the first two
+/// duplicate [`LogEntry::target`] once it's normalized — so they're dropped
+/// rather than appended to the displayed message.
+fn is_log_bridge_field(name: &str) -> bool {
+    name.starts_with("log.")
+}
+
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if is_log_bridge_field(field.name()) {
+            return;
+        }
         let text = format!("{value:?}");
         if field.name() == "message" {
             self.message = Some(text);
@@ -246,6 +259,9 @@ impl Visit for MessageVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
+        if is_log_bridge_field(field.name()) {
+            return;
+        }
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
@@ -287,7 +303,20 @@ impl<S: Subscriber> Layer<S> for LogBufferLayer {
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         let message = visitor.into_message();
-        let metadata = event.metadata();
+
+        // Almost everything in this crate logs through the `log` macros, and
+        // `tracing-log` cannot give those events a real `target` in their
+        // metadata: a `tracing` callsite needs a `'static` target, so the
+        // bridge uses the fixed target `"log"` for all of them and stashes
+        // the true one in a `log.target` field. Reading
+        // `event.metadata().target()` directly therefore records `"log"` for
+        // every `log::info!` in the process, which silently breaks both the
+        // dashboard's target filter and its access/server split.
+        // `normalized_metadata()` reconstructs the original target (and
+        // level); it returns `None` for events that came from `tracing`
+        // natively, which already carry correct metadata.
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
         self.buffer.push(*metadata.level(), metadata.target(), message);
     }
 }
@@ -459,5 +488,59 @@ mod tests {
         assert_eq!(LogCategory::parse(Some("all")), LogCategory::All);
         assert_eq!(LogCategory::parse(Some("bogus")), LogCategory::All);
         assert_eq!(LogCategory::parse(None), LogCategory::All);
+    }
+
+    // -- LogBufferLayer over `log`-bridged events ----------------------------
+    //
+    // Everything in this crate logs through the `log` macros, so these two
+    // exercise the path that actually matters in production.
+    // `tracing_log::format_trace` builds exactly the event `LogTracer` would
+    // dispatch for a `log::Record`, without having to install a global
+    // logger.
+
+    fn capture_log_record(target: &str, message: &str) -> LogEntry {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = LogBuffer::new(LOG_BUFFER_CAPACITY);
+        let subscriber = tracing_subscriber::registry().with(LogBufferLayer::new(buffer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // `Record::builder()` borrows the `Arguments`, so the format
+            // args have to outlive the record — hence the separate binding.
+            let args = format_args!("{message}");
+            let record = log::Record::builder()
+                .args(args)
+                .level(log::Level::Info)
+                .target(target)
+                .module_path(Some("recisdb_proxy::web"))
+                .file(Some("recisdb-proxy/src/web/mod.rs"))
+                .line(Some(190))
+                .build();
+            tracing_log::format_trace(&record).unwrap();
+        });
+
+        let result = buffer.query(LogQuery { limit: 10, ..Default::default() });
+        assert_eq!(result.entries.len(), 1, "expected exactly one buffered entry");
+        result.entries.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn log_bridged_events_keep_their_real_target() {
+        // Regression: the bridge gives every `log` event the fixed tracing
+        // target "log", so reading `event.metadata().target()` recorded
+        // "log" for all of them — the target filter matched nothing and the
+        // access/server split put the access log on the server side.
+        let entry = capture_log_record(ACCESS_LOG_TARGET, "1.2.3.4 \"GET /api/stats\" 200 0ms");
+        assert_eq!(entry.target, ACCESS_LOG_TARGET);
+        assert_eq!(entry.level, "INFO");
+        assert!(LogCategory::Access.matches(&entry.target));
+        assert!(!LogCategory::Server.matches(&entry.target));
+    }
+
+    #[test]
+    fn log_bridge_bookkeeping_fields_stay_out_of_the_message() {
+        // log.target / log.module_path / log.file / log.line would otherwise
+        // be appended as `key=value` noise on every single line.
+        let entry = capture_log_record("recisdb_proxy::scheduler", "Scan completed");
+        assert_eq!(entry.message, "Scan completed");
     }
 }
