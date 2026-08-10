@@ -57,17 +57,45 @@ proxy 経由でも同じ挙動になる (プロセスは生きたまま、OS の
 だけ。名前付きパイプ (`\\.\pipe\...` を入力パスとして渡す) が候補。次の手順で
 判定できる:
 
+パスはすべて絶対で書く。`Start-Process` の子プロセスは作業ディレクトリが呼び出し
+元と一致するとは限らず、相対パスだと出力先が追えなくなる。
+
 ```powershell
-$pipe = New-Object System.IO.Pipes.NamedPipeServerStream("dantto4ktest", [System.IO.Pipes.PipeDirection]::Out)
-Start-Process -NoNewWindow .\dantto4k.exe -ArgumentList '--no-progress','--no-stats','\\.\pipe\dantto4ktest','out3.ts'
-$pipe.WaitForConnection()
-$fs = [System.IO.File]::OpenRead("BS4K.mmts")
-$fs.CopyTo($pipe)
-$pipe.Dispose(); $fs.Dispose()
+$exe  = 'C:\DTV\BonDriver\dantto4k.exe'
+$in   = 'C:\DTV\BonDriver\BS4K.mmts'
+$out  = 'C:\DTV\BonDriver\out3.ts'
+$name = 'dantto4ktest'
+
+if (Test-Path $out) { Remove-Item $out }
+
+$server = New-Object System.IO.Pipes.NamedPipeServerStream($name, [System.IO.Pipes.PipeDirection]::Out)
+$proc = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+    -ArgumentList '--no-progress','--no-stats',"\\.\pipe\$name",$out
+
+# 変換器がパイプを開かなければ、ここで待たされ続けるので上限を切る
+$task = $server.WaitForConnectionAsync()
+if ($task.Wait(15000)) {
+    $fs = [System.IO.File]::OpenRead($in)
+    $fs.CopyTo($server)
+    $fs.Dispose()
+    $server.Dispose()
+    $proc.WaitForExit()
+    if (Test-Path $out) { Get-Item $out | Select-Object FullName, Length }
+    else { 'NG: 出力ファイルが作られなかった' }
+} else {
+    'NG: 変換器が名前付きパイプを開かなかった (入力にシークが必要と見られる)'
+    $server.Dispose()
+    if (-not $proc.HasExited) { $proc.Kill() }
+}
 ```
 
-`out3.ts` が育てば名前付きパイプで配信まで通せる。育たなければ入力にシークが
-必要ということなので、別の方法を考える必要がある。
+判定:
+
+- **`Length` が育っている** → 名前付きパイプで配信まで通せる
+- **`NG: 変換器が名前付きパイプを開かなかった`** → 入力にシークが必要。名前付き
+  パイプは使えないので別の方法が要る
+- **`NG: 出力ファイルが作られなかった`** → パイプは開けたが変換できていない。
+  変換器の出力を見る
 
 変換は **broadcast の手前** に置く。購読者ごとに変換するのは無駄だし、
 TS解析・EPG/ロゴ収集も TS しか解さないため。
