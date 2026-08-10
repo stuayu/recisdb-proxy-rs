@@ -547,13 +547,23 @@ pub(crate) async fn acquire(
                 // Decided here rather than at each call site: `acquire` is the
                 // single choke point every tuning path goes through, and it is
                 // the only one that already holds the database handle.
-                startup_config.b25_enabled = {
+                let stream_format = {
                     let db = database.lock().await;
-                    b25_enabled_for(
+                    startup_config.b25_enabled = b25_enabled_for(
                         db.driver_disables_b25(&key.tuner_path),
                         db.band_type_for_bon_channel(&key.tuner_path, space, channel),
-                    )
+                    );
+                    db.driver_stream_format(&key.tuner_path)
                 };
+
+                if stream_format.is_mmt_tlv() {
+                    // A 4K tuner hands back MMT/TLV, which nothing downstream
+                    // can read, so the converter is not optional here.
+                    startup_config.mmt_converter = Some(pool_config.mmt_converter.clone());
+                    // The converter descrambles (ACAS); libaribb25 has no part
+                    // in this path at all.
+                    startup_config.b25_enabled = false;
+                }
 
                 if let Err(e) = tuner
                     .start_reader(pool, key.tuner_path.clone(), space, channel, startup_config, start_permit, warm_to_use)
@@ -633,6 +643,7 @@ mod tests {
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
             b25_enabled: true,
+            mmt_converter: None,
         }
     }
 

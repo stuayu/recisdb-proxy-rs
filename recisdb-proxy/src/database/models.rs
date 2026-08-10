@@ -293,3 +293,42 @@ impl NewBonDriver {
         self
     }
 }
+
+/// What a BonDriver actually hands back from `GetTsStream`.
+///
+/// Everything downstream of the reader — the TS analyzer, the EPG and logo
+/// collectors, `send_ts_data`'s 188-byte alignment, every session — assumes
+/// MPEG-2 TS. A 4K tuner delivers MMT/TLV instead, which has to be converted
+/// before any of that runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamFormat {
+    /// MPEG-2 TS. Every terrestrial/BS/CS tuner.
+    #[default]
+    Ts,
+    /// Raw MMT/TLV from an advanced-BS (4K) tuner. Needs the external
+    /// converter (`tuner/mmt_pipe.rs`) in front of the broadcast.
+    MmtTlv,
+}
+
+impl StreamFormat {
+    pub fn as_db_value(self) -> &'static str {
+        match self {
+            StreamFormat::Ts => "ts",
+            StreamFormat::MmtTlv => "mmttlv",
+        }
+    }
+
+    /// Parse a stored value. Anything unrecognised is treated as TS: that
+    /// keeps a typo from silently inserting a converter (or, worse, from
+    /// leaving a 4K driver looking like a broken TS driver).
+    pub fn from_db_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mmttlv" | "mmt/tlv" | "mmt_tlv" => StreamFormat::MmtTlv,
+            _ => StreamFormat::Ts,
+        }
+    }
+
+    pub fn is_mmt_tlv(self) -> bool {
+        matches!(self, StreamFormat::MmtTlv)
+    }
+}

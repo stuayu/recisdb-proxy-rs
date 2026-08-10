@@ -427,6 +427,7 @@ async fn run_server(
                         set_channel_retry_timeout_ms,
                         signal_poll_interval_ms,
                         signal_wait_timeout_ms,
+                        mmt_converter: Default::default(),
                     },
                     (prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor),
                 )
@@ -436,6 +437,30 @@ async fn run_server(
                 (TunerPoolConfig::default(), (1000, 2000, 6000, 1.5))
             }
         }
+    };
+
+    // The MMT/TLV converter is config-file-only (it names an executable), so
+    // it is layered on after the DB-backed tuner settings rather than being
+    // one of them.
+    let tuner_config = {
+        let mut cfg = tuner_config;
+        cfg.mmt_converter = recisdb_proxy::tuner::mmt_pipe::MmtConverterConfig {
+            command_path: file_config.mmttlv.command_path.clone().unwrap_or_default(),
+            cas_proxy_server: file_config.mmttlv.cas_proxy_server.clone(),
+            smart_card_reader_name: file_config.mmttlv.smart_card_reader_name.clone(),
+            frontend_descrambled: file_config.mmttlv.frontend_descrambled,
+            extra_args: file_config.mmttlv.extra_args.clone(),
+        };
+        if !cfg.mmt_converter.command_path.is_empty() {
+            info!(
+                "  MMT/TLV converter: {} (casProxy={:?}, reader={:?}, frontendDescrambled={})",
+                cfg.mmt_converter.command_path,
+                cfg.mmt_converter.cas_proxy_server,
+                cfg.mmt_converter.smart_card_reader_name,
+                cfg.mmt_converter.frontend_descrambled,
+            );
+        }
+        cfg
     };
 
     // Build server config

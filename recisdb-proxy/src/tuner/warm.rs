@@ -295,6 +295,7 @@ mod tests {
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
             b25_enabled: true,
+            mmt_converter: None,
         }
     }
 

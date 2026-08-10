@@ -37,6 +37,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub preview: PreviewSection,
     #[serde(default)]
+    pub mmttlv: MmtTlvSection,
+    #[serde(default)]
     pub mirakurun: MirakurunSection,
     #[cfg(feature = "tls")]
     #[serde(default)]
@@ -83,6 +85,37 @@ pub struct TsreplaceSection {
     /// Same trust boundary as `command_path` (TOML-only, never via the Web
     /// API). Set to an empty string to clear an already-persisted value.
     pub preprocessor_path: Option<String>,
+}
+
+/// MMT/TLV → MPEG-2 TS converter (dantto4k) configuration for 4K tuners.
+///
+/// `command_path` is TOML-only for the same reason as `[tsreplace]`: the
+/// server executes it directly, so exposing it to the Web API would be a
+/// remote code execution vector. The CAS settings live here too rather than in
+/// the database, because without one of them the converter silently produces
+/// an undecipherable TS — they are part of getting the driver working at all,
+/// not a per-session preference.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct MmtTlvSection {
+    /// Path to the `dantto4k` executable.
+    pub command_path: Option<String>,
+    /// `--casProxyServer`: address of a running CasProxyServer, e.g.
+    /// `127.0.0.1:24000`. The converter falls back to local PC/SC when it
+    /// cannot reach this, so a wrong address looks like "no card reader".
+    pub cas_proxy_server: Option<String>,
+    /// `--smartCardReaderName`: PC/SC reader holding the A-CAS card.
+    /// Use `dantto4k --listSmartCardReader` to get the exact name.
+    pub smart_card_reader_name: Option<String>,
+    /// `--frontend-descrambled`: only remux, assume something upstream already
+    /// descrambled. Leave this off when reading raw off a tuner — nothing has
+    /// descrambled at that point, and turning it on yields a full-size,
+    /// unplayable TS with no warning.
+    #[serde(default)]
+    pub frontend_descrambled: bool,
+    /// Extra arguments appended verbatim (`--disableADTSConversion`,
+    /// `--customWinscardDLL <path>`, …).
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 /// Browser-preview (`?profile=preview`) encoder configuration that must only

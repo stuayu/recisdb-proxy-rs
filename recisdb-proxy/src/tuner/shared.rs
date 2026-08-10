@@ -262,7 +262,7 @@ fn init_b25_with_deadline(opt: DecoderOptions) -> Option<B25Pipe> {
 }
 
 /// Runtime startup tuning parameters for delayed network-backed drivers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReaderStartupConfig {
     pub set_channel_retry_interval_ms: u64,
     pub set_channel_retry_timeout_ms: u64,
@@ -278,6 +278,13 @@ pub struct ReaderStartupConfig {
     /// one card outage away from deleting the video instead of merely wasting
     /// work.
     pub b25_enabled: bool,
+    /// External MMT/TLV→TS converter to run in front of everything else.
+    ///
+    /// `Some` only for drivers registered as `stream_format = 'mmttlv'` (4K
+    /// tuners). The conversion has to happen here, before the broadcast:
+    /// every subscriber, the TS analyzer and the SI collectors all speak TS
+    /// and nothing else.
+    pub mmt_converter: Option<crate::tuner::mmt_pipe::MmtConverterConfig>,
 }
 
 impl From<&TunerPoolConfig> for ReaderStartupConfig {
@@ -290,6 +297,8 @@ impl From<&TunerPoolConfig> for ReaderStartupConfig {
             // Callers that know the source is pre-descrambled turn this off;
             // the pool config alone cannot tell.
             b25_enabled: true,
+            // Set by callers that know the driver delivers MMT/TLV.
+            mmt_converter: None,
         }
     }
 }
@@ -892,6 +901,34 @@ impl SharedTuner {
             enable_working_key: false,
         };
 
+        // ===== MMT/TLV → TS converter (4K) =====
+        // Runs before everything else: the rest of this loop, the analyzer and
+        // every subscriber assume MPEG-2 TS.
+        let mut mmt = match startup_config.mmt_converter.as_ref() {
+            Some(cfg) => match crate::tuner::mmt_pipe::MmtPipe::new(cfg) {
+                Ok(pipe) => {
+                    info!("[SharedTuner] MMT/TLV converter started for {:?}", shared.key);
+                    Some(pipe)
+                }
+                Err(e) => {
+                    // Without the converter this driver emits MMT/TLV that
+                    // nothing downstream can read, so publishing the raw bytes
+                    // would just look like a dead channel. Fail the start.
+                    error!(
+                        "[SharedTuner] Failed to start MMT/TLV converter for {:?}: {}",
+                        shared.key, e
+                    );
+                    let _ = ready_tx.send(Err(format!(
+                        "MMT/TLV converter failed to start: {}",
+                        e
+                    )));
+                    shared.stop_and_release_slot();
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let mut b25 = if startup_config.b25_enabled {
             init_b25_with_deadline(b25_opt)
         } else {
@@ -1082,7 +1119,33 @@ impl SharedTuner {
                     // here, on the read-rate-limiting thread, once per chunk
                     // (P3 §2.2-10). They now run in their own task fed by the
                     // same broadcast — see `spawn_si_collector`.
-                    let raw = &buf[..n];
+                    // 4K: what the driver handed over is MMT/TLV, not TS.
+                    // Convert first; everything below (B25, the analyzer, the
+                    // broadcast) only ever sees the converted TS.
+                    let converted;
+                    let raw: &[u8] = match mmt.as_mut() {
+                        Some(pipe) => match pipe.push(&buf[..n]) {
+                            Ok(ts) => {
+                                if ts.is_empty() {
+                                    // Normal at start-up and whenever the
+                                    // converter is still filling: nothing to
+                                    // publish yet, but the tuner read must keep
+                                    // running.
+                                    continue;
+                                }
+                                converted = ts;
+                                &converted
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[SharedTuner] MMT/TLV conversion failed for {:?}: {}",
+                                    shared.key, e
+                                );
+                                break;
+                            }
+                        },
+                        None => &buf[..n],
+                    };
 
                     // 起動時はB25の可否がまだ分かっていないことがある
                     // (`init_b25_with_deadline` 参照)。判定が「使える」で
@@ -1381,6 +1444,9 @@ impl SharedTuner {
     ) -> Result<(), std::io::Error> {
         let mut warm = warm;
         let tuner_path_for_fallback = tuner_path.clone();
+        // Cloned for the cold-open fallback below: the config is no longer
+        // `Copy` now that it carries the converter settings.
+        let startup_config_for_fallback = startup_config.clone();
         match warm
             .activate(Arc::clone(self), tuner_path, space, channel, startup_config, ready_timeout)
             .await
@@ -1413,7 +1479,7 @@ impl SharedTuner {
                         self.set_slot_permit(permit);
                         self.set_state(ReaderState::Starting);
                         return self
-                            .start_reader_cold(tuner_path_for_fallback, space, channel, startup_config, ready_timeout)
+                            .start_reader_cold(tuner_path_for_fallback, space, channel, startup_config_for_fallback, ready_timeout)
                             .await;
                     }
                     // No permit to retry with (someone else took it): give
@@ -1768,6 +1834,7 @@ fn test_startup_config() -> ReaderStartupConfig {
         signal_poll_interval_ms: 5,
         signal_wait_timeout_ms: 50,
         b25_enabled: true,
+        mmt_converter: None,
     }
 }
 
@@ -2075,6 +2142,7 @@ mod tests {
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
             b25_enabled: true,
+            mmt_converter: None,
         };
         assert_eq!(
             timing::reader_ready_timeout(config.set_channel_retry_timeout_ms),

@@ -44,6 +44,14 @@ pub struct TunerPoolConfig {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    /// MMT/TLV→TS converter settings, from `[mmttlv]` in the config file.
+    ///
+    /// Carried here so `acquire` — the one place every tuning path goes
+    /// through — can hand them to readers for drivers registered as
+    /// `stream_format = 'mmttlv'`. Unset means 4K drivers cannot start, which
+    /// is the honest outcome: without the converter they emit MMT/TLV that
+    /// nothing downstream can read.
+    pub mmt_converter: crate::tuner::mmt_pipe::MmtConverterConfig,
 }
 
 impl Default for TunerPoolConfig {
@@ -56,6 +64,7 @@ impl Default for TunerPoolConfig {
             set_channel_retry_timeout_ms: 10_000,
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
+            mmt_converter: crate::tuner::mmt_pipe::MmtConverterConfig::default(),
         }
     }
 }
@@ -820,6 +829,7 @@ mod tests {
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
             b25_enabled: true,
+            mmt_converter: None,
         }
     }
 

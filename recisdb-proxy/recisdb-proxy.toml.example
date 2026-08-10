@@ -129,3 +129,43 @@ preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.e
 # true にするとクライアント証明書がない接続は拒否されます
 # require_client_cert = false
 
+# =====================================================
+# BS4K (MMT/TLV) 変換設定
+# =====================================================
+# 4Kチューナーは MPEG-2 TS ではなく MMT/TLV を出力します。本体が生の
+# MMT/TLV を読み出し、この設定の変換器 (dantto4k) にパイプで渡して TS へ
+# 変換してから配信します。
+#
+# 使うには、対象の BonDriver を stream_format = 'mmttlv' として登録します:
+#   UPDATE bon_drivers SET stream_format = 'mmttlv' WHERE dll_path = '...';
+#
+# 詳細は docs/FOURK_SETUP.md を参照してください。
+# [mmttlv]
+# dantto4k の実行ファイルのパス
+# (実行ファイルのパスは [tsreplace] と同じ理由でこの設定ファイルからのみ
+#  指定できます。Web API から変更可能にするとリモートコード実行の踏み台に
+#  なるため)
+# command_path = "C:\\DTV\\BonDriver\\dantto4k.exe"
+#
+# --- ACAS 復号の設定 (どちらか一方が必須) ---
+# 変換器がスクランブル解除まで行います。どちらも設定しないと、変換自体は
+# 成功するのに復号されていない TS が出力され、「変換は通るのに再生できない」
+# 状態になります。この場合サーバーログに警告が出ます。
+#
+# CasProxyServer のアドレス
+# 指定しても実際にサーバーが起動していないと、変換器はローカルの PC/SC に
+# フォールバックし "No smart card readers are available" を出します
+# cas_proxy_server = "127.0.0.1:24000"
+#
+# A-CAS カードを読む PC/SC リーダー名
+# 正確な名前は `dantto4k.exe --listSmartCardReader` で確認できます
+# smart_card_reader_name = ""
+#
+# 前段で復号済みの場合に指定します (--frontend-descrambled)。
+# 生のチューナー出力を読む通常の構成では **false のままにしてください**。
+# スクランブルされたままの入力にこれを指定すると、警告なしで再生できない
+# TS が出力されます
+# frontend_descrambled = false
+#
+# その他の引数をそのまま渡します
+# extra_args = ["--disableADTSConversion"]

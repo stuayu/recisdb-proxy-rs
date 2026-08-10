@@ -179,7 +179,47 @@ impl Database {
         ("017_card_reader_name", Database::migration_017_card_reader_name),
         ("018_ts_queue_duration_columns", Database::migration_018_ts_queue_duration_columns),
         ("019_bon_driver_disable_b25", Database::migration_019_bon_driver_disable_b25),
+        ("020_bon_driver_stream_format", Database::migration_020_bon_driver_stream_format),
     ];
+
+    /// Migration 020: what the driver actually hands back.
+    ///
+    /// `'ts'` (default) = MPEG-2 TS, the only thing the rest of the pipeline
+    /// understands. `'mmttlv'` = raw MMT/TLV, i.e. a 4K tuner, which has to go
+    /// through the external converter first (`tuner/mmt_pipe.rs`).
+    ///
+    /// This cannot be derived from a scan the way `band_type` is: scanning
+    /// parses TS, so a raw 4K tuner produces nothing to classify until the
+    /// converter is already in the path. It is a property of the driver, set
+    /// when the driver is registered.
+    fn migration_020_bon_driver_stream_format(&self) -> Result<()> {
+        self.add_column_if_not_exists("bon_drivers", "stream_format", "TEXT DEFAULT 'ts'")
+    }
+
+    /// Stream format the driver delivers. Unknown drivers and unrecognised
+    /// values answer `Ts`: assuming TS keeps existing setups working, while
+    /// wrongly assuming MMT/TLV would insert a converter into a stream that
+    /// does not need one.
+    pub fn driver_stream_format(&self, dll_path: &str) -> StreamFormat {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(stream_format, 'ts') FROM bon_drivers WHERE dll_path = ?1",
+                rusqlite::params![dll_path],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|s| StreamFormat::from_db_value(&s))
+            .unwrap_or(StreamFormat::Ts)
+    }
+
+    /// Set the stream format for a driver.
+    pub fn set_driver_stream_format(&self, dll_path: &str, format: StreamFormat) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bon_drivers SET stream_format = ?2, updated_at = strftime('%s','now')
+             WHERE dll_path = ?1",
+            rusqlite::params![dll_path, format.as_db_value()],
+        )?;
+        Ok(())
+    }
 
     /// Migration 019: per-driver "this source is already descrambled" flag.
     ///
@@ -1251,6 +1291,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    /// Migration 020 must be idempotent and default to TS, so registering a
+    /// driver keeps meaning "MPEG-2 TS" unless it is explicitly said otherwise.
+    #[test]
+    fn migration_020_adds_stream_format_idempotently() {
+        let db = Database::open_in_memory().unwrap();
+        db.migration_020_bon_driver_stream_format().unwrap();
+        db.migration_020_bon_driver_stream_format().unwrap();
+
+        let path = "BonDriver_BDA_CATV4K_1.dll";
+        db.get_or_create_bon_driver(path).unwrap();
+        assert_eq!(db.driver_stream_format(path), StreamFormat::Ts);
+
+        db.set_driver_stream_format(path, StreamFormat::MmtTlv).unwrap();
+        assert_eq!(db.driver_stream_format(path), StreamFormat::MmtTlv);
+        assert!(db.driver_stream_format(path).is_mmt_tlv());
+
+        db.set_driver_stream_format(path, StreamFormat::Ts).unwrap();
+        assert_eq!(db.driver_stream_format(path), StreamFormat::Ts);
+    }
+
+    /// An unknown driver must read as TS. Guessing MMT/TLV would put a
+    /// converter in front of a stream that does not need one.
+    #[test]
+    fn unknown_driver_reads_as_ts() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(
+            db.driver_stream_format("BonDriver_NotRegistered.dll"),
+            StreamFormat::Ts
+        );
+    }
+
+    /// A typo in the stored value must not turn a TS driver into a 4K one.
+    #[test]
+    fn an_unrecognised_stream_format_falls_back_to_ts() {
+        assert_eq!(StreamFormat::from_db_value("ts"), StreamFormat::Ts);
+        assert_eq!(StreamFormat::from_db_value("mmttlv"), StreamFormat::MmtTlv);
+        assert_eq!(StreamFormat::from_db_value("MMTTLV"), StreamFormat::MmtTlv);
+        assert_eq!(StreamFormat::from_db_value(" mmt/tlv "), StreamFormat::MmtTlv);
+        assert_eq!(StreamFormat::from_db_value("mmt"), StreamFormat::Ts);
+        assert_eq!(StreamFormat::from_db_value(""), StreamFormat::Ts);
     }
 
     /// Migration 019 must be idempotent (the ledger replays from

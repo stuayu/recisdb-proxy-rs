@@ -16,6 +16,7 @@ pub(crate) mod ts_source;
 pub mod ts_parser;
 pub mod ts_analyzer;
 pub mod b25_pipe;
+pub mod mmt_pipe;
 pub mod quality_scorer;
 pub mod warm;
 pub mod logo_collector;

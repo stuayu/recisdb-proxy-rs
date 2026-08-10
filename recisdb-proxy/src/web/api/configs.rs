@@ -298,6 +298,11 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        // Carried over, not rebuilt: the MMT/TLV converter comes from the
+        // config file (it names an executable, so it is deliberately not
+        // reachable from the Web API). Defaulting it here would silently
+        // unconfigure 4K tuners the first time anyone saved this form.
+        mmt_converter: web_state.tuner_pool.config().await.mmt_converter,
     };
     web_state.tuner_pool.update_config(pool_config).await;
 
