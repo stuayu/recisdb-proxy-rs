@@ -479,6 +479,7 @@ fn scan_space_blocking(
     channels: &[(u32, String)],
     signal_lock_wait_ms: u64,
     ts_read_timeout_ms: u64,
+    mmt_converter: Option<&crate::tuner::mmt_pipe::MmtConverterConfig>,
 ) -> Result<Vec<ScanChannelResult>, Box<dyn std::error::Error + Send + Sync>> {
     info!("scan_space_blocking: Loading BonDriver {}", dll_path);
     let tuner = BonDriverTuner::new(dll_path)?;
@@ -648,7 +649,7 @@ fn scan_space_blocking(
         for attempt in 0..3 {
             // catch_unwind to prevent panics (e.g. from FFI) from crashing the process
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                analyze_ts_stream(&tuner, ts_read_timeout_ms)
+                analyze_ts_stream(&tuner, ts_read_timeout_ms, mmt_converter)
             })) {
                 Ok(r) => r,
                 Err(panic_err) => {
@@ -745,8 +746,18 @@ fn scan_space_blocking(
 fn analyze_ts_stream(
     tuner: &BonDriverTuner,
     ts_read_timeout_ms: u64,
+    mmt_converter: Option<&crate::tuner::mmt_pipe::MmtConverterConfig>,
 ) -> Result<TsAnalysis, Box<dyn std::error::Error + Send + Sync>> {
     debug!("analyze_ts_stream: Starting TS analysis");
+
+    // 4K: the driver delivers MMT/TLV, so everything below — the 0x47 resync,
+    // the 188-byte framing, the PAT/NIT/SDT parser — needs the converted TS
+    // rather than what came off the tuner. One converter per channel, torn
+    // down with this function.
+    let mut mmt = match mmt_converter {
+        Some(cfg) => Some(crate::tuner::mmt_pipe::MmtPipe::new(cfg)?),
+        None => None,
+    };
 
     let config = AnalyzerConfig {
         parse_nit: true,
@@ -831,7 +842,32 @@ fn analyze_ts_stream(
         }
 
         // 3) carry へ入れて 188 単位で feed（TS固定長）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
-        carry.extend_from_slice(&buffer[..size]);
+        //    4K は変換器を通してからでないと 0x47 が現れない。
+        match mmt.as_mut() {
+            Some(pipe) => {
+                // 復号できていない変換器は、正常終了しながら暗号化された TS を
+                // 出し続ける。放っておくと解析は永久に完成せず、1チャンネル
+                // あたり ts_read_timeout_ms (既定5分) を丸ごと待つことになる。
+                // 8チャンネルで40分。原因も出ないので、掴んだ時点で打ち切る。
+                if pipe.status().descramble_failing() {
+                    return Err(format!(
+                        "MMT/TLV converter cannot descramble ({} error(s) on stderr); \
+                         check the CasProxyServer / smart card reader settings \
+                         (see docs/FOURK_SETUP.md)",
+                        pipe.status().descramble_error_count()
+                    )
+                    .into());
+                }
+
+                let converted = pipe.push(&buffer[..size])?;
+                if converted.is_empty() {
+                    // 変換器が出力を出すまでは何も足さない。起動直後は普通。
+                    continue;
+                }
+                carry.extend_from_slice(&converted);
+            }
+            None => carry.extend_from_slice(&buffer[..size]),
+        }
 
         // resync（sync byte 0x47 を探す）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
         if !carry.is_empty() && carry[0] != 0x47 {
@@ -1063,7 +1099,7 @@ fn scan_results_to_channel_infos(
 async fn perform_scan(
     driver: &BonDriverRecord,
     database: DatabaseHandle,
-    _tuner_pool: Arc<TunerPool>,
+    tuner_pool: Arc<TunerPool>,
     signal_lock_wait_ms: u64,
     ts_read_timeout_ms: u64,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -1098,6 +1134,28 @@ async fn perform_scan(
     }
 
     // Collect all scan results
+    // A 4K driver hands back MMT/TLV, which `analyze_ts_stream` cannot parse:
+    // it looks for 0x47 sync bytes and would only ever log "resync failed".
+    // The scan needs the same conversion the streaming path gets — resolved
+    // here because the blocking closure below can touch neither the async DB
+    // handle nor the pool.
+    let mmt_converter = {
+        let is_mmt_tlv = {
+            let db = database.lock().await;
+            db.driver_stream_format(&dll_path).is_mmt_tlv()
+        };
+        if is_mmt_tlv {
+            let cfg = tuner_pool.config().await.mmt_converter;
+            info!(
+                "perform_scan: {} is registered as MMT/TLV; scanning through the converter",
+                dll_path
+            );
+            Some(cfg)
+        } else {
+            None
+        }
+    };
+
     let dll = dll_path.clone();
     let all_results = tokio::task::spawn_blocking(move || {
         let mut results = Vec::new();
@@ -1134,7 +1192,7 @@ async fn perform_scan(
                 channels.len()
             );
 
-            match scan_space_blocking(&dll, space, &channels, signal_lock_wait_ms, ts_read_timeout_ms) {
+            match scan_space_blocking(&dll, space, &channels, signal_lock_wait_ms, ts_read_timeout_ms, mmt_converter.as_ref()) {
                 Ok(r) => results.extend(r),
                 Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
             }

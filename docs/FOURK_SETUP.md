@@ -68,6 +68,28 @@ UPDATE bon_drivers SET stream_format = 'mmttlv' WHERE dll_path = '...';
 `stream_format = 'mmttlv'` のドライバでは B25 (libaribb25) を無条件で切る。
 復号は変換器の担当なので、TS 用の復号器を通す意味がない。
 
+### スキャンも同じ変換器を通る
+
+チャンネルスキャンは配信経路 (`SharedTuner`) を使わず、**BonDriver を直接開いて
+自分で TS を読み**、`analyze_ts_stream` が PAT/NIT/SDT を解析する。
+そのままでは 0x47 を探して "resync failed" を出し続けるだけなので、
+`stream_format = 'mmttlv'` のドライバではスキャン側にも変換器を挟む。
+
+```mermaid
+flowchart LR
+    SS["スキャン<br/>scan_space_blocking"] -->|"BonDriverを直接open"| TU["4Kチューナー"]
+    TU -->|"生MMT/TLV"| AN["analyze_ts_stream"]
+    AN <-->|"stdin / stdout"| CV["dantto4k<br/>チャンネル毎に起動"]
+    AN -->|"MPEG-2 TS"| PS["PAT / NIT / SDT 解析<br/>NID / TSID / SID を取得"]
+```
+
+変換器はチャンネルごとに起動して解析が終わると落とす。
+
+**復号できていない場合はスキャンを即座に打ち切る。** 変換器は正常終了しながら
+暗号化された TS を出し続けるため、放置すると解析が永久に完成せず、
+1チャンネルあたり `ts_read_timeout_ms` (既定5分) を丸ごと待つ。8チャンネルなら
+40分沈黙したうえ理由も出ない。stderr の該当メッセージを掴んだ時点でエラーにする。
+
 ## 復号が最大のハマりどころ
 
 **変換器は復号できなくても正常終了し、フルサイズの TS を書く。**
