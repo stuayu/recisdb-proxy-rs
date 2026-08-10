@@ -1,38 +1,100 @@
 # BS4K (高度BSデジタル) 対応
 
-## 方式: dantto4k の BonDriver ラッパーを噛ませる
+## 方式: 生MMT/TLVは本体で読み、変換だけdantto4kに渡す
 
 4K放送は MMT/TLV 多重で、MPEG-2 TS ではない。recisdb-proxy のパイプライン
-(B25・TS解析・EPG・チャンネル列挙・録画) はすべて TS 前提なので、**TS に
-変換してから proxy に入れる**。
-
-変換は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) が
-同梱する `BonDriver_dantto4k.dll` で行う。これは別の BonDriver を内側に
-ロードし、ACAS 復号 + MMT/TLV→MPEG-2 TS 変換をリアルタイムで行って返す
-BonDriver。
+(TS解析・EPG・ロゴ・チャンネル列挙・録画・全セッション) はすべて TS 前提なので、
+**TS に変換してから broadcast に流す**。
 
 ```
-4Kチューナー → BonDriver_BDA 等 → BonDriver_dantto4k.dll → recisdb-proxy
-                                    ↑ここでTSになる
+4Kチューナー ─BonDriver─▶ recisdb-proxy のリーダー ─stdin─▶ dantto4k ─stdout─▶ TS ─▶ broadcast
+                          (生MMT/TLV)                                          (以降すべて既存経路)
 ```
 
-recisdb-proxy から見れば**ただの BonDriver** なので、DB に登録するだけでよい。
-proxy 側にソースの取り込みや FFI 結合は不要。
+変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI を
+パイプモード (`dantto4k [OPTION...] - -`) で使う。
 
-補足: dantto4k は**復調しない**。復調はチューナーのハードと内側の BonDriver が
-行う。dantto4k がやるのは復号と多重方式の変換。
+変換は **broadcast の手前** に置く。購読者ごとに変換するのは無駄だし、
+TS解析・EPG/ロゴ収集も TS しか解さないため。
+
+### なぜ BonDriver ラッパーを使わないのか
+
+dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の BonDriver を
+ロードしてインラインで変換する。理屈の上ではこちらなら proxy 側の変更はゼロで済む。
+
+しかし**実際に試すと、MMT/TLV は流れているのに何も出力されない**状態になった。
+そのため生の読み出しは本体が行い、dantto4k には変換機能だけを使わせる。
+
+補足: dantto4k は**復調しない**。復調はチューナーのハードと BonDriver が行う。
 
 ## セットアップ
 
-1. dantto4k を配置し、`BonDriver_dantto4k.ini` で内側の BonDriver
-   (4Kチューナーのもの) を指定する
-2. ACAS カードを PC/SC で読める状態にする (または dantto4k の casproxyserver)
-3. `BonDriver_dantto4k.dll` のパスを recisdb-proxy の BonDriver として登録
-4. スキャンを実行
+1. dantto4k を配置する
+2. **ACAS 復号の手段を用意する** (下記「復号が最大のハマりどころ」)
+3. `recisdb-proxy.toml` に `[mmttlv]` を書く:
 
-複数チューナーで使う場合は、DLL とその `.ini` をチューナーごとにコピーして
-別名にする (`BonDriver_dantto4k_T0.dll` など)。`max_instances` は 1 のままに
-しておく。
+```toml
+[mmttlv]
+command_path = "C:\\DTV\\BonDriver\\dantto4k.exe"
+cas_proxy_server = "127.0.0.1:24000"   # または smart_card_reader_name
+```
+
+4. 4Kチューナーの BonDriver を登録し、**MMT/TLV を出すことを明示する**:
+
+```sql
+UPDATE bon_drivers SET stream_format = 'mmttlv' WHERE dll_path = '...';
+```
+
+これはスキャン結果から導出できない。スキャンは TS を解析するので、変換器が
+経路に入るまで分類する材料が存在しない。ドライバの性質として登録時に決める。
+
+5. スキャンを実行
+
+`stream_format = 'mmttlv'` のドライバでは B25 (libaribb25) を無条件で切る。
+復号は変換器の担当なので、TS 用の復号器を通す意味がない。
+
+## 復号が最大のハマりどころ
+
+**変換器は復号できなくても正常終了し、フルサイズの TS を書く。**
+中身は暗号化されたままなので再生できない。「変換は通るのに映らない」の正体は
+だいたいこれ。
+
+実機の統計がその状態を示していた例:
+
+```
+No smart card readers are available     ← 8回出ている
+...
+PacketId: 0xFFF1, Count: 613, ECM       ← スクランブルされている
+PacketId: 0xFFF2, Count: 239, EMM
+PacketId: 0xF300, Count: 133361, HEVC(3840x2160)   ← 変換自体は成功
+```
+
+`--casProxyServer` を渡していても、**実際に CasProxyServer が起動していないと
+ローカル PC/SC にフォールバックして**この状態になる。
+
+対応として、本体は変換器の stderr を監視し、該当メッセージを掴んだら
+エラーとしてログに出す (`tuner/mmt_pipe.rs`)。黙って暗号文を配信しない。
+
+確認手順:
+
+- `dantto4k.exe --listSmartCardReader` でリーダーが見えるか
+- CasProxyServer を使うなら、指定アドレスで実際に待ち受けているか
+- 復号が通れば `No smart card readers are available` が出なくなる
+
+`--frontend-descrambled` は前段で復号済みの場合のオプション。
+**生のチューナー出力を読む本構成では使わない** (何も復号されていないため)。
+スクランブルされたままの入力に指定すると、警告すら出ずに再生できない TS が出る。
+
+### NullPacket が大半なのは正常
+
+```
+TLV:
+ - HeaderCompressedIpPacket: 149091
+ - NullPacket: 578067
+```
+
+TLV の約79%が Null。実データは HeaderCompressedIpPacket 側。帯域の穴埋めなので
+異常ではない。「データが出ていない」と誤読しやすい。
 
 ## 実装済みの対応
 
@@ -87,6 +149,9 @@ B25 が起動してしまう。
   「既に復号済みのソース」はストリームから判別できないため
 - **未スキャンで帯域が分からないチャンネルは B25 有効のまま。** 不要な復号は
   無駄なだけだが、必要な復号を外すと映像が出ない
+- **`stream_format = 'mmttlv'` のドライバは帯域を見るまでもなく B25 を切る。**
+  復号は変換器の担当。こちらはスキャン前でも効くので、上の「未スキャンなら
+  有効のまま」より優先される
 
 手動指定は現状 SQL で行う (Web API / ダッシュボードには未露出):
 
@@ -114,7 +179,8 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
   既定の `preview-h264` プロファイルは `--interlace tff --vpp-deinterlace normal`
   を渡すが、**BS4K は 2160/59.94p のプログレッシブ**なのでこの指定は誤り。
   4K 用プロファイル (デインタレースなし + スケール指定) の追加が必要
-- **`disable_b25` の Web API / ダッシュボード露出**
+- **`disable_b25` / `stream_format` の Web API / ダッシュボード露出**
+  (現状どちらも SQL で設定する)
 - **Drop カウント**: 実機の PID 別集計では全 PID に少量の Drop が出ていた
   (映像 794484 パケット中 57)。変換器が PSI を再生成する際に連続性カウンタが
   飛んでいる可能性がある。ダッシュボードの品質表示に常時 Drop が出るなら、
@@ -123,18 +189,17 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
   (`web/mirakurun.rs`)。EPGStation 側が 4K サービスをどう扱うかは未検証。
   dantto4k の README には PT4K + Mirakurun 運用時のタイムアウト問題への言及が
   あり、本プロジェクトの Mirakurun 互換 API でも該当する可能性がある
-- **Linux**: `BonDriver_dantto4k.dll` は Windows 専用。Linux では dantto4k の
-  CLI (`dantto4k - -`) をパイプ段に挟む形になる。既存の tsreadex/tsreplace
-  パイプライン機構が流用できるが、未実装
+- **Linux**: 変換は CLI パイプなので方式としては動くはずだが、Linux 側で 4K
+  チューナーの生 MMT/TLV をどう読み出すか (DVB 経由の可否) は未検証
 
-## なぜソースを流用しないのか
+## なぜソースを取り込まない (CLI に留める) のか
 
 - dantto4k は**アプリケーション**であってライブラリではない
   (`dllmain.cpp` / `bonTuner.cpp`)。ライブラリ境界を切り出す作業が要る
 - ビルドに tsduck・OpenSSL・PC/SC を引き込む
 - ライセンスは Apache-2.0。本リポジトリ root は GPLv3 なので取り込み自体は
   可能だが、各クレートが宣言している `MIT OR Apache-2.0` の MIT 側を潰す
-- BonDriver ラッパーをそのまま使えば proxy 側の変更はほぼゼロで済む
+- プロセス分離なら、変換器の更新に追従するのがバイナリの差し替えだけで済む
 
 Rust での再実装は MMT/TLV 逆多重化・MPU/MFU 再構成・MMT-SI→PSI/SI 変換・
 ACAS (AES)・ARIB B24 変換を全部書くことになり、得るものに対して割に合わない。
