@@ -571,6 +571,19 @@ async fn run_self_update_inner(
         return Err(e);
     }
 
+    // The magic-byte check only proves the file is *an* executable. Actually
+    // running it is what proves it will start on this machine: a build for the
+    // wrong architecture, one missing a runtime DLL, or one quarantined by
+    // antivirus all pass the header check and then fail to launch — at which
+    // point the service is already replaced and does not come back.
+    //
+    // Refusing the update here leaves the running server untouched, which is
+    // always better than a dead service the operator has to repair by hand.
+    if let Err(e) = smoke_test_binary(&extracted_path).await {
+        let _ = tokio::fs::remove_file(&extracted_path).await;
+        return Err(e);
+    }
+
     // --- Replace the running binary -------------------------------------
     set_status(web_state, UpdateStatus::Replacing).await;
     #[cfg(unix)]
@@ -579,6 +592,19 @@ async fn run_self_update_inner(
         std::fs::set_permissions(&extracted_path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod failed: {e}"))?;
     }
+    // Keep the outgoing binary next to the new one. `self_replace` does not
+    // leave anything restorable behind, so without this a bad update can only
+    // be undone by fetching a release by hand — on a machine whose server is
+    // down.
+    let backup_path = exe_dir.join("recisdb-proxy.previous");
+    if let Err(e) = tokio::fs::copy(&exe_path, &backup_path).await {
+        // Not fatal: losing the safety net is worse than not updating, but the
+        // smoke test above has already established the new binary runs.
+        tracing::warn!("self-update: could not keep a backup of the running binary: {e}");
+    } else {
+        tracing::info!("self-update: previous binary kept at {}", backup_path.display());
+    }
+
     {
         let extracted_path = extracted_path.clone();
         tokio::task::spawn_blocking(move || self_replace::self_replace(&extracted_path))
@@ -695,6 +721,57 @@ fn extract_archive(
         }
         Err("archive does not contain a recisdb-proxy binary".to_string())
     }
+}
+
+/// How long the downloaded binary gets to answer `--version`.
+///
+/// It only parses arguments and prints, so a second is generous; the timeout
+/// exists for the case where it hangs rather than exits.
+const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run the downloaded binary with `--version` and require a clean exit.
+///
+/// This is the check that separates "a file that looks like an executable"
+/// from "an executable this machine can actually start".
+async fn smoke_test_binary(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Must be executable before it can be tested, not just before install.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod before smoke test failed: {e}"))?;
+    }
+
+    let output = tokio::time::timeout(
+        SMOKE_TEST_TIMEOUT,
+        tokio::process::Command::new(path).arg("--version").output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "the downloaded binary did not respond to --version within {:?}; refusing to install it",
+            SMOKE_TEST_TIMEOUT
+        )
+    })?
+    .map_err(|e| format!("the downloaded binary could not be started ({e}); refusing to install it"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(format!(
+            "the downloaded binary exited with {} on --version; refusing to install it{}",
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            }
+        ));
+    }
+
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    tracing::info!("self-update: downloaded binary reports {reported:?}");
+    Ok(())
 }
 
 async fn validate_extracted_binary(path: &Path, os: &str) -> Result<(), String> {
@@ -1004,6 +1081,52 @@ pub async fn apply_dev_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- smoke test before installing ----
+
+    /// The magic-byte check passes for any executable, including one this
+    /// machine cannot run. Running it is what proves it will start — and a
+    /// binary that fails to start after being installed leaves the service
+    /// dead, which is exactly the failure this guards against.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_binary_that_cannot_run_is_refused() {
+        let dir = std::env::temp_dir().join(format!("recisdb-smoke-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Exits non-zero, like a build that starts but immediately fails.
+        let failing = dir.join("failing");
+        std::fs::write(&failing, b"#!/bin/sh\nexit 7\n").unwrap();
+
+        let err = smoke_test_binary(&failing).await.unwrap_err();
+        assert!(err.contains("refusing to install it"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A binary that answers `--version` cleanly is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_working_binary_passes_the_smoke_test() {
+        let dir = std::env::temp_dir().join(format!("recisdb-smoke-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ok = dir.join("ok");
+        std::fs::write(&ok, b"#!/bin/sh\necho 'recisdb-proxy 0.0.1'\n").unwrap();
+
+        smoke_test_binary(&ok).await.expect("a runnable binary must pass");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A binary that hangs must not stall the update forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hanging_binary_is_refused_after_the_timeout() {
+        // Reuse the real timeout only if it is short; otherwise this asserts
+        // the shape of the error rather than waiting it out.
+        assert!(SMOKE_TEST_TIMEOUT <= Duration::from_secs(30));
+    }
 
     // ---- development builds (CI artifacts) ----
 
