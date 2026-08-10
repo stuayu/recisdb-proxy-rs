@@ -98,6 +98,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/TUNER_PIPELINE_REDESIGN.md` — チューナー選択・配信・切り替え経路の再設計(2026-08)
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
 - `docs/CLIENT_REVIEW_2026-08.md` — **クライアントDLLのレビュー台帳**。多段構成・拠点間WAN前提で洗い出した18件と対応状況
+- `docs/UPDATE.md` — 自己更新(リリース版/開発版アーティファクト)。トークン要件、入れ替え前の起動確認、Windowsでブロックされた場合の復旧
 - `docs/FOURK_SETUP.md` — **BS4K対応**。生MMT/TLVを本体で読みdantto4k CLIで変換する構成、復号失敗の見分け方、4Kの分類とB25無効化の理由、未対応事項
 - `docs/EPGSTATION_COMPAT.md` — **Mirakurun互換API(`/mirakurun/api/*`)のクライアント側仕様の調査台帳**。EPGStation(stuayuフォーク)が要求するAPI・データ構造・ストリームの挙動と、現状の実装との差分
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`

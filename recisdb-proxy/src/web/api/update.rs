@@ -571,11 +571,15 @@ async fn run_self_update_inner(
         return Err(e);
     }
 
+    // Best effort, before the smoke test so the test sees the file as it will
+    // be installed.
+    strip_mark_of_the_web(&extracted_path);
+
     // The magic-byte check only proves the file is *an* executable. Actually
     // running it is what proves it will start on this machine: a build for the
-    // wrong architecture, one missing a runtime DLL, or one quarantined by
-    // antivirus all pass the header check and then fail to launch — at which
-    // point the service is already replaced and does not come back.
+    // wrong architecture, one missing a runtime DLL, or one blocked by
+    // SmartScreen/Defender all pass the header check and then fail to launch —
+    // at which point the service is already replaced and does not come back.
     //
     // Refusing the update here leaves the running server untouched, which is
     // always better than a dead service the operator has to repair by hand.
@@ -723,6 +727,33 @@ fn extract_archive(
     }
 }
 
+/// Remove the "downloaded from the Internet" mark, if the file carries one.
+///
+/// Windows stores it in a `Zone.Identifier` alternate data stream, and the
+/// Attachment Manager refuses to launch (or SmartScreen warns about) files that
+/// have it. We write the binary ourselves with ordinary file I/O, which does
+/// *not* apply the mark — so this is defensive rather than a known fix: it
+/// costs one syscall and covers the paths where a mark can appear anyway (an
+/// archive that was itself marked, a future download route that goes through an
+/// API which applies it).
+///
+/// Note this does not help with SmartScreen/Defender *reputation* checks on an
+/// unsigned executable, which is a separate mechanism — that one is what the
+/// smoke test below is for.
+#[cfg(windows)]
+fn strip_mark_of_the_web(path: &Path) {
+    let mut ads = path.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    match std::fs::remove_file(std::path::PathBuf::from(&ads)) {
+        Ok(()) => tracing::info!("self-update: removed the mark-of-the-web from the new binary"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::debug!("self-update: could not remove the mark-of-the-web: {e}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_mark_of_the_web(_path: &Path) {}
+
 /// How long the downloaded binary gets to answer `--version`.
 ///
 /// It only parses arguments and prints, so a second is generous; the timeout
@@ -753,7 +784,13 @@ async fn smoke_test_binary(path: &Path) -> Result<(), String> {
             SMOKE_TEST_TIMEOUT
         )
     })?
-    .map_err(|e| format!("the downloaded binary could not be started ({e}); refusing to install it"))?;
+    .map_err(|e| {
+        format!(
+            "the downloaded binary could not be started ({e}); refusing to install it. \
+             On Windows this is usually SmartScreen/Defender blocking an unsigned, \
+             low-reputation executable — allow the install directory or the binary, then retry"
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
