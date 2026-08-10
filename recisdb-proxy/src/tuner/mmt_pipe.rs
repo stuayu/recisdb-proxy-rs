@@ -89,47 +89,17 @@ pub struct MmtConverterConfig {
     pub extra_args: Vec<String>,
 }
 
-/// Where the converter reads from and writes to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConverterIo {
-    /// `-` `-`: stdin → stdout.
-    ///
-    /// **Does not work with the builds seen so far.** Verified directly on the
-    /// command line: `type x.mmts | dantto4k --no-progress --no-stats - - > out.ts`
-    /// produces an empty file, while the same converter given two file paths
-    /// works. Kept because it is the right shape for live streaming if a build
-    /// ever supports it.
-    Pipe,
-    /// Explicit input and output paths — the only mode observed to work.
-    Files { input: String, output: String },
-}
-
-/// Build the converter's argument list.
+/// Build the converter's argument list: `-` `-` for stdin → stdout.
 ///
 /// Progress and statistics are suppressed: both go to the console and would
-/// otherwise be written for every conversion, drowning the messages that
+/// otherwise be written for every reader start, drowning the messages that
 /// matter.
-pub fn build_args_for(config: &MmtConverterConfig, io: &ConverterIo) -> Vec<String> {
-    let mut args = build_common_args(config);
-    match io {
-        ConverterIo::Pipe => {
-            args.push("-".to_string());
-            args.push("-".to_string());
-        }
-        ConverterIo::Files { input, output } => {
-            args.push(input.clone());
-            args.push(output.clone());
-        }
-    }
-    args
-}
-
-/// Pipe-mode arguments (kept for the streaming path and its tests).
+///
+/// Requires a converter that can take a live stdin. Older builds probe the
+/// input size with `seekg` (which leaves a non-seekable stream in a failed
+/// state) and read in 5MB blocks (which stalls a live feed until that much has
+/// accumulated); against one of those this produces no output at all.
 pub fn build_args(config: &MmtConverterConfig) -> Vec<String> {
-    build_args_for(config, &ConverterIo::Pipe)
-}
-
-fn build_common_args(config: &MmtConverterConfig) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     if let Some(addr) = config
@@ -159,6 +129,10 @@ fn build_common_args(config: &MmtConverterConfig) -> Vec<String> {
     args.push("--no-stats".to_string());
 
     args.extend(config.extra_args.iter().cloned());
+
+    // Input and output, in that order, must come last.
+    args.push("-".to_string());
+    args.push("-".to_string());
     args
 }
 
@@ -262,129 +236,6 @@ impl ConverterStatus {
             }
         }
     }
-}
-
-/// Convert a captured MMT/TLV file to MPEG-2 TS, blocking until the converter
-/// exits.
-///
-/// This is the mode that actually works: passing `-` for stdin/stdout produces
-/// nothing (verified on the command line), while two file paths convert
-/// correctly. Batching through a file costs latency, which is irrelevant for a
-/// channel scan — it only needs the SI tables out of a few seconds of stream.
-///
-/// Returns the converter's stderr so the caller can report *why* a conversion
-/// produced nothing, which is otherwise invisible: the converter exits
-/// successfully even when it could not descramble a single packet.
-pub fn convert_file(
-    config: &MmtConverterConfig,
-    input: &std::path::Path,
-    output: &std::path::Path,
-    timeout: Duration,
-) -> std::io::Result<String> {
-    if config.command_path.trim().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "MMT/TLV converter path is not configured ([mmttlv] command_path)",
-        ));
-    }
-
-    let args = build_args_for(
-        config,
-        &ConverterIo::Files {
-            input: input.to_string_lossy().into_owned(),
-            output: output.to_string_lossy().into_owned(),
-        },
-    );
-    info!(
-        "[MmtPipe] Converting {} -> {} ({} {})",
-        input.display(),
-        output.display(),
-        config.command_path,
-        args.join(" ")
-    );
-
-    let mut child = Command::new(&config.command_path)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    // Drain both streams on threads: a converter that fills a pipe buffer while
-    // we wait on the process would deadlock.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(mut s) = stdout {
-            use std::io::Read;
-            let _ = s.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(mut s) = stderr {
-            use std::io::Read;
-            let _ = s.read_to_string(&mut buf);
-        }
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("MMT/TLV conversion did not finish within {timeout:?}"),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    };
-
-    let stdout_text = out_handle.join().unwrap_or_default();
-    let stderr_text = err_handle.join().unwrap_or_default();
-    let messages = format!("{stdout_text}{stderr_text}");
-
-    for line in messages.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        match classify_stderr_line(line) {
-            Some(ConverterProblem::NoDescrambler) => {
-                error!(
-                    "[MmtPipe] 4K descrambling is not working: {line}. \
-                     出力TSは復号されていない。CasProxyServerの起動と \
-                     --smartCardReaderName / --casProxyServer の設定を確認"
-                );
-            }
-            None => info!("[MmtPipe] converter: {line}"),
-        }
-    }
-
-    if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("MMT/TLV converter exited with {status}"),
-        ));
-    }
-
-    Ok(messages)
-}
-
-/// Whether the converter reported that it could not descramble.
-///
-/// The converter exits successfully and writes a full-size TS even when every
-/// packet is still encrypted, so this is the only way to tell a good conversion
-/// from an unusable one.
-pub fn output_is_undescrambled(messages: &str) -> bool {
-    messages
-        .lines()
-        .any(|line| classify_stderr_line(line.trim()) == Some(ConverterProblem::NoDescrambler))
 }
 
 /// A running `dantto4k` process wired up as a byte-stream transform.
@@ -681,44 +532,6 @@ mod tests {
         assert_eq!(args[pos("--smartCardReaderName") + 1], "My Reader 0");
         assert!(args.contains(&"--disableADTSConversion".to_string()));
         assert_eq!(&args[args.len() - 2..], &["-".to_string(), "-".to_string()]);
-    }
-
-    /// File mode is the only mode that works. The paths are positional and go
-    /// last, in input-then-output order — swapping them would overwrite the
-    /// capture with the conversion.
-    #[test]
-    fn file_mode_puts_input_then_output_last() {
-        let args = build_args_for(
-            &MmtConverterConfig {
-                command_path: "dantto4k".to_string(),
-                cas_proxy_server: Some("127.0.0.1:24000".to_string()),
-                ..Default::default()
-            },
-            &ConverterIo::Files {
-                input: "C:/tmp/in.mmts".to_string(),
-                output: "C:/tmp/out.ts".to_string(),
-            },
-        );
-
-        assert_eq!(
-            &args[args.len() - 2..],
-            &["C:/tmp/in.mmts".to_string(), "C:/tmp/out.ts".to_string()]
-        );
-        assert!(!args.contains(&"-".to_string()), "file mode must not pass the pipe placeholder");
-        // CAS options still apply — the converter descrambles in either mode.
-        assert!(args.contains(&"--casProxyServer".to_string()));
-    }
-
-    /// The converter exits successfully and writes a full-size TS even when it
-    /// descrambled nothing, so its own messages are the only way to tell the
-    /// output is unusable.
-    #[test]
-    fn undescrambled_output_is_detected_from_the_converter_messages() {
-        assert!(output_is_undescrambled(
-            "TLV: NullPacket: 1\nNo smart card readers are available\n"
-        ));
-        assert!(!output_is_undescrambled("TLV: NullPacket: 1\nMMT: PacketId 0x0000\n"));
-        assert!(!output_is_undescrambled(""));
     }
 
     #[test]
