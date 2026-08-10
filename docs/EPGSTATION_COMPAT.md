@@ -239,6 +239,40 @@ DB 挿入用データへ変換するループを 1 つ回すが、このルー�
 EPGStation はこれを特別扱いし、暫定の終了時刻 (3 時間) を与えたうえで番組表 API で次番組の開始時刻まで切り詰める (`src/util/ProgramDuration.ts`)。
 実際の長さや 0 を返すとこの処理が働かず、番組表と予約が壊れる。
 
+### `ChannelType` に `BS4K` は無い — 4K は `BS` として出す (2026-08-10 追記)
+
+BS4K 対応 (`docs/FOURK_SETUP.md`) を入れるにあたり、4K サービスをどの
+`type` で出すべきかを EPGStation 側の実コードで確認した。
+
+**根拠 (EPGStation 同梱物・実コード):**
+
+- `node_modules/mirakurun/api.d.ts:48-52`
+  ```
+  export type ChannelType = "GR" | "BS" | "CS" | "SKY" |
+      "NW1" | ... | "NW40";
+  ```
+  **`BS4K` は宣言に存在しない。** stuayu フォークが足したのは `NW1`〜`NW40`
+  であって 4K 用の型ではない。
+- `src/model/db/ChannelDB.ts:169` `getChannelTypeId(type)` は
+  `GR`→0 / `BS`→1 / `CS`→2 / `SKY`→3 / `NW1`〜`NW40`→4〜43 の switch で、
+  **`default: return 44`**。未知の型でも例外にはならず、単一のその他枠に
+  落ちる。
+
+つまり `BS4K` を出しても EPGStation は落ちないが、型宣言の外であり、
+チャンネル種別が「その他」に丸められる。
+
+**判断: 出力は `BS` のままにする。** 4K は実運用上ほぼ BS 配信であり、
+`BS` なら EPGStation の GUI でも BS グループに正しく並ぶ。
+
+**入力としては `BS4K` を受け付ける** (`web/mirakurun.rs`)。
+4K 対応フォークの [MMirakurun](https://github.com/otya128/MMirakurun) は
+`BS4K` を実在の ChannelType として定義しているため、それに合わせて書かれた
+クライアントが `type=BS4K` で問い合わせたときに空を返さないようにする。
+追加分岐なので既存の挙動は変わらない。
+
+**未確認**: EPGStation が 4K サービス (H.265 / 2160p) を録画・再生時に
+どう扱うか。型の問題とは別に、エンコード設定側での対応が要る可能性がある。
+
 ## 5. ストリームのセマンティクス
 
 EPGStation は録画の開始・終了をストリームの挙動そのもので判定する。パスを生やすだけでは足りない。

@@ -200,6 +200,22 @@ fn mirakurun_type_to_band_candidates(t: &str) -> Option<&'static [BandType]> {
         "BS" => Some(&[BandType::BS, BandType::FourK]),
         "CS" => Some(&[BandType::CS]),
         "SKY" => Some(&[BandType::SKY, BandType::Other]),
+        // Accepted on input only, never produced by `band_type_to_mirakurun`.
+        //
+        // MMirakurun (otya128), the 4K-capable fork, does define `BS4K` as a
+        // real ChannelType, so a client written against it would otherwise get
+        // an empty list from us. Answering it costs nothing and is purely
+        // additive.
+        //
+        // We still advertise 4K as `BS`: the `api.d.ts` that EPGStation
+        // actually compiles against declares
+        // `"GR" | "BS" | "CS" | "SKY" | "NW1".."NW40"` with no `BS4K`
+        // (`node_modules/mirakurun/api.d.ts:48-52`), and its
+        // `ChannelDB.getChannelTypeId` funnels anything unrecognised into a
+        // single catch-all bucket (`src/model/db/ChannelDB.ts:169`, `default:
+        // return 44`). Emitting a type outside the union would be off-contract
+        // for the client we care about.
+        "BS4K" => Some(&[BandType::FourK]),
         _ => None,
     }
 }
@@ -1012,7 +1028,34 @@ mod tests {
 
     #[test]
     fn unknown_type_string_has_no_candidates() {
-        assert!(mirakurun_type_to_band_candidates("BS4K").is_none());
+        assert!(mirakurun_type_to_band_candidates("BS8K").is_none());
+        assert!(mirakurun_type_to_band_candidates("").is_none());
+        assert!(mirakurun_type_to_band_candidates("bs4k").is_none(), "types are case-sensitive");
+    }
+
+    /// `BS4K` is accepted on input because MMirakurun defines it, but must not
+    /// be produced: the `api.d.ts` EPGStation compiles against has no such
+    /// member, and its ChannelDB drops unknown types into a catch-all bucket.
+    #[test]
+    fn bs4k_is_accepted_on_input_but_never_advertised() {
+        assert_eq!(
+            mirakurun_type_to_band_candidates("BS4K"),
+            Some(&[BandType::FourK][..])
+        );
+        assert_eq!(band_type_to_mirakurun(BandType::FourK), "BS");
+
+        // Nothing may advertise itself as BS4K.
+        for bt in [
+            BandType::Terrestrial,
+            BandType::BS,
+            BandType::CS,
+            BandType::FourK,
+            BandType::CATV,
+            BandType::SKY,
+            BandType::Other,
+        ] {
+            assert_ne!(band_type_to_mirakurun(bt), "BS4K");
+        }
     }
 
     // ------------------------------------------------------------------

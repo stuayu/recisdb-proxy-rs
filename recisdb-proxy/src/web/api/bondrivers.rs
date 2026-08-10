@@ -1,5 +1,6 @@
 //! BonDriver CRUD endpoints and scan history.
 
+use crate::database::StreamFormat;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -29,6 +30,16 @@ pub struct BonDriverInfo {
     pub next_scan_at: Option<i64>,
     pub passive_scan_enabled: bool,
     pub max_instances: i32,
+    /// What the driver hands back: `"ts"` or `"mmttlv"` (4K).
+    ///
+    /// Cannot be derived from a scan — scanning parses TS, so a raw 4K tuner
+    /// produces nothing to classify until the converter is already in the
+    /// path. It is a property of the driver, set here.
+    pub stream_format: String,
+    /// Never run libaribb25 on this driver, because the source arrives
+    /// already descrambled. 4K is switched off automatically by band as well;
+    /// this covers descrambled sources that are not 4K.
+    pub disable_b25: bool,
     /// Whether a channel scan is holding this driver right now. The scan
     /// reserves a real tuner slot, so this is also why the driver may look
     /// unavailable to viewers.
@@ -60,6 +71,9 @@ pub struct UpdateBonDriverRequest {
     pub scan_interval_hours: Option<i32>,
     pub scan_priority: Option<i32>,
     pub passive_scan_enabled: Option<bool>,
+    /// `"ts"` or `"mmttlv"`. Anything unrecognised is treated as `"ts"`.
+    pub stream_format: Option<String>,
+    pub disable_b25: Option<bool>,
 }
 
 /// Create BonDriver request.
@@ -73,6 +87,9 @@ pub struct CreateBonDriverRequest {
     pub scan_interval_hours: Option<i32>,
     pub scan_priority: Option<i32>,
     pub passive_scan_enabled: Option<bool>,
+    /// `"ts"` or `"mmttlv"`. Anything unrecognised is treated as `"ts"`.
+    pub stream_format: Option<String>,
+    pub disable_b25: Option<bool>,
 }
 
 /// Get all BonDrivers with full details.
@@ -97,6 +114,8 @@ pub async fn get_bondrivers(
             next_scan_at: d.next_scan_at,
             passive_scan_enabled: d.passive_scan_enabled,
             max_instances: d.max_instances,
+            stream_format: db.driver_stream_format(&d.dll_path).as_db_value().to_string(),
+            disable_b25: db.driver_disables_b25(&d.dll_path),
             is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
             created_at: d.created_at,
             updated_at: d.updated_at,
@@ -133,6 +152,8 @@ pub async fn get_bondriver(
                 next_scan_at: d.next_scan_at,
                 passive_scan_enabled: d.passive_scan_enabled,
                 max_instances: d.max_instances,
+                stream_format: db.driver_stream_format(&d.dll_path).as_db_value().to_string(),
+                disable_b25: db.driver_disables_b25(&d.dll_path),
                 is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
                 created_at: d.created_at,
                 updated_at: d.updated_at,
@@ -173,6 +194,18 @@ pub async fn create_bondriver(
     if let Some(group) = payload.group_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         db.set_group_name(id, Some(group))
             .map_err(|e| ApiError::internal(format!("Failed to set group_name: {}", e)))?;
+    }
+
+    // Settable at registration: a 4K driver is unusable until it is marked as
+    // one, so making the caller register first and patch afterwards would just
+    // guarantee a broken first scan.
+    if let Some(format) = &payload.stream_format {
+        db.set_driver_stream_format(dll_path, StreamFormat::from_db_value(format))
+            .map_err(|e| ApiError::internal(format!("Failed to set stream_format: {}", e)))?;
+    }
+    if let Some(disable) = payload.disable_b25 {
+        db.set_driver_disable_b25(dll_path, disable)
+            .map_err(|e| ApiError::internal(format!("Failed to set disable_b25: {}", e)))?;
     }
 
     if payload.auto_scan_enabled.is_some()
@@ -223,6 +256,26 @@ pub async fn update_bondriver(
     if let Some(group) = &payload.group_name {
         db.set_group_name(id, Some(group.as_str()))
             .map_err(|e| ApiError::internal(format!("Failed to update group_name: {}", e)))?;
+    }
+
+    // Stream format / B25 are keyed by dll_path rather than id, so resolve the
+    // row once — and after any dll_path change above, so the new path is used.
+    if payload.stream_format.is_some() || payload.disable_b25.is_some() {
+        let dll_path = match db.get_bon_driver(id) {
+            Ok(Some(d)) => d.dll_path,
+            Ok(None) => return Err(ApiError::not_found("BonDriver not found")),
+            Err(e) => return Err(e.into()),
+        };
+
+        if let Some(format) = &payload.stream_format {
+            let parsed = StreamFormat::from_db_value(format);
+            db.set_driver_stream_format(&dll_path, parsed)
+                .map_err(|e| ApiError::internal(format!("Failed to update stream_format: {}", e)))?;
+        }
+        if let Some(disable) = payload.disable_b25 {
+            db.set_driver_disable_b25(&dll_path, disable)
+                .map_err(|e| ApiError::internal(format!("Failed to update disable_b25: {}", e)))?;
+        }
     }
 
     // Update scan config if any scan-related fields are provided

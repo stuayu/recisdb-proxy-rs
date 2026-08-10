@@ -265,15 +265,26 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 - **プレビュー / エンコードプロファイル**: 映像は H.265 (stream_type 0x24)。
   既定の `preview-h264` プロファイルは `--interlace tff --vpp-deinterlace normal`
   を渡すが、**BS4K は 2160/59.94p のプログレッシブ**なのでこの指定は誤り。
-  4K 用プロファイル (デインタレースなし + スケール指定) の追加が必要
-- **`disable_b25` / `stream_format` の Web API / ダッシュボード露出**
-  (現状どちらも SQL で設定する)
+  4K 用プロファイル (デインタレースなし + スケール指定) が要る。
+
+  単にプロファイル行を足すだけでは足りない: プレビューは
+  `get_encode_profile_by_purpose("preview")` で **purpose が preview の
+  有効な行を1つ選ぶだけ**で、チャンネルの帯域を見ていない
+  (`web/stream.rs:246`)。帯域別に選ばせるには、プロファイルを読む時点
+  (`web/stream.rs:371` 付近、いまは `sid` しかスコープに無い) でチャンネルの
+  `band_type` を解決する配線が要る。実機のエンコーダなしでは検証できないため
+  未着手
+- **ダッシュボード (Vue) のフォーム露出**。Web API 側は対応済みで、
+  `GET/POST/PATCH /api/bondrivers` が `stream_format` と `disable_b25` を
+  読み書きする。画面から設定できるようにするには `web-ui/` 側の作業が要る
 - **Drop カウント**: 実機の PID 別集計では全 PID に少量の Drop が出ていた
   (映像 794484 パケット中 57)。変換器が PSI を再生成する際に連続性カウンタが
   飛んでいる可能性がある。ダッシュボードの品質表示に常時 Drop が出るなら、
   4K では計上の仕方を見直す必要がある
-- **Mirakurun 互換 API**: `FourK → "BS"` にマッピング済み
-  (`web/mirakurun.rs`)。EPGStation 側が 4K サービスをどう扱うかは未検証。
+- **Mirakurun 互換 API**: 出力は `FourK → "BS"`、入力は `BS4K` も受け付ける
+  (`web/mirakurun.rs`)。EPGStation 同梱の `api.d.ts` に `BS4K` が無いことを
+  実コードで確認済み — 根拠と判断は `docs/EPGSTATION_COMPAT.md` §4 に記載。
+  EPGStation が 4K サービス (H.265 / 2160p) を録画・再生でどう扱うかは未検証。
   dantto4k の README には PT4K + Mirakurun 運用時のタイムアウト問題への言及が
   あり、本プロジェクトの Mirakurun 互換 API でも該当する可能性がある
 - **Linux**: 変換は CLI パイプなので方式としては動くはずだが、Linux 側で 4K
