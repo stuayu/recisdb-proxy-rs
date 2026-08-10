@@ -159,6 +159,127 @@ type PreviewSetupReport = {
   warnings: string[]
 }
 
+// ---- 開発版 (GitHub Actions のアーティファクト) への更新 ----
+//
+// アーティファクトのダウンロードは公開リポジトリでも認証が要るため、
+// トークンが無いと一覧は見えても更新できない。その状態を先に見せる。
+type DevBuild = {
+  run_id: number
+  branch: string | null
+  sha: string | null
+  title: string | null
+  created_at: string | null
+  html_url: string | null
+  artifact_id: number | null
+  size_in_bytes: number | null
+  installable: boolean
+}
+type DevBuildsResponse = {
+  success: boolean
+  supported: boolean
+  token_configured: boolean
+  reason?: string
+  error?: string
+  artifact_name?: string
+  builds: DevBuild[]
+}
+
+const devBuilds = ref<DevBuildsResponse | null>(null)
+const devBuildsLoading = ref(false)
+const devError = ref('')
+const devMessage = ref('')
+const githubToken = ref('')
+const tokenConfigured = ref(false)
+const devApplying = ref<number | null>(null)
+const devStatus = ref('')
+
+async function loadDevBuilds() {
+  devBuildsLoading.value = true
+  devError.value = ''
+  try {
+    const result = await api<DevBuildsResponse>('/update/dev-builds')
+    devBuilds.value = result
+    tokenConfigured.value = result.token_configured
+    if (result.error) devError.value = result.error
+  } catch (e) {
+    devError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    devBuildsLoading.value = false
+  }
+}
+
+async function saveGithubToken() {
+  devError.value = ''
+  devMessage.value = ''
+  try {
+    await api('/update/github-token', {
+      method: 'POST',
+      body: JSON.stringify({ token: githubToken.value }),
+    })
+    githubToken.value = ''
+    devMessage.value = 'トークンを保存しました。'
+    await loadDevBuilds()
+  } catch (e) {
+    devError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+function formatSize(bytes: number | null) {
+  if (!bytes) return '—'
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function applyDevBuild(build: DevBuild) {
+  if (build.artifact_id == null) return
+  const ok = window.confirm(
+    `開発版 (${build.branch ?? '?'} / ${(build.sha ?? '').slice(0, 7)}) に更新します。\n` +
+      '実行ファイルを入れ替えてサーバーを再起動します。視聴中・録画中のセッションはすべて切断されます。よろしいですか？',
+  )
+  if (!ok) return
+
+  devApplying.value = build.artifact_id
+  devError.value = ''
+  devMessage.value = ''
+  devStatus.value = '開始しています…'
+  try {
+    await api('/update/dev-build', {
+      method: 'POST',
+      body: JSON.stringify({
+        artifact_id: build.artifact_id,
+        label: `${build.branch ?? 'dev'}@${(build.sha ?? '').slice(0, 7)}`,
+      }),
+    })
+    // 進捗は /update/status に出る。再起動まで見届けて自動で再読込する。
+    const deadline = Date.now() + 10 * 60 * 1000
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      try {
+        const status = await api<{ state: string; message?: string | null }>('/update/status')
+        devStatus.value = status.message || status.state
+        if (status.state === 'error') {
+          devError.value = status.message || '更新に失敗しました。'
+          devApplying.value = null
+          return
+        }
+        if (status.state === 'restarting') break
+      } catch {
+        // 再起動で一時的に落ちるのは想定内
+        break
+      }
+    }
+    devStatus.value = '再起動を待っています…'
+    if (await waitForServer()) {
+      location.reload()
+    } else {
+      devError.value = 'サーバーの再起動を確認できませんでした。手動で確認してください。'
+    }
+  } catch (e) {
+    devError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    devApplying.value = null
+  }
+}
+
 const previewSetup = ref<PreviewSetupReport | null>(null)
 const previewSetupBusy = ref(false)
 const previewSetupError = ref('')
@@ -406,6 +527,74 @@ onMounted(() => {
       </p>
       <button class="button" type="submit">保存</button>
     </form>
+
+    <div class="panel">
+      <h3>開発版に更新</h3>
+      <p class="hint">
+        GitHub Actions がビルドした最新の開発版に更新します。リリース版より新しい代わりに、
+        検証されていない変更が含まれます。
+      </p>
+
+      <p v-if="!tokenConfigured" class="hint">
+        <strong>GitHubトークンが必要です。</strong>
+        アーティファクトのダウンロードは公開リポジトリでも認証が必要なため、リリース版の更新と違い
+        トークン無しでは実行できません。fine-grained トークンなら Actions: read、
+        classic トークンなら repo スコープを付けてください。
+      </p>
+      <form @submit.prevent="saveGithubToken">
+        <label class="field"
+          ><span>GitHubトークン{{ tokenConfigured ? '（設定済み・再設定する場合のみ）' : '' }}</span
+          ><input
+            v-model="githubToken"
+            type="password"
+            autocomplete="off"
+            placeholder="ghp_... / github_pat_..." /></label
+        ><button class="button secondary" type="submit">保存</button>
+      </form>
+
+      <div class="actions">
+        <button class="button secondary" :disabled="devBuildsLoading" @click="loadDevBuilds">
+          {{ devBuildsLoading ? '取得中…' : '開発版の一覧を取得' }}
+        </button>
+      </div>
+
+      <p v-if="devMessage" class="muted" v-text="devMessage" />
+      <p v-if="devError" class="error" v-text="devError" />
+      <p v-if="devStatus" class="muted" v-text="devStatus" />
+
+      <p v-if="devBuilds && !devBuilds.supported" class="hint" v-text="devBuilds.reason" />
+
+      <div v-if="devBuilds?.supported && devBuilds.builds.length" class="table-region">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>ブランチ</th>
+              <th>コミット</th>
+              <th>日時</th>
+              <th>サイズ</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="build in devBuilds.builds" :key="build.run_id">
+              <td data-label="ブランチ" v-text="build.branch ?? '—'" />
+              <td data-label="コミット" v-text="(build.sha ?? '').slice(0, 7) || '—'" />
+              <td data-label="日時" v-text="build.created_at ?? '—'" />
+              <td data-label="サイズ" v-text="formatSize(build.size_in_bytes)" />
+              <td data-label="操作">
+                <button
+                  class="button small"
+                  :disabled="!build.installable || !tokenConfigured || devApplying !== null"
+                  @click="applyDevBuild(build)"
+                >
+                  {{ build.installable ? 'この版に更新' : '対象なし' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </section>
 </template>
 
