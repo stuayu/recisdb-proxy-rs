@@ -28,74 +28,55 @@ flowchart LR
 
 変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI。
 
-### 壊れているのは「標準入力からの入力」だけ
+### 変換器の入出力の制約 (ソースを読んで確定)
 
-**実機で確認済み**。`-` の扱い全般ではなく、入力側だけが機能しない。
+`~/prog/dantto4k` のソース (`src/dantto4k.cpp`) を読んで確定した事項。
+
+実測での挙動:
 
 | 呼び方 | 結果 |
 |---|---|
 | `dantto4k in.mmts out.ts` | 動く |
-| `dantto4k in.mmts -` (出力が標準出力) | **動く** |
+| `dantto4k in.mmts -` (出力が標準出力) | 動く |
 | `type in.mmts \| dantto4k - -` (入力が標準入力) | **動かない**。出力は空のまま |
 
-proxy 経由でも同じ挙動になる (プロセスは生きたまま、OS のパイプバッファぶん以外
-何も読まない)。Rust 側の問題ではない — 送信スレッドはブロックされているだけで、
-子プロセスが死んでいれば別のエラーになる。
+ソースから分かること:
 
-入力を「ファイルとして開けるもの」にすれば通る、というのが現時点の理解。
-ただし変換器が入力にシーク / サイズ取得を要求している可能性は残っている
-(ファイル入力時の進捗表示が総サイズを知っていた)。名前付きパイプが使えるかは
-これ次第で、未検証。
+- **名前付きパイプは入力に使えない。** ファイル入力のとき、進捗表示用に
+  `tellg` / `seekg(0, end)` / `seekg(currentPos)` でサイズを取る。名前付きパイプは
+  シーク不可なので failbit が立ち、以後の `read` は何も読まず `gcount()` が 0 を
+  返し続ける。`eof()` にもならないので終了判定にも掛からない。
+  **`--no-progress` を付けてもこのシークは実行される。**
+- 単独の `-` は引数解析では正しく扱われている。cxxopts は
+  `argv[i][0] == '-' && argv[i][1] != '\0'` でオプション判定するので、単独の `-` は
+  位置引数になる
+- 標準入力の経路はシークを通らず、Windows では
+  `_setmode(_fileno(stdin), _O_BINARY)` も呼んでいる。実装は存在するが実測では
+  動かない。**静的に読んだ範囲では原因を特定できていない**
+- 入力は **5MB 単位のブロッキング読み** (`inputStream->read(buf, 5MB)`)。仮に
+  標準入力が動いたとしても、13.6Mbps では 1 バッチあたり約 3 秒の遅延になる
+- **デマルチプレクサは途中から同期できる。** 不正な TLV は 1 バイトずつ読み飛ばす
+  (`mmtTlvDemuxer.cpp` の `demux`)。任意の位置から切り出した断片でも変換できるので、
+  スキャンのバッチ方式が成立する
+
+proxy 経由でも標準入力は同じ挙動になる (プロセスは生きたまま、OS のパイプバッファ
+ぶん以外を読まない)。Rust 側の問題ではない — 送信スレッドがブロックされている
+だけで、子プロセスが死んでいれば別のエラーになる。
 
 そのため**チャンネルスキャンはファイル経由で変換する**。生 MMT/TLV を一時ファイル
 に数秒ぶん貯めて `dantto4k in.mmts out.ts` で変換し、出てきた TS を解析器に渡す。
 バッチ化による遅延はスキャンには影響しない (必要なのは SI だけ)。
 
-**配信 (視聴・録画) は未対応。** 常時変換が要るため、ファイル経由では成立しない。
+**配信 (視聴・録画) は未対応。** 入力が「シーク可能なファイル」でなければならず、
+標準入力は動かず、名前付きパイプはシークできない。**連続した入力を渡す手段が
+現状ない。** 方向としては:
 
-出力側の `-` が使えることは分かっているので、残る課題は入力を止めずに渡す方法
-だけ。名前付きパイプ (`\\.\pipe\...` を入力パスとして渡す) が候補。次の手順で
-判定できる:
+- 短いファイルを連続で変換して継ぎ合わせる。継ぎ目でデコーダがリセットされるため
+  映像が途切れる可能性が高い
+- 変換器側を直す (Apache-2.0)。標準入力の不具合を直すか、`--no-progress` のときは
+  サイズ取得を省いてシーク不可の入力を受け付けるようにする。後者だけでも名前付き
+  パイプが使えるようになる
 
-パスはすべて絶対で書く。`Start-Process` の子プロセスは作業ディレクトリが呼び出し
-元と一致するとは限らず、相対パスだと出力先が追えなくなる。
-
-```powershell
-$exe  = 'C:\DTV\BonDriver\dantto4k.exe'
-$in   = 'C:\DTV\BonDriver\BS4K.mmts'
-$out  = 'C:\DTV\BonDriver\out3.ts'
-$name = 'dantto4ktest'
-
-if (Test-Path $out) { Remove-Item $out }
-
-$server = New-Object System.IO.Pipes.NamedPipeServerStream($name, [System.IO.Pipes.PipeDirection]::Out)
-$proc = Start-Process -FilePath $exe -PassThru -NoNewWindow `
-    -ArgumentList '--no-progress','--no-stats',"\\.\pipe\$name",$out
-
-# 変換器がパイプを開かなければ、ここで待たされ続けるので上限を切る
-$task = $server.WaitForConnectionAsync()
-if ($task.Wait(15000)) {
-    $fs = [System.IO.File]::OpenRead($in)
-    $fs.CopyTo($server)
-    $fs.Dispose()
-    $server.Dispose()
-    $proc.WaitForExit()
-    if (Test-Path $out) { Get-Item $out | Select-Object FullName, Length }
-    else { 'NG: 出力ファイルが作られなかった' }
-} else {
-    'NG: 変換器が名前付きパイプを開かなかった (入力にシークが必要と見られる)'
-    $server.Dispose()
-    if (-not $proc.HasExited) { $proc.Kill() }
-}
-```
-
-判定:
-
-- **`Length` が育っている** → 名前付きパイプで配信まで通せる
-- **`NG: 変換器が名前付きパイプを開かなかった`** → 入力にシークが必要。名前付き
-  パイプは使えないので別の方法が要る
-- **`NG: 出力ファイルが作られなかった`** → パイプは開けたが変換できていない。
-  変換器の出力を見る
 
 変換は **broadcast の手前** に置く。購読者ごとに変換するのは無駄だし、
 TS解析・EPG/ロゴ収集も TS しか解さないため。
