@@ -26,8 +26,28 @@ flowchart LR
 4K以外の経路は一切変わらない。変換器が挟まるのは
 `stream_format = 'mmttlv'` のドライバだけ。
 
-変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI を
-パイプモード (`dantto4k [OPTION...] - -`) で使う。
+変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI。
+
+### パイプモード (`- -`) は使えない
+
+**実機で確認済み**: 標準入出力を使う形は、コマンドラインで直接叩いても動かない。
+
+```powershell
+type BS4K.mmts | .\dantto4k.exe --no-progress --no-stats - - > out.ts   # out.ts は空のまま
+.\dantto4k.exe BS4K.mmts out.ts                                          # こちらは動く
+```
+
+proxy 経由でも同じ挙動になる (プロセスは生きたまま、OS のパイプバッファぶん以外
+何も読まない)。Rust 側の問題ではない — 送信スレッドはブロックされているだけで、
+子プロセスが死んでいれば別のエラーになる。
+
+そのため**チャンネルスキャンはファイル経由で変換する**。生 MMT/TLV を一時ファイル
+に数秒ぶん貯めて `dantto4k in.mmts out.ts` で変換し、出てきた TS を解析器に渡す。
+バッチ化による遅延はスキャンには影響しない (必要なのは SI だけ)。
+
+**配信 (視聴・録画) は未対応。** 常時変換が要るため、ファイル経由では成立しない。
+名前付きパイプが候補だが、変換器が入力にシーク/サイズ取得を要求している場合は
+同じ結果になるため、未検証。
 
 変換は **broadcast の手前** に置く。購読者ごとに変換するのは無駄だし、
 TS解析・EPG/ロゴ収集も TS しか解さないため。

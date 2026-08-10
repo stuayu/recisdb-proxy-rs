@@ -743,6 +743,174 @@ fn scan_space_blocking(
 }
 
 /// Analyze TS stream to extract TSID, NID, and service information.
+/// How much raw MMT/TLV to capture before handing a batch to the converter.
+///
+/// At the ~13.6 Mbps observed on a real 4K channel this is about 8 seconds,
+/// which is comfortably more than the SI tables need to repeat. Larger batches
+/// only add dead time before the first parse attempt.
+const MMT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on one conversion. The converter processed 273 MiB in well under a
+/// minute in manual testing, so a batch this size finishing is a matter of
+/// seconds; the limit exists for the case where it hangs.
+const MMT_CONVERT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Scan a channel whose driver delivers MMT/TLV.
+///
+/// Captures a batch of raw stream to a temporary file, converts it with the
+/// external converter, and feeds the resulting TS to the same analyzer the
+/// MPEG-2 TS path uses. Repeats until the analyzer has what it needs or the
+/// overall timeout expires.
+///
+/// Files rather than a pipe because the converter's stdin/stdout mode does not
+/// work (see the call site). Temporary files are removed on every exit path;
+/// they are only a few tens of MB but a scan touches every channel.
+fn analyze_mmt_tlv_stream(
+    tuner: &BonDriverTuner,
+    ts_read_timeout_ms: u64,
+    converter: &crate::tuner::mmt_pipe::MmtConverterConfig,
+) -> Result<TsAnalysis, Box<dyn std::error::Error + Send + Sync>> {
+    let config = AnalyzerConfig {
+        parse_nit: true,
+        parse_sdt: true,
+        parse_all_pmts: false,
+        max_packets: 200_000,
+    };
+    let mut analyzer = TsAnalyzer::new(config);
+
+    let timeout = std::time::Duration::from_millis(ts_read_timeout_ms);
+    let start_time = std::time::Instant::now();
+    let mut buffer = vec![0u8; TS_BUFFER_SIZE];
+
+    let scratch = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut batch = 0u32;
+    let mut total_captured = 0usize;
+
+    while !analyzer.is_complete() && start_time.elapsed() < timeout {
+        batch += 1;
+        let raw_path = scratch.join(format!("recisdb-mmt-{pid}-{batch}.mmts"));
+        let ts_path = scratch.join(format!("recisdb-mmt-{pid}-{batch}.ts"));
+
+        // --- capture a batch of raw MMT/TLV ---
+        let captured = {
+            let mut file = std::fs::File::create(&raw_path)?;
+            let mut captured = 0usize;
+            while captured < MMT_BATCH_BYTES && start_time.elapsed() < timeout {
+                tuner.wait_ts_stream(TS_WAIT_MS);
+                let (size, _remaining) = match tuner.get_ts_stream(&mut buffer) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&raw_path);
+                        return Err(e.into());
+                    }
+                };
+                if size == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                std::io::Write::write_all(&mut file, &buffer[..size])?;
+                captured += size;
+            }
+            std::io::Write::flush(&mut file)?;
+            captured
+        };
+        total_captured += captured;
+
+        if captured == 0 {
+            let _ = std::fs::remove_file(&raw_path);
+            warn!("analyze_mmt_tlv_stream: no MMT/TLV captured; the tuner is not delivering");
+            break;
+        }
+
+        info!(
+            "analyze_mmt_tlv_stream: captured {} bytes (batch {}), converting",
+            captured, batch
+        );
+
+        // --- convert ---
+        let convert_result = crate::tuner::mmt_pipe::convert_file(
+            converter,
+            &raw_path,
+            &ts_path,
+            MMT_CONVERT_TIMEOUT,
+        );
+        let _ = std::fs::remove_file(&raw_path);
+
+        let messages = match convert_result {
+            Ok(messages) => messages,
+            Err(e) => {
+                let _ = std::fs::remove_file(&ts_path);
+                return Err(format!("MMT/TLV conversion failed: {e}").into());
+            }
+        };
+
+        // A conversion that could not descramble writes a full-size but
+        // unusable TS. Continuing would burn the whole timeout parsing
+        // ciphertext, so stop with the actual reason.
+        if crate::tuner::mmt_pipe::output_is_undescrambled(&messages) {
+            let _ = std::fs::remove_file(&ts_path);
+            return Err("MMT/TLV converter could not descramble: the output TS is still \
+                        encrypted. Check the CasProxyServer / smart card reader settings \
+                        (see docs/FOURK_SETUP.md)"
+                .into());
+        }
+
+        // --- feed the converted TS to the analyzer ---
+        let converted = std::fs::read(&ts_path)?;
+        let _ = std::fs::remove_file(&ts_path);
+        info!(
+            "analyze_mmt_tlv_stream: conversion produced {} bytes of TS",
+            converted.len()
+        );
+
+        if converted.is_empty() {
+            warn!("analyze_mmt_tlv_stream: converter produced no TS from {captured} bytes");
+            continue;
+        }
+
+        // Same resync the TS path uses: the converted file starts at a packet
+        // boundary in practice, but nothing guarantees it.
+        let start = converted
+            .iter()
+            .position(|&b| b == 0x47)
+            .unwrap_or(converted.len());
+        let aligned = &converted[start..];
+        let full_len = aligned.len() - (aligned.len() % TS_PACKET_SIZE);
+        if full_len >= TS_PACKET_SIZE {
+            analyzer.feed(&aligned[..full_len]);
+        }
+
+        let r = analyzer.result();
+        info!(
+            "analyze_mmt_tlv_stream: PAT:{} NIT:{} SDT:{} packets:{}",
+            r.pat.is_some(),
+            r.nit.is_some(),
+            r.sdt.is_some(),
+            r.packets_processed
+        );
+    }
+
+    let result = analyzer.into_result();
+    info!(
+        "analyze_mmt_tlv_stream: finished in {:?} after {} batch(es), {} bytes captured — \
+         PAT:{} NIT:{} SDT:{} complete:{}",
+        start_time.elapsed(),
+        batch,
+        total_captured,
+        result.pat.is_some(),
+        result.nit.is_some(),
+        result.sdt.is_some(),
+        result.complete
+    );
+
+    build_ts_analysis(result)
+}
+
 fn analyze_ts_stream(
     tuner: &BonDriverTuner,
     ts_read_timeout_ms: u64,
@@ -751,13 +919,18 @@ fn analyze_ts_stream(
     debug!("analyze_ts_stream: Starting TS analysis");
 
     // 4K: the driver delivers MMT/TLV, so everything below — the 0x47 resync,
-    // the 188-byte framing, the PAT/NIT/SDT parser — needs the converted TS
-    // rather than what came off the tuner. One converter per channel, torn
-    // down with this function.
-    let mut mmt = match mmt_converter {
-        Some(cfg) => Some(crate::tuner::mmt_pipe::MmtPipe::new(cfg)?),
-        None => None,
-    };
+    // the 188-byte framing, the PAT/NIT/SDT parser — needs converted TS rather
+    // than what came off the tuner.
+    //
+    // The conversion goes through files rather than a pipe. Feeding the
+    // converter on stdin produces nothing (verified on the command line: `type
+    // x.mmts | dantto4k --no-progress --no-stats - - > out.ts` leaves out.ts
+    // empty, while the same converter given two paths works). Batching costs
+    // latency, which a scan does not care about: it only needs the SI tables
+    // out of a few seconds of stream.
+    if let Some(cfg) = mmt_converter {
+        return analyze_mmt_tlv_stream(tuner, ts_read_timeout_ms, cfg);
+    }
 
     let config = AnalyzerConfig {
         parse_nit: true,
@@ -842,32 +1015,7 @@ fn analyze_ts_stream(
         }
 
         // 3) carry へ入れて 188 単位で feed（TS固定長）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
-        //    4K は変換器を通してからでないと 0x47 が現れない。
-        match mmt.as_mut() {
-            Some(pipe) => {
-                // 復号できていない変換器は、正常終了しながら暗号化された TS を
-                // 出し続ける。放っておくと解析は永久に完成せず、1チャンネル
-                // あたり ts_read_timeout_ms (既定5分) を丸ごと待つことになる。
-                // 8チャンネルで40分。原因も出ないので、掴んだ時点で打ち切る。
-                if pipe.status().descramble_failing() {
-                    return Err(format!(
-                        "MMT/TLV converter cannot descramble ({} error(s) on stderr); \
-                         check the CasProxyServer / smart card reader settings \
-                         (see docs/FOURK_SETUP.md)",
-                        pipe.status().descramble_error_count()
-                    )
-                    .into());
-                }
-
-                let converted = pipe.push(&buffer[..size])?;
-                if converted.is_empty() {
-                    // 変換器が出力を出すまでは何も足さない。起動直後は普通。
-                    continue;
-                }
-                carry.extend_from_slice(&converted);
-            }
-            None => carry.extend_from_slice(&buffer[..size]),
-        }
+        carry.extend_from_slice(&buffer[..size]);
 
         // resync（sync byte 0x47 を探す）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
         if !carry.is_empty() && carry[0] != 0x47 {
@@ -935,74 +1083,7 @@ fn analyze_ts_stream(
         result.pat.is_some(), result.nit.is_some(), result.sdt.is_some(), result.complete
     );
 
-    // services 抽出（元コード踏襲）
-    let services: Vec<ServiceInfo> = if let Some(ref pat) = result.pat {
-        pat.get_all_program_numbers()
-            .into_iter()
-            .filter(|&sid| sid != 0)
-            .map(|sid| {
-                let (service_name, service_type) = result
-                    .sdt
-                    .as_ref()
-                    .and_then(|sdt| sdt.find_service(sid))
-                    .map(|svc| {
-                        let name = svc.get_service_name().map(|s| s.to_string());
-                        let stype = svc.get_service_type();
-                        (name, stype)
-                    })
-                    .unwrap_or((None, None));
-
-                ServiceInfo { service_id: sid, service_name, service_type }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Remote-control key from the NIT TS情報記述子 of our own TS.
-    // Terrestrial NIT actual normally lists only the tuned TS; the
-    // find_map fallback covers streams that omit the TSID match (BS/CS
-    // carry no TS情報記述子, so this stays None there).
-    let remote_control_key = result
-        .nit
-        .as_ref()
-        .and_then(|nit| {
-            result
-                .transport_stream_id
-                .and_then(|tsid| nit.find_transport_stream(tsid))
-                .and_then(|ts| ts.remote_control_key)
-                .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.remote_control_key))
-        });
-
-    // Physical UHF channel from the NIT 地上分配システム記述子 (terrestrial
-    // only; BS/CS derive theirs from the TSID in scan_results_to_channel_infos).
-    // The descriptor may list several frequencies (親局+中継局); the first
-    // entry is the main transmitter, which is what channel files display.
-    let physical_ch = result
-        .nit
-        .as_ref()
-        .and_then(|nit| {
-            result
-                .transport_stream_id
-                .and_then(|tsid| nit.find_transport_stream(tsid))
-                .and_then(|ts| ts.terrestrial_delivery.as_ref())
-                .or_else(|| {
-                    nit.transport_streams
-                        .iter()
-                        .find_map(|ts| ts.terrestrial_delivery.as_ref())
-                })
-                .and_then(|d| d.frequencies.first().copied())
-        })
-        .and_then(uhf_channel_from_frequency);
-
-    Ok(TsAnalysis {
-        network_id: result.network_id,
-        transport_stream_id: result.transport_stream_id,
-        network_name: result.network_name.clone(),
-        remote_control_key,
-        physical_ch,
-        services,
-    })
+    build_ts_analysis(result)
 }
 
 /// Physical channel of the tuned TS. Terrestrial comes from the NIT
@@ -1434,4 +1515,83 @@ fn log_scan_results(channel_infos: &[recisdb_protocol::ChannelInfo], total: usiz
     }
 
     info!("perform_scan: ==== End of Results ====");
+}
+
+
+/// Turn a finished analyzer result into the scan's `TsAnalysis`.
+///
+/// Shared by the MPEG-2 TS path and the MMT/TLV path: both end up with the
+/// same analyzer state, and the derivation of services / remote-control key /
+/// physical channel from it must not drift between them.
+fn build_ts_analysis(
+    result: crate::ts_analyzer::AnalyzerResult,
+) -> Result<TsAnalysis, Box<dyn std::error::Error + Send + Sync>> {
+    // services 抽出（元コード踏襲）
+    let services: Vec<ServiceInfo> = if let Some(ref pat) = result.pat {
+        pat.get_all_program_numbers()
+            .into_iter()
+            .filter(|&sid| sid != 0)
+            .map(|sid| {
+                let (service_name, service_type) = result
+                    .sdt
+                    .as_ref()
+                    .and_then(|sdt| sdt.find_service(sid))
+                    .map(|svc| {
+                        let name = svc.get_service_name().map(|s| s.to_string());
+                        let stype = svc.get_service_type();
+                        (name, stype)
+                    })
+                    .unwrap_or((None, None));
+
+                ServiceInfo { service_id: sid, service_name, service_type }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Remote-control key from the NIT TS情報記述子 of our own TS.
+    // Terrestrial NIT actual normally lists only the tuned TS; the
+    // find_map fallback covers streams that omit the TSID match (BS/CS
+    // carry no TS情報記述子, so this stays None there).
+    let remote_control_key = result
+        .nit
+        .as_ref()
+        .and_then(|nit| {
+            result
+                .transport_stream_id
+                .and_then(|tsid| nit.find_transport_stream(tsid))
+                .and_then(|ts| ts.remote_control_key)
+                .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.remote_control_key))
+        });
+
+    // Physical UHF channel from the NIT 地上分配システム記述子 (terrestrial
+    // only; BS/CS derive theirs from the TSID in scan_results_to_channel_infos).
+    // The descriptor may list several frequencies (親局+中継局); the first
+    // entry is the main transmitter, which is what channel files display.
+    let physical_ch = result
+        .nit
+        .as_ref()
+        .and_then(|nit| {
+            result
+                .transport_stream_id
+                .and_then(|tsid| nit.find_transport_stream(tsid))
+                .and_then(|ts| ts.terrestrial_delivery.as_ref())
+                .or_else(|| {
+                    nit.transport_streams
+                        .iter()
+                        .find_map(|ts| ts.terrestrial_delivery.as_ref())
+                })
+                .and_then(|d| d.frequencies.first().copied())
+        })
+        .and_then(uhf_channel_from_frequency);
+
+    Ok(TsAnalysis {
+        network_id: result.network_id,
+        transport_stream_id: result.transport_stream_id,
+        network_name: result.network_name.clone(),
+        remote_control_key,
+        physical_ch,
+        services,
+    })
 }
