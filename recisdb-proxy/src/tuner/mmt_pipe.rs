@@ -54,6 +54,14 @@ const WRITE_BACKLOG_CHUNKS: usize = 64;
 /// Size of each read from the converter's stdout.
 const STDOUT_CHUNK: usize = 256 * 1024;
 
+/// Give up once this many chunks have been dropped without a single byte of
+/// converted output coming back.
+///
+/// At a tuner's ~9 chunks/second this is a few seconds of evidence — long
+/// enough that a slow start is not mistaken for a stall, short enough that the
+/// operator is not left watching warnings for the whole read timeout.
+const STALLED_DROP_LIMIT: u64 = 64;
+
 /// Configuration for the external converter.
 ///
 /// `command_path` is TOML-only for the same reason as `[tsreplace]`: the
@@ -155,6 +163,14 @@ pub struct ConverterStatus {
     descramble_errors: AtomicU64,
     /// Chunks dropped because the converter could not keep up.
     dropped_chunks: AtomicU64,
+    /// Bytes actually handed to the converter's stdin.
+    ///
+    /// Separates "the converter never consumed anything" from "it consumed but
+    /// produced nothing" — two very different faults that otherwise look
+    /// identical from the outside (no TS either way).
+    written_bytes: AtomicU64,
+    /// Bytes read back from the converter's stdout.
+    read_bytes: AtomicU64,
     /// The most recent unrecognised stderr line, for diagnostics.
     last_message: Mutex<Option<String>>,
 }
@@ -170,6 +186,14 @@ impl ConverterStatus {
 
     pub fn dropped_chunks(&self) -> u64 {
         self.dropped_chunks.load(Ordering::Relaxed)
+    }
+
+    pub fn written_bytes(&self) -> u64 {
+        self.written_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
     }
 
     pub fn last_message(&self) -> Option<String> {
@@ -195,6 +219,10 @@ impl ConverterStatus {
                 }
             }
             None => {
+                // 認識できない行こそ原因が書いてある。溜めるだけでは見えないので
+                // 出す。変換器は毎秒何かを吐くわけではないので、そのまま流して
+                // 問題ない (進捗表示は --no-progress で止めてある)。
+                warn!("[MmtPipe] converter: {}", line);
                 *self
                     .last_message
                     .lock()
@@ -263,24 +291,36 @@ impl MmtPipe {
         let mut workers = Vec::with_capacity(3);
 
         // stdin feeder.
+        let status_for_stdin = Arc::clone(&status);
         workers.push(std::thread::spawn(move || {
             while let Ok(chunk) = write_rx.recv() {
+                let len = chunk.len() as u64;
                 if let Err(e) = stdin.write_all(&chunk) {
                     warn!("[MmtPipe] Converter stdin write failed: {}", e);
                     break;
                 }
+                // Counted only after the write returns: a converter that never
+                // drains stdin leaves this at zero while the backlog overflows,
+                // which is exactly the signature we need to see.
+                status_for_stdin
+                    .written_bytes
+                    .fetch_add(len, Ordering::Relaxed);
             }
             // Closing stdin lets the converter flush and exit.
             drop(stdin);
         }));
 
         // stdout collector.
+        let status_for_stdout = Arc::clone(&status);
         workers.push(std::thread::spawn(move || {
             let mut buf = vec![0u8; STDOUT_CHUNK];
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        status_for_stdout
+                            .read_bytes
+                            .fetch_add(n as u64, Ordering::Relaxed);
                         if read_tx.send(buf[..n].to_vec()).is_err() {
                             break; // pipe dropped
                         }
@@ -345,10 +385,45 @@ impl MmtPipe {
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     if n == 1 || n % 100 == 0 {
+                        // The byte counters are the diagnosis: 0 written means
+                        // the converter is not reading its stdin at all (the
+                        // writer thread is parked in write_all), which is a
+                        // different fault from "reading but producing nothing".
                         warn!(
-                            "[MmtPipe] Converter cannot keep up; dropped {} chunk(s) of MMT/TLV",
-                            n
+                            "[MmtPipe] Converter cannot keep up; dropped {} chunk(s) of MMT/TLV \
+                             (written to converter: {} bytes, received: {} bytes)",
+                            n,
+                            self.status.written_bytes(),
+                            self.status.read_bytes()
                         );
+                    }
+
+                    // Dropping MMT/TLV is not a recoverable degradation the way
+                    // dropping TS frames is — the stream is being shredded and
+                    // nothing downstream will ever parse it. Once the backlog
+                    // has overflowed this much with *nothing* coming back, the
+                    // converter is not going to start working; fail loudly
+                    // instead of warning for the rest of the read timeout.
+                    //
+                    // The test is on bytes *received*, not bytes written: the
+                    // OS pipe buffer absorbs the first tens of KB even when the
+                    // converter never reads its stdin, so `written_bytes` is a
+                    // poor stall signal. It is still reported, because it
+                    // separates "never consumed anything" from "consumed but
+                    // produced nothing".
+                    if n >= STALLED_DROP_LIMIT && self.status.read_bytes() == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!(
+                                "MMT/TLV converter produced no output at all after {} dropped \
+                                 chunk(s) ({} bytes accepted on stdin). It is running but not \
+                                 converting: check that it supports '-' (stdin/stdout) pipe mode \
+                                 on this platform, and that it is not blocked waiting on the CAS \
+                                 proxy or a smart card",
+                                n,
+                                self.status.written_bytes()
+                            ),
+                        ));
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -493,6 +568,58 @@ mod tests {
             Ok(_) => panic!("an unconfigured converter path must not spawn anything"),
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A converter that produces nothing must be reported, not warned about
+    /// forever: dropping MMT/TLV shreds the stream, so there is nothing to
+    /// recover by continuing. Observed for real — the process stayed alive and
+    /// the backlog overflowed for minutes while no TS ever came back.
+    #[cfg(unix)]
+    #[test]
+    fn a_converter_that_never_reads_stdin_is_reported() {
+        // `sleep` ignores stdin entirely, which is exactly the failure mode.
+        let mut pipe = MmtPipe::spawn("/bin/sleep", &["30".to_string()]).expect("spawn sleep");
+
+        // Push until the bounded backlog fills and the stall limit trips.
+        let chunk = vec![0u8; 64 * 1024];
+        let mut err = None;
+        for _ in 0..(WRITE_BACKLOG_CHUNKS as u64 + STALLED_DROP_LIMIT + 8) {
+            if let Err(e) = pipe.push(&chunk) {
+                err = Some(e);
+                break;
+            }
+        }
+
+        let err = err.expect("a converter that produces nothing must eventually be reported");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            err.to_string().contains("no output at all"),
+            "the message must name the actual fault: {err}"
+        );
+        assert_eq!(pipe.status().read_bytes(), 0);
+    }
+
+    /// The byte counters are what separate "never consumed anything" from
+    /// "consumed but produced nothing".
+    #[cfg(unix)]
+    #[test]
+    fn byte_counters_track_both_directions() {
+        let mut pipe = MmtPipe::spawn("/bin/cat", &["-".to_string()]).expect("spawn cat");
+        let payload = vec![0x7Fu8; 2048];
+        pipe.push(&payload).expect("push");
+
+        let mut received = 0usize;
+        for _ in 0..50 {
+            if received >= payload.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            received += pipe.push(&[]).expect("drain").len();
+        }
+
+        assert_eq!(pipe.status().written_bytes(), payload.len() as u64);
+        assert_eq!(pipe.status().read_bytes(), payload.len() as u64);
+        assert_eq!(pipe.status().dropped_chunks(), 0);
     }
 
     /// End-to-end through a real child process: `cat` stands in for the
