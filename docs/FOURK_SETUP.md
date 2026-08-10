@@ -6,10 +6,25 @@
 (TS解析・EPG・ロゴ・チャンネル列挙・録画・全セッション) はすべて TS 前提なので、
 **TS に変換してから broadcast に流す**。
 
+```mermaid
+flowchart LR
+    T4K["4Kチューナー"] -->|"生MMT/TLV"| BD4["BonDriver<br/>BDA 等"]
+    TTS["地デジ / BS / CS<br/>チューナー"] -->|"MPEG-2 TS"| BDT["BonDriver"]
+
+    BD4 --> RD
+    BDT --> RD
+
+    RD["SharedTuner リーダー<br/>tuner/shared.rs"]
+    RD <-->|"stdin / stdout"| CONV["dantto4k 子プロセス<br/>tuner/mmt_pipe.rs<br/>MMT/TLV→TS + ACAS復号"]
+
+    RD -->|"MPEG-2 TS"| BC["broadcast<br/>容量4096"]
+    BC --> SI["SI収集<br/>EPG / ロゴ"]
+    BC --> SES["各セッション<br/>プリフィル → 188境界整列<br/>→ バイト予算で送出"]
+    SES --> CL["TVTest / EPGStation / 録画"]
 ```
-4Kチューナー ─BonDriver─▶ recisdb-proxy のリーダー ─stdin─▶ dantto4k ─stdout─▶ TS ─▶ broadcast
-                          (生MMT/TLV)                                          (以降すべて既存経路)
-```
+
+4K以外の経路は一切変わらない。変換器が挟まるのは
+`stream_format = 'mmttlv'` のドライバだけ。
 
 変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI を
 パイプモード (`dantto4k [OPTION...] - -`) で使う。
@@ -75,6 +90,23 @@ PacketId: 0xF300, Count: 133361, HEVC(3840x2160)   ← 変換自体は成功
 対応として、本体は変換器の stderr を監視し、該当メッセージを掴んだら
 エラーとしてログに出す (`tuner/mmt_pipe.rs`)。黙って暗号文を配信しない。
 
+```mermaid
+sequenceDiagram
+    participant R as リーダー
+    participant D as dantto4k
+    participant W as stderr監視スレッド
+    participant L as サーバーログ
+
+    R->>D: 生MMT/TLV (stdin)
+    Note over D: カードにもCasProxyにも届かない
+    D-->>R: MPEG-2 TS (stdout) 中身は暗号化されたまま
+    D->>W: No smart card readers are available
+    W->>L: error! 復号できていない
+    Note over W,L: 初回 + 100回ごと ECM毎に出るため間引く
+```
+
+変換器は**エラー終了しない**。この行が唯一の手がかりになる。
+
 確認手順:
 
 - `dantto4k.exe --listSmartCardReader` でリーダーが見えるか
@@ -84,6 +116,21 @@ PacketId: 0xF300, Count: 133361, HEVC(3840x2160)   ← 変換自体は成功
 `--frontend-descrambled` は前段で復号済みの場合のオプション。
 **生のチューナー出力を読む本構成では使わない** (何も復号されていないため)。
 スクランブルされたままの入力に指定すると、警告すら出ずに再生できない TS が出る。
+
+### 切り分け
+
+```mermaid
+flowchart TD
+    S["4Kが映らない"] --> Q1{"ログに<br/>No smart card readers"}
+    Q1 -->|"出る"| CAS["復号できていない<br/>CasProxyServerが起動しているか<br/>--listSmartCardReader で見えるか"]
+    Q1 -->|"出ない"| Q2{"ダッシュボードの<br/>ビットレートが 0 か"}
+    Q2 -->|"0 のまま"| Q3{"変換器の起動ログが<br/>出ているか"}
+    Q3 -->|"出ていない"| FMT["stream_format が ts のまま<br/>変換器が挟まっていない"]
+    Q3 -->|"出ている"| RAW["チューナーから読めていない<br/>BonDriver の space / channel 指定<br/>64bit 揃えを確認"]
+    Q2 -->|"流れている"| Q4{"frontend_descrambled<br/>を true にしていないか"}
+    Q4 -->|"true"| FD["復号を飛ばしている<br/>生チューナー読み出しでは false"]
+    Q4 -->|"false"| DEC["TSは出ている<br/>プレイヤー側 H.265 デコードを疑う"]
+```
 
 ### NullPacket が大半なのは正常
 
@@ -152,6 +199,46 @@ B25 が起動してしまう。
 - **`stream_format = 'mmttlv'` のドライバは帯域を見るまでもなく B25 を切る。**
   復号は変換器の担当。こちらはスキャン前でも効くので、上の「未スキャンなら
   有効のまま」より優先される
+
+### リーダー起動時のステージ選択
+
+判定はすべて `tuner/acquire.rs` で行う。全選局経路が通る唯一の絞り込み点で、
+DB ハンドルを持っているのもここだけ。
+
+```mermaid
+flowchart TD
+    START["リーダー起動"] --> Q1{"stream_format"}
+    Q1 -->|"mmttlv"| MMT["MMT/TLV変換器を挿入<br/>B25は無条件で無効<br/>復号は変換器の担当"]
+    Q1 -->|"ts (既定)"| Q2{"disable_b25 = 1 ?"}
+    Q2 -->|"はい"| OFF["B25 無効"]
+    Q2 -->|"いいえ"| Q3{"スキャン済みの band_type"}
+    Q3 -->|"4K"| OFF
+    Q3 -->|"地デジ / BS / CS"| ON["B25 有効"]
+    Q3 -->|"未スキャン (不明)"| ON
+```
+
+未スキャンで有効側に倒すのは、不要な復号は無駄なだけで済むのに対し、
+必要な復号を外すと映像が出ないため。
+
+### チャンク1個の流れ
+
+```mermaid
+flowchart TD
+    R["driver から n バイト読む"] --> C{"変換器あり?"}
+    C -->|"なし"| B{"B25 有効?"}
+    C -->|"あり"| P["mmt_pipe.push<br/>stdin へ投入し stdout を回収"]
+    P --> E{"変換出力あり?"}
+    E -->|"空 (起動直後は普通)"| R
+    E -->|"TSあり"| B
+    B -->|"はい"| D["b25.push"]
+    B -->|"いいえ"| BC["broadcast へ"]
+    D --> BC
+    BC --> R
+```
+
+変換器への書き込みは上限付きバックログ越し。変換器が詰まってもチューナーの
+読み取りループは止めない (止めると BonDriver 側のバッファが溢れる)。
+溢れた分は破棄して計上する。
 
 手動指定は現状 SQL で行う (Web API / ダッシュボードには未露出):
 
