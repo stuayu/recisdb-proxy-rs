@@ -385,17 +385,43 @@ impl MmtPipe {
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     if n == 1 || n % 100 == 0 {
-                        // The byte counters are the diagnosis: 0 written means
-                        // the converter is not reading its stdin at all (the
-                        // writer thread is parked in write_all), which is a
-                        // different fault from "reading but producing nothing".
+                        // A full backlog means we never attempt a write, and a
+                        // write is the only thing that would surface a dead
+                        // child as a broken pipe — so a converter that exited
+                        // immediately looks exactly like one that is merely
+                        // slow. Check explicitly rather than inferring.
+                        let exited = match self.child.try_wait() {
+                            Ok(Some(status)) => Some(status.to_string()),
+                            Ok(None) => None,
+                            Err(e) => Some(format!("unknown ({e})")),
+                        };
+
+                        // The byte counters are the rest of the diagnosis: 0
+                        // written means the converter is not reading its stdin
+                        // at all, which is a different fault from "reading but
+                        // producing nothing".
                         warn!(
                             "[MmtPipe] Converter cannot keep up; dropped {} chunk(s) of MMT/TLV \
-                             (written to converter: {} bytes, received: {} bytes)",
+                             (written to converter: {} bytes, received: {} bytes, process: {})",
                             n,
                             self.status.written_bytes(),
-                            self.status.read_bytes()
+                            self.status.read_bytes(),
+                            match &exited {
+                                Some(status) => format!("EXITED {status}"),
+                                None => "running".to_string(),
+                            }
                         );
+
+                        if let Some(status) = exited {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                format!(
+                                    "MMT/TLV converter exited ({status}) after accepting {} bytes. \
+                                     Check the converter's own output above for the reason",
+                                    self.status.written_bytes()
+                                ),
+                            ));
+                        }
                     }
 
                     // Dropping MMT/TLV is not a recoverable degradation the way
@@ -427,9 +453,22 @@ impl MmtPipe {
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // The feeder thread only ends when a write to the child
+                    // failed, which means the child is gone. Report why rather
+                    // than naming our own internal thread — the exit status is
+                    // the useful half.
+                    let status = match self.child.try_wait() {
+                        Ok(Some(status)) => status.to_string(),
+                        Ok(None) => "still running (stdin closed unexpectedly)".to_string(),
+                        Err(e) => format!("unknown ({e})"),
+                    };
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
-                        "converter input thread ended",
+                        format!(
+                            "MMT/TLV converter exited ({status}) after accepting {} bytes. \
+                             Check the converter's own output above for the reason",
+                            self.status.written_bytes()
+                        ),
                     ));
                 }
             }
@@ -597,6 +636,41 @@ mod tests {
             "the message must name the actual fault: {err}"
         );
         assert_eq!(pipe.status().read_bytes(), 0);
+    }
+
+    /// A converter that exits immediately must be reported as such. While the
+    /// backlog is full nothing is ever written, and a write is the only thing
+    /// that would surface a dead child as a broken pipe — so without an
+    /// explicit check this is indistinguishable from a slow converter.
+    #[cfg(unix)]
+    #[test]
+    fn a_converter_that_exits_immediately_is_reported() {
+        let mut pipe = MmtPipe::spawn("/bin/sh", &["-c".to_string(), "exit 3".to_string()])
+            .expect("spawn sh");
+
+        // Give it a moment to actually exit before pushing.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let chunk = vec![0u8; 64 * 1024];
+        let mut err = None;
+        for _ in 0..(WRITE_BACKLOG_CHUNKS as u64 + STALLED_DROP_LIMIT + 8) {
+            if let Err(e) = pipe.push(&chunk) {
+                err = Some(e);
+                break;
+            }
+        }
+
+        let err = err.expect("a converter that exited must be reported");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        let message = err.to_string();
+        assert!(
+            message.contains("converter exited"),
+            "the message must name the converter, not an internal thread: {message}"
+        );
+        assert!(
+            message.contains("exit status: 3") || message.contains("exit code: 3"),
+            "the exit status is the useful half: {message}"
+        );
     }
 
     /// The byte counters are what separate "never consumed anything" from
