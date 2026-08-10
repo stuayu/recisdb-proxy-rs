@@ -499,7 +499,12 @@ async fn set_status(web_state: &WebState, status: UpdateStatus) {
 /// `UpdateStatus::Error` so a bad release/network hiccup can't take the
 /// whole server down.
 async fn run_self_update(web_state: Arc<WebState>, tag: String, download_url: String) {
-    if let Err(message) = run_self_update_inner(&web_state, &tag, &download_url).await {
+    let source = UpdateSource {
+        download_url,
+        kind: ArchiveKind::for_release_asset(std::env::consts::OS),
+        auth_token: None,
+    };
+    if let Err(message) = run_self_update_inner(&web_state, &tag, &source).await {
         tracing::warn!("self-update ({tag}) failed: {message}");
         set_status(&web_state, UpdateStatus::Error(message)).await;
     }
@@ -508,8 +513,25 @@ async fn run_self_update(web_state: Arc<WebState>, tag: String, download_url: St
     // reaching here always means failure.
 }
 
-async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &str) -> Result<(), String> {
+/// Where an update is being pulled from.
+///
+/// Releases and CI artifacts differ in two ways that reach all the way down to
+/// extraction: artifacts need an `Authorization` header (the download endpoint
+/// rejects anonymous requests even on public repositories) and are always zip.
+pub struct UpdateSource {
+    pub download_url: String,
+    pub kind: ArchiveKind,
+    /// `Some` only for CI artifacts. Never logged.
+    pub auth_token: Option<String>,
+}
+
+async fn run_self_update_inner(
+    web_state: &WebState,
+    tag: &str,
+    source: &UpdateSource,
+) -> Result<(), String> {
     tracing::info!("self-update: starting update to {tag}");
+    let kind = source.kind;
     let os = std::env::consts::OS;
     let exe_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let exe_dir = exe_path.parent().ok_or("current executable has no parent directory")?.to_path_buf();
@@ -520,10 +542,12 @@ async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &s
     // --- Download (streamed to disk; the archive is never fully buffered
     // in memory) -------------------------------------------------------
     set_status(web_state, UpdateStatus::Downloading).await;
-    download_to_file(download_url, &archive_path).await.map_err(|e| {
-        let _ = std::fs::remove_file(&archive_path);
-        format!("download failed: {e}")
-    })?;
+    download_to_file(&source.download_url, &archive_path, source.auth_token.as_deref())
+        .await
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&archive_path);
+            format!("download failed: {e}")
+        })?;
 
     // --- Extract (blocking file/archive I/O off the async runtime) -----
     set_status(web_state, UpdateStatus::Extracting).await;
@@ -531,7 +555,7 @@ async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &s
         let archive_path = archive_path.clone();
         let extracted_path = extracted_path.clone();
         let os = os.to_string();
-        tokio::task::spawn_blocking(move || extract_archive(&archive_path, &extracted_path, &os))
+        tokio::task::spawn_blocking(move || extract_archive(&archive_path, &extracted_path, &os, kind))
             .await
             .map_err(|e| format!("extract task panicked: {e}"))?
     };
@@ -575,15 +599,30 @@ async fn run_self_update_inner(web_state: &WebState, tag: &str, download_url: &s
     crate::service::restart_self().map_err(|e| e.to_string())
 }
 
-async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
+async fn download_to_file(url: &str, dest: &Path, auth_token: Option<&str>) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent(format!("recisdb-proxy/{}", crate::VERSION))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let mut request = client.get(url);
+    if let Some(token) = auth_token {
+        request = request.bearer_auth(token);
+    }
+
+    let mut resp = request.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        // The status is the whole diagnosis for artifacts: 401/403 means the
+        // token is missing, expired or lacks the scope; 404 also shows up for
+        // an artifact that has passed its retention window.
+        let status = resp.status();
+        return Err(match status.as_u16() {
+            401 | 403 => format!(
+                "HTTP {status} — the GitHub token is missing, expired, or lacks the required scope"
+            ),
+            404 => format!("HTTP {status} — artifact not found (expired retention?)"),
+            _ => format!("HTTP {status}"),
+        });
     }
 
     use tokio::io::AsyncWriteExt;
@@ -598,8 +637,37 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
 /// Extracts just the `recisdb-proxy`/`recisdb-proxy.exe` entry out of the
 /// downloaded archive into `out_path`. Blocking I/O — always called via
 /// `spawn_blocking`.
-fn extract_archive(archive_path: &Path, out_path: &Path, os: &str) -> Result<(), String> {
-    if os == "windows" {
+/// How the downloaded file is packed.
+///
+/// Release assets are `.zip` on Windows and `.tar.gz` elsewhere, but a GitHub
+/// Actions artifact is **always** a zip regardless of platform — the API zips
+/// whatever the workflow uploaded. Inferring the format from the OS was fine
+/// while releases were the only source; it would fail on every non-Windows
+/// artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveKind {
+    Zip,
+    TarGz,
+}
+
+impl ArchiveKind {
+    /// What a release asset for `os` is packed as.
+    pub fn for_release_asset(os: &str) -> Self {
+        if os == "windows" {
+            ArchiveKind::Zip
+        } else {
+            ArchiveKind::TarGz
+        }
+    }
+}
+
+fn extract_archive(
+    archive_path: &Path,
+    out_path: &Path,
+    os: &str,
+    kind: ArchiveKind,
+) -> Result<(), String> {
+    if kind == ArchiveKind::Zip {
         let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
         let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         for i in 0..zip.len() {
@@ -646,9 +714,345 @@ async fn validate_extracted_binary(path: &Path, os: &str) -> Result<(), String> 
     Ok(())
 }
 
+// ===========================================================================
+// Development builds (GitHub Actions artifacts)
+// ===========================================================================
+
+/// Workflow whose artifacts are offered as development builds.
+const DEV_WORKFLOW_FILE: &str = "build.yml";
+
+const RUNS_URL: &str = "https://api.github.com/repos/stuayu/recisdb-proxy-rs/actions/workflows/build.yml/runs?status=success&per_page=10";
+
+/// Artifact name this platform should install, matching `build.yml`'s
+/// `recisdb-${{ matrix.label }}` upload naming.
+///
+/// Returns `None` for a platform the workflow does not build, so the UI can say
+/// "no development build for this platform" instead of offering an artifact
+/// that would fail the magic-byte check after a pointless download.
+pub fn dev_artifact_name(os: &str, arch: &str) -> Option<&'static str> {
+    let label = match (os, arch) {
+        ("windows", "x86_64") => "win-x64",
+        ("windows", "x86") => "win-x86",
+        ("windows", "aarch64") => "win-arm64",
+        ("linux", "x86_64") => "linux-amd64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "x86_64") => "macos-amd64",
+        ("macos", "aarch64") => "macos-arm64",
+        _ => return None,
+    };
+    Some(match label {
+        "win-x64" => "recisdb-win-x64",
+        "win-x86" => "recisdb-win-x86",
+        "win-arm64" => "recisdb-win-arm64",
+        "linux-amd64" => "recisdb-linux-amd64",
+        "linux-arm64" => "recisdb-linux-arm64",
+        "macos-amd64" => "recisdb-macos-amd64",
+        _ => "recisdb-macos-arm64",
+    })
+}
+
+fn current_dev_artifact_name() -> Option<&'static str> {
+    dev_artifact_name(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowRun {
+    pub id: u64,
+    pub head_branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub display_title: Option<String>,
+    pub created_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowRunsResponse {
+    pub workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Artifact {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default)]
+    pub size_in_bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ArtifactsResponse {
+    pub artifacts: Vec<Artifact>,
+}
+
+/// Pick the artifact this platform should install out of one run's artifacts.
+///
+/// Expired artifacts are skipped: GitHub keeps the metadata after the retention
+/// window but the download 404s, so offering one would only produce a confusing
+/// failure part-way through an update.
+pub fn select_dev_artifact<'a>(artifacts: &'a [Artifact], wanted_name: &str) -> Option<&'a Artifact> {
+    artifacts
+        .iter()
+        .find(|a| a.name == wanted_name && !a.expired)
+}
+
+fn github_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(format!("recisdb-proxy/{}", crate::VERSION))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+async fn github_get_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    token: Option<&str>,
+) -> Result<T, String> {
+    let client = github_client()?;
+    let mut request = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<T>().await.map_err(|e| e.to_string())
+}
+
+/// `GET /api/update/dev-builds` — recent successful CI runs and whether each
+/// has an installable artifact for this platform.
+pub async fn dev_builds(State(web_state): State<Arc<WebState>>) -> Json<serde_json::Value> {
+    let token = {
+        let db = web_state.database.lock().await;
+        db.get_github_token().ok().flatten()
+    };
+
+    let Some(artifact_name) = current_dev_artifact_name() else {
+        return Json(json!({
+            "success": true,
+            "supported": false,
+            "token_configured": token.is_some(),
+            "reason": format!(
+                "no development build is produced for {}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+            "builds": [],
+        }));
+    };
+
+    let runs: WorkflowRunsResponse = match github_get_json(RUNS_URL, token.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(json!({
+                "success": false,
+                "supported": true,
+                "token_configured": token.is_some(),
+                "error": format!("failed to list workflow runs: {e}"),
+                "builds": [],
+            }))
+        }
+    };
+
+    let mut builds = Vec::new();
+    for run in runs.workflow_runs.iter().take(10) {
+        let url = format!(
+            "https://api.github.com/repos/stuayu/recisdb-proxy-rs/actions/runs/{}/artifacts",
+            run.id
+        );
+        let artifacts: Vec<Artifact> = github_get_json::<ArtifactsResponse>(&url, token.as_deref())
+            .await
+            .map(|r| r.artifacts)
+            .unwrap_or_default();
+        let selected = select_dev_artifact(&artifacts, artifact_name);
+        builds.push(json!({
+            "run_id": run.id,
+            "branch": run.head_branch,
+            "sha": run.head_sha,
+            "title": run.display_title,
+            "created_at": run.created_at,
+            "html_url": run.html_url,
+            "artifact_id": selected.map(|a| a.id),
+            "artifact_name": artifact_name,
+            "size_in_bytes": selected.map(|a| a.size_in_bytes),
+            "installable": selected.is_some(),
+        }));
+    }
+
+    Json(json!({
+        "success": true,
+        "supported": true,
+        // Listing runs works anonymously on a public repository, but the
+        // download does not — surfaced separately so the UI can prompt for a
+        // token before the user clicks a build that cannot be fetched.
+        "token_configured": token.is_some(),
+        "workflow": DEV_WORKFLOW_FILE,
+        "artifact_name": artifact_name,
+        "builds": builds,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetGithubTokenRequest {
+    /// Empty string clears the stored token.
+    pub token: String,
+}
+
+/// `GET /api/update/github-token` — whether a token is stored.
+///
+/// Never returns the token itself: it is a credential, and the dashboard only
+/// needs to know whether to prompt for one.
+pub async fn get_github_token_status(State(web_state): State<Arc<WebState>>) -> Json<serde_json::Value> {
+    let configured = {
+        let db = web_state.database.lock().await;
+        db.get_github_token().ok().flatten().is_some()
+    };
+    Json(json!({ "success": true, "configured": configured }))
+}
+
+/// `POST /api/update/github-token` — store or clear the token.
+pub async fn set_github_token(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<SetGithubTokenRequest>,
+) -> Json<serde_json::Value> {
+    let db = web_state.database.lock().await;
+    match db.set_github_token(&payload.token) {
+        Ok(()) => Json(json!({
+            "success": true,
+            "configured": !payload.token.trim().is_empty(),
+        })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ApplyDevBuildRequest {
+    pub artifact_id: u64,
+    /// Shown in the status line and logs; purely descriptive.
+    pub label: Option<String>,
+}
+
+/// `POST /api/update/dev-build` — install a CI artifact and restart.
+pub async fn apply_dev_build(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<ApplyDevBuildRequest>,
+) -> Json<serde_json::Value> {
+    if !self_update_supported() {
+        return Json(json!({
+            "success": false,
+            "error": "self-update is not supported on this platform",
+        }));
+    }
+    if current_dev_artifact_name().is_none() {
+        return Json(json!({
+            "success": false,
+            "error": "no development build is produced for this platform",
+        }));
+    }
+
+    let token = {
+        let db = web_state.database.lock().await;
+        db.get_github_token().ok().flatten()
+    };
+    let Some(token) = token else {
+        return Json(json!({
+            "success": false,
+            // The single most common failure, and not something the user can
+            // guess from an HTTP status later in the process.
+            "error": "a GitHub token is required: artifact downloads are authenticated even for public repositories. Set one in the update settings (a fine-grained token with Actions: read, or a classic token with the repo scope).",
+        }));
+    };
+
+    {
+        let status = web_state.update_status.lock().await;
+        if matches!(
+            *status,
+            UpdateStatus::Downloading | UpdateStatus::Extracting | UpdateStatus::Replacing | UpdateStatus::Restarting
+        ) {
+            return Json(json!({ "success": false, "error": "an update is already in progress" }));
+        }
+    }
+
+    let label = payload
+        .label
+        .unwrap_or_else(|| format!("artifact #{}", payload.artifact_id));
+    let source = UpdateSource {
+        download_url: format!(
+            "https://api.github.com/repos/stuayu/recisdb-proxy-rs/actions/artifacts/{}/zip",
+            payload.artifact_id
+        ),
+        // Always zip: the API packs whatever the workflow uploaded.
+        kind: ArchiveKind::Zip,
+        auth_token: Some(token),
+    };
+
+    let state = Arc::clone(&web_state);
+    let label_for_task = label.clone();
+    tokio::spawn(async move {
+        if let Err(message) = run_self_update_inner(&state, &label_for_task, &source).await {
+            tracing::warn!("dev-build update ({label_for_task}) failed: {message}");
+            set_status(&state, UpdateStatus::Error(message)).await;
+        }
+    });
+
+    Json(json!({ "success": true, "status": "started", "label": label }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- development builds (CI artifacts) ----
+
+    /// The artifact name must match `build.yml`'s `recisdb-${{ matrix.label }}`
+    /// upload naming, or the update silently finds nothing to install.
+    #[test]
+    fn dev_artifact_names_match_the_workflow_labels() {
+        assert_eq!(dev_artifact_name("windows", "x86_64"), Some("recisdb-win-x64"));
+        assert_eq!(dev_artifact_name("windows", "x86"), Some("recisdb-win-x86"));
+        assert_eq!(dev_artifact_name("windows", "aarch64"), Some("recisdb-win-arm64"));
+        assert_eq!(dev_artifact_name("linux", "x86_64"), Some("recisdb-linux-amd64"));
+        assert_eq!(dev_artifact_name("linux", "aarch64"), Some("recisdb-linux-arm64"));
+        assert_eq!(dev_artifact_name("macos", "x86_64"), Some("recisdb-macos-amd64"));
+        assert_eq!(dev_artifact_name("macos", "aarch64"), Some("recisdb-macos-arm64"));
+
+        // Platforms the workflow does not build must say so rather than
+        // offering an artifact that cannot exist.
+        assert_eq!(dev_artifact_name("freebsd", "x86_64"), None);
+        assert_eq!(dev_artifact_name("linux", "riscv64"), None);
+    }
+
+    fn artifact(id: u64, name: &str, expired: bool) -> Artifact {
+        Artifact { id, name: name.to_string(), expired, size_in_bytes: 1234 }
+    }
+
+    #[test]
+    fn dev_artifact_selection_picks_this_platform_and_skips_expired() {
+        let artifacts = vec![
+            artifact(1, "recisdb-linux-amd64", false),
+            artifact(2, "recisdb-win-x64", false),
+        ];
+        assert_eq!(select_dev_artifact(&artifacts, "recisdb-win-x64").map(|a| a.id), Some(2));
+        assert!(select_dev_artifact(&artifacts, "recisdb-macos-arm64").is_none());
+
+        // GitHub keeps the metadata after retention but the download 404s, so
+        // an expired artifact must not be offered.
+        let expired = vec![artifact(3, "recisdb-win-x64", true)];
+        assert!(select_dev_artifact(&expired, "recisdb-win-x64").is_none());
+    }
+
+    /// Release assets are tar.gz off Windows, but a CI artifact is always a
+    /// zip — the API zips whatever the workflow uploaded. Inferring from the OS
+    /// would break every non-Windows artifact.
+    #[test]
+    fn archive_kind_differs_between_releases_and_artifacts() {
+        assert_eq!(ArchiveKind::for_release_asset("windows"), ArchiveKind::Zip);
+        assert_eq!(ArchiveKind::for_release_asset("linux"), ArchiveKind::TarGz);
+        assert_eq!(ArchiveKind::for_release_asset("macos"), ArchiveKind::TarGz);
+    }
 
     fn release(tag: &str, prerelease: bool, draft: bool) -> GithubRelease {
         GithubRelease {

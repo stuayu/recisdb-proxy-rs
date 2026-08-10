@@ -46,6 +46,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))
         .route("/update/status", get(api::update_status))
+        // Development builds from CI artifacts (web/api/update.rs)
+        .route("/update/dev-builds", get(api::dev_builds))
+        .route("/update/dev-build", post(api::apply_dev_build))
+        .route("/update/github-token", get(api::get_github_token_status).post(api::set_github_token))
 
         // OSサービス連携 (service/mod.rs)。登録/削除は権限昇格の経路に
         // なるため Web からは行わない (CLI とセットアップGUIのみ)。

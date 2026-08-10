@@ -180,7 +180,47 @@ impl Database {
         ("018_ts_queue_duration_columns", Database::migration_018_ts_queue_duration_columns),
         ("019_bon_driver_disable_b25", Database::migration_019_bon_driver_disable_b25),
         ("020_bon_driver_stream_format", Database::migration_020_bon_driver_stream_format),
+        ("021_github_token", Database::migration_021_github_token),
     ];
+
+    /// Migration 021: GitHub token for development-build updates.
+    ///
+    /// GitHub's artifact download endpoint requires authentication **even for
+    /// public repositories** (a `repo`-scoped token), unlike release assets
+    /// which are anonymous. Updating to a CI build is therefore impossible
+    /// without one, so it is stored next to the Web API token rather than in
+    /// the config file: it is a credential the operator pastes once from the
+    /// dashboard, not a deployment setting.
+    fn migration_021_github_token(&self) -> Result<()> {
+        self.add_column_if_not_exists("web_auth_config", "github_token", "TEXT")
+    }
+
+    /// GitHub token used to download CI artifacts, if configured.
+    pub fn get_github_token(&self) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT github_token FROM web_auth_config WHERE id = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match result {
+            Ok(token) => Ok(token.filter(|t| !t.trim().is_empty())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DatabaseError::Sqlite(e)),
+        }
+    }
+
+    /// Store (or, with an empty string, clear) the GitHub token.
+    pub fn set_github_token(&self, token: &str) -> Result<()> {
+        let trimmed = token.trim();
+        let value = if trimmed.is_empty() { None } else { Some(trimmed) };
+        self.conn.execute(
+            "INSERT INTO web_auth_config (id, github_token, updated_at)
+             VALUES (1, ?1, strftime('%s','now'))
+             ON CONFLICT(id) DO UPDATE SET github_token = ?1, updated_at = strftime('%s','now')",
+            rusqlite::params![value],
+        )?;
+        Ok(())
+    }
 
     /// Migration 020: what the driver actually hands back.
     ///
@@ -1291,6 +1331,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    /// The GitHub token is what makes CI-artifact updates possible at all, so
+    /// it must survive a round trip and be clearable.
+    #[test]
+    fn github_token_roundtrip_and_clear() {
+        let db = Database::open_in_memory().unwrap();
+        db.migration_021_github_token().unwrap();
+        db.migration_021_github_token().unwrap();
+
+        assert_eq!(db.get_github_token().unwrap(), None);
+
+        db.set_github_token("ghp_example").unwrap();
+        assert_eq!(db.get_github_token().unwrap(), Some("ghp_example".to_string()));
+
+        // Whitespace-only is the same as unset, so a cleared field does not
+        // turn into an Authorization header of spaces.
+        db.set_github_token("   ").unwrap();
+        assert_eq!(db.get_github_token().unwrap(), None);
+
+        // Storing does not disturb the Web API token in the same row.
+        db.set_web_auth_token("web-token").unwrap();
+        db.set_github_token("ghp_second").unwrap();
+        assert_eq!(db.get_web_auth_token().unwrap(), Some("web-token".to_string()));
+        assert_eq!(db.get_github_token().unwrap(), Some("ghp_second".to_string()));
     }
 
     /// Migration 020 must be idempotent and default to TS, so registering a
