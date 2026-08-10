@@ -369,6 +369,7 @@ fn encode_channel_filter(buf: &mut BytesMut, filter: &ChannelFilter) {
                 BroadcastType::Terrestrial => 0,
                 BroadcastType::BS => 1,
                 BroadcastType::CS => 2,
+                BroadcastType::FourK => 3,
             });
         }
         None => {
@@ -396,6 +397,10 @@ fn decode_channel_filter(buf: &mut Bytes) -> Result<ChannelFilter, ProtocolError
         Some(match buf.get_u8() {
             0 => BroadcastType::Terrestrial,
             1 => BroadcastType::BS,
+            3 => BroadcastType::FourK,
+            // 2 and anything unknown: CS is the historical fallback. A peer
+            // that predates FourK encodes/decodes 3 as CS; both ends ship
+            // together, so this only matters for a mixed-version pair.
             _ => BroadcastType::CS,
         })
     } else {

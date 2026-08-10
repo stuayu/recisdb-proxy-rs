@@ -89,6 +89,7 @@ pub fn region_key_for_nid(nid: u16) -> &'static str {
     match btype {
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
+        BroadcastType::FourK => "BS4K",
         BroadcastType::Terrestrial => match terrestrial_region {
             Some(TerrestrialRegion::Unknown(_)) | None => "Unknown",
             Some(r) => r.display_name(),
@@ -162,10 +163,17 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
         );
     }
 
-    // Order: terrestrial regions (sorted by region key), then BS, then CS.
+    // Order: terrestrial regions (sorted by region key), then BS, then CS,
+    // then BS4K.
+    //
+    // BS4K goes last on purpose. The space index is the client's addressing
+    // scheme (.ch2 / ChSet5), so inserting a space anywhere but the end
+    // renumbers everything after it and silently repoints existing presets.
+    // Appended last, a setup with no 4K channels keeps every index it had.
     let mut terrestrial: Vec<SpaceEntry> = Vec::new();
     let mut bs: Option<SpaceEntry> = None;
     let mut cs: Option<SpaceEntry> = None;
+    let mut four_k: Option<SpaceEntry> = None;
 
     for (region_key, (actual_space, display_name)) in space_region_names {
         let entry = SpaceEntry {
@@ -176,6 +184,7 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
         match region_key.as_str() {
             "BS" => bs = Some(entry),
             "CS" => cs = Some(entry),
+            "BS4K" => four_k = Some(entry),
             _ => terrestrial.push(entry),
         }
     }
@@ -184,6 +193,7 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
     let mut spaces = terrestrial;
     spaces.extend(bs);
     spaces.extend(cs);
+    spaces.extend(four_k);
 
     SpaceListResult {
         spaces,
@@ -381,6 +391,50 @@ mod tests {
         let names: Vec<_> = result.spaces.iter().map(|s| s.region_key.as_str()).collect();
         assert_eq!(names, vec!["関東", "BS", "CS"]);
         assert_eq!(result.spaces[0].display_name, "地デジ (関東)");
+    }
+
+    /// 4K (advanced BS, NID 0x000B) must get its own space instead of being
+    /// swept into a bogus terrestrial one. It goes last so that a setup
+    /// without 4K keeps the space indices its .ch2 / ChSet5 files were built
+    /// against.
+    #[test]
+    fn four_k_gets_its_own_space_and_is_appended_last() {
+        let d = driver(1, "BonDriver_A.dll", None);
+        let without_4k = vec![
+            row(&d, 0x0004, 0x4010, 101, Some("BS朝日"), 1, 0, true),
+            row(&d, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 27, true),
+            row(&d, 0x0006, 0x6020, 100, Some("CS100"), 2, 0, true),
+        ];
+        let baseline: Vec<_> = build_space_list(&without_4k, |p| p == "BonDriver_A.dll")
+            .spaces
+            .iter()
+            .map(|s| s.region_key.clone())
+            .collect();
+
+        let mut with_4k = without_4k.clone();
+        // Real capture: BS朝日4K is NID 0x000B / TSID 0xB070 / SID 0x97.
+        with_4k.push(row(&d, 0x000B, 0xB070, 0x97, Some("BS朝日 4K"), 3, 0, true));
+
+        let result = build_space_list(&with_4k, |p| p == "BonDriver_A.dll");
+        let keys: Vec<_> = result.spaces.iter().map(|s| s.region_key.clone()).collect();
+
+        assert_eq!(keys, vec!["関東", "BS", "CS", "BS4K"]);
+        assert_eq!(
+            keys[..baseline.len()],
+            baseline[..],
+            "existing spaces must keep their indices when 4K appears"
+        );
+        assert_eq!(result.spaces[3].display_name, "BS4K");
+    }
+
+    /// Before 4K was classified, NID 0x000B fell through to the terrestrial
+    /// branch and produced an "Unknown" space — which also sorted *among* the
+    /// terrestrial regions and so shifted BS/CS.
+    #[test]
+    fn four_k_is_not_classified_as_unknown_terrestrial() {
+        assert_eq!(region_key_for_nid(0x000B), "BS4K");
+        assert_eq!(region_key_for_nid(0x000C), "BS4K");
+        assert_ne!(region_key_for_nid(0x000B), "Unknown");
     }
 
     #[test]

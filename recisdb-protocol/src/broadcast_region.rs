@@ -298,6 +298,15 @@ pub fn classify_nid(nid: u16) -> (BroadcastType, Option<TerrestrialRegion>) {
         // 10: SKY PerfecTV! Premium Service
         6 | 7 | 10 => (BroadcastType::CS, None),
 
+        // Advanced BS/CS (BS4K). 0x000B = 高度BS, 0x000C = 高度110度CS
+        // (operation ended). Must be matched before the terrestrial
+        // fall-through: these NIDs are far below the terrestrial range, so
+        // `classify_terrestrial_nid` would label them
+        // `Terrestrial(Unknown(11))` and file 4K channels into a bogus
+        // terrestrial tuning space. `BandType::from_nid` has always
+        // classified them correctly, so the two classifiers disagreed.
+        0x000B | 0x000C => (BroadcastType::FourK, None),
+
         // Terrestrial digital broadcasting
         // NID ranges based on ARIB TR-B14
         nid => classify_terrestrial_nid(nid),
@@ -323,6 +332,7 @@ pub fn broadcast_type_name(btype: BroadcastType) -> &'static str {
         BroadcastType::Terrestrial => "地デジ",
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
+        BroadcastType::FourK => "BS4K",
     }
 }
 
@@ -332,6 +342,7 @@ pub fn broadcast_type_name_en(btype: BroadcastType) -> &'static str {
         BroadcastType::Terrestrial => "Terrestrial",
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
+        BroadcastType::FourK => "BS4K",
     }
 }
 
@@ -352,6 +363,7 @@ pub fn generate_space_name(btype: BroadcastType, region: Option<TerrestrialRegio
     match btype {
         BroadcastType::BS => "BS".to_string(),
         BroadcastType::CS => "CS".to_string(),
+        BroadcastType::FourK => "BS4K".to_string(),
         BroadcastType::Terrestrial => {
             if let Some(r) = region {
                 format!("地デジ ({})", r.display_name())
@@ -460,6 +472,26 @@ mod tests {
         let (btype, region) = classify_nid(0x1000);
         assert_eq!(btype, BroadcastType::Terrestrial);
         assert!(matches!(region, Some(TerrestrialRegion::Unknown(0x1000))));
+    }
+
+    #[test]
+    /// NID 0x000B (高度BS) is far below the terrestrial NID range, so before
+    /// it was matched explicitly it fell through to `classify_terrestrial_nid`
+    /// and came back as `Terrestrial(Unknown(11))`. `BandType::from_nid` has
+    /// always classified the same NID as 4K, so the two classifiers
+    /// contradicted each other and 4K channels landed in a bogus terrestrial
+    /// tuning space.
+    #[test]
+    fn advanced_bs_nids_classify_as_four_k() {
+        assert_eq!(classify_nid(0x000B), (BroadcastType::FourK, None));
+        assert_eq!(classify_nid(0x000C), (BroadcastType::FourK, None));
+        assert_eq!(generate_space_name(BroadcastType::FourK, None), "BS4K");
+
+        // The two classifiers must agree.
+        assert_eq!(
+            crate::types::BandType::from_nid(0x000B),
+            crate::types::BandType::FourK
+        );
     }
 
     #[test]

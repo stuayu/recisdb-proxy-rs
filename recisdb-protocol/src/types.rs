@@ -664,6 +664,16 @@ pub enum BroadcastType {
     BS,
     /// CS digital (CS1, CS2)
     CS,
+    /// Advanced BS/CS digital (高度BS/CS = BS4K). NID 0x000B / 0x000C.
+    ///
+    /// 4K services are delivered as MMT/TLV, not MPEG-2 TS, so they only
+    /// reach this code path through a converter such as
+    /// `BonDriver_dantto4k.dll`, which remuxes to TS while **preserving the
+    /// original network_id**. That preserved NID is the only usable signal:
+    /// the converted services carry `service_type` 0x01 (ordinary digital TV),
+    /// not the 4K-specific 0xAD, so nothing else in the stream distinguishes
+    /// them.
+    FourK,
 }
 
 /// Channel key for identifying removed channels in updates.
