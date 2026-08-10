@@ -31,6 +31,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - GetTsStreamは必ず **`C_GetTsStream2`(BYTE**ゼロコピー版)** を使う。BYTE*コピー版は未実装/バグ持ちのDLLが多く、リリースビルドのみクラッシュするUBの原因。
 - **GetTsStreamが返した `size` は全バイト受け取る。** DLLは返した時点で内部バッファを消費済み。呼び出し側バッファに入らない分を切り捨てると、そのTSは永久に失われ、しかも切れ目が188境界に乗らないので以降の同期も壊れる。入らなかった分は `IBon::pending` に退避し次回返す(`bondriver/windows.rs`)。プロキシ系DLL(BonDriver_NetworkProxy / BonDriverProxyEx)はハードウェアDLLよりずっと大きいチャンクを返すため、多段構成で顕在化する。
 - **クライアントDLLは `CreateBonDriver()` ごとに独立インスタンスを返す。** 接続・リングバッファ・選局状態をプロセス共有にしない(詳細と理由: `docs/DESIGN.md` §5)。
+- **4K(NID 0x000B/0x000C)ではB25を走らせない。** 変換器が復号済みにするがPMTにCA記述子が残り、そのCA system IDが0x0005で我々のB-CASシムと一致するため、libaribb25が死んだECM PIDを掴む。判定は `tuner/acquire.rs::b25_enabled_for` の1箇所(詳細: `docs/FOURK_SETUP.md`)。
 - C++側FFIラッパーは必ず `try { } catch (...) { }` で包む。Rustの `catch_unwind` はC++/SEH例外を捕まえられない。SEHには `/EHa`。
 - Rust panic がFFI境界(`extern "system"`)を越えるとプロセスabort(TVTestが無言で落ちる)。クライアントDLL内では panic し得るコード(unwrap/添字)を書かない。
 - `from_wide_ptr` は最大長キャップ(32768)+ `?` 必須(`.unwrap()` 禁止)。
@@ -43,6 +44,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - クライアントに見せる space/channel は**仮想インデックス**(`server/client_view.rs`)。space=放送地域(地デジ広域圏→BS→CS)、channel=(NID,TSID)で重複排除し (NID,TSID) 昇順。
 - 関東広域(NHK等)と県域局(テレ玉等)は**同じ「関東」スペース**に入り、県域局のNIDの方が小さいので先頭側に並ぶ。
 - インデックスはDBの channels テーブルの内容から導出されるため、**スキャンでDBが変わると既存クライアント(.ch2/TVTestスキャン結果)のインデックスとズレる**。チャンネル列挙順に影響する変更をしたら .ch2/ChSet の再生成が必要な旨を必ず告知すること。
+- 空間の並びは **地デジ→BS→CS→BS4K**。4Kは必ず末尾に置く(途中に挿すと以降のインデックスが全部ずれる)。
 
 ### 選局(チューナー選択)
 - 選局の**決定**は `tuner/policy.rs::decide()` の純関数のみ。I/O・async・ログを持ち込まない。
@@ -95,6 +97,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/TUNER_PIPELINE_REDESIGN.md` — チューナー選択・配信・切り替え経路の再設計(2026-08)
 - `docs/SYSTEM_REVIEW_2026-07.md` — レビュー指摘と対応状況の台帳
 - `docs/CLIENT_REVIEW_2026-08.md` — **クライアントDLLのレビュー台帳**。多段構成・拠点間WAN前提で洗い出した18件と対応状況
+- `docs/FOURK_SETUP.md` — **BS4K対応**。dantto4kのBonDriverラッパー経由でTS化する構成、4Kの分類とB25無効化の理由、未対応事項
 - `docs/EPGSTATION_COMPAT.md` — **Mirakurun互換API(`/mirakurun/api/*`)のクライアント側仕様の調査台帳**。EPGStation(stuayuフォーク)が要求するAPI・データ構造・ストリームの挙動と、現状の実装との差分
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)
