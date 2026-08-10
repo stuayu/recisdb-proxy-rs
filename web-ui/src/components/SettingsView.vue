@@ -193,6 +193,20 @@ const tokenConfigured = ref(false)
 const devApplying = ref<number | null>(null)
 const devStatus = ref('')
 
+/// 保存済みかどうかだけを問い合わせる（値はサーバーが返さない）。
+///
+/// 一覧の取得と分けているのは、`/update/dev-builds` が GitHub API を
+/// 「ラン一覧 + ラン毎の成果物」で十数回叩くため。未認証の GitHub API は
+/// 1時間60回しかないので、設定画面を開くたびに消費させない。
+async function loadTokenStatus() {
+  try {
+    const result = await api<{ configured: boolean }>('/update/github-token')
+    tokenConfigured.value = result.configured
+  } catch {
+    // 取れなくても画面は使える（未設定として扱う）
+  }
+}
+
 async function loadDevBuilds() {
   devBuildsLoading.value = true
   devError.value = ''
@@ -365,6 +379,7 @@ onMounted(() => {
   void load()
   void loadService()
   void loadCardReaders()
+  void loadTokenStatus()
 })
 </script>
 <template>
@@ -419,6 +434,74 @@ onMounted(() => {
       </button>
     </div>
     <div class="panel">
+      <h3>開発版に更新</h3>
+      <p class="hint">
+        GitHub Actions がビルドした最新の開発版に更新します。リリース版より新しい代わりに、
+        検証されていない変更が含まれます。
+      </p>
+
+      <p v-if="tokenConfigured" class="muted">GitHubトークン: 設定済み</p>
+      <p v-if="!tokenConfigured" class="hint">
+        <strong>GitHubトークンが必要です。</strong>
+        アーティファクトのダウンロードは公開リポジトリでも認証が必要なため、リリース版の更新と違い
+        トークン無しでは実行できません。fine-grained トークンなら Actions: read、 classic
+        トークンなら repo スコープを付けてください。
+      </p>
+      <form @submit.prevent="saveGithubToken">
+        <label class="field"
+          ><span>GitHubトークン{{ tokenConfigured ? '（設定済み・再設定する場合のみ）' : '' }}</span
+          ><input
+            v-model="githubToken"
+            type="password"
+            autocomplete="off"
+            placeholder="ghp_... / github_pat_..." /></label
+        ><button class="button secondary" type="submit">保存</button>
+      </form>
+
+      <div class="actions">
+        <button class="button secondary" :disabled="devBuildsLoading" @click="loadDevBuilds">
+          {{ devBuildsLoading ? '取得中…' : '開発版の一覧を取得' }}
+        </button>
+      </div>
+
+      <p v-if="devMessage" class="muted" v-text="devMessage" />
+      <p v-if="devError" class="error" v-text="devError" />
+      <p v-if="devStatus" class="muted" v-text="devStatus" />
+
+      <p v-if="devBuilds && !devBuilds.supported" class="hint" v-text="devBuilds.reason" />
+
+      <div v-if="devBuilds?.supported && devBuilds.builds.length" class="table-region">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>ブランチ</th>
+              <th>コミット</th>
+              <th>日時</th>
+              <th>サイズ</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="build in devBuilds.builds" :key="build.run_id">
+              <td data-label="ブランチ" v-text="build.branch ?? '—'" />
+              <td data-label="コミット" v-text="(build.sha ?? '').slice(0, 7) || '—'" />
+              <td data-label="日時" v-text="build.created_at ?? '—'" />
+              <td data-label="サイズ" v-text="formatSize(build.size_in_bytes)" />
+              <td data-label="操作">
+                <button
+                  class="button small"
+                  :disabled="!build.installable || !tokenConfigured || devApplying !== null"
+                  @click="applyDevBuild(build)"
+                >
+                  {{ build.installable ? 'この版に更新' : '対象なし' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
       <h3>ブラウザプレビュー</h3>
       <p class="muted">
         ブラウザで映像を確認するには、エンコーダー（ffmpeg）と前段処理（tsreadex）が必要です。
@@ -453,7 +536,9 @@ onMounted(() => {
         :disabled="previewSetupBusy"
         @click="runPreviewAutoSetup"
       >
-        {{ previewSetupBusy ? '準備中…（数分かかることがあります）' : 'プレビューを使えるようにする' }}
+        {{
+          previewSetupBusy ? '準備中…（数分かかることがあります）' : 'プレビューを使えるようにする'
+        }}
       </button>
     </div>
     <div class="panel">
@@ -465,11 +550,7 @@ onMounted(() => {
       </p>
       <p v-if="cardReaderError" class="notice error" role="alert" v-text="cardReaderError" />
       <p v-if="cardReaderMessage" class="notice success" v-text="cardReaderMessage" />
-      <p
-        v-if="cardReaders && !cardReaders.selected_present"
-        class="notice error"
-        role="alert"
-      >
+      <p v-if="cardReaders && !cardReaders.selected_present" class="notice error" role="alert">
         選択中の「{{ cardReaders.selected }}」は現在つながっていません。
       </p>
       <p v-if="cardReaders && cardReaders.readers.length === 0" class="muted">
@@ -527,74 +608,6 @@ onMounted(() => {
       </p>
       <button class="button" type="submit">保存</button>
     </form>
-
-    <div class="panel">
-      <h3>開発版に更新</h3>
-      <p class="hint">
-        GitHub Actions がビルドした最新の開発版に更新します。リリース版より新しい代わりに、
-        検証されていない変更が含まれます。
-      </p>
-
-      <p v-if="!tokenConfigured" class="hint">
-        <strong>GitHubトークンが必要です。</strong>
-        アーティファクトのダウンロードは公開リポジトリでも認証が必要なため、リリース版の更新と違い
-        トークン無しでは実行できません。fine-grained トークンなら Actions: read、
-        classic トークンなら repo スコープを付けてください。
-      </p>
-      <form @submit.prevent="saveGithubToken">
-        <label class="field"
-          ><span>GitHubトークン{{ tokenConfigured ? '（設定済み・再設定する場合のみ）' : '' }}</span
-          ><input
-            v-model="githubToken"
-            type="password"
-            autocomplete="off"
-            placeholder="ghp_... / github_pat_..." /></label
-        ><button class="button secondary" type="submit">保存</button>
-      </form>
-
-      <div class="actions">
-        <button class="button secondary" :disabled="devBuildsLoading" @click="loadDevBuilds">
-          {{ devBuildsLoading ? '取得中…' : '開発版の一覧を取得' }}
-        </button>
-      </div>
-
-      <p v-if="devMessage" class="muted" v-text="devMessage" />
-      <p v-if="devError" class="error" v-text="devError" />
-      <p v-if="devStatus" class="muted" v-text="devStatus" />
-
-      <p v-if="devBuilds && !devBuilds.supported" class="hint" v-text="devBuilds.reason" />
-
-      <div v-if="devBuilds?.supported && devBuilds.builds.length" class="table-region">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>ブランチ</th>
-              <th>コミット</th>
-              <th>日時</th>
-              <th>サイズ</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="build in devBuilds.builds" :key="build.run_id">
-              <td data-label="ブランチ" v-text="build.branch ?? '—'" />
-              <td data-label="コミット" v-text="(build.sha ?? '').slice(0, 7) || '—'" />
-              <td data-label="日時" v-text="build.created_at ?? '—'" />
-              <td data-label="サイズ" v-text="formatSize(build.size_in_bytes)" />
-              <td data-label="操作">
-                <button
-                  class="button small"
-                  :disabled="!build.installable || !tokenConfigured || devApplying !== null"
-                  @click="applyDevBuild(build)"
-                >
-                  {{ build.installable ? 'この版に更新' : '対象なし' }}
-                </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
   </section>
 </template>
 
