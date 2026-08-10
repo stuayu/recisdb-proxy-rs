@@ -1400,3 +1400,19 @@ textarea:focus-visible,
     min-height: 320px;
   }
 }
+
+/* フォーム項目の補足説明。設定の意味が名前だけでは伝わらないもの
+   (ストリーム形式、B25の無効化など) に添える。 */
+.hint {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+/* 既定から外れていることだけ示せばよい補助バッジ。主バッジより弱く見せる。 */
+.badge.muted {
+  border-color: var(--muted);
+  color: var(--muted);
+  margin-left: 6px;
+}
