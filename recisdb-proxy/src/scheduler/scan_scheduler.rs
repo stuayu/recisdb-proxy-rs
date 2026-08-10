@@ -902,10 +902,34 @@ fn analyze_ts_stream(
     let elapsed = start_time.elapsed();
     let result = analyzer.into_result();
 
+    // The effective rate is the fastest way to tell "we cannot parse this" from
+    // "nothing is arriving". A tuned Japanese channel runs at ~15-33 Mbps; a
+    // reading in the kbps means the tuner is not delivering and no amount of
+    // parsing or format conversion will help.
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let kbps = (total_bytes_read as f64) * 8.0 / 1000.0 / elapsed_secs;
     info!(
-        "analyze_ts_stream: Completed in {:?}, read {} bytes in {} reads ({} attempts), {} packets processed",
-        elapsed, total_bytes_read, reads, attempts, result.packets_processed
+        "analyze_ts_stream: Completed in {:?}, read {} bytes in {} reads ({} attempts, {:.0}% with data), {:.0} kbps, {} packets processed",
+        elapsed,
+        total_bytes_read,
+        reads,
+        attempts,
+        if attempts > 0 { reads as f64 / attempts as f64 * 100.0 } else { 0.0 },
+        kbps,
+        result.packets_processed
     );
+
+    // 1 Mbps is far below any real broadcast channel but well above "exactly
+    // zero", which the no-data path above already catches.
+    if total_bytes_read > 0 && kbps < 1000.0 {
+        warn!(
+            "analyze_ts_stream: only {:.0} kbps arrived — a tuned channel should deliver \
+             roughly 15000-33000 kbps. The tuner is almost certainly not locked/streaming; \
+             check the channel definitions and that nothing else holds the device \
+             (this is upstream of any TS/MMT-TLV parsing problem)",
+            kbps
+        );
+    }
     info!(
         "analyze_ts_stream: PAT:{} NIT:{} SDT:{} complete:{}",
         result.pat.is_some(), result.nit.is_some(), result.sdt.is_some(), result.complete
