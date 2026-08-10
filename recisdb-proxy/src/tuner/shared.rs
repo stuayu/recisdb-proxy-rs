@@ -268,6 +268,16 @@ pub struct ReaderStartupConfig {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    /// Whether to run the stream through libaribb25.
+    ///
+    /// `false` for sources that arrive already descrambled. 4K is the case
+    /// that forced this: a MMT/TLV→TS converter descrambles ACAS itself but
+    /// leaves the CA descriptor in the PMT advertising `CA_system_id` 0x0005 —
+    /// the very id our B-CAS shim reports — so libaribb25 latches the declared
+    /// ECM PID and waits for keys that never come. With `strip: true` that is
+    /// one card outage away from deleting the video instead of merely wasting
+    /// work.
+    pub b25_enabled: bool,
 }
 
 impl From<&TunerPoolConfig> for ReaderStartupConfig {
@@ -277,6 +287,9 @@ impl From<&TunerPoolConfig> for ReaderStartupConfig {
             set_channel_retry_timeout_ms: cfg.set_channel_retry_timeout_ms,
             signal_poll_interval_ms: cfg.signal_poll_interval_ms,
             signal_wait_timeout_ms: cfg.signal_wait_timeout_ms,
+            // Callers that know the source is pre-descrambled turn this off;
+            // the pool config alone cannot tell.
+            b25_enabled: true,
         }
     }
 }
@@ -879,7 +892,15 @@ impl SharedTuner {
             enable_working_key: false,
         };
 
-        let mut b25 = init_b25_with_deadline(b25_opt);
+        let mut b25 = if startup_config.b25_enabled {
+            init_b25_with_deadline(b25_opt)
+        } else {
+            info!(
+                "[SharedTuner] B25 disabled for {:?} (source is already descrambled)",
+                shared.key
+            );
+            None
+        };
         // 判定中に起動した場合の作り直しは1回だけ。毎チャンク試すと、
         // カードが遅い環境で読み取りループが止まり続ける。
         let mut b25_init_retried = false;
@@ -1068,7 +1089,11 @@ impl SharedTuner {
                     // 確定したら、ここで一度だけデコーダを作る。これをやらないと、
                     // 判定中に始まったリーダーは以後ずっとスクランブルされたままの
                     // TSを流し続ける (視聴者には「映像が出ない」としか見えない)。
-                    if b25.is_none() && !b25_init_retried && b25_known_available() {
+                    if startup_config.b25_enabled
+                        && b25.is_none()
+                        && !b25_init_retried
+                        && b25_known_available()
+                    {
                         b25_init_retried = true;
                         b25 = init_b25_with_deadline(DecoderOptions {
                             strip: true,
@@ -1742,6 +1767,7 @@ fn test_startup_config() -> ReaderStartupConfig {
         set_channel_retry_timeout_ms: 50,
         signal_poll_interval_ms: 5,
         signal_wait_timeout_ms: 50,
+        b25_enabled: true,
     }
 }
 
@@ -2048,6 +2074,7 @@ mod tests {
             set_channel_retry_timeout_ms: 10_000,
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
+            b25_enabled: true,
         };
         assert_eq!(
             timing::reader_ready_timeout(config.set_channel_retry_timeout_ms),

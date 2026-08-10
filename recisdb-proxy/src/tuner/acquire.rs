@@ -53,6 +53,25 @@ use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason
 use crate::tuner::shared::{ReaderStartupConfig, StopReason};
 use crate::tuner::{CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle};
 
+/// Whether libaribb25 should run for a source, given the driver's manual
+/// override and the band the channel was scanned as.
+///
+/// 4K is switched off automatically: a MMT/TLV→TS converter has already
+/// descrambled (ACAS) by the time we see the stream, yet the PMT still
+/// advertises a CA descriptor with `CA_system_id` 0x0005 — the same id our
+/// B-CAS shim reports — so libaribb25 latches the declared ECM PID and waits
+/// for keys that never arrive.
+///
+/// An unscanned channel has no band yet, so it stays on: leaving B25 enabled
+/// on a source that did not need it wastes a little work, while disabling it
+/// on one that did need it is a black screen.
+fn b25_enabled_for(driver_disables_b25: bool, band_type: Option<i64>) -> bool {
+    if driver_disables_b25 {
+        return false;
+    }
+    band_type != Some(recisdb_protocol::BandType::FourK as i64)
+}
+
 /// A caller's request to have some physical channel tuned in and its
 /// `SharedTuner` handed back, expressed candidate-first the same way
 /// [`policy::TuneRequest`] is (see that type's doc comment) plus whatever
@@ -519,10 +538,21 @@ pub(crate) async fn acquire(
                 };
 
                 let pool_config = pool.config().await;
-                let startup_config = ReaderStartupConfig::from(&pool_config);
+                let mut startup_config = ReaderStartupConfig::from(&pool_config);
                 let (space, channel) = match &key.channel {
                     ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
                     ChannelKeySpec::Simple(c) => (0, *c as u32),
+                };
+
+                // Decided here rather than at each call site: `acquire` is the
+                // single choke point every tuning path goes through, and it is
+                // the only one that already holds the database handle.
+                startup_config.b25_enabled = {
+                    let db = database.lock().await;
+                    b25_enabled_for(
+                        db.driver_disables_b25(&key.tuner_path),
+                        db.band_type_for_bon_channel(&key.tuner_path, space, channel),
+                    )
                 };
 
                 if let Err(e) = tuner
@@ -573,12 +603,36 @@ mod tests {
     use crate::database::{Database, NewBonDriver};
     use crate::tuner::ts_source::FakeTsSource;
 
+    #[test]
+    fn b25_is_switched_off_for_four_k_and_by_manual_override() {
+        use recisdb_protocol::BandType;
+
+        // Ordinary bands keep descrambling.
+        assert!(b25_enabled_for(false, Some(BandType::Terrestrial as i64)));
+        assert!(b25_enabled_for(false, Some(BandType::BS as i64)));
+        assert!(b25_enabled_for(false, Some(BandType::CS as i64)));
+
+        // 4K arrives already descrambled; running B25 over it makes
+        // libaribb25 chase an ECM PID that never delivers.
+        assert!(!b25_enabled_for(false, Some(BandType::FourK as i64)));
+
+        // Manual override wins for pre-descrambled sources that are not 4K,
+        // where the stream gives nothing away.
+        assert!(!b25_enabled_for(true, Some(BandType::BS as i64)));
+        assert!(!b25_enabled_for(true, None));
+
+        // Not scanned yet: stay on. Descrambling needlessly is cheap;
+        // not descrambling when we should is a black screen.
+        assert!(b25_enabled_for(false, None));
+    }
+
     fn fast_startup_config() -> ReaderStartupConfig {
         ReaderStartupConfig {
             set_channel_retry_interval_ms: 5,
             set_channel_retry_timeout_ms: 50,
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
+            b25_enabled: true,
         }
     }
 

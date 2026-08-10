@@ -178,7 +178,74 @@ impl Database {
         ),
         ("017_card_reader_name", Database::migration_017_card_reader_name),
         ("018_ts_queue_duration_columns", Database::migration_018_ts_queue_duration_columns),
+        ("019_bon_driver_disable_b25", Database::migration_019_bon_driver_disable_b25),
     ];
+
+    /// Migration 019: per-driver "this source is already descrambled" flag.
+    ///
+    /// A BonDriver that hands back an already-descrambled stream must not be
+    /// run through libaribb25. The case that forced this is 4K: a converter
+    /// such as `BonDriver_dantto4k.dll` descrambles ACAS itself and remuxes
+    /// MMT/TLV to TS, but leaves the CA descriptor in the PMT — and it
+    /// advertises `CA_system_id` 0x0005, the exact id our B-CAS shim reports
+    /// (`b25-sys/src/bindings/ffi.rs`), so libaribb25 latches onto the
+    /// declared ECM PID even though no ECM packets ever arrive.
+    ///
+    /// `0` = decide automatically (4K is switched off by band), `1` = never
+    /// run B25 on this driver. The manual setting exists for descrambled
+    /// sources that are not 4K, where nothing in the stream gives the band
+    /// away.
+    fn migration_019_bon_driver_disable_b25(&self) -> Result<()> {
+        self.add_column_if_not_exists("bon_drivers", "disable_b25", "INTEGER DEFAULT 0")
+    }
+
+    /// Whether this driver is configured to never run B25.
+    ///
+    /// Unknown drivers and read errors answer `false`: refusing to descramble
+    /// when we should have is a blank screen, while descrambling when we did
+    /// not need to is (with the ECM PID dead) just wasted work.
+    pub fn driver_disables_b25(&self, dll_path: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(disable_b25, 0) FROM bon_drivers WHERE dll_path = ?1",
+                rusqlite::params![dll_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
+    /// Band of the channel a driver's (space, channel) pair tunes, as recorded
+    /// by the last scan. `None` when it has not been scanned yet.
+    pub fn band_type_for_bon_channel(
+        &self,
+        dll_path: &str,
+        space: u32,
+        channel: u32,
+    ) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT c.band_type
+                 FROM channels c
+                 JOIN bon_drivers d ON d.id = c.bon_driver_id
+                 WHERE d.dll_path = ?1 AND c.bon_space = ?2 AND c.bon_channel = ?3
+                   AND c.band_type IS NOT NULL
+                 LIMIT 1",
+                rusqlite::params![dll_path, space, channel],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+    }
+
+    /// Set the per-driver B25 override.
+    pub fn set_driver_disable_b25(&self, dll_path: &str, disable: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bon_drivers SET disable_b25 = ?2, updated_at = strftime('%s','now')
+             WHERE dll_path = ?1",
+            rusqlite::params![dll_path, if disable { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
 
     /// Migration 018: per-class TS write queue durations
     /// (STREAMING_DESIGN.md §3.2).
@@ -1184,6 +1251,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 8);
+    }
+
+    /// Migration 019 must be idempotent (the ledger replays from
+    /// user_version=0 on pre-ledger databases) and default to "decide
+    /// automatically".
+    #[test]
+    fn migration_019_adds_disable_b25_idempotently() {
+        let db = Database::open_in_memory().unwrap();
+        db.migration_019_bon_driver_disable_b25().unwrap();
+        db.migration_019_bon_driver_disable_b25().unwrap();
+
+        let path = "BonDriver_dantto4k.dll";
+        db.get_or_create_bon_driver(path).unwrap();
+        assert!(!db.driver_disables_b25(path), "default is automatic");
+
+        db.set_driver_disable_b25(path, true).unwrap();
+        assert!(db.driver_disables_b25(path));
+        db.set_driver_disable_b25(path, false).unwrap();
+        assert!(!db.driver_disables_b25(path));
+    }
+
+    /// An unknown driver must not be reported as "B25 disabled": failing to
+    /// descramble is a black screen, while descrambling needlessly is cheap.
+    #[test]
+    fn unknown_driver_does_not_disable_b25() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(!db.driver_disables_b25("BonDriver_NotRegistered.dll"));
+    }
+
+    /// The band lookup is what switches B25 off for 4K automatically, so it
+    /// has to find the row by the driver's own (space, channel) pair.
+    #[test]
+    fn band_lookup_finds_the_scanned_band_for_a_bon_channel() {
+        let db = Database::open_in_memory().unwrap();
+        let path = "BonDriver_dantto4k.dll";
+        let driver_id = db.get_or_create_bon_driver(path).unwrap();
+
+        // Real capture: BS朝日4K.
+        db.connection()
+            .execute(
+                "INSERT INTO channels
+                   (bon_driver_id, nid, sid, tsid, bon_space, bon_channel, band_type)
+                 VALUES (?1, 0x000B, 0x97, 0xB070, 3, 0, ?2)",
+                rusqlite::params![driver_id, recisdb_protocol::BandType::FourK as i64],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.band_type_for_bon_channel(path, 3, 0),
+            Some(recisdb_protocol::BandType::FourK as i64)
+        );
+        // Not scanned yet.
+        assert_eq!(db.band_type_for_bon_channel(path, 9, 9), None);
+        assert_eq!(db.band_type_for_bon_channel("BonDriver_Other.dll", 3, 0), None);
     }
 
     /// Migration 018 must be idempotent (the whole ledger replays from
