@@ -28,26 +28,46 @@ flowchart LR
 
 変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI。
 
-### パイプモード (`- -`) は使えない
+### 壊れているのは「標準入力からの入力」だけ
 
-**実機で確認済み**: 標準入出力を使う形は、コマンドラインで直接叩いても動かない。
+**実機で確認済み**。`-` の扱い全般ではなく、入力側だけが機能しない。
 
-```powershell
-type BS4K.mmts | .\dantto4k.exe --no-progress --no-stats - - > out.ts   # out.ts は空のまま
-.\dantto4k.exe BS4K.mmts out.ts                                          # こちらは動く
-```
+| 呼び方 | 結果 |
+|---|---|
+| `dantto4k in.mmts out.ts` | 動く |
+| `dantto4k in.mmts -` (出力が標準出力) | **動く** |
+| `type in.mmts \| dantto4k - -` (入力が標準入力) | **動かない**。出力は空のまま |
 
 proxy 経由でも同じ挙動になる (プロセスは生きたまま、OS のパイプバッファぶん以外
 何も読まない)。Rust 側の問題ではない — 送信スレッドはブロックされているだけで、
 子プロセスが死んでいれば別のエラーになる。
+
+入力を「ファイルとして開けるもの」にすれば通る、というのが現時点の理解。
+ただし変換器が入力にシーク / サイズ取得を要求している可能性は残っている
+(ファイル入力時の進捗表示が総サイズを知っていた)。名前付きパイプが使えるかは
+これ次第で、未検証。
 
 そのため**チャンネルスキャンはファイル経由で変換する**。生 MMT/TLV を一時ファイル
 に数秒ぶん貯めて `dantto4k in.mmts out.ts` で変換し、出てきた TS を解析器に渡す。
 バッチ化による遅延はスキャンには影響しない (必要なのは SI だけ)。
 
 **配信 (視聴・録画) は未対応。** 常時変換が要るため、ファイル経由では成立しない。
-名前付きパイプが候補だが、変換器が入力にシーク/サイズ取得を要求している場合は
-同じ結果になるため、未検証。
+
+出力側の `-` が使えることは分かっているので、残る課題は入力を止めずに渡す方法
+だけ。名前付きパイプ (`\\.\pipe\...` を入力パスとして渡す) が候補。次の手順で
+判定できる:
+
+```powershell
+$pipe = New-Object System.IO.Pipes.NamedPipeServerStream("dantto4ktest", [System.IO.Pipes.PipeDirection]::Out)
+Start-Process -NoNewWindow .\dantto4k.exe -ArgumentList '--no-progress','--no-stats','\\.\pipe\dantto4ktest','out3.ts'
+$pipe.WaitForConnection()
+$fs = [System.IO.File]::OpenRead("BS4K.mmts")
+$fs.CopyTo($pipe)
+$pipe.Dispose(); $fs.Dispose()
+```
+
+`out3.ts` が育てば名前付きパイプで配信まで通せる。育たなければ入力にシークが
+必要ということなので、別の方法を考える必要がある。
 
 変換は **broadcast の手前** に置く。購読者ごとに変換するのは無駄だし、
 TS解析・EPG/ロゴ収集も TS しか解さないため。
