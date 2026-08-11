@@ -4,6 +4,7 @@ import { api, type JsonRecord } from '../api'
 import { useColumnVisibility, type ColumnDef } from '../columns'
 import ColumnPicker from './ColumnPicker.vue'
 import MetricSparkline from './MetricSparkline.vue'
+import { formatPid } from '../pid'
 
 const lossPidColumns: ColumnDef[] = [
   { key: 'pid', label: 'PID' },
@@ -158,7 +159,8 @@ onUnmounted(() => {
               <td
                 v-if="lossPidIsVisible('pid')"
                 data-label="PID"
-                v-text="String(pidValue(pid, 'pid', 0) ?? '—')"
+                class="pid-cell"
+                v-text="formatPid(pidValue(pid, 'pid', 0))"
               />
               <td
                 v-if="lossPidIsVisible('packets')"
@@ -179,3 +181,11 @@ onUnmounted(() => {
     <p v-if="error" class="notice error" role="alert" v-text="error" />
   </section>
 </template>
+
+<style scoped>
+/* PID 名は長いので、狭幅で横スクロールを出さないよう折り返しを許す。 */
+.data-table td.pid-cell {
+  white-space: normal;
+  min-width: 12ch;
+}
+</style>
