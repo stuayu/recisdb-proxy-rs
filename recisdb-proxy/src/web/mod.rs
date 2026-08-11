@@ -164,9 +164,12 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
 /// HTTP access-log middleware, layered over the whole router in
 /// [`build_app`].
 ///
-/// Emits exactly one `INFO` line per request *after* the handler produced a
+/// Emits exactly one line per request *after* the handler produced a
 /// response: remote address, method, path (including the query string),
-/// status code, and elapsed time in milliseconds.
+/// status code, and elapsed time in milliseconds. `INFO`, except for
+/// successful dashboard polling GETs ([`is_dashboard_poll`]) which drop to
+/// `DEBUG` — those repeat every few seconds per open browser tab and
+/// otherwise dominate the log.
 ///
 /// Notes:
 /// - The remote address comes from [`ConnectInfo`], which is only present
@@ -201,16 +204,39 @@ async fn access_log(request: Request, next: Next) -> Response {
 
     let response = next.run(request).await;
 
-    log::info!(
+    let status = response.status();
+    // ダッシュボードのポーリングは1画面あたり数秒に1回来るので、成功時まで
+    // INFO で残すと1日2万行を超える(本番ログ2026-08-10: /api/stats 11529件 +
+    // /api/clients 10741件)。失敗したときは原因追跡に要るので INFO のまま。
+    let level = if status.is_success() && is_dashboard_poll(&method, &path_and_query) {
+        log::Level::Debug
+    } else {
+        log::Level::Info
+    };
+    log::log!(
         target: ACCESS_LOG_TARGET,
+        level,
         "{} \"{} {}\" {} {}ms",
         remote.as_deref().unwrap_or("-"),
         method,
         path_and_query,
-        response.status().as_u16(),
+        status.as_u16(),
         start.elapsed().as_millis(),
     );
     response
+}
+
+/// ダッシュボードが定期ポーリングするだけのエンドポイントか。
+/// ここに挙げたものは成功時 DEBUG に落とす([`access_log`])。
+fn is_dashboard_poll(method: &axum::http::Method, path_and_query: &str) -> bool {
+    if method != axum::http::Method::GET {
+        return false;
+    }
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    matches!(
+        path,
+        "/api/stats" | "/api/clients" | "/api/tuners" | "/api/version" | "/api/service/status"
+    )
 }
 
 /// Build the full application router bound to `web_state`.

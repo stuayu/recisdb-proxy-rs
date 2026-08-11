@@ -58,7 +58,7 @@ use crate::server::session_space_cache::{
 use crate::server::session_driver_selection::select_group_driver_for_channel;
 use crate::server::session_capacity::{cleanup_unused_tuner_after_switch, driver_max_instances};
 use crate::server::session_channel_candidates::collect_group_channel_candidates;
-use crate::tuner::acquire::{acquire, AcquireRequest};
+use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::server::session_tuner_handoff::handoff_current_tuner;
 
 
@@ -1461,7 +1461,17 @@ impl Session {
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
             Ok(outcome) => outcome,
             Err(e) => {
-                error!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                // `OpenCooldown` fires at the same cadence as the client's
+                // own reconnect loop (up to ~13/s during the 2026-08 flood
+                // that motivated tuner::open_backoff) — logging every one at
+                // ERROR here would just move the log flood from acquire.rs
+                // to session.rs. acquire.rs already logs the real cause once
+                // per minute per driver; this is only a symptom of that.
+                if matches!(e, AcquireError::OpenCooldown { .. }) {
+                    debug!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                } else {
+                    error!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                }
                 return self.fail_set_channel(&old_tuner_key).await;
             }
         };
@@ -2019,7 +2029,15 @@ impl Session {
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
             Ok(outcome) => outcome,
             Err(e) => {
-                error!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
+                // See the matching comment in SetChannel above: OpenCooldown
+                // is a symptom of a reconnect loop, not a new fact worth an
+                // ERROR line here — acquire.rs already logged the underlying
+                // failure, rate-limited, once per minute per driver.
+                if matches!(e, AcquireError::OpenCooldown { .. }) {
+                    debug!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
+                } else {
+                    error!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
+                }
                 return self.fail_set_channel_space(&old_tuner_key).await;
             }
         };
@@ -2696,7 +2714,11 @@ impl Session {
         self.interval_packets_dropped += delta.packets_dropped;
 
         if self.last_ts_log.elapsed().as_secs_f32() >= 1.0 {
-            info!(
+            // 視聴中のセッション1本につき毎秒1行。同じ数字はダッシュボードの
+            // クライアント一覧(直下でsession registryへ反映している)から常に
+            // 見えるので、ログは DEBUG で十分。INFO のままだと視聴が続く限り
+            // 積み上がる(本番ログ2026-08-10: 79358行/日)。
+            debug!(
                 "[Session {}] TsData sending: msgs={} bytes={}",
                 self.id, self.ts_msgs_sent, self.ts_bytes_sent
             );

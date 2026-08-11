@@ -21,6 +21,24 @@ use crate::tuner::timing;
 use crate::tuner::ts_source::TsSource;
 use crate::tuner::warm::WarmTunerHandle;
 
+/// 空振り(`wait_ts_stream` が false / `get_ts_stream` が WouldBlock)が
+/// 何回続いたらログを出すか。100ms ポーリングなので 50 回 ≒ 5 秒間無データ。
+const EMPTY_STREAK_LOG_THRESHOLD: u64 = 50;
+
+/// 空振り連続回数 `streak` でログを出すべきか。
+///
+/// 正常に流れている間も「1チャンク届く → 1回空振り」は普通に起きるので、
+/// 連続回数がしきい値に達するまでは何も出さない。達したあとは
+/// `EMPTY_STREAK_LOG_THRESHOLD` 回ごと(= 5秒ごと)に1行だけ出す。
+///
+/// 旧実装は `streak % 50 == 1` で、`streak` はデータが1バイトでも届くと 1 に
+/// 戻るため、通常のストリーミング中ずっと条件が成立して**全ての空振りが
+/// ログに出ていた**(本番ログ2026-08-10: このログだけで68万行/日、
+/// うち99.4%が "(1 times)")。間引きの条件としては逆になっていた。
+fn should_log_empty_streak(streak: u64) -> bool {
+    streak >= EMPTY_STREAK_LOG_THRESHOLD && streak % EMPTY_STREAK_LOG_THRESHOLD == 0
+}
+
 /// Lifecycle state of a [`SharedTuner`]'s background reader
 /// (docs/TUNER_PIPELINE_REDESIGN.md §4 P1).
 ///
@@ -1043,7 +1061,7 @@ impl SharedTuner {
             let wait_result = tuner.wait_ts_stream(timing::WAIT_TS_STREAM_POLL_MS as u32);
             if !wait_result {
                 consecutive_empty = consecutive_empty.saturating_add(1);
-                if consecutive_empty % 50 == 1 {
+                if should_log_empty_streak(consecutive_empty) {
                     info!("[SharedTuner] wait_ts_stream returned false ({} times), total_bytes={}, elapsed={}ms",
                           consecutive_empty, total_bytes_read, reader_start_time.elapsed().as_millis());
                 }
@@ -1271,7 +1289,7 @@ impl SharedTuner {
                 Ok(Err(e)) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         consecutive_empty = consecutive_empty.saturating_add(1);
-                        if consecutive_empty % 50 == 1 && !reader_first_read {
+                        if should_log_empty_streak(consecutive_empty) && !reader_first_read {
                             info!("[SharedTuner] get_ts_stream WouldBlock ({} times), total_bytes={}", consecutive_empty, total_bytes_read);
                         }
                         let max_attempts = if reader_first_read { 40000 } else { 1000 };
@@ -1841,6 +1859,29 @@ fn test_startup_config() -> ReaderStartupConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 通常のストリーミング(空振りが単発で終わる)では1行も出さない。
+    /// 旧実装(`streak % 50 == 1`)はここで毎回 true を返していた。
+    #[test]
+    fn single_empty_polls_between_chunks_are_never_logged() {
+        for _ in 0..10_000 {
+            assert!(!should_log_empty_streak(1));
+        }
+        assert!(!should_log_empty_streak(2));
+        assert!(!should_log_empty_streak(EMPTY_STREAK_LOG_THRESHOLD - 1));
+    }
+
+    /// 本当に無データが続いたときだけ、しきい値ごとに1行出す。
+    #[test]
+    fn sustained_starvation_logs_once_per_threshold() {
+        assert!(should_log_empty_streak(EMPTY_STREAK_LOG_THRESHOLD));
+        assert!(should_log_empty_streak(EMPTY_STREAK_LOG_THRESHOLD * 2));
+        assert!(!should_log_empty_streak(EMPTY_STREAK_LOG_THRESHOLD + 1));
+
+        // 5秒相当(50回)無データが1分続いても12行まで。
+        let logged = (1..=600).filter(|n| should_log_empty_streak(*n)).count();
+        assert_eq!(logged, 12);
+    }
 
     #[test]
     fn test_subscriber_count() {
