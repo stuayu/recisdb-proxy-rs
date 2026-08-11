@@ -362,6 +362,20 @@ async fn map_acquire_error(
             let running = count_running_instances_on_driver(tuner_pool, &resolved.dll_path, Some(&resolved.channel_key)).await;
             ChannelResolveError::Busy { id: resolved.channel.id, running, max: resolved.max_instances }
         }
+        // Same treatment as `ReaderStart`: the DLL open is what actually
+        // failed here too, just refused pre-emptively instead of attempted
+        // again. `ConnectionRefused` communicates "the resource is not
+        // currently reachable" to HTTP/Mirakurun callers the same way an
+        // outright open failure would.
+        AcquireError::OpenCooldown { tuner_path, consecutive, retry_in } => {
+            ChannelResolveError::ReaderStart(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!(
+                    "driver {tuner_path} is in an open-failure cooldown for another {}ms after {consecutive} consecutive failure(s)",
+                    retry_in.as_millis()
+                ),
+            ))
+        }
     }
 }
 

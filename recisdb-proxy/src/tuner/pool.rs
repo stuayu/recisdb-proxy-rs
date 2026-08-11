@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::sync::oneshot;
 
 use crate::tuner::channel_key::ChannelKey;
+use crate::tuner::open_backoff::OpenFailureBackoff;
 use crate::tuner::shared::SharedTuner;
 
 /// Priority levels for tuner requests.
@@ -260,6 +261,10 @@ pub struct TunerPool {
     /// because [`ScanReservation`]'s `Drop` has to clear it, and `Drop`
     /// cannot await.
     scanning: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Per-DLL consecutive-open-failure cooldown/log-throttle (see
+    /// [`crate::tuner::open_backoff`] for the production incident this
+    /// exists to prevent).
+    open_backoff: Arc<OpenFailureBackoff>,
 }
 
 struct IdleHandle {
@@ -283,7 +288,16 @@ impl TunerPool {
             driver_slots: DriverSlots::new(),
             channel_locks: Mutex::new(HashMap::new()),
             scanning: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            open_backoff: Arc::new(OpenFailureBackoff::new()),
         }
+    }
+
+    /// Per-DLL open-failure cooldown/log-throttle tracker (see
+    /// [`crate::tuner::open_backoff`]). Shared (`Arc`) so
+    /// `crate::tuner::acquire::acquire` can hold a clone across `.await`
+    /// points without borrowing the pool.
+    pub(crate) fn open_backoff(&self) -> &Arc<OpenFailureBackoff> {
+        &self.open_backoff
     }
 
     /// Try to reserve one of `dll_path`'s `max_instances` slots.

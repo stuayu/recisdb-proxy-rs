@@ -989,3 +989,64 @@ P1b でスロットが permit 制になったため、症状は「そのドラ�
   遅延、EALREADY、GetTsStream の切り詰め) は実機確認が必要。
 - P2 は 3 経路の挙動差を意図的に潰すため、既存クライアントの体感が変わる箇所が
   ある (特に排他選局時の退避対象)。P0 で現状挙動をテストに固定してから変更する。
+
+## 7. `OpenTuner` 連続失敗のバックオフとログ抑制 (2026-08-11)
+
+### 事象 (本番ログ実測)
+
+2026-08-06〜07 の本番ログで `OpenTuner failed - tuner may be in use, not
+present, or hardware error` が 20 時間にわたり毎分 2,000〜4,300 回発生し、
+1 日で 467,039 行 (131MB) の ERROR ログになった。セッション ID が 80ms 間隔で
+連番 (669→116671、11.6 万セッション/日) になっており、クライアントが
+「接続 → 選局失敗 → 即再接続」を無限に繰り返していたと分かる。サーバ側に
+抑制が一切なかったため、`acquire` は毎秒 13 回ほど同じ DLL の `OpenTuner` を
+叩き続けていた。
+
+### 対応
+
+`recisdb-proxy/src/tuner/open_backoff.rs` に `OpenFailureBackoff` を追加し、
+DLL パス (`tuner_path`) ごとに連続オープン失敗を数えて次の 2 つを行う。
+
+1. **クールダウン**: 連続失敗が閾値を超えたら、`acquire` はその DLL の
+   `start_reader` を呼ばずに `AcquireError::OpenCooldown` で即座に断る。
+   クールダウン経過後は通常どおり再試行される。
+2. **ログ抑制**: `acquire` 側の失敗ログ (`warn!`) は DLL ごとに 60 秒に 1 回
+   だけ出し、抑制した件数を次のログにまとめて含める。
+
+パラメータと根拠:
+
+- `FAILURE_THRESHOLD = 3`: 単発の「一時的に使用中」(他プロセスが今開いている
+  等) は珍しくなく、遅延させたくない。3 回連続して初めて DLL/デバイス側の
+  異常とみなす。
+- クールダウン = `min(1s * 2^(連続失敗数 - 3), 30s)`: 指数バックオフ。上限
+  30 秒は、恒久的に壊れているドライバでも「完全に諦める」のではなく人間が
+  気付ける間隔で再試行され続けるようにするための妥協点。
+- ログ抑制間隔 60 秒: 本番実測 (毎分数千行) を 1 行/分まで落とせば、通常の
+  運用ログの中に埋もれない量になる。
+
+`AddrNotAvailable` (io::ErrorKind) を連続失敗としてカウントしない理由: この
+エラーは「そのドライバにその物理チャンネルが存在しない」ことを表し、DLL の
+オープン自体の健全性とは無関係。これをカウントすると、正常に動作している
+ドライバに対して存在しないチャンネルへの選局要求が何度か来ただけでクール
+ダウンに入ってしまう。
+
+`TunerPool` は `open_backoff: Arc<OpenFailureBackoff>` を持ち、
+`TunerPool::open_backoff()` で公開する。`acquire` は `start_reader` を呼ぶ
+直前にクールダウンを確認し、クールダウン中なら `start_permit` の破棄・
+`warm_to_use` の `shutdown()`・(orphanable なら) プールエントリの削除という
+既存の失敗パスと同じ後始末をしてから `OpenCooldown` を返す — ここではログを
+出さない (出すと結局同じ頻度で溢れるため)。`start_reader` が実際に失敗した
+場合のみ `record_failure` を呼び、成功時は `record_success` で完全リセット
+する。
+
+`server/session.rs` の `SetChannel`/`SetChannelSpace` は、`AcquireError` が
+`OpenCooldown` のときだけ `error!` ではなく `debug!` に落とす。クールダウン中は
+クライアントの再接続ループが毎秒十数回叩くままなので、ここを ERROR のまま
+にすると結局ログが溢れる。本当の原因 (DLL が開けない) は acquire 側が 60 秒に
+1 回まとめて `warn!` している。
+
+`server/channel_resolve.rs` (HTTP/Mirakurun 経路) では `OpenCooldown` を
+`ReaderStart` と同様 `ConnectionRefused` の `io::Error` に包んで
+`ChannelResolveError` へ変換する。
+
+チャンネル列挙順・DB スキーマへの影響はなし。

@@ -153,6 +153,12 @@ pub(crate) enum AcquireError {
     /// as `AtCapacity`/`Conflict` instead).
     #[error("tuner pool error: {0}")]
     Pool(#[from] TunerPoolError),
+    /// 直近のオープンが連続で失敗しているDLLに対する要求を、バックオフ中は
+    /// 即座に断る(`tuner::open_backoff`)。クライアントの再接続ループが
+    /// 毎秒十数回DLLを叩き続けるのを防ぐためのもので、`retry_in` 経過後は
+    /// 通常どおり再試行される。
+    #[error("driver is in an open-failure cooldown for another {}ms after {consecutive} consecutive failure(s)", retry_in.as_millis())]
+    OpenCooldown { tuner_path: String, consecutive: u32, retry_in: std::time::Duration },
 }
 
 impl From<RejectReason> for AcquireError {
@@ -565,6 +571,27 @@ pub(crate) async fn acquire(
                     startup_config.b25_enabled = false;
                 }
 
+                // Refuse to even try opening a DLL that has been failing to
+                // open repeatedly (tuner::open_backoff): otherwise a client
+                // stuck reconnect-fail-reconnect loop reaches `OpenTuner`
+                // dozens of times a second forever. Checked right before the
+                // actual open so a cooldown that expires between rounds is
+                // picked up promptly rather than only at the top of `acquire`.
+                if let Some(retry_in) = pool.open_backoff().cooldown_remaining(&key.tuner_path) {
+                    drop(start_permit);
+                    if let Some(w) = warm_to_use {
+                        w.shutdown().await;
+                    }
+                    if tuner.is_orphanable() {
+                        pool.remove(&key).await;
+                    }
+                    return Err(AcquireError::OpenCooldown {
+                        tuner_path: key.tuner_path.clone(),
+                        consecutive: pool.open_backoff().consecutive_failures(&key.tuner_path),
+                        retry_in,
+                    });
+                }
+
                 if let Err(e) = tuner
                     .start_reader(pool, key.tuner_path.clone(), space, channel, startup_config, start_permit, warm_to_use)
                     .await
@@ -572,8 +599,26 @@ pub(crate) async fn acquire(
                     if tuner.is_orphanable() {
                         pool.remove(&key).await;
                     }
+                    // `AddrNotAvailable` means "no such channel on this
+                    // driver", not "the DLL itself is unhealthy" — counting
+                    // it would cool down (and eventually silence logging
+                    // for) a driver whose open path works fine.
+                    if e.kind() != std::io::ErrorKind::AddrNotAvailable {
+                        let report = pool.open_backoff().record_failure(&key.tuner_path);
+                        if report.should_log {
+                            warn!(
+                                "[acquire] BonDriver open keeps failing for {}: {} consecutive failure(s), backing off {}ms (suppressed {} similar message(s) in the last minute): {}",
+                                key.tuner_path,
+                                report.consecutive,
+                                report.cooldown.as_millis(),
+                                report.suppressed,
+                                e
+                            );
+                        }
+                    }
                     return Err(AcquireError::ReaderStart(e));
                 }
+                pool.open_backoff().record_success(&key.tuner_path);
 
                 return Ok(AcquireOutcome {
                     tuner,
@@ -612,6 +657,7 @@ mod tests {
     use super::*;
     use crate::database::{Database, NewBonDriver};
     use crate::tuner::ts_source::FakeTsSource;
+    use std::time::Duration;
 
     #[test]
     fn b25_is_switched_off_for_four_k_and_by_manual_override() {
@@ -772,6 +818,47 @@ mod tests {
         assert!(
             pool.acquire_slot(path, 1).await.is_some(),
             "the permit taken for the failed attempt must have been released"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // acquire(): open-failure backoff (tuner::open_backoff).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn repeated_open_failures_trip_a_cooldown_that_rejects_without_touching_the_pool() {
+        let pool = Arc::new(TunerPool::new(10));
+        let path = "/nonexistent/recisdb-proxy-test-device";
+        let database = db_handle_with_driver(path, 1);
+        let key = ChannelKey::space_channel(path, 0, 5);
+
+        // Fail enough times in a row to cross FAILURE_THRESHOLD (3).
+        for _ in 0..3 {
+            let result = acquire(&pool, &database, empty_request(vec![key.clone()])).await;
+            assert!(
+                matches!(&result, Err(AcquireError::ReaderStart(_))),
+                "these first failures happen at the reader-start step, before any cooldown exists: {result:?}"
+            );
+        }
+
+        // The driver is now in cooldown; the next attempt must be rejected
+        // before ever touching `start_reader` again, and must not leave a
+        // pool entry or a held permit behind.
+        let result = acquire(&pool, &database, empty_request(vec![key.clone()])).await;
+        assert!(
+            matches!(&result, Err(AcquireError::OpenCooldown { .. })),
+            "expected OpenCooldown once the failure streak crosses the threshold: {result:?}"
+        );
+        if let Err(AcquireError::OpenCooldown { tuner_path, consecutive, retry_in }) = &result {
+            assert_eq!(tuner_path, path);
+            assert_eq!(*consecutive, 3);
+            assert!(*retry_in > Duration::ZERO && *retry_in <= Duration::from_secs(1));
+        }
+
+        assert_eq!(pool.count().await, 0, "a cooldown rejection must not leave an orphaned pool entry");
+        assert!(
+            pool.acquire_slot(path, 1).await.is_some(),
+            "the permit taken for the cooled-down attempt must have been released, not leaked"
         );
     }
 

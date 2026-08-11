@@ -21,6 +21,7 @@ pub mod quality_scorer;
 pub mod warm;
 pub mod logo_collector;
 pub mod epg_collector;
+pub(crate) mod open_backoff;
 
 pub use channel_key::ChannelKey;
 pub use encoder_pool::{EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
