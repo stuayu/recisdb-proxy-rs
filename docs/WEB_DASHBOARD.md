@@ -140,6 +140,10 @@ TVTest / EDCB 側の設定を画面の指示どおりに進められるガイド
 `after_seq` が既に破棄済みの範囲を指していた場合、レスポンスの `dropped: true` を見て
 全件再取得するのはフロントエンド側の責務(`GET /api/logs` 参照)。
 
+**ログレベル・保持日数の変更**は「ログ」タブではなく「設定」タブの「ログ出力」パネルから行う
+(`GET`/`POST /api/log-config`、後述)。かつての `recisdb-proxy.toml` の `[logging]` セクション
+は廃止され、DBの `log_config` テーブルが正となった。レベルの変更は再起動不要で即座に反映される。
+
 ## API エンドポイント
 
 ### GET /api/channels
@@ -326,7 +330,7 @@ created_at は最古、updated_at は最新をマージ)。
 
 ### GET /api/logs/files
 
-`[logging] log_dir` (既定 `logs/`) 直下のローテーション済みログファイル
+`--log-dir` (既定 `logs/`) 直下のローテーション済みログファイル
 (`recisdb-proxy.log.YYYY-MM-DD`) の一覧をファイル名の降順(新しい日付が先頭)で返す。
 
 ```json
@@ -338,6 +342,30 @@ created_at は最古、updated_at は最新をマージ)。
 指定したログファイルをダウンロードする(`Content-Disposition: attachment`)。`name` は
 `recisdb-proxy.log.` で始まり、パス区切り文字・`..` を含まない、`log_dir` 直下の
 実在するファイル名のみ許可(パストラバーサル対策、`web/api/logs.rs`)。それ以外は `400`。
+
+### GET /api/log-config
+
+現在のログレベル・保持日数(DBの `log_config` テーブル、実装: `database/mod.rs` migration
+022)を返す。`env_override` は起動時に `RUST_LOG` 環境変数が設定されていたかどうか
+(モジュール別の細かい指定はこの値では表現されない)。
+
+```json
+{ "success": true, "config": { "level": "info", "retention_days": 7, "env_override": false } }
+```
+
+### POST /api/log-config
+
+ログレベル・保持日数を変更する。両フィールドとも省略可(省略時は現状維持)。
+
+```json
+{ "level": "debug", "retention_days": 14 }
+```
+
+- `level`: `trace`/`debug`/`info`/`warn`/`error` のいずれか(大文字小文字不問)。それ以外は
+  `400`。受理されると `tracing_subscriber` の reload レイヤ経由で**即座に**反映される
+  (再起動不要)。
+- `retention_days`: `1`〜`365` の範囲。範囲外は `400`。保存後、その場でログクリーンアップを
+  1回実行する(次回起動を待たずに古いログが消える)。
 
 ### GET /api/config
 

@@ -87,7 +87,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 ## 設定・ログ
 
 - 設定: `recisdb-proxy.toml`(CWD自動検出 or `-f`)。テンプレートは `recisdb-proxy.toml.example`(セットアップウィザードにも埋め込まれる唯一の情報源。構成変更はこのファイルへ)。
-- ログ優先度: `RUST_LOG` > `--verbose` > 設定 `[logging] level` > `"info"`。
+- ログレベル・保持日数はTOML `[logging]`ではなくDB(`log_config`テーブル)管理。起動時点(DBを開く前)の初期値は `RUST_LOG` > `--verbose` > `"info"`。DBを開いた直後にDB設定を`LogLevelHandle::set_level`で適用し(reloadレイヤ経由で反映、再起動不要)、以後はWebダッシュボード「設定 > ログ出力」(`GET`/`POST /api/log-config`)から変更する。ログ出力先ディレクトリのみCLI `--log-dir`(既定 `logs`)。
 
 ## ドキュメント
 

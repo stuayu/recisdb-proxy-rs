@@ -181,7 +181,57 @@ impl Database {
         ("019_bon_driver_disable_b25", Database::migration_019_bon_driver_disable_b25),
         ("020_bon_driver_stream_format", Database::migration_020_bon_driver_stream_format),
         ("021_github_token", Database::migration_021_github_token),
+        ("022_log_config", Database::migration_022_log_config),
     ];
+
+    /// Migration 022: log level/retention, moved from the TOML `[logging]`
+    /// section into the database so the Web dashboard can change them
+    /// without a restart (level, via `logging::LogLevelHandle::set_level`)
+    /// or a redeploy (retention_days). Single-row table (`id = 1`), same
+    /// pattern as `tuner_config`/`scan_scheduler_config`.
+    fn migration_022_log_config(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS log_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                level TEXT NOT NULL DEFAULT 'info',
+                retention_days INTEGER NOT NULL DEFAULT 7
+            );
+            INSERT OR IGNORE INTO log_config (id, level, retention_days) VALUES (1, 'info', 7);",
+        )?;
+        Ok(())
+    }
+
+    /// Log level/retention configuration (`[logging]` moved from TOML to the
+    /// DB). Seeds the default row if missing, same as [`Self::get_tuner_config`].
+    pub fn get_log_config(&self) -> Result<(String, u64)> {
+        let result = self.conn.query_row(
+            "SELECT level, retention_days FROM log_config WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        );
+
+        match result {
+            Ok(config) => Ok(config),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO log_config (id, level, retention_days) VALUES (1, 'info', 7)",
+                    [],
+                )?;
+                Ok(("info".to_string(), 7))
+            }
+            Err(e) => Err(DatabaseError::Sqlite(e)),
+        }
+    }
+
+    /// Update log level/retention configuration.
+    pub fn update_log_config(&self, level: &str, retention_days: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO log_config (id, level, retention_days) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET level = ?1, retention_days = ?2",
+            rusqlite::params![level, retention_days],
+        )?;
+        Ok(())
+    }
 
     /// Migration 021: GitHub token for development-build updates.
     ///
@@ -1356,6 +1406,34 @@ mod tests {
         db.set_github_token("ghp_second").unwrap();
         assert_eq!(db.get_web_auth_token().unwrap(), Some("web-token".to_string()));
         assert_eq!(db.get_github_token().unwrap(), Some("ghp_second".to_string()));
+    }
+
+    /// `get_log_config` on a freshly-opened DB must seed and return the
+    /// documented defaults (`info` / 7 days) — same seed-on-read pattern as
+    /// `get_tuner_config`.
+    #[test]
+    fn log_config_defaults_are_seeded() {
+        let db = Database::open_in_memory().unwrap();
+        let (level, retention_days) = db.get_log_config().unwrap();
+        assert_eq!(level, "info");
+        assert_eq!(retention_days, 7);
+    }
+
+    /// A saved level/retention must round-trip exactly, and migration 022
+    /// must be idempotent (replaying it must not clobber an already-updated
+    /// row back to defaults).
+    #[test]
+    fn log_config_roundtrips_and_migration_is_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        db.update_log_config("debug", 14).unwrap();
+
+        // Re-running the migration body (as would happen on a pre-ledger DB
+        // replaying from user_version=0) must not reset the row.
+        db.migration_022_log_config().unwrap();
+
+        let (level, retention_days) = db.get_log_config().unwrap();
+        assert_eq!(level, "debug");
+        assert_eq!(retention_days, 14);
     }
 
     /// Migration 020 must be idempotent and default to TS, so registering a

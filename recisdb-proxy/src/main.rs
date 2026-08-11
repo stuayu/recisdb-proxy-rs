@@ -238,15 +238,20 @@ async fn run_server(
     let config_path_for_web = app_config::resolve_config_path(&args);
     let file_config = app_config::load_file_config(&args)?;
 
-    // Merge logging configs (command line takes precedence)
-    let (log_dir, log_retention_days, log_level) =
-        app_config::resolve_log_settings(&args, &file_config);
+    // Log output directory: CLI-only (`--log-dir`), no TOML fallback.
+    let log_dir = app_config::resolve_log_dir(&args);
 
-    // Initialize logging with file output and rotation
+    // Initialize logging with file output and rotation. The initial level is
+    // RUST_LOG > --verbose > "info"; the DB-configured level (`log_config`
+    // table) is applied right after the database opens, below. The initial
+    // cleanup pass uses `args.log_retention_days` (default 7) since the DB
+    // is not open yet — the DB's `retention_days` governs every cleanup
+    // after that.
+    //
     // Keep the returned guard alive for the whole program: dropping it stops
     // the background file-writer thread and flushes buffered log lines.
-    let (_log_guard, log_buffer) =
-        logging::init_logging(&log_dir, log_retention_days, args.verbose, log_level.as_deref())
+    let (_log_guard, log_buffer, log_level_handle) =
+        logging::init_logging(&log_dir, args.log_retention_days, args.verbose)
             .expect("Failed to initialize logging");
 
     // Use log macros which are now bridged to tracing
@@ -271,6 +276,48 @@ async fn run_server(
         }
     };
     let db = std::sync::Arc::new(tokio::sync::Mutex::new(db));
+
+    // Apply the DB-configured log level/retention (moved off TOML — see
+    // `logging.rs` module doc). This is the point where `log_config`
+    // (database) becomes the source of truth for the level: whatever
+    // `--verbose` picked at `init_logging` time was only ever a placeholder
+    // until the database was available to read. RUST_LOG is the one exception
+    // — see below.
+    {
+        let (db_level, db_retention_days) = {
+            let db_guard = db.lock().await;
+            match db_guard.get_log_config() {
+                Ok(config) => config,
+                Err(e) => {
+                    warn!("Failed to load log config from database, keeping startup level: {}", e);
+                    (log_level_handle.current(), args.log_retention_days)
+                }
+            }
+        };
+        // RUST_LOG wins at startup: it is the debugging escape hatch, and it
+        // can carry per-module directives that a single DB level cannot
+        // express — `set_level` replaces the *whole* filter, so applying the
+        // DB level here would silently throw those directives away. A later
+        // change from the dashboard still overrides it (documented in
+        // `LogLevelHandle::set_level`).
+        if log_level_handle.env_override() {
+            info!(
+                "RUST_LOG is set, so it keeps precedence over the database log level '{}' for this run. Changing the level from the Web dashboard still overrides RUST_LOG entirely.",
+                db_level
+            );
+        } else {
+            match log_level_handle.set_level(&db_level) {
+                Ok(()) => info!("Log level set from database configuration: {}", db_level),
+                Err(e) => warn!("Failed to apply database log level '{}': {}", db_level, e),
+            }
+        }
+        // Re-run the cleanup pass with the DB's retention (the one at
+        // `init_logging` time used `args.log_retention_days`, since the DB
+        // was not open yet).
+        if let Err(e) = logging::rotate_logs(&log_dir, db_retention_days) {
+            warn!("Failed to rotate logs with database retention_days: {}", e);
+        }
+    }
 
     // tsreplace `command_path` is a trust boundary (REVIEW_2026-07.md S1):
     // the server executes it directly, so it can only be set here, from the
@@ -591,6 +638,7 @@ async fn run_server(
     };
     let web_log_buffer = Arc::clone(&log_buffer);
     let web_log_dir = log_dir.clone();
+    let web_log_level_handle = Arc::clone(&log_level_handle);
     let web_epg_events_tx = epg_events_tx.clone();
     tokio::spawn(async move {
         match web::start_web_server(
@@ -604,6 +652,7 @@ async fn run_server(
             web_auth_config,
             web_log_buffer,
             web_log_dir,
+            web_log_level_handle,
             mirakurun_enabled,
             Some(listen_addr),
             config_path_for_web,

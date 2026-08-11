@@ -433,9 +433,15 @@ pub struct WebState {
     /// backing the dashboard's "ログ" tab (`web/api/logs.rs`).
     pub log_buffer: Arc<LogBuffer>,
     /// Directory holding the daily-rotated log files (`recisdb-proxy.log.*`)
-    /// — `[logging] log_dir` resolved in `main.rs`/`app_config.rs`. Used by
+    /// — `--log-dir` (`app_config::resolve_log_dir`). Used by
     /// `GET /api/logs/files` and `GET /api/logs/files/:name`.
     pub log_dir: PathBuf,
+    /// Runtime log-level control (`logging::LogLevelHandle`), backing
+    /// `GET`/`POST /api/log-config` (`web/api/logs.rs`). The level itself is
+    /// stored in the database (`log_config` table); this handle is what
+    /// actually reloads the `tracing_subscriber::EnvFilter` without a
+    /// restart.
+    pub log_level: Arc<crate::logging::LogLevelHandle>,
     /// 起動時に読み込んだ設定ファイルのパス。プレビュー自動セットアップが
     /// `[preview]` の実行ファイルパスを書き戻す先。`None` のときは書き戻せない
     /// (= 次回起動で設定が巻き戻る) ので、その旨を警告として返す。
@@ -463,6 +469,7 @@ impl WebState {
         auth: AuthConfig,
         log_buffer: Arc<LogBuffer>,
         log_dir: PathBuf,
+        log_level: Arc<crate::logging::LogLevelHandle>,
         epg_events_tx: broadcast::Sender<ProgramUpsert>,
     ) -> Self {
         Self {
@@ -477,6 +484,7 @@ impl WebState {
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,
             log_dir,
+            log_level,
             epg_events_tx,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,

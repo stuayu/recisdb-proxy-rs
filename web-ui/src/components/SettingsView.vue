@@ -7,6 +7,7 @@ const endpoints = [
   ['チューナー最適化', '/tuner-config'],
   ['BNDP外部エンコード（tsreplace）', '/tsreplace-config'],
   ['ブラウザプレビュー', '/preview-config'],
+  ['ログ出力', '/log-config'],
 ] as const
 const selected = ref<string>(endpoints[0][1])
 const config = ref<JsonRecord>({})
@@ -14,7 +15,13 @@ const message = ref('')
 const error = ref('')
 const label = computed(() => endpoints.find((item) => item[1] === selected.value)?.[0] ?? '設定')
 const entries = computed(() => Object.entries(config.value))
-const protectedKeys = new Set(['command_path', 'preprocessor_path'])
+const protectedKeys = new Set([
+  'command_path',
+  'preprocessor_path',
+  'env_override',
+  'effective_level',
+])
+const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const
 function displayName(key: string) {
   const names: Record<string, string> = {
     check_interval_secs: '確認間隔（秒）',
@@ -41,6 +48,10 @@ function displayName(key: string) {
     preprocessor_arguments: '前処理プログラム引数',
     command_path: '実行ファイル（TOMLで設定）',
     preprocessor_path: '前処理プログラム（TOMLで設定）',
+    level: 'ログレベル',
+    retention_days: 'ログ保持日数（日）',
+    effective_level: '現在適用中のレベル（変更不可）',
+    env_override: 'RUST_LOG による上書き（変更不可）',
   }
   return names[key] ?? key
 }
@@ -589,6 +600,10 @@ onMounted(() => {
           ><input v-model="config[key]" type="checkbox" :disabled="protectedKeys.has(key)" /><span
             v-text="displayName(key)"
         /></label>
+        <label v-else-if="key === 'level'" class="field"
+          ><span v-text="displayName(key)" /><select v-model="config[key]">
+            <option v-for="lvl in LOG_LEVELS" :key="lvl" :value="lvl" v-text="lvl" /></select
+        ></label>
         <label v-else class="field"
           ><span v-text="displayName(key)" /><input
             v-if="typeof value === 'number'"
@@ -603,7 +618,12 @@ onMounted(() => {
             type="text"
         /></label>
       </template>
-      <p class="muted">
+      <p v-if="selected === '/log-config'" class="muted">
+        ログレベルは保存すると即座に反映されます（再起動不要）。保持日数を超えた古いログは保存時に削除されます。出力先ディレクトリは起動オプション
+        <code>--log-dir</code> で指定します。RUST_LOG
+        が設定されている間は、そちらが起動時のレベルとして優先されます。
+      </p>
+      <p v-else class="muted">
         実行ファイルのパスは安全上の理由で画面から変更できません。recisdb-proxy.tomlで設定してください。
       </p>
       <button class="button" type="submit">保存</button>

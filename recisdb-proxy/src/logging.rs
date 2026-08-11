@@ -3,12 +3,22 @@
 //! This module provides structured logging with both console and file output.
 //! Log files are automatically rotated based on time, keeping only logs from
 //! the last N days.
+//!
+//! The log level is **not** read from the TOML config file: the `[logging]`
+//! section was removed in favor of a DB-backed setting (`log_config` table,
+//! `database/mod.rs` migration) editable from the Web dashboard ("設定 > ログ
+//! 出力"). The level effective at any moment is whatever was last applied via
+//! [`LogLevelHandle::set_level`] — the DB is the source of truth, and
+//! `main.rs` applies it once right after opening the database. This module
+//! only decides the level to use *before* the DB is available (RUST_LOG >
+//! `--verbose` > `"info"`), via a `tracing_subscriber::reload` layer that lets
+//! the level change at runtime without restarting the process.
 
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 use chrono::Local;
 use std::fs;
 
@@ -18,13 +28,100 @@ pub use buffer::{
     ACCESS_LOG_TARGET, LOG_BUFFER_CAPACITY,
 };
 
+/// Log levels accepted by [`LogLevelHandle::set_level`] and the `/api/log-config`
+/// Web endpoint. Anything else (including `"off"`, which `EnvFilter` itself
+/// would accept) is rejected — the dashboard select only offers these five.
+const VALID_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
+/// Runtime handle to the global log level, backed by a
+/// `tracing_subscriber::reload` layer so the level can change without a
+/// process restart. Held by `WebState` and used by the `/api/log-config`
+/// handlers (`web/api/logs.rs`).
+pub struct LogLevelHandle {
+    handle: reload::Handle<EnvFilter, Registry>,
+    current: Mutex<String>,
+    /// Whether `RUST_LOG` was set at startup. When true, the effective
+    /// filter is whatever `RUST_LOG` specified (a full directive string,
+    /// possibly per-module), not just `current` — surfaced to the dashboard
+    /// so it can explain why a level change might look like it "didn't
+    /// stick" for some modules.
+    env_override: bool,
+}
+
+impl LogLevelHandle {
+    /// The filter currently in effect: the level last applied via
+    /// [`Self::set_level`], or — until then, when [`Self::env_override`] is
+    /// true — the raw `RUST_LOG` directive string, which may name modules
+    /// individually and so need not be one of the five canonical levels.
+    pub fn current(&self) -> String {
+        self.current.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether `RUST_LOG` was present (and non-empty) in the environment at
+    /// startup. It takes priority as the initial filter — `main.rs` skips
+    /// applying the DB level in that case — but [`Self::set_level`] can still
+    /// override it afterward like any other reload.
+    pub fn env_override(&self) -> bool {
+        self.env_override
+    }
+
+    /// Validate, apply, and remember a new log level. Rejects anything but
+    /// `trace|debug|info|warn|error` (case-insensitive) — the dashboard
+    /// exposes only these five, so we don't need to accept arbitrary
+    /// `EnvFilter` directive syntax here.
+    pub fn set_level(&self, level: &str) -> Result<(), String> {
+        let normalized = level.trim().to_ascii_lowercase();
+        if !VALID_LEVELS.contains(&normalized.as_str()) {
+            return Err(format!(
+                "invalid log level '{level}': must be one of {}",
+                VALID_LEVELS.join(", ")
+            ));
+        }
+        let filter = EnvFilter::new(&normalized);
+        self.handle
+            .reload(filter)
+            .map_err(|e| format!("failed to reload log filter: {e}"))?;
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = normalized;
+        Ok(())
+    }
+}
+
+/// A [`LogLevelHandle`] not wired to the process-global subscriber, for unit
+/// tests that need a `WebState` (`web/mod.rs`, `web/stream.rs` test helpers)
+/// without calling [`init_logging`] (which can only run once per process —
+/// `tracing::subscriber::set_global_default` errors on a second call).
+/// `reload::Handle` itself has no dependency on a global subscriber being
+/// set, so `set_level`/`current`/`env_override` all behave normally; the
+/// resulting filter changes just never apply to any live subscriber.
+#[cfg(test)]
+pub fn test_handle() -> Arc<LogLevelHandle> {
+    let (layer, handle) = reload::Layer::new(EnvFilter::new("info"));
+    // `reload::Handle` only holds a `Weak` reference into the `Layer` it was
+    // created from (see reload.rs upstream): if the `Layer` half is dropped,
+    // every `handle.reload(...)` call fails with `SubscriberGone`. Nothing
+    // in these tests ever attaches `layer` to a subscriber, so leak it to
+    // keep the `Arc` alive for the life of the test process — acceptable
+    // since this is `#[cfg(test)]`-only.
+    Box::leak(Box::new(layer));
+    Arc::new(LogLevelHandle {
+        handle,
+        current: Mutex::new("info".to_string()),
+        env_override: false,
+    })
+}
+
 /// Initialize the logging system with both console and file output.
 ///
 /// # Arguments
 /// * `log_dir` - Directory where log files will be stored
-/// * `retention_days` - Number of days to keep log files
+/// * `retention_days` - Number of days to keep log files (used only for the
+///   startup cleanup pass here; the DB value, once loaded, is what governs
+///   later cleanups — see `logging::rotate_logs` calls in `main.rs`)
 /// * `verbose` - Whether to enable debug-level logging
-/// * `level` - Log level override from config file (e.g. "warn", "info", "error")
+///
+/// The initial level is resolved as RUST_LOG (if set) > `--verbose` (debug) >
+/// `"info"`. `main.rs` overwrites it right after opening the database with
+/// whatever `log_config` says, via the returned [`LogLevelHandle`].
 ///
 /// # Returns
 /// A tuple of:
@@ -37,12 +134,13 @@ pub use buffer::{
 /// - The shared [`LogBuffer`] handle, for the Web dashboard's "ログ" tab
 ///   (`web/api/logs.rs`). Pass it into `web::state::WebState` alongside the
 ///   other shared handles.
+/// - The shared [`LogLevelHandle`], for runtime level changes from the Web
+///   dashboard and for `main.rs` to apply the DB-configured level at startup.
 pub fn init_logging(
     log_dir: &Path,
     retention_days: u64,
     verbose: bool,
-    level: Option<&str>,
-) -> Result<(WorkerGuard, Arc<LogBuffer>), Box<dyn std::error::Error>> {
+) -> Result<(WorkerGuard, Arc<LogBuffer>, Arc<LogLevelHandle>), Box<dyn std::error::Error>> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
 
@@ -56,14 +154,24 @@ pub fn init_logging(
     let file_appender = tracing_appender::rolling::daily(log_dir, "recisdb-proxy.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    // Priority: RUST_LOG env > --verbose flag > config file level > default "info"
-    let default_level = if verbose {
-        "debug"
-    } else {
-        level.unwrap_or("info")
-    };
+    // Priority: RUST_LOG env > --verbose flag > default "info". The DB-backed
+    // level (`log_config` table) is applied afterward by `main.rs` via the
+    // returned `LogLevelHandle`, once the database is open.
+    let rust_log = std::env::var("RUST_LOG").ok().filter(|v| !v.trim().is_empty());
+    let default_level = if verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_level));
+    // `current()` reports what is actually in effect, so when RUST_LOG is set
+    // it holds that directive string verbatim (which may be per-module, e.g.
+    // `recisdb_proxy::tuner=debug,info`) rather than one of the five
+    // canonical level words. `env_override()` is what tells callers to expect
+    // that.
+    let (env_filter, reload_handle) = reload::Layer::new(env_filter);
+    let log_level_handle = Arc::new(LogLevelHandle {
+        handle: reload_handle,
+        current: Mutex::new(rust_log.clone().unwrap_or_else(|| default_level.to_string())),
+        env_override: rust_log.is_some(),
+    });
 
     // In-memory ring buffer of recent log lines, for the Web dashboard's
     // "ログ" tab (web/api/logs.rs). See logging/buffer.rs's module doc for
@@ -108,7 +216,7 @@ pub fn init_logging(
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| format!("Failed to set default subscriber: {}", e))?;
 
-    Ok((guard, log_buffer))
+    Ok((guard, log_buffer, log_level_handle))
 }
 
 /// Clean up log files older than the specified number of days.

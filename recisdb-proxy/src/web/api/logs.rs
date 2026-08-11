@@ -188,6 +188,98 @@ fn read_log_file_for_download(log_dir: &StdPath, name: &str) -> Result<Vec<u8>, 
     std::fs::read(&canonical_file).map_err(|e| ApiError::internal(format!("failed to read log file: {e}")))
 }
 
+/// `GET /api/log-config` — current log level/retention (`log_config` table,
+/// `database/mod.rs` migration 022), for the dashboard's "設定 > ログ出力"
+/// panel.
+pub async fn get_log_config(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (level, retention_days) = {
+        let db = web_state.database.lock().await;
+        db.get_log_config()?
+    };
+    Ok(Json(json!({
+        "success": true,
+        "config": {
+            "level": level,
+            "retention_days": retention_days,
+            // What the process is actually filtering on right now. Differs
+            // from `level` only while RUST_LOG is in effect (startup keeps
+            // RUST_LOG; the DB level is not applied then — see `main.rs`).
+            "effective_level": web_state.log_level.current(),
+            "env_override": web_state.log_level.env_override(),
+        }
+    })))
+}
+
+/// `POST /api/log-config` request body. Both fields optional — omitted
+/// fields keep their current value.
+#[derive(Debug, Deserialize)]
+pub struct UpdateLogConfigRequest {
+    pub level: Option<String>,
+    pub retention_days: Option<u64>,
+}
+
+const MIN_RETENTION_DAYS: u64 = 1;
+const MAX_RETENTION_DAYS: u64 = 365;
+
+/// `POST /api/log-config` — update log level (applied immediately via
+/// [`crate::logging::LogLevelHandle::set_level`], no restart needed) and/or
+/// retention (persisted; takes effect on the next cleanup pass, triggered
+/// here immediately so a shortened retention is visible right away).
+pub async fn update_log_config(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdateLogConfigRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // The DB guard is scoped: `rotate_logs` below walks the log directory on
+    // a blocking thread, and nothing else should have to wait on the database
+    // for that.
+    let db = web_state.database.lock().await;
+    let (mut level, mut retention_days) = db.get_log_config()?;
+
+    if let Some(requested) = &payload.level {
+        // Validate + apply the reload *before* touching the DB: a rejected
+        // level must not get persisted.
+        web_state
+            .log_level
+            .set_level(requested)
+            .map_err(ApiError::bad_request)?;
+        level = web_state.log_level.current();
+    }
+    if let Some(requested) = payload.retention_days {
+        if !(MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(&requested) {
+            return Err(ApiError::bad_request(format!(
+                "retention_days must be between {MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS}"
+            )));
+        }
+        retention_days = requested;
+    }
+
+    db.update_log_config(&level, retention_days)?;
+    drop(db);
+
+    // Apply the (possibly just-shortened) retention immediately, same as
+    // `main.rs` does at startup — otherwise a lowered retention_days only
+    // takes effect on the next server restart.
+    let log_dir = web_state.log_dir.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || crate::logging::rotate_logs(&log_dir, retention_days))
+        .await
+        .map_err(|e| ApiError::internal(format!("log rotation task panicked: {e}")))?
+    {
+        log::warn!("Failed to rotate logs after /api/log-config update: {e}");
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "config": {
+            "level": level,
+            "retention_days": retention_days,
+            "effective_level": web_state.log_level.current(),
+            "env_override": web_state.log_level.env_override(),
+        }
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

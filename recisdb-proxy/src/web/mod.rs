@@ -59,6 +59,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/logs", get(api::get_logs))
         .route("/logs/files", get(api::list_log_files))
         .route("/logs/files/:name", get(api::download_log_file))
+        // Log level/retention configuration (`log_config` table, DB-backed
+        // since the TOML `[logging]` section was removed).
+        .route("/log-config", get(api::get_log_config))
+        .route("/log-config", post(api::update_log_config))
         // Session/Client API
         .route("/clients", get(api::get_clients))
         .route("/stats", get(api::get_stats))
@@ -269,6 +273,7 @@ pub async fn start_web_server(
     auth: AuthConfig,
     log_buffer: Arc<LogBuffer>,
     log_dir: PathBuf,
+    log_level: Arc<crate::logging::LogLevelHandle>,
     mirakurun_enabled: bool,
     proxy_listen_addr: Option<SocketAddr>,
     config_path: Option<PathBuf>,
@@ -282,6 +287,7 @@ pub async fn start_web_server(
         auth,
         log_buffer,
         log_dir,
+        log_level,
         epg_events_tx,
     );
     web_state.proxy_listen_addr = proxy_listen_addr;
@@ -348,6 +354,7 @@ mod tests {
         let encoder_pool = Arc::new(EncoderPool::default());
         let session_registry = Arc::new(SessionRegistry::new());
         let log_buffer = crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY);
+        let log_level = crate::logging::test_handle();
         let (epg_events_tx, _epg_events_rx) = tokio::sync::broadcast::channel(16);
         Arc::new(WebState::new(
             database,
@@ -357,6 +364,7 @@ mod tests {
             auth,
             log_buffer,
             std::path::PathBuf::from("logs"),
+            log_level,
             epg_events_tx,
         ))
     }
@@ -903,5 +911,66 @@ mod tests {
         assert_eq!(entries[0]["level"], "WARN");
         assert_eq!(entries[0]["target"], "recisdb_proxy::test");
         assert_eq!(entries[0]["message"], "something happened");
+    }
+
+    /// `POST /api/log-config` with an invalid level must be rejected (400)
+    /// and must not touch the persisted DB config.
+    #[tokio::test]
+    async fn log_config_api_rejects_invalid_level() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let app = build_app(Arc::clone(&state), false);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/log-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({ "level": "verbose" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let (level, _) = {
+            let db = state.database.lock().await;
+            db.get_log_config().unwrap()
+        };
+        assert_eq!(level, "info", "rejected level must not be persisted");
+    }
+
+    /// `POST /api/log-config` with a valid level/retention must apply
+    /// immediately (readable back via `LogLevelHandle::current`) and persist
+    /// to the database.
+    #[tokio::test]
+    async fn log_config_api_accepts_valid_level_and_retention() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let app = build_app(Arc::clone(&state), false);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/log-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(
+                        Body::from(
+                            serde_json::json!({ "level": "debug", "retention_days": 14 }).to_string(),
+                        ),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert_eq!(state.log_level.current(), "debug");
+        let (level, retention_days) = {
+            let db = state.database.lock().await;
+            db.get_log_config().unwrap()
+        };
+        assert_eq!(level, "debug");
+        assert_eq!(retention_days, 14);
     }
 }

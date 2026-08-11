@@ -1185,8 +1185,9 @@ mod tests {
 
         // recisdb-proxy.toml.example に存在する全セクションを、コメントアウト
         // 済みでもよいので案内として含んでいることを確認する
-        // (main.rs の ConfigFile が持つセクション: server/database/logging/
-        // web/mirakurun/tsreplace/preview/tls)。古いテンプレートへの
+        // (main.rs の ConfigFile が持つセクション: server/database/
+        // web/mirakurun/tsreplace/preview/tls。ログ設定は [logging] TOML
+        // セクションではなくDB管理に移行済み)。古いテンプレートへの
         // 先祖返りを防ぐリグレッションテスト。
         for section in ["[web]", "[mirakurun]", "[tsreplace]", "[preview]", "[tls]"] {
             assert!(

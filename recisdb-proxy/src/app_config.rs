@@ -7,7 +7,7 @@
 //!
 //! Resolution happens in two steps because logging is not initialized until
 //! after the log directory/retention are known:
-//! 1. [`load_file_config`] + [`resolve_log_settings`] — pure, no log macros,
+//! 1. [`load_file_config`] + [`resolve_log_dir`] — pure, no log macros,
 //!    safe to call before `logging::init_logging`.
 //! 2. [`load`] — everything else (listen addrs, tuner, TLS, web/mirakurun
 //!    toggles). Uses `log`/`info!`/`error!` macros, so must be called after
@@ -28,8 +28,6 @@ pub struct ConfigFile {
     pub server: ServerSection,
     #[serde(default)]
     pub database: DatabaseSection,
-    #[serde(default)]
-    pub logging: LoggingSection,
     #[serde(default)]
     pub web: WebSection,
     #[serde(default)]
@@ -140,13 +138,6 @@ pub struct ServerSection {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-pub struct LoggingSection {
-    pub log_dir: Option<String>,
-    pub retention_days: Option<u64>,
-    pub level: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
 pub struct DatabaseSection {
     pub path: Option<String>,
 }
@@ -209,24 +200,19 @@ pub fn load_file_config(args: &Args) -> Result<ConfigFile, Box<dyn std::error::E
     }
 }
 
-/// Log directory/retention/level, resolved before `logging::init_logging` is
-/// called (so it cannot itself use the `log` macros).
-pub fn resolve_log_settings(args: &Args, file_config: &ConfigFile) -> (PathBuf, u64, Option<String>) {
-    let log_dir = if args.log_dir.to_string_lossy() != "logs" {
-        args.log_dir.clone()
-    } else {
-        PathBuf::from(file_config.logging.log_dir.as_deref().unwrap_or("logs"))
-    };
-
-    let log_retention_days = if args.log_retention_days != 7 {
-        args.log_retention_days
-    } else {
-        file_config.logging.retention_days.unwrap_or(7)
-    };
-
-    let log_level = file_config.logging.level.clone();
-
-    (log_dir, log_retention_days, log_level)
+/// Log output directory, resolved before `logging::init_logging` is called
+/// (so it cannot itself use the `log` macros).
+///
+/// Unlike the rest of `[logging]` (level, retention), this stays CLI-only —
+/// there is no TOML fallback anymore: `--log-dir` (default `"logs"`) is the
+/// only source. Log **level** and **retention** are no longer read from the
+/// TOML file at all (the `[logging]` section is gone); they live in the
+/// database's `log_config` table and are managed from the Web dashboard
+/// ("設定 > ログ出力"), applied by `main.rs` once the database is open. A
+/// stray `[logging]` section left over in an old `recisdb-proxy.toml` is
+/// harmless — serde silently ignores unknown TOML sections.
+pub fn resolve_log_dir(args: &Args) -> PathBuf {
+    args.log_dir.clone()
 }
 
 /// Everything resolved by [`load`] besides logging (which must be up before
@@ -408,28 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn log_dir_prefers_arg_over_toml_when_explicitly_set() {
+    fn log_dir_uses_the_cli_arg() {
         let mut args = default_args();
         args.log_dir = PathBuf::from("custom-logs");
-
-        let mut file_config = ConfigFile::default();
-        file_config.logging.log_dir = Some("toml-logs".to_string());
-
-        let (log_dir, _, _) = resolve_log_settings(&args, &file_config);
-        assert_eq!(log_dir, PathBuf::from("custom-logs"));
+        assert_eq!(resolve_log_dir(&args), PathBuf::from("custom-logs"));
     }
 
     #[test]
-    fn log_dir_falls_back_to_toml_then_default() {
+    fn log_dir_falls_back_to_default_without_arg() {
         let args = default_args();
-
-        let mut file_config = ConfigFile::default();
-        file_config.logging.log_dir = Some("toml-logs".to_string());
-        let (log_dir, _, _) = resolve_log_settings(&args, &file_config);
-        assert_eq!(log_dir, PathBuf::from("toml-logs"));
-
-        let file_config = ConfigFile::default();
-        let (log_dir, _, _) = resolve_log_settings(&args, &file_config);
-        assert_eq!(log_dir, PathBuf::from("logs"));
+        assert_eq!(resolve_log_dir(&args), PathBuf::from("logs"));
     }
 }
