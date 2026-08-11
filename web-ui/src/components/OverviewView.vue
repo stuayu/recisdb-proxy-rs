@@ -72,6 +72,11 @@ function resetClientColumns() {
   visibleClientKeys.value = clientColumns.map((column) => column.key)
   localStorage.removeItem(clientColumnsStorageKey)
 }
+// 生値のまま出すと 12.34567890123 のように桁が伸びるので、必ず桁数を丸める。
+function formatNumber(value: unknown, digits: number): string {
+  const num = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(num) ? num.toFixed(digits) : String(value)
+}
 function cellText(row: JsonRecord, key: string): string {
   switch (key) {
     case 'status':
@@ -79,14 +84,16 @@ function cellText(row: JsonRecord, key: string): string {
     case 'channel':
       return String(row.channel_name ?? row.channel_info ?? '—')
     case 'signal':
-      return row.signal_level == null ? '—' : `${String(row.signal_level)} dB`
+      return row.signal_level == null ? '—' : `${formatNumber(row.signal_level, 1)} dB`
     case 'packets_sent':
     case 'packets_dropped':
     case 'packets_scrambled':
     case 'packets_error':
       return String(row[key] ?? 0)
     case 'bitrate':
-      return row.current_bitrate_mbps == null ? '—' : `${String(row.current_bitrate_mbps)} Mbps`
+      return row.current_bitrate_mbps == null
+        ? '—'
+        : `${formatNumber(row.current_bitrate_mbps, 2)} Mbps`
     case 'prefilling':
       return row.prefilling ? '中' : '—'
     default: {
