@@ -32,8 +32,9 @@ use log::{debug, warn};
 use tokio::sync::broadcast;
 
 use crate::tuner::TunerSubscription;
+use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
-use crate::web::stream::StreamCleanup;
+use crate::web::stream::{StreamCleanup, TsAligner};
 
 /// How long past `programs.start_at + duration_secs` this gate keeps waiting
 /// for the target event to become present before giving up. Programs
@@ -199,13 +200,21 @@ struct GatedStreamState {
     collector: EitPfCollector,
     gate: ProgramGate,
     deadline: DateTime<Utc>,
+    /// Same single-service filter `GET /services/:id/stream` applies — see
+    /// [`crate::web::stream::service_filtered_body_stream`]. Fed on *every*
+    /// chunk, including those the gate withholds, so its PAT/PMT whitelist is
+    /// already built when the gate opens and the recording does not start
+    /// with a PSI-less lead-in.
+    filter: TsServiceFilter,
+    aligner: TsAligner,
 }
 
 /// Body stream for `GET /programs/:id/stream`: withholds every TS chunk
 /// until the target event is observed as EIT[p/f] present on `target_sid`,
-/// then passes chunks through as-is (raw multiplex, same passthrough
-/// convention as every other Mirakurun stream endpoint in this module) until
-/// a *different* event becomes present, at which point the stream ends.
+/// then passes chunks through (filtered down to `target_sid`, matching real
+/// Mirakurun's per-service stream — see
+/// [`crate::web::stream::service_filtered_body_stream`]) until a *different*
+/// event becomes present, at which point the stream ends.
 ///
 /// The chunk in which the gate transitions Waiting -> Streaming is forwarded
 /// in full, not trimmed to start exactly at the EIT boundary: TS chunks are
@@ -240,6 +249,8 @@ pub(crate) fn gated_program_stream(
         collector: EitPfCollector::new(),
         gate: ProgramGate::new(target_sid, target_event_id),
         deadline,
+        filter: TsServiceFilter::new(target_sid),
+        aligner: TsAligner::new(),
     };
 
     stream::unfold(state, |mut state| async move {
@@ -261,10 +272,22 @@ pub(crate) fn gated_program_stream(
                     // Gate observation runs unconditionally (including on
                     // chunks yielded once already Streaming) so an
                     // Streaming -> Ended transition is caught mid-programme,
-                    // not just while still Waiting.
+                    // not just while still Waiting. It reads the *unfiltered*
+                    // chunk: EIT survives filtering, but the gate decides
+                    // whether this stream exists at all and must not depend
+                    // on the filter having warmed up.
                     state.collector.process_ts_chunk(&data, &mut state.gate);
-                    if state.gate.is_streaming() {
-                        return Some((Ok(data), state));
+
+                    // Feed the filter regardless of gate state (see
+                    // `GatedStreamState::filter`).
+                    let filtered = state
+                        .aligner
+                        .push(&data)
+                        .map(|chunk| state.filter.filter(&chunk))
+                        .unwrap_or_default();
+
+                    if state.gate.is_streaming() && !filtered.is_empty() {
+                        return Some((Ok(Bytes::from(filtered)), state));
                     }
                     // Still waiting (or just transitioned to Ended on this
                     // very chunk, in which case there is nothing left to
@@ -278,6 +301,7 @@ pub(crate) fn gated_program_stream(
                     // yet (or is mid-programme on) is harmless; the next
                     // successful recv picks up wherever the live edge is.
                     debug!("[mirakurun program stream] receiver lagged, skipped {} chunks", n);
+                    state.aligner.on_gap();
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,

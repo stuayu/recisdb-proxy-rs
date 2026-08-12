@@ -41,6 +41,8 @@ use tokio::sync::broadcast;
 
 use crate::database::Database;
 use crate::server::channel_resolve::{self, ChannelResolveError};
+use crate::ts_analyzer::service_filter::TsServiceFilter;
+use crate::ts_analyzer::{SYNC_BYTE, TS_PACKET_SIZE};
 use crate::tuner::encoder_pool::{self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::state::WebState;
@@ -187,6 +189,146 @@ pub(crate) fn broadcast_to_body_stream(
                 Ok(data) => return Some((Ok(data), state)),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     debug!("[HTTP stream] receiver lagged, skipped {} chunks", n);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+
+/// Re-aligns a stream of arbitrary byte chunks into whole 188-byte TS
+/// packets.
+///
+/// [`TsServiceFilter::filter`] requires packet-aligned input, but a broadcast
+/// chunk is whatever the tuner reader happened to hand over. The BNDP path
+/// solves this with `server/session.rs`'s `ts_send_carry`; this is the same
+/// idea for the HTTP paths, shared by [`service_filtered_body_stream`] and
+/// `web/mirakurun_program_stream.rs`.
+pub(crate) struct TsAligner {
+    carry: Vec<u8>,
+}
+
+impl TsAligner {
+    /// Cap on the carry buffer before it is treated as unsynchronizable
+    /// garbage and dropped: a handful of TS packets is all that can
+    /// legitimately be waiting for its tail. Without this, a source that
+    /// never produces a sync byte would grow the buffer without bound.
+    const MAX_CARRY: usize = TS_PACKET_SIZE * 16;
+
+    pub(crate) fn new() -> Self {
+        Self { carry: Vec::new() }
+    }
+
+    /// Append `data` and return whatever whole packets are now available,
+    /// starting on a sync byte. `None` when there is not (yet) a full packet.
+    pub(crate) fn push(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        self.carry.extend_from_slice(data);
+
+        if !self.resync() {
+            return None;
+        }
+
+        let aligned_len = self.carry.len() - (self.carry.len() % TS_PACKET_SIZE);
+        if aligned_len == 0 {
+            if self.carry.len() > Self::MAX_CARRY {
+                debug!("[HTTP stream] dropping {} unsynchronized bytes", self.carry.len());
+                self.carry.clear();
+            }
+            return None;
+        }
+
+        Some(self.carry.drain(..aligned_len).collect())
+    }
+
+    /// Called when chunks were lost (`RecvError::Lagged`): whatever is held is
+    /// the head of a packet whose tail will never arrive, so the boundary has
+    /// to be found again from the next chunk.
+    pub(crate) fn on_gap(&mut self) {
+        self.carry.clear();
+    }
+
+    /// Drop leading bytes until the buffer starts on a TS sync byte. `false`
+    /// if no sync byte is present at all (the buffer is then cleared, since
+    /// none of it can start a packet).
+    fn resync(&mut self) -> bool {
+        if self.carry.first() == Some(&SYNC_BYTE) {
+            return true;
+        }
+        match self.carry.iter().position(|b| *b == SYNC_BYTE) {
+            Some(pos) => {
+                self.carry.drain(..pos);
+                true
+            }
+            None => {
+                self.carry.clear();
+                false
+            }
+        }
+    }
+}
+
+/// State for [`service_filtered_body_stream`]. Field order matters for the
+/// same reason [`StreamState`]'s does: `rx` must drop before `_cleanup`.
+struct FilteredStreamState {
+    rx: BodyReceiver,
+    filter: TsServiceFilter,
+    aligner: TsAligner,
+    _cleanup: StreamCleanup,
+}
+
+/// Like [`broadcast_to_body_stream`], but filters the multiplex down to the
+/// single service `target_sid` (rewritten PAT + that service's PMT/ES PIDs +
+/// the SI tables every client needs), using the same [`TsServiceFilter`] the
+/// BNDP session path uses.
+///
+/// This is what makes `GET /mirakurun/api/services/:id/stream` behave like
+/// real Mirakurun, whose per-service stream carries one service — measured
+/// against the reference Mirakurun on the same reception setup, the unfiltered
+/// output carried 34 distinct PIDs where Mirakurun's carried 21 (the
+/// sub-channel, one-seg and data-broadcast services riding the same
+/// multiplex). EPGStation records straight from this endpoint, so the
+/// difference is recording size and what its drop check counts.
+///
+/// Two behaviours differ from the plain passthrough, both forced by the
+/// filter's "input must be 188-byte aligned" contract:
+/// - Chunks are re-aligned through `carry` (broadcast chunk boundaries are
+///   whatever the reader handed over, exactly as `server/session.rs`'s
+///   `ts_send_carry` handles for the BNDP path).
+/// - On `Lagged` the carry buffer is dropped and re-synchronized, but the
+///   filter itself is **not** reset: its PID whitelist stays valid across a
+///   gap, and resetting would blank the stream until the next PAT/PMT pair.
+///   Sections torn by the gap fail their CRC and are simply re-collected.
+///
+/// Until the first PAT+PMT pair is parsed the filter emits only the
+/// always-pass SI PIDs, so a client may see a brief lead-in with no video —
+/// the same warm-up real Mirakurun has.
+pub(crate) fn service_filtered_body_stream(
+    rx: BodyReceiver,
+    cleanup: StreamCleanup,
+    target_sid: u16,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let state = FilteredStreamState {
+        rx,
+        filter: TsServiceFilter::new(target_sid),
+        aligner: TsAligner::new(),
+        _cleanup: cleanup,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        loop {
+            match state.rx.recv().await {
+                Ok(data) => {
+                    let Some(chunk) = state.aligner.push(&data) else { continue };
+                    let filtered = state.filter.filter(&chunk);
+                    if filtered.is_empty() {
+                        continue;
+                    }
+                    return Some((Ok(Bytes::from(filtered)), state));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
+                    state.aligner.on_gap();
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -456,6 +598,80 @@ mod tests {
     use crate::web::auth::AuthConfig;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    // ------------------------------------------------------------------
+    // TsAligner
+    // ------------------------------------------------------------------
+
+    /// `n` synthetic TS packets, each starting with the sync byte and
+    /// carrying its own index so reordering/truncation is visible.
+    fn ts_packets(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * TS_PACKET_SIZE);
+        for i in 0..n {
+            out.push(SYNC_BYTE);
+            out.extend(std::iter::repeat(i as u8).take(TS_PACKET_SIZE - 1));
+        }
+        out
+    }
+
+    #[test]
+    fn aligner_passes_whole_packets_through_unchanged() {
+        let mut aligner = TsAligner::new();
+        let data = ts_packets(3);
+        assert_eq!(aligner.push(&data), Some(data));
+    }
+
+    #[test]
+    fn aligner_holds_a_partial_packet_until_its_tail_arrives() {
+        let data = ts_packets(2);
+        let (head, tail) = data.split_at(TS_PACKET_SIZE + 50);
+
+        let mut aligner = TsAligner::new();
+        // First chunk: one whole packet plus 50 bytes of the next.
+        assert_eq!(aligner.push(head), Some(data[..TS_PACKET_SIZE].to_vec()));
+        // Second chunk completes the held packet.
+        assert_eq!(aligner.push(tail), Some(data[TS_PACKET_SIZE..].to_vec()));
+    }
+
+    #[test]
+    fn aligner_returns_nothing_until_a_full_packet_is_available() {
+        let mut aligner = TsAligner::new();
+        assert_eq!(aligner.push(&ts_packets(1)[..100]), None);
+    }
+
+    #[test]
+    fn aligner_skips_leading_garbage_to_the_first_sync_byte() {
+        let data = ts_packets(1);
+        let mut with_garbage = vec![0x00, 0x11, 0x22];
+        with_garbage.extend_from_slice(&data);
+
+        let mut aligner = TsAligner::new();
+        assert_eq!(aligner.push(&with_garbage), Some(data));
+    }
+
+    #[test]
+    fn aligner_never_grows_without_bound_on_garbage() {
+        let mut aligner = TsAligner::new();
+        for _ in 0..100 {
+            assert_eq!(aligner.push(&[0x00; 1024]), None);
+        }
+        assert!(aligner.carry.len() <= TsAligner::MAX_CARRY + 1024);
+    }
+
+    /// After a gap the held bytes are the head of a packet whose tail was
+    /// lost — keeping them would splice two halves of different packets
+    /// together and desynchronize everything downstream.
+    #[test]
+    fn aligner_drops_the_partial_packet_after_a_gap() {
+        let data = ts_packets(2);
+        let mut aligner = TsAligner::new();
+
+        assert_eq!(aligner.push(&data[..TS_PACKET_SIZE + 50]), Some(data[..TS_PACKET_SIZE].to_vec()));
+        aligner.on_gap();
+
+        let next = ts_packets(1);
+        assert_eq!(aligner.push(&next), Some(next));
+    }
 
     fn test_web_state() -> Arc<WebState> {
         let database = Arc::new(tokio::sync::Mutex::new(Database::open_in_memory().unwrap()));

@@ -27,6 +27,11 @@ use super::pmt::PmtTable;
 use super::psi::{PsiSection, SectionCollector, crc32_mpeg2};
 
 /// Well-known PIDs that are always passed through.
+///
+/// This set matches what the reference Mirakurun emits on its own
+/// per-service stream for the same multiplex (compared packet-by-packet
+/// 2026-08-12): filtering to one service must not cost a client any SI it
+/// would have had from Mirakurun.
 const ALWAYS_PASS_PIDS: &[u16] = &[
     0x0000, // PAT (rewritten)
     0x0001, // CAT
@@ -34,6 +39,13 @@ const ALWAYS_PASS_PIDS: &[u16] = &[
     0x0011, // SDT
     0x0012, // EIT
     0x0014, // TOT/TDT
+    // BIT — carries the `affiliation_id` identifying a station's network
+    // (日テレ系/TBS系/…), which no API exposes: EPGStation's stuayu fork
+    // harvests it passively from the streams it receives
+    // (`src/model/channel/BitParser.ts`), so dropping this PID would silently
+    // stop network classification from ever learning a new station. Costs
+    // about six packets per eight seconds of stream.
+    0x0024,
 ];
 
 /// TS service filter that passes only packets for a single SID.
@@ -411,6 +423,18 @@ mod tests {
         assert!(filter.allowed_pids.contains(&0x0012)); // EIT
         assert!(filter.allowed_pids.contains(&0x0014)); // TOT/TDT
         assert!(!filter.is_ready());
+    }
+
+    /// BIT is the only source of a station's network affiliation, and
+    /// EPGStation collects it from the stream — see [`ALWAYS_PASS_PIDS`].
+    #[test]
+    fn bit_is_passed_through_so_affiliations_can_be_harvested() {
+        let filter = TsServiceFilter::new(0x0400);
+        assert!(filter.allowed_pids.contains(&0x0024));
+
+        let mut filter = filter;
+        filter.reset();
+        assert!(filter.allowed_pids.contains(&0x0024), "reset must restore it too");
     }
 
     #[test]

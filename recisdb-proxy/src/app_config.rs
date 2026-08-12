@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use log::warn;
 #[cfg(feature = "tls")]
 use log::{error, info};
 
@@ -65,6 +66,22 @@ pub struct MirakurunSection {
     /// KonomiTV — send none), so it is opt-in even though `web_listen`
     /// already defaults to loopback-only.
     pub enabled: Option<bool>,
+    /// Prefecture name (e.g. `"福島"`) whose terrestrial stations are the
+    /// *local* ones, reported as Mirakurun channel type `GR`. Every other
+    /// terrestrial region is then reported as `NW1`..`NW40`
+    /// (`web/mirakurun.rs::terrestrial_type_map`), which is how EPGStation's
+    /// fork separates out-of-area stations into their own programme-guide
+    /// tabs.
+    ///
+    /// Unset (the default) keeps every terrestrial station on `GR`, matching
+    /// the behaviour from before this option existed — correct for a
+    /// single-area install, and unhelpful only when several areas are
+    /// received at once.
+    ///
+    /// Accepts a prefecture name as spelled by
+    /// `recisdb_protocol::broadcast_region`; the wide-area Kanto network is
+    /// `"東京"`.
+    pub home_region: Option<String>,
 }
 
 /// tsreplace (external encoder) configuration that must only be settable via
@@ -225,6 +242,12 @@ pub struct ResolvedConfig {
     pub db_path: PathBuf,
     pub web_auth_enabled: bool,
     pub mirakurun_enabled: bool,
+    /// Region IDs resolved from `[mirakurun] home_region`, empty when unset
+    /// (or set to a name no prefecture matches — that case warns and falls
+    /// back to "every terrestrial station is GR" rather than failing startup
+    /// over a display-level setting). One name can cover several IDs; see
+    /// `recisdb_protocol::broadcast_region::region_ids_from_prefecture_name`.
+    pub mirakurun_home_regions: Vec<u8>,
     #[cfg(feature = "tls")]
     pub tls_config: Option<recisdb_proxy::server::TlsConfig>,
 }
@@ -257,6 +280,20 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
 
     let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
     let mirakurun_enabled = file_config.mirakurun.enabled.unwrap_or(false);
+    let mirakurun_home_regions = match file_config.mirakurun.home_region.as_deref() {
+        None => Vec::new(),
+        Some(name) => {
+            let resolved = recisdb_protocol::broadcast_region::region_ids_from_prefecture_name(name);
+            if resolved.is_empty() {
+                warn!(
+                    "[mirakurun] home_region = \"{}\" matches no prefecture; every terrestrial \
+                     station will be reported as GR",
+                    name
+                );
+            }
+            resolved
+        }
+    };
 
     // Build TLS config if enabled
     #[cfg(feature = "tls")]
@@ -327,6 +364,7 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
         db_path,
         web_auth_enabled,
         mirakurun_enabled,
+        mirakurun_home_regions,
         #[cfg(feature = "tls")]
         tls_config,
     })

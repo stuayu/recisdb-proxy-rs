@@ -301,6 +301,7 @@ pub async fn start_web_server(
     log_dir: PathBuf,
     log_level: Arc<crate::logging::LogLevelHandle>,
     mirakurun_enabled: bool,
+    mirakurun_home_regions: Vec<u8>,
     proxy_listen_addr: Option<SocketAddr>,
     config_path: Option<PathBuf>,
     epg_events_tx: tokio::sync::broadcast::Sender<crate::database::ProgramUpsert>,
@@ -318,6 +319,7 @@ pub async fn start_web_server(
     );
     web_state.proxy_listen_addr = proxy_listen_addr;
     web_state.config_path = config_path;
+    web_state.mirakurun_home_regions = mirakurun_home_regions;
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
     }

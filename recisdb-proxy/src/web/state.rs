@@ -446,6 +446,13 @@ pub struct WebState {
     /// `[preview]` の実行ファイルパスを書き戻す先。`None` のときは書き戻せない
     /// (= 次回起動で設定が巻き戻る) ので、その旨を警告として返す。
     pub config_path: Option<PathBuf>,
+    /// Region IDs treated as *local* by the Mirakurun-compatible API: their
+    /// terrestrial stations are reported as channel type `GR`, everything
+    /// else terrestrial as `NW1`..`NW40`
+    /// (`web/mirakurun.rs::terrestrial_type_map`). Empty (the default) means
+    /// every terrestrial station is `GR`. Resolved from `[mirakurun]
+    /// home_region` in `app_config.rs`.
+    pub mirakurun_home_regions: Vec<u8>,
     /// Fan-out for `GET /mirakurun/api/events/stream`
     /// (`web/mirakurun_events.rs`, `docs/EPGSTATION_COMPAT.md` §3/§6): every
     /// handler call does `.subscribe()` on this to get its own receiver.
@@ -480,6 +487,7 @@ impl WebState {
             auth,
             proxy_listen_addr: None,
             config_path: None,
+            mirakurun_home_regions: Vec::new(),
             update_check_cache: RwLock::new(None),
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,

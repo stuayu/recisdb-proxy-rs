@@ -161,6 +161,29 @@ pub fn get_prefecture_name_from_region_id(region_id: u8) -> Option<&'static str>
     }
 }
 
+/// Every region ID that [`get_prefecture_name_from_region_id`] reports under
+/// `name` — the reverse of that function.
+///
+/// A prefecture name is not one region ID: 北海道 has eight (one per
+/// broadcast area), and 東京/大阪/愛知 each have both a wide-area ID and a
+/// prefecture-level one. Callers asking "which regions are 東京?" mean all of
+/// them, so this returns the whole set (ascending; empty if nothing matches).
+///
+/// # Examples
+/// ```
+/// use recisdb_protocol::broadcast_region::region_ids_from_prefecture_name;
+///
+/// assert_eq!(region_ids_from_prefecture_name("福島"), vec![21]);
+/// // 関東広域 (1) と 東京県域 (23) の両方
+/// assert_eq!(region_ids_from_prefecture_name("東京"), vec![1, 23]);
+/// assert!(region_ids_from_prefecture_name("ありません").is_empty());
+/// ```
+pub fn region_ids_from_prefecture_name(name: &str) -> Vec<u8> {
+    (1..=62)
+        .filter(|id| get_prefecture_name_from_region_id(*id) == Some(name))
+        .collect()
+}
+
 /// Get region classification from region ID.
 fn get_terrestrial_region_from_id(region_id: u8) -> TerrestrialRegion {
     match region_id {

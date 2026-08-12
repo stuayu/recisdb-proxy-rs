@@ -93,12 +93,22 @@
 //!   ([`mirakurun_type_to_band_candidates`]) is therefore one-to-many (e.g.
 //!   `type=BS` matches both `BandType::BS` and `BandType::FourK` rows).
 //! - **`channel` string**: `physical_ch` for terrestrial rows when present,
-//!   else `bon_channel`, rendered as a decimal string. Real Mirakurun encodes
-//!   satellite channels as e.g. `"BS15_0"` (transponder + slot); reproducing
-//!   that convention exactly is out of scope here — EPGStation/KonomiTV
-//!   primarily key off `id`/`serviceId` for streaming and only display the
-//!   `channel` string, so this simplification does not block the "視聴が通
-//!   る" goal.
+//!   else `bon_channel`, rendered as a decimal string — then **disambiguated
+//!   so that `(type, channel)` identifies exactly one multiplex**
+//!   ([`assign_channel_strings`]), which is what Mirakurun's contract
+//!   requires and what neither of those raw numbers provides on a
+//!   multi-area, multi-BonDriver install. Real Mirakurun encodes satellite
+//!   channels as e.g. `"BS15_0"` (transponder + slot); reproducing that
+//!   convention exactly is out of scope here — EPGStation/KonomiTV primarily
+//!   key off `id`/`serviceId` for streaming and only display the `channel`
+//!   string, so this simplification does not block the "視聴が通る" goal.
+//! - **One row per service**: the `channels` table stores one row per
+//!   *(BonDriver, service)* pair, so a service receivable by four tuners has
+//!   four rows. `/services` and `/channels` collapse those to one entry per
+//!   `(networkId, serviceId)` ([`unique_services`]) — real Mirakurun lists
+//!   each service exactly once, and emitting duplicates let stale rows (with
+//!   a placeholder name, or a `bon_channel` belonging to another driver's
+//!   channel table) overwrite the good one in EPGStation's channel table.
 //!
 //! # Not runtime-verified
 //! No BonDriver hardware and no real Mirakurun client (EPGStation/mirakc/
@@ -126,7 +136,7 @@ use crate::web::mirakurun_program_stream;
 use crate::web::state::WebState;
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    BodyReceiver, StreamCleanup,
+    service_filtered_body_stream, BodyReceiver, StreamCleanup,
 };
 use recisdb_protocol::BandType;
 
@@ -190,6 +200,82 @@ fn band_type_to_mirakurun(bt: BandType) -> &'static str {
     }
 }
 
+/// The highest `NWn` EPGStation's fork defines (`api.d.ts`'s `ChannelType`
+/// is `"GR" | "BS" | "CS" | "SKY" | "NW1".."NW40"`). Regions past this fall
+/// back to `GR`: an over-full guide tab is recoverable, a channel type the
+/// client's type union does not contain is not (its `ChannelDB` funnels
+/// unknown types into one catch-all bucket, `src/model/db/ChannelDB.ts:169`).
+const MAX_NW_INDEX: usize = 40;
+
+/// Assigns each terrestrial `region_id` present in `services` a Mirakurun
+/// channel type: `GR` for the local region(s), `NW1`..`NW40` for the rest,
+/// in ascending `region_id` order.
+///
+/// This is what lets a multi-area install (several BonDriverProxy endpoints
+/// in different prefectures — the setup this project exists for) show up in
+/// EPGStation the way the reference Mirakurun does on the same hardware:
+/// there, only the 21 local services are `GR` and the other ~550 are spread
+/// over `NW1`..`NW27`, one group per reception area. Reporting all of them as
+/// `GR` instead puts several hundred stations in one guide tab.
+///
+/// `home_regions` empty (no `[mirakurun] home_region` configured) returns an
+/// empty map, which callers read as "everything terrestrial is `GR`" — the
+/// behaviour from before this existed, and the right answer for a
+/// single-area install.
+///
+/// The assignment is derived from the scan results, so **receiving a new
+/// area can shift the `NWn` numbering of areas sorted after it**. That only
+/// moves stations between guide tabs in EPGStation: its channel ids
+/// (`networkId * 100000 + serviceId`) do not change, so recordings, reserves
+/// and rules keep pointing at the same stations.
+fn terrestrial_type_map(services: &[ChannelRecord], home_regions: &[u8]) -> HashMap<u8, String> {
+    if home_regions.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut regions: Vec<u8> = services
+        .iter()
+        .filter(|c| matches!(band_type_from_db(c.band_type), BandType::Terrestrial | BandType::CATV))
+        .filter_map(region_id_of)
+        .filter(|id| !home_regions.contains(id))
+        .collect();
+    regions.sort_unstable();
+    regions.dedup();
+
+    let mut map: HashMap<u8, String> = home_regions.iter().map(|id| (*id, "GR".to_string())).collect();
+    for (index, region) in regions.into_iter().enumerate() {
+        let ty = if index < MAX_NW_INDEX {
+            format!("NW{}", index + 1)
+        } else {
+            "GR".to_string()
+        };
+        map.insert(region, ty);
+    }
+    map
+}
+
+/// The region a row belongs to: the scanned `channels.region_id` when
+/// present, else derived from the network id. The DB column is only filled in
+/// by newer scans, and the derivation is exact for terrestrial network ids
+/// (ARIB assigns them as `0x7FF0 - 0x10 × region + operator`), so falling
+/// back costs nothing.
+fn region_id_of(c: &ChannelRecord) -> Option<u8> {
+    c.region_id
+        .or_else(|| recisdb_protocol::broadcast_region::get_region_id_from_nid(c.nid))
+}
+
+/// The Mirakurun channel type for one row, honouring the `GR`/`NWn` split
+/// from [`terrestrial_type_map`]. Non-terrestrial rows are unaffected.
+fn mirakurun_type_of(c: &ChannelRecord, terrestrial_types: &HashMap<u8, String>) -> String {
+    let bt = band_type_from_db(c.band_type);
+    if matches!(bt, BandType::Terrestrial | BandType::CATV) {
+        if let Some(ty) = region_id_of(c).and_then(|id| terrestrial_types.get(&id)) {
+            return ty.clone();
+        }
+    }
+    band_type_to_mirakurun(bt).to_string()
+}
+
 /// Mirakurun `type` string → candidate `BandType`s to search when resolving
 /// `GET /channels/:type/:channel/stream` — necessarily one-to-many, the
 /// reverse of [`band_type_to_mirakurun`]. `None` for an unrecognized type
@@ -216,6 +302,58 @@ fn mirakurun_type_to_band_candidates(t: &str) -> Option<&'static [BandType]> {
         // return 44`). Emitting a type outside the union would be off-contract
         // for the client we care about.
         "BS4K" => Some(&[BandType::FourK]),
+        // Out-of-area terrestrial ([`terrestrial_type_map`]). Which region a
+        // given `NWn` refers to depends on what has been scanned, so the
+        // candidate bands are simply the terrestrial ones and the caller
+        // matches on the assigned `(type, channel)` pair.
+        t if is_nw_type(t) => Some(&[BandType::Terrestrial, BandType::CATV]),
+        _ => None,
+    }
+}
+
+/// `NW1`..`NW40` exactly — not `NW0`, `NW41`, or `NW01`.
+fn is_nw_type(t: &str) -> bool {
+    let Some(index) = t.strip_prefix("NW") else { return false };
+    if index.starts_with('0') {
+        return false;
+    }
+    matches!(index.parse::<usize>(), Ok(n) if (1..=MAX_NW_INDEX).contains(&n))
+}
+
+/// Mirakurun `types` per `bon_drivers.id`, derived from the bands that
+/// driver's scanned channels fall into. Ordered `GR`, `BS`, `CS`, `SKY` (the
+/// order real Mirakurun's `tuners.yml` conventionally lists them in) rather
+/// than by discovery, so the response is stable across restarts.
+fn channel_types_by_driver(channels: &[ChannelRecord]) -> HashMap<i64, Vec<&'static str>> {
+    const TYPE_ORDER: [&str; 4] = ["GR", "BS", "CS", "SKY"];
+
+    let mut seen: HashMap<i64, HashSet<&'static str>> = HashMap::new();
+    for c in channels {
+        let ty = band_type_to_mirakurun(band_type_from_db(c.band_type));
+        seen.entry(c.bon_driver_id).or_default().insert(ty);
+    }
+
+    seen.into_iter()
+        .map(|(driver_id, types)| {
+            let ordered = TYPE_ORDER.iter().filter(|t| types.contains(*t)).copied().collect();
+            (driver_id, ordered)
+        })
+        .collect()
+}
+
+/// The value reported as `Service.remoteControlKeyId`, **terrestrial rows
+/// only**.
+///
+/// `channels.remote_control_key` is also populated for CS110, where the
+/// scanner stores the 3-digit channel number in it (see `ChannelRecord`'s
+/// field comment) — that is not a remote-control key id and reporting it
+/// would put "161" where EPGStation draws a remote button number. Real
+/// Mirakurun agrees: on the reference server for this same reception setup,
+/// every terrestrial service carries `remoteControlKeyId` and no BS/CS
+/// service does.
+fn remote_control_key_id(c: &ChannelRecord) -> Option<u16> {
+    match band_type_from_db(c.band_type) {
+        BandType::Terrestrial | BandType::CATV => c.remote_control_key,
         _ => None,
     }
 }
@@ -275,6 +413,16 @@ pub struct MirakurunService {
     /// also named `type` and is this same numeric ARIB value.
     #[serde(rename = "type")]
     pub service_type: i32,
+    /// ARIB remote-control key id (the 1–12 button number printed on a
+    /// Japanese TV remote), from the TS information descriptor. Omitted
+    /// entirely when unknown rather than sent as `null`: EPGStation stores
+    /// `undefined` as SQL NULL either way
+    /// (`src/model/db/ChannelDB.ts:152`), but omitting matches real
+    /// Mirakurun, whose `remoteControlKeyId` is an optional field.
+    ///
+    /// Only terrestrial rows are reported — see [`remote_control_key_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_control_key_id: Option<u16>,
     /// **Array**, not a single object — matches real Mirakurun (both the
     /// stuayu fork this project targets and upstream): `ServiceItem.export()`
     /// puts `this._channel` (a `ChannelItem[]`) straight into this field, and
@@ -462,10 +610,25 @@ pub async fn get_status(State(web_state): State<Arc<WebState>>) -> impl IntoResp
         }
     }
 
+    // **Configured** tuners, not pool entries. `TunerPool::keys()` only has
+    // entries for drivers that have been opened at least once since start-up,
+    // so using its length reported "tunerCount: 1" on a 14-driver server —
+    // and it was then smaller than `/tuners`'s own array length, which is
+    // built from `bon_drivers`. Mirakurun's `tunerCount` is the number of
+    // configured tuner devices, so read the same table `get_tuners` does and
+    // fall back to the pool size only if the query fails.
+    let tuner_count = {
+        let db = web_state.database.lock().await;
+        db.get_all_bon_drivers().map(|d| d.len()).unwrap_or_else(|e| {
+            debug!("mirakurun: /status could not count bon_drivers ({e}); falling back to pool size");
+            tuner_keys.len()
+        })
+    };
+
     Json(json!({
         // Intentionally CARGO_PKG_VERSION, see get_version() above.
         "version": env!("CARGO_PKG_VERSION"),
-        "tunerCount": tuner_keys.len(),
+        "tunerCount": tuner_count,
         "runningTunerCount": running_tuner_count,
     }))
 }
@@ -479,6 +642,153 @@ fn usable_channels(db: &Database) -> Result<Vec<ChannelRecord>, crate::database:
         .map(|(channel, _dll_path)| channel)
         .filter(|c| c.is_enabled && c.bon_channel.is_some())
         .collect())
+}
+
+// ============================================================================
+// Deduplication: `channels` rows are per-BonDriver, Mirakurun services are not
+// ============================================================================
+
+/// How "trustworthy" a `channels` row is as *the* description of its service,
+/// higher is better. Used by [`unique_services`] to pick one row per
+/// `(nid, sid)`.
+///
+/// This project's `channels` table holds **one row per (BonDriver, service)**:
+/// a service receivable by four tuners has four rows, and re-scans leave rows
+/// behind from drivers that saw the multiplex at a different `bon_channel` or
+/// before SDT was parsed (`channel_name` still the synthetic `"BS09/TS1"`
+/// placeholder, `service_type`/`network_name` NULL). Mirakurun's `/services`
+/// is keyed by `id = networkId * 100000 + serviceId` and must list each
+/// service exactly once — EPGStation inserts them keyed by that id
+/// (`src/model/db/ChannelDB.ts:88-118`), so duplicates do not error out but
+/// the *last* row silently wins, which used to hand EPGStation a placeholder
+/// name and/or a `channel` string belonging to a different multiplex.
+///
+/// Ordering rationale (most significant first):
+/// 1. Rows whose `channel_name` is a real SDT service name rather than the
+///    synthetic `<band><ch>/TS<n>` placeholder.
+/// 2. Rows that carry `service_type` — only set once the SDT service
+///    descriptor was parsed.
+/// 3. Rows that carry `network_name` (NIT parsed).
+/// 4. Rows that carry `physical_ch` (the scan resolved a real RF channel).
+/// 5. Rows that carry `remote_control_key`.
+/// 6. Most recently seen, then highest `priority`, then fewest failures,
+///    then lowest row id — the last purely so the choice is deterministic.
+fn representative_rank(c: &ChannelRecord) -> (bool, bool, bool, bool, bool, i64, i32, i32, i64) {
+    (
+        !is_placeholder_name(c),
+        c.service_type.is_some(),
+        c.network_name.is_some(),
+        c.physical_ch.is_some(),
+        c.remote_control_key.is_some(),
+        c.last_seen.unwrap_or(0),
+        c.priority,
+        -c.failure_count,
+        -c.id,
+    )
+}
+
+/// Whether `channel_name` is the synthetic placeholder the scanner writes
+/// before the SDT service name is known (`"BS09/TS1"`, `"15Ch(NHK-G)"`-style
+/// rows keep their real name and are not matched here). Missing/empty names
+/// count as placeholders too — anything is better than an empty service name.
+fn is_placeholder_name(c: &ChannelRecord) -> bool {
+    let Some(name) = c.channel_name.as_deref() else { return true };
+    let name = name.trim();
+    if name.is_empty() {
+        return true;
+    }
+    // `<band><2-digit ch>/TS<n>` — e.g. "BS09/TS1", "CS02/TS0".
+    let Some((head, tail)) = name.split_once("/TS") else { return false };
+    tail.chars().all(|ch| ch.is_ascii_digit())
+        && !tail.is_empty()
+        && head.len() > 2
+        && head[..2].chars().all(|ch| ch.is_ascii_uppercase())
+        && head[2..].chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// One row per `(nid, sid)` — the highest-[`representative_rank`] row of each
+/// service, in a deterministic order (by `nid`, then `sid`).
+fn unique_services(channels: Vec<ChannelRecord>) -> Vec<ChannelRecord> {
+    let mut best: HashMap<(u16, u16), ChannelRecord> = HashMap::new();
+    for c in channels {
+        match best.entry((c.nid, c.sid)) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if representative_rank(&c) > representative_rank(e.get()) {
+                    e.insert(c);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(c);
+            }
+        }
+    }
+
+    let mut services: Vec<ChannelRecord> = best.into_values().collect();
+    services.sort_by_key(|c| (c.nid, c.sid));
+    services
+}
+
+/// The Mirakurun `(type, channel)` pair assigned to each multiplex, keyed by
+/// `(nid, tsid)`.
+///
+/// Mirakurun's contract is that `(type, channel)` identifies one multiplex —
+/// `GET /channels/:type/:channel/stream` has nothing else to go on. That does
+/// not hold for a raw [`channel_string`] here for two independent reasons:
+///
+/// - `physical_ch` is only unique within one reception area. This project is
+///   built for multi-area reception (a BonDriverProxy fan-out over tuners in
+///   several prefectures), where RF 15 is a different station per area — the
+///   production database has seven distinct `networkId`s on terrestrial 15.
+/// - The `bon_channel` fallback is a *per-BonDriver* index, so two drivers
+///   with different channel tables collide on the same number.
+///
+/// So: assign the natural string first, then disambiguate every group that
+/// collided by appending `_<nid>` (and `_<nid>_<tsid>` in the — impossible in
+/// practice, but cheap to be exhaustive about — case that two multiplexes on
+/// one network still collide). Non-colliding channels keep the plain number,
+/// which is what a single-area install sees.
+fn assign_channel_strings(
+    services: &[ChannelRecord],
+    terrestrial_types: &HashMap<u8, String>,
+) -> HashMap<(u16, u16), (String, String)> {
+    // (nid, tsid) -> (mirakurun type, natural channel string), first row wins
+    // (rows are already deduplicated and sorted by `unique_services`).
+    let mut natural: Vec<((u16, u16), String, String)> = Vec::new();
+    let mut seen: HashSet<(u16, u16)> = HashSet::new();
+    for c in services {
+        let key = (c.nid, c.tsid);
+        if !seen.insert(key) {
+            continue;
+        }
+        let ty = mirakurun_type_of(c, terrestrial_types);
+        let Some(ch) = channel_string(c) else {
+            seen.remove(&key);
+            continue;
+        };
+        natural.push((key, ty, ch));
+    }
+
+    // How many multiplexes want each (type, channel)?
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for (_, ty, ch) in &natural {
+        *counts.entry((ty.clone(), ch.clone())).or_insert(0) += 1;
+    }
+
+    let mut assigned: HashMap<(u16, u16), (String, String)> = HashMap::new();
+    let mut taken: HashSet<(String, String)> = HashSet::new();
+    for ((nid, tsid), ty, ch) in natural {
+        let mut candidate = ch.clone();
+        if counts.get(&(ty.clone(), ch.clone())).copied().unwrap_or(0) > 1 {
+            candidate = format!("{}_{}", ch, nid);
+            if taken.contains(&(ty.clone(), candidate.clone())) {
+                candidate = format!("{}_{}_{}", ch, nid, tsid);
+            }
+        }
+        taken.insert((ty.clone(), candidate.clone()));
+        assigned.insert((nid, tsid), (ty, candidate));
+    }
+
+    assigned
 }
 
 /// `GET /mirakurun/api/channels`.
@@ -497,21 +807,27 @@ pub async fn get_channels(State(web_state): State<Arc<WebState>>) -> Response {
         }
     };
 
-    // Group by (Mirakurun type, channel string): one multiplex can (and
-    // usually does) carry several services.
-    let mut order: Vec<(String, String)> = Vec::new();
-    let mut groups: HashMap<(String, String), MirakurunChannel> = HashMap::new();
+    // One row per service ([`unique_services`]), then grouped by the
+    // multiplex each belongs to — **keyed by `(nid, tsid)`, not by the
+    // channel string**: two different networks can land on the same RF
+    // channel number in a multi-area install, and merging them into one
+    // `Channel` entry would claim services from several stations belong to
+    // the same multiplex. See [`assign_channel_strings`].
+    let services = unique_services(channels);
+    let terrestrial_types = terrestrial_type_map(&services, &web_state.mirakurun_home_regions);
+    let channel_strings = assign_channel_strings(&services, &terrestrial_types);
 
-    for c in &channels {
-        let bt = band_type_from_db(c.band_type);
-        let ty = band_type_to_mirakurun(bt).to_string();
-        let Some(ch_str) = channel_string(c) else { continue };
-        let key = (ty.clone(), ch_str.clone());
+    let mut order: Vec<(u16, u16)> = Vec::new();
+    let mut groups: HashMap<(u16, u16), MirakurunChannel> = HashMap::new();
+
+    for c in &services {
+        let mux = (c.nid, c.tsid);
+        let Some((ty, ch_str)) = channel_strings.get(&mux) else { continue };
 
         groups
-            .entry(key.clone())
+            .entry(mux)
             .or_insert_with(|| {
-                order.push(key.clone());
+                order.push(mux);
                 let name = c
                     .network_name
                     .clone()
@@ -552,22 +868,29 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
         }
     };
 
-    let services: Vec<MirakurunService> = channels
+    // Exactly one entry per `(networkId, serviceId)` — see
+    // [`unique_services`] for why the raw table has several rows per service
+    // and what breaks in EPGStation when they are all emitted.
+    let unique = unique_services(channels);
+    let terrestrial_types = terrestrial_type_map(&unique, &web_state.mirakurun_home_regions);
+    let channel_strings = assign_channel_strings(&unique, &terrestrial_types);
+
+    let services: Vec<MirakurunService> = unique
         .iter()
         .filter_map(|c| {
-            let bt = band_type_from_db(c.band_type);
-            let ch_str = channel_string(c)?;
+            let (ty, ch_str) = channel_strings.get(&(c.nid, c.tsid))?;
             Some(MirakurunService {
                 id: mirakurun_service_id(c.nid, c.sid),
                 service_id: c.sid,
                 network_id: c.nid,
                 name: c.channel_name.clone().unwrap_or_default(),
                 service_type: c.service_type.map(|v| v as i32).unwrap_or(0),
+                remote_control_key_id: remote_control_key_id(c),
                 // Single-element array — see `MirakurunService::channel` doc
                 // comment.
                 channel: vec![MirakurunChannelRef {
-                    channel_type: band_type_to_mirakurun(bt).to_string(),
-                    channel: ch_str,
+                    channel_type: ty.clone(),
+                    channel: ch_str.clone(),
                 }],
                 has_logo_data: false,
             })
@@ -628,14 +951,18 @@ fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
 ///
 /// `:id` is the Mirakurun service id (`networkId * 100000 + serviceId`, see
 /// [`split_mirakurun_service_id`]), resolved to a channel via
-/// `channel_resolve::resolve_service_by_nid_sid`, then streamed with the
-/// exact same passthrough machinery `web/stream.rs`'s
-/// `GET /api/stream/service/:sid` uses (`StreamCleanup`,
-/// `broadcast_to_body_stream`, `respond_with_stream`) — no `?profile=`
-/// transcoding here: Mirakurun's convention is raw TS passthrough
-/// (STREAMING_DESIGN.md §7.1), and query params other than none are ignored
-/// by design (a `?decode=1`-style param some clients send is simply not
-/// read).
+/// `channel_resolve::resolve_service_by_nid_sid`, then streamed with the same
+/// machinery `web/stream.rs`'s `GET /api/stream/service/:sid` uses
+/// (`StreamCleanup`, `respond_with_stream`) — no `?profile=` transcoding
+/// here: Mirakurun's convention is un-transcoded TS (STREAMING_DESIGN.md
+/// §7.1), and query params other than none are ignored by design (a
+/// `?decode=1`-style param some clients send is simply not read).
+///
+/// Unlike this project's own `/api/stream/service/:sid`, the body is filtered
+/// down to the requested service
+/// ([`crate::web::stream::service_filtered_body_stream`]) rather than being
+/// the whole multiplex: Mirakurun's per-service stream carries one service,
+/// and EPGStation records straight off this endpoint.
 ///
 /// `X-Mirakurun-Priority` is parsed and logged (see
 /// [`parse_mirakurun_priority`]) but not otherwise acted on.
@@ -670,13 +997,15 @@ pub async fn stream_service_by_mirakurun_id(
 
     let tuner_rx = tuner.subscribe();
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
-    respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
+    respond_with_stream(service_filtered_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup, sid))
 }
 
 /// `GET /mirakurun/api/channels/:type/:channel/stream`.
 ///
-/// Finds the first usable channel whose (type, channel-string) matches, then
-/// streams it exactly like [`stream_service_by_mirakurun_id`] (raw TS
+/// Finds the multiplex that `GET /channels` advertises under this
+/// `(type, channel)` pair (see [`assign_channel_strings`] — the pair is
+/// assigned so exactly one multiplex answers to it), then streams it exactly
+/// like [`stream_service_by_mirakurun_id`] (raw TS
 /// passthrough — the full multiplex, not filtered to one service's PIDs;
 /// same simplification `web/stream.rs`'s passthrough path already makes, see
 /// its module doc comment).
@@ -691,19 +1020,31 @@ pub async fn stream_channel_by_type(
         );
     };
 
+    // Resolve through the same `(type, channel)` assignment `GET /channels`
+    // advertises ([`assign_channel_strings`]) — a bare [`channel_string`]
+    // comparison would miss every multiplex that had to be disambiguated, and
+    // would happily match a *different* network that shares the RF number.
     let target_id = {
         let db = web_state.database.lock().await;
         let channels = match usable_channels(&db) {
             Ok(c) => c,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        channels.iter().find_map(|c| {
+        let services = unique_services(channels);
+        let terrestrial_types = terrestrial_type_map(&services, &web_state.mirakurun_home_regions);
+        let channel_strings = assign_channel_strings(&services, &terrestrial_types);
+        services.iter().find_map(|c| {
             let bt = band_type_from_db(c.band_type);
             if !candidates.contains(&bt) {
                 return None;
             }
-            let cs = channel_string(c)?;
-            (cs == channel_str).then_some(c.id)
+            // Match the *assigned* type, not just the band: `GR` and `NW3`
+            // are both terrestrial, and after the `GR`/`NWn` split they can
+            // legitimately carry the same channel string (each `NWn` is its
+            // own namespace, so RF 15 needs no disambiguation once the areas
+            // are separated).
+            let (ty, cs) = channel_strings.get(&(c.nid, c.tsid))?;
+            (*ty == channel_type && *cs == channel_str).then_some(c.id)
         })
     };
 
@@ -745,12 +1086,6 @@ pub async fn stream_channel_by_type(
 ///
 /// Fields with no equivalent concept in this project, hardcoded to a
 /// type-appropriate default:
-/// - `types`: always `[]`. Real Mirakurun reports which `ChannelType`s a
-///   tuner can receive (from `tuners.yml`); this project's BonDriver rows
-///   are not statically typed to a band until channels are scanned onto
-///   them, and a single BonDriver can carry multiple bands, so there is no
-///   single honest static answer here without querying scanned channels
-///   per driver — left empty rather than guessed.
 /// - `pid`: always `0`. BonDriver DLLs run in-process (loaded by
 ///   `tuner/shared.rs`, not spawned as a subprocess), so there is no
 ///   separate OS process to report.
@@ -763,6 +1098,11 @@ pub async fn stream_channel_by_type(
 ///   is broken" flag distinct from "currently failing to stream").
 ///
 /// Fields derived from real state:
+/// - `types`: the Mirakurun channel types this driver actually has enabled,
+///   scanned channels for ([`channel_types_by_driver`]). Real Mirakurun takes
+///   this from `tuners.yml`; a BonDriver row here is not statically typed to a
+///   band, but its scan results say exactly which bands it reached. A driver
+///   with no scanned channels still reports `[]`.
 /// - `isUsing`/`isFree`: `true`/`false` if any [`crate::tuner::pool::TunerPool`]
 ///   key whose `tuner_path` equals this driver's `dll_path` currently has a
 ///   running [`crate::tuner::shared::SharedTuner`] — same signal
@@ -772,12 +1112,23 @@ pub async fn stream_channel_by_type(
 ///   `is_enabled` on individual channels, and a driver with no channels
 ///   enabled is still a usable tuner slot.
 pub async fn get_tuners(State(web_state): State<Arc<WebState>>) -> Response {
-    let drivers = {
+    let (drivers, types_by_driver) = {
         let db = web_state.database.lock().await;
-        match db.get_all_bon_drivers() {
+        let drivers = match db.get_all_bon_drivers() {
             Ok(d) => d,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        }
+        };
+        // Which Mirakurun channel types each driver has scanned channels for.
+        // A failed query only costs the `types` field, so degrade to empty
+        // rather than failing the whole request.
+        let types = match usable_channels(&db) {
+            Ok(channels) => channel_types_by_driver(&channels),
+            Err(e) => {
+                debug!("mirakurun: /tuners could not read channels for `types` ({e}); reporting []");
+                HashMap::new()
+            }
+        };
+        (drivers, types)
     };
 
     // Which dll_paths currently have a running reader, per the same signal
@@ -802,7 +1153,7 @@ pub async fn get_tuners(State(web_state): State<Arc<WebState>>) -> Response {
             json!({
                 "index": index,
                 "name": d.driver_name.clone().unwrap_or_else(|| d.dll_path.clone()),
-                "types": [],
+                "types": types_by_driver.get(&d.id).cloned().unwrap_or_default(),
                 "command": d.dll_path,
                 "pid": 0,
                 "users": [],
@@ -1116,6 +1467,351 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Deduplication of the per-BonDriver `channels` rows
+    // ------------------------------------------------------------------
+
+    /// A `channels` row for one service on one BonDriver, with only the
+    /// fields the dedup/channel-string logic reads spelled out.
+    #[allow(clippy::too_many_arguments)]
+    fn service_row(
+        id: i64,
+        bon_driver_id: i64,
+        nid: u16,
+        sid: u16,
+        tsid: u16,
+        band_type: Option<u8>,
+        physical_ch: Option<u8>,
+        bon_channel: Option<u32>,
+        channel_name: Option<&str>,
+    ) -> ChannelRecord {
+        ChannelRecord {
+            id,
+            bon_driver_id,
+            nid,
+            sid,
+            tsid,
+            channel_name: channel_name.map(|s| s.to_string()),
+            physical_ch,
+            bon_channel,
+            band_type,
+            ..make_channel_record(band_type, physical_ch, bon_channel)
+        }
+    }
+
+    #[test]
+    fn placeholder_names_are_recognized() {
+        let placeholder = |name: Option<&str>| {
+            is_placeholder_name(&service_row(1, 1, 4, 211, 16528, Some(1), None, Some(9), name))
+        };
+        assert!(placeholder(Some("BS09/TS1")));
+        assert!(placeholder(Some("CS02/TS0")));
+        assert!(placeholder(None));
+        assert!(placeholder(Some("   ")));
+        assert!(!placeholder(Some("ＢＳ１１イレブン")));
+        // A real service name that merely contains digits and a slash.
+        assert!(!placeholder(Some("15Ch(NHK-G)")));
+    }
+
+    /// The production case this dedup exists for: one service present on four
+    /// BonDrivers, one of those rows still carrying the pre-SDT placeholder
+    /// name and a `bon_channel` from a different driver's channel table.
+    #[test]
+    fn unique_services_keeps_one_row_per_service_and_prefers_the_scanned_one() {
+        let scanned = ChannelRecord {
+            service_type: Some(1),
+            network_name: Some("ＢＳ　Ｄｉｇｉｔａｌ".to_string()),
+            remote_control_key: Some(11),
+            last_seen: Some(1_783_849_518),
+            ..service_row(41, 1, 4, 211, 16528, Some(1), Some(9), Some(8), Some("ＢＳ１１イレブン"))
+        };
+        let placeholder = ChannelRecord {
+            last_seen: Some(1_771_730_985),
+            ..service_row(193, 4, 4, 211, 16528, Some(1), None, Some(9), Some("BS09/TS1"))
+        };
+        let bare = ChannelRecord {
+            service_type: Some(1),
+            last_seen: Some(1_771_824_058),
+            ..service_row(877, 14, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１イレブン"))
+        };
+
+        let unique = unique_services(vec![placeholder, bare, scanned]);
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].id, 41, "the fully-scanned row must win");
+    }
+
+    #[test]
+    fn unique_services_is_sorted_and_keeps_distinct_services() {
+        let a = service_row(1, 1, 4, 152, 16400, Some(1), None, Some(0), Some("ＢＳ朝日２"));
+        let b = service_row(2, 1, 4, 151, 16400, Some(1), None, Some(0), Some("ＢＳ朝日１"));
+        let c = service_row(3, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合"));
+
+        let unique = unique_services(vec![a, b, c]);
+        assert_eq!(
+            unique.iter().map(|c| (c.nid, c.sid)).collect::<Vec<_>>(),
+            vec![(4, 151), (4, 152), (32416, 21504)]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // GR / NW1..NW40 split
+    // ------------------------------------------------------------------
+
+    /// Terrestrial network ids of a few real areas, so the region derivation
+    /// (`0x7FF0 - 0x10 × region + operator`) is exercised rather than mocked.
+    const NID_FUKUSHIMA: u16 = 32416; // region 21
+    const NID_AKITA: u16 = 32466; // region 18
+    const NID_NIIGATA: u16 = 32256; // region 31
+    const NID_TOKYO_WIDE: u16 = 32736; // region 1 (関東広域)
+
+    fn gr_row(id: i64, nid: u16, sid: u16, physical_ch: u8) -> ChannelRecord {
+        service_row(id, 1, nid, sid, nid, Some(0), Some(physical_ch), Some(2), Some("局"))
+    }
+
+    #[test]
+    fn region_is_derived_from_the_network_id_when_the_column_is_empty() {
+        let row = gr_row(1, NID_FUKUSHIMA, 21504, 15);
+        assert_eq!(row.region_id, None, "this row has no scanned region_id");
+        assert_eq!(region_id_of(&row), Some(21));
+
+        // An explicitly scanned value wins over the derivation.
+        let scanned = ChannelRecord { region_id: Some(9), ..gr_row(2, NID_FUKUSHIMA, 21504, 15) };
+        assert_eq!(region_id_of(&scanned), Some(9));
+    }
+
+    #[test]
+    fn without_a_home_region_everything_terrestrial_stays_gr() {
+        let services = unique_services(vec![
+            gr_row(1, NID_FUKUSHIMA, 21504, 15),
+            gr_row(2, NID_AKITA, 18448, 15),
+        ]);
+        let types = terrestrial_type_map(&services, &[]);
+        assert!(types.is_empty());
+        for c in &services {
+            assert_eq!(mirakurun_type_of(c, &types), "GR");
+        }
+    }
+
+    /// The production shape: local prefecture on `GR`, every other area on
+    /// its own `NWn`, numbered by ascending region id.
+    #[test]
+    fn out_of_area_regions_become_nw_types_in_region_order() {
+        let services = unique_services(vec![
+            gr_row(1, NID_FUKUSHIMA, 21504, 15), // region 21 (home)
+            gr_row(2, NID_AKITA, 18448, 15),     // region 18
+            gr_row(3, NID_NIIGATA, 12345, 15),   // region 31
+        ]);
+        let types = terrestrial_type_map(&services, &[21]);
+
+        assert_eq!(types[&21], "GR");
+        assert_eq!(types[&18], "NW1", "lowest non-home region id comes first");
+        assert_eq!(types[&31], "NW2");
+    }
+
+    /// `home_region = "東京"` covers both the wide-area Kanto id and the
+    /// Tokyo prefecture id, so both must land on `GR`.
+    #[test]
+    fn every_region_id_of_the_home_prefecture_is_gr() {
+        let home = recisdb_protocol::broadcast_region::region_ids_from_prefecture_name("東京");
+        assert_eq!(home, vec![1, 23], "sanity: 東京 is two region ids");
+
+        let services = unique_services(vec![
+            gr_row(1, NID_TOKYO_WIDE, 1024, 21), // region 1
+            gr_row(2, NID_FUKUSHIMA, 21504, 15), // region 21
+        ]);
+        let types = terrestrial_type_map(&services, &home);
+        let type_of = |nid: u16| {
+            let row = services.iter().find(|c| c.nid == nid).unwrap();
+            mirakurun_type_of(row, &types)
+        };
+
+        assert_eq!(type_of(NID_TOKYO_WIDE), "GR");
+        assert_eq!(type_of(NID_FUKUSHIMA), "NW1");
+    }
+
+    #[test]
+    fn satellite_rows_are_unaffected_by_the_split() {
+        let bs = service_row(1, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１"));
+        let types = terrestrial_type_map(std::slice::from_ref(&bs), &[21]);
+        assert_eq!(mirakurun_type_of(&bs, &types), "BS");
+    }
+
+    /// EPGStation's `ChannelType` union stops at `NW40`; anything past that
+    /// must fall back to a type it knows rather than inventing `NW41`.
+    #[test]
+    fn regions_past_nw40_fall_back_to_gr() {
+        // 41 non-home regions: region ids 1..=41 minus the home one.
+        let services: Vec<ChannelRecord> = (1..=42u8)
+            .filter(|id| *id != 21)
+            .enumerate()
+            .map(|(i, region)| {
+                let nid = 0x7FF0 - 0x10 * region as u16;
+                gr_row(i as i64, nid, 100 + i as u16, 20)
+            })
+            .collect();
+        let services = unique_services(services);
+        let types = terrestrial_type_map(&services, &[21]);
+
+        let assigned: Vec<&String> = types.values().collect();
+        assert!(!assigned.iter().any(|t| t.as_str() == "NW41"));
+        assert_eq!(assigned.iter().filter(|t| t.as_str() == "NW40").count(), 1);
+        assert!(assigned.iter().any(|t| t.as_str() == "GR"), "the overflow falls back to GR");
+    }
+
+    #[test]
+    fn nw_types_are_recognized_on_input_within_range_only() {
+        assert!(is_nw_type("NW1"));
+        assert!(is_nw_type("NW40"));
+        assert!(!is_nw_type("NW0"));
+        assert!(!is_nw_type("NW41"));
+        assert!(!is_nw_type("NW01"), "no zero padding");
+        assert!(!is_nw_type("NW"));
+        assert!(!is_nw_type("nw1"), "types are case-sensitive");
+
+        assert_eq!(
+            mirakurun_type_to_band_candidates("NW3"),
+            Some(&[BandType::Terrestrial, BandType::CATV][..])
+        );
+    }
+
+    /// Separating the areas removes the reason to disambiguate: each `NWn`
+    /// is its own namespace, so RF 15 can stay plain `"15"` in both.
+    #[test]
+    fn splitting_areas_removes_channel_string_collisions() {
+        let services = unique_services(vec![
+            gr_row(1, NID_FUKUSHIMA, 21504, 15),
+            gr_row(2, NID_AKITA, 18448, 15),
+        ]);
+        let types = terrestrial_type_map(&services, &[21]);
+        let assigned = assign_channel_strings(&services, &types);
+
+        assert_eq!(assigned[&(NID_FUKUSHIMA, NID_FUKUSHIMA)], ("GR".to_string(), "15".to_string()));
+        assert_eq!(assigned[&(NID_AKITA, NID_AKITA)], ("NW1".to_string(), "15".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // (type, channel) assignment
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn channel_strings_stay_plain_when_nothing_collides() {
+        let services = unique_services(vec![
+            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
+            service_row(2, 1, 32417, 21512, 32417, Some(0), Some(13), Some(1), Some("ＮＨＫEテレ")),
+        ]);
+        let assigned = assign_channel_strings(&services, &HashMap::new());
+        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15".to_string()));
+        assert_eq!(assigned[&(32417, 32417)], ("GR".to_string(), "13".to_string()));
+    }
+
+    /// Multi-area reception: two networks on RF 15. Both must remain
+    /// addressable, so neither may keep the bare `"15"`.
+    #[test]
+    fn colliding_channel_strings_are_disambiguated_by_network_id() {
+        let services = unique_services(vec![
+            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合・福島")),
+            service_row(2, 1, 32466, 18448, 32466, Some(0), Some(15), Some(3), Some("ＡＢＳ秋田放送")),
+        ]);
+        let assigned = assign_channel_strings(&services, &HashMap::new());
+        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15_32416".to_string()));
+        assert_eq!(assigned[&(32466, 32466)], ("GR".to_string(), "15_32466".to_string()));
+
+        let all: HashSet<_> = assigned.values().collect();
+        assert_eq!(all.len(), 2, "every multiplex must get its own (type, channel)");
+    }
+
+    /// Same number on two different bands is not a collision — Mirakurun keys
+    /// on the pair, so `GR 15` and `BS 15` coexist.
+    #[test]
+    fn same_channel_number_on_different_bands_is_not_a_collision() {
+        let services = unique_services(vec![
+            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
+            service_row(2, 1, 4, 211, 16528, Some(1), None, Some(15), Some("ＢＳ１１")),
+        ]);
+        let assigned = assign_channel_strings(&services, &HashMap::new());
+        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15".to_string()));
+        assert_eq!(assigned[&(4, 16528)], ("BS".to_string(), "15".to_string()));
+    }
+
+    /// Two multiplexes of the *same* network colliding (different TSIDs on
+    /// one nid) must still separate, via the `_<nid>_<tsid>` form.
+    #[test]
+    fn colliding_multiplexes_on_one_network_fall_back_to_tsid() {
+        let services = unique_services(vec![
+            service_row(1, 1, 4, 101, 16528, Some(1), None, Some(9), Some("A")),
+            service_row(2, 2, 4, 102, 16530, Some(1), None, Some(9), Some("B")),
+        ]);
+        let assigned = assign_channel_strings(&services, &HashMap::new());
+        let a = &assigned[&(4, 16528)];
+        let b = &assigned[&(4, 16530)];
+        assert_ne!(a, b, "distinct multiplexes must not share (type, channel)");
+        assert!(b.1.starts_with("9_4"), "unexpected disambiguated form: {}", b.1);
+    }
+
+    // ------------------------------------------------------------------
+    // remoteControlKeyId
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn remote_control_key_is_reported_for_terrestrial_only() {
+        let terrestrial = ChannelRecord {
+            remote_control_key: Some(1),
+            ..service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合"))
+        };
+        assert_eq!(remote_control_key_id(&terrestrial), Some(1));
+
+        // CS110 stores the 3-digit channel number in this column; it is not a
+        // remote-control key and must not be reported as one.
+        let cs = ChannelRecord {
+            remote_control_key: Some(161),
+            ..service_row(2, 1, 7, 301, 18224, Some(2), None, Some(1), Some("エンタメ〜テレ"))
+        };
+        assert_eq!(remote_control_key_id(&cs), None);
+
+        let bs = ChannelRecord {
+            remote_control_key: Some(11),
+            ..service_row(3, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１"))
+        };
+        assert_eq!(remote_control_key_id(&bs), None);
+    }
+
+    #[test]
+    fn service_omits_remote_control_key_id_when_unknown() {
+        let service = MirakurunService {
+            id: mirakurun_service_id(4, 211),
+            service_id: 211,
+            network_id: 4,
+            name: "ＢＳ１１".to_string(),
+            service_type: 1,
+            remote_control_key_id: None,
+            channel: vec![MirakurunChannelRef { channel_type: "BS".to_string(), channel: "8".to_string() }],
+            has_logo_data: false,
+        };
+        let value = serde_json::to_value(&service).unwrap();
+        assert!(
+            value.get("remoteControlKeyId").is_none(),
+            "unknown remoteControlKeyId must be omitted, not null"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // /tuners `types`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tuner_types_come_from_scanned_channels_in_band_order() {
+        let channels = vec![
+            service_row(1, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１")),
+            service_row(2, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
+            service_row(3, 1, 7, 301, 18224, Some(2), None, Some(1), Some("エンタメ〜テレ")),
+            service_row(4, 2, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
+        ];
+        let types = channel_types_by_driver(&channels);
+        assert_eq!(types[&1], vec!["GR", "BS", "CS"]);
+        assert_eq!(types[&2], vec!["GR"]);
+        assert!(types.get(&3).is_none(), "a driver with no channels reports nothing");
+    }
+
+    // ------------------------------------------------------------------
     // Service.channel serializes as an array (docs/EPGSTATION_COMPAT.md §1/§4)
     // ------------------------------------------------------------------
 
@@ -1127,6 +1823,7 @@ mod tests {
             network_id: 1,
             name: "Test".to_string(),
             service_type: 1,
+            remote_control_key_id: Some(1),
             channel: vec![MirakurunChannelRef { channel_type: "GR".to_string(), channel: "27".to_string() }],
             has_logo_data: false,
         };

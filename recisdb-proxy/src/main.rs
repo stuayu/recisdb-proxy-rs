@@ -421,6 +421,7 @@ async fn run_server(
     // surface itself is logged from `web::start_web_server` once the router
     // is actually about to be nested in.
     let mirakurun_enabled = resolved.mirakurun_enabled;
+    let mirakurun_home_regions = resolved.mirakurun_home_regions.clone();
 
     // TLS config, resolved from args × TOML by app_config::load above.
     #[cfg(feature = "tls")]
@@ -654,6 +655,7 @@ async fn run_server(
             web_log_dir,
             web_log_level_handle,
             mirakurun_enabled,
+            mirakurun_home_regions,
             Some(listen_addr),
             config_path_for_web,
             web_epg_events_tx,
