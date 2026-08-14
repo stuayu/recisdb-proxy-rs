@@ -14,6 +14,7 @@ use recisdb_proxy::database;
 use recisdb_proxy::logging;
 use recisdb_proxy::alert;
 use recisdb_proxy::epg_writer;
+use recisdb_proxy::nit_writer;
 use recisdb_proxy::scheduler;
 use recisdb_proxy::server;
 use recisdb_proxy::tuner;
@@ -590,6 +591,18 @@ async fn run_server(
     let epg_writer_events_tx = epg_events_tx.clone();
     tokio::spawn(async move {
         let writer = epg_writer::EpgWriter::new(epg_db, epg_writer_events_tx);
+        writer.run().await;
+    });
+
+    // Start the NIT writer: fills the `channels` metadata that a scan would
+    // normally supply (remote-control key / physical channel / network name)
+    // for rows registered by hand, from the NIT seen on every live terrestrial
+    // stream (`tuner/nit_collector.rs`). Same startup ordering requirement as
+    // the EPG writer — it installs the process-wide sender its collectors
+    // send into.
+    let nit_db = db.clone();
+    tokio::spawn(async move {
+        let writer = nit_writer::NitWriter::new(nit_db);
         writer.run().await;
     });
 

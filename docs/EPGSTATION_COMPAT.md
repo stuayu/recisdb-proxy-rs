@@ -390,6 +390,61 @@ proxy 側は全地上波を `GR` に入れていたため、EPGStation の番組
 本番データ (地上波 194 サービス、15 地域) に `home_region = "福島"` を当てた場合の割り当て:
 福島 22 局が `GR`、以降 `NW1` 東京 27 局 / `NW2` 北海道 20 局 / … / `NW14` 新潟 23 局。
 
+## 5.4 `remoteControlKeyId` の欠損と NIT からの補完 (2026-08-14)
+
+**EPGStation 側の仕様**: 番組表・放映中の放送局の並び順は `remoteControlKeyId` 昇順で、
+**値が無い局は末尾へ回される** (`src/model/db/ChannelDB.ts:381-385` / `411-415`。
+`findChannleTypes()` と `findAll()` の両方が同じ ORDER BY を持つ)。この 2 つは
+`ScheduleApiModel` の番組表・放映中の入口 (`src/model/api/schedule/ScheduleApiModel.ts:202` /
+`364`) がそのまま使うため、**キーが無い局は番組表でも放映中でも、キー順に並んだ列の後ろに
+まとめて置かれる**。クライアント側は地域・系列で絞り込むだけで並び替えないので
+(`client/src/model/state/guide/GuideState.ts:245-256`)、サーバーが返した順がそのまま画面に出る。
+
+**本番で起きていたこと**: 地上波 183 局のうち 48 局が `remoteControlKeyId: null` で、
+テレ玉・とちぎテレビ・チバテレ・tvk・TOKYO MX・NHK 総合 (東京)・福島の民放 4 局などが
+番組表の末尾に固まっていた。該当行はいずれも **CSV インポートまたは `POST /api/channels` で
+手動登録した行** で、その 2 経路は `remote_control_key` / `physical_ch` / `network_name` /
+`raw_name` を NULL 固定で INSERT する (`web/api/channels.rs`)。スキャン経由の行は NIT の
+TS情報記述子からキーが入るため、共有チューナー (BonDriverProxyEx 経由) のようにスキャンを
+回していない構成だけが欠損する。
+
+**対応**: 視聴・EPG 収集中の TS から NIT (PID 0x0010) を読み、**NULL の列だけ**埋める。
+
+- `tuner/nit_collector.rs` — `EpgCollector` と同じ形。NIT actual (0x40) / other (0x41) の両方を
+  読む (地上波の NIT other は近隣局を各局の `original_network_id` 付きで載せるので、
+  手動登録行に足りない情報がここから取れる)。ネットワーク名だけは、そのテーブル自身が
+  記述するネットワークのエントリにしか付けない (他ネットワークのエントリに付けると別局の名前になる)
+- `nit_writer.rs` — `Database::fill_missing_terrestrial_metadata()` を呼ぶ。`COALESCE` で
+  **既存値は上書きしない** (スキャン結果が常に優先)。適用済みの networkId を憶えておき、
+  NIT が繰り返し届いても DB ロックを取らない
+- **照合は networkId だけ**で `(nid, tsid)` ではない。手動登録行の tsid はプレースホルダ
+  (実データでは `tsid == nid`) のことが多く、それこそが直したい行のため。地上波は
+  networkId と TS が 1:1 なので別の multiplex を巻き込まない。衛星は 1 つの networkId が
+  多数の tsid にまたがるので、収集側で BS/CS のエントリを捨てている
+  (BS/CS のキーは TSID/SID から導出する既存経路が持つ)
+- 物理チャンネルの導出 (`uhf_channel_from_frequency` / `NitTransportStream::physical_ch()`) は
+  `ts_analyzer/nit.rs` に集約し、スキャン経路 (`scheduler/scan_scheduler.rs`) と共有する
+
+**残る制約**: 埋まるのは**一度でも選局した局だけ**。ロゴ (§6) と同じで、受信していない局は
+NULL のまま = EPGStation 側では末尾に並ぶ。スキャンを回すか、手動で値を入れる必要がある。
+
+## 5.5 EPGStation の視聴・録画をダッシュボードに出す (2026-08-14)
+
+EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
+`GET /programs/{id}/stream` (録画) でチューナーを占有するが、**ダッシュボードのクライアント一覧には
+一切出ていなかった**。`SessionRegistry` へ登録していたのが BNDP セッション
+(`server/listener.rs`) だけだったため。結果として「チューナーは動いているのにクライアントは 0 件」に
+見え、録画中かどうかを画面から判断できなかった。
+
+- HTTP 経路 (Mirakurun 互換 API と `web/stream.rs` のダッシュボード用配信) も登録するようにした。
+  登録・解除はレスポンスボディの寿命に紐づく RAII (`web/http_session.rs`)
+- 行には `protocol` (`bndp` / `http` / `mirakurun`) が付き、UI は「接続方式」列で見分ける。
+  `GET /programs/{id}/stream` は録画なので `stream_class` を `record` で登録する
+- `POST /api/clients/{id}/disconnect` は EPGStation のストリームにも効く (ボディがそこで終わる)。
+  **EPGStation 側は切断を録画失敗として扱う**ので、録画中の行を切るときは承知の上で
+- 信号レベル・ドロップ数は 0 のまま。HTTP は共有 broadcast を読むだけで、BNDP のような
+  クライアント単位の送信キューが無く、そこでの取りこぼしという概念が無い
+
 ## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 更新)
 
 `web/mirakurun.rs` / `web/mod.rs:126-136` を読んだ結果 + §5.2 の実起動確認。
@@ -406,6 +461,8 @@ proxy 側は全地上波を `GR` に入れていたため、EPGStation の番組
 | `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12 修正) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`remoteControlKeyId` は地上波のみ。§5.2-1/2/3 |
 | `GET /services/{id}/stream` | 実装済み (2026-08-12 にサービスフィルタ追加) | `TsServiceFilter` で対象サービスのみへ絞る (旧実装は multiplex 全体)。§5.2-5/6 |
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
+| `remoteControlKeyId` の欠損 | 実装済み (2026-08-14) | 手動登録 (CSV インポート / `POST /api/channels`) した行は `remote_control_key` が NULL で、EPGStation の番組表・放映中で末尾に回されていた。視聴・EPG 収集中の NIT から NULL の列だけ補完する (`tuner/nit_collector.rs` → `nit_writer.rs`)。**一度も選局していない局は埋まらない**。§5.4 |
+| ダッシュボードのクライアント表示 | 実装済み (2026-08-14) | EPGStation の視聴・録画ストリームがクライアント一覧に出るようになった (`protocol` = `mirakurun`)。切断・グラフ・プレビューも同じ行から使える。§5.5 |
 | `X-Mirakurun-Priority` | **受理のみ** | パースしてログに出すが、チューナー競合には反映していない。**録画がライブ視聴に負ける状態は解消していない**。反映には `tuner/policy.rs::decide()` の設計変更が要る (CLAUDE.md「選局」の不変条件) |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` / `video` / `audio` / `relatedItems` | 無し | 番組詳細が埋まらない・イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 (`EPGUpdateManageModel.ts:144-147`) |

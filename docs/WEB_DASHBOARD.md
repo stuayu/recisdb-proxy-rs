@@ -35,6 +35,10 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 - クライアントのIPアドレス
 - 現在のセッション状態
 - 接続先チューナーと選択チャンネル
+- **接続方式** (`BonDriver` / `HTTP` / `Mirakurun`) — TVTest・EDCB のような BonDriver クライアントだけ
+  でなく、ダッシュボードのプレビューと Mirakurun 互換 API 経由の視聴・録画 (EPGStation 等) も
+  同じ一覧に並ぶ。切断・グラフ・プレビューはどの方式でも同じように使える
+  (Mirakurun 経由の録画を切断すると EPGStation 側では録画失敗になる)
 
 **サーバー統計**
 - 総セッション数

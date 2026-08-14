@@ -66,6 +66,7 @@ pub async fn get_clients(
             let effective_exclusive = s.override_exclusive.unwrap_or(s.client_exclusive);
             json!({
                 "session_id": s.id,
+                "protocol": s.protocol.as_str(),
                 "address": s.addr,
                 "host": s.host,
                 "tuner_path": s.tuner_path,

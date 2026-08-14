@@ -414,12 +414,33 @@ sequenceDiagram
   スキャン優先度順に実行 (同時実行数上限あり、既定 1)。チューナー使用中は譲る (scan priority=0)。
 - **ts_analyzer**: PAT→SDT→NIT を解析し NID/SID/TSID・サービス名・物理 ch・リモコンキーを取得、
   `channels` に upsert。ARIB 文字は `aribb24` ラッパーでデコード (Linux の文字化け対応済み)。
-- **PassiveScanner**: 配信中の TS から同情報を抽出して DB を裏で更新 (`passive_scan_enabled`)。
 - **logo_collector**: 配信中 TS からロゴ (CDT) を収集し Web `/logos/:file` で配信。
+- **nit_collector** (2026-08-14): 配信中 TS の NIT (PID 0x0010) から、スキャンなら入るはずの
+  `channels.remote_control_key` / `physical_ch` / `network_name` を拾い、**NULL の列だけ**埋める
+  (`tuner/nit_collector.rs` → `nit_writer.rs` → `Database::fill_missing_terrestrial_metadata`)。
+  対象は CSV インポート・`POST /api/channels` で手動登録した行 — その 2 経路はこれらを NULL 固定で
+  INSERT するため、スキャンを回さない共有チューナー構成ではリモコンキーが永久に埋まらず、
+  EPGStation の番組表・放映中で当該局が末尾に固まっていた (`docs/EPGSTATION_COMPAT.md` §5.4)。
+  既存値は `COALESCE` で温存する (スキャン結果が常に優先)。照合は networkId 単位で、衛星は対象外。
+- `bon_drivers.passive_scan_enabled` は DB 列と設定 UI だけが残っており、**参照する実装は無い**。
+  上記 2 つのコレクタはこのフラグを見ずに常時動く。
 
 ### 4.7 Web ダッシュボード / API
 
 - axum。`/` に埋め込みVueダッシュボード (`web-ui/` を Vite ビルドして `rust-embed` で同梱)、`/api/*` に JSON API、`/api/events` にSSE更新イベント。
+- **クライアント一覧は BNDP と HTTP の両方を載せる (2026-08-14)**。`SessionRegistry` へ登録するのは
+  かつて BNDP セッション (`server/listener.rs`) だけで、HTTP 経由の視聴 —
+  ダッシュボードのプレビュー、および Mirakurun 互換 API 経由の EPGStation の視聴・録画 — は
+  チューナーを占有しながら一覧に出なかった (「チューナーが埋まっている理由は必ず画面に出す」に反する)。
+  HTTP 側は `web/http_session.rs` の `HttpStreamSession` が RAII で登録・解除する
+  (`StreamCleanup` が保持し、レスポンスボディの破棄 = 切断で解除)。
+  - `SessionInfo.protocol` (`bndp` / `http` / `mirakurun`) で経路が分かる。UI の「接続方式」列
+  - **セッション id は `SessionRegistry::allocate_id()` が全経路へ払い出す**。BNDP が自前で
+    connection_count を数えていたままだと HTTP と衝突する (同じ map・同じ切断 API を共有するため)
+  - `POST /api/clients/{id}/disconnect` は HTTP セッションにも効く。受け取った body ストリームは
+    そこで終了する (`web/stream.rs` の `shutdown_rx`)
+  - 統計は送信バイトから 1 秒に 1 回だけ反映する (`packets_sent` / ビットレート)。信号レベルと
+    ドロップ数は BNDP のような per-client の送信キューが無いため既定値のまま
 - 主なリソース: tuners / bondrivers (CRUD+scan+品質) / channels (CRUD+import/export+batch) /
   clients (品質・履歴・切断・制御) / session-history / alert-rules / scan-config / tuner-config / tsreplace-config /
   encode-profiles (CRUD、STREAMING_DESIGN.md §5.3 P5) / stream (HTTP-TS 配信、§6.3 P5) /

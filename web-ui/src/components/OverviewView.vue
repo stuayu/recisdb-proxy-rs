@@ -22,6 +22,7 @@ function closePreview() {
 type ClientColumn = { key: string; label: string }
 const clientColumns: ClientColumn[] = [
   { key: 'session_id', label: 'セッションID' },
+  { key: 'protocol', label: '接続方式' },
   { key: 'address', label: 'クライアント' },
   { key: 'host', label: 'ホスト名' },
   { key: 'status', label: '状態' },
@@ -47,7 +48,9 @@ function initialClientKeys(): string[] {
           (key): key is string =>
             typeof key === 'string' && clientColumns.some((column) => column.key === key),
         )
-        if (valid.length) return valid
+        // 接続方式は BNDP と HTTP(EPGStation 等)を見分ける唯一の列なので、
+        // 列構成を保存済みの利用者にも必ず出す(保存値には無い新しい列)。
+        if (valid.length) return valid.includes('protocol') ? valid : ['session_id', 'protocol', ...valid.filter((key) => key !== 'session_id')]
       }
     } catch {
       localStorage.removeItem(clientColumnsStorageKey)
@@ -79,6 +82,13 @@ function formatNumber(value: unknown, digits: number): string {
 }
 function cellText(row: JsonRecord, key: string): string {
   switch (key) {
+    case 'protocol':
+      // BNDP は TVTest/EDCB、mirakurun は EPGStation などの録画クライアント、
+      // http はダッシュボードのプレビュー。
+      return (
+        { bndp: 'BonDriver', http: 'HTTP', mirakurun: 'Mirakurun' }[String(row.protocol ?? '')] ??
+        '—'
+      )
     case 'status':
       return row.is_streaming ? '配信中' : '接続中'
     case 'channel':

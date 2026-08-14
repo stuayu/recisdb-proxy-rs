@@ -29,7 +29,8 @@ use crate::tuner::{EncoderPool, TunerPool};
 use auth::AuthConfig;
 use state::WebState;
 
-pub use state::{SessionInfo, SessionRegistry};
+pub mod http_session;
+pub use state::{SessionInfo, SessionProtocol, SessionRegistry};
 
 /// Build the `/api/*` router (auth middleware attached, no state bound yet).
 ///

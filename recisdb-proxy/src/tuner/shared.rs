@@ -16,6 +16,7 @@ use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
 use crate::tuner::epg_collector::EpgCollector;
+use crate::tuner::nit_collector::NitCollector;
 use crate::tuner::pool::{SlotPermit, TunerPool, TunerPoolConfig};
 use crate::tuner::timing;
 use crate::tuner::ts_source::TsSource;
@@ -1657,6 +1658,7 @@ impl SharedTuner {
         tokio::spawn(async move {
             let mut logo_collector = ChannelLogoCollector::new();
             let mut epg_collector = EpgCollector::new();
+            let mut nit_collector = NitCollector::new();
             let mut scramble_watch = ScrambleWatch::new();
 
             loop {
@@ -1665,6 +1667,7 @@ impl SharedTuner {
                         Ok(data) => {
                             logo_collector.process_ts_chunk(&data);
                             epg_collector.process_ts_chunk(&data);
+                            nit_collector.process_ts_chunk(&data);
                             scramble_watch.observe(&key, &data);
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {

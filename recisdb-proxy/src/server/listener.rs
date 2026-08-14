@@ -78,13 +78,13 @@ impl Server {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         info!("Server listening on {}", self.config.listen_addr);
 
-        let mut connection_count = 0u64;
-
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
-                    connection_count += 1;
-                    let session_id = connection_count;
+                    // Session ids come from the registry so that BNDP and the
+                    // HTTP stream paths (`web/http_session.rs`) never hand out
+                    // the same id — they share one map and one disconnect API.
+                    let session_id = self.session_registry.allocate_id();
 
                     info!("[Session {}] New connection from {}", session_id, addr);
 
@@ -177,7 +177,9 @@ async fn handle_connection(
     );
 
     // Register the session
-    let shutdown_rx = session_registry.register(session_id, addr).await;
+    let shutdown_rx = session_registry
+        .register(session_id, addr, crate::web::SessionProtocol::Bndp)
+        .await;
 
     let mut session = Session::new(
         session_id,

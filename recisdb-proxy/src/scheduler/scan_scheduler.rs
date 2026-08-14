@@ -958,14 +958,6 @@ fn physical_ch_for(nid: u16, tsid: u16, nit_physical_ch: Option<u8>) -> Option<u
     }
 }
 
-/// UHF center frequency (Hz) → physical channel 13-62.
-/// ch13 = 473 + 1/7 MHz, 6 MHz spacing (ISDB-T).
-fn uhf_channel_from_frequency(freq_hz: u32) -> Option<u8> {
-    let offset = freq_hz as i64 - 473_142_857;
-    let ch = 13 + (offset + 3_000_000).div_euclid(6_000_000);
-    (13..=62).contains(&ch).then_some(ch as u8)
-}
-
 /// BS/CS remote-control key (SID-based fixed assignment; neither band
 /// carries a NIT TS情報記述子, so unlike terrestrial this cannot come from
 /// the stream).
@@ -1215,18 +1207,8 @@ async fn perform_scan(
 mod tests {
     use super::*;
 
-    #[test]
-    fn uhf_channel_from_frequency_maps_center_frequencies() {
-        // ch13 = 473.142857 MHz, ch27 = 557.142857 MHz, ch52 = 707.142857 MHz
-        assert_eq!(uhf_channel_from_frequency(473_142_857), Some(13));
-        assert_eq!(uhf_channel_from_frequency(557_142_857), Some(27));
-        assert_eq!(uhf_channel_from_frequency(707_142_857), Some(52));
-        // ±3MHz 未満のずれは同じチャンネルに丸める
-        assert_eq!(uhf_channel_from_frequency(556_000_000), Some(27));
-        // UHF帯域外
-        assert_eq!(uhf_channel_from_frequency(200_000_000), None);
-        assert_eq!(uhf_channel_from_frequency(800_000_000), None);
-    }
+    // uhf_channel_from_frequency のテストは定義元
+    // (`ts_analyzer/nit.rs`) へ移動した。
 
     #[test]
     fn physical_ch_for_derives_satellite_transponder_from_tsid() {
@@ -1429,22 +1411,13 @@ fn build_ts_analysis(
     // only; BS/CS derive theirs from the TSID in scan_results_to_channel_infos).
     // The descriptor may list several frequencies (親局+中継局); the first
     // entry is the main transmitter, which is what channel files display.
-    let physical_ch = result
-        .nit
-        .as_ref()
-        .and_then(|nit| {
-            result
-                .transport_stream_id
-                .and_then(|tsid| nit.find_transport_stream(tsid))
-                .and_then(|ts| ts.terrestrial_delivery.as_ref())
-                .or_else(|| {
-                    nit.transport_streams
-                        .iter()
-                        .find_map(|ts| ts.terrestrial_delivery.as_ref())
-                })
-                .and_then(|d| d.frequencies.first().copied())
-        })
-        .and_then(uhf_channel_from_frequency);
+    let physical_ch = result.nit.as_ref().and_then(|nit| {
+        result
+            .transport_stream_id
+            .and_then(|tsid| nit.find_transport_stream(tsid))
+            .and_then(|ts| ts.physical_ch())
+            .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.physical_ch()))
+    });
 
     Ok(TsAnalysis {
         network_id: result.network_id,

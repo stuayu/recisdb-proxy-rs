@@ -54,6 +54,48 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Fill in terrestrial metadata columns that are still NULL, from a NIT
+    /// seen on a live stream (`tuner/nit_collector.rs`).
+    ///
+    /// Rows created by the manual routes (CSV import / `POST /api/channels`)
+    /// insert `remote_control_key` / `physical_ch` / `network_name` as NULL,
+    /// and nothing else fills them in afterwards — a scan is the only other
+    /// source. This is the repair path for them.
+    ///
+    /// Matching is by `nid` alone rather than `(nid, tsid)`: those manual rows
+    /// routinely carry a placeholder tsid, and they are exactly the rows this
+    /// exists to fix. A terrestrial network id maps to a single transport
+    /// stream, so the wider match cannot reach an unrelated multiplex — the
+    /// caller drops satellite entries, where one nid does span many tsids.
+    ///
+    /// Existing values are never overwritten (`COALESCE`), so a scan result
+    /// always outranks a live observation. Returns the number of rows changed.
+    pub fn fill_missing_terrestrial_metadata(
+        &self,
+        nid: u16,
+        remote_control_key: Option<u8>,
+        physical_ch: Option<u8>,
+        network_name: Option<&str>,
+    ) -> Result<usize> {
+        let changed = self.conn.execute(
+            "UPDATE channels SET
+                 remote_control_key = COALESCE(remote_control_key, ?1),
+                 physical_ch        = COALESCE(physical_ch, ?2),
+                 network_name       = COALESCE(network_name, ?3)
+             WHERE nid = ?4
+               AND ((remote_control_key IS NULL AND ?1 IS NOT NULL)
+                 OR (physical_ch IS NULL AND ?2 IS NOT NULL)
+                 OR (network_name IS NULL AND ?3 IS NOT NULL))",
+            params![
+                remote_control_key.map(|v| v as i32),
+                physical_ch.map(|v| v as i32),
+                network_name,
+                nid as i32,
+            ],
+        )?;
+        Ok(changed)
+    }
+
     /// Get channel by primary key (id).
     pub fn get_channel_by_id(&self, id: i64) -> Result<Option<ChannelRecord>> {
         let mut stmt = self.conn.prepare("SELECT * FROM channels WHERE id = ?1")?;
@@ -1100,6 +1142,71 @@ mod tests {
         info.bon_space = Some(0);
         info.bon_channel = Some(sid as u32);
         info
+    }
+
+    #[test]
+    fn fill_missing_terrestrial_metadata_only_fills_nulls() {
+        let db = Database::open_in_memory().unwrap();
+        let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+
+        // 手動登録相当: リモコンキー・物理チャンネル・ネットワーク名が NULL。
+        // tsid は nid と同値のプレースホルダ (CSV インポートで実際に起きる形)。
+        let manual = create_test_channel(0x7E87, 23608, 0x7E87);
+        db.insert_channel(bon_driver_id, &manual).unwrap();
+
+        // スキャン済み相当: 既に値が入っている別サービス。
+        let mut scanned = create_test_channel(0x7E87, 23610, 0x7E87);
+        scanned.remote_control_key = Some(5);
+        scanned.physical_ch = Some(20);
+        scanned.network_name = Some("スキャン済み".to_string());
+        db.insert_channel(bon_driver_id, &scanned).unwrap();
+
+        let changed = db
+            .fill_missing_terrestrial_metadata(0x7E87, Some(9), Some(16), Some("ＴＯＫＹＯ　ＭＸ"))
+            .unwrap();
+        assert_eq!(changed, 1, "欠損している行だけが更新される");
+
+        let filled = db
+            .get_channel_by_key(bon_driver_id, 0x7E87, 23608, 0x7E87, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filled.remote_control_key, Some(9));
+        assert_eq!(filled.physical_ch, Some(16));
+        assert_eq!(filled.network_name, Some("ＴＯＫＹＯ　ＭＸ".to_string()));
+
+        // 既存値はスキャン由来が優先。上書きしない
+        let untouched = db
+            .get_channel_by_key(bon_driver_id, 0x7E87, 23610, 0x7E87, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.remote_control_key, Some(5));
+        assert_eq!(untouched.physical_ch, Some(20));
+        assert_eq!(untouched.network_name, Some("スキャン済み".to_string()));
+
+        // 2 回目は変更なし (NitWriter がここで打ち切れる)
+        assert_eq!(
+            db.fill_missing_terrestrial_metadata(0x7E87, Some(9), Some(16), Some("ＴＯＫＹＯ　ＭＸ"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn fill_missing_terrestrial_metadata_ignores_other_networks() {
+        let db = Database::open_in_memory().unwrap();
+        let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
+        db.insert_channel(bon_driver_id, &create_test_channel(0x7E87, 23608, 0x7E87))
+            .unwrap();
+
+        assert_eq!(
+            db.fill_missing_terrestrial_metadata(0x7E88, Some(1), None, None).unwrap(),
+            0
+        );
+        let record = db
+            .get_channel_by_key(bon_driver_id, 0x7E87, 23608, 0x7E87, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.remote_control_key, None);
     }
 
     #[test]

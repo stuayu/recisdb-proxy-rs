@@ -48,6 +48,28 @@ impl NitTransportStream {
             .map(|d| d.frequencies.clone())
             .unwrap_or_default()
     }
+
+    /// Physical UHF channel of this transport stream (terrestrial only).
+    ///
+    /// The 地上分配システム記述子 may list several frequencies (親局+中継局);
+    /// the first entry is the main transmitter, which is what channel files
+    /// display. Shared by the scan path (`scheduler/scan_scheduler.rs`) and
+    /// the live NIT collector (`tuner/nit_collector.rs`) so the two cannot
+    /// derive different physical channels for the same stream.
+    pub fn physical_ch(&self) -> Option<u8> {
+        self.terrestrial_delivery
+            .as_ref()
+            .and_then(|d| d.frequencies.first().copied())
+            .and_then(uhf_channel_from_frequency)
+    }
+}
+
+/// UHF center frequency (Hz) → physical channel 13-62.
+/// ch13 = 473 + 1/7 MHz, 6 MHz spacing (ISDB-T).
+pub fn uhf_channel_from_frequency(freq_hz: u32) -> Option<u8> {
+    let offset = freq_hz as i64 - 473_142_857;
+    let ch = 13 + (offset + 3_000_000).div_euclid(6_000_000);
+    (13..=62).contains(&ch).then_some(ch as u8)
 }
 
 /// Parsed NIT (Network Information Table).
@@ -219,6 +241,39 @@ mod tests {
         assert_eq!(nit.transport_streams.len(), 1);
         assert_eq!(nit.transport_streams[0].transport_stream_id, 0x7FE1);
         assert_eq!(nit.transport_streams[0].original_network_id, 0x7FE0);
+    }
+
+    #[test]
+    fn uhf_channel_from_frequency_maps_center_frequencies() {
+        // ch13 = 473.142857 MHz, ch27 = 557.142857 MHz, ch52 = 707.142857 MHz
+        assert_eq!(uhf_channel_from_frequency(473_142_857), Some(13));
+        assert_eq!(uhf_channel_from_frequency(557_142_857), Some(27));
+        assert_eq!(uhf_channel_from_frequency(707_142_857), Some(52));
+        // ±3MHz 未満のずれは同じチャンネルに丸める
+        assert_eq!(uhf_channel_from_frequency(556_000_000), Some(27));
+        // UHF帯域外
+        assert_eq!(uhf_channel_from_frequency(200_000_000), None);
+        assert_eq!(uhf_channel_from_frequency(800_000_000), None);
+    }
+
+    #[test]
+    fn physical_ch_uses_the_first_listed_frequency() {
+        let mut ts = NitTransportStream {
+            transport_stream_id: 0x7FE1,
+            original_network_id: 0x7FE0,
+            descriptors: vec![],
+            terrestrial_delivery: None,
+            remote_control_key: None,
+        };
+        // 地上分配システム記述子が無ければ物理チャンネルは決まらない
+        assert_eq!(ts.physical_ch(), None);
+
+        ts.terrestrial_delivery = Some(TerrestrialDeliveryDescriptor {
+            // 親局 (ch27) が先頭、以降は中継局
+            frequencies: vec![557_142_857, 473_142_857],
+            ..Default::default()
+        });
+        assert_eq!(ts.physical_ch(), Some(27));
     }
 
     #[test]

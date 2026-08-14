@@ -50,11 +50,43 @@ pub struct TunerConfigInfo {
     pub jitter_safety_factor: f64,
 }
 
+/// How a session reaches the proxy.
+///
+/// The dashboard's client list used to show BNDP sessions only, because that
+/// was the only path that registered itself. HTTP viewers (the dashboard's
+/// own preview, and everything going through the Mirakurun-compatible API —
+/// EPGStation's live viewing and recording) occupied tuners while staying
+/// invisible, which breaks the rule that a busy tuner must always show why
+/// (CLAUDE.md, Web ダッシュボード). Both paths now register; this says which
+/// one a row came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionProtocol {
+    /// BonDriver proxy protocol over TCP (`server/listener.rs`) — TVTest/EDCB.
+    Bndp,
+    /// Dashboard HTTP stream (`GET /api/stream/service/...`).
+    Http,
+    /// Mirakurun-compatible HTTP API (`web/mirakurun.rs`) — EPGStation etc.
+    Mirakurun,
+}
+
+impl SessionProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionProtocol::Bndp => "bndp",
+            SessionProtocol::Http => "http",
+            SessionProtocol::Mirakurun => "mirakurun",
+        }
+    }
+}
+
 /// Information about an active session.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
     /// Session ID.
     pub id: u64,
+    /// Which transport this session arrived on.
+    pub protocol: SessionProtocol,
     /// Client address.
     pub addr: String,
     /// Client hostname (reverse DNS).
@@ -127,6 +159,12 @@ impl SessionInfo {
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<u64, SessionInfo>>,
     shutdown_txs: RwLock<HashMap<u64, mpsc::Sender<()>>>,
+    /// Source of session ids for **every** transport. BNDP used to count its
+    /// own accepted connections; HTTP sessions share the same id space (they
+    /// live in the same map and are addressed by the same
+    /// `POST /api/clients/:id/disconnect`), so the counter has to be shared
+    /// or the two would collide.
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 /// Session metrics history for sparklines.
@@ -166,11 +204,18 @@ impl SessionRegistry {
         Self {
             sessions: RwLock::new(HashMap::new()),
             shutdown_txs: RwLock::new(HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
+    /// Allocate the next session id. Shared by every transport — see
+    /// [`SessionRegistry::next_id`].
+    pub fn allocate_id(&self) -> u64 {
+        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Register a new session.
-    pub async fn register(&self, id: u64, addr: SocketAddr) -> mpsc::Receiver<()> {
+    pub async fn register(&self, id: u64, addr: SocketAddr, protocol: SessionProtocol) -> mpsc::Receiver<()> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let ip = addr.ip();
         let host = tokio::task::spawn_blocking(move || lookup_addr(&ip).ok())
@@ -179,6 +224,7 @@ impl SessionRegistry {
             .flatten();
         let info = SessionInfo {
             id,
+            protocol,
             addr: addr.to_string(),
             host,
             tuner_path: None,
@@ -536,7 +582,7 @@ mod tests {
     async fn update_stats_propagates_loss_breakdown() {
         let registry = SessionRegistry::new();
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let _shutdown_rx = registry.register(1, addr).await;
+        let _shutdown_rx = registry.register(1, addr, SessionProtocol::Bndp).await;
 
         registry
             .update_stats(
@@ -566,6 +612,7 @@ mod tests {
     fn session_info_loss_fields_serialize_to_json() {
         let info = SessionInfo {
             id: 42,
+            protocol: SessionProtocol::Bndp,
             addr: "127.0.0.1:1".to_string(),
             host: None,
             tuner_path: None,

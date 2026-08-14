@@ -121,10 +121,11 @@
 //! in-memory database and `tower::ServiceExt::oneshot`.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -136,13 +137,14 @@ use serde_json::json;
 use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
 use crate::tuner::logo_collector::{collected_logo_keys, logo_path};
+use crate::web::http_session::HttpStreamSession;
 use crate::web::mirakurun_program_stream;
-use crate::web::state::WebState;
+use crate::web::state::{SessionProtocol, WebState};
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    service_filtered_body_stream, BodyReceiver, StreamCleanup,
+    service_filtered_body_stream, session_info_for, BodyReceiver, StreamCleanup,
 };
-use recisdb_protocol::BandType;
+use recisdb_protocol::{BandType, StreamClass};
 
 // ============================================================================
 // Service id <-> (nid, sid) conversion
@@ -976,6 +978,7 @@ fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
 /// [`parse_mirakurun_priority`]) but not otherwise acted on.
 pub async fn stream_service_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path(id): Path<u64>,
     headers: HeaderMap,
 ) -> Response {
@@ -1003,8 +1006,15 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
+    let (session, shutdown_rx) = HttpStreamSession::register(
+        Arc::clone(&web_state.session_registry),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::View),
+    )
+    .await;
+
     let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
+    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
+        .with_session(session, shutdown_rx);
     respond_with_stream(service_filtered_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup, sid))
 }
 
@@ -1019,6 +1029,7 @@ pub async fn stream_service_by_mirakurun_id(
 /// its module doc comment).
 pub async fn stream_channel_by_type(
     State(web_state): State<Arc<WebState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path((channel_type, channel_str)): Path<(String, String)>,
 ) -> Response {
     let Some(candidates) = mirakurun_type_to_band_candidates(&channel_type) else {
@@ -1077,8 +1088,15 @@ pub async fn stream_channel_by_type(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
+    let (session, shutdown_rx) = HttpStreamSession::register(
+        Arc::clone(&web_state.session_registry),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::View),
+    )
+    .await;
+
     let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
+    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
+        .with_session(session, shutdown_rx);
     respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
 }
 
@@ -1249,6 +1267,7 @@ pub async fn get_logo(Path(id): Path<u64>) -> Response {
 /// [`stream_service_by_mirakurun_id`].
 pub async fn stream_program_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path(id): Path<u64>,
     headers: HeaderMap,
 ) -> Response {
@@ -1294,8 +1313,16 @@ pub async fn stream_program_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
+    // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
+    let (session, shutdown_rx) = HttpStreamSession::register(
+        Arc::clone(&web_state.session_registry),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::Record),
+    )
+    .await;
+
     let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool));
+    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
+        .with_session(session, shutdown_rx);
     respond_with_stream(mirakurun_program_stream::gated_program_stream(
         tuner_rx, cleanup, sid, event_id, deadline,
     ))

@@ -23,11 +23,12 @@
 //! STREAMING_DESIGN.md §7.1) can build its own passthrough streams on top of
 //! the exact same response-body machinery instead of re-implementing it.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -37,7 +38,7 @@ use futures::stream::{self, Stream};
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::database::Database;
 use crate::server::channel_resolve::{self, ChannelResolveError};
@@ -45,7 +46,9 @@ use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{SYNC_BYTE, TS_PACKET_SIZE};
 use crate::tuner::encoder_pool::{self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
-use crate::web::state::WebState;
+use crate::web::http_session::{HttpStreamSession, HttpStreamSessionInfo};
+use crate::web::state::{SessionProtocol, WebState};
+use recisdb_protocol::StreamClass;
 
 /// Query parameters for `GET /api/stream/service/:sid`.
 #[derive(Debug, Deserialize)]
@@ -117,6 +120,16 @@ pub(crate) struct StreamCleanup {
     /// tracked subscription.
     parked_tuner_sub: Option<TunerSubscription>,
     encoder: Option<EncoderCleanup>,
+    /// Dashboard registration for this stream (`web/http_session.rs`).
+    /// Dropping it removes the row from the client list, so it belongs to the
+    /// same RAII story as the subscriptions above. `None` only in tests and
+    /// on paths that could not determine a peer address.
+    session: Option<HttpStreamSession>,
+    /// Receiver for `POST /api/clients/{id}/disconnect`, handed to the body
+    /// stream when it is built (see [`StreamCleanup::take_shutdown`]). Kept
+    /// here rather than in a separate parameter so that every existing
+    /// `broadcast_to_body_stream(rx, cleanup)` call site keeps working.
+    shutdown_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl StreamCleanup {
@@ -126,7 +139,28 @@ impl StreamCleanup {
     /// (無変換) が既定"). The subscription itself is expected to live in the
     /// sibling `BodyReceiver::Tuner`, not here.
     pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
-        Self { tuner, tuner_pool, parked_tuner_sub: None, encoder: None }
+        Self { tuner, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+    }
+
+    /// Attach the dashboard registration for this stream, together with the
+    /// remote-disconnect receiver it was given.
+    pub(crate) fn with_session(mut self, session: HttpStreamSession, shutdown_rx: mpsc::Receiver<()>) -> Self {
+        self.session = Some(session);
+        self.shutdown_rx = Some(shutdown_rx);
+        self
+    }
+
+    /// Take the remote-disconnect receiver out for the body stream to poll.
+    fn take_shutdown(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.shutdown_rx.take()
+    }
+
+    /// Account for a chunk handed to the client, when this stream is
+    /// registered on the dashboard.
+    fn record_sent(&self, len: usize) {
+        if let Some(session) = self.session.as_ref() {
+            session.record_sent(len);
+        }
     }
 }
 
@@ -167,6 +201,10 @@ impl Drop for StreamCleanup {
 /// check (Rust drops a struct's fields in declaration order).
 struct StreamState {
     rx: BodyReceiver,
+    /// Fires when the dashboard asks this client to disconnect
+    /// (`POST /api/clients/{id}/disconnect`). `None` for unregistered
+    /// streams, which then simply have no remote-shutdown path.
+    shutdown_rx: Option<mpsc::Receiver<()>>,
     _cleanup: StreamCleanup,
 }
 
@@ -181,12 +219,33 @@ struct StreamState {
 /// normally, which the browser/mpegts.js/ffmpeg observes as EOF.
 pub(crate) fn broadcast_to_body_stream(
     rx: BodyReceiver,
-    cleanup: StreamCleanup,
+    mut cleanup: StreamCleanup,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    stream::unfold(StreamState { rx, _cleanup: cleanup }, |mut state| async move {
+    let shutdown_rx = cleanup.take_shutdown();
+
+    stream::unfold(StreamState { rx, shutdown_rx, _cleanup: cleanup }, |mut state| async move {
         loop {
-            match state.rx.recv().await {
-                Ok(data) => return Some((Ok(data), state)),
+            let received = match state.shutdown_rx.as_mut() {
+                Some(shutdown_rx) => {
+                    tokio::select! {
+                        // Dashboard-initiated disconnect: end the body, which
+                        // drops the cleanup guard (tuner subscription and
+                        // dashboard registration) just like a client hangup.
+                        _ = shutdown_rx.recv() => {
+                            debug!("[HTTP stream] disconnect requested from the dashboard");
+                            return None;
+                        }
+                        received = state.rx.recv() => received,
+                    }
+                }
+                None => state.rx.recv().await,
+            };
+
+            match received {
+                Ok(data) => {
+                    state._cleanup.record_sent(data.len());
+                    return Some((Ok(data), state));
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     debug!("[HTTP stream] receiver lagged, skipped {} chunks", n);
                     continue;
@@ -272,6 +331,8 @@ impl TsAligner {
 /// same reason [`StreamState`]'s does: `rx` must drop before `_cleanup`.
 struct FilteredStreamState {
     rx: BodyReceiver,
+    /// See [`StreamState::shutdown_rx`].
+    shutdown_rx: Option<mpsc::Receiver<()>>,
     filter: TsServiceFilter,
     aligner: TsAligner,
     _cleanup: StreamCleanup,
@@ -305,11 +366,12 @@ struct FilteredStreamState {
 /// the same warm-up real Mirakurun has.
 pub(crate) fn service_filtered_body_stream(
     rx: BodyReceiver,
-    cleanup: StreamCleanup,
+    mut cleanup: StreamCleanup,
     target_sid: u16,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let state = FilteredStreamState {
         rx,
+        shutdown_rx: cleanup.take_shutdown(),
         filter: TsServiceFilter::new(target_sid),
         aligner: TsAligner::new(),
         _cleanup: cleanup,
@@ -317,13 +379,27 @@ pub(crate) fn service_filtered_body_stream(
 
     stream::unfold(state, |mut state| async move {
         loop {
-            match state.rx.recv().await {
+            let received = match state.shutdown_rx.as_mut() {
+                Some(shutdown_rx) => {
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            debug!("[HTTP stream] disconnect requested from the dashboard");
+                            return None;
+                        }
+                        received = state.rx.recv() => received,
+                    }
+                }
+                None => state.rx.recv().await,
+            };
+
+            match received {
                 Ok(data) => {
                     let Some(chunk) = state.aligner.push(&data) else { continue };
                     let filtered = state.filter.filter(&chunk);
                     if filtered.is_empty() {
                         continue;
                     }
+                    state._cleanup.record_sent(filtered.len());
                     return Some((Ok(Bytes::from(filtered)), state));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -427,6 +503,7 @@ fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u
 /// broadcast service_id — the dashboard UI uses `stream_service_by_sid`.
 pub async fn stream_service(
     State(web_state): State<Arc<WebState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path(sid): Path<i64>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
@@ -438,7 +515,7 @@ pub async fn stream_service(
         Ok(r) => r,
         Err(e) => return channel_resolve_error_response(sid, &e),
     };
-    stream_resolved(web_state, resolved, query, sid).await
+    stream_resolved(web_state, resolved, query, sid, peer).await
 }
 
 /// `GET /api/stream/service/by-sid/:sid[?profile=preview]` — same streaming
@@ -446,6 +523,7 @@ pub async fn stream_service(
 /// as SID everywhere).
 pub async fn stream_service_by_sid(
     State(web_state): State<Arc<WebState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Path(sid): Path<u16>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
@@ -457,7 +535,40 @@ pub async fn stream_service_by_sid(
         Ok(r) => r,
         Err(e) => return channel_resolve_error_response(sid as i64, &e),
     };
-    stream_resolved(web_state, resolved, query, sid as i64).await
+    stream_resolved(web_state, resolved, query, sid as i64, peer).await
+}
+
+/// Build the dashboard registration payload for a resolved channel.
+///
+/// `channel_info` is formatted the same way the BNDP path formats it
+/// (`server/session.rs::apply_channel_metadata`) so both kinds of row read
+/// alike in the client list.
+pub(crate) fn session_info_for(
+    protocol: SessionProtocol,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    resolved: &channel_resolve::ResolvedService,
+    stream_class: StreamClass,
+) -> HttpStreamSessionInfo {
+    let channel = &resolved.channel;
+
+    HttpStreamSessionInfo {
+        protocol,
+        // `ConnectInfo` is only present when the app is served via
+        // `into_make_service_with_connect_info` (it is, in `web/mod.rs`) —
+        // the fallback keeps this an optional extractor so a request can
+        // never fail with 500 just because the peer address is unavailable,
+        // the same treatment the access log gives it.
+        addr: peer.map(|ConnectInfo(addr)| addr),
+        tuner_path: Some(resolved.dll_path.clone()),
+        channel_name: channel.channel_name.clone().or_else(|| channel.raw_name.clone()),
+        channel_info: match (channel.bon_space, channel.bon_channel) {
+            (Some(space), Some(bon_channel)) => Some(format!("Space {}, Ch {}", space, bon_channel)),
+            _ => None,
+        },
+        nid: Some(channel.nid),
+        sid: Some(channel.sid),
+        stream_class,
+    }
 }
 
 /// Shared body of the two `stream_service*` handlers once the channel row
@@ -467,11 +578,20 @@ async fn stream_resolved(
     resolved: channel_resolve::ResolvedService,
     query: StreamQuery,
     sid: i64,
+    peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Response {
     let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(sid, &e),
     };
+
+    // Show up in the dashboard's client list for as long as the body lives
+    // (`web/http_session.rs`).
+    let (session, shutdown_rx) = HttpStreamSession::register(
+        Arc::clone(&web_state.session_registry),
+        session_info_for(SessionProtocol::Http, peer, &resolved, StreamClass::View),
+    )
+    .await;
 
     // Tracked subscription: keeps the tuner counted as "in use" for as long
     // as this HTTP response body is alive, exactly like a BNDP session's
@@ -492,12 +612,8 @@ async fn stream_resolved(
 
     if profile.is_empty() {
         info!("[HTTP stream] service {} -> raw passthrough (tuner={:?})", sid, resolved.channel_key);
-        let cleanup = StreamCleanup {
-            tuner: Arc::clone(&tuner),
-            tuner_pool: Arc::clone(&web_state.tuner_pool),
-            parked_tuner_sub: None,
-            encoder: None,
-        };
+        let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
+            .with_session(session, shutdown_rx);
         return respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup));
     }
 
@@ -555,7 +671,10 @@ async fn stream_resolved(
                     key,
                     encoder,
                 }),
-            };
+                session: None,
+                shutdown_rx: None,
+            }
+            .with_session(session, shutdown_rx);
             respond_with_stream(broadcast_to_body_stream(BodyReceiver::Encoder(enc_rx), cleanup))
         }
         Err(EncoderPoolError::Saturated) => {
@@ -709,6 +828,8 @@ mod tests {
             tuner_pool: Arc::clone(&tuner_pool),
             parked_tuner_sub: Some(sub),
             encoder: None,
+            session: None,
+            shutdown_rx: None,
         };
         drop(cleanup);
 
