@@ -44,9 +44,62 @@ pub struct ChannelLogoCollector {
     output_dir: PathBuf,
 }
 
+/// Directory the collected logos live in.
+///
+/// Every reader of the logo files goes through here (the Mirakurun-compatible
+/// `hasLogoData`/`getLogoImage` endpoints and the dashboard's `/logos/:file`)
+/// so the collector stays the single authority on where they are written.
+pub fn logo_dir() -> PathBuf {
+    PathBuf::from("logos")
+}
+
+/// File name a logo is stored under: `<nid>_<sid>.png`.
+pub fn logo_file_name(nid: u16, sid: u16) -> String {
+    format!("{}_{}.png", nid, sid)
+}
+
+/// Full path of one service's logo. The file only exists once the logo has
+/// been seen on a live stream from that network — CDT logos are only carried
+/// in the broadcast itself, so a service has no logo until it (or another
+/// service on the same network) has been tuned at least once.
+pub fn logo_path(nid: u16, sid: u16) -> PathBuf {
+    logo_dir().join(logo_file_name(nid, sid))
+}
+
+/// The `(nid, sid)` pairs a logo file currently exists for.
+///
+/// Read once per request that needs it: callers such as `GET /services`
+/// answer `hasLogoData` for hundreds of services, and stat-ing each one
+/// separately would be hundreds of syscalls per request. Returns an empty
+/// set when the directory cannot be read (no logos collected yet).
+pub fn collected_logo_keys() -> HashSet<(u16, u16)> {
+    collected_logo_keys_in(&logo_dir())
+}
+
+/// [`collected_logo_keys`] against an explicit directory.
+pub fn collected_logo_keys_in(dir: &std::path::Path) -> HashSet<(u16, u16)> {
+    let mut keys = HashSet::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return keys;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".png") else { continue };
+        let Some((nid, sid)) = stem.split_once('_') else { continue };
+        let (Ok(nid), Ok(sid)) = (nid.parse::<u16>(), sid.parse::<u16>()) else {
+            continue;
+        };
+        keys.insert((nid, sid));
+    }
+
+    keys
+}
+
 impl ChannelLogoCollector {
     pub fn new() -> Self {
-        let output_dir = PathBuf::from("logos");
+        let output_dir = logo_dir();
         if let Err(e) = fs::create_dir_all(&output_dir) {
             warn!("[LogoCollector] Failed to create logo directory {:?}: {}", output_dir, e);
         }
@@ -186,7 +239,7 @@ impl ChannelLogoCollector {
                 continue;
             }
 
-            let path = self.output_dir.join(format!("{}_{}.png", nid, sid));
+            let path = self.output_dir.join(logo_file_name(nid, *sid));
             if path.exists() {
                 self.saved_keys.insert(key);
                 continue;
@@ -472,4 +525,60 @@ fn png_crc32(data: &[u8]) -> u32 {
         crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch directory of this test's own. `std::env::temp_dir()` is
+    /// shared, so the name carries the test name to keep parallel tests apart.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("recisdb-proxy-logo-test-{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the test directory");
+        dir
+    }
+
+    #[test]
+    fn logo_file_name_is_nid_underscore_sid() {
+        assert_eq!(logo_file_name(32416, 21504), "32416_21504.png");
+        assert_eq!(logo_path(4, 211), logo_dir().join("4_211.png"));
+    }
+
+    #[test]
+    fn collected_logo_keys_reads_the_nid_and_sid_out_of_the_file_names() {
+        let dir = scratch_dir("keys");
+        fs::write(dir.join(logo_file_name(32416, 21504)), b"png").unwrap();
+        fs::write(dir.join(logo_file_name(4, 211)), b"png").unwrap();
+
+        let keys = collected_logo_keys_in(&dir);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&(32416, 21504)));
+        assert!(keys.contains(&(4, 211)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collected_logo_keys_ignores_files_that_are_not_a_logo() {
+        let dir = scratch_dir("ignore");
+        fs::write(dir.join("readme.txt"), b"x").unwrap();
+        fs::write(dir.join("32416.png"), b"x").unwrap();
+        fs::write(dir.join("nid_sid.png"), b"x").unwrap();
+        // 70000 does not fit in a u16 network id
+        fs::write(dir.join("70000_1.png"), b"x").unwrap();
+
+        assert!(collected_logo_keys_in(&dir).is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collected_logo_keys_is_empty_when_no_logo_has_been_collected_yet() {
+        let missing = std::env::temp_dir().join("recisdb-proxy-logo-test-missing");
+        let _ = fs::remove_dir_all(&missing);
+
+        assert!(collected_logo_keys_in(&missing).is_empty());
+    }
 }

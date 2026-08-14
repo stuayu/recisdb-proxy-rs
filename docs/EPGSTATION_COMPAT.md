@@ -187,7 +187,7 @@ mirakurunAPIPath: '/api'
 
 ### 実害が小さいもの
 
-- `GET /services/{id}/logo` (`getLogoImage`) — `ChannelApiModel.ts:101`。`hasLogoData: false` を返している限り EPGStation はロゴを要求しない
+- `GET /services/{id}/logo` (`getLogoImage`) — `ChannelApiModel.ts:101`。実装済み (2026-08-14)。ロゴ収集器 (`tuner/logo_collector.rs`) が CDT から取り出して `logos/<nid>_<sid>.png` へ保存したものを返す。EPGStation は `hasLogoData` が `true` のサービスにしかロゴを要求しないため、まだ一度も選局していない局は従来どおり要求されない
 
 ## 4. データ構造の要求
 
@@ -405,7 +405,7 @@ proxy 側は全地上波を `GR` に入れていたため、EPGStation の番組
 | `GET /status` | 実装済み (`tunerCount` は 2026-08-12 修正) | `tunerCount` は `bon_drivers` の行数 (旧実装は `TunerPool` のキー数を数えており、14 台のサーバーが 1 を返していた)。§5.2-4 |
 | `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12 修正) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`remoteControlKeyId` は地上波のみ。§5.2-1/2/3 |
 | `GET /services/{id}/stream` | 実装済み (2026-08-12 にサービスフィルタ追加) | `TsServiceFilter` で対象サービスのみへ絞る (旧実装は multiplex 全体)。§5.2-5/6 |
-| `GET /services/{id}/logo` | スタブ (404) | `hasLogoData` が常に `false` なので EPGStation からは呼ばれない。`/docs` との整合のためルートだけ存在する |
+| `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
 | `X-Mirakurun-Priority` | **受理のみ** | パースしてログに出すが、チューナー競合には反映していない。**録画がライブ視聴に負ける状態は解消していない**。反映には `tuner/policy.rs::decide()` の設計変更が要る (CLAUDE.md「選局」の不変条件) |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` / `video` / `audio` / `relatedItems` | 無し | 番組詳細が埋まらない・イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 (`EPGUpdateManageModel.ts:144-147`) |

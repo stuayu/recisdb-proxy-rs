@@ -28,7 +28,7 @@ pub async fn get_logo(Path(file): Path<String>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, "invalid logo file").into_response();
     }
 
-    let path = std::path::PathBuf::from("logos").join(&file);
+    let path = crate::tuner::logo_collector::logo_dir().join(&file);
     if !path.exists() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

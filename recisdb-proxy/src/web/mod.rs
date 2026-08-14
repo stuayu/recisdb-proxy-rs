@@ -153,7 +153,7 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
         .route("/tuners", get(mirakurun::get_tuners))
         .route("/config/server", get(mirakurun::get_server_config))
         .route("/services/:id/stream", get(mirakurun::stream_service_by_mirakurun_id))
-        .route("/services/:id/logo", get(mirakurun::get_logo_stub))
+        .route("/services/:id/logo", get(mirakurun::get_logo))
         .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
         .route("/programs/:id/stream", get(mirakurun::stream_program_by_mirakurun_id))
         // Incremental EPG update stream — see `mirakurun_events.rs` module

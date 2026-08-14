@@ -61,10 +61,13 @@
 //!   **and** have a scanned physical assignment (`bon_channel` present) — an
 //!   unscanned row has no meaningful `channel` string to report and nothing
 //!   to stream.
-//! - Service logos (`GET /api/services/:id/logo`, `logoId`/`hasLogoData`) are
-//!   not implemented; `hasLogoData` is always reported `false`. This
-//!   project's own `/logos/:file` convention (`<nid>_<sid>.png`) is not
-//!   wired up to the Mirakurun logo endpoint.
+//! - Service logos are served from this project's own logo store
+//!   (`logos/<nid>_<sid>.png`, filled by `tuner/logo_collector.rs` from CDT on
+//!   live streams): `hasLogoData` reports whether that file exists and
+//!   `GET /api/services/:id/logo` returns it. `logoId` is not reported — it is
+//!   the broadcast's logo identifier, which nothing in EPGStation reads (it
+//!   keys off `hasLogoData` alone). A service that has never been tuned has no
+//!   logo file and so reports `hasLogoData: false`.
 //! - `X-Mirakurun-Priority` (sent on both stream endpoints, real and EPG-
 //!   Station-specific: `recPriority`/`conflictPriority`/`streamingPriority`)
 //!   is accepted and parsed but **not** fed into tuner-contention decisions
@@ -132,6 +135,7 @@ use serde_json::json;
 
 use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
+use crate::tuner::logo_collector::{collected_logo_keys, logo_path};
 use crate::web::mirakurun_program_stream;
 use crate::web::state::WebState;
 use crate::web::stream::{
@@ -875,6 +879,10 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
     let terrestrial_types = terrestrial_type_map(&unique, &web_state.mirakurun_home_regions);
     let channel_strings = assign_channel_strings(&unique, &terrestrial_types);
 
+    // Read the logo directory once instead of stat-ing each of the several
+    // hundred services — see [`collected_logo_keys`].
+    let logo_keys = collected_logo_keys();
+
     let services: Vec<MirakurunService> = unique
         .iter()
         .filter_map(|c| {
@@ -892,7 +900,7 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
                     channel_type: ty.clone(),
                     channel: ch_str.clone(),
                 }],
-                has_logo_data: false,
+                has_logo_data: logo_keys.contains(&(c.nid, c.sid)),
             })
         })
         .collect();
@@ -1187,18 +1195,32 @@ pub async fn get_server_config() -> Response {
     .into_response()
 }
 
-/// `GET /mirakurun/api/services/:id/logo` — **placeholder, not
-/// implemented**.
+/// `GET /mirakurun/api/services/:id/logo`.
 ///
-/// Declared in `/docs` (`getLogoImage`) for completeness, but every service
-/// this API reports has `hasLogoData: false` ([`get_services`]) — real
-/// Mirakurun clients, including EPGStation's `ChannelApiModel.ts:101`, only
-/// call this when a service's `hasLogoData` is `true`, so in practice this
-/// route is never hit. Answers `404` rather than `501`: unlike the
-/// programs/events endpoints, this one has a well-defined "correct" empty
-/// answer ("this service has no logo") rather than "not built yet".
-pub async fn get_logo_stub(Path(id): Path<u64>) -> Response {
-    error_response(StatusCode::NOT_FOUND, format!("service {} has no logo", id))
+/// Serves the PNG the logo collector extracted from CDT on a live stream
+/// (`tuner/logo_collector.rs`, stored as `logos/<nid>_<sid>.png`). Real
+/// Mirakurun answers this from its own logo store and EPGStation proxies it
+/// straight through as `GET /api/channels/:id/logo`, so the response has to
+/// be the raw image — no envelope.
+///
+/// `404` when the file is not there: logos only exist for networks that have
+/// been tuned at least once, so "no logo yet" is a normal answer, and it
+/// matches what [`get_services`] reports through `hasLogoData` (clients only
+/// call this endpoint when that flag is true).
+pub async fn get_logo(Path(id): Path<u64>) -> Response {
+    let Some((nid, sid)) = split_mirakurun_service_id(id) else {
+        return error_response(StatusCode::BAD_REQUEST, format!("invalid service id {}", id));
+    };
+
+    match tokio::fs::read(logo_path(nid, sid)).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "image/png")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => error_response(StatusCode::NOT_FOUND, format!("service {} has no logo", id)),
+    }
 }
 
 /// `GET /mirakurun/api/programs/:id/stream`.
@@ -1832,6 +1854,36 @@ mod tests {
         assert_eq!(channel.len(), 1);
         assert_eq!(channel[0]["type"], "GR");
         assert_eq!(channel[0]["channel"], "27");
+    }
+
+    // ------------------------------------------------------------------
+    // hasLogoData / getLogoImage
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn has_logo_data_follows_whether_a_logo_file_was_collected() {
+        let dir = std::env::temp_dir().join("recisdb-proxy-mirakurun-logo-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("32416_21504.png"), b"png").unwrap();
+
+        // Same lookup `get_services` does per service.
+        let keys = crate::tuner::logo_collector::collected_logo_keys_in(&dir);
+        assert!(keys.contains(&(32416, 21504)), "a collected logo is reported");
+        assert!(
+            !keys.contains(&(32416, 21505)),
+            "a service whose network has been tuned but that has no logo file of its own is not"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn logo_endpoint_rejects_an_id_that_is_not_a_mirakurun_service_id() {
+        // `get_logo` answers 400 (not 404) for these — the id could never have
+        // named a service, so it is a malformed request rather than a miss.
+        assert!(split_mirakurun_service_id(u64::MAX).is_none());
+        assert_eq!(split_mirakurun_service_id(mirakurun_service_id(32416, 21504)), Some((32416, 21504)));
     }
 
     // ------------------------------------------------------------------
