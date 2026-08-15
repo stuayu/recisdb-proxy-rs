@@ -254,6 +254,22 @@ function formatSize(bytes: number | null) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+// GitHub API は ISO8601 (UTC) を返すので JST に直して表示する
+function formatJst(iso: string | null) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('ja-JP', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
 async function applyDevBuild(build: DevBuild) {
   if (build.artifact_id == null) return
   const ok = window.confirm(
@@ -496,7 +512,7 @@ onMounted(() => {
             <tr v-for="build in devBuilds.builds" :key="build.run_id">
               <td data-label="ブランチ" v-text="build.branch ?? '—'" />
               <td data-label="コミット" v-text="(build.sha ?? '').slice(0, 7) || '—'" />
-              <td data-label="日時" v-text="build.created_at ?? '—'" />
+              <td data-label="日時" v-text="formatJst(build.created_at)" />
               <td data-label="サイズ" v-text="formatSize(build.size_in_bytes)" />
               <td data-label="操作">
                 <button
