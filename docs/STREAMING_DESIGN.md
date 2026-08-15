@@ -492,6 +492,27 @@ CREATE TABLE encode_profiles(
   複数一致時は `is_enabled DESC, priority DESC, id ASC` で決定的に1件選ぶ)。
   Mirakurun 側のストリームは **passthrough 固定** (生 TS、`?profile=` 等の変換クエリは実装しない —
   §7.1 の「passthrough が既定」の通り)。
+- **複数候補への対応 (2026-08 追加)**: `channels` テーブルは (BonDriver, サービス) ごとに1行のため、
+  同じサービスが複数の BonDriver に載っていることがある (実例: 実サーバーで SID 21520 が3行 —
+  他ドライバは満杯だが別の1台では既に稼働中だった)。これまで `resolve_service_by_sid`/
+  `resolve_service_by_nid_sid` は `LIMIT 1` で先頭行しか返さず、`tuner::acquire::acquire` に
+  単一候補しか渡していなかったため、その1行のドライバが埋まっていると他ドライバで既に配信中でも
+  503 になっていた。`database/channel.rs` に `get_channels_by_sid`/`get_channels_by_nid_sid`
+  (`LIMIT` なし、既存単数版と同じ `ORDER BY is_enabled DESC, priority DESC, id ASC`) を追加し、
+  `ResolvedService` を「代表行 `channel` + 全候補 `candidates: Vec<CandidateTarget>`」の形に変更。
+  `resolve_service_by_sid`/`resolve_service_by_nid_sid` は enabled な行それぞれを物理ターゲットへ解決し
+  (`(dll_path, space, channel)` で重複排除)、`start_tuner_for_service` は全候補の `channel_key` を
+  `acquire()` に渡す。ドライバ選択・既存リーダーへの相乗り (`Decision::Reuse`) は変わらず
+  `tuner::policy::decide` の仕事——本モジュールは候補リストを組み立てるだけで、`decide`/`acquire`
+  自体は変更していない。`resolve_service`(`channels.id` 直指定) は従来どおり単一候補のまま
+  (`channels.id` は「この行のこのドライバ」を明示的に指す契約のため広げない)。
+  `ChannelResolveError::Busy` は `drivers: usize` フィールドを追加し「全何台の候補ドライバが
+  埋まっているか」を伝える (`running`/`max`/`path` は先頭候補=最高優先度候補のもの)。
+  `acquire()` が実際にどの候補を選んだかは `AcquireOutcome::key`(= 起動/合流した `SharedTuner::key`)
+  でのみ分かるため、`web/stream.rs::session_info_for` はダッシュボードのクライアント一覧に出す
+  `tuner_path`/`channel_info` を `resolved`(先頭候補の代表行)からではなく実際の `SharedTuner::key`
+  から組み立てるよう変更した。`EncodeKey`(§5.3 プレビュー用) も同様に実キーを使う
+  ——直さないと、別ドライバに載った同一サービスのプレビューがエンコーダ共有可否を誤判定する。
 - **データマッピング**: サービス id は `mirakurun_service_id(nid, sid) = nid as u64 * 100000 + sid as u64`
   とその逆変換 `split_mirakurun_service_id`(範囲外は `None`)。`band_type → Mirakurun type` は
   `Terrestrial→"GR"`, `BS→"BS"`, `CS→"CS"`, `FourK→"BS"`(4K相当の型が本サブセットに無いための簡略化),

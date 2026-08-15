@@ -44,6 +44,7 @@ use crate::database::Database;
 use crate::server::channel_resolve::{self, ChannelResolveError};
 use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{SYNC_BYTE, TS_PACKET_SIZE};
+use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::encoder_pool::{self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::http_session::{HttpStreamSession, HttpStreamSessionInfo};
@@ -543,10 +544,21 @@ pub async fn stream_service_by_sid(
 /// `channel_info` is formatted the same way the BNDP path formats it
 /// (`server/session.rs::apply_channel_metadata`) so both kinds of row read
 /// alike in the client list.
+///
+/// `tuner` is the [`SharedTuner`] `channel_resolve::start_tuner_for_service`
+/// actually returned, NOT necessarily `resolved.primary()`: `resolved` may
+/// carry several physical candidates (same service scanned into more than
+/// one BonDriver — `server/channel_resolve.rs`'s module doc comment), and
+/// `tuner::acquire::acquire` is free to settle on any of them (e.g. joining
+/// one that's already running elsewhere). `tuner.key` is the only source of
+/// truth for which driver/space/channel this session actually landed on;
+/// using `resolved`'s metadata here would show the wrong driver whenever the
+/// chosen candidate isn't the first one.
 pub(crate) fn session_info_for(
     protocol: SessionProtocol,
     peer: Option<ConnectInfo<SocketAddr>>,
     resolved: &channel_resolve::ResolvedService,
+    tuner: &SharedTuner,
     stream_class: StreamClass,
 ) -> HttpStreamSessionInfo {
     let channel = &resolved.channel;
@@ -559,11 +571,11 @@ pub(crate) fn session_info_for(
         // never fail with 500 just because the peer address is unavailable,
         // the same treatment the access log gives it.
         addr: peer.map(|ConnectInfo(addr)| addr),
-        tuner_path: Some(resolved.dll_path.clone()),
+        tuner_path: Some(tuner.key.tuner_path.clone()),
         channel_name: channel.channel_name.clone().or_else(|| channel.raw_name.clone()),
-        channel_info: match (channel.bon_space, channel.bon_channel) {
-            (Some(space), Some(bon_channel)) => Some(format!("Space {}, Ch {}", space, bon_channel)),
-            _ => None,
+        channel_info: match &tuner.key.channel {
+            ChannelKeySpec::SpaceChannel { space, channel } => Some(format!("Space {}, Ch {}", space, channel)),
+            ChannelKeySpec::Simple(ch) => Some(format!("Ch {}", ch)),
         },
         nid: Some(channel.nid),
         sid: Some(channel.sid),
@@ -589,7 +601,7 @@ async fn stream_resolved(
     // (`web/http_session.rs`).
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Http, peer, &resolved, StreamClass::View),
+        session_info_for(SessionProtocol::Http, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
 
@@ -611,7 +623,7 @@ async fn stream_resolved(
     let profile = query.profile.as_deref().unwrap_or("");
 
     if profile.is_empty() {
-        info!("[HTTP stream] service {} -> raw passthrough (tuner={:?})", sid, resolved.channel_key);
+        info!("[HTTP stream] service {} -> raw passthrough (tuner={:?})", sid, tuner.key);
         let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
             .with_session(session, shutdown_rx);
         return respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup));
@@ -645,7 +657,7 @@ async fn stream_resolved(
     } else {
         vec![resolved.channel.sid]
     };
-    let key = EncodeKey::new(resolved.channel_key.clone(), sids, generation);
+    let key = EncodeKey::new(tuner.key.clone(), sids, generation);
 
     match web_state
         .encoder_pool

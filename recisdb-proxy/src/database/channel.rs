@@ -276,6 +276,42 @@ impl Database {
         }
     }
 
+    /// Get every row for a given `(nid, sid)`, not just the top-ranked one.
+    ///
+    /// The same broadcast service is routinely scanned into more than one
+    /// BonDriver's `channels` rows (one row per (BonDriver, service) pair —
+    /// see `server/channel_resolve.rs`'s module doc comment), so a caller
+    /// that needs every physical tuning target for a service (to hand them
+    /// all to `tuner::acquire::acquire` as candidates) cannot use
+    /// [`Self::get_channel_by_nid_sid`]'s `LIMIT 1`. Same ordering as that
+    /// single-row lookup (`is_enabled DESC, priority DESC, id ASC`), so
+    /// `rows.first()` here is exactly what the single-row version would have
+    /// returned.
+    pub fn get_channels_by_nid_sid(&self, nid: u16, sid: u16) -> Result<Vec<ChannelRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM channels WHERE nid = ?1 AND sid = ?2
+             ORDER BY is_enabled DESC, priority DESC, id ASC",
+        )?;
+        let records = stmt
+            .query_map(params![nid as i32, sid as i32], Self::row_to_channel_record)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Get every row for a given broadcast service_id alone (any network),
+    /// not just the top-ranked one. See [`Self::get_channels_by_nid_sid`]
+    /// (same reasoning, keyed on `sid` alone like [`Self::get_channel_by_sid`]).
+    pub fn get_channels_by_sid(&self, sid: u16) -> Result<Vec<ChannelRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM channels WHERE sid = ?1
+             ORDER BY is_enabled DESC, priority DESC, id ASC",
+        )?;
+        let records = stmt
+            .query_map(params![sid as i32], Self::row_to_channel_record)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Get all distinct SIDs for a given NID+TSID combination.
     pub fn get_sids_for_nid_tsid(&self, nid: u16, tsid: u16) -> Result<Vec<u16>> {
         let mut stmt = self.conn.prepare(
@@ -1299,6 +1335,53 @@ mod tests {
         let driver = rows[0].1.as_ref().unwrap();
         assert_eq!(driver.group_name.as_deref(), Some("GroupY"));
         assert_eq!(driver.max_instances, 2);
+    }
+
+    #[test]
+    fn test_get_channels_by_nid_sid_returns_all_rows_ordered() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_a = db.get_or_create_bon_driver("A.dll").unwrap();
+        let driver_b = db.get_or_create_bon_driver("B.dll").unwrap();
+
+        // Same (nid, sid) scanned on two drivers, differing priority.
+        let id_a = db.insert_channel(driver_a, &create_test_channel(1, 100, 200)).unwrap();
+        let id_b = db.insert_channel(driver_b, &create_test_channel(1, 100, 201)).unwrap();
+        db.update_channel_fields(id_a, None, Some(0), None).unwrap();
+        db.update_channel_fields(id_b, None, Some(10), None).unwrap();
+
+        let rows = db.get_channels_by_nid_sid(1, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // priority DESC first.
+        assert_eq!(rows[0].id, id_b);
+        assert_eq!(rows[1].id, id_a);
+
+        // Single-row lookup must agree with rows[0] (same ORDER BY).
+        let single = db.get_channel_by_nid_sid(1, 100).unwrap().unwrap();
+        assert_eq!(single.id, rows[0].id);
+
+        assert!(db.get_channels_by_nid_sid(1, 999).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_channels_by_sid_returns_all_rows_ordered() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_a = db.get_or_create_bon_driver("A.dll").unwrap();
+        let driver_b = db.get_or_create_bon_driver("B.dll").unwrap();
+
+        let id_a = db.insert_channel(driver_a, &create_test_channel(1, 100, 200)).unwrap();
+        let id_b = db.insert_channel(driver_b, &create_test_channel(2, 100, 300)).unwrap();
+        db.disable_channel(id_a).unwrap();
+
+        let rows = db.get_channels_by_sid(100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // is_enabled DESC first: the still-enabled row (id_b) leads.
+        assert_eq!(rows[0].id, id_b);
+        assert_eq!(rows[1].id, id_a);
+
+        let single = db.get_channel_by_sid(100).unwrap().unwrap();
+        assert_eq!(single.id, rows[0].id);
+
+        assert!(db.get_channels_by_sid(9999).unwrap().is_empty());
     }
 
     #[test]

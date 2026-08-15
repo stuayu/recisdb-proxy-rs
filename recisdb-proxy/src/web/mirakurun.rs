@@ -1008,7 +1008,7 @@ pub async fn stream_service_by_mirakurun_id(
 
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::View),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
 
@@ -1090,7 +1090,7 @@ pub async fn stream_channel_by_type(
 
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::View),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
 
@@ -1316,7 +1316,7 @@ pub async fn stream_program_by_mirakurun_id(
     // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, StreamClass::Record),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::Record),
     )
     .await;
 

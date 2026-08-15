@@ -532,6 +532,25 @@ P2b に残した (下記)。
     P2b-3 で優先度比較を `>=` から `>` に変える際、この経路も同じ規則に
     従う (同値では退避しない)。
 
+- **HTTP 経路が単一候補しか渡していなかった不具合とその修正 (2026-08)**:
+  `AcquireRequest.candidates` は元々複数候補を受け取れる (BNDP 経路は
+  グループ選局で複数ドライバを渡す) が、HTTP 経路 (`resolve_service_by_sid`/
+  `resolve_service_by_nid_sid`) は `channels` テーブルから `LIMIT 1` で
+  1行だけ取得し、`candidates: vec![resolved.channel_key]` と単一候補で
+  `acquire()` を呼んでいた。`channels` は (BonDriver, サービス) ごとに1行
+  なので同じサービスが複数ドライバに載っていることがあり、たまたま先頭行の
+  ドライバが満杯だと、**他のドライバで既に同じサービスが配信中でも** 503
+  (`Busy`) になっていた (実例: 実サーバーで SID 21520 が3行に分かれ、
+  1台は満杯・別の1台は既に稼働中だったのに 503 になった)。
+  `decide()` 自身の Rule 2 (同一物理チャンネルを既に回している候補は
+  capacity/priority を素通りして `Reuse`) は元から複数候補前提で書かれて
+  いたので、`decide`/`acquire` 側は変更せず、HTTP 側の候補の詰め方だけを
+  修正した: `database/channel.rs` に `get_channels_by_sid`/
+  `get_channels_by_nid_sid` (`LIMIT` なし) を追加し、`ResolvedService` を
+  「代表行 + 全候補 `Vec<CandidateTarget>`」の形に変更、`acquire()` には
+  全候補の `channel_key` を渡す。詳細は `docs/STREAMING_DESIGN.md` P6の
+  「複数候補への対応」節、実装は `server/channel_resolve.rs`。
+
 ### P2b-2 — SetChannelSpace を acquire へ載せ替え (実装済み)
 
 BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替え、
