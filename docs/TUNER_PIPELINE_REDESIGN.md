@@ -1027,8 +1027,9 @@ present, or hardware error` が 20 時間にわたり毎分 2,000〜4,300 回発
 DLL パス (`tuner_path`) ごとに連続オープン失敗を数えて次の 2 つを行う。
 
 1. **クールダウン**: 連続失敗が閾値を超えたら、`acquire` はその DLL の
-   `start_reader` を呼ばずに `AcquireError::OpenCooldown` で即座に断る。
-   クールダウン経過後は通常どおり再試行される。
+   `start_reader` を呼ばずに今回の候補から除外し、同じサービスを受信できる
+   別候補 DLL があればそちらを試す。全候補が尽きた場合のみ
+   `AcquireError::OpenCooldown` を返す。クールダウン経過後は通常どおり再試行される。
 2. **ログ抑制**: `acquire` 側の失敗ログ (`warn!`) は DLL ごとに 60 秒に 1 回
    だけ出し、抑制した件数を次のログにまとめて含める。
 
@@ -1053,10 +1054,12 @@ DLL パス (`tuner_path`) ごとに連続オープン失敗を数えて次の 2 
 `TunerPool::open_backoff()` で公開する。`acquire` は `start_reader` を呼ぶ
 直前にクールダウンを確認し、クールダウン中なら `start_permit` の破棄・
 `warm_to_use` の `shutdown()`・(orphanable なら) プールエントリの削除という
-既存の失敗パスと同じ後始末をしてから `OpenCooldown` を返す — ここではログを
-出さない (出すと結局同じ頻度で溢れるため)。`start_reader` が実際に失敗した
-場合のみ `record_failure` を呼び、成功時は `record_success` で完全リセット
-する。
+既存の失敗パスと同じ後始末をしてから候補を除外する。別候補が残っていれば
+その候補を続けて試し、全候補が尽きた時点で最後の `OpenCooldown` または
+`ReaderStart` を返す。クールダウン中の候補ごとに通常のエラーを出すとログが
+溢れるため、候補切り替えは `info!` の決定ログに留める。`start_reader` が
+実際に失敗した場合のみ `record_failure` を呼び、成功時は `record_success` で
+完全リセットする。
 
 `server/session.rs` の `SetChannel`/`SetChannelSpace` は、`AcquireError` が
 `OpenCooldown` のときだけ `error!` ではなく `debug!` に落とす。クールダウン中は

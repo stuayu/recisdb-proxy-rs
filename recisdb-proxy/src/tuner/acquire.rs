@@ -387,6 +387,10 @@ pub(crate) async fn acquire(
 
     let attempts = max_attempts(request.candidates.len());
     let mut exhausted: Vec<String> = Vec::new();
+    // Keep the last retryable startup failure so that, when every candidate
+    // has been tried, the caller still receives the concrete reason rather
+    // than a generic capacity error.
+    let mut last_start_failure: Option<AcquireError> = None;
 
     for attempt in 0..attempts {
         let snap = snapshot(pool, database, &dll_paths).await;
@@ -414,7 +418,9 @@ pub(crate) async fn acquire(
                 request.priority,
                 request.exclusive
             );
-            return Err(AcquireError::AtCapacity { lowest_idle_priority: None });
+            return Err(last_start_failure.unwrap_or(AcquireError::AtCapacity {
+                lowest_idle_priority: None,
+            }));
         }
 
         let tune_req = policy::TuneRequest {
@@ -585,11 +591,19 @@ pub(crate) async fn acquire(
                     if tuner.is_orphanable() {
                         pool.remove(&key).await;
                     }
-                    return Err(AcquireError::OpenCooldown {
+                    let failure = AcquireError::OpenCooldown {
                         tuner_path: key.tuner_path.clone(),
                         consecutive: pool.open_backoff().consecutive_failures(&key.tuner_path),
                         retry_in,
-                    });
+                    };
+                    info!(
+                        "[acquire] candidate unavailable: {} is in open-failure cooldown ({}ms remaining); trying another candidate",
+                        key.tuner_path,
+                        retry_in.as_millis()
+                    );
+                    exhausted.push(key.tuner_path.clone());
+                    last_start_failure = Some(failure);
+                    continue;
                 }
 
                 if let Err(e) = tuner
@@ -616,7 +630,14 @@ pub(crate) async fn acquire(
                             );
                         }
                     }
-                    return Err(AcquireError::ReaderStart(e));
+                    info!(
+                        "[acquire] candidate unavailable: {} failed to start; trying another candidate: {}",
+                        key.tuner_path,
+                        e
+                    );
+                    exhausted.push(key.tuner_path.clone());
+                    last_start_failure = Some(AcquireError::ReaderStart(e));
+                    continue;
                 }
                 pool.open_backoff().record_success(&key.tuner_path);
 
