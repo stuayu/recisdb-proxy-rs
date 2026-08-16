@@ -829,6 +829,8 @@ pub unsafe extern "system" fn set_channel2(
         state.connection.clone()
     };
 
+    file_log!(info, "SetChannel2: connection state before tuning={:?}", connection.state());
+
     file_log!(debug, "SetChannel2: Calling connection.set_channel_space...");
 
     let priority = connection.default_priority();
@@ -846,9 +848,12 @@ pub unsafe extern "system" fn set_channel2(
         connection.purge_stream();
 
         // ★ここでストリーム開始（WaitTsStream に依存しない）
-        let _ = connection.start_stream();
+        let started = connection.start_stream();
+        if !started {
+            file_log!(error, "SetChannel2: StartStream failed after SetChannelSpace (space={}, channel={}, state={:?})", space, channel, connection.state());
+        }
 
-        file_log!(info, "SetChannel2: Success");
+        file_log!(info, "SetChannel2: SetChannelSpace succeeded; StartStream={}", started);
         1
     } else {
         file_log!(error, "SetChannel2: Failed");
@@ -1167,22 +1172,38 @@ fn get_module_base() -> usize {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetModuleHandleW(lpModuleName: *const u16) -> *mut c_void;
+        fn GetModuleHandleExW(
+            dw_flags: u32,
+            lp_module_name: *const u16,
+            ph_module: *mut *mut c_void,
+        ) -> i32;
     }
 
-    // Get handle to our own DLL
-    // We pass the DLL name to get our specific module
-    let dll_name: Vec<u16> = "BonDriver_NetworkProxy.dll\0"
-        .encode_utf16()
-        .collect();
+    // The DLL is commonly renamed per tuner/group, e.g.
+    // `BonDriver_NetworkProxy_13_Kanto.dll`.  Looking it up by the crate's
+    // default filename therefore fails even though this code is running in
+    // the correct module.  Resolve the module from an address in this DLL;
+    // this is independent of the filename used by the host and also avoids
+    // accidentally using the host executable's image base.
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    let mut handle = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let ok = unsafe {
+        GetModuleHandleExW(
+            flags,
+            get_module_base as *const () as *const u16,
+            &mut handle,
+        )
+    };
 
-    let handle = unsafe { GetModuleHandleW(dll_name.as_ptr()) };
-    if handle.is_null() {
-        // Fallback: try to get by NULL (main executable, but won't work for DLL)
-        // This is just for safety, shouldn't happen
-        file_log!(error, "get_module_base: GetModuleHandleW failed for DLL name, trying NULL");
-        let handle = unsafe { GetModuleHandleW(std::ptr::null()) };
-        handle as usize
+    if ok == 0 || handle.is_null() {
+        // This should only be possible if Windows rejects the address.  Do
+        // not fall back to GetModuleHandleW(NULL): that returns the EXE base,
+        // which would turn every RTTI RVA into an invalid pointer.
+        file_log!(error, "get_module_base: GetModuleHandleExW(FROM_ADDRESS) failed");
+        0
     } else {
         handle as usize
     }

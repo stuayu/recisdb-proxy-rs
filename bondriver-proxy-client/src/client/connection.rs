@@ -142,6 +142,29 @@ fn is_reply_to(req: &ClientMessage, resp: &ServerMessage) -> bool {
     )
 }
 
+fn client_message_name(msg: &ClientMessage) -> &'static str {
+    match msg {
+        ClientMessage::Hello { .. } => "Hello",
+        ClientMessage::Ping => "Ping",
+        ClientMessage::OpenTuner { .. } => "OpenTuner",
+        ClientMessage::OpenTunerWithGroup { .. } => "OpenTunerWithGroup",
+        ClientMessage::CloseTuner => "CloseTuner",
+        ClientMessage::SetChannel { .. } => "SetChannel",
+        ClientMessage::SetChannelSpace { .. } => "SetChannelSpace",
+        ClientMessage::SetChannelSpaceInGroup { .. } => "SetChannelSpaceInGroup",
+        ClientMessage::GetSignalLevel => "GetSignalLevel",
+        ClientMessage::EnumTuningSpace { .. } => "EnumTuningSpace",
+        ClientMessage::EnumChannelName { .. } => "EnumChannelName",
+        ClientMessage::StartStream => "StartStream",
+        ClientMessage::StopStream => "StopStream",
+        ClientMessage::PurgeStream => "PurgeStream",
+        ClientMessage::SetLnbPower { .. } => "SetLnbPower",
+        ClientMessage::SelectLogicalChannel { .. } => "SelectLogicalChannel",
+        ClientMessage::GetChannelList { .. } => "GetChannelList",
+        ClientMessage::SetServiceFilter { .. } => "SetServiceFilter",
+    }
+}
+
 /// Last channel selection, remembered so it can be re-applied after an
 /// automatic reconnect.
 #[derive(Debug, Clone, Copy)]
@@ -476,6 +499,7 @@ impl Connection {
         // those responsive.
         if self.link_status.load(Ordering::Acquire) == link::DOWN {
             debug!("[Connection] Link down; failing request fast");
+            file_log!(warn, "RPC {} skipped: link is down (state={:?})", client_message_name(&msg), self.state());
             return None;
         }
 
@@ -510,6 +534,7 @@ impl Connection {
             debug!("[Connection] Sending message: {:?}", std::mem::discriminant(&msg));
             if tx.blocking_send(msg.clone()).is_err() {
                 error!("[Connection] Failed to send request to server");
+                file_log!(error, "RPC {} failed: request channel is closed", client_message_name(&msg));
                 return None;
             }
         }
@@ -525,6 +550,7 @@ impl Connection {
             let now = Instant::now();
             if now >= deadline {
                 warn!("[Connection] Request timed out after {:?}", timeout);
+                file_log!(error, "RPC {} timed out after {:?} (state={:?})", client_message_name(&msg), timeout, self.state());
                 return None;
             }
             let wait = SLICE.min(deadline - now);
@@ -541,6 +567,9 @@ impl Connection {
                         );
                         continue;
                     }
+                    if let ServerMessage::Error { error_code, message } = &resp {
+                        file_log!(error, "RPC {} rejected: error_code={} message={:?}", client_message_name(&msg), error_code, message);
+                    }
                     debug!("[Connection] Received response");
                     return Some(resp);
                 }
@@ -549,12 +578,14 @@ impl Connection {
                     // waited, so we don't hold the lock for the full timeout.
                     if self.link_status.load(Ordering::Acquire) == link::DOWN {
                         debug!("[Connection] Link went down while waiting; failing request");
+                        file_log!(error, "RPC {} interrupted: link dropped while waiting (state={:?})", client_message_name(&msg), self.state());
                         return None;
                     }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     error!("[Connection] Response channel closed");
+                    file_log!(error, "RPC {} failed: response channel closed", client_message_name(&msg));
                     return None;
                 }
             }
@@ -719,10 +750,19 @@ impl Connection {
                 if success {
                     self.session.lock().channel =
                         Some(ChannelSel::V2 { space, channel, priority, exclusive });
+                } else {
+                    file_log!(error, "SetChannelSpace rejected: space={} channel={} priority={} exclusive={}", space, channel, priority, exclusive);
                 }
                 success
             }
-            _ => false,
+            Some(other) => {
+                file_log!(error, "SetChannelSpace unexpected response: space={} channel={} response={:?}", space, channel, std::mem::discriminant(&other));
+                false
+            }
+            None => {
+                file_log!(error, "SetChannelSpace failed without response: space={} channel={} state={:?}", space, channel, self.state());
+                false
+            }
         }
     }
 
@@ -759,6 +799,7 @@ impl Connection {
     /// Start streaming.
     pub fn start_stream(&self) -> bool {
         if self.state() != ConnectionState::TunerOpen {
+            file_log!(error, "StartStream skipped: invalid client state {:?}", self.state());
             return false;
         }
 
@@ -770,9 +811,19 @@ impl Connection {
                     *self.state.lock() = ConnectionState::Streaming;
                     self.session.lock().streaming = true;
                 }
+                if !success {
+                    file_log!(error, "StartStream rejected by server");
+                }
                 success
             }
-            _ => false,
+            Some(other) => {
+                file_log!(error, "StartStream unexpected response: {:?}", std::mem::discriminant(&other));
+                false
+            }
+            None => {
+                file_log!(error, "StartStream failed without response: client_state={:?}", self.state());
+                false
+            }
         }
     }
 
@@ -1352,6 +1403,7 @@ async fn connection_loop(
     // `writer_done` guards against polling/awaiting the JoinHandle twice: once
     // the writer branch of the select fires, the handle is already resolved.
     let mut writer_done = false;
+    let mut last_request = "none";
     let mut idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
     let exit = loop {
         // Only police silence while the client actually expects TS. An idle
@@ -1364,6 +1416,8 @@ async fn connection_loop(
             maybe_msg = req_rx.recv() => {
                 match maybe_msg {
                     Some(msg) => {
+                        last_request = client_message_name(&msg);
+                        file_log!(debug, "connection_loop: sending request {}", last_request);
                         // Unbounded send is synchronous — never stalls the reader.
                         if write_tx.send(msg).is_err() {
                             // Writer task is gone; the socket is unusable.
@@ -1401,6 +1455,7 @@ async fn connection_loop(
                 match res {
                     Ok(0) => {
                         info!("Connection closed by server");
+                        file_log!(error, "connection_loop: server closed connection (last_request={}, client_state={:?})", last_request, conn.state());
                         break LoopExit::Dropped("server closed (EOF)".to_string());
                     }
                     Ok(_) => {
