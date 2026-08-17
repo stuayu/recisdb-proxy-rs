@@ -513,9 +513,14 @@ async fn run_server(
     };
 
     // Build server config
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         listen_addr,
         max_connections,
+        // Replaced with the DB-derived value below after the optional default
+        // tuner has been registered. Keep a conservative floor for an empty
+        // database and avoid an arbitrary pool-wide cap for multi-BonDriver
+        // installations.
+        max_tuners: 16,
         default_tuner: default_tuner.clone(),
         database: db.clone(),
         tuner_config: tuner_config.clone(),
@@ -552,6 +557,25 @@ async fn run_server(
             }
         }
     }
+
+    // The pool-wide limit must not be smaller than the sum of the per-driver
+    // limits.  The old hard-coded 16 caused Mirakurun/EPGStation requests to
+    // fail with 503 after 16 readers existed, even when another registered
+    // BonDriver had a free physical tuner.
+    let configured_tuner_capacity = {
+        let db_guard = db.lock().await;
+        db_guard
+            .get_all_bon_drivers()
+            .map(|drivers| {
+                drivers
+                    .iter()
+                    .map(|driver| driver.max_instances.max(0) as usize)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
+    };
+    config.max_tuners = config.max_tuners.max(configured_tuner_capacity);
+    info!("  Tuner pool capacity: {}", config.max_tuners);
 
     // Create session registry for tracking active sessions
     let session_registry = Arc::new(web::SessionRegistry::new());

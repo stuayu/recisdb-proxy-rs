@@ -25,6 +25,12 @@ pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     /// Maximum concurrent connections.
     pub max_connections: usize,
+    /// Pool-wide ceiling for shared tuner readers.
+    ///
+    /// This must cover the configured BonDriver capacities.  A fixed ceiling
+    /// makes an otherwise available alternate driver unreachable once enough
+    /// independent drivers have been opened (HTTP/Mirakurun then returns 503).
+    pub max_tuners: usize,
     /// Path to the default tuner device.
     pub default_tuner: Option<String>,
     /// Database handle.
@@ -60,9 +66,13 @@ impl Server {
     pub fn new(config: ServerConfig, session_registry: Arc<SessionRegistry>) -> Self {
         let database = config.database.clone();
         let tuner_config = config.tuner_config.clone();
+        let max_tuners = config.max_tuners.max(1);
         Self {
             config,
-            tuner_pool: Arc::new(TunerPool::new_with_config(16, tuner_config)),
+            tuner_pool: Arc::new(TunerPool::new_with_config(
+                max_tuners,
+                tuner_config,
+            )),
             // Shared tsreplace encoder pool (STREAMING_DESIGN.md §5 P4).
             // The concurrency cap is re-synced from tsreplace_config each time
             // a session starts an encoder, so the initial value here only
