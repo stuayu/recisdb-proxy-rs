@@ -48,6 +48,36 @@ fn require_system_scope(scope: ServiceScope) -> Result<(), ServiceError> {
     }
 }
 
+/// SCM の制御 API は要求を受け付けた時点で戻るため、呼び出し側が
+/// `STOP_PENDING` のまま `start` しないよう、状態が確定するまで待つ。
+/// 特に BonDriver の解放には数秒かかることがあり、ここを待たないと
+/// `service restart` が「開始済み」に見えても実プロセスが残ったままになる。
+fn wait_for_state(
+    service: &windows_service::service::Service,
+    expected: ServiceState,
+) -> Result<(), ServiceError> {
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + TIMEOUT;
+
+    loop {
+        let status = service.query_status().map_err(to_windows_service_error)?;
+        if status.current_state == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ServiceError::CommandFailed {
+                command: "windows-service wait".to_string(),
+                exit_code: None,
+                stderr: format!(
+                    "timed out waiting for service state {:?} (current: {:?})",
+                    expected, status.current_state
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// `spec.args` の先頭に `--run-as-service --service-workdir <dir>` を付与した
 /// launch_arguments を組み立てる。
 fn launch_arguments(spec: &ServiceSpec) -> Vec<OsString> {
@@ -143,9 +173,10 @@ pub fn start(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(to_windows_service_error)?;
     let service = manager
-        .open_service(name, ServiceAccess::START)
+        .open_service(name, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
         .map_err(to_windows_service_error)?;
-    service.start(&Vec::<&OsStr>::new()).map_err(to_windows_service_error)
+    service.start(&Vec::<&OsStr>::new()).map_err(to_windows_service_error)?;
+    wait_for_state(&service, ServiceState::Running)
 }
 
 pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
@@ -153,10 +184,15 @@ pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(to_windows_service_error)?;
     let service = manager
-        .open_service(name, ServiceAccess::STOP)
+        .open_service(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
         .map_err(to_windows_service_error)?;
+    if service.query_status().map_err(to_windows_service_error)?.current_state
+        == ServiceState::Stopped
+    {
+        return Ok(());
+    }
     service.stop().map_err(to_windows_service_error)?;
-    Ok(())
+    wait_for_state(&service, ServiceState::Stopped)
 }
 
 pub fn restart(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
