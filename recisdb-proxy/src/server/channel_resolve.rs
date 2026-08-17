@@ -464,6 +464,7 @@ async fn try_acquire(
             candidates: resolved.candidates.iter().map(|c| c.channel_key.clone()).collect(),
             priority: resolved.channel.priority,
             exclusive: false,
+            client_host: "http".to_string(),
             // HTTP requests are stateless: there is no "the tuner this
             // caller was already on" to exclude from capacity, and nothing
             // to hand a permit down from.
@@ -500,7 +501,7 @@ async fn map_acquire_error(
         AcquireError::NoCandidates => {
             ChannelResolveError::Pool(TunerPoolError::OpenFailed("no candidates supplied".to_string()))
         }
-        AcquireError::AtCapacity { .. } | AcquireError::Conflict(_) => {
+        AcquireError::AtCapacity { .. } | AcquireError::Warming { .. } | AcquireError::Conflict(_) => {
             let primary = resolved.primary();
             let running = count_running_instances_on_driver(tuner_pool, &primary.dll_path, Some(&primary.channel_key)).await;
             ChannelResolveError::Busy {

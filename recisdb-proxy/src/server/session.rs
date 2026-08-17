@@ -119,6 +119,8 @@ pub struct Session {
     warm_tuner_path: Option<String>,
     /// Current tuner path.
     current_tuner_path: Option<String>,
+    tuner_claim_priority: i32,
+    tuner_claim_exclusive: bool,
     /// Default tuner path.
     default_tuner: Option<String>,
     /// Current group name (if opened with group).
@@ -265,6 +267,8 @@ impl Session {
             warm_tuner: None,
             warm_tuner_path: None,
             current_tuner_path: None,
+            tuner_claim_priority: 0,
+            tuner_claim_exclusive: false,
             default_tuner,
             current_group_name: None,
             group_driver_paths: Vec::new(),
@@ -701,7 +705,12 @@ impl Session {
         self.current_tuner = Some(old_tuner.clone());
         // If we were (or are still) streaming, re-subscribe so TS data flows again.
         if self.state == SessionState::Streaming && self.ts_receiver.is_none() {
-            self.ts_receiver = Some(old_tuner.subscribe());
+            self.ts_receiver = Some(
+                old_tuner.subscribe_with_claim(
+                    self.tuner_claim_priority,
+                    self.tuner_claim_exclusive,
+                ),
+            );
         }
     }
 
@@ -1380,6 +1389,8 @@ impl Session {
             .await
             .unwrap_or((Some(priority), exclusive));
         let effective_priority = effective_priority_opt.unwrap_or(priority);
+        self.tuner_claim_priority = effective_priority;
+        self.tuner_claim_exclusive = effective_exclusive;
 
         let tuner_path = match &self.current_tuner_path {
             Some(p) => p.clone(),
@@ -1456,6 +1467,7 @@ impl Session {
             warm,
             own_key: old_tuner_key.clone(),
             own_key_will_free_slot,
+            client_host: self.addr.ip().to_string(),
         };
 
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
@@ -1467,7 +1479,10 @@ impl Session {
                 // ERROR here would just move the log flood from acquire.rs
                 // to session.rs. acquire.rs already logs the real cause once
                 // per minute per driver; this is only a symptom of that.
-                if matches!(e, AcquireError::OpenCooldown { .. }) {
+                if matches!(
+                    e,
+                    AcquireError::OpenCooldown { .. } | AcquireError::Warming { .. }
+                ) {
                     debug!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
                 } else {
                     error!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
@@ -1488,6 +1503,8 @@ impl Session {
             &mut self.ts_receiver,
             &mut self.current_tuner,
             outcome.tuner.clone(),
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SetChannel:",
         ).await;
@@ -1667,6 +1684,7 @@ impl Session {
             warm,
             own_key: old_tuner_key.clone(),
             own_key_will_free_slot,
+            client_host: self.addr.ip().to_string(),
         };
 
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
@@ -1696,6 +1714,8 @@ impl Session {
             &mut self.ts_receiver,
             &mut self.current_tuner,
             outcome.tuner.clone(),
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SelectLogicalChannel:",
         ).await;
@@ -1810,6 +1830,8 @@ impl Session {
             .unwrap_or((Some(priority), exclusive));
         let _priority = effective_priority.unwrap_or(priority);
         let _exclusive = effective_exclusive;
+        self.tuner_claim_priority = _priority;
+        self.tuner_claim_exclusive = _exclusive;
         
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             error!("[Session {}] SetChannelSpace: Tuner not open (state: {:?})", self.id, self.state);
@@ -2024,6 +2046,7 @@ impl Session {
             warm,
             own_key: old_tuner_key.clone(),
             own_key_will_free_slot,
+            client_host: self.addr.ip().to_string(),
         };
 
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
@@ -2033,7 +2056,10 @@ impl Session {
                 // is a symptom of a reconnect loop, not a new fact worth an
                 // ERROR line here — acquire.rs already logged the underlying
                 // failure, rate-limited, once per minute per driver.
-                if matches!(e, AcquireError::OpenCooldown { .. }) {
+                if matches!(
+                    e,
+                    AcquireError::OpenCooldown { .. } | AcquireError::Warming { .. }
+                ) {
                     debug!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
                 } else {
                     error!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
@@ -2061,6 +2087,8 @@ impl Session {
             &mut self.ts_receiver,
             &mut self.current_tuner,
             outcome.tuner.clone(),
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SetChannelSpace:",
         ).await;
@@ -2199,7 +2227,10 @@ impl Session {
         self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
         // Subscribe to the tuner's broadcast channel
-        let rx = tuner.subscribe();
+        let rx = tuner.subscribe_with_claim(
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
+        );
         self.ts_receiver = Some(rx);
         self.state = SessionState::Streaming;
 

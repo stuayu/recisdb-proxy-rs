@@ -45,13 +45,16 @@ use log::{info, warn};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
-use crate::tuner::pool::TunerPoolError;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
+use crate::tuner::pool::TunerPoolError;
 use crate::tuner::shared::{ReaderStartupConfig, StopReason};
-use crate::tuner::{CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle};
+use crate::tuner::{
+    CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle,
+};
 
 /// Whether libaribb25 should run for a source, given the driver's manual
 /// override and the band the channel was scanned as.
@@ -85,6 +88,7 @@ pub(crate) struct AcquireRequest {
     pub candidates: Vec<ChannelKey>,
     pub priority: i32,
     pub exclusive: bool,
+    pub client_host: String,
     pub bondriver_version: u8,
     /// A slot permit the caller already holds, usable only if `decide`
     /// settles on a `Create` whose key lands on the same DLL path (see
@@ -108,6 +112,12 @@ pub(crate) struct AcquireRequest {
     /// ever gets a chance to be used.
     pub own_key: Option<ChannelKey>,
     pub own_key_will_free_slot: bool,
+}
+
+fn candidate_set(candidates: &[ChannelKey]) -> String {
+    let mut paths: Vec<String> = candidates.iter().map(|k| format!("{:?}", k)).collect();
+    paths.sort();
+    paths.join(",")
 }
 
 /// What `acquire` did and handed back.
@@ -140,6 +150,8 @@ pub(crate) enum AcquireError {
     /// eviction — mirrors [`policy::RejectReason::AtCapacity`].
     #[error("all tuner slot(s) on the requested driver are in use (lowest idle priority observed: {lowest_idle_priority:?})")]
     AtCapacity { lowest_idle_priority: Option<i32> },
+    #[error("all tuner slots are still warming; retry after {}ms", retry_after.as_millis())]
+    Warming { retry_after: std::time::Duration },
     /// Every snapshot→decide→act round lost a race
     /// against concurrent pool activity (see this module's doc comment).
     #[error("gave up after {0} attempt(s) racing a concurrent tuner-pool change")]
@@ -158,16 +170,23 @@ pub(crate) enum AcquireError {
     /// 毎秒十数回DLLを叩き続けるのを防ぐためのもので、`retry_in` 経過後は
     /// 通常どおり再試行される。
     #[error("driver is in an open-failure cooldown for another {}ms after {consecutive} consecutive failure(s)", retry_in.as_millis())]
-    OpenCooldown { tuner_path: String, consecutive: u32, retry_in: std::time::Duration },
+    OpenCooldown {
+        tuner_path: String,
+        consecutive: u32,
+        retry_in: std::time::Duration,
+    },
 }
 
 impl From<RejectReason> for AcquireError {
     fn from(reason: RejectReason) -> Self {
         match reason {
             RejectReason::NoCandidates => AcquireError::NoCandidates,
-            RejectReason::AtCapacity { lowest_idle_priority } => {
-                AcquireError::AtCapacity { lowest_idle_priority }
-            }
+            RejectReason::AtCapacity {
+                lowest_idle_priority,
+            } => AcquireError::AtCapacity {
+                lowest_idle_priority,
+            },
+            RejectReason::Warming { retry_after } => AcquireError::Warming { retry_after },
         }
     }
 }
@@ -209,13 +228,21 @@ pub(crate) async fn snapshot(
     database: &DatabaseHandle,
     dll_paths: &[String],
 ) -> TunerSnapshot {
-    let dll_paths: Vec<String> = dll_paths.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+    let dll_paths: Vec<String> = dll_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     // --- Pool state first (async, no locks of ours held). ---------------
     struct RawEntry {
         key: ChannelKey,
         state: crate::tuner::shared::ReaderState,
         subscribers: u32,
+        priority: i32,
+        incumbent_exclusive: bool,
+        held_for: std::time::Duration,
         space: u32,
         channel: u32,
     }
@@ -223,7 +250,12 @@ pub(crate) async fn snapshot(
     let pending_idle_close = pool.keys_pending_idle_close().await;
     let open_cooldowns: std::collections::HashMap<String, bool> = dll_paths
         .iter()
-        .map(|path| (path.clone(), pool.open_backoff().cooldown_remaining(path).is_some()))
+        .map(|path| {
+            (
+                path.clone(),
+                pool.open_backoff().cooldown_remaining(path).is_some(),
+            )
+        })
         .collect();
 
     let mut raw_entries = Vec::new();
@@ -231,7 +263,9 @@ pub(crate) async fn snapshot(
         if !dll_paths.iter().any(|p| p == &key.tuner_path) {
             continue;
         }
-        let Some(tuner) = pool.get(&key).await else { continue };
+        let Some(tuner) = pool.get(&key).await else {
+            continue;
+        };
         let (space, channel) = match &key.channel {
             ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
             ChannelKeySpec::Simple(c) => (0, *c as u32),
@@ -240,6 +274,12 @@ pub(crate) async fn snapshot(
             key,
             state: tuner.state(),
             subscribers: tuner.subscriber_count(),
+            priority: tuner.incumbent_claim().map(|c| c.priority).unwrap_or(0),
+            incumbent_exclusive: tuner
+                .incumbent_claim()
+                .map(|c| c.exclusive)
+                .unwrap_or(false),
+            held_for: tuner.held_for(),
             space,
             channel,
         });
@@ -276,12 +316,14 @@ pub(crate) async fn snapshot(
     let entries = raw_entries
         .into_iter()
         .zip(priorities)
-        .map(|(e, priority)| EntryState {
+        .map(|(e, db_priority)| EntryState {
             idle_close_pending: pending_idle_close.contains(&e.key),
             key: e.key,
             state: e.state,
             subscribers: e.subscribers,
-            priority,
+            priority: db_priority.max(e.priority),
+            incumbent_exclusive: e.incumbent_exclusive,
+            held_for: e.held_for,
         })
         .collect();
 
@@ -347,7 +389,9 @@ async fn take_permit_for_path(
 /// comment — so, unlike the pre-P1b version of this helper, there is
 /// nothing left for a caller-side wait-for-slot-release poll loop to do.
 async fn evict_tuner(pool: &Arc<TunerPool>, key: &ChannelKey) {
-    let Some(tuner) = pool.get(key).await else { return };
+    let Some(tuner) = pool.get(key).await else {
+        return;
+    };
     // Record *why* before stopping: a session watching this tuner's state
     // wakes on the transition to `Stopped` and reads the reason to report a
     // displacement rather than a bare disconnect
@@ -378,8 +422,15 @@ pub(crate) async fn acquire(
     if request.candidates.is_empty() {
         return Err(AcquireError::NoCandidates);
     }
-
-    let dll_paths: Vec<String> = request.candidates.iter().map(|k| k.tuner_path.clone()).collect();
+    let gate_key = (
+        request.client_host.clone(),
+        candidate_set(&request.candidates),
+    );
+    let dll_paths: Vec<String> = request
+        .candidates
+        .iter()
+        .map(|k| k.tuner_path.clone())
+        .collect();
 
     // Serialize identical requests so a burst of viewers for one channel
     // shares a reader instead of opening one each — see
@@ -432,6 +483,7 @@ pub(crate) async fn acquire(
             candidates,
             priority: request.priority,
             exclusive: request.exclusive,
+            min_hold: std::time::Duration::from_secs(pool.config().await.min_hold_secs),
             own_key: request.own_key.clone(),
             own_key_will_free_slot: request.own_key_will_free_slot,
         };
@@ -464,6 +516,7 @@ pub(crate) async fn acquire(
                 // P1b §6) — a permit is never even asked for on this branch.
                 match pool.get(&key).await {
                     Some(tuner) => {
+                        pool.reject_gate().clear(&gate_key);
                         return Ok(AcquireOutcome {
                             tuner,
                             key,
@@ -481,6 +534,7 @@ pub(crate) async fn acquire(
                 }
             }
             Decision::Create { key, evict } => {
+                pool.reject_gate().clear(&gate_key);
                 for victim in &evict {
                     evict_tuner(pool, victim).await;
                 }
@@ -612,7 +666,15 @@ pub(crate) async fn acquire(
                 }
 
                 if let Err(e) = tuner
-                    .start_reader(pool, key.tuner_path.clone(), space, channel, startup_config, start_permit, warm_to_use)
+                    .start_reader(
+                        pool,
+                        key.tuner_path.clone(),
+                        space,
+                        channel,
+                        startup_config,
+                        start_permit,
+                        warm_to_use,
+                    )
                     .await
                 {
                     if tuner.is_orphanable() {
@@ -671,6 +733,26 @@ pub(crate) async fn acquire(
                             retry_in,
                         });
                     }
+                }
+                if matches!(
+                    reason,
+                    RejectReason::AtCapacity { .. } | RejectReason::Warming { .. }
+                ) {
+                    if let Some((cached, log_suppressed)) =
+                        pool.reject_gate().check(&gate_key, Instant::now())
+                    {
+                        if let Some(suppressed) = log_suppressed {
+                            info!("[acquire] suppressing repeated tuner rejection for host={} candidates={} ({} suppressed)", request.client_host, gate_key.1, suppressed);
+                        }
+                        return Err(AcquireError::from(cached));
+                    }
+                    let ms = pool.config().await.reject_cooldown_ms;
+                    pool.reject_gate().record(
+                        gate_key.clone(),
+                        reason.clone(),
+                        std::time::Duration::from_millis(ms),
+                        Instant::now(),
+                    );
                 }
                 return Err(AcquireError::from(reason));
             }
@@ -733,6 +815,7 @@ mod tests {
             set_channel_retry_timeout_ms: 50,
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
+            no_data_timeout_secs: 30,
             b25_enabled: true,
             mmt_converter: None,
         }
@@ -749,6 +832,7 @@ mod tests {
             candidates,
             priority: 0,
             exclusive: false,
+            client_host: "test".to_string(),
             bondriver_version: 2,
             carried_permit: None,
             warm: None,
@@ -789,6 +873,101 @@ mod tests {
         assert!(snap.entries[0].is_running());
         assert!(snap.entries[0].has_subscribers());
 
+        tuner.stop_reader().await;
+    }
+
+    async fn running_snapshot_fixture() -> (
+        Arc<TunerPool>,
+        DatabaseHandle,
+        Arc<SharedTuner>,
+        ChannelKey,
+    ) {
+        let pool = Arc::new(TunerPool::new(10));
+        let database = db_handle_with_driver("/dev/test", 3);
+        let key = ChannelKey::space_channel("/dev/test", 0, 5);
+        let permit = pool.acquire_slot("/dev/test", 3).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = tuner
+            .spawn_fake_reader(FakeTsSource::new(), 0, 5, fast_startup_config())
+            .await;
+        ready_rx.await.unwrap().unwrap();
+        (pool, database, tuner, key)
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_claim_priority_over_database_channel_priority() {
+        let (pool, database, tuner, key) = running_snapshot_fixture().await;
+        let _sub = tuner.subscribe_with_claim(9, false);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert_eq!(snap.entries[0].key, key);
+        let priority = snap.entries[0].priority;
+        tuner.stop_reader().await;
+        assert_eq!(priority, 9);
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_claim_exclusive() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _sub = tuner.subscribe_with_claim(10, true);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert!(snap.entries[0].incumbent_exclusive);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_drops_claim_when_subscription_is_dropped() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let sub = tuner.subscribe_with_claim(9, false);
+        assert_eq!(snapshot(&pool, &database, &["/dev/test".to_string()]).await.entries[0].priority, 9);
+        drop(sub);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert_eq!(snap.entries[0].priority, 0);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_the_highest_claim_across_subscribers() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _viewer = tuner.subscribe_with_claim(9, false);
+        let _recorder = tuner.subscribe_with_claim(10, true);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert_eq!(snap.entries[0].priority, 10);
+        assert!(snap.entries[0].incumbent_exclusive);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_running_held_for_duration() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _sub = tuner.subscribe();
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert!(snap.entries[0].held_for > Duration::ZERO);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_untracked_subscription_does_not_create_a_claim() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _sub = tuner.subscribe_untracked();
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert_eq!(snap.entries[0].priority, 0);
+        assert!(!snap.entries[0].incumbent_exclusive);
+        assert_eq!(snap.entries[0].subscribers, 0);
         tuner.stop_reader().await;
     }
 
@@ -894,13 +1073,22 @@ mod tests {
             matches!(&result, Err(AcquireError::OpenCooldown { .. })),
             "expected OpenCooldown once the failure streak crosses the threshold: {result:?}"
         );
-        if let Err(AcquireError::OpenCooldown { tuner_path, consecutive, retry_in }) = &result {
+        if let Err(AcquireError::OpenCooldown {
+            tuner_path,
+            consecutive,
+            retry_in,
+        }) = &result
+        {
             assert_eq!(tuner_path, path);
             assert_eq!(*consecutive, 3);
             assert!(*retry_in > Duration::ZERO && *retry_in <= Duration::from_secs(1));
         }
 
-        assert_eq!(pool.count().await, 0, "a cooldown rejection must not leave an orphaned pool entry");
+        assert_eq!(
+            pool.count().await,
+            0,
+            "a cooldown rejection must not leave an orphaned pool entry"
+        );
         assert!(
             pool.acquire_slot(path, 1).await.is_some(),
             "the permit taken for the cooled-down attempt must have been released, not leaked"

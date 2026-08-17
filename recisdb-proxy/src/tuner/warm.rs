@@ -294,6 +294,7 @@ mod tests {
             set_channel_retry_timeout_ms: 50,
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
+            no_data_timeout_secs: 30,
             b25_enabled: true,
             mmt_converter: None,
         }

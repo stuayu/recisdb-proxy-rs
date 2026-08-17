@@ -21,6 +21,8 @@ pub(super) async fn handoff_current_tuner(
     ts_receiver: &mut Option<TunerSubscription>,
     current_tuner: &mut Option<Arc<SharedTuner>>,
     next_tuner: Arc<SharedTuner>,
+    claim_priority: i32,
+    claim_exclusive: bool,
     is_streaming: bool,
     log_prefix: &str,
 ) -> Option<Arc<SharedTuner>> {
@@ -39,7 +41,7 @@ pub(super) async fn handoff_current_tuner(
                 // ordering — never a transient subscriber_count==0 on a
                 // still-active tuner — falls out of assignment semantics
                 // rather than needing an explicit manual unsubscribe() call.
-                let new_sub = next_tuner.subscribe();
+                let new_sub = next_tuner.subscribe_with_claim(claim_priority, claim_exclusive);
                 *ts_receiver = Some(new_sub);
             }
             *current_tuner = Some(next_tuner);
@@ -48,12 +50,15 @@ pub(super) async fn handoff_current_tuner(
 
         if ts_receiver.is_some() {
             *ts_receiver = None; // drops the old TunerSubscription: decrements old's count
-            debug!("[Session {}] {} unsubscribed from old tuner", session_id, log_prefix);
+            debug!(
+                "[Session {}] {} unsubscribed from old tuner",
+                session_id, log_prefix
+            );
         }
 
         let needs_cleanup = old.subscriber_count() == 0;
         if is_streaming {
-            *ts_receiver = Some(next_tuner.subscribe());
+            *ts_receiver = Some(next_tuner.subscribe_with_claim(claim_priority, claim_exclusive));
         }
         *current_tuner = Some(next_tuner);
 
@@ -64,7 +69,7 @@ pub(super) async fn handoff_current_tuner(
     }
 
     if is_streaming {
-        *ts_receiver = Some(next_tuner.subscribe());
+        *ts_receiver = Some(next_tuner.subscribe_with_claim(claim_priority, claim_exclusive));
     }
     *current_tuner = Some(next_tuner);
     None
@@ -83,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_same_tuner_reuse_keeps_subscriber_count_stable() {
         let tuner = SharedTuner::new(ChannelKey::simple("/dev/test", 1), 2);
-        let mut ts_receiver = Some(tuner.subscribe());
+        let mut ts_receiver = Some(tuner.subscribe_with_claim(42, true));
         let mut current_tuner = Some(Arc::clone(&tuner));
         assert_eq!(tuner.subscriber_count(), 1);
 
@@ -92,14 +97,30 @@ mod tests {
             &mut ts_receiver,
             &mut current_tuner,
             Arc::clone(&tuner),
+            42,
+            true,
             true,
             "test:",
         )
         .await;
 
-        assert!(cleanup.is_none(), "same-tuner reuse never returns a cleanup target");
-        assert_eq!(tuner.subscriber_count(), 1, "count must settle back at 1, not leak or drop to 0");
+        assert!(
+            cleanup.is_none(),
+            "same-tuner reuse never returns a cleanup target"
+        );
+        assert_eq!(
+            tuner.subscriber_count(),
+            1,
+            "count must settle back at 1, not leak or drop to 0"
+        );
         assert!(ts_receiver.is_some());
+        assert_eq!(
+            tuner.incumbent_claim(),
+            Some(crate::tuner::shared::Claim {
+                priority: 42,
+                exclusive: true
+            })
+        );
     }
 
     /// Switching to a different tuner while streaming: the old tuner's
@@ -119,6 +140,8 @@ mod tests {
             &mut ts_receiver,
             &mut current_tuner,
             Arc::clone(&new_tuner),
+            0,
+            false,
             true,
             "test:",
         )
@@ -150,12 +173,18 @@ mod tests {
             &mut ts_receiver,
             &mut current_tuner,
             Arc::clone(&new_tuner),
+            0,
+            false,
             true,
             "test:",
         )
         .await;
 
         assert!(cleanup.is_none());
-        assert_eq!(old_tuner.subscriber_count(), 1, "only this session's own subscription is released");
+        assert_eq!(
+            old_tuner.subscriber_count(),
+            1,
+            "only this session's own subscription is released"
+        );
     }
 }

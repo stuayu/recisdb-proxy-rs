@@ -89,6 +89,7 @@ pub async fn get_tuner_config(
         jitter_safety_factor,
     ) = db.get_tuner_config()?;
     let (ts_queue_view_ms, ts_queue_preview_ms, ts_queue_record_ms) = db.get_ts_queue_config()?;
+    let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) = db.get_tuner_livelock_config()?;
 
     Ok(Json(json!({
         "success": true,
@@ -100,6 +101,9 @@ pub async fn get_tuner_config(
             "set_channel_retry_timeout_ms": set_channel_retry_timeout_ms,
             "signal_poll_interval_ms": signal_poll_interval_ms,
             "signal_wait_timeout_ms": signal_wait_timeout_ms,
+            "min_hold_secs": min_hold_secs,
+            "reject_cooldown_ms": reject_cooldown_ms,
+            "no_data_timeout_secs": no_data_timeout_secs,
             "prefill_view_ms": prefill_view_ms,
             "prefill_preview_ms": prefill_preview_ms,
             "prefill_record_ms": prefill_record_ms,
@@ -121,6 +125,9 @@ pub struct UpdateTunerConfigRequest {
     pub set_channel_retry_timeout_ms: Option<u64>,
     pub signal_poll_interval_ms: Option<u64>,
     pub signal_wait_timeout_ms: Option<u64>,
+    pub min_hold_secs: Option<u64>,
+    pub reject_cooldown_ms: Option<u64>,
+    pub no_data_timeout_secs: Option<u64>,
     /// STREAMING_DESIGN.md §4/§9 P3: fixed-duration prefill/jitter buffer.
     pub prefill_view_ms: Option<u64>,
     pub prefill_preview_ms: Option<u64>,
@@ -147,12 +154,17 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        min_hold_secs,
+        reject_cooldown_ms,
+        no_data_timeout_secs,
         prefill_view_ms,
         prefill_preview_ms,
         prefill_record_ms,
         jitter_safety_factor,
     ) = {
         let db = web_state.database.lock().await;
+        let (mut min_hold_secs, mut reject_cooldown_ms, mut no_data_timeout_secs) =
+            db.get_tuner_livelock_config().unwrap_or((10, 2_000, 30));
 
         let (
             mut keep_alive,
@@ -206,6 +218,9 @@ pub async fn update_tuner_config(
                 signal_wait_timeout_ms = val;
             }
         }
+        if let Some(val) = payload.min_hold_secs { if val > 0 { min_hold_secs = val; } }
+        if let Some(val) = payload.reject_cooldown_ms { if val > 0 { reject_cooldown_ms = val; } }
+        if let Some(val) = payload.no_data_timeout_secs { if val > 0 { no_data_timeout_secs = val; } }
         if let Some(val) = payload.prefill_view_ms {
             prefill_view_ms = val;
         }
@@ -254,6 +269,8 @@ pub async fn update_tuner_config(
             jitter_safety_factor,
         )
         .map_err(|e| ApiError::internal(format!("Failed to save configuration: {}", e)))?;
+        db.update_tuner_livelock_config(min_hold_secs, reject_cooldown_ms, no_data_timeout_secs)
+            .map_err(|e| ApiError::internal(format!("Failed to save livelock configuration: {}", e)))?;
 
         (
             keep_alive,
@@ -263,6 +280,9 @@ pub async fn update_tuner_config(
             set_channel_retry_timeout_ms,
             signal_poll_interval_ms,
             signal_wait_timeout_ms,
+            min_hold_secs,
+            reject_cooldown_ms,
+            no_data_timeout_secs,
             prefill_view_ms,
             prefill_preview_ms,
             prefill_record_ms,
@@ -278,6 +298,9 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        min_hold_secs,
+        reject_cooldown_ms,
+        no_data_timeout_secs,
         prefill_view_ms,
         prefill_preview_ms,
         prefill_record_ms,
@@ -298,6 +321,9 @@ pub async fn update_tuner_config(
         set_channel_retry_timeout_ms,
         signal_poll_interval_ms,
         signal_wait_timeout_ms,
+        min_hold_secs,
+        reject_cooldown_ms,
+        no_data_timeout_secs,
         // Carried over, not rebuilt: the MMT/TLV converter comes from the
         // config file (it names an executable, so it is deliberately not
         // reachable from the Web API). Defaulting it here would silently
@@ -317,6 +343,9 @@ pub async fn update_tuner_config(
             "set_channel_retry_timeout_ms": config.set_channel_retry_timeout_ms,
             "signal_poll_interval_ms": config.signal_poll_interval_ms,
             "signal_wait_timeout_ms": config.signal_wait_timeout_ms,
+            "min_hold_secs": config.min_hold_secs,
+            "reject_cooldown_ms": config.reject_cooldown_ms,
+            "no_data_timeout_secs": config.no_data_timeout_secs,
             "prefill_view_ms": config.prefill_view_ms,
             "prefill_preview_ms": config.prefill_preview_ms,
             "prefill_record_ms": config.prefill_record_ms,

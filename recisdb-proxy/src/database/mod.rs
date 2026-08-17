@@ -182,6 +182,7 @@ impl Database {
         ("020_bon_driver_stream_format", Database::migration_020_bon_driver_stream_format),
         ("021_github_token", Database::migration_021_github_token),
         ("022_log_config", Database::migration_022_log_config),
+        ("023_tuner_livelock_config", Database::migration_023_tuner_livelock_config),
     ];
 
     /// Migration 022: log level/retention, moved from the TOML `[logging]`
@@ -198,6 +199,15 @@ impl Database {
             );
             INSERT OR IGNORE INTO log_config (id, level, retention_days) VALUES (1, 'info', 7);",
         )?;
+        Ok(())
+    }
+
+    /// Livelock protection settings. Kept as one idempotent migration so old
+    /// databases receive all three controls together.
+    fn migration_023_tuner_livelock_config(&self) -> Result<()> {
+        self.add_column_if_not_exists("tuner_config", "min_hold_secs", "INTEGER NOT NULL DEFAULT 10")?;
+        self.add_column_if_not_exists("tuner_config", "reject_cooldown_ms", "INTEGER NOT NULL DEFAULT 2000")?;
+        self.add_column_if_not_exists("tuner_config", "no_data_timeout_secs", "INTEGER NOT NULL DEFAULT 30")?;
         Ok(())
     }
 
@@ -775,6 +785,22 @@ impl std::fmt::Debug for Database {
 
 /// Scan scheduler configuration storage.
 impl Database {
+    pub fn get_tuner_livelock_config(&self) -> Result<(u64, u64, u64)> {
+        self.conn.query_row(
+            "SELECT min_hold_secs, reject_cooldown_ms, no_data_timeout_secs FROM tuner_config WHERE id = 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                self.conn.execute("INSERT OR IGNORE INTO tuner_config (id, keep_alive_secs, prewarm_enabled, prewarm_timeout_secs, min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) VALUES (1, 60, 1, 30, 10, 2000, 30)", [])?;
+                Ok((10, 2000, 30))
+            } else { Err(e) }
+        }).map_err(DatabaseError::Sqlite)
+    }
+
+    pub fn update_tuner_livelock_config(&self, min_hold_secs: u64, reject_cooldown_ms: u64, no_data_timeout_secs: u64) -> Result<()> {
+        self.conn.execute("UPDATE tuner_config SET min_hold_secs=?1, reject_cooldown_ms=?2, no_data_timeout_secs=?3, updated_at=strftime('%s','now') WHERE id=1", rusqlite::params![min_hold_secs, reject_cooldown_ms, no_data_timeout_secs])?;
+        Ok(())
+    }
     /// Get scan scheduler configuration from database.
     pub fn get_scan_scheduler_config(&self) -> Result<(u64, usize, u64, u64, u64)> {
         let mut stmt = self.conn.prepare(

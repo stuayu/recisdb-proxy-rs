@@ -648,16 +648,19 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
    ここも同じ規則を使う)。
 5. それでも駄目なら `Reject`。
 
-`may_evict(req, victim_priority)`:
+`may_evict(req, victim)` は、要求側の client claim と居座り側の client claim を
+同じ `(priority, exclusive)` 物差しで比較する。以前は要求側が client priority、
+居座り側が DB channel priority で、比較する値の出自が揃っていなかった。この差分と
+最低保持時間・warming の扱いは `docs/TUNER_SELECTION_LIVELOCK_2026-08.md` に記録する。
 
 ```text
-req.priority > victim_priority || req.exclusive
+(req.priority, req.exclusive) > (victim.priority, victim.incumbent_exclusive)
 ```
 
 - **同値では奪わない** (`>=` → `>`)。同順位の要求が先着を蹴散らしても得るものが
   無く、動いているストリームを切るだけだったため。
-- **`exclusive` は同値でも奪う**。ハードウェアそのものを要求しているという
-  意味なので、タイは新しい要求が勝つ。
+- **`exclusive` は辞書式比較のタイブレーク**。同順位で incumbent も exclusive
+  なら奪わず、非 exclusive には勝つ。
 
 **`max_instances` を超えて作ることは無くなった。** 従来、容量到達かつ idle の
 退避候補が無い場合は、退避もフォールバックも拒否もせずそのまま追加のリーダーを

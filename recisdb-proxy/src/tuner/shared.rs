@@ -1,5 +1,6 @@
 //! Shared tuner implementation with broadcast capability.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,6 +288,7 @@ pub struct ReaderStartupConfig {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    pub no_data_timeout_secs: u64,
     /// Whether to run the stream through libaribb25.
     ///
     /// `false` for sources that arrive already descrambled. 4K is the case
@@ -313,6 +315,7 @@ impl From<&TunerPoolConfig> for ReaderStartupConfig {
             set_channel_retry_timeout_ms: cfg.set_channel_retry_timeout_ms,
             signal_poll_interval_ms: cfg.signal_poll_interval_ms,
             signal_wait_timeout_ms: cfg.signal_wait_timeout_ms,
+            no_data_timeout_secs: cfg.no_data_timeout_secs,
             // Callers that know the source is pre-descrambled turn this off;
             // the pool config alone cannot tell.
             b25_enabled: true,
@@ -335,6 +338,10 @@ pub struct SharedTuner {
     /// see that type's doc comment for why manual subscribe/unsubscribe was
     /// removed.
     subscriber_count: AtomicU32,
+    claims: std::sync::Mutex<HashMap<u64, Claim>>,
+    next_claim_id: AtomicU64,
+    running_since: std::sync::Mutex<Option<std::time::Instant>>,
+    last_data_at: AtomicU64,
     /// Lifecycle state of the background reader task. See [`ReaderState`].
     reader_state: AtomicU8,
     /// Broadcasts every [`ReaderState`] transition so subscribers learn that
@@ -381,6 +388,10 @@ impl SharedTuner {
             tx,
             channel_change_tx,
             subscriber_count: AtomicU32::new(0),
+            claims: std::sync::Mutex::new(HashMap::new()),
+            next_claim_id: AtomicU64::new(1),
+            running_since: std::sync::Mutex::new(None),
+            last_data_at: AtomicU64::new(0),
             reader_state: AtomicU8::new(ReaderState::Idle as u8),
             state_tx: watch::channel(ReaderState::Idle).0,
             stop_reason: AtomicU8::new(StopReason::Unspecified as u8),
@@ -456,25 +467,36 @@ impl SharedTuner {
         self.packets_received.load(Ordering::Acquire)
     }
 
+    fn mark_data_sent(&self) {
+        self.last_data_at
+            .store(monotonic_millis(), Ordering::Release);
+    }
+
     /// Wait for the first TS packet to arrive (indicating driver is ready).
     /// Returns true if packet received within timeout, false if timeout.
     pub async fn wait_first_data(&self, timeout_ms: u64) -> bool {
         let start = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
-        
+
         loop {
             // Check if we've received any data
             if self.has_received_packets() {
-                info!("[SharedTuner] First data received after {}ms", start.elapsed().as_millis());
+                info!(
+                    "[SharedTuner] First data received after {}ms",
+                    start.elapsed().as_millis()
+                );
                 return true;
             }
-            
+
             // Check timeout
             if start.elapsed() > timeout {
-                warn!("[SharedTuner] wait_first_data timeout after {}ms", timeout_ms);
+                warn!(
+                    "[SharedTuner] wait_first_data timeout after {}ms",
+                    timeout_ms
+                );
                 return false;
             }
-            
+
             // Small sleep to avoid busy waiting
             tokio::time::sleep(Duration::from_millis(timing::WAIT_FIRST_DATA_POLL_MS)).await;
         }
@@ -499,13 +521,33 @@ impl SharedTuner {
     /// `TunerPool`), so this is a transparent signature change: `tuner.subscribe()`
     /// keeps compiling unchanged.
     pub fn subscribe(self: &Arc<Self>) -> TunerSubscription {
+        self.subscribe_with_claim(0, false)
+    }
+
+    pub fn subscribe_with_claim(
+        self: &Arc<Self>,
+        priority: i32,
+        exclusive: bool,
+    ) -> TunerSubscription {
+        let id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
+        self.claims.lock().unwrap().insert(
+            id,
+            Claim {
+                priority,
+                exclusive,
+            },
+        );
         self.subscriber_count.fetch_add(1, Ordering::SeqCst);
         debug!(
             "New subscriber for {:?}, total: {}",
             self.key,
             self.subscriber_count.load(Ordering::SeqCst)
         );
-        TunerSubscription { tuner: Arc::clone(self), rx: self.tx.subscribe() }
+        TunerSubscription {
+            tuner: Arc::clone(self),
+            rx: self.tx.subscribe(),
+            claim_id: Some(id),
+        }
     }
 
     /// Subscribe to the TS data stream WITHOUT incrementing the subscriber
@@ -521,7 +563,9 @@ impl SharedTuner {
     /// contract is visible in the type, not just the doc comment; its `Drop`
     /// does nothing (there is no count to decrement).
     pub(crate) fn subscribe_untracked(&self) -> UntrackedSubscription {
-        UntrackedSubscription { rx: self.tx.subscribe() }
+        UntrackedSubscription {
+            rx: self.tx.subscribe(),
+        }
     }
 
     /// Subscribe to channel change notifications.
@@ -545,17 +589,40 @@ impl SharedTuner {
         self.subscriber_count.load(Ordering::SeqCst) > 0
     }
 
+    pub fn incumbent_claim(&self) -> Option<Claim> {
+        self.claims
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max_by_key(|c| (c.priority, c.exclusive as u8))
+    }
+
+    pub fn held_for(&self) -> Duration {
+        self.running_since
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    }
+
     /// Current reader lifecycle state. See [`ReaderState`].
     pub fn state(&self) -> ReaderState {
         // The stored value is only ever written via `set_state`, which only
         // ever writes valid `ReaderState as u8` values, so the `TryFrom`
         // cannot fail in practice; `Stopped` is a safe fallback regardless.
-        ReaderState::try_from(self.reader_state.load(Ordering::Acquire)).unwrap_or(ReaderState::Stopped)
+        ReaderState::try_from(self.reader_state.load(Ordering::Acquire))
+            .unwrap_or(ReaderState::Stopped)
     }
 
     /// Transition the reader lifecycle state and publish it to watchers.
     pub(crate) fn set_state(&self, state: ReaderState) {
         self.reader_state.store(state as u8, Ordering::Release);
+        if state == ReaderState::Running {
+            *self.running_since.lock().unwrap() = Some(std::time::Instant::now());
+            self.last_data_at
+                .store(monotonic_millis(), Ordering::Release);
+        }
         // `send_replace`, not `send`: with no receivers attached, `send`
         // returns an error *and leaves the stored value untouched*, so a
         // watcher that subscribes later would see whatever the state was
@@ -625,14 +692,21 @@ impl SharedTuner {
     /// nothing left to stop it (this was caught by a hanging test during
     /// review — see `reader_state_stop_during_starting_is_not_clobbered`).
     fn try_transition_starting_to_running(&self) -> bool {
-        self.reader_state
+        let transitioned = self
+            .reader_state
             .compare_exchange(
                 ReaderState::Starting as u8,
                 ReaderState::Running as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if transitioned {
+            *self.running_since.lock().unwrap() = Some(std::time::Instant::now());
+            self.last_data_at
+                .store(monotonic_millis(), Ordering::Release);
+        }
+        transitioned
     }
 
     /// Whether this entry is occupying a pool slot: currently starting,
@@ -735,19 +809,29 @@ impl SharedTuner {
         // bound for a well-behaved DLL.
         let joined = if let Ok(mut guard) = tokio::time::timeout(
             std::time::Duration::from_millis(timing::STOP_READER_TIMEOUT_MS),
-            self.reader_handle.lock()
-        ).await {
+            self.reader_handle.lock(),
+        )
+        .await
+        {
             if let Some(handle) = guard.take() {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(timing::STOP_READER_TIMEOUT_MS),
-                    handle
-                ).await {
+                    handle,
+                )
+                .await
+                {
                     Ok(_) => {
-                        info!("[SharedTuner] Reader task completed gracefully for {:?}", self.key);
+                        info!(
+                            "[SharedTuner] Reader task completed gracefully for {:?}",
+                            self.key
+                        );
                         true
                     }
                     Err(_) => {
-                        error!("[SharedTuner] Reader task timeout for {:?}, aborting", self.key);
+                        error!(
+                            "[SharedTuner] Reader task timeout for {:?}, aborting",
+                            self.key
+                        );
                         false
                     }
                 }
@@ -870,13 +954,17 @@ impl SharedTuner {
                             elapsed,
                             e
                         );
-                        std::thread::sleep(std::time::Duration::from_millis(startup_config.set_channel_retry_interval_ms));
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            startup_config.set_channel_retry_interval_ms,
+                        ));
                         continue;
                     }
 
                     if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                        warn!("[SharedTuner] Channel unavailable space={} channel={}: {}",
-                              space, channel, e);
+                        warn!(
+                            "[SharedTuner] Channel unavailable space={} channel={}: {}",
+                            space, channel, e
+                        );
                     } else {
                         error!("[SharedTuner] Failed to set channel space={} channel={}: {} (kind: {:?})",
                                space, channel, e, e.kind());
@@ -899,7 +987,9 @@ impl SharedTuner {
                     error!("[SharedTuner] PANIC during SetChannel: {:?}", panic_err);
                     shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
-                    let _ = ready_tx.send(Err("SetChannel caused panic - BonDriver may be corrupted".to_string()));
+                    let _ = ready_tx.send(Err(
+                        "SetChannel caused panic - BonDriver may be corrupted".to_string(),
+                    ));
                     return;
                 }
             }
@@ -909,7 +999,9 @@ impl SharedTuner {
         tuner.purge_ts_stream();
 
         // Short stabilization wait for new driver to have something in buffer
-        std::thread::sleep(std::time::Duration::from_millis(timing::SET_CHANNEL_STABILIZATION_SLEEP_MS));
+        std::thread::sleep(std::time::Duration::from_millis(
+            timing::SET_CHANNEL_STABILIZATION_SLEEP_MS,
+        ));
 
         // ===== B25 decoder init =====
         let b25_opt = DecoderOptions {
@@ -1019,11 +1111,41 @@ impl SharedTuner {
 
         info!("[SharedTuner] Reader task started for {:?}", shared.key);
 
+        // The reader loop only records the last successful broadcast. The
+        // timeout decision lives in this separate async task so read/decode/
+        // distribute remains the only work in the blocking loop.
+        let watchdog_shared = Arc::clone(&shared);
+        let timeout_secs = startup_config.no_data_timeout_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if watchdog_shared.state() != ReaderState::Running {
+                    break;
+                }
+                let last = watchdog_shared.last_data_at.load(Ordering::Acquire);
+                if timeout_secs > 0
+                    && monotonic_millis().saturating_sub(last) >= timeout_secs.saturating_mul(1_000)
+                {
+                    warn!(
+                        "[SharedTuner] no TS data for {}s; stopping {:?}",
+                        timeout_secs, watchdog_shared.key
+                    );
+                    watchdog_shared.set_stop_reason(StopReason::ReaderFailed);
+                    let _ = watchdog_shared.stop_reader().await;
+                    break;
+                }
+            }
+        });
+
         // Log initial signal level (informational only; does not block the caller).
         // The read loop updates signal every 5 s during streaming.
         {
             let initial_signal = tuner.get_signal_level();
-            info!("[SharedTuner] Initial signal level: {:.1}dB", initial_signal);
+            info!(
+                "[SharedTuner] Initial signal level: {:.1}dB",
+                initial_signal
+            );
         }
 
         // Use a larger initial buffer, and expand dynamically if needed
@@ -1216,14 +1338,14 @@ impl SharedTuner {
 
                                     let data = Bytes::from(decoded);
 
-                                    match shared.tx.send(data) {
-                                        Ok(_count) => {}
-                                        Err(_e) => {
-                                            broadcast_send_errors += 1;
-                                            if broadcast_send_errors == 1 || broadcast_send_errors % 100 == 0 {
-                                                warn!("[SharedTuner] Broadcast send failed ({} times total) for {:?} - no active receivers",
+                                    shared.mark_data_sent();
+                                    if let Err(_e) = shared.tx.send(data) {
+                                        broadcast_send_errors += 1;
+                                        if broadcast_send_errors == 1
+                                            || broadcast_send_errors % 100 == 0
+                                        {
+                                            warn!("[SharedTuner] Broadcast send failed ({} times total) for {:?} - no active receivers",
                                                       broadcast_send_errors, shared.key);
-                                            }
                                         }
                                     }
                                 }
@@ -1244,6 +1366,7 @@ impl SharedTuner {
                                         shared.increment_packet_count(packet_count);
                                     }
                                     let data = Bytes::copy_from_slice(raw);
+                                    shared.mark_data_sent();
                                     let _ = shared.tx.send(data);
                                 }
                                 Err(_panic_err) => {
@@ -1256,6 +1379,7 @@ impl SharedTuner {
                                         shared.increment_packet_count(packet_count);
                                     }
                                     let data = Bytes::copy_from_slice(raw);
+                                    shared.mark_data_sent();
                                     let _ = shared.tx.send(data);
                                 }
                             }
@@ -1266,6 +1390,7 @@ impl SharedTuner {
                                 shared.increment_packet_count(packet_count);
                             }
                             let data = Bytes::copy_from_slice(raw);
+                            shared.mark_data_sent();
                             let _ = shared.tx.send(data);
                         }
                     } else {
@@ -1275,6 +1400,7 @@ impl SharedTuner {
                             shared.increment_packet_count(packet_count);
                         }
                         let data = Bytes::copy_from_slice(raw);
+                        shared.mark_data_sent();
                         let _ = shared.tx.send(data);
                     }
 
@@ -1409,9 +1535,19 @@ impl SharedTuner {
         // scheduled and reached its own `set_state(Starting)`".
         self.set_state(ReaderState::Starting);
 
-        let ready_timeout = timing::reader_ready_timeout(startup_config.set_channel_retry_timeout_ms);
+        let ready_timeout =
+            timing::reader_ready_timeout(startup_config.set_channel_retry_timeout_ms);
 
-        let started = self.dispatch_reader_start(warm, tuner_path, space, channel, startup_config, ready_timeout).await;
+        let started = self
+            .dispatch_reader_start(
+                warm,
+                tuner_path,
+                space,
+                channel,
+                startup_config,
+                ready_timeout,
+            )
+            .await;
         if started.is_ok() {
             // Fed by the same broadcast the clients read; see its doc comment.
             self.spawn_si_collector();
@@ -1433,16 +1569,28 @@ impl SharedTuner {
     ) -> Result<(), std::io::Error> {
         match warm {
             Some(warm) if warm.path() == tuner_path => {
-                self.start_reader_warm(warm, tuner_path, space, channel, startup_config, ready_timeout).await
+                self.start_reader_warm(
+                    warm,
+                    tuner_path,
+                    space,
+                    channel,
+                    startup_config,
+                    ready_timeout,
+                )
+                .await
             }
             Some(warm) => {
                 // Warm handle for a different DLL path — not usable for this
                 // request; shut it down (releasing its own permit) and cold
                 // start instead.
                 warm.shutdown().await;
-                self.start_reader_cold(tuner_path, space, channel, startup_config, ready_timeout).await
+                self.start_reader_cold(tuner_path, space, channel, startup_config, ready_timeout)
+                    .await
             }
-            None => self.start_reader_cold(tuner_path, space, channel, startup_config, ready_timeout).await,
+            None => {
+                self.start_reader_cold(tuner_path, space, channel, startup_config, ready_timeout)
+                    .await
+            }
         }
     }
 
@@ -1467,12 +1615,22 @@ impl SharedTuner {
         // `Copy` now that it carries the converter settings.
         let startup_config_for_fallback = startup_config.clone();
         match warm
-            .activate(Arc::clone(self), tuner_path, space, channel, startup_config, ready_timeout)
+            .activate(
+                Arc::clone(self),
+                tuner_path,
+                space,
+                channel,
+                startup_config,
+                ready_timeout,
+            )
             .await
         {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!("[SharedTuner] Warm tuner activation failed for {:?}: {}", self.key, e);
+                warn!(
+                    "[SharedTuner] Warm tuner activation failed for {:?}: {}",
+                    self.key, e
+                );
                 let warm_thread_gone = e.kind() == std::io::ErrorKind::NotConnected;
                 warm.shutdown().await;
 
@@ -1498,7 +1656,13 @@ impl SharedTuner {
                         self.set_slot_permit(permit);
                         self.set_state(ReaderState::Starting);
                         return self
-                            .start_reader_cold(tuner_path_for_fallback, space, channel, startup_config_for_fallback, ready_timeout)
+                            .start_reader_cold(
+                                tuner_path_for_fallback,
+                                space,
+                                channel,
+                                startup_config_for_fallback,
+                                ready_timeout,
+                            )
                             .await;
                     }
                     // No permit to retry with (someone else took it): give
@@ -1544,20 +1708,30 @@ impl SharedTuner {
                 info!("[SharedTuner] Opening BonDriver: {}", tuner_path);
                 let tuner = match BonDriverTuner::new(&tuner_path) {
                     Ok(t) => {
-                        info!("[SharedTuner] BonDriver created successfully for {}", tuner_path);
+                        info!(
+                            "[SharedTuner] BonDriver created successfully for {}",
+                            tuner_path
+                        );
                         t
-                    },
+                    }
                     Err(e) => {
-                        error!("[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})",
-                               tuner_path, e, e.kind());
+                        error!(
+                            "[SharedTuner] Failed to create/open BonDriver {}: {} (kind: {:?})",
+                            tuner_path,
+                            e,
+                            e.kind()
+                        );
                         shared.set_stop_reason(StopReason::ReaderFailed);
                         shared.stop_and_release_slot();
                         let err_msg = match e.kind() {
-                            std::io::ErrorKind::NotFound =>
-                                format!("BonDriver not found or cannot load: {}", e),
-                            std::io::ErrorKind::ConnectionRefused =>
-                                format!("Failed to open tuner (may be in use or hardware issue): {}", e),
-                            _ => format!("BonDriver error: {}", e)
+                            std::io::ErrorKind::NotFound => {
+                                format!("BonDriver not found or cannot load: {}", e)
+                            }
+                            std::io::ErrorKind::ConnectionRefused => format!(
+                                "Failed to open tuner (may be in use or hardware issue): {}",
+                                e
+                            ),
+                            _ => format!("BonDriver error: {}", e),
                         };
                         let _ = ready_tx.send(Err(err_msg));
                         return;
@@ -1621,11 +1795,17 @@ impl SharedTuner {
             }
             Ok(Err(_)) => {
                 error!("[SharedTuner] Reader channel closed unexpectedly");
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "Reader channel closed"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Reader channel closed",
+                ))
             }
             Err(_) => {
                 error!("[SharedTuner] Timeout waiting for reader to start");
-                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout waiting for reader"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Timeout waiting for reader",
+                ))
             }
         }
     }
@@ -1735,6 +1915,7 @@ impl Drop for SharedTuner {
 pub struct TunerSubscription {
     tuner: Arc<SharedTuner>,
     rx: broadcast::Receiver<Bytes>,
+    claim_id: Option<u64>,
 }
 
 impl TunerSubscription {
@@ -1768,6 +1949,9 @@ impl std::ops::DerefMut for TunerSubscription {
 
 impl Drop for TunerSubscription {
     fn drop(&mut self) {
+        if let Some(id) = self.claim_id.take() {
+            self.tuner.claims.lock().unwrap().remove(&id);
+        }
         // Plain fetch_sub: unlike the old manual `unsubscribe()`, there is no
         // way to construct a `TunerSubscription` without a matching earlier
         // increment in `subscribe()`, so underflow cannot happen here by
@@ -1779,6 +1963,20 @@ impl Drop for TunerSubscription {
             prev - 1
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Claim {
+    pub priority: i32,
+    pub exclusive: bool,
+}
+
+fn monotonic_millis() -> u64 {
+    static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// A subscription to a [`SharedTuner`]'s TS broadcast that deliberately does
@@ -1854,6 +2052,7 @@ fn test_startup_config() -> ReaderStartupConfig {
         set_channel_retry_timeout_ms: 50,
         signal_poll_interval_ms: 5,
         signal_wait_timeout_ms: 50,
+        no_data_timeout_secs: 30,
         b25_enabled: true,
         mmt_converter: None,
     }
@@ -1984,13 +2183,33 @@ mod tests {
             .await
             .expect("ready signal timed out")
             .expect("ready channel closed unexpectedly");
-        assert!(ready.is_ok(), "expected successful startup, got {:?}", ready);
+        assert!(
+            ready.is_ok(),
+            "expected successful startup, got {:?}",
+            ready
+        );
         assert_eq!(shared.state(), ReaderState::Running);
         assert!(shared.is_running());
+
+        assert!(shared.held_for() > std::time::Duration::ZERO);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(shared.held_for() >= std::time::Duration::from_millis(10));
 
         shared.stop_reader().await;
         assert_eq!(shared.state(), ReaderState::Stopped);
         assert!(!shared.is_running());
+    }
+
+    #[test]
+    fn running_transition_initializes_monotonic_data_clock_without_subscribers() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/test", 1), 2);
+        shared.set_state(ReaderState::Starting);
+        assert!(shared.try_transition_starting_to_running());
+        let before = shared.last_data_at.load(Ordering::Acquire);
+        assert!(before > 0 || monotonic_millis() == 0);
+        shared.mark_data_sent();
+        assert!(shared.last_data_at.load(Ordering::Acquire) >= before);
+        assert_eq!(shared.subscriber_count(), 0);
     }
 
     #[tokio::test]
@@ -1998,8 +2217,11 @@ mod tests {
         let key = ChannelKey::simple("/dev/test", 1);
         let shared = SharedTuner::new(key, 2);
 
-        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let source =
+            FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
 
         let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
             .await
@@ -2185,6 +2407,7 @@ mod tests {
             set_channel_retry_timeout_ms: 10_000,
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
+            no_data_timeout_secs: 30,
             b25_enabled: true,
             mmt_converter: None,
         };

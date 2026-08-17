@@ -2,14 +2,81 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
-use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::sync::oneshot;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::open_backoff::OpenFailureBackoff;
+use crate::tuner::policy::RejectReason;
 use crate::tuner::shared::SharedTuner;
+
+struct RejectGateEntry {
+    until: Instant,
+    reason: RejectReason,
+    suppressed: u32,
+    last_log: Instant,
+}
+
+pub(crate) struct RejectGate {
+    state: std::sync::Mutex<HashMap<(String, String), RejectGateEntry>>,
+}
+
+impl RejectGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn check(
+        &self,
+        key: &(String, String),
+        now: Instant,
+    ) -> Option<(RejectReason, Option<u32>)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retain(|_, entry| entry.until > now);
+        let entry = state.get_mut(key)?;
+        entry.suppressed = entry.suppressed.saturating_add(1);
+        if now.duration_since(entry.last_log) >= Duration::from_secs(60) {
+            let suppressed = entry.suppressed;
+            entry.suppressed = 0;
+            entry.last_log = now;
+            Some((entry.reason.clone(), Some(suppressed)))
+        } else {
+            Some((entry.reason.clone(), None))
+        }
+    }
+
+    pub(crate) fn record(
+        &self,
+        key: (String, String),
+        reason: RejectReason,
+        duration: Duration,
+        now: Instant,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retain(|_, entry| entry.until > now);
+        state.insert(
+            key,
+            RejectGateEntry {
+                until: now + duration,
+                reason,
+                suppressed: 0,
+                last_log: now,
+            },
+        );
+    }
+
+    pub(crate) fn clear(&self, key: &(String, String)) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+}
 
 /// Priority levels for tuner requests.
 pub mod priority {
@@ -45,6 +112,9 @@ pub struct TunerPoolConfig {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    pub min_hold_secs: u64,
+    pub reject_cooldown_ms: u64,
+    pub no_data_timeout_secs: u64,
     /// MMT/TLV→TS converter settings, from `[mmttlv]` in the config file.
     ///
     /// Carried here so `acquire` — the one place every tuning path goes
@@ -65,6 +135,9 @@ impl Default for TunerPoolConfig {
             set_channel_retry_timeout_ms: 10_000,
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
+            min_hold_secs: 10,
+            reject_cooldown_ms: 2_000,
+            no_data_timeout_secs: 30,
             mmt_converter: crate::tuner::mmt_pipe::MmtConverterConfig::default(),
         }
     }
@@ -181,7 +254,9 @@ struct DriverSlots {
 
 impl DriverSlots {
     fn new() -> Self {
-        Self { entries: Mutex::new(HashMap::new()) }
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Get (creating if needed) the semaphore for `dll_path`, resizing it to
@@ -218,7 +293,10 @@ impl DriverSlots {
                 let semaphore = Arc::new(Semaphore::new(max_instances as usize));
                 entries.insert(
                     dll_path.to_string(),
-                    DriverSlotEntry { semaphore: Arc::clone(&semaphore), capacity: max_instances },
+                    DriverSlotEntry {
+                        semaphore: Arc::clone(&semaphore),
+                        capacity: max_instances,
+                    },
                 );
                 semaphore
             }
@@ -265,6 +343,7 @@ pub struct TunerPool {
     /// [`crate::tuner::open_backoff`] for the production incident this
     /// exists to prevent).
     open_backoff: Arc<OpenFailureBackoff>,
+    reject_gate: Arc<RejectGate>,
 }
 
 struct IdleHandle {
@@ -289,6 +368,7 @@ impl TunerPool {
             channel_locks: Mutex::new(HashMap::new()),
             scanning: Arc::new(std::sync::Mutex::new(HashMap::new())),
             open_backoff: Arc::new(OpenFailureBackoff::new()),
+            reject_gate: Arc::new(RejectGate::new()),
         }
     }
 
@@ -298,6 +378,10 @@ impl TunerPool {
     /// points without borrowing the pool.
     pub(crate) fn open_backoff(&self) -> &Arc<OpenFailureBackoff> {
         &self.open_backoff
+    }
+
+    pub(crate) fn reject_gate(&self) -> &Arc<RejectGate> {
+        &self.reject_gate
     }
 
     /// Try to reserve one of `dll_path`'s `max_instances` slots.
@@ -313,9 +397,15 @@ impl TunerPool {
     /// Passing a different `max_instances` than the last call for the same
     /// `dll_path` resizes that path's semaphore (see [`DriverSlots::semaphore_for`]).
     pub async fn acquire_slot(&self, dll_path: &str, max_instances: i32) -> Option<SlotPermit> {
-        let semaphore = self.driver_slots.semaphore_for(dll_path, max_instances).await;
+        let semaphore = self
+            .driver_slots
+            .semaphore_for(dll_path, max_instances)
+            .await;
         match semaphore.try_acquire_owned() {
-            Ok(permit) => Some(SlotPermit { permit, dll_path: dll_path.to_string() }),
+            Ok(permit) => Some(SlotPermit {
+                permit,
+                dll_path: dll_path.to_string(),
+            }),
             Err(_) => None,
         }
     }
@@ -400,7 +490,10 @@ impl TunerPool {
     /// Ordering note: this is always taken *before* the per-DLL init lock
     /// (which `SharedTuner::start_reader` takes internally), never the other
     /// way round, so the two cannot deadlock against each other.
-    pub async fn acquire_channel_lock(&self, candidates: &[ChannelKey]) -> tokio::sync::OwnedMutexGuard<()> {
+    pub async fn acquire_channel_lock(
+        &self,
+        candidates: &[ChannelKey],
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         let mut ids: Vec<String> = candidates
             .iter()
             .map(|k| format!("{}#{:?}", k.tuner_path, k.channel))
@@ -842,6 +935,7 @@ mod tests {
             set_channel_retry_timeout_ms: 50,
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
+            no_data_timeout_secs: 30,
             b25_enabled: true,
             mmt_converter: None,
         }

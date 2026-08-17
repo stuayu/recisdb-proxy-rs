@@ -164,6 +164,8 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   退避やドライバ障害を即座に検知して理由付きで切断する (旧: 2 秒周期のポーリング)。
 - **keep-alive**: subscriber が 0 になっても `keep_alive_secs` (既定 60s、DB `tuner_config` で変更可) は
   リーダーを維持し、ザッピング戻りを即応させる。`cancel_idle_close()` で復帰。
+  `min_hold_secs` (既定 10)、`reject_cooldown_ms` (既定 2000)、`no_data_timeout_secs` (既定 30) も
+  `tuner_config` の設定で、いずれも Web ダッシュボードの「設定」 (`/api/tuner-config`) から変更できる。
 - **prewarm**: OpenTuner 時に DLL に空きスロットがあればウォームチューナーを起動して初回選局を高速化。
   warm ハンドルもスロット permit を保持する (開いている以上、容量を占有しているため)。
 - **SI 収集は別タスク**: SDT/CDT (ロゴ) と EIT (EPG) の収集は、クライアントと同じ broadcast を
@@ -223,8 +225,11 @@ TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
 4. どれも退避できなければ別の候補ドライバの退避を試す
 5. それでも駄目なら拒否
 
-1・2 の可否は `may_evict = 要求優先度 > 相手の優先度 || exclusive`。
-**同値では奪わない**。`exclusive` はハードウェアそのものの要求なのでタイに勝つ。
+退避可否は、まず購読者がいて `Running` に入ってから `min_hold_secs` 未満のリーダーを
+無条件に保護し、その後 `(要求優先度, exclusive)` と `(相手の優先度, 相手の exclusive)` の
+辞書式順序を比較して、要求側が**厳密に大きい**ときだけ許可する。
+**同値では奪わない**。`exclusive` はハードウェアそのものの要求なので、同じ優先度のタイには勝つが、
+優先度を無視して勝つわけではない。
 **`max_instances` を超えて作ることはない** — 上限はハードウェアの事実なので、
 超過するくらいなら稼働中のリーダーを停止して作り直す。
 
@@ -240,25 +245,31 @@ TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
 
 ```mermaid
 flowchart TD
-    A[選局要求] --> B{候補があるか}
-    B -- いいえ --> R0[Reject: NoCandidates]
-    B -- はい --> C[候補を並べ替え\n排他数 → 稼働数 → 品質]
-    C --> D{同一チャンネルが\n既に稼働中か}
-    D -- はい --> R[Reuse: 既存チューナーを共有]
-    D -- いいえ --> E{候補ドライバに\n空きインスタンスがあるか}
-    E -- はい --> N[Create: 空きドライバで起動]
-    E -- いいえ --> F{主候補以外の\n同一グループに空きがあるか}
-    F -- はい --> G[Create: グループ内の空きへ起動\n退避なし]
-    F -- いいえ --> H{主候補に退避可能な\nidle / 低優先度リーダーがあるか}
-    H -- はい --> I[Create: 退避して主候補で起動]
-    H -- いいえ --> J{他候補で退避可能か}
-    J -- はい --> K[Create: 退避して候補ドライバで起動]
-    J -- いいえ --> R1[Reject: AtCapacity]
+    A[選局要求] --> B{"候補があるか"}
+    B -->|"いいえ"| R0["Reject: NoCandidates"]
+    B -->|"はい"| C["候補を並べ替え<br/>排他数 → 稼働数 → 品質"]
+    C --> D{"同一チャンネルが<br/>既に稼働中か"}
+    D -->|"はい"| R["Reuse: 既存チューナーを共有"]
+    D -->|"いいえ"| CD{"open cooldown 中の<br/>候補を除外して残るか"}
+    CD -->|"いいえ"| R2["Reject: AtCapacity<br/>候補なし"]
+    CD -->|"はい"| E{"候補ドライバに<br/>空きインスタンスがあるか"}
+    E -->|"はい"| N["Create: 空きドライバで起動"]
+    E -->|"いいえ"| F{"主候補以外の<br/>同一グループに空きがあるか"}
+    F -->|"はい"| G["Create: グループ内の空きへ起動<br/>退避なし"]
+    F -->|"いいえ"| H{"主候補に退避可能な<br/>idle / 低優先度リーダーがあるか"}
+    H -->|"はい"| I["Create: 退避して主候補で起動"]
+    H -->|"いいえ"| J{"他候補で退避可能か"}
+    J -->|"はい"| K["Create: 退避して候補ドライバで起動"]
+    J -->|"いいえ"| W{"全候補ドライバが<br/>warming か"}
+    W -->|"はい"| RW["Reject: Warming<br/>retry_after"]
+    W -->|"いいえ"| R1["Reject: AtCapacity"]
 ```
 
 同一グループに空きがある場合は、要求が排他であっても主候補のリーダーを先に退避しない。
 `max_instances` はドライバごとの上限として常に守り、候補がすべて満杯のときだけ優先度と
-`exclusive` による退避判定へ進む。
+`exclusive` による退避判定へ進む。`Reuse` 判定は `open_cooldown` の候補除外より先に行う。
+兄弟ドライバの空き探索と全候補の退避探索を終えても候補がなく、全候補ドライバが
+`Reserved` / `Starting` の warming 状態のときだけ `Warming` を返す。
 
 ### 4.4.1 図解: チューナーを取り合う全経路
 
@@ -285,7 +296,7 @@ flowchart TD
     SNAP --> DEC["policy::decide()<br/>純関数・I/Oなし"]
 
     DEC -->|Reuse| REUSE["既存リーダーに合流<br/>permit を取りに行かない"]
-    DEC -->|Reject| REJ["AtCapacity / NoCandidates"]
+    DEC -->|Reject| REJ["AtCapacity / Warming / NoCandidates"]
     DEC -->|"Create (key, evict)"| EVICT["evict 対象を停止<br/>StopReason=Evicted"]
 
     EVICT --> PERM{"permit 取得<br/>carried → warm → acquire_slot"}
@@ -353,6 +364,9 @@ stateDiagram-v2
 
 `Reserved` と `Starting` を分けないと「起動すべきか」の判定が必ず誤る
 (起動をサボる、または他タスクの起動に重ねて二重オープンする)。
+また、`Running` に入ってから `no_data_timeout_secs` (既定 30 秒) の間に TS を 1 バイトも
+読めない場合は TS 枯死ウォッチドッグが `StopReason::ReaderFailed` を立てて自ら停止する
+(`Running → Stopping → Stopped`)。本番では 67 分間 0 Mbps のままスロットを保持した例があった。
 
 #### 満杯のときに誰を退避するか
 
@@ -364,15 +378,19 @@ flowchart TD
     IK -->|"いいえ<br/>= 選局直後で未購読"| PROTECT["奪わない<br/>要求元が壊れる"]
     I -->|"ない"| L{"最も優先度の低い<br/>視聴中リーダー"}
     PROTECT --> L
-    L --> C{"要求優先度 > 相手<br/>または exclusive?"}
+    L --> MH{"購読者あり・Running で<br/>held_for < min_hold?"}
+    MH -->|"はい"| PROTECT2["奪わない<br/>最低保持時間中"]
+    MH -->|"いいえ"| C{"(要求優先度, exclusive) が<br/>(相手の優先度, exclusive) より大きい?"}
     C -->|"はい"| TAKE2["奪う<br/>視聴者は切断される"]
-    C -->|"いいえ<br/>(同値含む)"| NEXT["別の候補ドライバへ"]
+    C -->|"いいえ"| NEXT["別の候補ドライバへ"]
+    PROTECT2 --> NEXT
     NEXT --> NONE{"候補が尽きた?"}
     NONE -->|"はい"| REJECT["拒否<br/>上限超過では作らない"]
 ```
 
 - **同値では奪わない。** 同順位が先着を蹴散らしても得るものがない。
-- **`exclusive` はタイに勝つ。** ハードウェアそのものを要求しているため。
+- **`exclusive` は同じ優先度のタイに勝つ。** ハードウェアそのものの要求なので、
+  `(priority, exclusive)` の辞書式順序で上回る場合に限る。優先度を無視して勝つわけではない。
 - **keep-alive の残骸は優先度に関わらず譲る。** 誰も見ていないため。ただし
   「購読者ゼロ」だけで判断してはいけない ―― `SetChannelSpace` と `StartStream` の
   間のエントリも購読者ゼロで、これを奪うと要求元が壊れる。
@@ -643,7 +661,7 @@ src/
 | `bon_drivers` | DLL 登録・グループ・スキャン設定・容量 | `group_name`, `max_instances`, `auto_scan_enabled`, `scan_interval_hours`, `next_scan_at`, `passive_scan_enabled` |
 | `channels` | チャンネル正規化情報 | 一意キー `(bon_driver_id, nid, sid, tsid, manual_sheet)`。`band_type`/`region_id`/`terrestrial_region` は自動判定。`priority` は論理選局の既定優先度、`failure_count` で不良チャンネル追跡 |
 | `scan_history` | スキャン実行記録 | 成否・件数・エラー |
-| `scan_scheduler_config` / `tuner_config` / `tsreplace_config` | 単一行 (id=1) の実行時設定 | Web API から変更 → 次回参照時に反映 |
+| `scan_scheduler_config` / `tuner_config` / `tsreplace_config` | 単一行 (id=1) の実行時設定 | `tuner_config`: `keep_alive_secs`, `min_hold_secs`, `reject_cooldown_ms`, `no_data_timeout_secs` など。Web API から変更 → 次回参照時に反映 |
 | `session_history` | セッション統計の永続化 | drop/scramble/error、平均ビットレート・信号、切断理由 |
 | `alert_rules` / `alert_history` | アラート定義と発火記録 | webhook_url/format |
 | `driver_quality_stats` | ドライバー個体の品質スコア | `quality_score` 0.0-1.0 (**selector 未接続 — REVIEW 5-5**) |
@@ -659,7 +677,7 @@ src/
 | 層 | 内容 |
 |---|---|
 | CLI / TOML | `listen` (既定 **0.0.0.0:40070**), `web_listen` (既定 **127.0.0.1:40080**、2026-07-04 変更。REVIEW P0), `tuner`, `database`, `max_connections` (64), ログ設定, TLS パス, `[web] auth_enabled`/`auth_token`, `[tsreplace] command_path` |
-| DB (Web API から変更) | `tuner_config` (keep_alive=60s, prewarm, SetChannel リトライ, signal 待ち), `scan_scheduler_config`, `tsreplace_config` (`command_path` を除く — API からは変更不可), `web_auth_config` (トークン永続化、API からは変更不可・main.rs のみが書き込む) |
+| DB (Web API から変更) | `tuner_config` (keep_alive=60s, min_hold=10s, reject_cooldown=2000ms, no_data_timeout=30s, prewarm, SetChannel リトライ, signal 待ち), `scan_scheduler_config`, `tsreplace_config` (`command_path` を除く — API からは変更不可), `web_auth_config` (トークン永続化、API からは変更不可・main.rs のみが書き込む) |
 
 TLS 設定 (`[tls]`) は **現状サーバー側で機能しない** (パースのみ、accept 経路未結線)。実装完了までは使用しない。
 

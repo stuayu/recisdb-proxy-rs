@@ -463,6 +463,8 @@ async fn run_server(
                     signal_poll_interval_ms,
                     signal_wait_timeout_ms
                 );
+                let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) =
+                    db_lock.get_tuner_livelock_config().unwrap_or((10, 2_000, 30));
                 info!(
                     "Loaded prefill config from database: view={}ms, preview={}ms, record={}ms, safety_factor={}",
                     prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor
@@ -476,6 +478,9 @@ async fn run_server(
                         set_channel_retry_timeout_ms,
                         signal_poll_interval_ms,
                         signal_wait_timeout_ms,
+                        min_hold_secs,
+                        reject_cooldown_ms,
+                        no_data_timeout_secs,
                         mmt_converter: Default::default(),
                     },
                     (prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor),
@@ -656,6 +661,9 @@ async fn run_server(
         set_channel_retry_timeout_ms: tuner_config.set_channel_retry_timeout_ms,
         signal_poll_interval_ms: tuner_config.signal_poll_interval_ms,
         signal_wait_timeout_ms: tuner_config.signal_wait_timeout_ms,
+        min_hold_secs: tuner_config.min_hold_secs,
+        reject_cooldown_ms: tuner_config.reject_cooldown_ms,
+        no_data_timeout_secs: tuner_config.no_data_timeout_secs,
         prefill_view_ms,
         prefill_preview_ms,
         prefill_record_ms,

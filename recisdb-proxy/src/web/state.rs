@@ -42,6 +42,9 @@ pub struct TunerConfigInfo {
     pub set_channel_retry_timeout_ms: u64,
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
+    pub min_hold_secs: u64,
+    pub reject_cooldown_ms: u64,
+    pub no_data_timeout_secs: u64,
     /// Fixed-duration prefill/jitter buffer settings (STREAMING_DESIGN.md
     /// §4/§9 P3), per stream class plus a shared safety margin.
     pub prefill_view_ms: u64,
@@ -558,6 +561,9 @@ impl WebState {
                 set_channel_retry_timeout_ms: 10_000,
                 signal_poll_interval_ms: 500,
                 signal_wait_timeout_ms: 10_000,
+                min_hold_secs: 10,
+                reject_cooldown_ms: 2_000,
+                no_data_timeout_secs: 30,
                 prefill_view_ms: 1000,
                 prefill_preview_ms: 2000,
                 prefill_record_ms: 6000,

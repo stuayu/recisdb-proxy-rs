@@ -442,7 +442,9 @@ CREATE TABLE encode_profiles(
     (b) それでも `start_bondriver_reader` が `EALREADY` を返した場合の最終手段として再度呼び
     300ms 後に1回だけリトライする (Unix限定、`#[cfg(unix)]`)。**稼働中かつ購読者ありのリーダーは
     一切退避しない**ため、他セッション/リクエストが実際に視聴中のストリームを奪うことはなく、
-    session.rs の優先度ベース排他退避 (低優先度の視聴中リーダーを止めてでも奪う) とは区別される。
+    session.rs の優先度ベース退避とは区別される。現在の `exclusive` は無条件の強制権ではなく、
+    client claim の `(priority, exclusive)` 辞書式比較のタイブレークであり、同順位の exclusive
+    同士は先着のストリームを維持する。
     容量不足のまま退避対象が見つからない場合は `ChannelResolveError::Busy` → HTTP 503。
 - **切断時のリーク防止**: `web/stream.rs::StreamCleanup` が RAII ガード。レスポンスボディ
   (`axum::body::Body::from_stream` + `futures::stream::unfold`) の state に埋め込み、

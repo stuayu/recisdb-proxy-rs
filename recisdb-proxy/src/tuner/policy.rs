@@ -64,6 +64,7 @@
 //! trying to predict it.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::ChannelKey;
@@ -238,6 +239,10 @@ pub struct EntryState {
     /// channel (already resolved to a plain `i32`, matching every call
     /// site's `.unwrap_or(Some(0)).unwrap_or(0)` pattern).
     pub priority: i32,
+    /// Highest live client claim on this tuner.
+    pub incumbent_exclusive: bool,
+    /// Time since the reader entered Running.
+    pub held_for: Duration,
     /// Whether a keep-alive (idle-close) timer is counting down on this
     /// entry. Only meaningful when nothing is subscribed, and it is what
     /// distinguishes a keep-alive leftover (takeable) from an entry whose
@@ -295,7 +300,9 @@ impl TunerSnapshot {
     fn running_count_excluding(&self, dll_path: &str, exclude: Option<&ChannelKey>) -> i32 {
         self.entries
             .iter()
-            .filter(|e| e.occupies_slot() && e.key.tuner_path == dll_path && exclude != Some(&e.key))
+            .filter(|e| {
+                e.occupies_slot() && e.key.tuner_path == dll_path && exclude != Some(&e.key)
+            })
             .count() as i32
     }
 
@@ -329,6 +336,7 @@ pub struct TuneRequest {
     /// it needs a DB read).
     pub priority: i32,
     pub exclusive: bool,
+    pub min_hold: Duration,
     /// This session's currently-held key, if any.
     pub own_key: Option<ChannelKey>,
     /// Whether switching away from `own_key` will free its slot on that
@@ -352,6 +360,8 @@ pub enum RejectReason {
     /// driver, when there was one, for diagnostics/logging by the caller —
     /// mirrors the value `handle_set_channel_space_capacity_limit` logs.
     AtCapacity { lowest_idle_priority: Option<i32> },
+    /// All occupied slots are still starting and therefore cannot be evicted.
+    Warming { retry_after: Duration },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -362,14 +372,21 @@ pub enum Decision {
     /// unconditionally on a same-channel running-tuner match, and doubles
     /// as the "requested channel already running" skip inside
     /// `handle_set_channel_space_exclusive_access`).
-    Reuse { key: ChannelKey },
+    Reuse {
+        key: ChannelKey,
+    },
     /// Create (or `get_or_create`-attach to) a tuner at `key`, first
     /// evicting every key listed in `evict` (0 or 1 in every current
     /// caller, since today's eviction is always "one victim per attempt" —
     /// kept as a `Vec` since P2's slot-reservation model may need to evict
     /// more than one to make room in the same request).
-    Create { key: ChannelKey, evict: Vec<ChannelKey> },
-    Reject { reason: RejectReason },
+    Create {
+        key: ChannelKey,
+        evict: Vec<ChannelKey>,
+    },
+    Reject {
+        reason: RejectReason,
+    },
 }
 
 fn candidate_tuple(key: &ChannelKey) -> DriverCandidate {
@@ -404,7 +421,10 @@ fn build_max_instances_map(snapshot: &TunerSnapshot) -> HashMap<String, i32> {
         .collect()
 }
 
-fn build_instances_map(snapshot: &TunerSnapshot, exclude: Option<&ChannelKey>) -> HashMap<String, i32> {
+fn build_instances_map(
+    snapshot: &TunerSnapshot,
+    exclude: Option<&ChannelKey>,
+) -> HashMap<String, i32> {
     let mut map: HashMap<String, i32> = HashMap::new();
     for e in &snapshot.entries {
         if !e.occupies_slot() || exclude == Some(&e.key) {
@@ -439,14 +459,21 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
 
     // Rule 1: sort candidates (fewer exclusive channels, then fewer running
     // instances, then higher quality score).
-    sort_candidate_drivers(&mut candidate_tuples, &exclusive_map, &instances_map, &score_map);
+    sort_candidate_drivers(
+        &mut candidate_tuples,
+        &exclusive_map,
+        &instances_map,
+        &score_map,
+    );
 
     // Rule 2: a candidate already running this exact physical channel wins
     // outright, short-circuiting capacity/priority/exclusive logic —
     // this *is* the "same channel already running" reuse case, so there is
     // no separate step for it later.
     let running_channels = snapshot.running_channel_specs();
-    if let Some((path, space, channel)) = select_running_driver(&candidate_tuples, &running_channels) {
+    if let Some((path, space, channel)) =
+        select_running_driver(&candidate_tuples, &running_channels)
+    {
         return Decision::Reuse {
             key: ChannelKey::space_channel(path, space, channel),
         };
@@ -464,22 +491,28 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
     });
     if candidate_tuples.is_empty() {
         return Decision::Reject {
-            reason: RejectReason::AtCapacity { lowest_idle_priority: None },
+            reason: RejectReason::AtCapacity {
+                lowest_idle_priority: None,
+            },
         };
     }
 
     // Rule 3: otherwise the first candidate with spare capacity.
     // Rule 4: otherwise the sorted head (every candidate is full; the
     // capacity/priority/exclusive logic below decides what happens next).
-    let (path, space, channel) = select_driver_with_capacity(&candidate_tuples, &instances_map, &max_instances_map)
-        .unwrap_or_else(|| candidate_tuples[0].clone());
+    let (path, space, channel) =
+        select_driver_with_capacity(&candidate_tuples, &instances_map, &max_instances_map)
+            .unwrap_or_else(|| candidate_tuples[0].clone());
     let primary = ChannelKey::space_channel(path.clone(), space, channel);
 
     let running = snapshot.running_count_excluding(&path, exclude_own);
     let max = max_instances_map.get(&path).copied().unwrap_or(1);
 
     if has_capacity(running, max) {
-        return Decision::Create { key: primary, evict: vec![] };
+        return Decision::Create {
+            key: primary,
+            evict: vec![],
+        };
     }
 
     decide_at_capacity(
@@ -500,13 +533,15 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
 ///
 /// - **idle** (no subscribers) — always yes. It is only alive because of the
 ///   keep-alive window.
-/// - **live viewer** — only if `req` strictly outranks it, or is `exclusive`.
-///   Strictly greater, not `>=`: a request that merely ties does not get to
-///   displace a working stream (P2b-3; before that `>=` let an
-///   equal-priority request bump whoever got there first for no gain). An
-///   `exclusive` request is the exception — it is asking for the hardware
-///   outright, and wins ties.
-fn may_evict(req: &TuneRequest, victim_priority: i32, victim_is_keep_alive: bool) -> bool {
+/// - **live viewer** — only if the request strictly outranks it in the
+///   `(priority, exclusive)` lexicographic rank. Exclusive is a tie-breaker,
+///   not an unconditional override.
+fn may_evict(
+    req: &TuneRequest,
+    victim: &EntryState,
+    victim_is_keep_alive: bool,
+    min_hold: Duration,
+) -> bool {
     if victim_is_keep_alive {
         // Nobody is watching it and its keep-alive timer is already running.
         // That window exists to make zapping back cheap — an optimisation,
@@ -518,8 +553,10 @@ fn may_evict(req: &TuneRequest, victim_priority: i32, victim_is_keep_alive: bool
         // taking that one away would break the request that created it.
         return true;
     }
-    // Displacing a live viewer is the case the priority rule is for.
-    req.priority > victim_priority || req.exclusive
+    if victim.has_subscribers() && victim.is_running() && victim.held_for < min_hold {
+        return false;
+    }
+    (req.priority, req.exclusive as u8) > (victim.priority, victim.incumbent_exclusive as u8)
 }
 
 /// Pick a victim on `dll_path`, preferring an idle (subscriber-less) reader
@@ -529,7 +566,10 @@ fn may_evict(req: &TuneRequest, victim_priority: i32, victim_is_keep_alive: bool
 /// choice across *all* running readers on the driver, subscribed ones
 /// included. Callers try them in that order, so a live viewer is only ever
 /// displaced when no idle reader could be taken instead.
-fn eviction_options(snapshot: &TunerSnapshot, dll_path: &str) -> (Option<EvictionCandidate>, Option<EvictionCandidate>) {
+fn eviction_options(
+    snapshot: &TunerSnapshot,
+    dll_path: &str,
+) -> (Option<EvictionCandidate>, Option<EvictionCandidate>) {
     let all: Vec<EvictionCandidate> = snapshot
         .entries
         .iter()
@@ -596,16 +636,23 @@ fn decide_at_capacity(
     let lowest_idle_priority = idle_victim.as_ref().map(|(_, p, _)| *p);
 
     for option in [idle_victim, any_victim].into_iter().flatten() {
-        let (victim, victim_priority, _) = option;
-        if may_evict(req, victim_priority, is_keep_alive_leftover(snapshot, &victim)) {
-            return Decision::Create {
-                key: primary,
-                evict: vec![victim],
-            };
+        let (victim, _, _) = option;
+        if let Some(victim_state) = snapshot.entries.iter().find(|e| e.key == victim) {
+            if may_evict(
+                req,
+                victim_state,
+                is_keep_alive_leftover(snapshot, &victim),
+                req.min_hold,
+            ) {
+                return Decision::Create {
+                    key: primary,
+                    evict: vec![victim],
+                };
+            }
         }
     }
 
-    decide_fallback(
+    let fallback_decision = decide_fallback(
         snapshot,
         req,
         candidate_tuples,
@@ -613,7 +660,44 @@ fn decide_at_capacity(
         max_instances_map,
         exclude_own,
         lowest_idle_priority,
-    )
+    );
+    if matches!(fallback_decision, Decision::Reject { .. })
+        && all_candidate_drivers_warming(snapshot, candidate_tuples, max_instances_map, exclude_own)
+    {
+        Decision::Reject {
+            reason: RejectReason::Warming {
+                retry_after: Duration::from_millis(500),
+            },
+        }
+    } else {
+        fallback_decision
+    }
+}
+
+fn all_candidate_drivers_warming(
+    snapshot: &TunerSnapshot,
+    candidates: &[DriverCandidate],
+    max_instances_map: &HashMap<String, i32>,
+    exclude_own: Option<&ChannelKey>,
+) -> bool {
+    let mut paths = std::collections::BTreeSet::new();
+    for (path, _, _) in candidates {
+        paths.insert(path.as_str());
+    }
+    !paths.is_empty()
+        && paths.into_iter().all(|path| {
+            let max = max_instances_map.get(path).copied().unwrap_or(1);
+            let occupied: Vec<&EntryState> = snapshot
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.key.tuner_path == path && e.occupies_slot() && Some(&e.key) != exclude_own
+                })
+                .collect();
+            occupied.len() >= max as usize
+                && !occupied.is_empty()
+                && occupied.iter().all(|e| !e.is_running())
+        })
 }
 
 /// Find a sibling group candidate with a free instance, without considering
@@ -667,13 +751,23 @@ fn decide_fallback(
 
         let (idle_victim, any_victim) = eviction_options(snapshot, path);
         for option in [idle_victim, any_victim].into_iter().flatten() {
-            let (victim, victim_priority, _) = option;
+            let (victim, _, _) = option;
             if victim == key {
                 // Never evict the very entry we are about to (re)use.
                 continue;
             }
-            if may_evict(req, victim_priority, is_keep_alive_leftover(snapshot, &victim)) {
-                return Decision::Create { key, evict: vec![victim] };
+            if let Some(victim_state) = snapshot.entries.iter().find(|e| e.key == victim) {
+                if may_evict(
+                    req,
+                    victim_state,
+                    is_keep_alive_leftover(snapshot, &victim),
+                    req.min_hold,
+                ) {
+                    return Decision::Create {
+                        key,
+                        evict: vec![victim],
+                    };
+                }
             }
         }
     }
@@ -744,13 +838,14 @@ mod tests {
 
     #[test]
     fn select_running_driver_prefers_same_physical_channel_already_streaming() {
-        let candidates: Vec<DriverCandidate> = vec![
-            ("A.dll".to_string(), 0, 27),
-            ("B.dll".to_string(), 0, 5),
-        ];
+        let candidates: Vec<DriverCandidate> =
+            vec![("A.dll".to_string(), 0, 27), ("B.dll".to_string(), 0, 5)];
         let running = vec![(
             "B.dll".to_string(),
-            ChannelKeySpec::SpaceChannel { space: 0, channel: 5 },
+            ChannelKeySpec::SpaceChannel {
+                space: 0,
+                channel: 5,
+            },
         )];
 
         let selected = select_running_driver(&candidates, &running);
@@ -762,7 +857,10 @@ mod tests {
         let candidates: Vec<DriverCandidate> = vec![("A.dll".to_string(), 0, 27)];
         let running = vec![(
             "A.dll".to_string(),
-            ChannelKeySpec::SpaceChannel { space: 1, channel: 99 },
+            ChannelKeySpec::SpaceChannel {
+                space: 1,
+                channel: 99,
+            },
         )];
         assert_eq!(select_running_driver(&candidates, &running), None);
     }
@@ -814,7 +912,14 @@ mod tests {
         }
     }
 
-    fn entry(path: &str, space: u32, channel: u32, running: bool, subscribers: u32, priority: i32) -> EntryState {
+    fn entry(
+        path: &str,
+        space: u32,
+        channel: u32,
+        running: bool,
+        subscribers: u32,
+        priority: i32,
+    ) -> EntryState {
         use crate::tuner::shared::ReaderState;
         EntryState {
             key: ChannelKey::space_channel(path, space, channel),
@@ -822,9 +927,15 @@ mod tests {
             // cares about; `decide()` only ever distinguishes `Running` from
             // "anything else", so `Stopped` is an arbitrary-but-equivalent
             // stand-in for every `false` case.
-            state: if running { ReaderState::Running } else { ReaderState::Stopped },
+            state: if running {
+                ReaderState::Running
+            } else {
+                ReaderState::Stopped
+            },
             subscribers,
             priority,
+            incumbent_exclusive: false,
+            held_for: Duration::from_secs(10),
             // Most tests are about live-vs-idle and priority; a
             // subscriber-less entry stands in for a keep-alive leftover
             // unless a test says otherwise.
@@ -837,6 +948,7 @@ mod tests {
             candidates,
             priority: 0,
             exclusive: false,
+            min_hold: Duration::from_secs(10),
             own_key: None,
             own_key_will_free_slot: false,
         }
@@ -915,6 +1027,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reuse_wins_even_when_the_driver_is_in_open_cooldown() {
+        let mut cooled = driver("A.dll", 1);
+        cooled.open_cooldown = true;
+        let snapshot = TunerSnapshot {
+            drivers: vec![cooled],
+            entries: vec![entry("A.dll", 0, 5, true, 1, 0)],
+        };
+        let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 5)]);
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Reuse {
+                key: ChannelKey::space_channel("A.dll", 0, 5)
+            }
+        );
+    }
+
     /// At capacity, non-exclusive: a strictly higher priority evicts the
     /// lowest-priority *idle* tuner, leaving the subscribed one alone even
     /// though it also outranks the request's own priority.
@@ -946,14 +1075,22 @@ mod tests {
     fn equal_priority_does_not_evict_a_live_viewer() {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
-            entries: vec![entry("A.dll", 0, 1, true, 1, 7)],
+            entries: vec![{
+                let mut e = entry("A.dll", 0, 1, true, 1, 7);
+                e.incumbent_exclusive = false;
+                e
+            }],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 7; // exactly equal, not strictly greater.
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
+            Decision::Reject {
+                reason: RejectReason::AtCapacity {
+                    lowest_idle_priority: None
+                }
+            }
         );
     }
 
@@ -981,8 +1118,8 @@ mod tests {
         );
     }
 
-    /// ...but an `exclusive` request wins ties: it is asking for the
-    /// hardware outright (P2b-3).
+    /// Exclusive is only a tie-breaker when the incumbent is non-exclusive;
+    /// exclusive claims do not evict one another.
     #[test]
     fn exclusive_request_wins_a_priority_tie() {
         let snapshot = TunerSnapshot {
@@ -998,6 +1135,115 @@ mod tests {
             Decision::Create {
                 key: ChannelKey::space_channel("A.dll", 0, 9),
                 evict: vec![ChannelKey::space_channel("A.dll", 0, 1)],
+            }
+        );
+    }
+
+    #[test]
+    fn livelock_regression_same_priority_viewer_is_not_evicted() {
+        // This fixes the decide() rule; the production P0 regression where
+        // snapshot() used DB priority instead of the incumbent claim is
+        // guarded by acquire.rs snapshot tests.
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 2)],
+            entries: vec![
+                entry("A.dll", 0, 12, true, 2, 9),
+                entry("A.dll", 0, 14, true, 2, 9),
+            ],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 16)]);
+        req.priority = 9;
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn equal_priority_exclusive_claims_do_not_evict_each_other() {
+        let mut incumbent = entry("A.dll", 0, 1, true, 1, 10);
+        incumbent.incumbent_exclusive = true;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![incumbent],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 10;
+        req.exclusive = true;
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn low_priority_exclusive_does_not_evict_high_priority_recording() {
+        let mut incumbent = entry("A.dll", 0, 1, true, 1, 200);
+        incumbent.incumbent_exclusive = false;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![incumbent],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 10;
+        req.exclusive = true;
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn higher_priority_claim_can_evict_lower_priority_claim() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 1, 9)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 200;
+        assert!(
+            matches!(decide(&snapshot, &req), Decision::Create { evict, .. } if evict.len() == 1)
+        );
+    }
+
+    #[test]
+    fn grace_period_blocks_eviction_of_live_reader() {
+        let mut incumbent = entry("A.dll", 0, 1, true, 1, 9);
+        incumbent.held_for = Duration::from_secs(1);
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![incumbent],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 200;
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn all_starting_slots_report_warming() {
+        let mut starting = entry("A.dll", 0, 1, false, 0, 0);
+        starting.state = crate::tuner::shared::ReaderState::Starting;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![starting],
+        };
+        let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        assert!(matches!(
+            decide(&snapshot, &req),
+            Decision::Reject {
+                reason: RejectReason::Warming { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn starting_primary_uses_sibling_capacity_before_warming_rejection() {
+        let mut primary = entry("A.dll", 0, 1, false, 0, 0);
+        primary.state = crate::tuner::shared::ReaderState::Starting;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 1)],
+            entries: vec![primary],
+        };
+        let req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![],
             }
         );
     }
@@ -1304,6 +1550,8 @@ mod tests {
                 state: crate::tuner::shared::ReaderState::Running,
                 subscribers: 0,
                 priority: 0,
+                incumbent_exclusive: false,
+                held_for: Duration::from_secs(10),
                 idle_close_pending: true,
             }],
         };
@@ -1332,6 +1580,8 @@ mod tests {
                 state: crate::tuner::shared::ReaderState::Running,
                 subscribers: 0,
                 priority: 42,
+                incumbent_exclusive: false,
+                held_for: Duration::from_secs(10),
                 idle_close_pending: true,
             }],
         };
