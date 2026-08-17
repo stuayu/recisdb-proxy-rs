@@ -170,6 +170,12 @@ pub struct TsAnalyzer {
     collectors: HashMap<u16, SectionCollector>,
     /// PMT PIDs to watch (from PAT).
     pmt_pids: HashMap<u16, u16>, // PID -> program_number
+    pat_sections: HashMap<u8, PatTable>,
+    nit_sections: HashMap<u8, NitTable>,
+    sdt_sections: HashMap<u8, SdtTable>,
+    pat_last_section_number: Option<u8>,
+    nit_last_section_number: Option<u8>,
+    sdt_last_section_number: Option<u8>,
 }
 
 impl TsAnalyzer {
@@ -180,6 +186,12 @@ impl TsAnalyzer {
             result: AnalyzerResult::default(),
             collectors: HashMap::new(),
             pmt_pids: HashMap::new(),
+            pat_sections: HashMap::new(),
+            nit_sections: HashMap::new(),
+            sdt_sections: HashMap::new(),
+            pat_last_section_number: None,
+            nit_last_section_number: None,
+            sdt_last_section_number: None,
         }
     }
 
@@ -223,7 +235,7 @@ impl TsAnalyzer {
                 }
 
                 // Check if complete
-                if self.result.is_complete(&self.config) {
+                if self.is_tables_complete() {
                     self.result.complete = true;
                     return true;
                 }
@@ -309,24 +321,39 @@ impl TsAnalyzer {
             return;
         }
 
-        // Skip if we already have PAT with same or newer version
+        // Reject an older version, but retain every section of the current
+        // version. PAT may span multiple sections.
         if let Some(ref existing) = self.result.pat {
-            if !is_newer_version(existing.version_number, section.header.version_number) {
+            if existing.version_number != section.header.version_number
+                && !is_newer_version(existing.version_number, section.header.version_number)
+            {
                 return;
             }
         }
 
         if let Ok(pat) = PatTable::parse(section) {
+            if self
+                .result
+                .pat
+                .as_ref()
+                .is_some_and(|old| old.version_number != pat.version_number)
+            {
+                self.pat_sections.clear();
+                self.pat_last_section_number = None;
+            }
+            self.pat_last_section_number = Some(section.header.last_section_number);
+            self.pat_sections.insert(section.header.section_number, pat);
+            let merged = merge_pat_sections(&self.pat_sections);
             // Update PMT PIDs to watch
             self.pmt_pids.clear();
-            for entry in &pat.programs {
+            for entry in &merged.programs {
                 if self.config.parse_all_pmts {
                     self.pmt_pids.insert(entry.pid, entry.program_number);
                 }
             }
 
-            self.result.transport_stream_id = Some(pat.transport_stream_id);
-            self.result.pat = Some(pat);
+            self.result.transport_stream_id = Some(merged.transport_stream_id);
+            self.result.pat = Some(merged);
         }
     }
 
@@ -339,17 +366,32 @@ impl TsAnalyzer {
             return;
         }
 
-        // Skip if we already have NIT with same or newer version
+        // Reject an older version, but retain every section of the current
+        // version because NIT can span multiple sections.
         if let Some(ref existing) = self.result.nit {
-            if !is_newer_version(existing.version_number, section.header.version_number) {
+            if existing.version_number != section.header.version_number
+                && !is_newer_version(existing.version_number, section.header.version_number)
+            {
                 return;
             }
         }
 
         if let Ok(nit) = NitTable::parse(section) {
-            self.result.network_id = Some(nit.network_id);
-            self.result.network_name = nit.network_name.clone();
-            self.result.nit = Some(nit);
+            if self
+                .result
+                .nit
+                .as_ref()
+                .is_some_and(|old| old.version_number != nit.version_number)
+            {
+                self.nit_sections.clear();
+                self.nit_last_section_number = None;
+            }
+            self.nit_last_section_number = Some(section.header.last_section_number);
+            self.nit_sections.insert(section.header.section_number, nit);
+            let merged = merge_nit_sections(&self.nit_sections);
+            self.result.network_id = Some(merged.network_id);
+            self.result.network_name = merged.network_name.clone();
+            self.result.nit = Some(merged);
         }
     }
 
@@ -362,15 +404,29 @@ impl TsAnalyzer {
             return;
         }
 
-        // Skip if we already have SDT with same or newer version
+        // Reject an older version, but retain every section of the current
+        // version because SDT can span multiple sections.
         if let Some(ref existing) = self.result.sdt {
-            if !is_newer_version(existing.version_number, section.header.version_number) {
+            if existing.version_number != section.header.version_number
+                && !is_newer_version(existing.version_number, section.header.version_number)
+            {
                 return;
             }
         }
 
         if let Ok(sdt) = SdtTable::parse(section) {
-            self.result.sdt = Some(sdt);
+            if self
+                .result
+                .sdt
+                .as_ref()
+                .is_some_and(|old| old.version_number != sdt.version_number)
+            {
+                self.sdt_sections.clear();
+                self.sdt_last_section_number = None;
+            }
+            self.sdt_last_section_number = Some(section.header.last_section_number);
+            self.sdt_sections.insert(section.header.section_number, sdt);
+            self.result.sdt = Some(merge_sdt_sections(&self.sdt_sections));
         }
     }
 
@@ -415,11 +471,34 @@ impl TsAnalyzer {
         self.result = AnalyzerResult::default();
         self.collectors.clear();
         self.pmt_pids.clear();
+        self.pat_sections.clear();
+        self.nit_sections.clear();
+        self.sdt_sections.clear();
+        self.pat_last_section_number = None;
+        self.nit_last_section_number = None;
+        self.sdt_last_section_number = None;
     }
 
     /// Check if analysis is complete.
     pub fn is_complete(&self) -> bool {
         self.result.complete
+    }
+
+    fn is_tables_complete(&self) -> bool {
+        if !all_sections_received(&self.pat_sections, self.pat_last_section_number) {
+            return false;
+        }
+        if self.config.parse_nit
+            && !all_sections_received(&self.nit_sections, self.nit_last_section_number)
+        {
+            return false;
+        }
+        if self.config.parse_sdt
+            && !all_sections_received(&self.sdt_sections, self.sdt_last_section_number)
+        {
+            return false;
+        }
+        self.result.is_complete(&self.config)
     }
 }
 
@@ -429,6 +508,56 @@ fn is_newer_version(current: u8, new: u8) -> bool {
     let new = new & 0x1F;
     let delta = new.wrapping_sub(current) & 0x1F;
     delta != 0 && delta < 16
+}
+
+fn all_sections_received<T>(sections: &HashMap<u8, T>, last_section_number: Option<u8>) -> bool {
+    let Some(last_section_number) = last_section_number else {
+        return false;
+    };
+    (0..=last_section_number).all(|section_number| sections.contains_key(&section_number))
+}
+
+fn merge_pat_sections(sections: &HashMap<u8, PatTable>) -> PatTable {
+    let mut merged = sections.values().next().cloned().unwrap_or_default();
+    merged.programs = sections
+        .values()
+        .flat_map(|section| section.programs.iter().copied())
+        .collect();
+    merged.programs.sort_by_key(|entry| entry.program_number);
+    merged.programs.dedup_by_key(|entry| entry.program_number);
+    merged.nit_pid = sections.values().find_map(|section| section.nit_pid);
+    merged
+}
+
+fn merge_nit_sections(sections: &HashMap<u8, NitTable>) -> NitTable {
+    let mut merged = sections.values().next().cloned().unwrap_or_default();
+    merged.transport_streams = sections
+        .values()
+        .flat_map(|section| section.transport_streams.iter().cloned())
+        .collect();
+    merged
+        .transport_streams
+        .sort_by_key(|stream| (stream.transport_stream_id, stream.original_network_id));
+    merged
+        .transport_streams
+        .dedup_by_key(|stream| (stream.transport_stream_id, stream.original_network_id));
+    if merged.network_name.is_none() {
+        merged.network_name = sections
+            .values()
+            .find_map(|section| section.network_name.clone());
+    }
+    merged
+}
+
+fn merge_sdt_sections(sections: &HashMap<u8, SdtTable>) -> SdtTable {
+    let mut merged = sections.values().next().cloned().unwrap_or_default();
+    merged.services = sections
+        .values()
+        .flat_map(|section| section.services.iter().cloned())
+        .collect();
+    merged.services.sort_by_key(|service| service.service_id);
+    merged.services.dedup_by_key(|service| service.service_id);
+    merged
 }
 
 #[cfg(test)]
@@ -442,6 +571,53 @@ mod tests {
         assert!(!is_newer_version(0, 31));
         assert!(!is_newer_version(7, 7));
         assert!(!is_newer_version(0, 16));
+    }
+
+    #[test]
+    fn all_sections_received_requires_every_section() {
+        let mut sections = HashMap::new();
+        sections.insert(0, ());
+        sections.insert(2, ());
+        assert!(!all_sections_received(&sections, Some(2)));
+        sections.insert(1, ());
+        assert!(all_sections_received(&sections, Some(2)));
+        assert!(!all_sections_received(&sections, None));
+    }
+
+    #[test]
+    fn merge_pat_sections_keeps_programs_from_each_section() {
+        use crate::ts_analyzer::pat::PatEntry;
+
+        let mut sections = HashMap::new();
+        sections.insert(
+            0,
+            PatTable {
+                transport_stream_id: 1,
+                version_number: 2,
+                programs: vec![PatEntry {
+                    program_number: 101,
+                    pid: 1001,
+                }],
+                nit_pid: Some(16),
+            },
+        );
+        sections.insert(
+            1,
+            PatTable {
+                transport_stream_id: 1,
+                version_number: 2,
+                programs: vec![PatEntry {
+                    program_number: 102,
+                    pid: 1002,
+                }],
+                nit_pid: None,
+            },
+        );
+
+        let merged = merge_pat_sections(&sections);
+        assert_eq!(merged.programs.len(), 2);
+        assert_eq!(merged.programs[1].program_number, 102);
+        assert_eq!(merged.nit_pid, Some(16));
     }
 
     #[test]
