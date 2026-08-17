@@ -558,6 +558,21 @@ fn decide_at_capacity(
     max_instances_map: &HashMap<String, i32>,
     exclude_own: Option<&ChannelKey>,
 ) -> Decision {
+    // A group request must consume an unused instance from a sibling driver
+    // before evicting a reader on the primary driver.  Previously the
+    // primary driver's eviction branch ran first; an exclusive request could
+    // therefore displace a live reader even though another driver in the
+    // same group still had capacity.
+    if let Some(key) = find_fallback_with_capacity(
+        candidate_tuples,
+        dll_path,
+        snapshot,
+        max_instances_map,
+        exclude_own,
+    ) {
+        return Decision::Create { key, evict: vec![] };
+    }
+
     let (idle_victim, any_victim) = eviction_options(snapshot, dll_path);
     let lowest_idle_priority = idle_victim.as_ref().map(|(_, p, _)| *p);
 
@@ -580,6 +595,26 @@ fn decide_at_capacity(
         exclude_own,
         lowest_idle_priority,
     )
+}
+
+/// Find a sibling group candidate with a free instance, without considering
+/// eviction.  This is deliberately separate from `decide_fallback`: an
+/// available group instance always wins over evicting a reader elsewhere.
+fn find_fallback_with_capacity(
+    candidate_tuples: &[DriverCandidate],
+    skip_path: &str,
+    snapshot: &TunerSnapshot,
+    max_instances_map: &HashMap<String, i32>,
+    exclude_own: Option<&ChannelKey>,
+) -> Option<ChannelKey> {
+    candidate_tuples.iter().find_map(|(path, space, channel)| {
+        if path == skip_path {
+            return None;
+        }
+        let running = snapshot.running_count_excluding(path, exclude_own);
+        let max = max_instances_map.get(path).copied().unwrap_or(1);
+        has_capacity(running, max).then(|| ChannelKey::space_channel(path.clone(), *space, *channel))
+    })
 }
 
 /// Walk the remaining candidate drivers, applying the same rule as
@@ -958,6 +993,52 @@ mod tests {
             ChannelKey::space_channel("B.dll", 0, 9),
         ]);
         req.priority = 1;
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+        );
+    }
+
+    /// A free sibling instance is preferred over evicting a live viewer on
+    /// the primary driver, including for an exclusive request.
+    #[test]
+    fn group_spare_capacity_precedes_exclusive_eviction_on_primary() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 2)],
+            entries: vec![
+                entry("A.dll", 0, 1, true, 1, 100), // primary is full
+                entry("B.dll", 0, 1, true, 1, 0),   // sibling still has a slot
+            ],
+        };
+        let mut req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+        req.exclusive = true;
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+        );
+    }
+
+    /// The same ordering applies to non-exclusive requests: use group
+    /// capacity before displacing a live primary reader that we outrank.
+    #[test]
+    fn group_spare_capacity_precedes_nonexclusive_eviction_on_primary() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1), driver("B.dll", 2)],
+            entries: vec![
+                entry("A.dll", 0, 1, true, 1, 1), // primary is full
+                entry("B.dll", 0, 1, true, 1, 0), // sibling still has a slot
+            ],
+        };
+        let mut req = base_request(vec![
+            ChannelKey::space_channel("A.dll", 0, 9),
+            ChannelKey::space_channel("B.dll", 0, 9),
+        ]);
+        req.priority = 2;
 
         assert_eq!(
             decide(&snapshot, &req),
