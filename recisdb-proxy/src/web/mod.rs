@@ -704,6 +704,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_reports_process_uptime() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let started_at = state.started_at;
+        let app = build_app(state, false);
+
+        let res = app
+            .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let uptime = json["stats"]["uptime_seconds"].as_u64().unwrap();
+        assert!(uptime <= started_at.elapsed().as_secs());
+    }
+
+    #[tokio::test]
     async fn stream_endpoint_requires_auth_like_every_other_api_route() {
         // STREAMING_DESIGN.md §6.5: the streaming endpoint must sit behind
         // the exact same auth gate as the rest of `/api/*`.

@@ -142,7 +142,7 @@ pub async fn get_stats(
         active_tuners,
         scanning_tuners: scanning.len(),
         scanning_drivers: scanning,
-        uptime_seconds: 0,
+        uptime_seconds: web_state.started_at.elapsed().as_secs(),
         total_sessions_db,
         total_channels,
     };

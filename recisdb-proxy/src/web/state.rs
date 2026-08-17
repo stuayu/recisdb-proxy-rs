@@ -449,6 +449,8 @@ pub enum UpdateStatus {
 
 /// Shared state for the web server.
 pub struct WebState {
+    /// Monotonic process start time used by the dashboard uptime statistic.
+    pub started_at: Instant,
     /// Database handle.
     pub database: DatabaseHandle,
     /// Tuner pool reference.
@@ -526,6 +528,7 @@ impl WebState {
         epg_events_tx: broadcast::Sender<ProgramUpsert>,
     ) -> Self {
         Self {
+            started_at: Instant::now(),
             database,
             tuner_pool,
             encoder_pool,

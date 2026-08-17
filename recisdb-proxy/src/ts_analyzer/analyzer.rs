@@ -299,10 +299,15 @@ impl TsAnalyzer {
         if section.header.table_id != table_id::PAT {
             return;
         }
+        // A next table (`current_next_indicator == 0`) is a scheduled
+        // replacement and must not affect the active service map yet.
+        if !section.header.current_next_indicator {
+            return;
+        }
 
         // Skip if we already have PAT with same or newer version
         if let Some(ref existing) = self.result.pat {
-            if existing.version_number >= section.header.version_number {
+            if !is_newer_version(existing.version_number, section.header.version_number) {
                 return;
             }
         }
@@ -326,10 +331,13 @@ impl TsAnalyzer {
         if section.header.table_id != table_id::NIT_ACTUAL {
             return;
         }
+        if !section.header.current_next_indicator {
+            return;
+        }
 
         // Skip if we already have NIT with same or newer version
         if let Some(ref existing) = self.result.nit {
-            if existing.version_number >= section.header.version_number {
+            if !is_newer_version(existing.version_number, section.header.version_number) {
                 return;
             }
         }
@@ -346,10 +354,13 @@ impl TsAnalyzer {
         if section.header.table_id != table_id::SDT_ACTUAL {
             return;
         }
+        if !section.header.current_next_indicator {
+            return;
+        }
 
         // Skip if we already have SDT with same or newer version
         if let Some(ref existing) = self.result.sdt {
-            if existing.version_number >= section.header.version_number {
+            if !is_newer_version(existing.version_number, section.header.version_number) {
                 return;
             }
         }
@@ -364,6 +375,9 @@ impl TsAnalyzer {
         if section.header.table_id != table_id::PMT {
             return;
         }
+        if !section.header.current_next_indicator {
+            return;
+        }
 
         // Verify program number matches
         if section.header.table_id_extension != expected_program {
@@ -372,7 +386,7 @@ impl TsAnalyzer {
 
         // Skip if we already have PMT with same or newer version
         if let Some(existing) = self.result.pmts.get(&expected_program) {
-            if existing.version_number >= section.header.version_number {
+            if !is_newer_version(existing.version_number, section.header.version_number) {
                 return;
             }
         }
@@ -405,9 +419,30 @@ impl TsAnalyzer {
     }
 }
 
+/// Compare the five-bit PSI/SI version number as a modulo-32 counter.
+///
+/// A plain `new > current` comparison breaks when a broadcaster changes a
+/// table from version 31 to version 0. A difference of 16 is deliberately
+/// treated as not newer because the modulo counter cannot disambiguate it.
+fn is_newer_version(current: u8, new: u8) -> bool {
+    let current = current & 0x1F;
+    let new = new & 0x1F;
+    let delta = new.wrapping_sub(current) & 0x1F;
+    delta != 0 && delta < 16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psi_version_comparison_wraps_at_31() {
+        assert!(is_newer_version(31, 0));
+        assert!(is_newer_version(30, 1));
+        assert!(!is_newer_version(0, 31));
+        assert!(!is_newer_version(7, 7));
+        assert!(!is_newer_version(0, 16));
+    }
 
     #[test]
     fn test_analyzer_config_default() {

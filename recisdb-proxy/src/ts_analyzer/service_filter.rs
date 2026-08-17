@@ -48,6 +48,11 @@ const ALWAYS_PASS_PIDS: &[u16] = &[
     0x0024,
 ];
 
+fn is_newer_version(current: u8, new: u8) -> bool {
+    let delta = (new & 0x1F).wrapping_sub(current & 0x1F) & 0x1F;
+    delta != 0 && delta < 16
+}
+
 /// TS service filter that passes only packets for a single SID.
 pub struct TsServiceFilter {
     /// Target service ID (program_number in PAT).
@@ -189,13 +194,21 @@ impl TsServiceFilter {
         let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };
+        if !section.header.current_next_indicator {
+            return;
+        }
         let Ok(pat) = PatTable::parse(&section) else {
             return;
         };
 
-        // Check version change
-        if self.pat_version == Some(pat.version_number) {
-            return;
+        // Accept every section of the current version, but reject an older
+        // table. PAT is allowed to span multiple sections; dropping all
+        // same-version sections can hide the target SID when it is not in
+        // section 0.
+        if let Some(current) = self.pat_version {
+            if current != pat.version_number && !is_newer_version(current, pat.version_number) {
+                return;
+            }
         }
 
         debug!(
@@ -263,14 +276,18 @@ impl TsServiceFilter {
         let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };
+        if !section.header.current_next_indicator {
+            return;
+        }
 
         let Ok(pmt) = PmtTable::parse(&section) else {
             return;
         };
 
-        // Check version change
-        if self.pmt_version == Some(pmt.version_number) {
-            return;
+        if let Some(current) = self.pmt_version {
+            if current != pmt.version_number && !is_newer_version(current, pmt.version_number) {
+                return;
+            }
         }
 
         debug!(
