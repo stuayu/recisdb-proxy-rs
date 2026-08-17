@@ -221,6 +221,10 @@ pub(crate) async fn snapshot(
     }
 
     let pending_idle_close = pool.keys_pending_idle_close().await;
+    let open_cooldowns: std::collections::HashMap<String, bool> = dll_paths
+        .iter()
+        .map(|path| (path.clone(), pool.open_backoff().cooldown_remaining(path).is_some()))
+        .collect();
 
     let mut raw_entries = Vec::new();
     for key in pool.keys().await {
@@ -253,6 +257,7 @@ pub(crate) async fn snapshot(
                 max_instances: db.get_max_instances_for_path(path).unwrap_or(1),
                 quality_score: db.get_driver_quality_score_by_path(path).unwrap_or(1.0),
                 exclusive_channel_count: exclusive_counts.get(path).copied().unwrap_or(0),
+                open_cooldown: open_cooldowns.get(path).copied().unwrap_or(false),
             })
             .collect();
 
@@ -649,7 +654,26 @@ pub(crate) async fn acquire(
                     unused_warm: warm,
                 });
             }
-            Decision::Reject { reason } => return Err(AcquireError::from(reason)),
+            Decision::Reject { reason } => {
+                if let Some(key) = request.candidates.iter().find(|key| {
+                    pool.open_backoff().cooldown_remaining(&key.tuner_path).is_some()
+                }) {
+                    if request.candidates.iter().all(|candidate| {
+                        pool.open_backoff().cooldown_remaining(&candidate.tuner_path).is_some()
+                    }) {
+                        let retry_in = pool
+                            .open_backoff()
+                            .cooldown_remaining(&key.tuner_path)
+                            .unwrap_or_default();
+                        return Err(AcquireError::OpenCooldown {
+                            tuner_path: key.tuner_path.clone(),
+                            consecutive: pool.open_backoff().consecutive_failures(&key.tuner_path),
+                            retry_in,
+                        });
+                    }
+                }
+                return Err(AcquireError::from(reason));
+            }
         }
     }
 

@@ -212,6 +212,9 @@ pub struct DriverState {
     pub quality_score: f64,
     /// `db.get_exclusive_channel_counts`; defaults to `0` when unset.
     pub exclusive_channel_count: i64,
+    /// Temporarily exclude this driver after repeated OpenTuner failures.
+    /// Capturing this in the same snapshot keeps policy and execution in sync.
+    pub open_cooldown: bool,
 }
 
 /// Per-pool-entry state needed by the decision. Mirrors the subset of
@@ -446,6 +449,22 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
     if let Some((path, space, channel)) = select_running_driver(&candidate_tuples, &running_channels) {
         return Decision::Reuse {
             key: ChannelKey::space_channel(path, space, channel),
+        };
+    }
+
+    // A cooldown blocks opening a new reader, not reuse. Reuse was handled
+    // above, so do not rank a driver that acquire() will reject later.
+    candidate_tuples.retain(|(path, _, _)| {
+        snapshot
+            .drivers
+            .iter()
+            .find(|driver| driver.dll_path == *path)
+            .map(|driver| !driver.open_cooldown)
+            .unwrap_or(true)
+    });
+    if candidate_tuples.is_empty() {
+        return Decision::Reject {
+            reason: RejectReason::AtCapacity { lowest_idle_priority: None },
         };
     }
 
@@ -791,6 +810,7 @@ mod tests {
             max_instances,
             quality_score: 1.0,
             exclusive_channel_count: 0,
+            open_cooldown: false,
         }
     }
 
@@ -870,6 +890,28 @@ mod tests {
         assert_eq!(
             decide(&snapshot, &req),
             Decision::Create { key: ChannelKey::space_channel("A.dll", 0, 5), evict: vec![] }
+        );
+    }
+
+    #[test]
+    fn skips_open_cooldown_driver_before_capacity_ranking() {
+        let mut failed = driver("failed.dll", 2);
+        failed.open_cooldown = true;
+        let snapshot = TunerSnapshot {
+            drivers: vec![failed, driver("healthy.dll", 2)],
+            entries: vec![entry("healthy.dll", 0, 1, true, 1, 0)],
+        };
+        let req = base_request(vec![
+            ChannelKey::space_channel("failed.dll", 0, 5),
+            ChannelKey::space_channel("healthy.dll", 0, 5),
+        ]);
+
+        assert_eq!(
+            decide(&snapshot, &req),
+            Decision::Create {
+                key: ChannelKey::space_channel("healthy.dll", 0, 5),
+                evict: vec![],
+            }
         );
     }
 
