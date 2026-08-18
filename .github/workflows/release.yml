@@ -90,15 +90,20 @@ jobs:
           # build.rs itself.
           RECISDB_PROXY_VERSION: ${{ github.ref_name }}
         run: |
-          docker run --rm -i -e RECISDB_PROXY_VERSION -v "$(pwd):/work" -w /work ubuntu:build bash -c '/root/.cargo/bin/cargo build --release -p recisdb-proxy'
+          docker run --rm -i -e RECISDB_PROXY_VERSION -v "$(pwd):/work" -w /work ubuntu:build bash -c '/root/.cargo/bin/cargo build --release -p recisdb-proxy -p recisdb -F recisdb/dvb'
       - name: Package proxy tarball
         run: |
           # docker run creates artifacts/ and target/ as root
           sudo chown -R "$(id -u):$(id -g)" artifacts target
           STAGE="recisdb-proxy-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p "$STAGE"
-          cp target/release/recisdb-proxy "$STAGE/"
-          cp target/release/recisdb-proxy-setup "$STAGE/"
+          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
+            test -x "target/release/$name" || {
+              echo "Required Linux update bundle file is missing: target/release/$name" >&2
+              exit 1
+            }
+            cp "target/release/$name" "$STAGE/"
+          done
           cp recisdb-proxy/recisdb-proxy.toml.example "$STAGE/"
           [ -f recisdb-proxy/recisdb-proxy-rs.service ] && cp recisdb-proxy/recisdb-proxy-rs.service "$STAGE/"
           tar czf "artifacts/$STAGE.tar.gz" "$STAGE"
@@ -162,16 +167,21 @@ jobs:
           # See the Linux job's "Build proxy binaries" step for why the tag is
           # passed explicitly instead of relying on build.rs's `git describe`.
           RECISDB_PROXY_VERSION: ${{ github.ref_name }}
-        run: cargo build --release -p recisdb-proxy
+        run: cargo build --release -p recisdb-proxy -p recisdb
       - name: Package proxy tarball
         run: |
           # The archive layout must match what the self-update endpoint
           # expects: a single top-level directory containing `recisdb-proxy`.
-          # See `is_target_binary_entry` in web/api/update.rs.
+          # See `UNIX_BUNDLE_FILES` in web/api/update.rs.
           STAGE="recisdb-proxy-${{ github.ref_name }}-${{ matrix.label }}"
           mkdir -p artifacts "$STAGE"
-          cp target/release/recisdb-proxy "$STAGE/"
-          cp target/release/recisdb-proxy-setup "$STAGE/"
+          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
+            test -x "target/release/$name" || {
+              echo "Required macOS update bundle file is missing: target/release/$name" >&2
+              exit 1
+            }
+            cp "target/release/$name" "$STAGE/"
+          done
           cp recisdb-proxy/recisdb-proxy.toml.example "$STAGE/"
           tar czf "artifacts/$STAGE.tar.gz" "$STAGE"
           ls -la artifacts/
@@ -251,10 +261,22 @@ jobs:
           $outDir = "release-assets"
           New-Item -ItemType Directory -Force -Path $stage, $outDir
 
-          Copy-Item "$targetDir/recisdb.exe" "$stage/"
-          Copy-Item "$targetDir/recisdb-proxy.exe" "$stage/"
-          Copy-Item "$targetDir/recisdb-proxy-setup.exe" "$stage/"
-          Copy-Item "$targetDir/BonDriver_NetworkProxy.dll" "$stage/"
+          # Keep the self-update contract in sync with update.rs. Publishing a
+          # partial archive would leave installed components on mixed versions,
+          # so fail the release before creating any assets.
+          $required = @(
+            "recisdb-proxy.exe",
+            "recisdb.exe",
+            "recisdb-proxy-setup.exe",
+            "BonDriver_NetworkProxy.dll"
+          )
+          foreach ($name in $required) {
+            $source = Join-Path $targetDir $name
+            if (!(Test-Path $source)) {
+              throw "Required Windows update bundle file is missing: $source"
+            }
+            Copy-Item $source "$stage/"
+          }
           Copy-Item "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$stage/"
           Copy-Item "recisdb-proxy/recisdb-proxy.toml.example" "$stage/"
 

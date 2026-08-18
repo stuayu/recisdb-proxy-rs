@@ -4,6 +4,36 @@ recisdb-proxy は 2 つの経路で自分を更新できる。どちらも「ダ
 検証 → 実行ファイルの入れ替え → 再起動」という同じ流れを通る
 (`web/api/update.rs`)。
 
+全プラットフォームで、リリース／開発版アーティファクトに含まれる実行ファイルを
+**同じ版の一式**として更新する。どれか1つでも欠けていれば更新を開始しない。
+
+Linux／macOSの必須ファイル:
+
+- `recisdb-proxy`
+- `recisdb`
+- `recisdb-proxy-setup`
+
+Windowsの必須ファイル:
+
+- `recisdb-proxy.exe`
+- `recisdb.exe`
+- `recisdb-proxy-setup.exe`
+- `BonDriver_NetworkProxy.dll`
+
+PDBと `BonDriver_NetworkProxy.ini.sample`、`recisdb-proxy.toml.example` も、
+アーカイブに含まれていれば更新する。実運用中の `.ini` と `.toml` は設定を
+失わないよう上書きしない。
+
+各ファイルは全プラットフォームで同じディレクトリの `*.previous.*` へ退避してから差し替える。
+`recisdb.exe` やDLLがMirakurun／TVTestなどで使用中のため置換できない場合は、
+それまでに差し替えたファイルを元へ戻し、proxy本体は更新しない。利用中の
+プロセスを止めてから再実行すること。
+
+自動更新が対象にするDLLは、recisdb-proxyのインストールディレクトリに同梱された
+`BonDriver_NetworkProxy.dll` である。TVTestやMirakurunの別ディレクトリへ別名で
+複製したDLLは配置場所を安全に特定できないため、セットアップGUIの
+「既存クライアントDLLを更新」で反映する。
+
 | 経路 | 取得元 | 認証 | 画面 |
 |---|---|---|---|
 | リリース版 | GitHub Releases の資産 | 不要 | ヘッダーの更新通知 |
@@ -35,10 +65,12 @@ recisdb-proxy は 2 つの経路で自分を更新できる。どちらも「ダ
 することを確かめる。失敗した場合は**更新を中止し、動いているサーバーをその
 まま残す**。手作業で直すしかない停止状態を作るよりよい。
 
-あわせて、入れ替え前のバイナリを実行ファイルと同じディレクトリに
-`recisdb-proxy.previous` として残す。`self_replace` は復元できるものを残さない
-ため、これがないと「サーバーが落ちている機械で手動でリリースを取ってくる」
-しか復旧手段がない。
+あわせて、入れ替え前のproxy本体を実行ファイルと同じディレクトリに
+`recisdb-proxy.previous` として残す。その他の同梱ファイルも、Linux／macOSなら
+`recisdb.previous`、Windowsなら `recisdb.previous.exe` や
+`BonDriver_NetworkProxy.previous.dll` のような名前で残す。`self_replace` は
+復元できるものを残さないため、これがないと
+「サーバーが落ちている機械で手動でリリースを取ってくる」しか復旧手段がない。
 
 ### Windows でブロックされた場合
 

@@ -277,7 +277,7 @@ async function applyDevBuild(build: DevBuild) {
   if (build.artifact_id == null) return
   const ok = window.confirm(
     `開発版 (${build.branch ?? '?'} / ${(build.sha ?? '').slice(0, 7)}) に更新します。\n` +
-      '実行ファイルを入れ替えてサーバーを再起動します。視聴中・録画中のセッションはすべて切断されます。よろしいですか？',
+      'proxy本体、recisdb、セットアップツールを同じビルドの一式へ更新します。WindowsではクライアントDLLも更新します。サーバー再起動時に視聴中・録画中のセッションはすべて切断されます。よろしいですか？',
   )
   if (!ok) return
 
@@ -467,7 +467,7 @@ onMounted(() => {
       <h3>開発版に更新</h3>
       <p class="hint">
         GitHub Actions がビルドした最新の開発版に更新します。リリース版より新しい代わりに、
-        検証されていない変更が含まれます。
+        検証されていない変更が含まれます。recisdbとセットアップツールも同じビルドへ更新し、WindowsではクライアントDLLも含めます。
       </p>
 
       <p v-if="tokenConfigured" class="muted">GitHubトークン: 設定済み</p>

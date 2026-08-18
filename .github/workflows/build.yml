@@ -91,11 +91,28 @@ jobs:
           $outDir = "artifacts-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path $outDir
 
-          # Copy only the built binaries (exe/dll) and their debug symbols;
+          # Self-update treats these four files as one versioned bundle. Fail
+          # the build instead of publishing an artifact that could only update
+          # a subset of an installation.
+          $required = @(
+            "recisdb-proxy.exe",
+            "recisdb.exe",
+            "recisdb-proxy-setup.exe",
+            "BonDriver_NetworkProxy.dll"
+          )
+          foreach ($name in $required) {
+            $source = Join-Path $targetDir $name
+            if (!(Test-Path $source)) {
+              throw "Required Windows update bundle file is missing: $source"
+            }
+            Copy-Item $source "$outDir/"
+          }
+
+          # Copy debug symbols too. The required runtime files were copied
+          # explicitly above so a missing one can never be hidden by
+          # -ErrorAction SilentlyContinue.
           # $targetDir also holds deps/build/incremental/.fingerprint, which
           # are compiler intermediates, not distributable artifacts.
-          Copy-Item "$targetDir/*.exe" "$outDir/" -ErrorAction SilentlyContinue
-          Copy-Item "$targetDir/*.dll" "$outDir/" -ErrorAction SilentlyContinue
           Copy-Item "$targetDir/*.pdb" "$outDir/" -ErrorAction SilentlyContinue
 
           # Copy sample config if exists
@@ -171,10 +188,19 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy only the built executables and shared libraries;
+          # Self-update installs these as one versioned bundle. Do not publish
+          # a partial artifact.
+          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
+            test -x "$TARGET_DIR/$name" || {
+              echo "Required Linux update bundle file is missing: $TARGET_DIR/$name" >&2
+              exit 1
+            }
+            cp "$TARGET_DIR/$name" "$OUT_DIR/"
+          done
+
+          # Copy shared libraries too;
           # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
           # are compiler intermediates, not distributable artifacts.
-          find "$TARGET_DIR" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -exec cp {} "$OUT_DIR/" \;
           find "$TARGET_DIR" -maxdepth 1 -type f -name '*.so' -exec cp {} "$OUT_DIR/" \;
 
           # Copy sample configs
@@ -240,10 +266,19 @@ jobs:
           OUT_DIR="artifacts-${{ matrix.label }}"
           mkdir -p "$OUT_DIR"
 
-          # Copy only the built executables and shared libraries;
+          # Self-update installs these as one versioned bundle. Do not publish
+          # a partial artifact.
+          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
+            test -x "$TARGET_DIR/$name" || {
+              echo "Required macOS update bundle file is missing: $TARGET_DIR/$name" >&2
+              exit 1
+            }
+            cp "$TARGET_DIR/$name" "$OUT_DIR/"
+          done
+
+          # Copy shared libraries too;
           # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
           # are compiler intermediates, not distributable artifacts.
-          find "$TARGET_DIR" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -exec cp {} "$OUT_DIR/" \;
           find "$TARGET_DIR" -maxdepth 1 -type f -name '*.dylib' -exec cp {} "$OUT_DIR/" \;
 
           # Copy sample configs

@@ -6,8 +6,9 @@
 //! - `GET /api/update/check` — fetches `stuayu/recisdb-proxy-rs` releases
 //!   (6h in-memory cache), returns the newest applicable stable/prerelease.
 //! - `POST /api/update/apply` — downloads a specific release's platform
-//!   asset, extracts the binary, validates it, and replaces the running
-//!   executable in place (`self-replace` crate) before re-executing itself.
+//!   asset, validates the complete platform bundle, and replaces it before
+//!   re-executing the server. Every platform updates `recisdb` and the setup
+//!   executable too; Windows additionally updates `BonDriver_NetworkProxy.dll`.
 //! - `GET /api/update/status` — progress of an in-flight (or last) apply.
 //!
 //! The web-ui (`App.vue`) used to hit GitHub directly from the browser; that
@@ -24,7 +25,8 @@ use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -277,6 +279,7 @@ fn release_has_asset(release: &GithubRelease, os: &str, arch: &str) -> bool {
 /// executable we want to extract, for the given `os` ("windows" wants a
 /// `.exe" suffix; everything else — i.e. our Linux release archives — does
 /// not).
+#[cfg(test)]
 fn is_target_binary_entry(entry_name: &str, os: &str) -> bool {
     let normalized = entry_name.replace('\\', "/");
     let base = normalized.rsplit('/').next().unwrap_or(&normalized);
@@ -285,6 +288,120 @@ fn is_target_binary_entry(entry_name: &str, os: &str) -> bool {
     } else {
         base == "recisdb-proxy"
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BundleFile {
+    name: &'static str,
+    required: bool,
+    executable: bool,
+}
+
+const UNIX_BUNDLE_FILES: &[BundleFile] = &[
+    BundleFile {
+        name: "recisdb-proxy",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb-proxy-setup",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb-proxy.toml.example",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "recisdb-proxy-rs.service",
+        required: false,
+        executable: false,
+    },
+];
+
+// These names are kept in sync with build.yml and release.yml.  A Windows
+// update is accepted only when all runtime components come from the same
+// archive, preventing a new proxy from being paired with an old CLI or client
+// DLL. Debug symbols and example files are installed when present but are not
+// required, so older release archives remain updateable.
+const WINDOWS_BUNDLE_FILES: &[BundleFile] = &[
+    BundleFile {
+        name: "recisdb-proxy.exe",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb.exe",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb-proxy-setup.exe",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "BonDriver_NetworkProxy.dll",
+        required: true,
+        executable: true,
+    },
+    BundleFile {
+        name: "recisdb-proxy.pdb",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "recisdb.pdb",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "recisdb-proxy-setup.pdb",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "BonDriver_NetworkProxy.pdb",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "BonDriver_NetworkProxy.ini.sample",
+        required: false,
+        executable: false,
+    },
+    BundleFile {
+        name: "recisdb-proxy.toml.example",
+        required: false,
+        executable: false,
+    },
+];
+
+fn bundle_files(os: &str) -> &'static [BundleFile] {
+    if os == "windows" {
+        WINDOWS_BUNDLE_FILES
+    } else {
+        UNIX_BUNDLE_FILES
+    }
+}
+
+fn archive_entry_base(entry_name: &str) -> &str {
+    let normalized = entry_name.rsplit(['/', '\\']).next();
+    normalized.unwrap_or(entry_name)
+}
+
+fn bundle_file_for_entry(entry_name: &str, os: &str) -> Option<BundleFile> {
+    let base = archive_entry_base(entry_name);
+    bundle_files(os)
+        .iter()
+        .copied()
+        .find(|file| file.name == base)
 }
 
 /// Minimum plausible size for a real `recisdb-proxy` binary. Guards against
@@ -537,7 +654,8 @@ async fn run_self_update_inner(
     let exe_dir = exe_path.parent().ok_or("current executable has no parent directory")?.to_path_buf();
     let pid = std::process::id();
     let archive_path = exe_dir.join(format!(".recisdb-proxy-update-{pid}.download"));
-    let extracted_path = exe_dir.join(format!(".recisdb-proxy-update-{pid}.new"));
+    let stage_dir = exe_dir.join(format!(".recisdb-proxy-update-{pid}.stage"));
+    let _ = std::fs::remove_dir_all(&stage_dir);
 
     // --- Download (streamed to disk; the archive is never fully buffered
     // in memory) -------------------------------------------------------
@@ -553,21 +671,32 @@ async fn run_self_update_inner(
     set_status(web_state, UpdateStatus::Extracting).await;
     let extract_result = {
         let archive_path = archive_path.clone();
-        let extracted_path = extracted_path.clone();
+        let stage_dir = stage_dir.clone();
         let os = os.to_string();
-        tokio::task::spawn_blocking(move || extract_archive(&archive_path, &extracted_path, &os, kind))
+        tokio::task::spawn_blocking(move || extract_archive(&archive_path, &stage_dir, &os, kind))
             .await
             .map_err(|e| format!("extract task panicked: {e}"))?
     };
     let _ = tokio::fs::remove_file(&archive_path).await;
     extract_result.map_err(|e| {
-        let _ = std::fs::remove_file(&extracted_path);
+        let _ = std::fs::remove_dir_all(&stage_dir);
         format!("extraction failed: {e}")
     })?;
 
+    let extracted_path = stage_dir.join(if os == "windows" {
+        "recisdb-proxy.exe"
+    } else {
+        "recisdb-proxy"
+    });
+
     // --- Validate before touching the running binary --------------------
     if let Err(e) = validate_extracted_binary(&extracted_path, os).await {
-        let _ = tokio::fs::remove_file(&extracted_path).await;
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Err(e);
+    }
+
+    if let Err(e) = validate_bundle(&stage_dir, os).await {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
         return Err(e);
     }
 
@@ -584,8 +713,17 @@ async fn run_self_update_inner(
     // Refusing the update here leaves the running server untouched, which is
     // always better than a dead service the operator has to repair by hand.
     if let Err(e) = smoke_test_binary(&extracted_path).await {
-        let _ = tokio::fs::remove_file(&extracted_path).await;
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
         return Err(e);
+    }
+
+    // recisdb is invoked independently by Mirakurun, so prove that it starts
+    // on this machine before installing any part of the bundle.
+    let recisdb_name = if os == "windows" { "recisdb.exe" } else { "recisdb" };
+    let recisdb_path = stage_dir.join(recisdb_name);
+    if let Err(e) = smoke_test_binary(&recisdb_path).await {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Err(format!("{recisdb_name} validation failed: {e}"));
     }
 
     // --- Replace the running binary -------------------------------------
@@ -609,16 +747,29 @@ async fn run_self_update_inner(
         tracing::info!("self-update: previous binary kept at {}", backup_path.display());
     }
 
-    {
+    let installed_companions = match install_bundle_companions(&stage_dir, &exe_dir, &exe_path, os) {
+        Ok(installed) => installed,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
+    };
+
+    let replace_result = {
         let extracted_path = extracted_path.clone();
         tokio::task::spawn_blocking(move || self_replace::self_replace(&extracted_path))
             .await
             .map_err(|e| format!("self_replace task panicked: {e}"))?
-            .map_err(|e| format!("self_replace failed: {e}"))?;
+            .map_err(|e| format!("self_replace failed: {e}"))
+    };
+    if let Err(e) = replace_result {
+        rollback_installed_files(&installed_companions);
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        return Err(e);
     }
-    // Best-effort: self_replace copies `extracted_path`'s contents into
-    // place, it does not consume the source file (see its doc comment).
-    let _ = tokio::fs::remove_file(&extracted_path).await;
+    // Best-effort cleanup. Companion files were moved out of this directory;
+    // self_replace copied the primary executable and leaves its source behind.
+    let _ = tokio::fs::remove_dir_all(&stage_dir).await;
 
     // --- Restart ----------------------------------------------------------
     set_status(web_state, UpdateStatus::Restarting).await;
@@ -664,9 +815,9 @@ async fn download_to_file(url: &str, dest: &Path, auth_token: Option<&str>) -> R
     Ok(())
 }
 
-/// Extracts just the `recisdb-proxy`/`recisdb-proxy.exe` entry out of the
-/// downloaded archive into `out_path`. Blocking I/O — always called via
-/// `spawn_blocking`.
+/// Extracts the platform bundle into `out_dir`. Only explicitly allowlisted
+/// basenames are written, so archive paths cannot escape the staging
+/// directory. Blocking I/O — always called via `spawn_blocking`.
 /// How the downloaded file is packed.
 ///
 /// Release assets are `.zip` on Windows and `.tar.gz` elsewhere, but a GitHub
@@ -693,22 +844,27 @@ impl ArchiveKind {
 
 fn extract_archive(
     archive_path: &Path,
-    out_path: &Path,
+    out_dir: &Path,
     os: &str,
     kind: ArchiveKind,
 ) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let mut extracted = HashSet::new();
+
     if kind == ArchiveKind::Zip {
         let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
         let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-            if is_target_binary_entry(entry.name(), os) {
-                let mut out = std::fs::File::create(out_path).map_err(|e| e.to_string())?;
+            if let Some(spec) = bundle_file_for_entry(entry.name(), os) {
+                if !extracted.insert(spec.name) {
+                    return Err(format!("archive contains duplicate entry '{}'", spec.name));
+                }
+                let mut out =
+                    std::fs::File::create(out_dir.join(spec.name)).map_err(|e| e.to_string())?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-                return Ok(());
             }
         }
-        Err("archive does not contain recisdb-proxy.exe".to_string())
     } else {
         let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
         let gz = flate2::read::GzDecoder::new(file);
@@ -716,14 +872,34 @@ fn extract_archive(
         let entries = archive.entries().map_err(|e| e.to_string())?;
         for entry in entries {
             let mut entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-            if is_target_binary_entry(&path, os) {
-                let mut out = std::fs::File::create(out_path).map_err(|e| e.to_string())?;
+            let path = entry
+                .path()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            if let Some(spec) = bundle_file_for_entry(&path, os) {
+                if !extracted.insert(spec.name) {
+                    return Err(format!("archive contains duplicate entry '{}'", spec.name));
+                }
+                let mut out =
+                    std::fs::File::create(out_dir.join(spec.name)).map_err(|e| e.to_string())?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-                return Ok(());
             }
         }
-        Err("archive does not contain a recisdb-proxy binary".to_string())
+    }
+
+    let missing: Vec<_> = bundle_files(os)
+        .iter()
+        .filter(|file| file.required && !extracted.contains(file.name))
+        .map(|file| file.name)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "archive is missing required update files: {}",
+            missing.join(", ")
+        ))
     }
 }
 
@@ -826,6 +1002,139 @@ async fn validate_extracted_binary(path: &Path, os: &str) -> Result<(), String> 
         return Err("downloaded binary failed the magic-byte signature check".to_string());
     }
     Ok(())
+}
+
+async fn validate_bundle(stage_dir: &Path, os: &str) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    for file in bundle_files(os) {
+        let path = stage_dir.join(file.name);
+        if !path.exists() {
+            if file.required {
+                return Err(format!("required update file '{}' is missing", file.name));
+            }
+            continue;
+        }
+        if file.executable {
+            let mut magic = [0u8; 4];
+            let mut input = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| format!("failed to open '{}': {e}", file.name))?;
+            input
+                .read_exact(&mut magic)
+                .await
+                .map_err(|e| format!("failed to read '{}': {e}", file.name))?;
+            if !has_valid_magic(&magic, os) {
+                return Err(format!(
+                    "update file '{}' has an invalid executable signature for {os}",
+                    file.name
+                ));
+            }
+            strip_mark_of_the_web(&path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("failed to make '{}' executable: {e}", file.name))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InstalledFile {
+    destination: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+fn previous_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("update-file");
+    match path.extension().and_then(|s| s.to_str()) {
+        Some(extension) => path.with_file_name(format!("{stem}.previous.{extension}")),
+        None => path.with_file_name(format!("{stem}.previous")),
+    }
+}
+
+/// Install every staged bundle member except the currently running
+/// proxy executable. Each old file is retained next to it as `*.previous.*`.
+/// If any rename fails (commonly because Mirakurun/TVTest still has recisdb or
+/// the DLL open), all earlier replacements are rolled back and the update is
+/// aborted before the server binary is touched.
+fn install_bundle_companions(
+    stage_dir: &Path,
+    install_dir: &Path,
+    running_exe: &Path,
+    os: &str,
+) -> Result<Vec<InstalledFile>, String> {
+    let running_name = running_exe.file_name();
+    let mut installed = Vec::new();
+
+    for file in bundle_files(os) {
+        if Some(std::ffi::OsStr::new(file.name)) == running_name {
+            continue;
+        }
+        let source = stage_dir.join(file.name);
+        if !source.exists() {
+            continue;
+        }
+        let destination = install_dir.join(file.name);
+        let backup = if destination.exists() {
+            let backup = previous_path(&destination);
+            if backup.exists() {
+                if let Err(e) = std::fs::remove_file(&backup) {
+                    rollback_installed_files(&installed);
+                    return Err(format!(
+                        "failed to remove old backup '{}': {e}",
+                        backup.display()
+                    ));
+                }
+            }
+            if let Err(e) = std::fs::rename(&destination, &backup) {
+                rollback_installed_files(&installed);
+                return Err(format!(
+                    "failed to back up '{}': {e}; stop programs using this file and retry",
+                    destination.display()
+                ));
+            }
+            Some(backup)
+        } else {
+            None
+        };
+
+        if let Err(e) = std::fs::rename(&source, &destination) {
+            if let Some(backup) = backup.as_ref() {
+                let _ = std::fs::rename(backup, &destination);
+            }
+            rollback_installed_files(&installed);
+            return Err(format!(
+                "failed to install '{}': {e}",
+                destination.display()
+            ));
+        }
+        installed.push(InstalledFile {
+            destination,
+            backup,
+        });
+    }
+
+    Ok(installed)
+}
+
+fn rollback_installed_files(installed: &[InstalledFile]) {
+    for file in installed.iter().rev() {
+        let _ = std::fs::remove_file(&file.destination);
+        if let Some(backup) = file.backup.as_ref() {
+            if let Err(e) = std::fs::rename(backup, &file.destination) {
+                tracing::error!(
+                    "self-update rollback: failed to restore {}: {e}",
+                    file.destination.display()
+                );
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -1118,6 +1427,123 @@ pub async fn apply_dev_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "recisdb-update-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn windows_bundle_requires_all_runtime_components() {
+        let required: Vec<_> = WINDOWS_BUNDLE_FILES
+            .iter()
+            .filter(|file| file.required)
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(
+            required,
+            vec![
+                "recisdb-proxy.exe",
+                "recisdb.exe",
+                "recisdb-proxy-setup.exe",
+                "BonDriver_NetworkProxy.dll",
+            ]
+        );
+        assert_eq!(
+            bundle_file_for_entry("recisdb-v1-win-x64/recisdb.exe", "windows").map(|f| f.name),
+            Some("recisdb.exe")
+        );
+        assert!(bundle_file_for_entry("recisdb-v1-win-x64/evil.exe", "windows").is_none());
+    }
+
+    #[test]
+    fn unix_bundle_requires_proxy_cli_and_setup() {
+        let required: Vec<_> = UNIX_BUNDLE_FILES
+            .iter()
+            .filter(|file| file.required)
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(required, vec!["recisdb-proxy", "recisdb", "recisdb-proxy-setup"]);
+        assert_eq!(
+            bundle_file_for_entry("recisdb-proxy-v1-linux-amd64/recisdb", "linux").map(|f| f.name),
+            Some("recisdb")
+        );
+    }
+
+    #[test]
+    fn companion_install_can_be_rolled_back_as_one_bundle() {
+        let root = test_dir("rollback");
+        let stage = root.join("stage");
+        let install = root.join("install");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+
+        for file in WINDOWS_BUNDLE_FILES {
+            if file.name == "recisdb-proxy.exe" || !file.required {
+                continue;
+            }
+            std::fs::write(stage.join(file.name), format!("new-{}", file.name)).unwrap();
+            std::fs::write(install.join(file.name), format!("old-{}", file.name)).unwrap();
+        }
+
+        let running = install.join("recisdb-proxy.exe");
+        let installed = install_bundle_companions(&stage, &install, &running, "windows").unwrap();
+        assert_eq!(installed.len(), 3);
+        assert_eq!(
+            std::fs::read(install.join("recisdb.exe")).unwrap(),
+            b"new-recisdb.exe"
+        );
+
+        rollback_installed_files(&installed);
+        assert_eq!(
+            std::fs::read(install.join("recisdb.exe")).unwrap(),
+            b"old-recisdb.exe"
+        );
+        assert_eq!(
+            std::fs::read(install.join("BonDriver_NetworkProxy.dll")).unwrap(),
+            b"old-BonDriver_NetworkProxy.dll"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_archive_missing_a_companion_is_rejected() {
+        use std::io::Write;
+
+        let root = test_dir("missing");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("bundle.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for name in [
+            "recisdb-proxy.exe",
+            "recisdb.exe",
+            "recisdb-proxy-setup.exe",
+        ] {
+            zip.start_file(format!("release/{name}"), options).unwrap();
+            zip.write_all(b"MZ fake").unwrap();
+        }
+        zip.finish().unwrap();
+
+        let error = extract_archive(
+            &archive_path,
+            &root.join("stage"),
+            "windows",
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
+        assert!(error.contains("BonDriver_NetworkProxy.dll"), "{error}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     // ---- smoke test before installing ----
 

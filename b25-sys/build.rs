@@ -310,7 +310,11 @@ fn prep_cmake(cx: TargetVar) -> cmake::Config {
 
     // Staticaly link against libaribb25.so or aribb25.lib.
     if cx.env.clone().take().unwrap_or_default().contains("gnu") {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
+        if cx.os.as_deref() == Some("windows") {
+            println!("cargo:rustc-link-lib=static=stdc++");
+        } else {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        }
     }
     println!("cargo:rustc-link-lib=static=aribb25");
 

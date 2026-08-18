@@ -2,7 +2,7 @@ use crate::utils::StreamExitType;
 use clap::Parser;
 use futures_executor::block_on;
 use futures_time::future::FutureExt;
-use log::{debug, info};
+use log::{debug, error, info};
 
 mod channels;
 mod commands;
@@ -59,9 +59,15 @@ fn main() {
     };
 
     match result {
-        StreamExitType::Success(_) => {}
-        StreamExitType::Timeout => {}
-        StreamExitType::Error(_) => {}
-        StreamExitType::UnexpectedEofInTuner => {}
+        StreamExitType::Success(_) | StreamExitType::Timeout => {}
+        StreamExitType::Error(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        StreamExitType::Error(e) => {
+            error!("Stream terminated with an error: {e}");
+            std::process::exit(1);
+        }
+        StreamExitType::UnexpectedEofInTuner => {
+            error!("Tuner stream ended before the requested duration");
+            std::process::exit(1);
+        }
     }
 }

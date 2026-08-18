@@ -147,7 +147,8 @@ pub(crate) fn process_command(
                 })
             };
 
-            let (body, _) = AsyncInOutTriple::new(input, output, dec, !exit_on_card_error);
+            let (body, _) =
+                AsyncInOutTriple::new(input, output, dec, !exit_on_card_error, cfg!(windows));
             info!("Recording...");
             (body, rec_duration, None)
         }
@@ -189,7 +190,7 @@ pub(crate) fn process_command(
                 ..DecoderOptions::default()
             });
 
-            let (body, progress) = AsyncInOutTriple::new(input, output, dec, false);
+            let (body, progress) = AsyncInOutTriple::new(input, output, dec, false, false);
             info!("Decoding...");
             (body, None, input_sz.map(|sz| (sz, progress)))
         }

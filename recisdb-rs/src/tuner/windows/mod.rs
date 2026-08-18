@@ -46,6 +46,7 @@ impl AsyncRead for BonDriverInner {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => Poll::Ready(Err(e)),
             _ => {
                 let w = cx.waker().clone();
 
@@ -77,7 +78,7 @@ impl UnTunedTuner {
         };
 
         let interface = {
-            let i_bon = dll_imported.create_interface();
+            let i_bon = dll_imported.create_interface()?;
             let ver = if i_bon.2.is_none() {
                 1
             } else if i_bon.3.is_none() {
@@ -143,9 +144,11 @@ impl Tunable for UnTunedTuner {
             }
         }
 
+        self.inner.get_ref().interface.PurgeTsStream();
+
         // LNB
         if lnb.is_some() {
-            self.inner.get_ref().interface.SetLnbPower(1).unwrap();
+            self.inner.get_ref().interface.SetLnbPower(1)?;
         }
 
         Ok(Tuner {
@@ -174,9 +177,11 @@ impl Tunable for Tuner {
             _ => {}
         }
 
+        self.inner.get_ref().interface.PurgeTsStream();
+
         // LNB
         if lnb.is_some() {
-            self.inner.get_ref().interface.SetLnbPower(1).unwrap();
+            self.inner.get_ref().interface.SetLnbPower(1)?;
         }
 
         Ok(Tuner {

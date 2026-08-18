@@ -473,7 +473,10 @@ onUnmounted(() => {
               `recisdb-proxy を ${applyDialog.tag} に更新してサーバーを再起動します。接続中のクライアントは一時切断されます。`
             "
           />
-          <p>BonDriver_NetworkProxy.dll は自動更新されません。必要ならリリースページから手動で更新してください。</p>
+          <p>
+            recisdbとセットアップツールも同じリリースの一式へ更新します。Windowsでは
+            BonDriver_NetworkProxy.dllも対象です。使用中のファイルを置換できない場合は更新を中止します。
+          </p>
           <div class="actions">
             <button class="button secondary" @click="closeApplyDialog">キャンセル</button>
             <button class="button" @click="startApply">更新を実行</button>

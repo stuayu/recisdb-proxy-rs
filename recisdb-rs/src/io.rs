@@ -34,6 +34,7 @@ impl AsyncInOutTriple {
         o: Box<dyn Write>,
         config: Option<DecoderOptions>,
         continue_on_error: bool,
+        stop_on_stdin: bool,
     ) -> (Self, std::sync::mpsc::Receiver<u64>) {
         let raw = config.and_then(|op| match StreamDecoder::new(op) {
             Ok(raw) => Some(raw),
@@ -68,6 +69,21 @@ impl AsyncInOutTriple {
             }
         })
         .expect("Error setting Ctrl-C handler");
+
+        // Mirakurun stops Windows tuner commands by writing a newline to
+        // stdin, matching BonRecTest's contract.  Without this listener it has
+        // to force-kill recisdb after its grace period on every release.
+        if stop_on_stdin {
+            let weak = Arc::downgrade(&abort);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                if matches!(std::io::stdin().read_line(&mut line), Ok(read) if read > 0) {
+                    if let Some(ptr) = weak.upgrade() {
+                        ptr.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         (

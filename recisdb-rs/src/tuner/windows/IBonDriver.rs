@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use cpp_utils::{DynamicCast, MutPtr, Ptr};
 
+use crate::tuner::TsCarryOver;
+
 include!(concat!(env!("OUT_DIR"), "/BonDriver_binding.rs"));
 
 mod ib1 {
@@ -81,9 +83,9 @@ mod ib_utils {
             return None;
         }
         unsafe {
-            let len = (0..std::isize::MAX)
-                .position(|i| *ptr.offset(i) == 0)
-                .unwrap();
+            // A BonDriver owns this pointer, so never scan unbounded memory if
+            // it returns a malformed, unterminated string.
+            let len = (0..32768).position(|i| *ptr.add(i) == 0)?;
             if len == 0 {
                 return None;
             }
@@ -101,10 +103,15 @@ mod ib_utils {
 }
 
 impl BonDriver {
-    pub fn create_interface(&self) -> IBon {
+    pub fn create_interface(&self) -> Result<IBon, io::Error> {
         let IBon1 = unsafe {
             let ptr = self.CreateBonDriver();
-            NonNull::new(ptr).unwrap()
+            NonNull::new(ptr).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "CreateBonDriver returned null",
+                )
+            })?
         };
 
         let (IBon2, IBon3) = unsafe {
@@ -124,7 +131,13 @@ impl BonDriver {
             _ => 0,
         };
 
-        IBon(version, IBon1, IBon2, IBon3)
+        Ok(IBon(
+            version,
+            IBon1,
+            IBon2,
+            IBon3,
+            std::sync::Mutex::new(TsCarryOver::default()),
+        ))
     }
 }
 
@@ -153,6 +166,7 @@ pub struct IBon(
     pub(crate) NonNull<IBonDriver>,
     pub(crate) Option<NonNull<IBonDriver2>>,
     pub(crate) Option<NonNull<IBonDriver3>>,
+    std::sync::Mutex<TsCarryOver>,
 );
 
 impl Drop for IBon {
@@ -210,22 +224,47 @@ impl IBon {
         &self,
         buf: &'a mut [u8],
     ) -> Result<(&'a [u8], usize), io::Error> {
+        let mut pending = self
+            .4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some((copied, remaining)) = pending.read_pending(buf) {
+            return Ok((&buf[..copied], remaining));
+        }
+
+        let mut ptr: *mut u8 = std::ptr::null_mut();
         let mut size = 0_u32;
         let mut remaining = 0_u32;
 
         let iface = self.1.as_ptr();
         unsafe {
-            if ib1::C_GetTsStream(
+            if ib1::C_GetTsStream2(
                 iface,
-                buf.as_mut_ptr(),
+                &mut ptr as *mut *mut u8,
                 &mut size as *mut u32,
                 &mut remaining as *mut u32,
-            ) != 0
+            ) == 0
+                || ptr.is_null()
+                || size == 0
             {
-                Ok((&buf[..size as usize], remaining as usize))
-            } else {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, E::GetTsError))
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, E::GetTsError));
             }
+
+            let size = size as usize;
+            let chunk = std::slice::from_raw_parts(ptr, size);
+            let (copied, carried) = pending.copy_chunk(chunk, buf)?;
+
+            Ok((&buf[..copied], carried.saturating_add(remaining as usize)))
+        }
+    }
+    pub(crate) fn PurgeTsStream(&self) {
+        self.4
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        unsafe {
+            ib1::C_PurgeTsStream(self.1.as_ptr());
         }
     }
     pub(crate) fn GetSignalLevel(&self) -> Result<f32, io::Error> {
@@ -234,9 +273,14 @@ impl IBon {
     }
     //IBon2
     pub(crate) fn SetChannelBySpace(&self, space: u32, ch: u32) -> Result<(), io::Error> {
+        let iface = self.2.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The BonDriver does not implement IBonDriver2",
+            )
+        })?;
         unsafe {
-            let iface = self.2.unwrap().as_ptr();
-            if ib2::C_SetChannel2(iface, space, ch) != 0 {
+            if ib2::C_SetChannel2(iface.as_ptr(), space, ch) != 0 {
                 Ok(())
             } else {
                 Err(io::Error::new(
@@ -247,24 +291,29 @@ impl IBon {
         }
     }
     pub(crate) fn EnumTuningSpace(&self, space: u32) -> Option<String> {
+        let iface = self.2?;
         unsafe {
-            let iface = self.2.unwrap().as_ptr();
-            let returned = ib2::C_EnumTuningSpace(iface, space);
+            let returned = ib2::C_EnumTuningSpace(iface.as_ptr(), space);
             ib_utils::from_wide_ptr(returned)
         }
     }
     pub(crate) fn EnumChannelName(&self, space: u32, ch: u32) -> Option<String> {
+        let iface = self.2?;
         unsafe {
-            let iface = self.2.unwrap().as_ptr();
-            let returned = ib2::C_EnumChannelName2(iface, space, ch);
+            let returned = ib2::C_EnumChannelName2(iface.as_ptr(), space, ch);
             ib_utils::from_wide_ptr(returned)
         }
     }
     // IBon3
     pub(crate) fn SetLnbPower(&self, bEnable: BOOL) -> Result<(), io::Error> {
+        let iface = self.3.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The BonDriver does not implement IBonDriver3",
+            )
+        })?;
         unsafe {
-            let iface = self.3.unwrap().as_ptr();
-            if ib3::C_SetLnbPower(iface, bEnable) != 0 {
+            if ib3::C_SetLnbPower(iface.as_ptr(), bEnable) != 0 {
                 Ok(())
             } else {
                 Err(io::Error::new(io::ErrorKind::Unsupported, E::LnbError))

@@ -51,9 +51,13 @@ fn main() {
 
     compiler
         .cpp(true)
+        .cpp_link_stdlib_static(
+            env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+                && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu"),
+        )
         .warnings(false)
         // Ensure MSVC treats sources as C++ even if global CL flags force C mode (/TC).
         .flag_if_supported("/TP")
-        .flag_if_supported("/EHa")   // SEH例外もcatch(...)で捕捉可能にする
+        .flag_if_supported("/EHa") // SEH例外もcatch(...)で捕捉可能にする
         .compile("BonDriver_dynamic_cast_ffi");
 }
