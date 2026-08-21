@@ -143,6 +143,34 @@ Initial ─Hello/HelloAck→ Ready ─OpenTuner→ TunerOpen ─StartStream→ S
   - 制御: bounded + `send().await` (低頻度・損失不可)
   - TS: bounded + `try_send` (満杯時は最古を破棄。TCP 輻輳でセッションループを止めない)
 
+#### セッションの寿命保証 (ゾンビ対策, 2026-08)
+
+本番でセッションが無期限に残る事例が2種類確認されたため、次の3つの打ち切り機構を入れている。
+
+1. **TCP keepalive (`server/listener.rs::configure_keepalive`)** — accept したソケットに
+   idle 30s / interval 10s / retries 3 で設定する。FIN も RST も出さずに消えるピア
+   (ホストのクラッシュ、経路断、サーバーとの間に入る中継・トンネル) を検出するため。
+   BNDP には自発的なハートビートが無い (`Ping`/`Pong` はプロトコルに存在するが、
+   どちら側も定期送信しない)。クライアントDLL側の keepalive は中継で止まるので、
+   サーバー側にも必要。
+2. **アイドルタイムアウト (`IDLE_NO_TUNER_TIMEOUT`, 既定 600 秒)** — チューナーを開いて
+   いないセッションのみ対象。クライアントDLLは `Release()` までTCPを閉じない
+   (`CloseTuner` では閉じない) が、次の `OpenTuner` で自動再接続するため、
+   アイドル接続を切ってもクライアントに実害はない。
+   **`TunerOpen` のセッションは対象外** — 配信せずチューナーを保持し続けるのは正当な使い方。
+3. **TSソース無しウォッチドッグ (`NO_TS_SOURCE_GRACE`, 既定 10 秒)** — `Streaming` なのに
+   `ts_receiver` も共有エンコーダも無い状態が続いたら切断する (`disconnect_reason=tuner_lost`)。
+   チャンネル切り替え失敗時、切替前クリーンアップが購読を落とした後に `acquire()` が失敗し、
+   `try_restore_previous_channel()` も復元できないと、この状態に落ちる。
+   放置するとダッシュボード上は「視聴中・排他」のまま1パケットも流さないセッションになる
+   (本番実測: 76分、`packets_sent=0`、`signal_level=0`)。
+
+HTTP/Mirakurun 側の配信経路も、ダッシュボードの強制切断
+(`POST /api/clients/{id}/disconnect`) を全経路で受けること。
+`/mirakurun/api/programs/:id/stream` は `StreamCleanup::take_shutdown()` を呼んでおらず
+切断要求を無視していた (2026-08 修正)。番組ストリームの待機打ち切り (`PRESENT_WAIT_GRACE`) も
+`recv()` 復帰時のみの判定から `tokio::select!` + `sleep_until` に変え、完全無通信でも発火する。
+
 ### 4.3 チューナー共有 (TunerPool / SharedTuner)
 
 - `ChannelKey = (tuner_path, ChannelKeySpec)`。同一チャンネル要求は既存 SharedTuner に**合流** (subscriber += 1)。
