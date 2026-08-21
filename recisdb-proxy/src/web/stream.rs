@@ -57,6 +57,14 @@ pub struct StreamQuery {
     /// `"preview"` selects the shared H.264 encoder pipeline. Absent/empty
     /// means raw passthrough.
     pub profile: Option<String>,
+    /// Disambiguates `GET /api/stream/service/by-sid/:sid`, whose `:sid` is
+    /// the raw broadcast service_id — a value that repeats across networks
+    /// (BS and BS4K reuse the same SID space, and terrestrial SIDs repeat
+    /// across regions). When present, `stream_service_by_sid` resolves via
+    /// `channel_resolve::resolve_service_by_nid_sid(nid, sid)` instead of
+    /// `resolve_service_by_sid(sid)`. Not consumed by `stream_service`
+    /// (`:sid` there is already the unambiguous `channels.id` primary key).
+    pub nid: Option<u16>,
 }
 
 /// Cleanup for a live shared-encoder subscription, released together with
@@ -519,9 +527,20 @@ pub async fn stream_service(
     stream_resolved(web_state, resolved, query, sid, peer).await
 }
 
-/// `GET /api/stream/service/by-sid/:sid[?profile=preview]` — same streaming
-/// behaviour but `:sid` is the real broadcast service_id (what the UI shows
-/// as SID everywhere).
+/// `GET /api/stream/service/by-sid/:sid[?profile=preview][&nid=N]` — same
+/// streaming behaviour but `:sid` is the real broadcast service_id (what the
+/// UI shows as SID everywhere).
+///
+/// A bare SID is not a unique service identity: it repeats across networks
+/// (BS/BS4K share one SID space, and terrestrial SIDs repeat across
+/// regions), so resolving by SID alone can silently land on the wrong
+/// network's service. When the caller supplies `nid`, that ambiguity can't
+/// arise and resolution goes straight through
+/// `channel_resolve::resolve_service_by_nid_sid`. When `nid` is omitted,
+/// this checks whether `sid` is actually ambiguous (spans more than one
+/// distinct NID among its enabled rows) before falling back to the old
+/// `resolve_service_by_sid` behaviour, and reports 409 instead of silently
+/// picking one network if it is.
 pub async fn stream_service_by_sid(
     State(web_state): State<Arc<WebState>>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -530,13 +549,47 @@ pub async fn stream_service_by_sid(
 ) -> Response {
     let resolved = {
         let db = web_state.database.lock().await;
-        channel_resolve::resolve_service_by_sid(&db, sid)
+        match query.nid {
+            Some(nid) => channel_resolve::resolve_service_by_nid_sid(&db, nid, sid),
+            None => match ambiguous_sid_response(&db, sid) {
+                Some(resp) => return resp,
+                None => channel_resolve::resolve_service_by_sid(&db, sid),
+            },
+        }
     };
     let resolved = match resolved {
         Ok(r) => r,
         Err(e) => return channel_resolve_error_response(sid as i64, &e),
     };
     stream_resolved(web_state, resolved, query, sid as i64, peer).await
+}
+
+/// When `sid` (looked up without a `nid` hint) has enabled rows on more than
+/// one distinct NID, resolving it unambiguously is impossible — some other
+/// network's service could be picked instead of the one the caller meant.
+/// Returns `Some(409 response)` naming every candidate NID in that case, or
+/// `None` when it's safe to fall through to
+/// `channel_resolve::resolve_service_by_sid` (0 or 1 distinct NID among the
+/// enabled rows — `resolve_service_by_sid` itself reports `NotFound`/
+/// `Disabled` for the 0 case, so this only ever short-circuits the
+/// genuinely-ambiguous case).
+fn ambiguous_sid_response(db: &Database, sid: u16) -> Option<Response> {
+    let rows = db.get_channels_by_sid(sid).ok()?;
+    let mut nids: Vec<u16> = rows.iter().filter(|c| c.is_enabled).map(|c| c.nid).collect();
+    nids.sort_unstable();
+    nids.dedup();
+    if nids.len() < 2 {
+        return None;
+    }
+    let nid_list = nids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    warn!("[HTTP stream] SID {} is ambiguous across NID {} without a nid= hint", sid, nid_list);
+    Some(error_response(
+        StatusCode::CONFLICT,
+        format!(
+            "SID {sid} は NID {nid_list} に存在するため一意に解決できません。\
+             ?nid= で対象のNIDを指定してください。"
+        ),
+    ))
 }
 
 /// Build the dashboard registration payload for a resolved channel.
@@ -955,5 +1008,118 @@ mod tests {
         assert_eq!(cfg.preprocessor_path, "preview-pre");
         assert_eq!(cfg.preprocessor_arguments, "-x 18 -n {SID} -");
         assert_eq!(cfg.read_timeout_ms, 7_000);
+    }
+
+    // ------------------------------------------------------------------
+    // stream_service_by_sid: SID ambiguity across networks (bug fix —
+    // SID alone isn't a unique service identity, e.g. BS/BS4K reuse SIDs).
+    // ------------------------------------------------------------------
+
+    fn insert_channel_with_nid_sid(db: &Database, driver_name: &str, nid: u16, sid: u16) -> i64 {
+        let driver_id = db.insert_bon_driver(&NewBonDriver::new(driver_name)).unwrap();
+        let info = recisdb_protocol::ChannelInfo {
+            nid,
+            sid,
+            tsid: 200,
+            manual_sheet: None,
+            raw_name: None,
+            channel_name: Some("Test".to_string()),
+            physical_ch: None,
+            remote_control_key: None,
+            service_type: None,
+            network_name: None,
+            bon_space: Some(0),
+            bon_channel: Some(13),
+            band_type: None,
+            terrestrial_region: None,
+        };
+        db.insert_channel(driver_id, &info).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_by_sid_without_nid_is_409_when_sid_spans_multiple_networks() {
+        let state = test_web_state();
+        {
+            let db = state.database.lock().await;
+            // Same SID (e.g. 101), two different NIDs — mirrors BS vs BS4K
+            // reusing a SID, or a terrestrial SID repeating across regions.
+            insert_channel_with_nid_sid(&db, "driver-bs.dll", 4, 101);
+            insert_channel_with_nid_sid(&db, "driver-bs4k.dll", 11, 101);
+        }
+
+        let app = axum::Router::new()
+            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .with_state(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/service/by-sid/101")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn stream_by_sid_with_nid_disambiguates_and_skips_409() {
+        let state = test_web_state();
+        {
+            let db = state.database.lock().await;
+            insert_channel_with_nid_sid(&db, "driver-bs.dll", 4, 101);
+            insert_channel_with_nid_sid(&db, "driver-bs4k.dll", 11, 101);
+        }
+
+        let app = axum::Router::new()
+            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .with_state(state);
+
+        // No real BonDriver DLL exists in this test environment, so tuner
+        // startup will fail past resolution — the point of this test is
+        // only that supplying `nid=` bypasses the 409 ambiguity gate (i.e.
+        // the response must NOT be 409; resolution proceeds to the
+        // (unrelated) tuner-start failure instead).
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/service/by-sid/101?nid=4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(res.status(), StatusCode::CONFLICT, "nid= must disambiguate instead of 409ing");
+    }
+
+    #[tokio::test]
+    async fn stream_by_sid_without_nid_is_not_ambiguous_when_sid_is_on_one_network() {
+        let state = test_web_state();
+        {
+            let db = state.database.lock().await;
+            // Two rows, but both on the same NID (e.g. scanned from two
+            // BonDrivers carrying the same multiplex) — not ambiguous.
+            insert_channel_with_nid_sid(&db, "driver-a.dll", 4, 101);
+            insert_channel_with_nid_sid(&db, "driver-b.dll", 4, 101);
+        }
+
+        let app = axum::Router::new()
+            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .with_state(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stream/service/by-sid/101")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(res.status(), StatusCode::CONFLICT, "a single-network SID must not be treated as ambiguous");
     }
 }

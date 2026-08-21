@@ -11,6 +11,10 @@ const previewSid = computed<string | number>(() => {
   const value = previewRow.value?.sid
   return typeof value === 'number' || typeof value === 'string' ? value : ''
 })
+const previewNid = computed<string | number | null>(() => {
+  const value = previewRow.value?.nid
+  return typeof value === 'number' || typeof value === 'string' ? value : null
+})
 function openPreview(row: JsonRecord) {
   if (row.sid == null) return
   previewRow.value = row
@@ -259,7 +263,7 @@ onUnmounted(() => store.stop())
           </div>
           <button class="button secondary" @click="closePreview">閉じる</button>
         </div>
-        <PreviewPlayer :key="previewSid" :initial-sid="previewSid" />
+        <PreviewPlayer :key="`${previewNid}-${previewSid}`" :initial-sid="previewSid" :initial-nid="previewNid" />
       </section>
     </div>
   </section>

@@ -754,7 +754,11 @@ onUnmounted(() => {
           </div>
           <button class="button secondary" @click="closePreview">閉じる</button>
         </div>
-        <PreviewPlayer :key="previewProgram.sid" :initial-sid="previewProgram.sid" />
+        <PreviewPlayer
+          :key="`${previewProgram.nid}-${previewProgram.sid}`"
+          :initial-sid="previewProgram.sid"
+          :initial-nid="previewProgram.nid"
+        />
       </section>
     </div>
   </section>

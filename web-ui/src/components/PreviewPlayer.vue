@@ -6,9 +6,17 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 const props = defineProps<{
   /** When set, the player locks onto this SID and starts automatically. */
   initialSid?: string | number | null
+  /**
+   * NID paired with `initialSid`. SID alone isn't a unique service identity
+   * (BS/BS4K reuse SIDs, terrestrial SIDs repeat across regions), so this is
+   * sent as `&nid=` to disambiguate — without it the server 409s when the
+   * SID is genuinely ambiguous instead of guessing a network.
+   */
+  initialNid?: string | number | null
 }>()
 
 const sid = ref(props.initialSid != null ? String(props.initialSid) : '')
+const nid = ref(props.initialNid != null ? String(props.initialNid) : '')
 const locked = props.initialSid != null
 const container = ref<HTMLElement | null>(null)
 const error = ref('')
@@ -49,8 +57,13 @@ async function start() {
       throw new Error('このブラウザでは再生できません')
     }
     const token = localStorage.getItem('recisdbApiToken')
-    // by-sid: 放送のservice_idで解決する(/stream/service/:id はDB主キーなので使わない)
-    const url = `/api/stream/service/by-sid/${encodeURIComponent(sid.value)}?profile=preview`
+    // by-sid: 放送のservice_idで解決する(/stream/service/:id はDB主キーなので使わない)。
+    // SIDは網(NID)をまたぐと重複しうるので、分かっていれば必ずnid=を付けて曖昧さを
+    // 排除する(省略時、サーバ側で複数網にまたがるSIDは409を返す)。
+    let url = `/api/stream/service/by-sid/${encodeURIComponent(sid.value)}?profile=preview`
+    if (nid.value !== '') {
+      url += `&nid=${encodeURIComponent(nid.value)}`
+    }
     // DPlayer delegates actual decoding to mpegts.js via customType, so the
     // existing Authorization-header handling keeps working unchanged.
     dp = new DPlayer({
@@ -126,10 +139,11 @@ if (locked) {
     void start()
   })
   watch(
-    () => props.initialSid,
-    (value) => {
-      if (value == null) return
-      sid.value = String(value)
+    () => [props.initialSid, props.initialNid] as const,
+    ([sidValue, nidValue]) => {
+      if (sidValue == null) return
+      sid.value = String(sidValue)
+      nid.value = nidValue != null ? String(nidValue) : ''
       void start()
     },
   )
@@ -150,17 +164,45 @@ onBeforeUnmount(stop)
         <button v-else class="button" :disabled="!sid" @click="start">再生</button>
       </div>
     </div>
-    <label class="field">
-      <span>サービスID</span>
-      <input
-        v-model="sid"
-        inputmode="numeric"
-        placeholder="例: 1024"
-        :readonly="locked"
-        @keyup.enter="start"
-      />
-    </label>
+    <div class="preview-fields">
+      <label class="field">
+        <span>サービスID</span>
+        <input
+          v-model="sid"
+          inputmode="numeric"
+          placeholder="例: 1024"
+          :readonly="locked"
+          @keyup.enter="start"
+        />
+      </label>
+      <label class="field">
+        <span>NID（任意・網をまたぐSIDの重複解消用）</span>
+        <input
+          v-model="nid"
+          inputmode="numeric"
+          placeholder="例: 4"
+          :readonly="locked"
+          @keyup.enter="start"
+        />
+      </label>
+    </div>
     <div ref="container" class="preview-video" />
     <p v-if="error" class="notice error preserve-lines" role="alert" v-text="error" />
   </section>
 </template>
+
+<style scoped>
+/* Two `.field`s side by side on wide screens; wraps to stacked full-width
+   fields on narrow ones instead of overflowing (CLAUDE.md: no fixed px,
+   must not break at ~360-430px phone widths). */
+.preview-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 16px;
+}
+
+.preview-fields .field {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+</style>
