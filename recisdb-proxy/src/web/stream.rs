@@ -152,7 +152,7 @@ impl StreamCleanup {
     }
 
     /// Take the remote-disconnect receiver out for the body stream to poll.
-    fn take_shutdown(&mut self) -> Option<mpsc::Receiver<()>> {
+    pub(crate) fn take_shutdown(&mut self) -> Option<mpsc::Receiver<()>> {
         self.shutdown_rx.take()
     }
 

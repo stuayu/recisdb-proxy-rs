@@ -29,7 +29,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream};
 use log::{debug, warn};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::tuner::TunerSubscription;
 use crate::ts_analyzer::service_filter::TsServiceFilter;
@@ -45,6 +45,17 @@ use crate::web::stream::{StreamCleanup, TsAligner};
 /// forever. One hour is a generous margin past the program's own scheduled
 /// end — comfortably longer than any realistic slip while still bounded.
 pub(crate) const PRESENT_WAIT_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Converts an absolute `DateTime<Utc>` deadline into a `tokio::time::Instant`
+/// so it can be raced against `rx.recv()`/`shutdown_rx.recv()` in a
+/// `tokio::select!` (see [`gated_program_stream`]) without waiting for a TS
+/// chunk to arrive first — a completely silent multiplex would otherwise
+/// never trip [`PRESENT_WAIT_GRACE`]. An already-elapsed deadline maps to
+/// "now", so the branch fires on the very next poll instead of blocking.
+fn deadline_to_instant(deadline: DateTime<Utc>) -> tokio::time::Instant {
+    let remaining = (deadline - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+    tokio::time::Instant::now() + remaining
+}
 
 // ============================================================================
 // ProgramGate: pure state machine
@@ -196,6 +207,12 @@ impl EitPfCollector {
 
 struct GatedStreamState {
     rx: TunerSubscription,
+    /// Fires when the dashboard asks this client to disconnect
+    /// (`POST /api/clients/{id}/disconnect`). `None` for unregistered
+    /// streams, which then simply have no remote-shutdown path — see
+    /// `web/stream.rs::StreamState::shutdown_rx`, whose contract this
+    /// mirrors.
+    shutdown_rx: Option<mpsc::Receiver<()>>,
     _cleanup: StreamCleanup,
     collector: EitPfCollector,
     gate: ProgramGate,
@@ -238,13 +255,15 @@ struct GatedStreamState {
 /// problem to solve twice.
 pub(crate) fn gated_program_stream(
     rx: TunerSubscription,
-    cleanup: StreamCleanup,
+    mut cleanup: StreamCleanup,
     target_sid: u16,
     target_event_id: u16,
     deadline: DateTime<Utc>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let shutdown_rx = cleanup.take_shutdown();
     let state = GatedStreamState {
         rx,
+        shutdown_rx,
         _cleanup: cleanup,
         collector: EitPfCollector::new(),
         gate: ProgramGate::new(target_sid, target_event_id),
@@ -258,16 +277,48 @@ pub(crate) fn gated_program_stream(
             if state.gate.is_ended() {
                 return None;
             }
-            if !state.gate.is_streaming() && Utc::now() >= state.deadline {
-                debug!(
-                    "[mirakurun program stream] gave up waiting for sid={} event_id={} to become present \
-                     (deadline elapsed)",
-                    state.gate.target_sid, state.gate.target_event_id
-                );
-                return None;
-            }
 
-            match state.rx.recv().await {
+            // The deadline only bounds the *Waiting* phase (see
+            // `PRESENT_WAIT_GRACE` doc comment) — once Streaming there is no
+            // "gave up" condition, so the branch below is disabled via `if
+            // !state.gate.is_streaming()` rather than racing a sleep that
+            // could fire mid-programme. Recomputed every iteration (not
+            // hoisted once before the loop) because `state.deadline` is
+            // fixed but "how long from now" obviously is not; an
+            // already-elapsed deadline maps to "fire immediately" (see
+            // `deadline_to_instant`), so this also covers the case where the
+            // grace period expired while this loop was blocked on the
+            // previous `recv()`.
+            let received = tokio::select! {
+                // Dashboard-initiated disconnect: end the body, which drops
+                // the cleanup guard (tuner subscription and dashboard
+                // registration) just like a client hangup. Same wording as
+                // `web/stream.rs::broadcast_to_body_stream`.
+                _ = async {
+                    match state.shutdown_rx.as_mut() {
+                        Some(rx) => { rx.recv().await; }
+                        // Unreachable: the guard below disables this branch.
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if state.shutdown_rx.is_some() => {
+                    debug!("[mirakurun program stream] disconnect requested from the dashboard");
+                    return None;
+                }
+                // Deadline elapsed while still Waiting, with no TS chunk
+                // ever arriving to trigger the (former) per-chunk check —
+                // an entirely silent multiplex would otherwise wait forever.
+                _ = tokio::time::sleep_until(deadline_to_instant(state.deadline)), if !state.gate.is_streaming() => {
+                    debug!(
+                        "[mirakurun program stream] gave up waiting for sid={} event_id={} to become present \
+                         (deadline elapsed)",
+                        state.gate.target_sid, state.gate.target_event_id
+                    );
+                    return None;
+                }
+                received = state.rx.recv() => received,
+            };
+
+            match received {
                 Ok(data) => {
                     // Gate observation runs unconditionally (including on
                     // chunks yielded once already Streaming) so an
