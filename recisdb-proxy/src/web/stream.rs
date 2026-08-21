@@ -464,17 +464,59 @@ pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tune
     }
 }
 
+/// Which preview encode template a channel needs. BS4K differs enough from
+/// every other band (progressive 2160p H.265 rather than 1080i H.264) that it
+/// cannot share one — see `DEFAULT_PREVIEW_4K_ENCODE_ARGS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewBand {
+    FourK,
+    Other,
+}
+
+impl PreviewBand {
+    /// Classified from the NID, the same way every other 4K decision in the
+    /// codebase is (`tuner/acquire.rs::b25_enabled_for`, the channel
+    /// enumeration): `band_type` is only populated by a scan and may be
+    /// missing on hand-inserted rows, while the NID always identifies the
+    /// network.
+    fn of_nid(nid: u16) -> Self {
+        match recisdb_protocol::broadcast_region::classify_nid(nid).0 {
+            recisdb_protocol::BroadcastType::FourK => Self::FourK,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Load the runtime encoder settings for `?profile=preview`: codec/bitrate/
 /// arguments from the `encode_profiles` row with `purpose='preview'`
 /// (STREAMING_DESIGN.md §5.3), everything else from `preview_encoder_config`
 /// — the browser-preview pipeline's own table, fully separate from the BNDP
 /// (TVTest) `tsreplace_config` which is never consulted here. Both
 /// executable paths are TOML-only (`[preview]` section, REVIEW S1).
-fn load_preview_encoder_config(db: &Database) -> Result<(EncoderRuntimeConfig, u64), String> {
-    let profile = db
-        .get_encode_profile_by_purpose("preview")
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no enabled encode profile with purpose='preview' is configured".to_string())?;
+fn load_preview_encoder_config(
+    db: &Database,
+    band: PreviewBand,
+) -> Result<(EncoderRuntimeConfig, u64), String> {
+    // BS4K is progressive 2160p H.265: the ordinary preview template
+    // deinterlaces it and encodes at full resolution, which no realtime
+    // encoder keeps up with — the picture breaks up. Prefer the 4K template
+    // when the channel is 4K, and fall back to the ordinary one if the admin
+    // deleted or disabled it (a stuttering preview beats no preview).
+    let profile = match band {
+        PreviewBand::FourK => db
+            .get_encode_profile_by_purpose("preview4k")
+            .map_err(|e| e.to_string())?,
+        PreviewBand::Other => None,
+    };
+    let profile = match profile {
+        Some(p) => p,
+        None => db
+            .get_encode_profile_by_purpose("preview")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                "no enabled encode profile with purpose='preview' is configured".to_string()
+            })?,
+    };
 
     let (enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms) =
         db.get_preview_encoder_config().map_err(|e| e.to_string())?;
@@ -692,7 +734,7 @@ async fn stream_resolved(
 
     let (encoder_cfg, generation) = {
         let db = web_state.database.lock().await;
-        match load_preview_encoder_config(&db) {
+        match load_preview_encoder_config(&db, PreviewBand::of_nid(resolved.channel.nid)) {
             Ok(v) => v,
             Err(msg) => {
                 release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
@@ -984,7 +1026,7 @@ mod tests {
 
         // preview_encoder_config disabled (default) -> rejected, message
         // names the actual gate.
-        let err = load_preview_encoder_config(&db).unwrap_err();
+        let err = load_preview_encoder_config(&db, PreviewBand::Other).unwrap_err();
         assert!(
             err.contains("preview_encoder_config.enabled"),
             "error should name preview_encoder_config.enabled, got: {err}"
@@ -992,7 +1034,7 @@ mod tests {
 
         // Enabled but command_path unset -> rejected with the TOML hint.
         db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
-        let err = load_preview_encoder_config(&db).unwrap_err();
+        let err = load_preview_encoder_config(&db, PreviewBand::Other).unwrap_err();
         assert!(
             err.contains("command_path"),
             "error should name the missing command_path, got: {err}"
@@ -1003,11 +1045,66 @@ mod tests {
         db.set_preview_command_path("preview-enc").unwrap();
         db.set_preview_preprocessor_path("preview-pre").unwrap();
         let (cfg, _generation) =
-            load_preview_encoder_config(&db).expect("configured preview should pass the gate");
+            load_preview_encoder_config(&db, PreviewBand::Other).expect("configured preview should pass the gate");
         assert_eq!(cfg.command_path, "preview-enc");
         assert_eq!(cfg.preprocessor_path, "preview-pre");
         assert_eq!(cfg.preprocessor_arguments, "-x 18 -n {SID} -");
         assert_eq!(cfg.read_timeout_ms, 7_000);
+    }
+
+    /// BS4K is progressive 2160p: encoding it with the 1080i template
+    /// (`--vpp-deinterlace` + no downscale) is what made the 4K preview
+    /// break up. 4K channels must get their own template, and every other
+    /// band must keep the ordinary one.
+    #[test]
+    fn preview_picks_the_4k_template_only_for_4k_channels() {
+        let db = Database::open_in_memory().unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        db.set_preview_command_path("preview-enc").unwrap();
+
+        let (four_k, _) = load_preview_encoder_config(&db, PreviewBand::FourK).unwrap();
+        assert!(
+            !four_k.arguments.contains("--vpp-deinterlace"),
+            "4K is progressive; the template must not deinterlace: {}",
+            four_k.arguments
+        );
+        assert!(
+            four_k.arguments.contains("--output-res"),
+            "4K must be downscaled before encoding: {}",
+            four_k.arguments
+        );
+
+        let (other, _) = load_preview_encoder_config(&db, PreviewBand::Other).unwrap();
+        assert!(other.arguments.contains("--vpp-deinterlace"));
+    }
+
+    /// NID 0x000B/0x000C are the 4K networks; everything else (BS, CS,
+    /// terrestrial) uses the ordinary template.
+    #[test]
+    fn preview_band_is_classified_from_the_nid() {
+        assert_eq!(PreviewBand::of_nid(0x000B), PreviewBand::FourK);
+        assert_eq!(PreviewBand::of_nid(0x000C), PreviewBand::FourK);
+        assert_eq!(PreviewBand::of_nid(4), PreviewBand::Other);
+        assert_eq!(PreviewBand::of_nid(32391), PreviewBand::Other);
+    }
+
+    /// Falling back keeps a (stuttering) preview working when the admin has
+    /// deleted or disabled the 4K row, rather than failing the request.
+    #[test]
+    fn a_4k_channel_falls_back_to_the_ordinary_template_when_no_4k_profile_exists() {
+        let db = Database::open_in_memory().unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        db.set_preview_command_path("preview-enc").unwrap();
+        let four_k_id = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .expect("seeded")
+            .id;
+        db.update_encode_profile(four_k_id, None, None, None, None, None, None, Some(false))
+            .unwrap();
+
+        let (cfg, _) = load_preview_encoder_config(&db, PreviewBand::FourK).unwrap();
+        assert!(cfg.arguments.contains("--vpp-deinterlace"), "must fall back to the ordinary template");
     }
 
     // ------------------------------------------------------------------

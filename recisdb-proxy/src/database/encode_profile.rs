@@ -27,6 +27,23 @@ pub(crate) const DEFAULT_PREVIEW_ENCODE_ARGS: &str =
      --audio-codec aac --audio-bitrate 192 --audio-samplerate 48000 \
      --data-copy timed_id3 --output-format mpegts -o -";
 
+/// Preview arguments for BS4K (`purpose = 'preview4k'`).
+///
+/// BS4K is 2160/59.94**p** H.265 — progressive, and four times the pixels of
+/// a 1080i broadcast. Running it through the ordinary preview profile is
+/// wrong twice over: `--interlace tff --vpp-deinterlace normal` deinterlaces
+/// a progressive source, and encoding 2160p in real time is far more work
+/// than a browser preview needs, so the encoder falls behind and the picture
+/// breaks up. This template drops the deinterlacer and downscales to 1080p
+/// before encoding; everything else matches
+/// `DEFAULT_PREVIEW_ENCODE_ARGS` so the two profiles behave alike.
+pub(crate) const DEFAULT_PREVIEW_4K_ENCODE_ARGS: &str =
+    "--avhw -i - --input-format mpegts --input-analyze 0.6 --input-probesize 1000K \
+     --vpp-resize algo=auto --output-res 1920x1080 -c h264 --profile high \
+     --vbr 4000 --max-bitrate 6000 --gop-len 60 --dar 16:9 \
+     --audio-codec aac --audio-bitrate 192 --audio-samplerate 48000 \
+     --data-copy timed_id3 --output-format mpegts -o -";
+
 /// The template seeded before the two-stage `[preview]` pipeline existed:
 /// QSVEncC wrapped inside a tsreplace command line. Kept only so
 /// `seed_default_encode_profiles` can recognize an untouched legacy row and
@@ -318,6 +335,29 @@ impl Database {
                      template to the direct QSVEncC template"
                 );
             }
+        }
+
+        // BS4K needs its own template (see `DEFAULT_PREVIEW_4K_ENCODE_ARGS`).
+        // Seeded separately and by name, so an admin who deletes or edits it
+        // keeps their version across restarts, exactly like the row above.
+        let four_k_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM encode_profiles WHERE name = ?1)",
+            params!["preview-4k"],
+            |row| row.get(0),
+        )?;
+        if !four_k_exists {
+            self.insert_encode_profile(
+                "preview-4k",
+                "preview4k",
+                "h264",
+                "mpegts",
+                Some(4_000_000),
+                Some(DEFAULT_PREVIEW_4K_ENCODE_ARGS),
+                true,
+            )?;
+            log::info!(
+                "Seeded default encode profile 'preview-4k' (1080p downscale, no deinterlace, purpose=preview4k)"
+            );
         }
         Ok(())
     }

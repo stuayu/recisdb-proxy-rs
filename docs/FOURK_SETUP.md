@@ -311,6 +311,27 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 | 0x0024 | BIT | — |
 | 0x0029 | CDT | **ロゴ収集が動く** |
 
+### プレビュー用エンコードプロファイル (2026-08-22 対応)
+
+映像は H.265 (stream_type 0x24)、**2160/59.94p のプログレッシブ**。既定の
+`preview-h264` プロファイルは `--interlace tff --vpp-deinterlace normal` を
+渡すうえに解像度もそのままなので、4K に適用すると (1) プログレッシブ素材を
+デインタレースし、(2) 2160p をリアルタイムで encode しようとして追いつかず、
+再生がブツブツ途切れる。
+
+対応: `purpose = 'preview4k'` の専用プロファイル `preview-4k` を seed し
+(`database/encode_profile.rs::DEFAULT_PREVIEW_4K_ENCODE_ARGS`、デインタレース
+なし + `--output-res 1920x1080` へ縮小 + VBR 4Mbps)、`?profile=preview` の
+プロファイル選択をチャンネルの帯域で分岐させた
+(`web/stream.rs::PreviewBand`)。判定は `band_type` ではなく **NID**
+(`classify_nid`) で行う — `band_type` はスキャンでしか埋まらず手動投入行では
+欠けるが、NID は必ず網を示すため。`preview4k` 行を管理者が削除・無効化した
+場合は通常プロファイルへフォールバックする (途切れるプレビューでも、
+再生できないよりはよい)。
+
+seed は名前 (`preview-4k`) で存在確認する冪等処理なので、管理者が編集した
+引数は再起動しても上書きされない。**実機のエンコーダでの検証は未実施。**
+
 ## 未対応 / 要確認
 
 - **配信 (視聴・録画) は未検証。** スキャンと同じ `MmtPipe` を通るので方式としては
@@ -319,18 +340,6 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
   いない可能性がある。読み込み単位の修正 (5MB → 64KB) で改善するかもしれないが、
   復号のカード往復が律速なら残る
 - **修正版 dantto4k のビルド確認**。手元では tsduck が無くビルドできていない
-- **プレビュー / エンコードプロファイル**: 映像は H.265 (stream_type 0x24)。
-  既定の `preview-h264` プロファイルは `--interlace tff --vpp-deinterlace normal`
-  を渡すが、**BS4K は 2160/59.94p のプログレッシブ**なのでこの指定は誤り。
-  4K 用プロファイル (デインタレースなし + スケール指定) が要る。
-
-  単にプロファイル行を足すだけでは足りない: プレビューは
-  `get_encode_profile_by_purpose("preview")` で **purpose が preview の
-  有効な行を1つ選ぶだけ**で、チャンネルの帯域を見ていない
-  (`web/stream.rs:246`)。帯域別に選ばせるには、プロファイルを読む時点
-  (`web/stream.rs:371` 付近、いまは `sid` しかスコープに無い) でチャンネルの
-  `band_type` を解決する配線が要る。実機のエンコーダなしでは検証できないため
-  未着手
 - **ダッシュボード (Vue) のフォーム露出**。Web API 側は対応済みで、
   `GET/POST/PATCH /api/bondrivers` が `stream_format` と `disable_b25` を
   読み書きする。画面から設定できるようにするには `web-ui/` 側の作業が要る
