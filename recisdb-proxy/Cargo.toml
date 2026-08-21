@@ -32,6 +32,11 @@ recisdb-protocol = { path = "../recisdb-protocol" }
 # recisdb = { path = "../recisdb-rs", default-features = false, features = ["bg-runtime"] }
 
 tokio = { version = "1.35", features = ["full"] }
+# TCP keepalive on accepted sockets. Without it a client that vanishes
+# without a FIN/RST (host crash, link loss, a relay/tunnel in between) leaves
+# its session blocked on `read` forever. Already in Cargo.lock via the client
+# DLL crate, so this adds no new crate to the build.
+socket2 = { version = "0.5", features = ["all"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.5"
 futures = "0.3"

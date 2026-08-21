@@ -75,6 +75,46 @@ const BITRATE_EWMA_ALPHA: f64 = 0.3;
 /// infrequent. 64 slots is more than sufficient.
 const CTRL_WRITE_BUFFER_CAPACITY: usize = 64;
 
+/// How long a session may stay in `Streaming` with no TS source attached
+/// before it is disconnected.
+///
+/// A failed channel switch can leave the session subscribed to nothing: the
+/// pre-switch cleanup drops `ts_receiver`/`current_tuner`, `acquire` then
+/// fails, and `try_restore_previous_channel` cannot bring the old reader
+/// back (it was stopped or already reaped from the pool). Without this the
+/// run loop simply parks on the 100 ms idle tick forever — a session that
+/// reports "streaming" on the dashboard, holds a priority/exclusive claim in
+/// the client view, and never delivers a single packet (observed in
+/// production: 76 minutes, `packets_sent = 0`, `signal_level = 0`).
+/// Disconnecting hands the decision back to the client, which reconnects and
+/// re-selects instead of staring at a dead stream.
+const NO_TS_SOURCE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One idle tick of a `Streaming` session that has no TS source attached.
+///
+/// Starts the clock on the first such tick and reports whether the grace
+/// period has run out. Split out of the run loop so the deadline itself is
+/// testable without a live socket and tuner.
+fn no_ts_source_deadline_passed(
+    since: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    grace: std::time::Duration,
+) -> bool {
+    let start = *since.get_or_insert(now);
+    now.saturating_duration_since(start) >= grace
+}
+
+/// How long a session with no tuner open may sit idle before it is dropped.
+///
+/// The client DLL keeps its TCP connection up until `Release()` — `CloseTuner`
+/// alone does not close it (`bondriver-proxy-client` `bondriver/exports.rs`) —
+/// and it reconnects by itself on the next `OpenTuner`, so dropping an idle
+/// connection costs the client nothing. Leaving them up costs a session row
+/// each on the dashboard forever (observed in production: one connected for
+/// 3.6 days, never having selected a channel). Sessions that *do* hold a tuner
+/// are exempt: keeping a tuner open without streaming is legitimate.
+const IDLE_NO_TUNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 use crate::server::ts_queue::{budget_bytes, TsWriteQueue};
 use crate::server::session_backpressure::{
     send_ts_frame, should_auto_promote_to_record, TsFrameSendOutcome,
@@ -130,6 +170,12 @@ pub struct Session {
     /// TS data receiver (when streaming). RAII: dropping releases the
     /// tracked subscription automatically (see `TunerSubscription`).
     ts_receiver: Option<TunerSubscription>,
+    /// Since when this session has been `Streaming` without anything to read
+    /// from (no `ts_receiver`, no shared encoder). Normally `None`: every
+    /// successful selection re-subscribes. It becomes `Some` only when a
+    /// channel switch tore the old subscription down and could not put a new
+    /// one in its place — see `NO_TS_SOURCE_GRACE`.
+    no_ts_source_since: Option<std::time::Instant>,
     // Session struct に追加
     ts_bytes_sent: u64,
     ts_msgs_sent: u64,
@@ -273,6 +319,7 @@ impl Session {
             current_group_name: None,
             group_driver_paths: Vec::new(),
             ts_receiver: None,
+            no_ts_source_since: None,
             ts_bytes_sent: 0,
             ts_msgs_sent: 0,
             last_ts_log: std::time::Instant::now(),
@@ -687,7 +734,19 @@ impl Session {
     ///
     /// The old tuner may still be alive in the pool when `keep_alive_secs > 0` (default 60 s).
     /// If it is still running we cancel the idle-close timer and re-subscribe.
+    ///
+    /// When the restore does not happen (no old key, gone from the pool,
+    /// already stopped) and this session was streaming, it is now left with
+    /// no TS source at all. That is not recoverable from here — the run
+    /// loop's `NO_TS_SOURCE_GRACE` watchdog disconnects it shortly after, so
+    /// the client can reconnect instead of holding a dead stream open.
     async fn try_restore_previous_channel(&mut self, old_tuner_key: &Option<ChannelKey>) {
+        let streaming = self.state == SessionState::Streaming;
+        if streaming && self.ts_receiver.is_none() && self.current_encoder.is_none() {
+            // Start the clock here rather than on the next idle tick, so the
+            // grace period is measured from the failure itself.
+            self.no_ts_source_since.get_or_insert_with(std::time::Instant::now);
+        }
         let Some(ref old_key) = old_tuner_key else { return };
         let Some(old_tuner) = self.tuner_pool.get(old_key).await else {
             warn!("[Session {}] Channel switch failed but old tuner {:?} is no longer in pool; cannot restore",
@@ -835,6 +894,11 @@ impl Session {
             // If streaming, we need to handle both incoming messages and TS data
             // Only handle TS data if we are actually streaming
             if self.state == SessionState::Streaming {
+                // A source is attached again (or still): forget the deadline.
+                if self.ts_receiver.is_some() || self.current_encoder.is_some() {
+                    self.no_ts_source_since = None;
+                }
+
                 // Create futures for socket read and TS receive
                 let mut tmp_buf = [0u8; 4096];
 
@@ -1020,12 +1084,43 @@ impl Session {
                                 self.disconnect_reason = Some("broadcast_closed".to_string());
                                 break;
                             }
-                            None => {}
+                            None => {
+                                // Idle tick from the "no TS source" arm above.
+                                // Streaming with nothing attached is a lost
+                                // tuner, not a quiet moment: give the restore
+                                // paths a short grace period, then disconnect
+                                // instead of parking here forever
+                                // (`NO_TS_SOURCE_GRACE`).
+                                if no_ts_source_deadline_passed(
+                                    &mut self.no_ts_source_since,
+                                    std::time::Instant::now(),
+                                    NO_TS_SOURCE_GRACE,
+                                ) {
+                                    error!(
+                                        "[Session {}] Streaming with no TS source for {:?} (channel switch left this session without a tuner); disconnecting",
+                                        self.id, NO_TS_SOURCE_GRACE
+                                    );
+                                    self.disconnect_reason = Some("tuner_lost".to_string());
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             } else {
-                // Not streaming, just wait for messages or shutdown
+                // Not streaming, just wait for messages or shutdown.
+                //
+                // A session that has not opened a tuner is also bounded in
+                // time (`IDLE_NO_TUNER_TIMEOUT`): TCP keepalive
+                // (`listener.rs`) catches a peer that is gone, but not one
+                // that is merely holding the socket open with nothing behind
+                // it. A `TunerOpen` session is deliberately excluded — a host
+                // may legitimately keep a tuner open without streaming.
+                let idle_limit = if self.current_tuner.is_none() {
+                    Some(IDLE_NO_TUNER_TIMEOUT)
+                } else {
+                    None
+                };
                 let socket = &mut self.socket_reader;
                 let read_buf = &mut self.read_buf;
                 let shutdown_rx = &mut self.shutdown_rx;
@@ -1035,7 +1130,25 @@ impl Session {
                         self.disconnect_reason = Some("remote_shutdown".to_string());
                         break;
                     }
-                    result = Self::read_message_with(socket, read_buf, self.id) => {
+                    result = async {
+                        match idle_limit {
+                            Some(limit) => tokio::time::timeout(
+                                limit,
+                                Self::read_message_with(socket, read_buf, self.id),
+                            )
+                            .await
+                            .map_err(|_| ()),
+                            None => Ok(Self::read_message_with(socket, read_buf, self.id).await),
+                        }
+                    } => {
+                        let Ok(result) = result else {
+                            info!(
+                                "[Session {}] Idle for {:?} with no tuner open; disconnecting",
+                                self.id, IDLE_NO_TUNER_TIMEOUT
+                            );
+                            self.disconnect_reason = Some("idle_timeout".to_string());
+                            break;
+                        };
                         match result? {
                             Some(msg) => {
                                 if !self.handle_message(msg).await? {
@@ -3200,6 +3313,57 @@ mod tests {
         assert!(should_auto_promote_to_record(200)); // 録画(通常) 目安
         assert!(should_auto_promote_to_record(255)); // 録画(排他) 目安
         assert!(should_auto_promote_to_record(i32::MAX));
+    }
+
+    // ---- NO_TS_SOURCE_GRACE: a Streaming session with nothing attached ----
+
+    #[test]
+    fn first_tick_without_a_ts_source_starts_the_clock_but_does_not_disconnect() {
+        let now = std::time::Instant::now();
+        let mut since = None;
+        assert!(!no_ts_source_deadline_passed(
+            &mut since,
+            now,
+            NO_TS_SOURCE_GRACE
+        ));
+        assert_eq!(since, Some(now), "the clock starts on the first idle tick");
+    }
+
+    #[test]
+    fn the_clock_keeps_its_original_start_across_ticks_and_expires() {
+        let start = std::time::Instant::now();
+        let mut since = None;
+        no_ts_source_deadline_passed(&mut since, start, NO_TS_SOURCE_GRACE);
+
+        // Still inside the grace period: the start must not be pushed forward.
+        assert!(!no_ts_source_deadline_passed(
+            &mut since,
+            start + NO_TS_SOURCE_GRACE / 2,
+            NO_TS_SOURCE_GRACE
+        ));
+        assert_eq!(since, Some(start));
+
+        assert!(no_ts_source_deadline_passed(
+            &mut since,
+            start + NO_TS_SOURCE_GRACE,
+            NO_TS_SOURCE_GRACE
+        ));
+    }
+
+    /// The run loop clears `no_ts_source_since` as soon as a source is
+    /// attached again, so a later failure gets a full grace period rather
+    /// than an instant disconnect.
+    #[test]
+    fn a_reattached_source_resets_the_clock() {
+        let start = std::time::Instant::now();
+        let mut since = Some(start);
+        since = None; // what the run loop does once ts_receiver/encoder is back
+
+        assert!(!no_ts_source_deadline_passed(
+            &mut since,
+            start + NO_TS_SOURCE_GRACE * 2,
+            NO_TS_SOURCE_GRACE
+        ));
     }
 
     // ---- P3 §2.2-9: outgoing alignment fast path ----

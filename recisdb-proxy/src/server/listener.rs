@@ -166,6 +166,9 @@ async fn handle_connection(
     // Disable Nagle's algorithm for lower latency
     socket.set_nodelay(true)?;
 
+    // Detect peers that go away without a FIN/RST.
+    configure_keepalive(&socket, session_id);
+
     // Split the socket into independent read/write halves.
     // The write half moves to a dedicated writer task so that socket writes
     // (which may block on TCP backpressure) never stall the main select loop.
@@ -211,6 +214,42 @@ async fn handle_connection(
     session_registry.unregister(session_id).await;
 
     result
+}
+
+/// Idle time after which TCP starts probing a quiet connection.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Interval between keepalive probes.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Number of unanswered probes before the connection is declared dead.
+#[cfg(not(windows))]
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Turn on TCP keepalive for an accepted client connection.
+///
+/// A client that disappears without a FIN or RST — host crash, link loss, or
+/// (as in production) a relay/tunnel in front of the server that keeps its own
+/// half of the connection open — leaves the session parked on `read` forever:
+/// the BNDP session is only driven by socket input while it is not streaming,
+/// and there is no application-level heartbeat (`Ping`/`Pong` exists in the
+/// protocol but no side sends it unprompted). Such sessions accumulate as
+/// "zombies" on the dashboard and never release what they hold. The client DLL
+/// already does this on its side (`bondriver-proxy-client`
+/// `client/connection.rs::configure_keepalive`); its probes stop at the relay,
+/// so the server needs its own.
+///
+/// Best-effort: failing to set the option must not reject an otherwise usable
+/// connection.
+fn configure_keepalive(socket: &TcpStream, session_id: u64) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    // Windows derives the probe count from the other two values.
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
+
+    if let Err(e) = socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive) {
+        warn!("[Session {}] Failed to enable TCP keepalive: {}", session_id, e);
+    }
 }
 
 /// Dedicated per-session writer task.
