@@ -952,6 +952,19 @@ const KEEPALIVE_RETRIES: u32 = 3;
 /// what TCP believes. Only armed while the client actually expects TS.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long to wait for the *first* TS chunk after StartStream or a channel
+/// switch, before `STREAM_IDLE_TIMEOUT` takes over.
+///
+/// Startup is not the steady state: the server may still be opening the
+/// BonDriver, waiting for a lock, or — for BS4K (`stream_format = 'mmttlv'`)
+/// — spawning the external MMT/TLV converter, which alone can take around 20
+/// seconds before a single byte of TS appears. Policing that window with the
+/// steady-state timeout drops the link exactly when the stream is about to
+/// start, and the reconnect restarts the same slow startup from scratch —
+/// a loop that never converges. Once TS has been seen, silence really does
+/// mean a dead link, so the short timeout applies from then on.
+const FIRST_DATA_GRACE: Duration = Duration::from_secs(60);
+
 /// Turn on TCP keepalive.
 ///
 /// Without it a silently blackholed path (NAT session expiry, route withdrawal)
@@ -1016,12 +1029,17 @@ async fn establish(
 /// leaving any remaining bytes in `read_buf` untouched — this is what the
 /// handshake/restore path uses to read one ack at a time without consuming
 /// subsequent frames.
+///
+/// Returns whether at least one `TsData` frame was seen, which is what the
+/// connection loop uses to tell "the stream has started" from "the server is
+/// still only answering commands" (see `FIRST_DATA_GRACE`).
 fn process_frames(
     read_buf: &mut BytesMut,
     buffer: &TsRingBuffer,
     mut on_msg: impl FnMut(ServerMessage),
     stop_after_first_control: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut ts_seen = false;
     static TS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1039,6 +1057,7 @@ fn process_frames(
                 // --- TsData fast path (single copy into the ring buffer) ---
                 if header.message_type == MessageType::TsData {
                     let ts_payload = read_buf.split_to(header.payload_len as usize);
+                    ts_seen = true;
 
                     let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1065,13 +1084,13 @@ fn process_frames(
                 on_msg(msg);
 
                 if stop_after_first_control {
-                    return Ok(());
+                    return Ok(ts_seen);
                 }
             }
             None => break, // Need more data
         }
     }
-    Ok(())
+    Ok(ts_seen)
 }
 
 /// Read frames until a single control (non-TS) message arrives, feeding any
@@ -1405,11 +1424,22 @@ async fn connection_loop(
     let mut writer_done = false;
     let mut last_request = "none";
     let mut idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
+    // Startup (and every channel switch) gets `FIRST_DATA_GRACE` instead of
+    // `STREAM_IDLE_TIMEOUT` until the first TS chunk lands — see the constant.
+    let mut awaiting_first_data = false;
+    let mut was_streaming = false;
     let exit = loop {
         // Only police silence while the client actually expects TS. An idle
         // tuner legitimately sends nothing for minutes at a time; TCP keepalive
         // covers that case instead.
         let expecting_data = conn.session.lock().streaming;
+        if expecting_data && !was_streaming {
+            // StartStream just took effect: the server may still be opening
+            // the driver / starting a converter.
+            awaiting_first_data = true;
+            idle_deadline = tokio::time::Instant::now() + FIRST_DATA_GRACE;
+        }
+        was_streaming = expecting_data;
 
         tokio::select! {
             // --- Outgoing requests: hand off to the writer task, non-blocking. ---
@@ -1417,6 +1447,19 @@ async fn connection_loop(
                 match maybe_msg {
                     Some(msg) => {
                         last_request = client_message_name(&msg);
+                        // A channel switch restarts the whole startup path on
+                        // the server (possibly onto a 4K driver), so the
+                        // stream goes quiet again for as long as a fresh
+                        // StartStream would.
+                        if matches!(
+                            msg,
+                            ClientMessage::SetChannel { .. }
+                                | ClientMessage::SetChannelSpace { .. }
+                                | ClientMessage::SelectLogicalChannel { .. }
+                        ) {
+                            awaiting_first_data = true;
+                            idle_deadline = tokio::time::Instant::now() + FIRST_DATA_GRACE;
+                        }
                         file_log!(debug, "connection_loop: sending request {}", last_request);
                         // Unbounded send is synchronous — never stalls the reader.
                         if write_tx.send(msg).is_err() {
@@ -1445,9 +1488,10 @@ async fn connection_loop(
 
             // --- Streaming went silent: treat as a dead link ---
             _ = tokio::time::sleep_until(idle_deadline), if expecting_data => {
-                warn!("No TS data for {:?} while streaming; treating the link as dead", STREAM_IDLE_TIMEOUT);
-                file_log!(warn, "No TS data for {:?} while streaming; reconnecting", STREAM_IDLE_TIMEOUT);
-                break LoopExit::Dropped(format!("idle for {:?} while streaming", STREAM_IDLE_TIMEOUT));
+                let limit = if awaiting_first_data { FIRST_DATA_GRACE } else { STREAM_IDLE_TIMEOUT };
+                warn!("No TS data for {:?} while streaming; treating the link as dead", limit);
+                file_log!(warn, "No TS data for {:?} while streaming; reconnecting", limit);
+                break LoopExit::Dropped(format!("idle for {:?} while streaming", limit));
             }
 
             // --- Incoming frames ---
@@ -1459,12 +1503,22 @@ async fn connection_loop(
                         break LoopExit::Dropped("server closed (EOF)".to_string());
                     }
                     Ok(_) => {
-                        idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
                         let r = process_frames(&mut read_buf, buffer, |m| {
                             if resp_tx.send(m).is_err() {
                                 debug!("Response channel closed");
                             }
                         }, false);
+                        if matches!(r, Ok(true)) {
+                            // Real TS: startup is over, police silence with
+                            // the steady-state timeout from here on.
+                            awaiting_first_data = false;
+                        }
+                        if !awaiting_first_data {
+                            idle_deadline = tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT;
+                        }
+                        // While awaiting the first chunk the original
+                        // `FIRST_DATA_GRACE` deadline stands: control frames
+                        // (acks, signal levels) must not extend it forever.
                         if let Err(e) = r {
                             error!("Frame decode error: {}", e);
                             break LoopExit::Dropped(format!("decode error: {}", e));
@@ -1648,6 +1702,28 @@ mod tests {
             }
             LoopExit::Shutdown => panic!("must report a drop, not a clean shutdown"),
         }
+    }
+
+    /// Startup silence is not a dead link: a BS4K driver can take ~20 s to
+    /// produce its first converted chunk, which is longer than
+    /// `STREAM_IDLE_TIMEOUT`. Until the first TS frame arrives the loop must
+    /// hold out for `FIRST_DATA_GRACE` instead, or the reconnect kills the
+    /// stream exactly when it is about to start.
+    #[tokio::test(start_paused = true)]
+    async fn startup_silence_is_tolerated_until_the_first_data_grace_expires() {
+        assert!(
+            FIRST_DATA_GRACE > STREAM_IDLE_TIMEOUT * 2,
+            "the bound below only proves anything if the grace is the longer one"
+        );
+        let result = tokio::time::timeout(
+            STREAM_IDLE_TIMEOUT * 2,
+            run_loop_against_a_silent_peer(true),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "must still be waiting for the first chunk, not reconnecting"
+        );
     }
 
     /// An idle tuner legitimately sends nothing for minutes. The idle timer must
