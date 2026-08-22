@@ -8,14 +8,12 @@ use std::sync::Arc;
 
 use log::debug;
 
-use crate::tuner::{SharedTuner, TunerSubscription};
+use crate::tuner::{EffectiveClaim, SharedTuner, TunerSubscription};
 
-/// Replace the session's current tuner with `next_tuner` while preserving the
-/// active stream subscription if needed.
-///
-/// Returns the previous tuner when it became subscriber-less and needs caller
-/// cleanup (idle close or capacity-aware stop). Same-tuner reuse never returns
-/// a cleanup target.
+/// Backwards-compatible adapter for existing session call sites. New code
+/// should compute one [`EffectiveClaim`] at request ingress and call
+/// [`handoff_current_tuner_with_claim`] so the exact same claim used by the
+/// acquire policy becomes the incumbent subscription claim.
 pub(super) async fn handoff_current_tuner(
     session_id: u64,
     ts_receiver: &mut Option<TunerSubscription>,
@@ -23,6 +21,37 @@ pub(super) async fn handoff_current_tuner(
     next_tuner: Arc<SharedTuner>,
     claim_priority: i32,
     claim_exclusive: bool,
+    is_streaming: bool,
+    log_prefix: &str,
+) -> Option<Arc<SharedTuner>> {
+    handoff_current_tuner_with_claim(
+        session_id,
+        ts_receiver,
+        current_tuner,
+        next_tuner,
+        EffectiveClaim::new(claim_priority, claim_exclusive),
+        is_streaming,
+        log_prefix,
+    )
+    .await
+}
+
+/// Replace the session's current tuner with `next_tuner` while preserving the
+/// active stream subscription if needed.
+///
+/// `claim` must be the canonical request claim already used by tuner
+/// arbitration. Recomputing priority/exclusivity here reintroduces the
+/// requester/incumbent asymmetry that caused the 2026-08 tuner livelock.
+///
+/// Returns the previous tuner when it became subscriber-less and needs caller
+/// cleanup (idle close or capacity-aware stop). Same-tuner reuse never returns
+/// a cleanup target.
+pub(super) async fn handoff_current_tuner_with_claim(
+    session_id: u64,
+    ts_receiver: &mut Option<TunerSubscription>,
+    current_tuner: &mut Option<Arc<SharedTuner>>,
+    next_tuner: Arc<SharedTuner>,
+    claim: EffectiveClaim,
     is_streaming: bool,
     log_prefix: &str,
 ) -> Option<Arc<SharedTuner>> {
@@ -36,12 +65,10 @@ pub(super) async fn handoff_current_tuner(
                 // Re-subscribe FIRST (count N→N+1), *then* let the
                 // assignment below drop the old `TunerSubscription` still
                 // held in `*ts_receiver` (count N+1→N). Rust evaluates the
-                // right-hand side of an assignment (the `subscribe()` call)
-                // before dropping the place's previous value, so this
-                // ordering — never a transient subscriber_count==0 on a
-                // still-active tuner — falls out of assignment semantics
-                // rather than needing an explicit manual unsubscribe() call.
-                let new_sub = next_tuner.subscribe_with_claim(claim_priority, claim_exclusive);
+                // right-hand side of an assignment (the subscribe call)
+                // before dropping the place's previous value, so there is
+                // never a transient subscriber_count==0 on an active tuner.
+                let new_sub = next_tuner.subscribe_with_claim(claim.priority, claim.exclusive);
                 *ts_receiver = Some(new_sub);
             }
             *current_tuner = Some(next_tuner);
@@ -58,7 +85,7 @@ pub(super) async fn handoff_current_tuner(
 
         let needs_cleanup = old.subscriber_count() == 0;
         if is_streaming {
-            *ts_receiver = Some(next_tuner.subscribe_with_claim(claim_priority, claim_exclusive));
+            *ts_receiver = Some(next_tuner.subscribe_with_claim(claim.priority, claim.exclusive));
         }
         *current_tuner = Some(next_tuner);
 
@@ -69,7 +96,7 @@ pub(super) async fn handoff_current_tuner(
     }
 
     if is_streaming {
-        *ts_receiver = Some(next_tuner.subscribe_with_claim(claim_priority, claim_exclusive));
+        *ts_receiver = Some(next_tuner.subscribe_with_claim(claim.priority, claim.exclusive));
     }
     *current_tuner = Some(next_tuner);
     None
@@ -92,13 +119,12 @@ mod tests {
         let mut current_tuner = Some(Arc::clone(&tuner));
         assert_eq!(tuner.subscriber_count(), 1);
 
-        let cleanup = handoff_current_tuner(
+        let cleanup = handoff_current_tuner_with_claim(
             1,
             &mut ts_receiver,
             &mut current_tuner,
             Arc::clone(&tuner),
-            42,
-            true,
+            EffectiveClaim::new(42, true),
             true,
             "test:",
         )
@@ -121,6 +147,30 @@ mod tests {
                 exclusive: true
             })
         );
+    }
+
+    /// The exact claim passed to arbitration must survive handoff unchanged.
+    #[tokio::test]
+    async fn canonical_claim_survives_handoff_without_reinterpretation() {
+        let tuner = SharedTuner::new(ChannelKey::simple("/dev/test", 1), 2);
+        let mut ts_receiver = None;
+        let mut current_tuner = None;
+        let claim = EffectiveClaim::new(3, true);
+
+        handoff_current_tuner_with_claim(
+            7,
+            &mut ts_receiver,
+            &mut current_tuner,
+            Arc::clone(&tuner),
+            claim,
+            true,
+            "claim-test:",
+        )
+        .await;
+
+        let incumbent = tuner.incumbent_claim().expect("subscription claim");
+        assert_eq!(incumbent.priority, claim.priority);
+        assert_eq!(incumbent.exclusive, claim.exclusive);
     }
 
     /// Switching to a different tuner while streaming: the old tuner's
