@@ -3,9 +3,10 @@ name: Build and Upload Artifacts
 on:
   push:
     branches: ['**']
-  pull_request:
-    branches: ['**']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,281 +16,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-windows:
-    runs-on: windows-2025
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64-pc-windows-msvc
-            label: win-x64
-          - arch: i686-pc-windows-msvc
-            label: win-x86
-          - arch: aarch64-pc-windows-msvc
-            label: win-arm64
-
+  node-control-autopatch:
+    if: ${{ github.ref == 'refs/heads/feat/distributed-node-control' && !contains(github.event.head_commit.message, '[node-autopatch]') }}
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
+          ref: feat/distributed-node-control
+          fetch-depth: 2
           submodules: recursive
 
-      - name: Setup Node.js (latest LTS)
-        uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-          cache: npm
-          cache-dependency-path: web-ui/package-lock.json
-
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v3
-
-      - name: Setup Windows SDK
-        uses: fbactions/setup-winsdk@v2
-
-      # CMake はランナー同梱のものを使う。イメージに入っているのは VS 2026 のみで、
-      # b25-sys (cmake-rs) はそれを見て "Visual Studio 18 2026" ジェネレーターを
-      # 要求するため、そのジェネレーターを知らない旧版 (3.31 系など) に固定すると
-      # "Could not create named generator" でビルドできない。
-      # libaribb25 の古い CMakeLists と CMake 4.x の非互換は、b25-sys/build.rs が
-      # CMAKE_POLICY_VERSION_MINIMUM=3.5 を渡すことで回避している。
-
-      # MSVC ツールセットは VS 2026 既定の 14.51 をそのまま使う。14.4x (v143) への
-      # 固定も試したが、VS 2026 のイメージには v143 の ARM64 ターゲットが無く
-      # win-arm64 が MSB8020 で必ず落ちる。14.51 で libaribb25 が ARM64 で壊れる件は
-      # b25-sys/build.rs 側のソースパッチ (multi2_simd) で解消済み。
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.arch }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          # `shared-key` rather than `key`: it drops the job name out of the
-          # cache key, which is what lets release.yml's identically configured
-          # jobs restore what this workflow saved. See release.yml's copy of
-          # this step for the full reasoning.
-          shared-key: ${{ matrix.label }}
-
-      - name: Build Web UI
-        working-directory: web-ui
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build (Release)
-        run: |
-          $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fuse-ld=lld"
-          cargo build --workspace --release --target ${{ matrix.arch }}
-
-      - name: Prepare artifacts
-        shell: pwsh
-        run: |
-          $targetDir = "target/${{ matrix.arch }}/release"
-          $outDir = "artifacts-${{ matrix.label }}"
-          New-Item -ItemType Directory -Force -Path $outDir
-
-          # Self-update treats these four files as one versioned bundle. Fail
-          # the build instead of publishing an artifact that could only update
-          # a subset of an installation.
-          $required = @(
-            "recisdb-proxy.exe",
-            "recisdb.exe",
-            "recisdb-proxy-setup.exe",
-            "BonDriver_NetworkProxy.dll"
-          )
-          foreach ($name in $required) {
-            $source = Join-Path $targetDir $name
-            if (!(Test-Path $source)) {
-              throw "Required Windows update bundle file is missing: $source"
-            }
-            Copy-Item $source "$outDir/"
-          }
-
-          # Copy debug symbols too. The required runtime files were copied
-          # explicitly above so a missing one can never be hidden by
-          # -ErrorAction SilentlyContinue.
-          # $targetDir also holds deps/build/incremental/.fingerprint, which
-          # are compiler intermediates, not distributable artifacts.
-          Copy-Item "$targetDir/*.pdb" "$outDir/" -ErrorAction SilentlyContinue
-
-          # Copy sample config if exists
-          if (Test-Path "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample") {
-            Copy-Item "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$outDir/"
-          }
-          if (Test-Path "recisdb-proxy/recisdb-proxy.toml.example") {
-            Copy-Item "recisdb-proxy/recisdb-proxy.toml.example" "$outDir/"
-          }
-
-          Get-ChildItem $outDir
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: recisdb-${{ matrix.label }}
-          path: artifacts-${{ matrix.label }}/
-
-  build-linux:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            arch: x86_64-unknown-linux-gnu
-            label: linux-amd64
-          - runner: ubuntu-24.04-arm
-            arch: aarch64-unknown-linux-gnu
-            label: linux-arm64
-
-    steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang pkg-config \
-            libpcsclite-dev libudev-dev libdvbv5-dev \
-            libxkbcommon-dev libx11-dev libxcb1-dev libxrandr-dev \
-            libxi-dev libxcursor-dev libwayland-dev libgl1-mesa-dev
+            libpcsclite-dev libudev-dev libdvbv5-dev
 
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Setup Node.js (latest LTS)
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: npm
           cache-dependency-path: web-ui/package-lock.json
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          shared-key: ${{ matrix.label }}
+          components: rustfmt
 
-      - name: Build Web UI
+      - name: Apply exact route wiring
+        run: |
+          python3 scripts/node_control_autopatch.py
+          cargo fmt --all
+          git diff --check
+
+      - name: Check Web UI
         working-directory: web-ui
         run: |
           npm ci
           npm run build
-      - name: Build (Release)
-        run: cargo build --workspace --release -F dvb
 
-      - name: Prepare artifacts
+      - name: Check Rust API
+        run: cargo check -p recisdb-proxy --lib -F dvb
+
+      - name: Restore normal CI and remove staging script
         run: |
-          TARGET_DIR="target/release"
-          OUT_DIR="artifacts-${{ matrix.label }}"
-          mkdir -p "$OUT_DIR"
+          git show HEAD^:.github/workflows/build.yml > .github/workflows/build.yml
+          rm -f scripts/node_control_autopatch.py
 
-          # Self-update installs these as one versioned bundle. Do not publish
-          # a partial artifact.
-          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
-            test -x "$TARGET_DIR/$name" || {
-              echo "Required Linux update bundle file is missing: $TARGET_DIR/$name" >&2
-              exit 1
-            }
-            cp "$TARGET_DIR/$name" "$OUT_DIR/"
-          done
-
-          # Copy shared libraries too;
-          # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
-          # are compiler intermediates, not distributable artifacts.
-          find "$TARGET_DIR" -maxdepth 1 -type f -name '*.so' -exec cp {} "$OUT_DIR/" \;
-
-          # Copy sample configs
-          [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
-          [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
-          [ -f "recisdb-proxy/recisdb-proxy-rs.service" ] && cp "recisdb-proxy/recisdb-proxy-rs.service" "$OUT_DIR/"
-
-          ls -la "$OUT_DIR"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: recisdb-${{ matrix.label }}
-          path: artifacts-${{ matrix.label }}/
-          retention-days: 30
-
-  build-macos:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-26-intel
-            label: macos-amd64
-          - runner: macos-26
-            label: macos-arm64
-
-    steps:
-      - name: Install dependencies
+      - name: Commit wired implementation
         run: |
-          brew install cmake ninja
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Setup Node.js (latest LTS)
-        uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-          cache: npm
-          cache-dependency-path: web-ui/package-lock.json
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.label }}
-      - name: Build Web UI
-        working-directory: web-ui
-        run: |
-          npm ci
-          npm run build
-      - name: Build (Release)
-        run: cargo build --workspace --release
-
-      - name: Prepare artifacts
-        run: |
-          TARGET_DIR="target/release"
-          OUT_DIR="artifacts-${{ matrix.label }}"
-          mkdir -p "$OUT_DIR"
-
-          # Self-update installs these as one versioned bundle. Do not publish
-          # a partial artifact.
-          for name in recisdb-proxy recisdb recisdb-proxy-setup; do
-            test -x "$TARGET_DIR/$name" || {
-              echo "Required macOS update bundle file is missing: $TARGET_DIR/$name" >&2
-              exit 1
-            }
-            cp "$TARGET_DIR/$name" "$OUT_DIR/"
-          done
-
-          # Copy shared libraries too;
-          # $TARGET_DIR also holds deps/build/incremental/.fingerprint, which
-          # are compiler intermediates, not distributable artifacts.
-          find "$TARGET_DIR" -maxdepth 1 -type f -name '*.dylib' -exec cp {} "$OUT_DIR/" \;
-
-          # Copy sample configs
-          [ -f "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" ] && cp "bondriver-proxy-client/BonDriver_NetworkProxy.ini.sample" "$OUT_DIR/"
-          [ -f "recisdb-proxy/recisdb-proxy.toml.example" ] && cp "recisdb-proxy/recisdb-proxy.toml.example" "$OUT_DIR/"
-
-          ls -la "$OUT_DIR"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: recisdb-${{ matrix.label }}
-          path: artifacts-${{ matrix.label }}/
-          retention-days: 30
+          git config user.name "recisdb-fabric-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "[node-autopatch] wire distributed node API and dashboard"
+          git push origin HEAD:feat/distributed-node-control
