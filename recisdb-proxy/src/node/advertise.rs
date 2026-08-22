@@ -32,9 +32,6 @@ use super::types::{
 struct LocalRoute {
     mux: LogicalMuxId,
     band_type: Option<u8>,
-    /// Only used to name the mux in `logical_muxes`; not part of the
-    /// advertisement itself.
-    network_name: Option<String>,
     dll_path: String,
     bon_space: u32,
     bon_channel: u32,
@@ -47,7 +44,7 @@ struct LocalRoute {
 fn local_routes(db: &Database) -> Result<Vec<LocalRoute>, crate::database::DatabaseError> {
     let conn = db.connection();
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT c.nid, c.tsid, c.band_type, c.network_name,
+        "SELECT DISTINCT c.nid, c.tsid, c.band_type,
                 bd.dll_path, c.bon_space, c.bon_channel, bd.max_instances
          FROM channels c
          JOIN bon_drivers bd ON c.bon_driver_id = bd.id
@@ -64,11 +61,10 @@ fn local_routes(db: &Database) -> Result<Vec<LocalRoute>, crate::database::Datab
                     tsid: row.get::<_, i64>(1)? as u16,
                 },
                 band_type: row.get::<_, Option<i64>>(2)?.map(|b| b as u8),
-                network_name: row.get(3)?,
-                dll_path: row.get(4)?,
-                bon_space: row.get::<_, i64>(5)? as u32,
-                bon_channel: row.get::<_, i64>(6)? as u32,
-                max_instances: row.get::<_, i64>(7)? as i32,
+                dll_path: row.get(3)?,
+                bon_space: row.get::<_, i64>(4)? as u32,
+                bon_channel: row.get::<_, i64>(5)? as u32,
+                max_instances: row.get::<_, i64>(6)? as i32,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

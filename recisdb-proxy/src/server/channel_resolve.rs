@@ -323,6 +323,89 @@ pub async fn start_tuner_for_service(
     .await
 }
 
+/// Where an HTTP/Mirakurun stream's TS is coming from.
+///
+/// A remote source behaves like a local one downstream: both hand out a
+/// `broadcast::Receiver<Bytes>` of raw TS. The distinction only matters for
+/// lifetime management, which is why it survives as far as `StreamCleanup`.
+pub enum StreamSource {
+    Local(Arc<SharedTuner>),
+    /// A lease on a peer's tuner (`node::consume`). The stream is kept alive
+    /// by holding this handle: dropping it releases the peer's lease.
+    Remote(Arc<crate::node::RemoteMuxStream>),
+}
+
+/// End-to-end budget for finding a remote node that can serve a request.
+///
+/// Deliberately generous relative to a local acquire: it covers a peer's own
+/// tuner open. It is a single budget for the whole search, not per peer.
+const REMOTE_SEARCH_BUDGET_MS: u64 = 20_000;
+
+/// Resolve a service to a TS source, preferring a local tuner and falling back
+/// to a paired node that advertises the same mux.
+///
+/// The fallback is *only* tried when no local tuner could serve the request.
+/// A locally receivable channel is never sent over the network just because a
+/// peer also has it: the local path has no transport failure domain at all.
+pub async fn start_source_for_service_with_claim(
+    tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    resolved: &ResolvedService,
+    claim: EffectiveClaim,
+    stream_class: recisdb_protocol::StreamClass,
+) -> Result<StreamSource, ChannelResolveError> {
+    let local = start_tuner_for_service_with_claim(tuner_pool, database, resolved, claim).await;
+    let local_error = match local {
+        Ok(tuner) => return Ok(StreamSource::Local(tuner)),
+        Err(e) => e,
+    };
+
+    let mux = crate::node::LogicalMuxId {
+        nid: resolved.channel.nid,
+        tsid: resolved.channel.tsid,
+    };
+    let local_identity = {
+        let db = database.lock().await;
+        match crate::node::NodeStore::new(&db).and_then(|s| s.local_identity()) {
+            Ok(identity) => identity,
+            // The fabric was never initialised on this node; the local error
+            // is the only answer there is.
+            Err(_) => return Err(local_error),
+        }
+    };
+
+    match crate::node::RemoteMuxStream::open_best(
+        database,
+        &local_identity,
+        mux,
+        Some(resolved.channel.sid),
+        stream_class,
+        claim,
+        REMOTE_SEARCH_BUDGET_MS,
+    )
+    .await
+    {
+        Ok(stream) => {
+            info!(
+                "[HTTP stream] service id={} served from remote lease {} ({})",
+                resolved.channel.id,
+                stream.lease().lease_id,
+                stream.base_url()
+            );
+            Ok(StreamSource::Remote(Arc::new(stream)))
+        }
+        Err(remote_error) => {
+            // Report the *local* failure: it is what the operator can act on,
+            // and "no remote node has this either" is a detail, not the cause.
+            info!(
+                "[HTTP stream] no remote node could serve service id={} either: {}",
+                resolved.channel.id, remote_error
+            );
+            Err(local_error)
+        }
+    }
+}
+
 /// Same resolver with an explicit canonical contention claim.
 ///
 /// Reclamation is intentionally left to `tuner::policy`: the former HTTP

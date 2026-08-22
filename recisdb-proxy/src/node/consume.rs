@@ -25,9 +25,14 @@ use bytes::{Bytes, BytesMut};
 use recisdb_protocol::StreamClass;
 use tokio::sync::broadcast;
 
+use crate::server::listener::DatabaseHandle;
+use crate::tuner::EffectiveClaim;
+
 use super::frame::{FrameFlags, NodeTsFrame, NODE_TS_HEADER_LEN};
+use super::identity::NodeIdentity;
+use super::store::NodeStore;
 use super::transport::{LeaseStreamError, NodeTransportClient, OpenLeaseReply, OpenLeaseRequest};
-use super::types::{LogicalMuxId, RequestContext};
+use super::types::{EndpointKind, LogicalMuxId, NodeEndpoint, RequestContext};
 
 /// Capacity of the local republish channel. Matches the local tuner fanout
 /// (`STREAMING_DESIGN.md`) so a slow consumer behaves identically whether the
@@ -120,6 +125,128 @@ impl RemoteMuxStream {
         );
 
         Ok(stream)
+    }
+
+    /// Find a peer that can receive `mux` and open a lease on it.
+    ///
+    /// Candidate peers come from the stored route advertisements
+    /// (`node::sync`), which is a cache: a peer may still refuse, so this
+    /// walks them in order until one succeeds.
+    ///
+    /// `budget_ms` is the whole end-to-end deadline for the attempt. It is
+    /// spent across every peer and endpoint tried, never reset per attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_best(
+        database: &DatabaseHandle,
+        local: &NodeIdentity,
+        mux: LogicalMuxId,
+        sid: Option<u16>,
+        class: StreamClass,
+        claim: EffectiveClaim,
+        budget_ms: u64,
+    ) -> Result<Self, ConsumeError> {
+        let started = std::time::Instant::now();
+
+        let peers = {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db).map_err(|e| ConsumeError::Transport(e.to_string()))?;
+            let routes = store
+                .remote_routes_for(mux)
+                .map_err(|e| ConsumeError::Transport(e.to_string()))?;
+
+            // One entry per node, keeping the route ordering the store applied.
+            let mut peers: Vec<(super::types::NodeId, Vec<NodeEndpoint>)> = Vec::new();
+            for route in routes {
+                if peers.iter().any(|(id, _)| id == &route.node_id) {
+                    continue;
+                }
+                let Ok(Some(_credential)) = store.credential_for(&route.node_id) else {
+                    continue;
+                };
+                let endpoints = store.endpoints(&route.node_id).unwrap_or_default();
+                peers.push((route.node_id, endpoints));
+            }
+            peers
+        };
+        if peers.is_empty() {
+            return Err(ConsumeError::NoPath);
+        }
+
+        let mut last_error = None;
+        for (node_id, endpoints) in peers {
+            let credential = {
+                let db = database.lock().await;
+                let store =
+                    NodeStore::new(&db).map_err(|e| ConsumeError::Transport(e.to_string()))?;
+                match store.credential_for(&node_id) {
+                    Ok(Some(credential)) => credential,
+                    // Unpaired between the listing above and now.
+                    _ => continue,
+                }
+            };
+            let client = match NodeTransportClient::new(local.node_id.clone(), credential) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    last_error = Some(ConsumeError::Transport(e.to_string()));
+                    continue;
+                }
+            };
+
+            for endpoint in usable_endpoints(&endpoints, class) {
+                let spent_ms = started.elapsed().as_millis() as u64;
+                if spent_ms >= budget_ms {
+                    return Err(last_error.unwrap_or(ConsumeError::NoPath));
+                }
+                let context = RequestContext {
+                    request_id: format!("remote-{}-{}", mux.nid, mux.tsid),
+                    trace_id: format!("{}-{}", local.node_id, started.elapsed().as_nanos()),
+                    stream_class: class,
+                    claim,
+                    remaining_ms: budget_ms,
+                    origin_node: local.node_id.clone(),
+                    // This node is recorded as visited so a peer can never
+                    // route the request back to us.
+                    visited_nodes: vec![local.node_id.clone()],
+                    hop_count: 0,
+                    max_hops: 3,
+                };
+
+                match Self::open(
+                    Arc::clone(&client),
+                    endpoint.address.clone(),
+                    context,
+                    mux,
+                    sid,
+                    spent_ms,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        log::info!(
+                            "[node] opened remote {:?} lease for NID=0x{:04X} TSID=0x{:04X} on {} via {}",
+                            class,
+                            mux.nid,
+                            mux.tsid,
+                            node_id,
+                            endpoint.address
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "[node] {} could not serve NID=0x{:04X} TSID=0x{:04X} via {}: {}",
+                            node_id,
+                            mux.nid,
+                            mux.tsid,
+                            endpoint.address,
+                            e
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or(ConsumeError::NoPath))
     }
 
     /// Subscribe to the republished TS, exactly like `SharedTuner::subscribe`.
@@ -341,10 +468,50 @@ async fn pump_once(
     }
 }
 
+/// Endpoints worth trying for `class`, best first.
+///
+/// This is a static ordering by endpoint *kind*, not a measured one: probing
+/// costs a round trip per path and this runs on the request path. Measured
+/// scoring (`node::path::score_path`) is applied by the dashboard's explicit
+/// probe, and will move here once `node_path_health` is populated
+/// continuously.
+///
+/// Two rules that are not just preference:
+/// - RECORD only ever uses endpoints the operator marked `record_allowed`.
+///   A recording must not be silently carried over a metered or best-effort
+///   relay.
+/// - RECORD refuses `CloudflarePublic` outright: a general-purpose HTTP proxy
+///   is a bootstrap and fallback path, not a sustained recording path
+///   (`docs/DISTRIBUTED_TUNER_FABRIC.md` §4).
+fn usable_endpoints(endpoints: &[NodeEndpoint], class: StreamClass) -> Vec<&NodeEndpoint> {
+    let mut usable: Vec<&NodeEndpoint> = endpoints
+        .iter()
+        .filter(|e| e.enabled)
+        .filter(|e| match class {
+            StreamClass::Record => e.record_allowed && e.kind != EndpointKind::CloudflarePublic,
+            _ => true,
+        })
+        .collect();
+    usable.sort_by_key(|e| (kind_rank(e.kind), -e.user_priority));
+    usable
+}
+
+/// Lower is preferred. LAN beats an overlay, an overlay beats the open
+/// Internet, and a public HTTP proxy is last.
+const fn kind_rank(kind: EndpointKind) -> u8 {
+    match kind {
+        EndpointKind::Lan => 0,
+        EndpointKind::Tailscale => 1,
+        EndpointKind::CloudflarePrivate => 2,
+        EndpointKind::Static => 3,
+        EndpointKind::InternetDirect => 4,
+        EndpointKind::CloudflarePublic => 5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tuner::EffectiveClaim;
     use super::super::types::NodeId;
 
     fn context(class: StreamClass) -> RequestContext {
@@ -397,5 +564,64 @@ mod tests {
         // The same node cannot be entered twice — that is a routing loop.
         let mut looping = ctx.clone();
         assert!(looping.enter_node(&node, 10).is_err());
+    }
+
+    fn endpoint(kind: EndpointKind, address: &str, record_allowed: bool) -> NodeEndpoint {
+        NodeEndpoint {
+            kind,
+            address: address.into(),
+            enabled: true,
+            record_allowed,
+            metered: false,
+            user_priority: 0,
+        }
+    }
+
+    #[test]
+    fn record_never_uses_a_path_not_marked_for_it() {
+        let endpoints = vec![
+            endpoint(EndpointKind::Lan, "http://lan", false),
+            endpoint(EndpointKind::Tailscale, "http://ts", true),
+        ];
+        let record = usable_endpoints(&endpoints, StreamClass::Record);
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].address, "http://ts");
+
+        // A viewer may use either.
+        assert_eq!(usable_endpoints(&endpoints, StreamClass::View).len(), 2);
+    }
+
+    #[test]
+    fn record_refuses_the_public_http_fallback_even_when_allowed() {
+        let endpoints = vec![endpoint(EndpointKind::CloudflarePublic, "https://public", true)];
+        assert!(usable_endpoints(&endpoints, StreamClass::Record).is_empty());
+        assert_eq!(usable_endpoints(&endpoints, StreamClass::Preview).len(), 1);
+    }
+
+    #[test]
+    fn endpoints_are_ordered_lan_overlay_then_open_internet() {
+        let endpoints = vec![
+            endpoint(EndpointKind::CloudflarePublic, "https://public", true),
+            endpoint(EndpointKind::InternetDirect, "https://direct", true),
+            endpoint(EndpointKind::Tailscale, "http://ts", true),
+            endpoint(EndpointKind::Lan, "http://lan", true),
+        ];
+        let ordered: Vec<&str> = usable_endpoints(&endpoints, StreamClass::View)
+            .iter()
+            .map(|e| e.address.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["http://lan", "http://ts", "https://direct", "https://public"]
+        );
+    }
+
+    #[test]
+    fn user_priority_breaks_ties_within_a_kind() {
+        let mut high = endpoint(EndpointKind::Tailscale, "http://preferred", true);
+        high.user_priority = 10;
+        let endpoints = vec![endpoint(EndpointKind::Tailscale, "http://other", true), high];
+        let ordered = usable_endpoints(&endpoints, StreamClass::View);
+        assert_eq!(ordered[0].address, "http://preferred");
     }
 }

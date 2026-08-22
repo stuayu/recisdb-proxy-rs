@@ -228,6 +228,39 @@ later instead of being deleted and rediscovered forever (§2).
 The stored picture is a **cache, not an authority**: a peer can still refuse
 the lease, and `available_slots` may already be stale when it is read.
 
+### 4.4 Using a peer from the HTTP/Mirakurun paths
+
+`channel_resolve::start_source_for_service_with_claim` returns a
+`StreamSource`: either a local `SharedTuner` or a `RemoteMuxStream`.
+
+**The remote path is a fallback, never a preference.** It is only tried when
+no local tuner could serve the request. A locally receivable channel is never
+sent over the network just because a peer also has it — the local path has no
+transport failure domain at all.
+
+Peer selection walks the stored advertisements (§4.3) node by node, and within
+a node walks endpoints in a static order: LAN, Tailscale, Cloudflare private,
+static, direct Internet, Cloudflare public. Two of those rules are not mere
+preference:
+
+- RECORD only uses endpoints the operator marked `record_allowed`.
+- RECORD refuses `CloudflarePublic` outright — a general-purpose HTTP proxy is
+  a bootstrap and fallback path, not a sustained recording path (§4).
+
+The whole search shares one `REMOTE_SEARCH_BUDGET_MS` budget across every peer
+and endpoint tried; it is never reset per attempt.
+
+The ordering is static rather than measured because probing costs a round trip
+per path and this runs on the request path. `node::path::score_path` is
+currently applied only by the dashboard's explicit probe, and moves here once
+`node_path_health` is populated continuously.
+
+Downstream is unchanged: `BodyReceiver::Remote` is just a
+`broadcast::Receiver<Bytes>`, so service filtering, the EIT gate and the
+RECORD `LossPolicy::Fatal` rule all behave identically. The dashboard shows
+`node:<peer> (<url>)` in the tuner column so a busy tuner still explains
+itself.
+
 ## 5. End-to-end request context
 
 Every inter-node acquisition carries one immutable arbitration context:
@@ -402,16 +435,21 @@ Done:
   `RemoteMuxStream` with renew / reconnect / `from_seq` resume and the RECORD
   no-silent-gap rule.
 - Route advertisement build/exchange/persistence (§4.3).
+- Remote fallback for `GET /mirakurun/api/services/:id/stream` and
+  `/programs/:id/stream` (§4.4), including per-class endpoint admission.
 
 Not done yet:
 
-- **Candidate discovery does not see remote routes.** `tuner::acquire` still
-  only enumerates local drivers, so `RemoteMuxStream` has to be opened
-  explicitly rather than being chosen by central policy against local
-  candidates. Unifying them needs one lease type covering both a local
-  `SharedTuner` and a remote stream (the TunerManager step below).
-- **The HTTP/Mirakurun paths cannot yet be fed by a remote source**:
-  `channel_resolve` returns `Arc<SharedTuner>` specifically.
+- **Local and remote are not ranked together.** Remote is a fallback tried
+  after local arbitration fails, not a candidate `tuner::policy::decide` weighs
+  against local drivers. Ranking them in one place needs a single lease type
+  covering both a local `SharedTuner` and a remote stream (the TunerManager
+  step below). Until then a healthy peer cannot beat a marginal local tuner.
+- **BNDP sessions (TVTest/EDCB) have no remote fallback.** Only the
+  HTTP/Mirakurun paths do; `server/session.rs` still resolves to a
+  `SharedTuner` directly.
+- **Path selection on the request path is static, not measured** (§4.4).
+- Route-group weights are stored but not consulted during candidate
+  generation.
 - No BonDriver process isolation (`recisdb-driver-worker`) or circuit breaker;
   `DriverHealth` collects the inputs but nothing acts on them yet.
-- Route-group weights are stored but not consulted during candidate generation.

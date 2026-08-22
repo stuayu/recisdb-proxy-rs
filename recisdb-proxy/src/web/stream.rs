@@ -89,13 +89,19 @@ struct EncoderCleanup {
 pub(crate) enum BodyReceiver {
     Tuner(TunerSubscription),
     Encoder(broadcast::Receiver<Bytes>),
+    /// TS republished from a lease on a peer's tuner (`node::consume`). The
+    /// lease handle itself lives in [`StreamCleanup`], so the receiver here
+    /// closing means the remote stream ended — which for a RECORD lease is a
+    /// failure, exactly as a closed local broadcast is.
+    Remote(broadcast::Receiver<Bytes>),
 }
 
 impl BodyReceiver {
-    async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
+    pub(crate) async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
         match self {
             BodyReceiver::Tuner(sub) => sub.recv().await,
             BodyReceiver::Encoder(rx) => rx.recv().await,
+            BodyReceiver::Remote(rx) => rx.recv().await,
         }
     }
 }
@@ -119,7 +125,12 @@ impl BodyReceiver {
 /// disconnect mid-stream); see the unit test below for the closest available
 /// proxy: dropping the guard decrements `SharedTuner`'s subscriber_count.
 pub(crate) struct StreamCleanup {
-    tuner: Arc<SharedTuner>,
+    /// `None` when the TS comes from a peer rather than a local tuner.
+    tuner: Option<Arc<SharedTuner>>,
+    /// Holding this handle is what keeps the peer's lease alive; dropping it
+    /// releases the lease (and the peer's tuner) — the remote equivalent of
+    /// dropping a `TunerSubscription`.
+    remote: Option<Arc<crate::node::RemoteMuxStream>>,
     tuner_pool: Arc<TunerPool>,
     /// Present only in `?profile=preview` mode, where the actual data comes
     /// from [`BodyReceiver::Encoder`] rather than from a `TunerSubscription`
@@ -148,7 +159,19 @@ impl StreamCleanup {
     /// (無変換) が既定"). The subscription itself is expected to live in the
     /// sibling `BodyReceiver::Tuner`, not here.
     pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
-        Self { tuner, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+        Self { tuner: Some(tuner), remote: None, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+    }
+
+    /// Cleanup guard for a stream fed by a lease on a peer's tuner.
+    ///
+    /// There is no local reader to keep warm, so there is no idle-close to
+    /// schedule: the lease's own TTL is what protects the peer's tuner across
+    /// a reconnect, and dropping the handle releases it.
+    pub(crate) fn remote_only(
+        remote: Arc<crate::node::RemoteMuxStream>,
+        tuner_pool: Arc<TunerPool>,
+    ) -> Self {
+        Self { tuner: None, remote: Some(remote), tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
     }
 
     /// Attach the dashboard registration for this stream, together with the
@@ -190,15 +213,21 @@ impl Drop for StreamCleanup {
         // check below could run (in the spawned task) before this decrement
         // actually happens.
         let _ = self.parked_tuner_sub.take();
+        // Releases the peer's lease. Synchronous: there is nothing async to
+        // do, and the peer frees its tuner as soon as the release lands (or
+        // when the lease TTL expires, whichever comes first).
+        let _ = self.remote.take();
 
-        let tuner = Arc::clone(&self.tuner);
+        let tuner = self.tuner.clone();
         let tuner_pool = Arc::clone(&self.tuner_pool);
         let encoder = self.encoder.take();
         tokio::spawn(async move {
-            if !tuner.has_subscribers() {
-                tuner_pool
-                    .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
-                    .await;
+            if let Some(tuner) = tuner {
+                if !tuner.has_subscribers() {
+                    tuner_pool
+                        .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
+                        .await;
+                }
             }
             if let Some(EncoderCleanup { pool, key, encoder }) = encoder {
                 pool.release(&key, &encoder).await;
@@ -706,7 +735,50 @@ pub(crate) fn session_info_for(
     tuner: &SharedTuner,
     stream_class: StreamClass,
 ) -> HttpStreamSessionInfo {
+    session_info_for_source(
+        protocol,
+        peer,
+        resolved,
+        Some(tuner),
+        None,
+        stream_class,
+    )
+}
+
+/// Same, for a stream that may be fed by a peer instead of a local tuner.
+///
+/// The dashboard must always show *why* a tuner is busy (CLAUDE.md, Web
+/// ダッシュボード). For a remote stream the honest answer is which node and
+/// lease are holding it, so that is what goes in the tuner column.
+pub(crate) fn session_info_for_source(
+    protocol: SessionProtocol,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    resolved: &channel_resolve::ResolvedService,
+    tuner: Option<&SharedTuner>,
+    remote: Option<&crate::node::RemoteMuxStream>,
+    stream_class: StreamClass,
+) -> HttpStreamSessionInfo {
     let channel = &resolved.channel;
+    let (tuner_path, channel_info) = match (tuner, remote) {
+        (Some(tuner), _) => (
+            Some(tuner.key.tuner_path.clone()),
+            match &tuner.key.channel {
+                ChannelKeySpec::SpaceChannel { space, channel } => {
+                    Some(format!("Space {}, Ch {}", space, channel))
+                }
+                ChannelKeySpec::Simple(ch) => Some(format!("Ch {}", ch)),
+            },
+        ),
+        (None, Some(remote)) => (
+            Some(format!(
+                "node:{} ({})",
+                remote.lease().owner_node,
+                remote.base_url()
+            )),
+            Some(format!("remote route {}", remote.lease().route_id)),
+        ),
+        (None, None) => (None, None),
+    };
 
     HttpStreamSessionInfo {
         protocol,
@@ -716,12 +788,9 @@ pub(crate) fn session_info_for(
         // never fail with 500 just because the peer address is unavailable,
         // the same treatment the access log gives it.
         addr: peer.map(|ConnectInfo(addr)| addr),
-        tuner_path: Some(tuner.key.tuner_path.clone()),
+        tuner_path,
         channel_name: channel.channel_name.clone().or_else(|| channel.raw_name.clone()),
-        channel_info: match &tuner.key.channel {
-            ChannelKeySpec::SpaceChannel { space, channel } => Some(format!("Space {}, Ch {}", space, channel)),
-            ChannelKeySpec::Simple(ch) => Some(format!("Ch {}", ch)),
-        },
+        channel_info,
         nid: Some(channel.nid),
         sid: Some(channel.sid),
         stream_class,
@@ -817,7 +886,8 @@ async fn stream_resolved(
             );
             let enc_rx = encoder.subscribe();
             let cleanup = StreamCleanup {
-                tuner: Arc::clone(&tuner),
+                tuner: Some(Arc::clone(&tuner)),
+                remote: None,
                 tuner_pool: Arc::clone(&web_state.tuner_pool),
                 // The actual data comes from `enc_rx` below; this is only
                 // here to keep `tuner_rx`'s refcount alive for the response's
@@ -982,7 +1052,8 @@ mod tests {
         // shape): the subscription lives in `StreamCleanup`, not in a
         // sibling `BodyReceiver::Tuner`.
         let cleanup = StreamCleanup {
-            tuner: Arc::clone(&tuner),
+            tuner: Some(Arc::clone(&tuner)),
+            remote: None,
             tuner_pool: Arc::clone(&tuner_pool),
             parked_tuner_sub: Some(sub),
             encoder: None,

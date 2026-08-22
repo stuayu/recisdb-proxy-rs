@@ -16,7 +16,8 @@
 //! - [`ProgramGate`]: pure state machine — "has the target event become
 //!   present yet, and has it since stopped being present".
 //! - [`gated_program_stream`]: wires a [`ProgramGate`] to a live
-//!   [`TunerSubscription`], parsing EIT out of each chunk with a
+//!   [`BodyReceiver`] (a local tuner or a lease on a peer's tuner),
+//!   parsing EIT out of each chunk with a
 //!   purpose-built lightweight [`EitPfCollector`] (same TS/PSI reassembly
 //!   pattern as `tuner/epg_collector.rs::EpgCollector`, but keeping only the
 //!   present/following table_id, and reporting straight to the gate instead
@@ -30,10 +31,9 @@ use futures::stream::{self, Stream};
 use log::{debug, warn};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::tuner::TunerSubscription;
 use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
-use crate::web::stream::{StreamCleanup, TsAligner};
+use crate::web::stream::{BodyReceiver, StreamCleanup, TsAligner};
 
 /// How long past `programs.start_at + duration_secs` this gate keeps waiting
 /// for the target event to become present before giving up. Programs
@@ -205,7 +205,7 @@ impl EitPfCollector {
 // ============================================================================
 
 struct GatedStreamState {
-    rx: TunerSubscription,
+    rx: BodyReceiver,
     /// Fires when the dashboard asks this client to disconnect
     /// (`POST /api/clients/{id}/disconnect`). `None` for unregistered
     /// streams, which then simply have no remote-shutdown path — see
@@ -263,7 +263,7 @@ struct GatedStreamState {
 /// `tuner/shared.rs`), so an actively broken tuner is not this function's
 /// problem to solve twice.
 pub(crate) fn gated_program_stream(
-    rx: TunerSubscription,
+    rx: BodyReceiver,
     mut cleanup: StreamCleanup,
     target_sid: u16,
     target_event_id: u16,

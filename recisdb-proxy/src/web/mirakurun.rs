@@ -142,7 +142,8 @@ use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    service_filtered_body_stream, session_info_for, BodyReceiver, LossPolicy, StreamCleanup,
+    service_filtered_body_stream, session_info_for, session_info_for_source, BodyReceiver,
+    LossPolicy, StreamCleanup,
 };
 use recisdb_protocol::{BandType, StreamClass};
 use crate::tuner::EffectiveClaim;
@@ -1002,11 +1003,6 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service_with_claim(&web_state.tuner_pool, &web_state.database, &resolved, EffectiveClaim::new(priority, false)).await {
-        Ok(t) => t,
-        Err(e) => return channel_resolve_error_response(id, &e),
-    };
-
     // Design decision (no better signal exists on this endpoint): EPGStation
     // sends `recPriority`/`conflictPriority` (defaults 2/1) for recording and
     // `streamingPriority` (default 0) for live viewing, and `/services/:id/
@@ -1023,22 +1019,56 @@ pub async fn stream_service_by_mirakurun_id(
         LossPolicy::Recover
     };
 
+    // Local tuner first; a paired node advertising the same mux is the
+    // fallback, never a preference (`server/channel_resolve.rs`).
+    let source = match channel_resolve::start_source_for_service_with_claim(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+        EffectiveClaim::new(priority, false),
+        stream_class,
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(e) => return channel_resolve_error_response(id, &e),
+    };
+
+    let (rx, cleanup, info) = match &source {
+        channel_resolve::StreamSource::Local(tuner) => (
+            BodyReceiver::Tuner(tuner.subscribe()),
+            StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                Some(tuner),
+                None,
+                stream_class,
+            ),
+        ),
+        channel_resolve::StreamSource::Remote(remote) => (
+            BodyReceiver::Remote(remote.subscribe()),
+            StreamCleanup::remote_only(Arc::clone(remote), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                None,
+                Some(remote),
+                stream_class,
+            ),
+        ),
+    };
+
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
         Arc::clone(&web_state.database),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, stream_class),
+        info,
     )
     .await;
-
-    let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
-        .with_session(session, shutdown_rx);
-    respond_with_stream(service_filtered_body_stream(
-        BodyReceiver::Tuner(tuner_rx),
-        cleanup,
-        sid,
-        loss_policy,
-    ))
+    let cleanup = cleanup.with_session(session, shutdown_rx);
+    respond_with_stream(service_filtered_body_stream(rx, cleanup, sid, loss_policy))
 }
 
 /// `GET /mirakurun/api/channels/:type/:channel/stream`.
@@ -1331,24 +1361,58 @@ pub async fn stream_program_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service_with_claim(&web_state.tuner_pool, &web_state.database, &resolved, EffectiveClaim::new(priority, false)).await {
-        Ok(t) => t,
+    // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
+    // ローカルのチューナーが取れないときだけ、同じ mux を広告している
+    // ペアリング済みノードへフォールバックする。
+    let source = match channel_resolve::start_source_for_service_with_claim(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+        EffectiveClaim::new(priority, false),
+        StreamClass::Record,
+    )
+    .await
+    {
+        Ok(source) => source,
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
+    let (rx, cleanup, info) = match &source {
+        channel_resolve::StreamSource::Local(tuner) => (
+            BodyReceiver::Tuner(tuner.subscribe()),
+            StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                Some(tuner),
+                None,
+                StreamClass::Record,
+            ),
+        ),
+        channel_resolve::StreamSource::Remote(remote) => (
+            BodyReceiver::Remote(remote.subscribe()),
+            StreamCleanup::remote_only(Arc::clone(remote), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                None,
+                Some(remote),
+                StreamClass::Record,
+            ),
+        ),
+    };
+
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
         Arc::clone(&web_state.database),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::Record),
+        info,
     )
     .await;
-
-    let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
-        .with_session(session, shutdown_rx);
+    let cleanup = cleanup.with_session(session, shutdown_rx);
     respond_with_stream(mirakurun_program_stream::gated_program_stream(
-        tuner_rx, cleanup, sid, event_id, deadline,
+        rx, cleanup, sid, event_id, deadline,
     ))
 }
 
