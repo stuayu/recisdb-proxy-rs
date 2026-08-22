@@ -236,6 +236,11 @@ impl Drop for ScanReservation {
 struct DriverSlotEntry {
     semaphore: Arc<Semaphore>,
     capacity: i32,
+    /// Permits a shrink could not remove yet because they were checked out at
+    /// the time. Carried until they can actually be taken back, so lowering
+    /// `max_instances` while readers are running is eventually enforced
+    /// instead of silently lost.
+    pending_shrink: usize,
 }
 
 /// Per-DLL-path semaphores enforcing `max_instances` (docs/TUNER_PIPELINE_REDESIGN.md
@@ -262,16 +267,16 @@ impl DriverSlots {
     /// Get (creating if needed) the semaphore for `dll_path`, resizing it to
     /// `max_instances` if that has changed since the last call.
     ///
-    /// Resizing is a plain `add_permits`/`forget_permits` delta against the
-    /// previously recorded `capacity` — increases take effect immediately;
-    /// decreases only remove *currently available* permits. If `max_instances`
-    /// is lowered while every existing permit is checked out, the excess
-    /// capacity is not clawed back until those permits are naturally returned
-    /// (each returned permit hands one slot back to whoever is waiting/next
-    /// to ask, rather than shrinking the pool further) — acceptable per
-    /// docs/TUNER_PIPELINE_REDESIGN.md P1b §1 ("減少しきれない分は次の解放時に
-    /// 自然に吸収される形でよい"): this is a rare admin reconfiguration, not a
-    /// safety property `acquire_slot` depends on.
+    /// Increases take effect immediately. Decreases can only remove permits
+    /// that are *currently available*, so a shrink applied while readers are
+    /// running is remembered in `pending_shrink` and absorbed as those permits
+    /// come back — the behaviour docs/TUNER_PIPELINE_REDESIGN.md P1b §1
+    /// describes ("減少しきれない分は次の解放時に自然に吸収される形でよい").
+    ///
+    /// Without carrying the remainder, a `forget_permits` that found nothing
+    /// available would simply be lost: once the running readers finished, the
+    /// driver would be back at its *old* capacity and could open more
+    /// instances than the operator had just configured.
     async fn semaphore_for(&self, dll_path: &str, max_instances: i32) -> Arc<Semaphore> {
         let max_instances = max_instances.max(0);
         let mut entries = self.entries.lock().await;
@@ -279,14 +284,30 @@ impl DriverSlots {
             Some(entry) => {
                 match max_instances.cmp(&entry.capacity) {
                     std::cmp::Ordering::Greater => {
-                        entry.semaphore.add_permits((max_instances - entry.capacity) as usize);
+                        let grow = (max_instances - entry.capacity) as usize;
+                        // Growing again cancels an outstanding shrink before
+                        // it adds anything: the two must not both apply.
+                        let cancelled = grow.min(entry.pending_shrink);
+                        entry.pending_shrink -= cancelled;
+                        if grow > cancelled {
+                            entry.semaphore.add_permits(grow - cancelled);
+                        }
                     }
                     std::cmp::Ordering::Less => {
-                        entry.semaphore.forget_permits((entry.capacity - max_instances) as usize);
+                        entry.pending_shrink += (entry.capacity - max_instances) as usize;
                     }
                     std::cmp::Ordering::Equal => {}
                 }
                 entry.capacity = max_instances;
+                // Take back as much of any outstanding shrink as is available
+                // right now. This runs on every lookup, so a permit returned
+                // after the reconfiguration is absorbed at the next attempt to
+                // use the driver — which is exactly when it would otherwise
+                // have been handed out over the new limit.
+                if entry.pending_shrink > 0 {
+                    let removed = entry.semaphore.forget_permits(entry.pending_shrink);
+                    entry.pending_shrink -= removed;
+                }
                 Arc::clone(&entry.semaphore)
             }
             None => {
@@ -296,6 +317,7 @@ impl DriverSlots {
                     DriverSlotEntry {
                         semaphore: Arc::clone(&semaphore),
                         capacity: max_instances,
+                        pending_shrink: 0,
                     },
                 );
                 semaphore
@@ -1066,6 +1088,64 @@ mod tests {
     // -----------------------------------------------------------------
     // P1b: driver slot reservation (docs/TUNER_PIPELINE_REDESIGN.md §4 P1b)
     // -----------------------------------------------------------------
+    /// Lowering `max_instances` while every permit is checked out cannot take
+    /// them back immediately. It must not be *lost* either: once the running
+    /// readers finish, the driver would otherwise be back at its old capacity
+    /// and happily open more instances than the operator configured.
+    #[tokio::test]
+    async fn shrinking_max_instances_while_permits_are_held_is_enforced_later() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/shrink-test";
+
+        let a = pool.acquire_slot(path, 2).await.expect("first of two slots");
+        let b = pool.acquire_slot(path, 2).await.expect("second of two slots");
+
+        // Operator drops the driver to a single instance. Nothing is
+        // available, so nothing can be taken back yet.
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "already over the new limit: no slot may be handed out"
+        );
+
+        drop(a);
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "the returned permit must be absorbed by the pending shrink, not re-issued"
+        );
+
+        drop(b);
+        let c = pool
+            .acquire_slot(path, 1)
+            .await
+            .expect("with everything returned, exactly one slot exists again");
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "and only one: the shrink must not have been lost"
+        );
+        drop(c);
+    }
+
+    /// Raising the limit again before the shrink could be applied must cancel
+    /// it rather than both taking effect.
+    #[tokio::test]
+    async fn regrowing_cancels_a_pending_shrink() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/regrow-test";
+
+        let a = pool.acquire_slot(path, 2).await.unwrap();
+        let b = pool.acquire_slot(path, 2).await.unwrap();
+        assert!(pool.acquire_slot(path, 1).await.is_none());
+
+        // Back to 2 before anything was returned.
+        drop(a);
+        drop(b);
+        let a = pool.acquire_slot(path, 2).await.expect("first slot back");
+        let b = pool.acquire_slot(path, 2).await.expect("second slot back");
+        assert!(pool.acquire_slot(path, 2).await.is_none(), "still only two");
+        drop(a);
+        drop(b);
+    }
+
 
     /// §1: capacity is now *taken*, not counted. A second slot on a
     /// `max_instances = 1` driver is simply unavailable — no snapshot, no

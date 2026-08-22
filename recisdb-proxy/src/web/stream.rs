@@ -1068,6 +1068,82 @@ mod tests {
         assert!(!tuner.has_subscribers(), "dropping StreamCleanup must release the tracked subscription");
     }
 
+    /// Build a receiver that has already fallen behind, so the next `recv`
+    /// returns `Lagged` — the shape a slow client produces in production.
+    fn lagged_receiver(packets: usize) -> (broadcast::Sender<Bytes>, broadcast::Receiver<Bytes>) {
+        // Capacity 2 so a handful of sends is guaranteed to overrun it.
+        let (tx, rx) = broadcast::channel::<Bytes>(2);
+        let packet = {
+            let mut p = vec![0u8; 188];
+            p[0] = 0x47;
+            Bytes::from(p)
+        };
+        for _ in 0..packets {
+            let _ = tx.send(packet.clone());
+        }
+        (tx, rx)
+    }
+
+    fn test_cleanup() -> StreamCleanup {
+        StreamCleanup::tuner_only(
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2),
+            Arc::new(TunerPool::new(4)),
+        )
+    }
+
+    /// CLAUDE.md / STREAMING_DESIGN.md §2: a recording must never lose data
+    /// silently. A lagging RECORD consumer has to see an error, because a
+    /// file with an unannounced hole is only discovered on playback.
+    #[tokio::test]
+    async fn a_lagging_record_stream_fails_instead_of_skipping_bytes() {
+        use futures::StreamExt;
+
+        let (_tx, rx) = lagged_receiver(16);
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            test_cleanup(),
+            1024,
+            LossPolicy::Fatal,
+        );
+        futures::pin_mut!(stream);
+
+        let first = stream.next().await.expect("a fatal loss must be reported, not swallowed");
+        let err = first.expect_err("the RECORD stream must terminate with an error");
+        assert!(
+            err.to_string().contains("record stream lost"),
+            "the reason must say what happened: {err}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after the fatal error rather than resuming mid-recording"
+        );
+    }
+
+    /// A viewer would rather resynchronize than be disconnected, so the same
+    /// event must *not* be fatal for VIEW/PREVIEW.
+    #[tokio::test]
+    async fn a_lagging_view_stream_resynchronizes_and_keeps_going() {
+        use futures::StreamExt;
+
+        let (tx, rx) = lagged_receiver(16);
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            test_cleanup(),
+            1024,
+            LossPolicy::Recover,
+        );
+        futures::pin_mut!(stream);
+
+        // Nothing is yielded for the gap itself; the stream simply waits for
+        // the next chunk. Dropping the sender ends it cleanly, which proves
+        // the `Lagged` did not terminate it with an error.
+        drop(tx);
+        assert!(
+            stream.next().await.is_none(),
+            "VIEW must end only when the source closes, never with a lag error"
+        );
+    }
+
     #[tokio::test]
     async fn stream_service_returns_404_for_unknown_sid() {
         let state = test_web_state();

@@ -255,7 +255,10 @@ pub enum Decision {
 
 - `TunerPool::acquire_slot(dll_path, max_instances) -> Option<SlotPermit>`。
   プールは DB を持たないので `max_instances` は引数で受け取り、値が変わって
-  いれば `add_permits` / `forget_permits` で追随する。**満杯なら待たずに
+  いれば `add_permits` / `forget_permits` で追随する。**縮小時に取り戻せ
+  なかった分は `pending_shrink` として持ち越し、permit が返ってきた時点で
+  吸収する** (取りこぼすと、動作中のリーダーが終わった後に元の容量へ戻って
+  しまい、設定した上限を超えて開けるようになる)。**満杯なら待たずに
   `None`** を返し、退避・フォールバック・失敗の判断は呼び出し元に委ねる。
 - `SlotPermit` は `Drop` で解放される。`SharedTuner` が保持し、
   `stop_reader()` とリーダーの全異常終了経路 (`stop_and_release_slot`) で
