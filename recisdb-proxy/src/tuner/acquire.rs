@@ -41,12 +41,13 @@
 //! giving up with
 //! [`AcquireError::Conflict`].
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::database::DriverRuntimeSample;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
@@ -207,6 +208,70 @@ fn max_attempts(candidates: usize) -> usize {
     // candidate may consume (see `is_ealready`), plus slack for a stale
     // snapshot round.
     candidates * 2 + 2
+}
+
+/// Write one runtime-health observation for `tuner_path`, if the driver is
+/// still in the database.
+///
+/// Failures here are logged and swallowed: health statistics must never turn
+/// a working tune into an error.
+async fn record_runtime_sample(
+    database: &DatabaseHandle,
+    tuner_path: &str,
+    sample: DriverRuntimeSample,
+) {
+    let db = database.lock().await;
+    let driver_id = match db.get_bon_driver_by_path(tuner_path) {
+        Ok(Some(driver)) => driver.id,
+        Ok(None) => return,
+        Err(e) => {
+            debug!("[acquire] cannot look up {tuner_path} for health sample: {e}");
+            return;
+        }
+    };
+    if let Err(e) = db.record_driver_runtime_sample(driver_id, sample) {
+        debug!("[acquire] failed to record health sample for {tuner_path}: {e}");
+    }
+}
+
+/// Watch a freshly started reader until it stops, then record what its whole
+/// life said about the driver.
+///
+/// Recorded at the *end* rather than at startup because stalls and no-data
+/// timeouts only accumulate while the reader runs, and a "technically works
+/// but is unusable" driver is exactly the one whose problems show up later
+/// (`docs/DISTRIBUTED_TUNER_FABRIC.md` §9). Open/tune failures are recorded
+/// immediately instead — see the error branch above — so a driver that cannot
+/// start at all is demoted without waiting for anything.
+fn spawn_runtime_health_recorder(
+    database: DatabaseHandle,
+    tuner: Arc<SharedTuner>,
+    tuner_path: String,
+    tune_ms: u64,
+) {
+    tokio::spawn(async move {
+        let mut states = tuner.subscribe_state();
+        // `changed()` only fires on transitions, so check the current value
+        // first: the reader may already have stopped.
+        while !matches!(*states.borrow(), ReaderState::Stopped | ReaderState::Idle) {
+            if states.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let first_ts_ms = tuner.first_ts_latency_ms();
+        let sample = DriverRuntimeSample {
+            tune_ms: Some(tune_ms),
+            first_ts_ms,
+            // No TS at all over the reader's whole life is a startup failure
+            // of the kind packet statistics can never show: the driver said
+            // yes and then delivered nothing.
+            first_ts_timeout: first_ts_ms.is_none(),
+            stalled: tuner.stall_events() > 0 || tuner.no_data_timeouts() > 0,
+            ..Default::default()
+        };
+        record_runtime_sample(&database, &tuner_path, sample).await;
+    });
 }
 
 /// Detect `EALREADY` from `start_reader`, which does NOT preserve
@@ -797,6 +862,7 @@ pub(crate) async fn acquire(
                     continue;
                 }
 
+                let start_began = std::time::Instant::now();
                 if let Err(e) = tuner
                     .start_reader(
                         pool,
@@ -809,6 +875,21 @@ pub(crate) async fn acquire(
                     )
                     .await
                 {
+                    // Health, not just backoff: a driver that fails to open
+                    // stays demoted for future selection even after its
+                    // cooldown expires. `AddrNotAvailable` is a tuning problem
+                    // ("no such channel here"), everything else is the driver.
+                    record_runtime_sample(
+                        database,
+                        &key.tuner_path,
+                        DriverRuntimeSample {
+                            tune_ms: Some(start_began.elapsed().as_millis() as u64),
+                            open_failed: e.kind() != std::io::ErrorKind::AddrNotAvailable,
+                            tune_failed: e.kind() == std::io::ErrorKind::AddrNotAvailable,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                     if tuner.is_orphanable() {
                         pool.remove(&key).await;
                     }
@@ -858,6 +939,12 @@ pub(crate) async fn acquire(
                     continue;
                 }
                 pool.open_backoff().record_success(&key.tuner_path);
+                spawn_runtime_health_recorder(
+                    database.clone(),
+                    Arc::clone(&tuner),
+                    key.tuner_path.clone(),
+                    start_began.elapsed().as_millis() as u64,
+                );
 
                 return Ok(AcquireOutcome {
                     tuner,

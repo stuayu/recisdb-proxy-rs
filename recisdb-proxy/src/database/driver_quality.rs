@@ -67,33 +67,11 @@ impl Database {
         Ok(())
     }
 
-    fn ensure_driver_runtime_health_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS driver_runtime_health (
-                bon_driver_id INTEGER PRIMARY KEY,
-                samples INTEGER NOT NULL DEFAULT 0,
-                open_latency_ewma_ms REAL,
-                tune_latency_ewma_ms REAL,
-                first_ts_latency_ewma_ms REAL,
-                stall_count INTEGER NOT NULL DEFAULT 0,
-                open_failures INTEGER NOT NULL DEFAULT 0,
-                tune_failures INTEGER NOT NULL DEFAULT 0,
-                first_ts_timeouts INTEGER NOT NULL DEFAULT 0,
-                worker_restarts INTEGER NOT NULL DEFAULT 0,
-                runtime_score REAL NOT NULL DEFAULT 1.0,
-                last_updated INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
-            );"
-        )?;
-        Ok(())
-    }
-
     /// Add a runtime observation and update latency EWMAs. The score is a
     /// deliberately conservative health multiplier: a flaky/very slow driver
     /// must not outrank a stable one merely because its TS packets are clean
     /// once it finally starts.
     pub fn record_driver_runtime_sample(&self, bon_driver_id: i64, sample: DriverRuntimeSample) -> Result<()> {
-        self.ensure_driver_runtime_health_schema()?;
         #[allow(clippy::type_complexity)]
         let existing: Option<(i64, Option<f64>, Option<f64>, Option<f64>, i64, i64, i64, i64, i64)> = self.conn
             .query_row(
@@ -166,7 +144,6 @@ impl Database {
     }
 
     pub fn get_driver_runtime_health_score_by_path(&self, dll_path: &str) -> Result<f64> {
-        self.ensure_driver_runtime_health_schema()?;
         let score = self.conn.query_row(
             "SELECT COALESCE(drh.runtime_score, 1.0)
              FROM bon_drivers bd
@@ -187,7 +164,6 @@ impl Database {
     /// path that is clean-but-slow or fast-but-corrupt without inventing a
     /// second selection policy outside `tuner::policy`.
     pub fn get_driver_quality_score_by_path(&self, dll_path: &str) -> Result<f64> {
-        self.ensure_driver_runtime_health_schema()?;
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(dqs.quality_score, 1.0), COALESCE(drh.runtime_score, 1.0)
              FROM bon_drivers bd
@@ -211,7 +187,6 @@ impl Database {
 
     /// Get BonDriver ranking by combined quality score.
     pub fn get_bondrivers_ranking(&self) -> Result<Vec<(BonDriverRecord, f64, f64, i64)>> {
-        self.ensure_driver_runtime_health_schema()?;
         let mut stmt = self.conn.prepare(
             "SELECT bd.id, bd.dll_path, bd.driver_name, bd.version, bd.group_name, bd.auto_scan_enabled, bd.scan_interval_hours, bd.scan_priority, bd.last_scan, bd.next_scan_at, bd.passive_scan_enabled, bd.max_instances, bd.created_at, bd.updated_at,
                     (COALESCE(dqs.quality_score, 1.0) * COALESCE(drh.runtime_score, 1.0)) as quality_score,
@@ -272,5 +247,93 @@ mod runtime_tests {
         }
         let score = db.get_driver_quality_score_by_path("slow.dll").unwrap();
         assert!(score < 0.6, "slow-but-successful driver must not remain perfect: {score}");
+    }
+
+    #[test]
+    fn a_fast_driver_keeps_a_perfect_score_and_outranks_a_slow_one() {
+        let db = Database::open_in_memory().unwrap();
+        let fast = db.insert_bon_driver(&NewBonDriver::new("fast.dll")).unwrap();
+        let slow = db.insert_bon_driver(&NewBonDriver::new("slow.dll")).unwrap();
+        for _ in 0..5 {
+            db.record_driver_runtime_sample(fast, DriverRuntimeSample {
+                open_ms: Some(120),
+                tune_ms: Some(900),
+                first_ts_ms: Some(1_200),
+                ..Default::default()
+            }).unwrap();
+            db.record_driver_runtime_sample(slow, DriverRuntimeSample {
+                open_ms: Some(2_000),
+                tune_ms: Some(8_000),
+                first_ts_ms: Some(7_000),
+                ..Default::default()
+            }).unwrap();
+        }
+        let fast_score = db.get_driver_quality_score_by_path("fast.dll").unwrap();
+        let slow_score = db.get_driver_quality_score_by_path("slow.dll").unwrap();
+        assert_eq!(fast_score, 1.0, "a comfortably fast driver must not be penalised");
+        assert!(
+            fast_score > slow_score,
+            "fast {fast_score} must outrank slow {slow_score}"
+        );
+    }
+
+    /// "Says yes, then delivers nothing" is invisible to packet statistics —
+    /// there are no packets to be wrong about — so it has to show up here.
+    #[test]
+    fn a_driver_that_never_produces_ts_is_demoted_hard() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db.insert_bon_driver(&NewBonDriver::new("silent.dll")).unwrap();
+        for _ in 0..3 {
+            db.record_driver_runtime_sample(id, DriverRuntimeSample {
+                tune_ms: Some(800),
+                first_ts_ms: None,
+                first_ts_timeout: true,
+                ..Default::default()
+            }).unwrap();
+        }
+        let score = db.get_driver_quality_score_by_path("silent.dll").unwrap();
+        assert!(score < 0.5, "a driver that never delivers TS must be demoted: {score}");
+    }
+
+    #[test]
+    fn stalls_demote_a_driver_that_is_otherwise_fast() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db.insert_bon_driver(&NewBonDriver::new("hiccup.dll")).unwrap();
+        for _ in 0..4 {
+            db.record_driver_runtime_sample(id, DriverRuntimeSample {
+                open_ms: Some(100),
+                tune_ms: Some(500),
+                first_ts_ms: Some(800),
+                stalled: true,
+                ..Default::default()
+            }).unwrap();
+        }
+        let score = db.get_driver_quality_score_by_path("hiccup.dll").unwrap();
+        assert!(score < 1.0, "a stalling driver must not score perfectly: {score}");
+    }
+
+    #[test]
+    fn open_failures_demote_a_driver_even_after_its_cooldown_expires() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db.insert_bon_driver(&NewBonDriver::new("flaky.dll")).unwrap();
+        for _ in 0..4 {
+            db.record_driver_runtime_sample(id, DriverRuntimeSample {
+                tune_ms: Some(300),
+                open_failed: true,
+                ..Default::default()
+            }).unwrap();
+        }
+        let score = db.get_driver_quality_score_by_path("flaky.dll").unwrap();
+        assert!(score < 0.7, "repeated open failures must persist as low health: {score}");
+    }
+
+    /// An unknown driver must not be treated as bad: selection would then
+    /// avoid every newly added tuner.
+    #[test]
+    fn a_driver_with_no_samples_scores_neutral() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_bon_driver(&NewBonDriver::new("new.dll")).unwrap();
+        assert_eq!(db.get_driver_quality_score_by_path("new.dll").unwrap(), 1.0);
+        assert_eq!(db.get_driver_quality_score_by_path("absent.dll").unwrap(), 1.0);
     }
 }

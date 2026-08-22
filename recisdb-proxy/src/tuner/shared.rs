@@ -342,6 +342,21 @@ pub struct SharedTuner {
     next_claim_id: AtomicU64,
     running_since: std::sync::Mutex<Option<std::time::Instant>>,
     last_data_at: AtomicU64,
+    /// Monotonic millis at which the current reader started, `0` when none is
+    /// running. Together with [`Self::first_ts_at_ms`] this is the driver's
+    /// *startup* quality — a driver that always works but takes 12 seconds to
+    /// produce a picture is a bad driver, which packet-level statistics alone
+    /// never show (`docs/DISTRIBUTED_TUNER_FABRIC.md` §9).
+    reader_started_at_ms: AtomicU64,
+    /// Monotonic millis of the first TS chunk of the current reader, `0`
+    /// while none has arrived yet.
+    first_ts_at_ms: AtomicU64,
+    /// Gaps long enough to be a stall but short of the hard no-data timeout.
+    /// Soft and hard deadlines are counted separately on purpose: a stream
+    /// that hiccups is not the same failure as one that died.
+    stall_events: AtomicU64,
+    /// Hard no-data timeouts that killed a reader.
+    no_data_timeouts: AtomicU64,
     /// Lifecycle state of the background reader task. See [`ReaderState`].
     reader_state: AtomicU8,
     /// Broadcasts every [`ReaderState`] transition so subscribers learn that
@@ -392,6 +407,10 @@ impl SharedTuner {
             next_claim_id: AtomicU64::new(1),
             running_since: std::sync::Mutex::new(None),
             last_data_at: AtomicU64::new(0),
+            reader_started_at_ms: AtomicU64::new(0),
+            first_ts_at_ms: AtomicU64::new(0),
+            stall_events: AtomicU64::new(0),
+            no_data_timeouts: AtomicU64::new(0),
             reader_state: AtomicU8::new(ReaderState::Idle as u8),
             state_tx: watch::channel(ReaderState::Idle).0,
             stop_reason: AtomicU8::new(StopReason::Unspecified as u8),
@@ -488,6 +507,51 @@ impl SharedTuner {
     fn mark_data_sent(&self) {
         self.last_data_at
             .store(monotonic_millis(), Ordering::Release);
+    }
+
+    /// Begin a fresh startup measurement. Called once per reader start, so a
+    /// restart never inherits the previous reader's latencies or counters.
+    pub(crate) fn begin_startup_metrics(&self) {
+        self.reader_started_at_ms
+            .store(monotonic_millis(), Ordering::Release);
+        self.first_ts_at_ms.store(0, Ordering::Release);
+        self.stall_events.store(0, Ordering::Release);
+        self.no_data_timeouts.store(0, Ordering::Release);
+    }
+
+    /// Record the arrival of the current reader's first TS chunk. Idempotent:
+    /// only the first call for a given reader is kept.
+    pub(crate) fn mark_first_ts(&self) {
+        let _ = self.first_ts_at_ms.compare_exchange(
+            0,
+            monotonic_millis(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn note_stall(&self) {
+        self.stall_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_no_data_timeout(&self) {
+        self.no_data_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Millis from reader start to the first TS chunk, `None` when either
+    /// never happened.
+    pub(crate) fn first_ts_latency_ms(&self) -> Option<u64> {
+        let started = self.reader_started_at_ms.load(Ordering::Acquire);
+        let first = self.first_ts_at_ms.load(Ordering::Acquire);
+        (started > 0 && first >= started).then(|| first - started)
+    }
+
+    pub(crate) fn stall_events(&self) -> u64 {
+        self.stall_events.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn no_data_timeouts(&self) -> u64 {
+        self.no_data_timeouts.load(Ordering::Relaxed)
     }
 
     /// Wait for the first TS packet to arrive (indicating driver is ready).
@@ -1136,19 +1200,42 @@ impl SharedTuner {
         let timeout_secs = startup_config.no_data_timeout_secs;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            // Soft deadline: long enough to be a real gap, short of the hard
+            // timeout that kills the reader. Counting the two separately is
+            // what lets driver health tell "this driver hiccups" apart from
+            // "this driver dies" (docs/DISTRIBUTED_TUNER_FABRIC.md §9).
+            let stall_ms = timing::soft_stall_threshold_ms(timeout_secs);
+            let mut stall_counted_for_gap = false;
             loop {
                 interval.tick().await;
                 if watchdog_shared.state() != ReaderState::Running {
                     break;
                 }
                 let last = watchdog_shared.last_data_at.load(Ordering::Acquire);
-                if timeout_secs > 0
-                    && monotonic_millis().saturating_sub(last) >= timeout_secs.saturating_mul(1_000)
-                {
+                let gap_ms = monotonic_millis().saturating_sub(last);
+
+                if gap_ms >= stall_ms {
+                    // Once per gap, not once per second: a 30 s outage is one
+                    // stall event, otherwise a single incident would bury the
+                    // driver's score.
+                    if !stall_counted_for_gap {
+                        stall_counted_for_gap = true;
+                        watchdog_shared.note_stall();
+                        debug!(
+                            "[SharedTuner] TS gap of {}ms on {:?} (soft stall threshold {}ms)",
+                            gap_ms, watchdog_shared.key, stall_ms
+                        );
+                    }
+                } else {
+                    stall_counted_for_gap = false;
+                }
+
+                if timeout_secs > 0 && gap_ms >= timeout_secs.saturating_mul(1_000) {
                     warn!(
                         "[SharedTuner] no TS data for {}s; stopping {:?}",
                         timeout_secs, watchdog_shared.key
                     );
+                    watchdog_shared.note_no_data_timeout();
                     watchdog_shared.set_stop_reason(StopReason::ReaderFailed);
                     let _ = watchdog_shared.stop_reader().await;
                     break;
@@ -1265,6 +1352,7 @@ impl SharedTuner {
                     if reader_first_read {
                         info!("[SharedTuner] FIRST_DATA_RECEIVED: {} bytes after {} empty reads, elapsed={}ms, STARTUP_SUCCESSFUL",
                               n, consecutive_empty, reader_start_time.elapsed().as_millis());
+                        shared.mark_first_ts();
                         reader_first_read = false;
                     } else if consecutive_empty > 0 {
                         debug!("[SharedTuner] Got data after {} empty reads: {} bytes", consecutive_empty, n);
@@ -1552,6 +1640,9 @@ impl SharedTuner {
         // "caller decided to start a reader" and "the blocking thread got
         // scheduled and reached its own `set_state(Starting)`".
         self.set_state(ReaderState::Starting);
+        // Fresh measurement window: a restart must never inherit the previous
+        // reader's latencies or stall counts.
+        self.begin_startup_metrics();
 
         let ready_timeout =
             timing::reader_ready_timeout(startup_config.set_channel_retry_timeout_ms);

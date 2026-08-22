@@ -379,6 +379,29 @@ Runtime health includes:
 The combined driver score multiplies stream-integrity quality by runtime-health
 quality so either kind of failure can demote the route.
 
+### 9.1 Where the numbers come from
+
+- **Startup latency** is measured across `SharedTuner::start_reader` in
+  `tuner::acquire` (open + SetChannel + ready, as one number — the DLL does not
+  separate them for us).
+- **First-TS latency** is recorded by the reader loop on its first chunk. A
+  reader that ran its whole life without ever producing TS is recorded as a
+  `first_ts_timeout`: "said yes, then delivered nothing" is invisible to packet
+  statistics, because there are no packets to be wrong about.
+- **Soft stalls** and **hard no-data timeouts** are counted separately by the
+  reader watchdog. The soft threshold is half the configured hard timeout,
+  clamped to 3–10 s, and each gap counts once rather than once per second — a
+  single 30 s outage must not bury a driver's score.
+- **Open/tune failures** are written immediately when `start_reader` fails, so
+  a driver that cannot start is demoted without waiting for anything.
+  `AddrNotAvailable` is classified as a *tuning* failure ("no such channel on
+  this driver"), not an unhealthy driver.
+- Everything else is written once when the reader stops, because stalls only
+  accumulate while it runs.
+
+A driver with no samples scores a neutral `1.0`. Treating "unknown" as "bad"
+would make selection avoid every newly added tuner.
+
 Long term, untrusted/poor native BonDriver code should run in a supervisor-owned
 worker process. Tokio blocking-task timeouts can abandon a waiter but cannot
 force a hung native DLL callback to return; a process boundary is required for
@@ -435,6 +458,11 @@ Done:
   `RemoteMuxStream` with renew / reconnect / `from_seq` resume and the RECORD
   no-silent-gap rule.
 - Route advertisement build/exchange/persistence (§4.3).
+- Driver runtime health is now actually measured and fed into selection
+  (§9): startup latency, first-TS latency, soft stalls, hard no-data timeouts
+  and open/tune failures. Before this the table existed and `tuner::policy`
+  already multiplied by `runtime_score`, but nothing ever wrote a sample, so
+  the score was permanently `1.0`.
 - Remote fallback for `GET /mirakurun/api/services/:id/stream` and
   `/programs/:id/stream` (§4.4), including per-class endpoint admission.
 
@@ -451,5 +479,9 @@ Not done yet:
 - **Path selection on the request path is static, not measured** (§4.4).
 - Route-group weights are stored but not consulted during candidate
   generation.
-- No BonDriver process isolation (`recisdb-driver-worker`) or circuit breaker;
-  `DriverHealth` collects the inputs but nothing acts on them yet.
+- **No circuit breaker.** `open_backoff` cools a driver down after repeated
+  open failures, but there is no Healthy → Degraded → Open → HalfOpen state
+  machine, and no separate soft/hard deadline for `Open`/`SetChannel`/`Stop`.
+- **No BonDriver process isolation** (`recisdb-driver-worker`,
+  `DriverSupervisor`). `spawn_blocking` + timeout cannot kill a thread stuck
+  inside a native DLL call, and a DLL crash still takes the proxy with it.
