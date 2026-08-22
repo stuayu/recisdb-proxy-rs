@@ -6,6 +6,7 @@
 
 pub(crate) mod acquire;
 pub mod channel_key;
+pub mod claim;
 pub mod encoder_pool;
 pub mod lock;
 pub mod policy;
@@ -25,6 +26,7 @@ pub mod nit_collector;
 pub(crate) mod open_backoff;
 
 pub use channel_key::ChannelKey;
+pub use claim::EffectiveClaim;
 pub use encoder_pool::{EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
 pub use pool::{CarriedSlotPermit, ScanReservation, SlotPermit, TunerPool, TunerPoolConfig};
 pub use shared::{ReaderState, SharedTuner, TunerSubscription};
