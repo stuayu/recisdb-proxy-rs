@@ -19,6 +19,7 @@ mod programs;
 mod update;
 mod logs;
 mod service;
+mod nodes;
 
 pub use error::*;
 pub use statics::*;
@@ -33,3 +34,4 @@ pub use programs::*;
 pub use update::*;
 pub use logs::*;
 pub use service::*;
+pub use nodes::*;
