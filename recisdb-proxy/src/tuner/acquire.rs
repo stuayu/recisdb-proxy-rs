@@ -1304,6 +1304,83 @@ mod tests {
         tuner.stop_reader().await;
     }
 
+    /// A detached slot permit must never evaporate on an error path. The
+    /// caller's old reader is still holding the device open, so releasing its
+    /// permit would let an unrelated task open a second instance on a driver
+    /// that only has room for one.
+    #[tokio::test]
+    async fn carried_permit_is_returned_to_the_still_live_owner_when_acquire_fails() {
+        let pool = Arc::new(TunerPool::new(10));
+        let old_path = "/dev/old-driver";
+        let new_path = "/nonexistent/recisdb-proxy-test-device";
+        let database = db_handle_with_driver(old_path, 1);
+        {
+            let db = database.lock().await;
+            db.insert_bon_driver(&NewBonDriver::new(new_path).with_max_instances(1)).unwrap();
+        }
+
+        let old_key = ChannelKey::space_channel(old_path, 0, 1);
+        let permit = pool.acquire_slot(old_path, 1).await.unwrap();
+        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
+        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        ready_rx.await.unwrap().unwrap();
+
+        // What a session does before switching channels: detach the slot so
+        // it can be handed to the replacement reader.
+        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        assert!(old.take_slot_permit().is_none());
+
+        // The winner is on a different, nonexistent driver, so the reader
+        // start fails and `acquire` returns an error without ever consuming
+        // the carried permit.
+        let mut request = empty_request(vec![ChannelKey::space_channel(new_path, 0, 7)]);
+        request.carried_permit = Some(carried);
+        request.own_key = Some(old_key.clone());
+        request.own_key_will_free_slot = true;
+
+        let result = acquire(&pool, &database, request).await;
+        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+
+        let restored = old.take_slot_permit().expect("permit must be back on the still-running old reader");
+        assert_eq!(restored.dll_path(), old_path);
+
+        old.stop_reader().await;
+    }
+
+    /// One permit backs at most one live native reader. When the winner is a
+    /// different channel on the *same* DLL, the old reader has to be stopped
+    /// before its slot is handed over — otherwise a `max_instances = 1`
+    /// driver briefly has two opens against a single reservation.
+    #[tokio::test]
+    async fn same_dll_slot_transfer_stops_the_old_reader_first() {
+        let pool = Arc::new(TunerPool::new(10));
+        // Nonexistent so the *new* reader start fails; the old reader must
+        // already be gone by then, which is what this asserts.
+        let path = "/nonexistent/recisdb-proxy-test-device";
+        let database = db_handle_with_driver(path, 1);
+
+        let old_key = ChannelKey::space_channel(path, 0, 1);
+        let permit = pool.acquire_slot(path, 1).await.unwrap();
+        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
+        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        ready_rx.await.unwrap().unwrap();
+
+        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        let mut request = empty_request(vec![ChannelKey::space_channel(path, 0, 2)]);
+        request.carried_permit = Some(carried);
+        request.own_key = Some(old_key.clone());
+        request.own_key_will_free_slot = true;
+
+        let result = acquire(&pool, &database, request).await;
+        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+
+        assert!(
+            pool.get(&old_key).await.is_none(),
+            "the old same-DLL reader must have been stopped and removed before its slot was reused"
+        );
+        assert!(!old.is_running(), "the old reader must not still be running on the transferred slot");
+    }
+
     // -----------------------------------------------------------------
     // take_permit_for_path(): the priority order in isolation.
     // -----------------------------------------------------------------
