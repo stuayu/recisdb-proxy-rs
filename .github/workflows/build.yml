@@ -10,11 +10,59 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  fabric-autopatch:
+    if: ${{ github.ref == 'refs/heads/feat/distributed-tuner-fabric' && !contains(github.event.head_commit.message, '[fabric-autopatch]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout integration branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/distributed-tuner-fabric
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang pkg-config \
+            libpcsclite-dev libudev-dev libdvbv5-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply exact-match integration patches
+        run: |
+          python3 scripts/fabric_autopatch.py
+          python3 scripts/fabric_autopatch_safety.py
+          cargo fmt --all
+          git diff --check
+          cargo check -p recisdb-proxy --lib -F dvb
+
+      - name: Remove one-shot integration machinery
+        run: |
+          git show HEAD^:.github/workflows/build.yml > .github/workflows/build.yml
+          rm -f scripts/fabric_autopatch.py scripts/fabric_autopatch_safety.py
+          rm -f .github/workflows/fabric-autopatch.yml
+
+      - name: Commit integrated source
+        run: |
+          git config user.name "recisdb-fabric-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "[fabric-autopatch] fix tuner arbitration and claim consistency"
+          git push origin HEAD:feat/distributed-tuner-fabric
+
   build-windows:
     runs-on: windows-2025
     strategy:
