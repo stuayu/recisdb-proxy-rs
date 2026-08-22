@@ -217,6 +217,10 @@ struct GatedStreamState {
     collector: EitPfCollector,
     gate: ProgramGate,
     deadline: DateTime<Utc>,
+    /// RECORD must never continue after a broadcast receiver gap.  Once set,
+    /// the stream yields one explicit I/O error and then remains terminated
+    /// even if the HTTP body implementation polls it again.
+    fatal: bool,
     /// Same single-service filter `GET /services/:id/stream` applies — see
     /// [`crate::web::stream::service_filtered_body_stream`]. Fed on *every*
     /// chunk, including those the gate withholds, so its PAT/PMT whitelist is
@@ -232,6 +236,12 @@ struct GatedStreamState {
 /// Mirakurun's per-service stream — see
 /// [`crate::web::stream::service_filtered_body_stream`]) until a *different*
 /// event becomes present, at which point the stream ends.
+///
+/// This endpoint is a RECORD path. If the underlying broadcast receiver
+/// reports `Lagged`, silently skipping bytes would create a corrupt recording
+/// while the HTTP request still looks successful. Such a gap is therefore a
+/// fatal body error; the client may retry/reacquire, but recisdb-proxy never
+/// pretends the recording remained lossless.
 ///
 /// The chunk in which the gate transitions Waiting -> Streaming is forwarded
 /// in full, not trimmed to start exactly at the EIT boundary: TS chunks are
@@ -268,13 +278,14 @@ pub(crate) fn gated_program_stream(
         collector: EitPfCollector::new(),
         gate: ProgramGate::new(target_sid, target_event_id),
         deadline,
+        fatal: false,
         filter: TsServiceFilter::new(target_sid),
         aligner: TsAligner::new(),
     };
 
     stream::unfold(state, |mut state| async move {
         loop {
-            if state.gate.is_ended() {
+            if state.fatal || state.gate.is_ended() {
                 return None;
             }
 
@@ -346,14 +357,17 @@ pub(crate) fn gated_program_stream(
                     continue;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // Same "log and continue" convention as
-                    // `web/stream.rs::broadcast_to_body_stream` — losing a
-                    // few chunks of a multiplex the gate hasn't opened for
-                    // yet (or is mid-programme on) is harmless; the next
-                    // successful recv picks up wherever the live edge is.
-                    debug!("[mirakurun program stream] receiver lagged, skipped {} chunks", n);
+                    warn!(
+                        "[mirakurun program stream] RECORD receiver lagged by {} chunks; terminating rather than silently corrupting the recording",
+                        n
+                    );
                     state.aligner.on_gap();
-                    continue;
+                    state.fatal = true;
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("record stream lost {n} broadcast chunk(s)"),
+                    );
+                    return Some((Err(error), state));
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -413,7 +427,7 @@ mod tests {
 
     #[test]
     fn state_is_stable_with_no_observations() {
-        let mut gate = ProgramGate::new(100, 5);
+        let gate = ProgramGate::new(100, 5);
         assert!(!gate.is_streaming());
         assert!(!gate.is_ended());
         // No `observe_*` calls at all -> state never changes on its own.
