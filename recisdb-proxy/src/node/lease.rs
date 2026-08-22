@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use recisdb_protocol::StreamClass;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::tuner::EffectiveClaim;
 
-use super::replay::{ReplayBudget, ReplayBuffer};
+use super::frame::NodeTsFrame;
+use super::replay::{ReplayBudget, ReplayBuffer, ReplayError};
 use super::types::{LogicalMuxId, NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -56,6 +57,7 @@ pub struct RemoteMuxLease {
     pub claim: EffectiveClaim,
     pub generation: u32,
     pub replay: Arc<Mutex<ReplayBuffer>>,
+    live_tx: broadcast::Sender<NodeTsFrame>,
     state: Arc<Mutex<LeaseTimes>>,
 }
 
@@ -78,6 +80,7 @@ impl RemoteMuxLease {
         replay_budget: ReplayBudget,
     ) -> Self {
         let now = Instant::now();
+        let (live_tx, _) = broadcast::channel(256);
         Self {
             id: RemoteLeaseId::random(),
             owner_node,
@@ -88,12 +91,25 @@ impl RemoteMuxLease {
             claim,
             generation,
             replay: Arc::new(Mutex::new(ReplayBuffer::new(replay_budget))),
+            live_tx,
             state: Arc::new(Mutex::new(LeaseTimes {
                 created_at: now,
                 renewed_at: now,
                 expires_at: now + ttl,
             })),
         }
+    }
+
+    /// Publish one source frame into both the replay history and live fanout.
+    /// A source sequence gap is fatal before anything is broadcast.
+    pub async fn publish(&self, frame: NodeTsFrame) -> Result<(), ReplayError> {
+        self.replay.lock().await.push(frame.clone())?;
+        let _ = self.live_tx.send(frame);
+        Ok(())
+    }
+
+    pub fn subscribe_live(&self) -> broadcast::Receiver<NodeTsFrame> {
+        self.live_tx.subscribe()
     }
 
     pub async fn renew(&self, ttl: Duration) {
@@ -221,6 +237,8 @@ impl RemoteLeaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use crate::node::{FrameFlags, NodeTsFrame};
 
     #[tokio::test]
     async fn lease_lifetime_is_not_bound_to_transport_connection() {
@@ -247,5 +265,34 @@ mod tests {
         let resumed = manager.get(&lease.id).await.unwrap();
         assert_eq!(resumed.id, lease.id);
         assert_eq!(resumed.claim, EffectiveClaim::new(2, false));
+    }
+
+    #[tokio::test]
+    async fn publish_populates_live_and_replay_from_same_sequence() {
+        let manager = RemoteLeaseManager::new(LeasePolicy::default());
+        let lease = manager
+            .create(
+                NodeId::new("fukushima").unwrap(),
+                "gunma-route".into(),
+                LogicalMuxId { nid: 1, tsid: 1 },
+                None,
+                StreamClass::Record,
+                EffectiveClaim::new(2, false),
+                7,
+            )
+            .await;
+        let mut live = lease.subscribe_live();
+        lease
+            .publish(NodeTsFrame {
+                generation: 7,
+                sequence: 100,
+                source_monotonic_ms: 0,
+                flags: FrameFlags::default(),
+                payload: Bytes::from(vec![0x47; 188]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(live.recv().await.unwrap().sequence, 100);
+        assert_eq!(lease.replay.lock().await.replay_from(7, 100).unwrap()[0].sequence, 100);
     }
 }
