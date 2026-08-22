@@ -9,6 +9,7 @@
 //! This makes RF quality, tuner health and WAN/VPN/tunnel health independent
 //! failure domains and is the basis for stable multi-site recording.
 
+pub mod discovery;
 pub mod frame;
 pub mod identity;
 pub mod lease;
@@ -20,6 +21,10 @@ pub mod store;
 pub mod transport;
 pub mod types;
 
+pub use discovery::{
+    classify_tailscale_ping, discover_tailscale_endpoint, inspect_tailscale_path,
+    probe_endpoint, ProbeConfig,
+};
 pub use frame::{FrameFlags, NodeTsFrame};
 pub use identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 pub use lease::{LeasePolicy, RemoteLeaseId, RemoteLeaseManager, RemoteMuxLease};
