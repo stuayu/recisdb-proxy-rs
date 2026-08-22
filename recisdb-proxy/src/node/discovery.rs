@@ -47,7 +47,8 @@ pub async fn discover_tailscale_endpoint(node_port: u16) -> Option<NodeEndpoint>
             .output(),
     )
     .await
-    .ok()??;
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
