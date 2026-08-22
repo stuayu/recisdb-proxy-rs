@@ -97,6 +97,27 @@ impl PairingCode {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Stable SHA-256 of the normalized code, used as the *stored* form of a
+    /// pending pairing.
+    ///
+    /// The plaintext code exists only in the issuing node's HTTP response and
+    /// in whatever the operator copies across. Persisting the digest means a
+    /// database dump (or a backup) cannot be replayed to create a trusted
+    /// peer, and matches the rule that credentials never appear in logs or
+    /// `Debug` output.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.0.as_bytes());
+        let out = hasher.finalize();
+        let mut hex = String::with_capacity(out.len() * 2);
+        for byte in out {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{byte:02x}");
+        }
+        hex
+    }
 }
 
 impl fmt::Debug for PairingCode {
@@ -127,6 +148,24 @@ mod tests {
         let raw = c.expose().to_owned();
         assert!(!format!("{c:?}").contains(&raw));
         assert!(c.matches(&raw));
+    }
+
+    #[test]
+    fn pairing_code_digest_is_normalization_stable_and_not_the_code() {
+        let a = PairingCode::parse("abcd ef01-2345 6789").unwrap();
+        let b = PairingCode::parse("ABCDEF0123456789").unwrap();
+        assert_eq!(a.digest(), b.digest());
+        assert_ne!(a.digest(), a.as_str());
+        assert_eq!(a.digest().len(), 64);
+
+        let other = PairingCode::parse("0000-0000-0000-0001").unwrap();
+        assert_ne!(a.digest(), other.digest());
+    }
+
+    #[test]
+    fn pairing_code_debug_never_leaks_the_code() {
+        let code = PairingCode::random();
+        assert!(!format!("{code:?}").contains(code.as_str()));
     }
 
     #[test]

@@ -47,6 +47,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // dashboard operations and therefore inherit the normal /api auth.
         .route("/nodes", get(api::get_nodes).post(api::upsert_node))
         .route("/nodes/:id/probe", post(api::probe_node))
+        // Pairing. Issuing returns the plaintext code exactly once; redeeming
+        // talks to the *other* node's transport listener.
+        .route("/nodes/pairing", post(api::issue_pairing_code))
+        .route("/nodes/pairing/redeem", post(api::redeem_pairing_code))
         .route("/node-route-groups/member", post(api::set_route_group_member))
         // Update notification / self-update API (web/api/update.rs)
         .route("/update/check", get(api::check_update))
@@ -311,6 +315,8 @@ pub async fn start_web_server(
     proxy_listen_addr: Option<SocketAddr>,
     config_path: Option<PathBuf>,
     epg_events_tx: tokio::sync::broadcast::Sender<crate::database::ProgramUpsert>,
+    node_transport: Option<Arc<crate::node::NodeTransportState>>,
+    node_listen_addr: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(
         database,
@@ -326,6 +332,8 @@ pub async fn start_web_server(
     web_state.proxy_listen_addr = proxy_listen_addr;
     web_state.config_path = config_path;
     web_state.mirakurun_home_regions = mirakurun_home_regions;
+    web_state.node_transport = node_transport;
+    web_state.node_listen_addr = node_listen_addr;
     if let Some(config) = scan_config {
         *web_state.scan_config.write().await = config;
     }

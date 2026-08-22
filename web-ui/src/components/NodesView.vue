@@ -37,11 +37,27 @@ type NodeEntry = {
 
 type RouteGroup = { id: number; name: string }
 
+type PendingPairing = {
+  label: string | null
+  expires_at_unix_ms: number
+  created_at_unix_ms: number
+}
+
 type NodesResponse = {
   success: boolean
   local: { node_id: string; display_name: string }
   nodes: NodeEntry[]
   route_groups: RouteGroup[]
+  pending_pairings: PendingPairing[]
+}
+
+type IssuedPairing = {
+  success: boolean
+  code: string
+  expires_at_unix_ms: number
+  ttl_secs: number
+  label: string | null
+  node_listen_addr: string | null
 }
 
 type ProbePath = {
@@ -89,6 +105,12 @@ const form = ref({
 })
 
 const groupForm = ref({ name: '関東', node_id: '', weight: 100 })
+const pairIssueForm = ref({ label: '' })
+const pairRedeemForm = ref({ base_url: '', code: '' })
+// Shown once, in this browser tab only. The server keeps only the digest, so
+// there is no endpoint that can hand it back.
+const issuedCode = ref<IssuedPairing | null>(null)
+const pairing = ref(false)
 const endpointKinds: Array<{ value: EndpointKind; label: string }> = [
   { value: 'lan', label: 'LAN' },
   { value: 'tailscale', label: 'Tailscale' },
@@ -201,6 +223,55 @@ async function probe(entry: NodeEntry) {
   }
 }
 
+function formatExpiry(unixMs: number) {
+  const remainingMs = unixMs - Date.now()
+  if (remainingMs <= 0) return '期限切れ'
+  return `あと約 ${Math.max(1, Math.round(remainingMs / 60000))} 分`
+}
+
+async function issuePairingCode() {
+  pairing.value = true
+  try {
+    issuedCode.value = await api<IssuedPairing>('/nodes/pairing', {
+      method: 'POST',
+      body: JSON.stringify({ label: pairIssueForm.value.label.trim() || null }),
+    })
+    error.value = ''
+    message.value = 'ペアリングコードを発行しました。この画面を離れると再表示できません。'
+    await load()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    pairing.value = false
+  }
+}
+
+async function redeemPairingCode() {
+  if (!pairRedeemForm.value.base_url.trim() || !pairRedeemForm.value.code.trim()) {
+    error.value = '相手ノードのURLとペアリングコードを入力してください。'
+    return
+  }
+  pairing.value = true
+  try {
+    const result = await api<{ node: StoredNode }>('/nodes/pairing/redeem', {
+      method: 'POST',
+      body: JSON.stringify({
+        base_url: pairRedeemForm.value.base_url.trim(),
+        code: pairRedeemForm.value.code.trim(),
+        endpoints: [],
+      }),
+    })
+    message.value = `${result.node.display_name} とペアリングしました。`
+    error.value = ''
+    pairRedeemForm.value = { base_url: '', code: '' }
+    await load()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    pairing.value = false
+  }
+}
+
 async function addGroupMember() {
   try {
     await api('/node-route-groups/member', {
@@ -239,8 +310,44 @@ onMounted(load)
 
     <div class="node-grid">
       <section class="node-panel">
+        <h3>ペアリング</h3>
+        <p class="muted">
+          片方でコードを発行し、もう片方でそのコードと相手のURLを入力すると、双方に共有クレデンシャルが保存されます。
+          VPN や Tailscale に繋がっているだけでは認証になりません。
+        </p>
+
+        <label>用途メモ（任意）<input v-model="pairIssueForm.label" autocomplete="off" placeholder="東京の受信機" /></label>
+        <button class="button" :disabled="pairing" @click="issuePairingCode">
+          {{ pairing ? '処理中…' : 'ペアリングコードを発行' }}
+        </button>
+
+        <div v-if="issuedCode" class="pairing-code">
+          <strong>この画面でしか表示されません</strong>
+          <code class="pairing-code-value" v-text="issuedCode.code" />
+          <span class="muted">
+            有効期限 {{ Math.round(issuedCode.ttl_secs / 60) }} 分・1回限り<template v-if="issuedCode.node_listen_addr">
+            / 相手が入力するURL: <code v-text="issuedCode.node_listen_addr" /></template>
+          </span>
+        </div>
+        <ul v-if="data?.pending_pairings?.length" class="pending-list">
+          <li v-for="(pending, idx) in data.pending_pairings" :key="idx">
+            発行済みコード<template v-if="pending.label">（{{ pending.label }}）</template>
+            — {{ formatExpiry(pending.expires_at_unix_ms) }}
+          </li>
+        </ul>
+
+        <hr />
+
+        <label>相手ノードのURL<input v-model="pairRedeemForm.base_url" autocomplete="off" placeholder="http://100.x.y.z:20773" /></label>
+        <label>ペアリングコード<input v-model="pairRedeemForm.code" autocomplete="off" placeholder="ABCD-EF01-2345-6789" /></label>
+        <button class="button" :disabled="pairing" @click="redeemPairingCode">
+          {{ pairing ? '処理中…' : 'このコードでペアリング' }}
+        </button>
+      </section>
+
+      <section class="node-panel">
         <h3>{{ form.node_id ? 'ノードを編集' : 'ノードを追加' }}</h3>
-        <p class="muted">通常は相手ノードのアドレスとペアリングコードだけで追加できるよう、次の段階で自動ペアリングを接続します。</p>
+        <p class="muted">通常はペアリングを使ってください。ここは手動登録・編集用です。</p>
         <label>ノードID<input v-model="form.node_id" autocomplete="off" placeholder="tokyo" /></label>
         <label>表示名<input v-model="form.display_name" autocomplete="off" placeholder="東京" /></label>
         <label>受信拠点<input v-model="form.site_name" autocomplete="off" placeholder="東京都" /></label>
@@ -336,6 +443,11 @@ onMounted(load)
 .node-panel input, .node-panel select { width: 100%; box-sizing: border-box; padding: .6rem .7rem; border: 1px solid var(--border, #cbd5e1); border-radius: 8px; background: inherit; color: inherit; }
 .node-panel .check { display: flex; align-items: center; gap: .5rem; }
 .node-panel .check input { width: auto; }
+.pairing-code { display: grid; gap: .4rem; padding: .75rem; border: 1px dashed var(--border, #cbd5e1); border-radius: 8px; }
+/* The code must stay readable on a phone: wrap instead of scrolling the page. */
+.pairing-code-value { font-size: 1.15rem; letter-spacing: .08em; font-weight: 700; overflow-wrap: anywhere; }
+.pending-list { margin: 0; padding-left: 1.1rem; font-size: .85rem; opacity: .8; }
+.node-panel hr { width: 100%; border: 0; border-top: 1px solid var(--border, #cbd5e1); margin: .25rem 0; }
 .node-list { display: grid; gap: .75rem; }
 .node-card { display: grid; gap: .9rem; }
 .node-card small { font-weight: 400; opacity: .7; }

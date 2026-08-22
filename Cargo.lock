@@ -3196,6 +3196,7 @@ dependencies = [
  "self-replace",
  "serde",
  "serde_json",
+ "sha2",
  "socket2 0.5.10",
  "tar",
  "thiserror 1.0.69",

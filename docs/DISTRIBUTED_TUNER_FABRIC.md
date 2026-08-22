@@ -116,6 +116,50 @@ Connection policy should eventually maintain separate pools for:
 A lossy or congested live-view connection must not consume the flow-control
 window used by an unrelated recording.
 
+### 4.1 Pairing (`POST /node/v3/pair`)
+
+Every other node endpoint requires a `NodeCredential` (32 random bytes, hex) in
+`Authorization: Bearer` plus `x-recisdb-node-id`. Pairing is the one endpoint
+that establishes the first credential, and it is therefore the only one not
+authenticated that way.
+
+Being reachable is deliberately **not** sufficient. Sitting on the same
+Tailnet, LAN or Cloudflare private network gets a caller to the listener and no
+further: without a live one-time code the request is `401`.
+
+Flow:
+
+1. On node A the operator issues a code from the dashboard
+   (`POST /api/nodes/pairing`). The plaintext code (64 bits of entropy,
+   formatted `XXXX-XXXX-XXXX-XXXX`) is returned **once, in that response**.
+   Only its SHA-256 is written to `node_pending_pairings`, so a database dump or
+   backup cannot be replayed into a trusted peer, and the dashboard can only
+   ever report *that* a code is outstanding and until when.
+2. On node B the operator enters A's node-transport URL and the code
+   (`POST /api/nodes/pairing/redeem`). B calls A's `POST /node/v3/pair` with its
+   own `NodeIdentity` and the endpoints A should use to reach it back.
+3. A redeems the code with a single `DELETE ... WHERE code_hash = ? AND
+   expires_at_unix_ms > ?`. Because that is one statement, two concurrent
+   redemptions cannot both succeed — exactly one sees a non-zero row count.
+   A then generates the shared `NodeCredential`, stores B as a `remote_nodes`
+   row, trusts it in memory immediately (no restart), and returns
+   `PairingAcceptance { identity, credential }`.
+4. B stores the same credential against A. Both sides now authenticate with it.
+
+Rules that must not be relaxed:
+
+- TTL is 10 minutes (`PAIRING_CODE_TTL`) and redemption is single-use.
+- The credential is never logged, never rendered in `Debug`
+  (`NodeCredential`'s impl prints `**redacted**`), and never serialized back to
+  the browser. `GET /api/nodes` reports `paired: true/false` only.
+- `/node/v3/pair` is rate limited (10 failures/minute) and answers `401`
+  identically for a malformed code, an unknown code and an expired one.
+- On startup `NodeTransportState::reload_peers()` repopulates the in-memory
+  credential map from `remote_nodes`, so pairings survive restarts.
+
+Configuration lives in `[node]` (`recisdb-proxy.toml.example`): `enabled`,
+`listen` (h2c — bind to a trusted overlay or loopback), `display_name`.
+
 ## 5. End-to-end request context
 
 Every inter-node acquisition carries one immutable arbitration context:
@@ -274,3 +318,23 @@ connection-independent remote leases, sequenced framing, RECORD replay and
 SQLite fabric tables. Existing tuner/session/Mirakurun acquisition paths are
 being migrated incrementally so the critical local tuner path remains usable at
 each commit.
+
+Done:
+
+- Node domain types, store schema, path scoring, qualification, replay/framing.
+- Node transport listener (`[node]` in the config file), wired into `main.rs`
+  and served on its own port.
+- One-time pairing (§4.1), dashboard API and the 分散ノード dashboard tab,
+  including issuing/redeeming codes and per-class path probes.
+- Central arbitration correctness the fabric depends on: a single canonical
+  `EffectiveClaim` per request, all-candidates acquire, no caller-side
+  preselection, `Stopping` never reused, RAII slot-permit transfer.
+
+Not done yet:
+
+- Remote `ReceptionRoute`s are not yet fed into candidate discovery, so
+  `tuner::acquire` still only sees local drivers. `RemoteMuxLease` exists and
+  can stream, but nothing acquires one from the arbitration path.
+- No BonDriver process isolation (`recisdb-driver-worker`) or circuit breaker;
+  `DriverHealth` collects the inputs but nothing acts on them yet.
+- Route-group weights are stored but not consulted during candidate generation.

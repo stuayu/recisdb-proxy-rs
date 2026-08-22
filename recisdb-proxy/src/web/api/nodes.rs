@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{
-    probe_endpoint, select_best_path, NodeCredential, NodeEndpoint, NodeId,
-    NodeStore, NodeTransportClient, PathPolicy, ProbeConfig, StoredNode,
+    probe_endpoint, select_best_path, NodeCredential, NodeEndpoint, NodeId, NodeStore,
+    NodeTransportClient, PairingCode, PathPolicy, ProbeConfig, StoredNode, PAIRING_CODE_TTL,
 };
 use crate::web::state::WebState;
 
@@ -50,6 +50,24 @@ pub struct ProbeNodeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IssuePairingRequest {
+    /// Free-form note shown next to the pending code ("東京の受信機" etc.).
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedeemPairingRequest {
+    /// Base URL of the *issuing* node's transport listener, e.g.
+    /// `http://tokyo.tailnet.ts.net:20773`.
+    pub base_url: String,
+    /// The one-time code shown on that node's dashboard.
+    pub code: String,
+    /// Endpoints this node advertises back, so the peer can reach us.
+    #[serde(default)]
+    pub endpoints: Vec<NodeEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RouteGroupMemberRequest {
     pub name: String,
     pub node_id: String,
@@ -75,12 +93,116 @@ pub async fn get_nodes(
         }));
     }
     let route_groups = store.list_route_groups()?;
+    // Only the expiry is knowable: the code itself was stored as a digest.
+    let pending_pairings = store.pending_pairings()?;
 
     Ok(Json(json!({
         "success": true,
         "local": local,
         "nodes": entries,
         "route_groups": route_groups,
+        "pending_pairings": pending_pairings,
+    })))
+}
+
+/// Issue a one-time pairing code for another node to redeem.
+///
+/// The plaintext code is returned **once, here**. Only its SHA-256 is stored,
+/// so it cannot be shown again — reissue instead.
+pub async fn issue_pairing_code(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<IssuePairingRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let label = payload.label.map(|l| l.trim().to_owned()).filter(|l| !l.is_empty());
+    let code = PairingCode::random();
+    let expires_at_unix_ms =
+        chrono::Utc::now().timestamp_millis() + PAIRING_CODE_TTL.as_millis() as i64;
+
+    let (local, listen_hint) = {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        store.create_pending_pairing(&code, label.as_deref(), expires_at_unix_ms)?;
+        (store.local_identity()?, web_state.node_listen_addr.clone())
+    };
+
+    Ok(Json(json!({
+        "success": true,
+        // Shown once; the server keeps only the digest.
+        "code": code.as_str(),
+        "expires_at_unix_ms": expires_at_unix_ms,
+        "ttl_secs": PAIRING_CODE_TTL.as_secs(),
+        "label": label,
+        "local": local,
+        "node_listen_addr": listen_hint,
+    })))
+}
+
+/// Redeem a code issued by another node, establishing the shared credential.
+///
+/// The credential the peer returns is stored but never echoed back to the
+/// browser (`GET /api/nodes` reports only `paired: true/false`).
+pub async fn redeem_pairing_code(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<RedeemPairingRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let base_url = payload.base_url.trim().trim_end_matches('/').to_owned();
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(ApiError::bad_request(
+            "base_url must start with http:// or https://",
+        ));
+    }
+    let code = PairingCode::parse(&payload.code).map_err(ApiError::bad_request)?;
+    for endpoint in &payload.endpoints {
+        if endpoint.address.trim().is_empty() {
+            return Err(ApiError::bad_request("endpoint address must not be empty"));
+        }
+    }
+
+    let local = {
+        let db = web_state.database.lock().await;
+        NodeStore::new(&db)?.local_identity()?
+    };
+
+    let acceptance =
+        NodeTransportClient::redeem_pairing_code(&base_url, &code, &local, &payload.endpoints)
+            .await
+            .map_err(|e| {
+                // `e` never contains the code (it is sent in the JSON body).
+                ApiError::bad_gateway(format!("pairing request to {base_url} failed: {e}"))
+            })?;
+
+    if acceptance.identity.node_id == local.node_id {
+        return Err(ApiError::bad_request("that endpoint is this node itself"));
+    }
+
+    let peer = StoredNode {
+        node_id: acceptance.identity.node_id.clone(),
+        display_name: acceptance.identity.display_name.clone(),
+        site_name: None,
+        enabled: true,
+        allow_transit: false,
+        auto_connect: true,
+        last_seen_unix_ms: Some(chrono::Utc::now().timestamp_millis()),
+    };
+    let endpoint = NodeEndpoint::direct(base_url.clone());
+    {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        store.upsert_node(&peer, Some(&acceptance.credential))?;
+        store.replace_endpoints(&peer.node_id, &[endpoint.clone()])?;
+    }
+    if let Some(node_state) = web_state.node_transport.as_ref() {
+        node_state
+            .trust_peer(peer.node_id.clone(), acceptance.credential.clone())
+            .await;
+    }
+
+    log::info!("Paired with node {} ({})", peer.node_id, peer.display_name);
+    Ok(Json(json!({
+        "success": true,
+        // Deliberately no credential in this response.
+        "node": peer,
+        "endpoint": endpoint,
     })))
 }
 

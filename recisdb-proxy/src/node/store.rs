@@ -8,7 +8,7 @@ use crate::database::{Database, DatabaseError};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::identity::{NodeCredential, NodeIdentity};
+use super::identity::{NodeCredential, NodeIdentity, PairingCode};
 use super::types::{NodeEndpoint, NodeId};
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -22,6 +22,15 @@ pub struct StoredNode {
     pub allow_transit: bool,
     pub auto_connect: bool,
     pub last_seen_unix_ms: Option<i64>,
+}
+
+/// An outstanding pairing code, as far as the dashboard may know about it.
+/// The code itself is never recoverable — only its digest was stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPairing {
+    pub label: Option<String>,
+    pub expires_at_unix_ms: i64,
+    pub created_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +176,17 @@ impl<'a> NodeStore<'a> {
                 PRIMARY KEY(node_id, endpoint_id),
                 FOREIGN KEY(node_id) REFERENCES remote_nodes(node_id) ON DELETE CASCADE,
                 FOREIGN KEY(endpoint_id) REFERENCES node_endpoints(id) ON DELETE CASCADE
+            );
+
+            -- One-time pairing codes issued by this node. Only the SHA-256 of
+            -- the normalized code is stored: the plaintext exists in the
+            -- issuing HTTP response and nowhere else, so a database dump
+            -- cannot be replayed to become a trusted peer.
+            CREATE TABLE IF NOT EXISTS node_pending_pairings (
+                code_hash TEXT PRIMARY KEY,
+                label TEXT,
+                expires_at_unix_ms INTEGER NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_reception_routes_mux ON reception_routes(mux_id, routing_state);
@@ -345,6 +365,70 @@ impl<'a> NodeStore<'a> {
         Ok(())
     }
 
+    /// Record a pairing code this node just issued. Only its digest is kept.
+    pub fn create_pending_pairing(
+        &self,
+        code: &PairingCode,
+        label: Option<&str>,
+        expires_at_unix_ms: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        // Housekeeping here rather than on a timer: pairing is rare and this
+        // is the only place that grows the table.
+        self.db
+            .connection()
+            .execute("DELETE FROM node_pending_pairings WHERE expires_at_unix_ms <= ?1", params![now])?;
+        self.db.connection().execute(
+            "INSERT OR REPLACE INTO node_pending_pairings (code_hash, label, expires_at_unix_ms, created_at_unix_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![code.digest(), label, expires_at_unix_ms, now],
+        )?;
+        Ok(())
+    }
+
+    /// Redeem a pairing code exactly once.
+    ///
+    /// The `DELETE ... RETURNING`-equivalent below is a single statement, so
+    /// two concurrent redemptions of the same code cannot both succeed: only
+    /// the one that actually removed the row sees a non-zero row count. An
+    /// expired row is removed and reported as *not* redeemable.
+    pub fn consume_pending_pairing(&self, code: &PairingCode) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let digest = code.digest();
+        let redeemed = self.db.connection().execute(
+            "DELETE FROM node_pending_pairings WHERE code_hash = ?1 AND expires_at_unix_ms > ?2",
+            params![digest, now],
+        )?;
+        if redeemed == 0 {
+            // Clean up a matching-but-expired row so a stale code cannot sit
+            // around being probed forever.
+            self.db.connection().execute(
+                "DELETE FROM node_pending_pairings WHERE code_hash = ?1",
+                params![digest],
+            )?;
+        }
+        Ok(redeemed > 0)
+    }
+
+    /// Expiry timestamps of the pairing codes still outstanding. The codes
+    /// themselves are unrecoverable by design, so the dashboard can only show
+    /// that one is pending and until when.
+    pub fn pending_pairings(&self) -> Result<Vec<PendingPairing>> {
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT label, expires_at_unix_ms, created_at_unix_ms FROM node_pending_pairings WHERE expires_at_unix_ms > ?1 ORDER BY created_at_unix_ms DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![chrono::Utc::now().timestamp_millis()], |row| {
+                Ok(PendingPairing {
+                    label: row.get(0)?,
+                    expires_at_unix_ms: row.get(1)?,
+                    created_at_unix_ms: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_route_groups(&self) -> Result<Vec<RouteGroup>> {
         let mut stmt = self.db.connection().prepare("SELECT id, name FROM route_groups ORDER BY name")?;
         let rows = stmt.query_map([], |row| Ok(RouteGroup { id: row.get(0)?, name: row.get(1)? }))?;
@@ -389,5 +473,66 @@ mod tests {
         assert_eq!(store.list_nodes().unwrap().len(), 1);
         assert_eq!(store.endpoints(&node.node_id).unwrap().len(), 1);
         assert_eq!(store.credential_for(&node.node_id).unwrap().unwrap(), credential);
+    }
+
+    #[test]
+    fn pairing_code_is_single_use() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let code = PairingCode::random();
+        let expires = chrono::Utc::now().timestamp_millis() + 600_000;
+
+        store.create_pending_pairing(&code, Some("東京"), expires).unwrap();
+        assert_eq!(store.pending_pairings().unwrap().len(), 1);
+
+        assert!(store.consume_pending_pairing(&code).unwrap());
+        // A replay of the same code must not pair a second node.
+        assert!(!store.consume_pending_pairing(&code).unwrap());
+        assert!(store.pending_pairings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_pairing_code_is_not_redeemable_and_is_cleaned_up() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let code = PairingCode::random();
+        let already_expired = chrono::Utc::now().timestamp_millis() - 1;
+
+        store.create_pending_pairing(&code, None, already_expired).unwrap();
+        assert!(store.pending_pairings().unwrap().is_empty());
+        assert!(!store.consume_pending_pairing(&code).unwrap());
+    }
+
+    #[test]
+    fn an_unrelated_code_never_matches() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let issued = PairingCode::random();
+        let guessed = PairingCode::random();
+        store
+            .create_pending_pairing(&issued, None, chrono::Utc::now().timestamp_millis() + 600_000)
+            .unwrap();
+
+        assert!(!store.consume_pending_pairing(&guessed).unwrap());
+        // The real code still works afterwards.
+        assert!(store.consume_pending_pairing(&issued).unwrap());
+    }
+
+    /// The plaintext code must not be recoverable from the database.
+    #[test]
+    fn only_the_digest_is_persisted() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let code = PairingCode::random();
+        store
+            .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+            .unwrap();
+
+        let stored: String = db
+            .connection()
+            .query_row("SELECT code_hash FROM node_pending_pairings", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(stored, code.as_str());
+        assert_eq!(stored, code.digest());
     }
 }

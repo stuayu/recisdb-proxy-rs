@@ -514,6 +514,14 @@ pub struct WebState {
     /// each independently creating a dead one. See `main.rs` for the
     /// capacity-1024 rationale.
     pub epg_events_tx: broadcast::Sender<ProgramUpsert>,
+    /// Live state of the dedicated node-to-node transport listener
+    /// (`node::transport`), when the distributed fabric is enabled. The
+    /// dashboard needs it to trust a newly paired peer immediately, without
+    /// waiting for a restart. `None` when `[node] enabled = false`.
+    pub node_transport: Option<Arc<crate::node::NodeTransportState>>,
+    /// `[node] listen` as configured, shown next to a freshly issued pairing
+    /// code so the operator knows which URL to type on the other node.
+    pub node_listen_addr: Option<String>,
 }
 
 impl WebState {
@@ -546,6 +554,8 @@ impl WebState {
             log_dir,
             log_level,
             epg_events_tx,
+            node_transport: None,
+            node_listen_addr: None,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

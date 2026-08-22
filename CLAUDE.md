@@ -103,6 +103,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - `docs/UPDATE.md` — 自己更新(リリース版/開発版アーティファクト)。トークン要件、入れ替え前の起動確認、Windowsでブロックされた場合の復旧
 - `docs/FOURK_SETUP.md` — **BS4K対応**。生MMT/TLVを本体で読みdantto4k CLIで変換する構成、復号失敗の見分け方、4Kの分類とB25無効化の理由、未対応事項
 - `docs/EPGSTATION_COMPAT.md` — **Mirakurun互換API(`/mirakurun/api/*`)のクライアント側仕様の調査台帳**。EPGStation(stuayuフォーク)が要求するAPI・データ構造・ストリームの挙動と、現状の実装との差分
+- `docs/DISTRIBUTED_TUNER_FABRIC.md` — **分散チューナーファブリック**。ノードID/受信経路/通信経路の分離、ノード間トランスポート (`/node/v3/*`)、ワンタイムペアリング (§4.1)、VIEW/PREVIEW/RECORD 別の経路選択、実装状況
 - `docs/WEB_DASHBOARD.md` / `docs/QUICKSTART.md`
 - `docs/archive/`, `docs/old/` — 歴史的経緯(現状の仕様としては参照しない)
 

@@ -26,12 +26,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::frame::{FrameFlags, NodeTsFrame};
-use super::identity::{NodeCredential, NodeIdentity};
+use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 use super::lease::{RemoteLeaseId, RemoteLeaseManager};
+use super::store::{NodeStore, StoredNode};
 use super::types::{NodeEndpoint, NodeId, ReceptionRouteAdvertisement};
+use crate::server::listener::DatabaseHandle;
 
 pub const NODE_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_ACTIVE_PROBE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long a freshly issued pairing code stays redeemable.
+pub const PAIRING_CODE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Failed `/node/v3/pair` attempts tolerated inside [`PAIRING_ATTEMPT_WINDOW`]
+/// before the endpoint stops answering. The code carries 64 bits of entropy,
+/// so this is belt-and-braces against an attacker who can reach the node
+/// listener rather than the primary defence.
+const PAIRING_ATTEMPT_LIMIT: u32 = 10;
+const PAIRING_ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapabilities {
@@ -93,6 +105,47 @@ struct LeaseReply {
     ok: bool,
 }
 
+/// What the redeeming node sends to `/node/v3/pair`.
+#[derive(Debug, Deserialize)]
+pub struct PairingRequest {
+    /// One-time code the operator copied from the issuing node's dashboard.
+    pub code: String,
+    /// Who is asking. Becomes a `remote_nodes` row on success.
+    pub identity: NodeIdentity,
+    /// How the issuing node can reach the caller back.
+    #[serde(default)]
+    pub endpoints: Vec<NodeEndpoint>,
+}
+
+/// Simple fixed-window limiter for the one unauthenticated endpoint.
+#[derive(Debug)]
+struct PairingAttempts {
+    window_started: std::time::Instant,
+    failures: u32,
+}
+
+impl Default for PairingAttempts {
+    fn default() -> Self {
+        Self { window_started: std::time::Instant::now(), failures: 0 }
+    }
+}
+
+impl PairingAttempts {
+    fn blocked(&mut self) -> bool {
+        if self.window_started.elapsed() > PAIRING_ATTEMPT_WINDOW {
+            *self = Self::default();
+        }
+        self.failures >= PAIRING_ATTEMPT_LIMIT
+    }
+
+    fn record_failure(&mut self) {
+        if self.window_started.elapsed() > PAIRING_ATTEMPT_WINDOW {
+            *self = Self::default();
+        }
+        self.failures += 1;
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeTransportState {
     pub identity: NodeIdentity,
@@ -101,6 +154,11 @@ pub struct NodeTransportState {
     pub routes: Arc<RwLock<Vec<ReceptionRouteAdvertisement>>>,
     pub peers: Arc<RwLock<HashMap<NodeId, NodeCredential>>>,
     pub leases: Arc<RemoteLeaseManager>,
+    /// Needed to redeem pairing codes and persist the resulting peer. When
+    /// absent (unit tests), `/node/v3/pair` answers 503 instead of pairing
+    /// against nothing.
+    pub database: Option<DatabaseHandle>,
+    pairing_attempts: Arc<std::sync::Mutex<PairingAttempts>>,
 }
 
 impl NodeTransportState {
@@ -112,7 +170,41 @@ impl NodeTransportState {
             routes: Arc::new(RwLock::new(Vec::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             leases,
+            database: None,
+            pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttempts::default())),
         }
+    }
+
+    /// Attach the database so this node can accept pairing requests.
+    pub fn with_database(mut self, database: DatabaseHandle) -> Self {
+        self.database = Some(database);
+        self
+    }
+
+    /// Load every already-paired peer's credential into the in-memory
+    /// authorization map. Called at startup and after a successful pairing.
+    pub async fn reload_peers(&self) -> Result<usize, crate::database::DatabaseError> {
+        let Some(database) = self.database.as_ref() else {
+            return Ok(0);
+        };
+        let pairs = {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db)?;
+            let mut pairs = Vec::new();
+            for node in store.list_nodes()? {
+                if let Some(credential) = store.credential_for(&node.node_id)? {
+                    pairs.push((node.node_id, credential));
+                }
+            }
+            pairs
+        };
+        let count = pairs.len();
+        let mut peers = self.peers.write().await;
+        peers.clear();
+        for (node_id, credential) in pairs {
+            peers.insert(node_id, credential);
+        }
+        Ok(count)
     }
 
     pub async fn trust_peer(&self, node_id: NodeId, credential: NodeCredential) {
@@ -141,6 +233,7 @@ impl NodeTransportState {
 
 pub fn router(state: Arc<NodeTransportState>) -> Router {
     Router::new()
+        .route("/node/v3/pair", post(pair))
         .route("/node/v3/hello", get(hello))
         .route("/node/v3/routes", get(routes))
         .route("/node/v3/probe/ping", get(probe_ping))
@@ -158,6 +251,87 @@ pub async fn serve_h2c(addr: SocketAddr, state: Arc<NodeTransportState>) -> io::
     let listener = tokio::net::TcpListener::bind(addr).await?;
     log::info!("Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)", addr);
     axum::serve(listener, router(state)).await
+}
+
+/// Redeem a one-time pairing code.
+///
+/// This is the only node endpoint that is not authenticated by a
+/// [`NodeCredential`] — it is how the first credential is established. Being
+/// reachable over Tailscale/LAN is deliberately *not* sufficient: without a
+/// live, unexpired, unused code the request is rejected.
+async fn pair(
+    State(state): State<Arc<NodeTransportState>>,
+    Json(payload): Json<PairingRequest>,
+) -> Response {
+    let Some(database) = state.database.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "pairing is not configured on this node").into_response();
+    };
+    if state.pairing_attempts.lock().unwrap().blocked() {
+        // Never say whether the code was wrong or the limiter tripped.
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    let Ok(code) = PairingCode::parse(&payload.code) else {
+        state.pairing_attempts.lock().unwrap().record_failure();
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if payload.identity.node_id == state.identity.node_id {
+        return (StatusCode::BAD_REQUEST, "a node cannot pair with itself").into_response();
+    }
+
+    let credential = NodeCredential::random();
+    let peer = StoredNode {
+        node_id: payload.identity.node_id.clone(),
+        display_name: payload.identity.display_name.clone(),
+        site_name: None,
+        enabled: true,
+        allow_transit: false,
+        auto_connect: true,
+        last_seen_unix_ms: Some(chrono::Utc::now().timestamp_millis()),
+    };
+
+    let stored = {
+        let db = database.lock().await;
+        let store = match NodeStore::new(&db) {
+            Ok(store) => store,
+            Err(e) => {
+                log::error!("Node pairing: store unavailable: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        match store.consume_pending_pairing(&code) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.pairing_attempts.lock().unwrap().record_failure();
+                log::warn!(
+                    "Node pairing rejected for {}: no valid pending code",
+                    payload.identity.node_id
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Err(e) => {
+                log::error!("Node pairing: failed to redeem code: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+        store
+            .upsert_node(&peer, Some(&credential))
+            .and_then(|()| store.replace_endpoints(&peer.node_id, &payload.endpoints))
+    };
+    if let Err(e) = stored {
+        log::error!("Node pairing: failed to persist peer {}: {e}", peer.node_id);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    state.trust_peer(peer.node_id.clone(), credential.clone()).await;
+    // The credential itself is never logged.
+    log::info!("Node pairing accepted: {} ({})", peer.node_id, peer.display_name);
+
+    Json(PairingAcceptance {
+        identity: state.identity.clone(),
+        credential,
+    })
+    .into_response()
 }
 
 async fn hello(State(state): State<Arc<NodeTransportState>>, headers: HeaderMap) -> Response {
@@ -393,6 +567,34 @@ impl NodeTransportClient {
             .bearer_auth(self.credential.expose())
     }
 
+    /// Redeem a pairing code at `base`, using an unauthenticated client (no
+    /// credential exists yet, by definition).
+    pub async fn redeem_pairing_code(
+        base: &str,
+        code: &PairingCode,
+        identity: &NodeIdentity,
+        endpoints: &[NodeEndpoint],
+    ) -> Result<PairingAcceptance, reqwest::Error> {
+        let base = base.trim_end_matches('/');
+        let client = if base.starts_with("http://") {
+            reqwest::Client::builder().http2_prior_knowledge().build()?
+        } else {
+            reqwest::Client::builder().build()?
+        };
+        client
+            .post(format!("{base}/node/v3/pair"))
+            .json(&serde_json::json!({
+                "code": code.as_str(),
+                "identity": identity,
+                "endpoints": endpoints,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+
     pub async fn hello(&self, base: &str) -> Result<NodeHello, reqwest::Error> {
         self.request(reqwest::Method::GET, format!("{}/node/v3/hello", base.trim_end_matches('/')))
             .send()
@@ -465,6 +667,114 @@ mod tests {
         headers.insert("x-recisdb-node-id", peer.as_str().parse().unwrap());
         headers.insert(header::AUTHORIZATION, "Bearer definitely-wrong".parse().unwrap());
         assert_eq!(state.authorize(&headers).await, Err(StatusCode::UNAUTHORIZED));
+    }
+
+    fn test_state_with_db() -> (Arc<NodeTransportState>, DatabaseHandle) {
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let database: DatabaseHandle = Arc::new(tokio::sync::Mutex::new(db));
+        let state = Arc::new(
+            NodeTransportState::new(
+                NodeIdentity {
+                    node_id: NodeId::new("fukushima").unwrap(),
+                    display_name: "福島".into(),
+                },
+                Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
+            )
+            .with_database(database.clone()),
+        );
+        (state, database)
+    }
+
+    fn peer_request(code: &str) -> PairingRequest {
+        PairingRequest {
+            code: code.to_string(),
+            identity: NodeIdentity {
+                node_id: NodeId::new("tokyo").unwrap(),
+                display_name: "東京".into(),
+            },
+            endpoints: vec![NodeEndpoint::direct("http://tokyo.tailnet:20773")],
+        }
+    }
+
+    /// Reachability is not authentication: without a live code the request is
+    /// rejected even though it arrived on the trusted overlay listener.
+    #[tokio::test]
+    async fn pairing_without_a_pending_code_is_rejected() {
+        let (state, _db) = test_state_with_db();
+        let code = PairingCode::random();
+
+        let response = pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(state.peers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pairing_redeems_once_and_trusts_the_peer() {
+        let (state, database) = test_state_with_db();
+        let code = PairingCode::random();
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .unwrap();
+        }
+
+        let response = pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let peer = NodeId::new("tokyo").unwrap();
+        let credential = state
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .expect("paired peer must be trusted immediately, without a restart");
+        {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db).unwrap();
+            assert_eq!(store.credential_for(&peer).unwrap().unwrap(), credential);
+            assert_eq!(store.endpoints(&peer).unwrap().len(), 1);
+        }
+
+        // Replaying the same code must not pair anything else.
+        let replay = pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await;
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reload_peers_restores_credentials_after_a_restart() {
+        let (state, database) = test_state_with_db();
+        let code = PairingCode::random();
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .unwrap();
+        }
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await.status(),
+            StatusCode::OK
+        );
+
+        // A "restarted" node sharing the same database.
+        let restarted = Arc::new(
+            NodeTransportState::new(state.identity.clone(), Arc::new(RemoteLeaseManager::new(LeasePolicy::default())))
+                .with_database(database.clone()),
+        );
+        assert_eq!(restarted.reload_peers().await.unwrap(), 1);
+
+        let peer = NodeId::new("tokyo").unwrap();
+        let credential = restarted.peers.read().await.get(&peer).cloned().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-recisdb-node-id", peer.as_str().parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", credential.expose()).parse().unwrap(),
+        );
+        assert_eq!(restarted.authorize(&headers).await, Ok(peer));
     }
 
     #[tokio::test]

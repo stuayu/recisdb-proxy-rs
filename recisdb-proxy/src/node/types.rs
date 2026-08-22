@@ -160,6 +160,22 @@ pub struct NodeEndpoint {
     pub user_priority: i32,
 }
 
+impl NodeEndpoint {
+    /// An operator-supplied base URL with no discovery behind it. Recording
+    /// over it is allowed by default: it is an address the user typed for
+    /// this specific peer, unlike a discovered Cloudflare/DERP fallback.
+    pub fn direct(address: impl Into<String>) -> Self {
+        Self {
+            kind: EndpointKind::Static,
+            address: address.into(),
+            enabled: true,
+            record_allowed: true,
+            metered: false,
+            user_priority: 0,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }

@@ -686,6 +686,79 @@ async fn run_server(
     let web_log_dir = log_dir.clone();
     let web_log_level_handle = Arc::clone(&log_level_handle);
     let web_epg_events_tx = epg_events_tx.clone();
+
+    // Distributed tuner fabric (`[node]`). The node-to-node transport is a
+    // dedicated listener: long-lived inter-node TS streams must not share a
+    // connection pool or failure domain with dashboard/Mirakurun polling.
+    let (node_transport_for_web, node_listen_display) = match (
+        resolved.node_enabled,
+        resolved.node_listen_addr,
+    ) {
+        (true, Some(node_addr)) => {
+            let identity = {
+                let db_lock = db.lock().await;
+                match recisdb_proxy::node::NodeStore::new(&db_lock) {
+                    Ok(store) => match store.local_identity() {
+                        Ok(mut identity) => {
+                            if let Some(name) = resolved.node_display_name.clone() {
+                                if name != identity.display_name {
+                                    identity.display_name = name;
+                                    if let Err(e) = store
+                                        .update_local_identity(&identity, Some(&node_addr.to_string()))
+                                    {
+                                        warn!("Failed to persist node display name: {}", e);
+                                    }
+                                }
+                            }
+                            Some(identity)
+                        }
+                        Err(e) => {
+                            error!("Node fabric disabled: cannot load local node identity: {}", e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        error!("Node fabric disabled: cannot open node store: {}", e);
+                        None
+                    }
+                }
+            };
+
+            match identity {
+                Some(identity) => {
+                    let leases = Arc::new(recisdb_proxy::node::RemoteLeaseManager::new(
+                        recisdb_proxy::node::LeasePolicy::default(),
+                    ));
+                    let state = Arc::new(
+                        recisdb_proxy::node::NodeTransportState::new(identity.clone(), leases)
+                            .with_database(db.clone()),
+                    );
+                    match state.reload_peers().await {
+                        Ok(count) => info!(
+                            "Node fabric enabled as {} (\"{}\"), {} paired peer(s)",
+                            identity.node_id, identity.display_name, count
+                        ),
+                        Err(e) => warn!("Failed to load paired node credentials: {}", e),
+                    }
+                    let serve_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            recisdb_proxy::node::serve_h2c(node_addr, serve_state).await
+                        {
+                            error!("Node transport listener stopped: {}", e);
+                        }
+                    });
+                    (Some(state), Some(node_addr.to_string()))
+                }
+                None => (None, None),
+            }
+        }
+        (true, None) => {
+            warn!("[node] enabled = true but no usable listen address; node transport not started");
+            (None, None)
+        }
+        (false, _) => (None, None),
+    };
     tokio::spawn(async move {
         match web::start_web_server(
             web_listen_addr,
@@ -704,6 +777,8 @@ async fn run_server(
             Some(listen_addr),
             config_path_for_web,
             web_epg_events_tx,
+            node_transport_for_web,
+            node_listen_display,
         ).await {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),

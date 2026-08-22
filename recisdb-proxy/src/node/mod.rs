@@ -37,6 +37,9 @@ pub use qualification::{
 };
 pub use replay::{ReplayBudget, ReplayBuffer, ReplayError};
 pub use route::{select_route, ReceptionCandidate, RouteDecision};
-pub use store::{NodeStore, RouteGroup, StoredNode};
-pub use transport::{NodeCapabilities, NodeHello, NodeTransportClient, NodeTransportState};
+pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode};
+pub use transport::{
+    serve_h2c, NodeCapabilities, NodeHello, NodeTransportClient, NodeTransportState,
+    PAIRING_CODE_TTL,
+};
 pub use types::*;

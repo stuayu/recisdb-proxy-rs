@@ -112,6 +112,25 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 
 サービスの**登録・削除はWeb APIにはありません**。管理者権限が必要な操作であり、任意の実行ファイルをネットワーク越しに常駐登録できると権限昇格の経路になるためです。登録はセットアップウィザードか `recisdb-proxy service install` から行います。
 
+## 分散ノード
+
+`[node] enabled = true` のときに使う。これらは**ダッシュボード側**のAPIで、通常の `/api/*` 認証に従う。
+ノード間通信そのものは別リスナー・別名前空間 (`/node/v3/*`、`NodeCredential` 認証) で、
+ダッシュボードのBearerトークンとは無関係。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/api/nodes` | ローカルID・登録ノード・エンドポイント・ルートグループ・発行済みペアリングの一覧 |
+| POST | `/api/nodes` | リモートノードの手動登録・編集（エンドポイントは丸ごと置換） |
+| POST | `/api/nodes/:id/probe` | 全エンドポイントを実測し、VIEW/PREVIEW/RECORD ごとの最良経路を返す |
+| POST | `/api/nodes/pairing` | ワンタイムのペアリングコードを発行する |
+| POST | `/api/nodes/pairing/redeem` | 相手ノードのURLとコードを指定してペアリングする |
+| POST | `/api/node-route-groups/member` | ルートグループを作成し、ノードを重み付きで追加・更新する |
+
+**クレデンシャルはレスポンスに出さない。** `GET /api/nodes` が返すのは `paired: true/false` だけ。
+`POST /api/nodes/pairing` が返す平文コードは**その1回だけ**で、サーバーにはSHA-256しか保存しない
+（失くしたら再発行する）。有効期限10分・1回限り。詳細は `docs/DISTRIBUTED_TUNER_FABRIC.md` §4.1。
+
 ## ストリームと静的資産
 
 | Method | Path | 用途 |

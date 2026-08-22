@@ -39,6 +39,8 @@ pub struct ConfigFile {
     pub mmttlv: MmtTlvSection,
     #[serde(default)]
     pub mirakurun: MirakurunSection,
+    #[serde(default)]
+    pub node: NodeSection,
     #[cfg(feature = "tls")]
     #[serde(default)]
     pub tls: TlsSection,
@@ -159,6 +161,23 @@ pub struct DatabaseSection {
     pub path: Option<String>,
 }
 
+/// Distributed tuner fabric (`docs/DISTRIBUTED_TUNER_FABRIC.md`).
+///
+/// The node transport is a *separate* listener from the dashboard/Mirakurun
+/// one on purpose: long-lived, high-bandwidth inter-node TS streams must not
+/// share a connection pool or failure domain with UI polling.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct NodeSection {
+    /// Serve the node-to-node transport. Off by default.
+    pub enabled: Option<bool>,
+    /// Address for the node transport listener (HTTP/2 prior knowledge).
+    /// **Cleartext h2c — bind it to a trusted overlay (Tailscale) or
+    /// loopback, never to a public interface.**
+    pub listen: Option<String>,
+    /// Name shown to peers instead of the generated node id.
+    pub display_name: Option<String>,
+}
+
 #[cfg(feature = "tls")]
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct TlsSection {
@@ -248,6 +267,13 @@ pub struct ResolvedConfig {
     /// over a display-level setting). One name can cover several IDs; see
     /// `recisdb_protocol::broadcast_region::region_ids_from_prefecture_name`.
     pub mirakurun_home_regions: Vec<u8>,
+    /// `[node] enabled` — serve the node-to-node transport listener.
+    pub node_enabled: bool,
+    /// `[node] listen`, parsed. `None` when the fabric is off or the value
+    /// could not be parsed (which warns rather than failing startup).
+    pub node_listen_addr: Option<SocketAddr>,
+    /// `[node] display_name`, applied to this node's stored identity.
+    pub node_display_name: Option<String>,
     #[cfg(feature = "tls")]
     pub tls_config: Option<recisdb_proxy::server::TlsConfig>,
 }
@@ -294,6 +320,25 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
             resolved
         }
     };
+
+    let node_enabled = file_config.node.enabled.unwrap_or(false);
+    let node_listen_addr = match (node_enabled, file_config.node.listen.as_deref()) {
+        (false, _) => None,
+        (true, None) => Some(SocketAddr::from(([127, 0, 0, 1], 20773))),
+        (true, Some(addr)) => match addr.parse::<SocketAddr>() {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!("[node] listen = \"{addr}\" is not a valid address ({e}); the node transport will not start");
+                None
+            }
+        },
+    };
+    let node_display_name = file_config
+        .node
+        .display_name
+        .clone()
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty());
 
     // Build TLS config if enabled
     #[cfg(feature = "tls")]
@@ -365,6 +410,9 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
         web_auth_enabled,
         mirakurun_enabled,
         mirakurun_home_regions,
+        node_enabled,
+        node_listen_addr,
+        node_display_name,
         #[cfg(feature = "tls")]
         tls_config,
     })
