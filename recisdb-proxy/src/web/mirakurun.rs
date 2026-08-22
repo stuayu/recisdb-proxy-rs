@@ -142,7 +142,7 @@ use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    service_filtered_body_stream, session_info_for, BodyReceiver, StreamCleanup,
+    service_filtered_body_stream, session_info_for, BodyReceiver, LossPolicy, StreamCleanup,
 };
 use recisdb_protocol::{BandType, StreamClass};
 use crate::tuner::EffectiveClaim;
@@ -1007,16 +1007,38 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
+    // Design decision (no better signal exists on this endpoint): EPGStation
+    // sends `recPriority`/`conflictPriority` (defaults 2/1) for recording and
+    // `streamingPriority` (default 0) for live viewing, and `/services/:id/
+    // stream` serves both. A positive priority is therefore treated as
+    // recording-grade: the stream is registered as `Record` so the dashboard
+    // shows *why* the tuner is busy, and broadcast lag fails the response
+    // instead of silently punching a hole in the recording. `/programs/:id/
+    // stream` (the EPG-reservation path) is unconditionally `Record` — see
+    // `web/mirakurun_program_stream.rs`.
+    let stream_class = if priority > 0 { StreamClass::Record } else { StreamClass::View };
+    let loss_policy = if stream_class == StreamClass::Record {
+        LossPolicy::Fatal
+    } else {
+        LossPolicy::Recover
+    };
+
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
+        Arc::clone(&web_state.database),
+        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, stream_class),
     )
     .await;
 
     let tuner_rx = tuner.subscribe();
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
         .with_session(session, shutdown_rx);
-    respond_with_stream(service_filtered_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup, sid))
+    respond_with_stream(service_filtered_body_stream(
+        BodyReceiver::Tuner(tuner_rx),
+        cleanup,
+        sid,
+        loss_policy,
+    ))
 }
 
 /// `GET /mirakurun/api/channels/:type/:channel/stream`.
@@ -1091,6 +1113,7 @@ pub async fn stream_channel_by_type(
 
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
+        Arc::clone(&web_state.database),
         session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
@@ -1316,6 +1339,7 @@ pub async fn stream_program_by_mirakurun_id(
     // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
+        Arc::clone(&web_state.database),
         session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::Record),
     )
     .await;

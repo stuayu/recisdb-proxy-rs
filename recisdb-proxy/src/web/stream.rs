@@ -171,6 +171,14 @@ impl StreamCleanup {
             session.record_sent(len);
         }
     }
+
+    /// Record why this stream is ending, for `session_history`. No-op for
+    /// unregistered streams (tests, peer-less requests).
+    pub(crate) fn set_disconnect_reason(&self, reason: &str) {
+        if let Some(session) = self.session.as_ref() {
+            session.set_disconnect_reason(reason);
+        }
+    }
 }
 
 impl Drop for StreamCleanup {
@@ -336,6 +344,21 @@ impl TsAligner {
     }
 }
 
+/// What a stream does when the broadcast channel reports `Lagged`.
+///
+/// STREAMING_DESIGN.md §2 / CLAUDE.md: a recording must never lose data
+/// silently. A viewer would rather resynchronize than be disconnected, but a
+/// recording that skips bytes produces a file whose corruption is only
+/// discovered on playback, so the recording is failed loudly instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossPolicy {
+    /// VIEW/PREVIEW: drop the torn carry buffer, resynchronize, keep going.
+    Recover,
+    /// RECORD: terminate the response with an error and record the reason in
+    /// `session_history`.
+    Fatal,
+}
+
 /// State for [`service_filtered_body_stream`]. Field order matters for the
 /// same reason [`StreamState`]'s does: `rx` must drop before `_cleanup`.
 struct FilteredStreamState {
@@ -344,6 +367,10 @@ struct FilteredStreamState {
     shutdown_rx: Option<mpsc::Receiver<()>>,
     filter: TsServiceFilter,
     aligner: TsAligner,
+    loss_policy: LossPolicy,
+    /// Set once [`LossPolicy::Fatal`] has yielded its error, so the stream
+    /// ends instead of being polled again.
+    fatal: bool,
     _cleanup: StreamCleanup,
 }
 
@@ -377,16 +404,22 @@ pub(crate) fn service_filtered_body_stream(
     rx: BodyReceiver,
     mut cleanup: StreamCleanup,
     target_sid: u16,
+    loss_policy: LossPolicy,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let state = FilteredStreamState {
         rx,
         shutdown_rx: cleanup.take_shutdown(),
         filter: TsServiceFilter::new(target_sid),
         aligner: TsAligner::new(),
+        loss_policy,
+        fatal: false,
         _cleanup: cleanup,
     };
 
     stream::unfold(state, |mut state| async move {
+        if state.fatal {
+            return None;
+        }
         loop {
             let received = match state.shutdown_rx.as_mut() {
                 Some(shutdown_rx) => {
@@ -412,9 +445,26 @@ pub(crate) fn service_filtered_body_stream(
                     return Some((Ok(Bytes::from(filtered)), state));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
                     state.aligner.on_gap();
-                    continue;
+                    match state.loss_policy {
+                        LossPolicy::Recover => {
+                            debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
+                            continue;
+                        }
+                        LossPolicy::Fatal => {
+                            warn!(
+                                "[HTTP stream] RECORD receiver lagged by {} chunks; terminating rather than silently corrupting the recording",
+                                n
+                            );
+                            state._cleanup.set_disconnect_reason("record_broadcast_lag");
+                            state.fatal = true;
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("record stream lost {n} broadcast chunk(s)"),
+                            );
+                            return Some((Err(error), state));
+                        }
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -696,6 +746,7 @@ async fn stream_resolved(
     // (`web/http_session.rs`).
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
+        Arc::clone(&web_state.database),
         session_info_for(SessionProtocol::Http, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;

@@ -361,6 +361,7 @@ pub(crate) fn gated_program_stream(
                         n
                     );
                     state.aligner.on_gap();
+                    state._cleanup.set_disconnect_reason("record_broadcast_lag");
                     state.fatal = true;
                     let error = std::io::Error::new(
                         std::io::ErrorKind::Other,

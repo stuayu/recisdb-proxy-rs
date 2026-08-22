@@ -18,14 +18,15 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use log::info;
+use log::{info, warn};
 use tokio::sync::mpsc;
 
 use recisdb_protocol::StreamClass;
 
+use crate::server::listener::DatabaseHandle;
 use crate::ts_analyzer::TS_PACKET_SIZE;
 use crate::web::state::{SessionProtocol, SessionRegistry};
 
@@ -67,6 +68,11 @@ pub struct HttpStreamStats {
 }
 
 impl HttpStreamStats {
+    /// Total bytes handed to the client so far.
+    fn total_bytes(&self) -> u64 {
+        self.bytes_total.load(Ordering::Relaxed)
+    }
+
     fn new() -> Self {
         Self {
             bytes_total: AtomicU64::new(0),
@@ -108,11 +114,28 @@ impl HttpStreamStats {
     }
 }
 
-/// RAII registration of one HTTP stream in the dashboard's session registry.
+/// RAII registration of one HTTP stream in the dashboard's session registry
+/// and in `session_history`.
+///
+/// The history row matters most for `StreamClass::Record`: an EPGStation
+/// recording that dies has to leave a reason behind, the same way a BNDP
+/// recording session does (`server/session.rs`'s `disconnect_reason`).
+/// Without it a failed recording is indistinguishable from a clean one.
 pub struct HttpStreamSession {
     registry: Arc<SessionRegistry>,
+    database: DatabaseHandle,
     id: u64,
     stats: Arc<HttpStreamStats>,
+    /// `session_history.id`, when the start row could be inserted.
+    history_id: Option<i64>,
+    started_at: i64,
+    tuner_path: Option<String>,
+    channel_info: Option<String>,
+    channel_name: Option<String>,
+    stream_class: StreamClass,
+    /// Why this stream ended. Set by the body stream before it yields its
+    /// final item; `None` means an ordinary client-side disconnect.
+    disconnect_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl HttpStreamSession {
@@ -121,15 +144,34 @@ impl HttpStreamSession {
     /// ends when it receives).
     pub async fn register(
         registry: Arc<SessionRegistry>,
+        database: DatabaseHandle,
         info: HttpStreamSessionInfo,
     ) -> (Self, mpsc::Receiver<()>) {
         let id = registry.allocate_id();
         let addr = info.addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         let shutdown_rx = registry.register(id, addr, info.protocol).await;
 
-        registry.update_tuner(id, info.tuner_path).await;
-        registry.update_channel(id, info.channel_info).await;
-        registry.update_channel_name(id, info.channel_name).await;
+        let started_at = chrono::Utc::now().timestamp();
+        let history_id = match database.lock().await.insert_session_start(
+            id,
+            &addr.to_string(),
+            info.tuner_path.as_deref(),
+            info.channel_info.as_deref(),
+            info.channel_name.as_deref(),
+            started_at,
+        ) {
+            Ok(row) => Some(row),
+            Err(e) => {
+                warn!("[Session {}] Failed to insert HTTP session history start: {}", id, e);
+                None
+            }
+        };
+
+        registry.update_tuner(id, info.tuner_path.clone()).await;
+        registry.update_channel(id, info.channel_info.clone()).await;
+        registry
+            .update_channel_name(id, info.channel_name.clone())
+            .await;
         registry.update_channel_ids(id, info.nid, info.sid).await;
         registry.update_stream_class(id, info.stream_class).await;
         registry.update_streaming(id, true).await;
@@ -141,11 +183,36 @@ impl HttpStreamSession {
             addr
         );
 
-        (Self { registry, id, stats: Arc::new(HttpStreamStats::new()) }, shutdown_rx)
+        let session = Self {
+            registry,
+            database,
+            id,
+            stats: Arc::new(HttpStreamStats::new()),
+            history_id,
+            started_at,
+            tuner_path: info.tuner_path,
+            channel_info: info.channel_info,
+            channel_name: info.channel_name,
+            stream_class: info.stream_class,
+            disconnect_reason: Arc::new(Mutex::new(None)),
+        };
+        (session, shutdown_rx)
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Record why this stream is ending, for `session_history`.
+    ///
+    /// First writer wins: the fatal cause (e.g. `record_broadcast_lag`) is
+    /// set before the body stream terminates, and the generic teardown that
+    /// follows must not overwrite it.
+    pub fn set_disconnect_reason(&self, reason: &str) {
+        let mut slot = self.disconnect_reason.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(reason.to_string());
+        }
     }
 
     /// Account for a chunk sent to the client, flushing to the registry at
@@ -175,10 +242,55 @@ impl HttpStreamSession {
 impl Drop for HttpStreamSession {
     fn drop(&mut self) {
         let registry = Arc::clone(&self.registry);
+        let database = self.database.clone();
         let id = self.id;
+        let history_id = self.history_id;
+        let ended_at = chrono::Utc::now().timestamp();
+        let duration_secs = (ended_at - self.started_at).max(0);
+        let bytes_sent = self.stats.total_bytes();
+        let average_bitrate_mbps = if duration_secs > 0 {
+            Some((bytes_sent as f64 * 8.0) / 1_000_000.0 / duration_secs as f64)
+        } else {
+            None
+        };
+        let reason = self.disconnect_reason.lock().unwrap().clone();
+        let tuner_path = self.tuner_path.clone();
+        let channel_info = self.channel_info.clone();
+        let channel_name = self.channel_name.clone();
+        let stream_class = self.stream_class;
+
         tokio::spawn(async move {
             registry.unregister(id).await;
-            info!("[Session {}] http stream ended", id);
+            if let Some(history_id) = history_id {
+                let db = database.lock().await;
+                if let Err(e) = db.update_session_end(
+                    history_id,
+                    ended_at,
+                    duration_secs,
+                    bytes_sent / TS_PACKET_SIZE as u64,
+                    // An HTTP stream reads an already-shared broadcast, so it
+                    // has no per-client loss accounting of its own (same
+                    // reason `record_sent` reports zeroes to the registry).
+                    0,
+                    0,
+                    0,
+                    bytes_sent,
+                    average_bitrate_mbps,
+                    None,
+                    reason.as_deref(),
+                    tuner_path.as_deref(),
+                    channel_info.as_deref(),
+                    channel_name.as_deref(),
+                    None,
+                    Some(stream_class.as_str()),
+                ) {
+                    warn!("[Session {}] Failed to update HTTP session history: {}", id, e);
+                }
+            }
+            match reason {
+                Some(reason) => info!("[Session {}] http stream ended: {}", id, reason),
+                None => info!("[Session {}] http stream ended", id),
+            }
         });
     }
 }
@@ -204,12 +316,22 @@ mod tests {
         }
     }
 
+    fn test_db() -> DatabaseHandle {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::database::Database::open_in_memory().unwrap(),
+        ))
+    }
+
     #[tokio::test]
     async fn registers_and_unregisters_with_channel_details() {
         let registry = Arc::new(SessionRegistry::new());
 
-        let (session, _shutdown_rx) =
-            HttpStreamSession::register(Arc::clone(&registry), session_info(SessionProtocol::Mirakurun)).await;
+        let (session, _shutdown_rx) = HttpStreamSession::register(
+            Arc::clone(&registry),
+            test_db(),
+            session_info(SessionProtocol::Mirakurun),
+        )
+        .await;
         let id = session.id();
 
         let sessions = registry.get_all().await;
@@ -238,7 +360,12 @@ mod tests {
         let bndp_id = registry.allocate_id();
         let _bndp = registry.register(bndp_id, addr(), SessionProtocol::Bndp).await;
 
-        let (http, _rx) = HttpStreamSession::register(Arc::clone(&registry), session_info(SessionProtocol::Http)).await;
+        let (http, _rx) = HttpStreamSession::register(
+            Arc::clone(&registry),
+            test_db(),
+            session_info(SessionProtocol::Http),
+        )
+        .await;
         assert_ne!(http.id(), bndp_id);
         assert_eq!(registry.count().await, 2);
     }

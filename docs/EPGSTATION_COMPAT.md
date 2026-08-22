@@ -445,7 +445,40 @@ EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
 - 信号レベル・ドロップ数は 0 のまま。HTTP は共有 broadcast を読むだけで、BNDP のような
   クライアント単位の送信キューが無く、そこでの取りこぼしという概念が無い
 
-## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 更新)
+## 5.6 `X-Mirakurun-Priority` のチューナー競合への反映 (2026-08-22)
+
+### 調べたこと (EPGStation 側)
+
+- EPGStation は 3 種類の優先度を送る: `recPriority` (録画)、`conflictPriority` (競合時)、
+  `streamingPriority` (ライブ視聴)。既定値はそれぞれ 2 / 1 / 0
+- 送出はどちらのストリームエンドポイントでも同じヘッダ (`X-Mirakurun-Priority`)
+- **EPG 予約の録画は `GET /programs/{id}/stream` を通る** (`RecordingStreamCreator.ts:248`)。
+  `GET /services/{id}/stream` はライブ視聴と時間指定録画の両方が通る
+
+### 実装
+
+1. **優先度の伝搬**: `channel_resolve::start_tuner_for_service_with_claim()` を追加し、
+   ヘッダ値を `EffectiveClaim { priority, exclusive: false }` として `acquire` へ渡す。
+   ヘッダが無い/不正な場合は 0 になり、従来どおり `channels.priority` の DB 既定値が使われる。
+   **Mirakurun の優先度で DB 優先度を上書きしない**(明示指定が無いときだけ DB を見る)
+2. **ストリームクラスの判定**: `/programs/{id}/stream` は無条件で `Record`。
+   `/services/{id}/stream` は **`priority > 0` なら `Record`、それ以外は `View`** として登録する。
+   このエンドポイントには録画か視聴かを区別する他の手がかりが無いため、EPGStation の既定値
+   (録画 2 / 競合 1 / 視聴 0) を根拠にしたヒューリスティック。判定はダッシュボードの
+   「チューナーが埋まっている理由」表示と、次項の欠損時の扱いの両方に効く
+3. **RECORD の欠損を無音にしない**: `Record` と判定したストリームは
+   `broadcast::error::RecvError::Lagged` で応答を打ち切る (`web/stream.rs::LossPolicy::Fatal`)。
+   `View` は従来どおり再同期して継続する
+4. **HTTP ストリームも `session_history` に残す**: 従来 BNDP セッションしか履歴行を作っておらず、
+   EPGStation の録画が落ちても理由が残らなかった。`HttpStreamSession` が開始時に
+   `insert_session_start`、Drop 時に `update_session_end` を行い、上記の打ち切りでは
+   `disconnect_reason = record_broadcast_lag` を記録する
+
+### 未確認
+
+実起動での競合検証は未実施 (§7)。
+
+## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 / 2026-08-22 更新)
 
 `web/mirakurun.rs` / `web/mod.rs:126-136` を読んだ結果 + §5.2 の実起動確認。
 
@@ -463,7 +496,7 @@ EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
 | `remoteControlKeyId` の欠損 | 実装済み (2026-08-14) | 手動登録 (CSV インポート / `POST /api/channels`) した行は `remote_control_key` が NULL で、EPGStation の番組表・放映中で末尾に回されていた。視聴・EPG 収集中の NIT から NULL の列だけ補完する (`tuner/nit_collector.rs` → `nit_writer.rs`)。**一度も選局していない局は埋まらない**。§5.4 |
 | ダッシュボードのクライアント表示 | 実装済み (2026-08-14) | EPGStation の視聴・録画ストリームがクライアント一覧に出るようになった (`protocol` = `mirakurun`)。切断・グラフ・プレビューも同じ行から使える。§5.5 |
-| `X-Mirakurun-Priority` | **受理のみ** | パースしてログに出すが、チューナー競合には反映していない。**録画がライブ視聴に負ける状態は解消していない**。反映には `tuner/policy.rs::decide()` の設計変更が要る (CLAUDE.md「選局」の不変条件) |
+| `X-Mirakurun-Priority` | 実装済み (2026-08-22) | `/services/{id}/stream` と `/programs/{id}/stream` の両方で、ヘッダ値をそのまま `EffectiveClaim.priority` として `tuner::acquire::acquire` へ渡す (`channel_resolve::start_tuner_for_service_with_claim`)。**DB のチャンネル優先度を置き換えるのではなく、明示指定が無いときだけ DB 既定値へフォールバックする**。exclusive は同順位時の比較軸のままで、優先度へ畳み込まない。§5.6 |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` / `video` / `audio` / `relatedItems` | 無し | 番組詳細が埋まらない・イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 (`EPGUpdateManageModel.ts:144-147`) |
 | `isFree` | 常に `true` 固定 | 無料/有料の判別ができない |
@@ -481,7 +514,7 @@ EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
 1. ~~**実起動での疎通確認**~~ — 2026-08-12 に実施済み (§5.2)。ただし**録画そのものは未検証**:
    `GET /programs/{id}/stream` の EIT[p/f] ゲートが実際の放送波で開閉するかは、EPGStation から
    予約を通して初めて確認できる (§7)
-2. `X-Mirakurun-Priority` をチューナー競合ポリシーへ反映する (録画 > ライブ視聴)。`tuner/policy.rs::decide()` の設計変更が要る
+2. ~~`X-Mirakurun-Priority` をチューナー競合ポリシーへ反映する~~ — 2026-08-22 実装 (§5.6)。実起動での競合検証は未実施
 3. `Program.extended` / `video` / `audio` / `relatedItems`、`isFree`、放送時間未定 (`duration: 1`) — いずれも `programs` テーブルのスキーマ拡張が前提
 4. ~~`NW1`〜`NW40` (県外地上波)~~ — 2026-08-12 実装 (§5.3)。衛星の `channel` 文字列 (`BS15_0` 形式) は未対応のまま
 
@@ -501,8 +534,11 @@ EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
      後から変えると EPGStation 側の `channelType` が一斉に変わる**ため、変更するなら EPGStation の
      放送局更新を挟むこと (放送局 ID は変わらないので予約・録画は維持される)
 - `decode` クエリを無視して常時デコード済みを返す運用で、EPGStation 側に不都合が出ないか
-- `X-Mirakurun-Priority` を無視したまま運用したときに、実際にどの程度「録画がライブ視聴に負ける」か
-  (競合が起きる構成でしか観測できない)
+- §5.6 の優先度伝搬が実際の競合で意図どおり働くか (録画が視聴を退避できるか、逆が起きないか)。
+  競合が起きる構成でしか観測できない
+- §5.6 の「priority > 0 なら録画扱い」ヒューリスティックが、EPGStation 側の
+  `streamingPriority` を 0 より大きく設定している利用者で誤判定しないか。誤判定すると
+  ライブ視聴がラグで切断される (録画としては正しい挙動だが視聴としては過剰)
 - §1・§3・§4・§6 に記した EPGStation 側の改修 (`ChannelDB` の配列/単一オブジェクト両対応、
   `tunerServerType` の明示指定、`/docs` 取得失敗時のログ) は**実装は完了しているが未コミット**であり、
   いつ・どのバージョンで正式リリースに取り込まれるかは未確定。本ファイルの当該記述は
