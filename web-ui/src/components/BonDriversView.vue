@@ -208,7 +208,24 @@ onMounted(load)
                    利用者が追えないため状態として出す。 -->
               <td v-if="listIsVisible('state')" data-label="状態">
                 <span v-if="row.is_scanning" class="badge badge-scanning">スキャン中</span>
-                <span v-else>—</span>
+                <!-- 「開けない」と「遅い」は別の障害。どちらも視聴できない
+                     理由になり得るので、いつ再試行されるかまで出す。 -->
+                <span
+                  v-if="row.breaker_state === 'open'"
+                  class="badge badge-breaker-open"
+                  :title="`連続したオープン失敗のため一時的に使用を停止しています`"
+                >オープン失敗中<template v-if="row.breaker_retry_in_secs">（あと{{ row.breaker_retry_in_secs }}秒）</template></span>
+                <span
+                  v-else-if="row.breaker_state === 'half_open'"
+                  class="badge badge-degraded"
+                  title="復旧したか確かめるため、1件だけ試しています"
+                >復旧確認中</span>
+                <span
+                  v-else-if="row.breaker_state === 'degraded'"
+                  class="badge badge-degraded"
+                  title="オープンには成功しますが、毎回時間がかかりすぎています"
+                >動作が遅い</span>
+                <span v-if="!row.is_scanning && (!row.breaker_state || row.breaker_state === 'healthy')">—</span>
               </td>
               <td data-label="操作">
                 <div class="actions">

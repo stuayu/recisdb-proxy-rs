@@ -40,6 +40,21 @@ pub struct BonDriverInfo {
     /// already descrambled. 4K is switched off automatically by band as well;
     /// this covers descrambled sources that are not 4K.
     pub disable_b25: bool,
+    /// Circuit state of the driver's open path: `"healthy"`, `"degraded"`
+    /// (answers, but far too slowly), `"open"` (refusing opens after repeated
+    /// failures) or `"half_open"` (one trial open is being allowed through).
+    ///
+    /// A tuner that is busy must always show *why* (CLAUDE.md, Web
+    /// ダッシュボード) — "the circuit is open for another 12 s" is a reason a
+    /// user can act on, whereas a bare failure is not.
+    pub breaker_state: String,
+    /// Seconds until this driver will be tried again, when the circuit is
+    /// open. `None` otherwise.
+    pub breaker_retry_in_secs: Option<u64>,
+    /// Combined driver health, `0.0`–`1.0`: stream integrity multiplied by
+    /// runtime health (startup latency, stalls, failures). `1.0` also means
+    /// "no observations yet".
+    pub quality_score: f64,
     /// Whether a channel scan is holding this driver right now. The scan
     /// reserves a real tuner slot, so this is also why the driver may look
     /// unavailable to viewers.
@@ -116,6 +131,9 @@ pub async fn get_bondrivers(
             max_instances: d.max_instances,
             stream_format: db.driver_stream_format(&d.dll_path).as_db_value().to_string(),
             disable_b25: db.driver_disables_b25(&d.dll_path),
+            breaker_state: breaker_state_str(&web_state, &d.dll_path),
+            breaker_retry_in_secs: breaker_retry_in_secs(&web_state, &d.dll_path),
+            quality_score: db.get_driver_quality_score_by_path(&d.dll_path).unwrap_or(1.0),
             is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
             created_at: d.created_at,
             updated_at: d.updated_at,
@@ -127,6 +145,26 @@ pub async fn get_bondrivers(
         "bondrivers": bondrivers,
         "count": bondrivers.len()
     })))
+}
+
+/// Circuit state of `dll_path`'s open path, as a stable API string.
+fn breaker_state_str(web_state: &Arc<WebState>, dll_path: &str) -> String {
+    use crate::tuner::open_backoff::BreakerState;
+    match web_state.tuner_pool.open_backoff().state(dll_path) {
+        BreakerState::Healthy => "healthy",
+        BreakerState::Degraded => "degraded",
+        BreakerState::Open => "open",
+        BreakerState::HalfOpen => "half_open",
+    }
+    .to_string()
+}
+
+fn breaker_retry_in_secs(web_state: &Arc<WebState>, dll_path: &str) -> Option<u64> {
+    web_state
+        .tuner_pool
+        .open_backoff()
+        .cooldown_remaining(dll_path)
+        .map(|d| d.as_secs().max(1))
 }
 
 /// Get single BonDriver.
@@ -154,6 +192,9 @@ pub async fn get_bondriver(
                 max_instances: d.max_instances,
                 stream_format: db.driver_stream_format(&d.dll_path).as_db_value().to_string(),
                 disable_b25: db.driver_disables_b25(&d.dll_path),
+                breaker_state: breaker_state_str(&web_state, &d.dll_path),
+                breaker_retry_in_secs: breaker_retry_in_secs(&web_state, &d.dll_path),
+                quality_score: db.get_driver_quality_score_by_path(&d.dll_path).unwrap_or(1.0),
                 is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
                 created_at: d.created_at,
                 updated_at: d.updated_at,

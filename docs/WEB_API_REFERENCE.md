@@ -112,6 +112,16 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 
 サービスの**登録・削除はWeb APIにはありません**。管理者権限が必要な操作であり、任意の実行ファイルをネットワーク越しに常駐登録できると権限昇格の経路になるためです。登録はセットアップウィザードか `recisdb-proxy service install` から行います。
 
+### BonDriverの健全性
+
+`GET /api/bondrivers` の各行に次が入る。
+
+- `breaker_state` — `healthy` / `degraded`（開けるが毎回遅すぎる）/ `open`（連続失敗で一時停止中）/ `half_open`（復旧確認の1件だけ通している）
+- `breaker_retry_in_secs` — `open` のとき、次に試すまでの秒数
+- `quality_score` — ストリーム品質 × 実行時ヘルス（起動レイテンシ・stall・失敗）の積。`1.0` は「観測がまだ無い」も意味する
+
+ダッシュボードの「状態」列に出る。詳細: `docs/DISTRIBUTED_TUNER_FABRIC.md` §9。
+
 ## 分散ノード
 
 `[node] enabled = true` のときに使う。これらは**ダッシュボード側**のAPIで、通常の `/api/*` 認証に従う。

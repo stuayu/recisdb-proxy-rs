@@ -839,7 +839,8 @@ pub(crate) async fn acquire(
                 // dozens of times a second forever. Checked right before the
                 // actual open so a cooldown that expires between rounds is
                 // picked up promptly rather than only at the top of `acquire`.
-                if let Some(retry_in) = pool.open_backoff().cooldown_remaining(&key.tuner_path) {
+                let admission = pool.open_backoff().try_admit(&key.tuner_path);
+                if let crate::tuner::open_backoff::Admission::Reject { retry_in } = admission {
                     drop(start_permit);
                     if let Some(w) = warm_to_use {
                         w.shutdown().await;
@@ -938,7 +939,11 @@ pub(crate) async fn acquire(
                     last_start_failure = Some(AcquireError::ReaderStart(e));
                     continue;
                 }
-                pool.open_backoff().record_success(&key.tuner_path);
+                // Latency, not just success: a driver that always answers but
+                // takes ten seconds is Degraded, and gets less rope before the
+                // next failure streak opens its circuit.
+                pool.open_backoff()
+                    .record_success_with_latency(&key.tuner_path, start_began.elapsed().as_millis() as u64);
                 spawn_runtime_health_recorder(
                     database.clone(),
                     Arc::clone(&tuner),

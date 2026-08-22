@@ -402,6 +402,39 @@ quality so either kind of failure can demote the route.
 A driver with no samples scores a neutral `1.0`. Treating "unknown" as "bad"
 would make selection avoid every newly added tuner.
 
+### 9.2 Circuit breaker (`tuner::open_backoff`)
+
+```text
+Healthy ──repeated slow opens──▶ Degraded
+   │                                │
+   └────repeated failures───────────┴──▶ Open
+                                         │ cooldown elapsed
+                                         ▼
+                                      HalfOpen ──success──▶ Healthy
+                                         │ failure
+                                         └──────────────▶ Open
+```
+
+- **Degraded** comes from the *soft* deadline: an open that succeeds but takes
+  longer than 5 s, three times in a row. The path stays admitted — a slow tuner
+  beats no tuner — but its failure threshold drops from 3 to 2, and
+  `tuner::policy` already ranks it below healthy siblings through the quality
+  score.
+- **Open** rejects every request until an exponential cooldown elapses (capped
+  at 30 s, so a permanently broken driver is still retried at a human-visible
+  cadence).
+- **HalfOpen** admits **exactly one** trial. Before this, a queue of clients
+  waiting out a cooldown all hit the DLL the instant it expired. A trial nobody
+  reports back on is released after 30 s, so one lost caller cannot close the
+  path forever.
+
+`acquire` calls `try_admit` once per attempt (it *takes* the trial slot) and
+reports the outcome through `record_success_with_latency` / `record_failure`.
+
+The dashboard's BonDriver list shows the state in the 状態 column with the
+remaining cooldown, because "the circuit is open for another 12 s" is a reason
+a user can act on and a bare failure is not.
+
 Long term, untrusted/poor native BonDriver code should run in a supervisor-owned
 worker process. Tokio blocking-task timeouts can abandon a waiter but cannot
 force a hung native DLL callback to return; a process boundary is required for
@@ -458,6 +491,7 @@ Done:
   `RemoteMuxStream` with renew / reconnect / `from_seq` resume and the RECORD
   no-silent-gap rule.
 - Route advertisement build/exchange/persistence (§4.3).
+- Circuit breaker on the driver open path (§9.2).
 - Driver runtime health is now actually measured and fed into selection
   (§9): startup latency, first-TS latency, soft stalls, hard no-data timeouts
   and open/tune failures. Before this the table existed and `tuner::policy`
@@ -479,9 +513,9 @@ Not done yet:
 - **Path selection on the request path is static, not measured** (§4.4).
 - Route-group weights are stored but not consulted during candidate
   generation.
-- **No circuit breaker.** `open_backoff` cools a driver down after repeated
-  open failures, but there is no Healthy → Degraded → Open → HalfOpen state
-  machine, and no separate soft/hard deadline for `Open`/`SetChannel`/`Stop`.
+- **No per-operation soft/hard deadlines.** The breaker below distinguishes a
+  slow open from a failed one, but `SetChannel`, first-TS and `Stop` still
+  share one timeout budget each rather than a soft/hard pair.
 - **No BonDriver process isolation** (`recisdb-driver-worker`,
   `DriverSupervisor`). `spawn_blocking` + timeout cannot kill a thread stuck
   inside a native DLL call, and a DLL crash still takes the proxy with it.
