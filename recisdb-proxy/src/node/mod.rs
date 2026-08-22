@@ -28,7 +28,9 @@ pub use discovery::{
 pub use frame::{FrameFlags, NodeTsFrame};
 pub use identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 pub use lease::{LeasePolicy, RemoteLeaseId, RemoteLeaseManager, RemoteMuxLease};
-pub use path::{PathHealth, PathPolicy, PathState, TransportPath};
+pub use path::{
+    score_path, select_best_path, PathHealth, PathPolicy, PathScore, PathState, TransportPath,
+};
 pub use qualification::{
     challenger_beats_current, qualify, QualificationDecision, QualificationPolicy,
     QualificationResult, ReceptionObservation, RouteQualifier,

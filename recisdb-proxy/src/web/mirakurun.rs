@@ -70,9 +70,9 @@
 //!   logo file and so reports `hasLogoData: false`.
 //! - `X-Mirakurun-Priority` (sent on both stream endpoints, real and EPG-
 //!   Station-specific: `recPriority`/`conflictPriority`/`streamingPriority`)
-//!   is accepted and parsed but **not** fed into tuner-contention decisions
-//!   (`tuner/policy.rs::decide()`) — that requires a design decision outside
-//!   this pass's scope. See [`stream_service_by_mirakurun_id`].
+//!   is parsed and propagated as the request's contention priority while
+//!   exclusivity remains a separate rank component. See
+//!   [`stream_service_by_mirakurun_id`].
 //!
 //! # Data mapping
 //!
@@ -145,6 +145,7 @@ use crate::web::stream::{
     service_filtered_body_stream, session_info_for, BodyReceiver, StreamCleanup,
 };
 use recisdb_protocol::{BandType, StreamClass};
+use crate::tuner::EffectiveClaim;
 
 // ============================================================================
 // Service id <-> (nid, sid) conversion
@@ -974,8 +975,8 @@ fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
 /// the whole multiplex: Mirakurun's per-service stream carries one service,
 /// and EPGStation records straight off this endpoint.
 ///
-/// `X-Mirakurun-Priority` is parsed and logged (see
-/// [`parse_mirakurun_priority`]) but not otherwise acted on.
+/// `X-Mirakurun-Priority` is the contention priority passed to the central
+/// tuner policy (see [`parse_mirakurun_priority`]).
 pub async fn stream_service_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -1001,7 +1002,7 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service_with_claim(&web_state.tuner_pool, &web_state.database, &resolved, EffectiveClaim::new(priority, false)).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(id, &e),
     };
@@ -1262,8 +1263,7 @@ pub async fn get_logo(Path(id): Path<u64>) -> Response {
 /// otherwise consulted (in particular, the *content* of the recording comes
 /// live off the tuner, not from anything stored about the program).
 ///
-/// `X-Mirakurun-Priority` is parsed and logged (see
-/// [`parse_mirakurun_priority`]) but not otherwise acted on, same as
+/// `X-Mirakurun-Priority` is propagated to tuner contention, same as
 /// [`stream_service_by_mirakurun_id`].
 pub async fn stream_program_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
@@ -1308,7 +1308,7 @@ pub async fn stream_program_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service_with_claim(&web_state.tuner_pool, &web_state.database, &resolved, EffectiveClaim::new(priority, false)).await {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(id, &e),
     };

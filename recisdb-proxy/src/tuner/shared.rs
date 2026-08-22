@@ -418,6 +418,24 @@ impl SharedTuner {
         *self.slot.lock().unwrap() = Some(permit);
     }
 
+    /// Put a permit back only if this entry is not already holding one.
+    ///
+    /// Used by `tuner::acquire`'s carried-permit guard on the error paths of a
+    /// same-DLL channel switch: the permit was detached from this still-live
+    /// reader, so it must go back rather than be released while the native
+    /// BonDriver stays open. Unlike [`Self::set_slot_permit`] this never
+    /// silently drops an existing reservation — if one is already stored the
+    /// permit is handed back to the caller to release itself.
+    #[must_use = "an unrestored permit must still be released"]
+    pub(crate) fn restore_slot_permit(&self, permit: SlotPermit) -> Option<SlotPermit> {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.is_some() {
+            return Some(permit);
+        }
+        *slot = Some(permit);
+        None
+    }
+
     /// Take this entry's driver-slot reservation, if it currently holds one.
     ///
     /// Used for two distinct purposes (docs/TUNER_PIPELINE_REDESIGN.md P1b):

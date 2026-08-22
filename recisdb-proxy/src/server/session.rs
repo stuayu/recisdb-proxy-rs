@@ -55,7 +55,6 @@ use crate::server::session_space_cache::{
     get_space_list_with_names as get_space_list_with_names_cached,
     map_space_idx_to_actual_with_region as map_space_idx_to_actual_with_region_cached,
 };
-use crate::server::session_driver_selection::select_group_driver_for_channel;
 use crate::server::session_capacity::{cleanup_unused_tuner_after_switch, driver_max_instances};
 use crate::server::session_channel_candidates::collect_group_channel_candidates;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
@@ -1522,19 +1521,20 @@ impl Session {
             self.id, channel, tuner_path
         );
 
-        // STREAMING_DESIGN.md §2: mirror the v2 SetChannelSpace priority
-        // resolution (client priority > exclusive-max > DB default) so v1
-        // SetChannel sessions get the same auto-promotion behavior.
+        // Priority and exclusivity are independent rank components. An
+        // exclusive request with no explicit priority inherits the DB default
+        // instead of being rewritten to i32::MAX. The same canonical values
+        // are stored for the eventual incumbent subscription below.
         let channel_priority_for_class = if effective_priority > 0 {
             effective_priority
-        } else if effective_exclusive {
-            i32::MAX
         } else {
             let db = self.database.lock().await;
             db.get_channel_priority(&tuner_path, 0, channel as u32)
                 .unwrap_or(Some(0))
                 .unwrap_or(0)
         };
+        self.tuner_claim_priority = channel_priority_for_class;
+        self.tuner_claim_exclusive = effective_exclusive;
         self.maybe_promote_stream_class(channel_priority_for_class).await;
 
         let key = ChannelKey::simple(&tuner_path, channel);
@@ -1758,108 +1758,6 @@ impl Session {
     }
 
 
-    /// Try one candidate driver for a logical (NID, TSID) selection.
-    ///
-    /// The outer loop in `handle_select_logical_channel` walks candidates in
-    /// the DB's own priority order and calls this once per candidate, rather
-    /// than handing the whole list to `acquire` at once: `decide` re-sorts a
-    /// candidate list by (exclusive count, load, quality score), which would
-    /// discard the DB ordering this path deliberately relies on. Unifying
-    /// the two ordering rules is P2b-3's call
-    /// (docs/TUNER_PIPELINE_REDESIGN.md).
-    async fn try_select_logical_channel_candidate(
-        &mut self,
-        candidate_idx: usize,
-        tuner_id: &str,
-        space: u32,
-        channel: u32,
-        carried_permit: &mut Option<SlotPermit>,
-    ) -> Option<std::io::Result<()>> {
-        let key = ChannelKey::space_channel(tuner_id, space, channel);
-        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
-
-        self.set_selected_tuner_path(tuner_id).await;
-
-        let own_key_will_free_slot = carried_permit
-            .as_ref()
-            .is_some_and(|p| p.dll_path() == tuner_id);
-        let warm = self.warm_tuner.take();
-        let request = AcquireRequest {
-            candidates: vec![key.clone()],
-            priority: 0,
-            // The BNDP `SelectLogicalChannel` message carries no exclusive
-            // flag, so there is nothing to propagate here. Displacing a
-            // live viewer still happens when this request outranks it
-            // (P2b-3's unified rule) — `exclusive` only decides ties.
-            exclusive: false,
-            bondriver_version: 2,
-            carried_permit: carried_permit.take(),
-            warm,
-            own_key: old_tuner_key.clone(),
-            own_key_will_free_slot,
-            client_host: self.addr.ip().to_string(),
-        };
-
-        let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                info!(
-                    "[Session {}] SelectLogicalChannel: candidate {} '{}' unavailable: {}",
-                    self.id, candidate_idx, tuner_id, e
-                );
-                return None;
-            }
-        };
-
-        self.absorb_acquire_leftovers(outcome.unused_permit.is_some(), outcome.unused_warm);
-        // Unconsumed permit goes back into the carrier so the next candidate
-        // (or the caller's restore path) can still use it — releasing it here
-        // would hand the slot away while this session's old reader still
-        // holds the device open.
-        if carried_permit.is_none() {
-            *carried_permit = outcome.unused_permit;
-        }
-
-        self.tuner_pool.cancel_idle_close(&outcome.key).await;
-
-        let cleanup_old = handoff_current_tuner(
-            self.id,
-            &mut self.ts_receiver,
-            &mut self.current_tuner,
-            outcome.tuner.clone(),
-            self.tuner_claim_priority,
-            self.tuner_claim_exclusive,
-            self.state == SessionState::Streaming,
-            "SelectLogicalChannel:",
-        ).await;
-        if let Some(old) = cleanup_old {
-            // SelectLogicalChannel: group members are assumed to
-            // hard-exclusive the underlying hardware, so a same-DLL switch
-            // always stops the old reader synchronously, even with spare
-            // capacity (unlike SetChannelSpace's idle-close allowance).
-            cleanup_unused_tuner_after_switch(
-                &self.database,
-                &self.tuner_pool,
-                self.id,
-                old,
-                Some(tuner_id),
-                true,
-                "SelectLogicalChannel cleanup:",
-            ).await;
-        }
-
-        let tuner = self.current_tuner.clone()?;
-        Some(
-            self.finish_logical_channel_selection_success(
-                &tuner,
-                candidate_idx,
-                tuner_id,
-                space,
-                channel,
-            ).await,
-        )
-    }
-
     async fn finish_logical_channel_selection_success(
         &mut self,
         tuner: &Arc<SharedTuner>,
@@ -1941,10 +1839,14 @@ impl Session {
             .get_effective_controls(self.id)
             .await
             .unwrap_or((Some(priority), exclusive));
-        let _priority = effective_priority.unwrap_or(priority);
-        let _exclusive = effective_exclusive;
-        self.tuner_claim_priority = _priority;
-        self.tuner_claim_exclusive = _exclusive;
+        // Preliminary claim from the wire/dashboard controls. It is refined
+        // once below (DB default when no explicit priority) and then never
+        // recomputed: acquire, the incumbent subscription and any later
+        // handoff all read `tuner_claim_{priority,exclusive}`.
+        let requested_priority = effective_priority.unwrap_or(priority);
+        let requested_exclusive = effective_exclusive;
+        self.tuner_claim_priority = requested_priority;
+        self.tuner_claim_exclusive = requested_exclusive;
         
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             error!("[Session {}] SetChannelSpace: Tuner not open (state: {:?})", self.id, self.state);
@@ -1978,11 +1880,10 @@ impl Session {
         // NID+TSID matching allows different BonDrivers to use different bon_channel values
         // for the same logical channel (same NID+TSID).
         //
-        // Collected exactly once and reused for both driver selection and the
-        // `acquire` candidate list. Before P2b-2 this query ran twice per
-        // channel change — once inside `select_group_driver_for_channel` and
-        // again to build `fallback_candidates` (docs/TUNER_PIPELINE_REDESIGN.md
-        // §2.2-14).
+        // Candidate discovery only. The winner is chosen once, by
+        // `tuner::policy::decide` inside `acquire`, from this complete list —
+        // there is no longer any caller-side preselection
+        // (docs/TUNER_PIPELINE_REDESIGN.md §2.2-14).
         let group_candidates: Vec<(String, u32, u32)> = if self.group_driver_paths.is_empty() {
             Vec::new()
         } else {
@@ -1999,39 +1900,22 @@ impl Session {
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
 
         let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty() {
-            let Some(selection) = select_group_driver_for_channel(
-                &self.database,
-                &self.tuner_pool,
-                self.id,
-                &self.group_driver_paths,
-                group_candidates.clone(),
-            ).await else {
-                error!("[Session {}] SetChannelSpace: Channel NID=0x{:04X} TSID=0x{:04X} not found in any group driver", 
-                    self.id, entry.nid, entry.tsid);
+            let Some((path, driver_space, driver_bon_channel)) = group_candidates.first().cloned() else {
+                error!(
+                    "[Session {}] SetChannelSpace: Channel NID=0x{:04X} TSID=0x{:04X} not found in any group driver",
+                    self.id, entry.nid, entry.tsid
+                );
                 return self.send_message(ServerMessage::SetChannelSpaceAck {
                     success: false,
                     error_code: ErrorCode::InvalidParameter.into(),
                 }).await;
             };
-
-            let (path, driver_space, driver_bon_channel) = selection.selected_driver;
-            debug!("[Session {}] Final selected driver for channel: {} (space {}, ch {})", 
-                self.id, path, driver_space, driver_bon_channel);
-            self.set_selected_tuner_path(&path).await;
+            // This is only a representative used for DB-default priority and
+            // same-DLL permit handoff. The actual winner is chosen once, by
+            // acquire()/policy, from the complete candidate set below.
             (path, driver_space, driver_bon_channel)
         } else {
-            // Single tuner mode
             match &self.current_tuner_path {
-                // ★ Use the representative channel row's own bon_space,
-                // not the region's representative `actual_space`: they are
-                // usually the same value, but when a region mixes NIDs from
-                // more than one physical space (e.g. a broad-area feed and
-                // a prefectural feed sharing a region), `actual_space` is
-                // only guaranteed to be the space of *some* channel in the
-                // region, not necessarily this `entry`'s. `entry.bon_space`
-                // is always the space from the same physical row `entry`
-                // (and thus `entry.bon_channel`) came from, so the pair
-                // stays consistent.
                 Some(p) => (p.clone(), entry.bon_space, entry.bon_channel),
                 None => {
                     error!("[Session {}] SetChannelSpace: current_tuner_path is None", self.id);
@@ -2087,24 +1971,20 @@ impl Session {
             }
         });
 
-        // ★ Use client-provided priority, or database default if priority <= 0
-        let channel_priority = if priority > 0 {
-            priority
-        } else if exclusive {
-            // If exclusive is requested, use maximum priority
-            i32::MAX
+        // Use explicit client priority, otherwise the DB default. Exclusive
+        // remains a separate tie-breaker and must never be encoded into the
+        // numeric priority. Store exactly the rank handed to acquire so the
+        // incumbent subscription cannot later appear weaker than its request.
+        let channel_priority = if requested_priority > 0 {
+            requested_priority
         } else {
-            // Database default for the *primary* candidate. In group mode the
-            // other candidates are the same logical channel on sibling
-            // drivers and normally carry the same configured priority, so
-            // looking it up once here (rather than per candidate, which would
-            // need the winner before `decide` has picked one) matches what
-            // this path did before P2b-2.
             let db = self.database.lock().await;
             db.get_channel_priority(&tuner_path, actual_space, actual_bon_channel)
                 .unwrap_or(Some(0))
                 .unwrap_or(0)
         };
+        self.tuner_claim_priority = channel_priority;
+        self.tuner_claim_exclusive = requested_exclusive;
 
         // STREAMING_DESIGN.md §2: high-priority (recording-grade) selection
         // auto-promotes this session to RECORD, regardless of what the
@@ -2153,7 +2033,7 @@ impl Session {
         let request = AcquireRequest {
             candidates,
             priority: channel_priority,
-            exclusive,
+            exclusive: requested_exclusive,
             bondriver_version: 2,
             carried_permit: inherited_permit,
             warm,
@@ -2521,6 +2401,10 @@ impl Session {
     }
 
     /// Handle SelectLogicalChannel message.
+    ///
+    /// One logical request is one acquire transaction. Every physical route
+    /// for the requested (NID, TSID) is presented together so policy can pick
+    /// a free/healthy sibling before it ever considers eviction.
     async fn handle_select_logical_channel(
         &mut self,
         nid: u16,
@@ -2541,7 +2425,6 @@ impl Session {
             self.id, nid, tsid, sid
         );
 
-        // Look up channel in database
         let channels = {
             let db = self.database.lock().await;
             match db.get_channels_by_nid_tsid_ordered(nid, tsid, sid) {
@@ -2553,81 +2436,127 @@ impl Session {
                 }
             }
         };
-
         if channels.is_empty() {
-            info!(
-                "[Session {}] No channel found for nid={}, tsid={}, sid={:?}",
-                self.id, nid, tsid, sid
-            );
             return self.fail_logical_channel_selection().await;
         }
 
-        // ★ Iterate through all candidate channels (sorted by priority) and try
-        // each one until we find a tuner that can be opened successfully.
-        // This provides automatic fallback when the highest-priority driver is
-        // busy, at capacity, or experiencing a hardware error.
+        let mut candidates = Vec::new();
+        for channel_with_driver in &channels {
+            let record = &channel_with_driver.channel;
+            let key = ChannelKey::space_channel(
+                &channel_with_driver.bon_driver_path,
+                record.bon_space.unwrap_or(0),
+                record.bon_channel.unwrap_or(0),
+            );
+            if !candidates.contains(&key) {
+                candidates.push(key);
+            }
+        }
+        if candidates.is_empty() {
+            return self.fail_logical_channel_selection().await;
+        }
 
-        // ★ Take this session's own slot permit BEFORE the loop, if switching
-        // away from the current tuner will actually free its slot (this
-        // session is its only subscriber).
-        //
-        // docs/TUNER_PIPELINE_REDESIGN.md P1b §4: this replaces the old
-        // `old_tuner_will_free_slot` count exclusion. The old reader is not
-        // stopped until *after* a candidate succeeds, so on a
-        // `max_instances = 1` driver it still holds the only permit — a
-        // candidate on that same DLL must inherit it rather than wait for a
-        // slot that cannot come free in time. A candidate on a different DLL
-        // leaves the permit untouched (`take_if_on_path`).
+        // SelectLogicalChannel has no wire-level priority/exclusive fields, so
+        // its canonical claim is the configured DB priority of the logical
+        // channel and non-exclusive. This same claim is used by arbitration
+        // and by the subscription installed after handoff.
+        let logical_priority = channels
+            .first()
+            .map(|c| c.channel.priority)
+            .unwrap_or(0);
+        self.tuner_claim_priority = logical_priority;
+        self.tuner_claim_exclusive = false;
+        self.maybe_promote_stream_class(logical_priority).await;
+
+        let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
         let old_tuner_for_permit = self.current_tuner.clone();
-        let mut carried_permit: Option<SlotPermit> = old_tuner_for_permit.as_ref().and_then(|old| {
+        let carried_permit: Option<SlotPermit> = old_tuner_for_permit.as_ref().and_then(|old| {
             let sub_count = old.subscriber_count();
             let will_free =
-                // Streaming: sole broadcast subscriber → slot freed after unsubscribe
                 (sub_count == 1 && self.ts_receiver.is_some()) ||
-                // TunerOpen: no broadcast subscription yet → slot freed immediately
                 (sub_count == 0 && self.ts_receiver.is_none());
             if will_free { old.take_slot_permit() } else { None }
         });
+        let own_key_will_free_slot = carried_permit.is_some();
+        let warm = self.warm_tuner.take();
 
-        for (candidate_idx, channel_with_driver) in channels.iter().enumerate() {
-            let channel_record = &channel_with_driver.channel;
-            let tuner_id = channel_with_driver.bon_driver_path.clone();
-            let space = channel_record.bon_space.unwrap_or(0);
-            let channel = channel_record.bon_channel.unwrap_or(0);
+        let request = AcquireRequest {
+            candidates,
+            priority: logical_priority,
+            exclusive: false,
+            bondriver_version: 2,
+            carried_permit,
+            warm,
+            own_key: old_tuner_key.clone(),
+            own_key_will_free_slot,
+            client_host: self.addr.ip().to_string(),
+        };
 
-            if let Some(result) = self
-                .try_select_logical_channel_candidate(
-                    candidate_idx,
-                    &tuner_id,
-                    space,
-                    channel,
-                    &mut carried_permit,
-                )
-                .await
-            {
-                // Success: the old tuner is stopped by the caller's cleanup,
-                // so an unconsumed permit (candidate was on another DLL) is
-                // released when `carried_permit` drops here.
-                return result;
+        let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if let Some(old) = old_tuner_for_permit.as_ref() {
+                    debug!(
+                        "[Session {}] SelectLogicalChannel: acquire failed with previous tuner {:?}: {}",
+                        self.id, old.key, e
+                    );
+                } else {
+                    debug!("[Session {}] SelectLogicalChannel: acquire failed: {}", self.id, e);
+                }
+                self.try_restore_previous_channel(&old_tuner_key).await;
+                return self.fail_logical_channel_selection().await;
             }
+        };
+
+        self.absorb_acquire_leftovers(outcome.unused_permit.is_some(), outcome.unused_warm);
+        if let Some(permit) = outcome.unused_permit {
+            self.return_unused_permit(permit).await;
         }
 
-        // Every candidate failed. The old reader keeps running (the caller
-        // restores it), so give its permit back — releasing it here would let
-        // the semaphore hand that slot to someone else while the DLL is still
-        // physically open.
-        if let (Some(old), Some(permit)) = (old_tuner_for_permit.as_ref(), carried_permit.take()) {
-            if permit.dll_path() == old.key.tuner_path && old.occupies_slot() {
-                old.set_slot_permit(permit);
-            }
+        let chosen_path = outcome.key.tuner_path.clone();
+        let (chosen_space, chosen_channel) = match outcome.key.channel {
+            ChannelKeySpec::SpaceChannel { space, channel } => (space, channel),
+            ChannelKeySpec::Simple(c) => (0, c as u32),
+        };
+        let candidate_idx = channels
+            .iter()
+            .position(|c| {
+                c.bon_driver_path == chosen_path
+                    && c.channel.bon_space.unwrap_or(0) == chosen_space
+                    && c.channel.bon_channel.unwrap_or(0) == chosen_channel
+            })
+            .unwrap_or(0);
+
+        self.tuner_pool.cancel_idle_close(&outcome.key).await;
+        let cleanup_old = handoff_current_tuner(
+            self.id,
+            &mut self.ts_receiver,
+            &mut self.current_tuner,
+            outcome.tuner.clone(),
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
+            self.state == SessionState::Streaming,
+            "SelectLogicalChannel:",
+        ).await;
+        if let Some(old) = cleanup_old {
+            cleanup_unused_tuner_after_switch(
+                &self.database,
+                &self.tuner_pool,
+                self.id,
+                old,
+                Some(chosen_path.as_str()),
+                true,
+                "SelectLogicalChannel cleanup:",
+            ).await;
         }
 
-        // All candidates exhausted
-        error!(
-            "[Session {}] SelectLogicalChannel: all {} candidate drivers failed for nid={}, tsid={}, sid={:?}",
-            self.id, channels.len(), nid, tsid, sid
-        );
-        self.fail_logical_channel_selection().await
+        self.finish_logical_channel_selection_success(
+            &outcome.tuner,
+            candidate_idx,
+            &chosen_path,
+            chosen_space,
+            chosen_channel,
+        ).await
     }
 
     /// Handle GetChannelList message.

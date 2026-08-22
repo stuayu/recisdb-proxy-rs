@@ -7,14 +7,13 @@
 //! (`TunerSnapshot`) plus the request (`TuneRequest`) and returns a
 //! `Decision` — no I/O, no async, no logging.
 //!
-//! **This module is not wired in yet.** `session.rs`'s existing helpers
-//! (`handle_set_channel_space` and friends) keep making the real decisions
-//! for now; replacing their control flow with calls into [`decide`] is P2.
-//! Wiring it up requires a second effect layer (`tuner/acquire.rs`, P2) that
-//! turns a `Decision` into pool mutations, reader starts, and evictions.
+//! **This module is live.** All modern tuning paths feed their physical
+//! candidate set through `tuner/acquire.rs`, which snapshots state, calls
+//! [`decide`], and executes the returned decision. Keep selection policy here
+//! rather than reintroducing caller-specific preselection.
 //!
 //! The individual pure helpers that used to live in
-//! `server::session_driver_selection` and `server::session_capacity` moved
+//! `server::session_driver_selection` (since removed) and `server::session_capacity` moved
 //! here unchanged (see re-exports at the bottom of those modules) since
 //! `decide` is built directly on top of them:
 //! - candidate ordering: [`sort_candidate_drivers`]
@@ -70,7 +69,7 @@ use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::ChannelKey;
 
 // ---------------------------------------------------------------------
-// Moved from `server::session_driver_selection` (P0).
+// Moved from the former `server::session_driver_selection` (P0).
 // ---------------------------------------------------------------------
 
 /// `(dll_path, bon_space, bon_channel)` — a driver paired with the physical
@@ -264,6 +263,15 @@ impl EntryState {
         self.state == crate::tuner::shared::ReaderState::Running
     }
 
+    /// Whether a new client may join this reader. `Starting` is joinable: the
+    /// reader start is already owned by another request and subscribers may
+    /// wait for it to become ready. `Stopping` is deliberately *not* joinable
+    /// even though it still occupies a driver slot.
+    pub fn is_joinable(&self) -> bool {
+        use crate::tuner::shared::ReaderState;
+        matches!(self.state, ReaderState::Starting | ReaderState::Running)
+    }
+
     /// Whether this entry is holding a slot on its driver — mirrors
     /// [`crate::tuner::SharedTuner::occupies_slot`].
     ///
@@ -309,10 +317,9 @@ impl TunerSnapshot {
     fn running_channel_specs(&self) -> Vec<(String, ChannelKeySpec)> {
         self.entries
             .iter()
-            // `occupies_slot`, not `is_running`: a driver already opening
-            // this exact channel is the right one to join rather than open a
-            // second instance for.
-            .filter(|e| e.occupies_slot())
+            // Starting/Running can be joined. Stopping still occupies a slot
+            // for capacity accounting but must never be resurrected by Reuse.
+            .filter(|e| e.is_joinable())
             .map(|e| (e.key.tuner_path.clone(), e.key.channel.clone()))
             .collect()
     }
@@ -323,17 +330,20 @@ impl TunerSnapshot {
 /// (irrelevant — `decide` re-sorts) list of concrete physical targets: one
 /// entry in single-tuner mode, or one per group driver carrying the same
 /// (NID, TSID) in group mode (mirrors
-/// `select_group_driver_for_channel`'s `candidate_drivers` /
+/// the former `select_group_driver_for_channel`'s `candidate_drivers` /
 /// `try_fallback_drivers`'s `fallback_candidates`, unified into one list
 /// since `decide` handles both the initial pick and the fallback walk).
+///
+/// Callers must present *every* physical route for the logical channel in a
+/// single request. Acquiring per candidate can evict an incumbent on a busy
+/// driver while a free sibling driver was available.
 #[derive(Debug, Clone)]
 pub struct TuneRequest {
     pub candidates: Vec<ChannelKey>,
-    /// Effective client/DB priority for the requested channel (already
-    /// resolved: client priority if `> 0`, else `i32::MAX` if `exclusive`,
-    /// else the DB default — mirrors `handle_set_channel_space`'s
-    /// `channel_priority` computation, which stays outside `decide` since
-    /// it needs a DB read).
+    /// Effective client/DB priority for the requested channel. Priority
+    /// and exclusivity are independent rank components: callers use an
+    /// explicit client priority when `> 0`, otherwise the DB default, and
+    /// pass `exclusive` separately as the tie-breaker.
     pub priority: i32,
     pub exclusive: bool,
     pub min_hold: Duration,
@@ -784,7 +794,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------
-    // Moved from `server::session_driver_selection` (unchanged).
+    // Moved from the former `server::session_driver_selection` (unchanged).
     // -----------------------------------------------------------------
 
     /// Basic priority order: fewer exclusive channels wins first; ties
@@ -1624,4 +1634,64 @@ mod tests {
             Decision::Create { key: ChannelKey::space_channel("Idle.dll", 0, 9), evict: vec![] }
         );
     }
+
+    #[test]
+    fn stopping_reader_occupies_capacity_but_is_never_reused() {
+        use crate::tuner::shared::ReaderState;
+        let key = ChannelKey::space_channel("A.dll", 0, 7);
+        let stopping = EntryState {
+            key: key.clone(),
+            state: ReaderState::Stopping,
+            subscribers: 0,
+            priority: 0,
+            incumbent_exclusive: false,
+            held_for: Duration::from_secs(30),
+            idle_close_pending: false,
+        };
+        assert!(stopping.occupies_slot());
+        assert!(!stopping.is_joinable());
+
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![stopping],
+        };
+        let req = TuneRequest {
+            candidates: vec![key],
+            priority: 0,
+            exclusive: false,
+            min_hold: Duration::ZERO,
+            own_key: None,
+            own_key_will_free_slot: false,
+        };
+        assert!(!matches!(decide(&snapshot, &req), Decision::Reuse { .. }));
+    }
+
+    #[test]
+    fn starting_reader_is_joinable_without_opening_a_duplicate() {
+        use crate::tuner::shared::ReaderState;
+        let key = ChannelKey::space_channel("A.dll", 0, 7);
+        let starting = EntryState {
+            key: key.clone(),
+            state: ReaderState::Starting,
+            subscribers: 0,
+            priority: 0,
+            incumbent_exclusive: false,
+            held_for: Duration::ZERO,
+            idle_close_pending: false,
+        };
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![starting],
+        };
+        let req = TuneRequest {
+            candidates: vec![key.clone()],
+            priority: 0,
+            exclusive: false,
+            min_hold: Duration::ZERO,
+            own_key: None,
+            own_key_will_free_slot: false,
+        };
+        assert_eq!(decide(&snapshot, &req), Decision::Reuse { key });
+    }
+
 }

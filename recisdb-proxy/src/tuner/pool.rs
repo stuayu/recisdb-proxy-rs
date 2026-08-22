@@ -776,7 +776,7 @@ impl TunerPool {
 
         // Create the shared tuner wrapper. Mark it `Reserved` immediately —
         // before it is even inserted into the map — so no concurrent
-        // `cleanup`/`evict_idle_on_path`/capacity-retain call can ever
+        // `cleanup`/capacity-retain call can ever
         // observe it as `Idle` (reclaimable) between insertion and whichever
         // caller-side `start_bondriver_reader`/`WarmTunerHandle::activate`
         // call is about to happen (SYSTEM_REVIEW_2026-07.md M8).
@@ -846,57 +846,49 @@ impl TunerPool {
         self.tuners.read().await.keys().cloned().collect()
     }
 
-    /// Evict all idle (running, no-subscriber) tuners on `tuner_path`, except
-    /// `except`.
+    /// Stop and remove *proven* keep-alive leftovers on `tuner_path`.
     ///
-    /// Unlike [`Self::cleanup`] (which only removes *stopped* tuners with no
-    /// subscribers), this stops and removes tuners that are still *running*
-    /// but currently have zero subscribers — i.e. readers kept warm only by
-    /// `schedule_idle_close`'s keep-alive window. This exists for physical
-    /// devices that allow only a single concurrent `open()` per device path
-    /// (e.g. px4-drv character devices returning `EALREADY`/errno 114 on a
-    /// second open): an idle-but-still-open reader on the same path blocks a
-    /// brand new one from opening at all, so it must be evicted before retrying,
-    /// not just left to expire on its own keep-alive timer.
+    /// "Running with zero subscribers" alone is NOT a safe idle test: a
+    /// reader that has just been started also has zero subscribers until its
+    /// requester attaches, and stopping it kills someone else's in-flight
+    /// tune. The extra condition here is an armed idle-close timer
+    /// (`keys_pending_idle_close`), which is only ever set after a reader
+    /// actually lost its last subscriber.
     ///
-    /// Returns the number of tuners stopped and removed.
-    pub async fn evict_idle_on_path(
+    /// Used only for the Unix single-open-per-device-path constraint (px4-drv
+    /// character devices return `EALREADY` on a second open even when the
+    /// configured `max_instances` says there is room). Capacity-driven
+    /// eviction belongs to `tuner::policy`, not here.
+    pub async fn reclaim_keepalive_leftovers_on_path(
         self: &Arc<Self>,
         tuner_path: &str,
         except: Option<&ChannelKey>,
     ) -> usize {
-        let keys = self.keys().await;
-        let mut evicted = 0usize;
+        let pending: Vec<ChannelKey> = self
+            .keys_pending_idle_close()
+            .await
+            .into_iter()
+            .filter(|k| k.tuner_path == tuner_path && except != Some(k))
+            .collect();
 
-        for key in keys {
-            if key.tuner_path != tuner_path {
-                continue;
-            }
-            if except == Some(&key) {
-                continue;
-            }
-
+        let mut reclaimed = 0usize;
+        for key in pending {
             let Some(tuner) = self.get(&key).await else {
                 continue;
             };
-            // Deliberately `state() == Running` (i.e. `is_running()`), not
-            // `occupies_slot()`: a `Starting` entry has not finished opening
-            // the DLL yet, so stopping it here would race the in-flight
-            // `SetChannel` rather than free up an already-idle reader.
             if !tuner.is_running() || tuner.has_subscribers() {
                 continue;
             }
 
             info!(
-                "evict_idle_on_path: evicting idle reader {:?} to free device path {}",
+                "reclaim_keepalive_leftovers_on_path: stopping keep-alive reader {:?} to free device path {}",
                 key, tuner_path
             );
             self.cancel_idle_close(&key).await;
             tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
-            // stop_reader() is async and yields; a concurrent subscribe() may
-            // have raced in during that await window, so re-check identity
-            // (not just presence) before removing the pool entry — mirrors
-            // the same pattern in schedule_idle_close() above.
+            // stop_reader() yields; a subscribe() may have raced in during
+            // that window, so re-check identity (not just presence) before
+            // removing the entry — same pattern as schedule_idle_close().
             tuner.stop_reader().await;
             {
                 let mut tuners = self.tuners.write().await;
@@ -906,10 +898,9 @@ impl TunerPool {
                     }
                 }
             }
-            evicted += 1;
+            reclaimed += 1;
         }
-
-        evicted
+        reclaimed
     }
 }
 
@@ -1070,116 +1061,6 @@ mod tests {
         assert!(result.is_err(), "still at capacity: Reserved entry must count as occupying its slot");
         assert_eq!(pool.count().await, 1, "tuner_a must not have been evicted while Reserved");
         assert!(pool.get(&key_a).await.is_some());
-    }
-
-    /// M8 corollary: `evict_idle_on_path` must never touch a `Starting`
-    /// entry (it isn't even open yet, let alone idle) — driven through a
-    /// real `spawn_fake_reader` with a long startup delay so the entry is
-    /// genuinely mid-`SetChannel` when eviction is attempted.
-    #[tokio::test]
-    async fn evict_idle_on_path_does_not_touch_starting_entry() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key = ChannelKey::simple("/dev/px4video0", 1);
-
-        let permit = test_permit(&pool, "/dev/px4video0").await;
-        let tuner = pool
-            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
-            .await
-            .unwrap();
-        let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
-        let _ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
-        assert_eq!(tuner.state(), ReaderState::Starting);
-        assert!(!tuner.has_subscribers());
-
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0, "a Starting reader must not be evicted as if it were idle");
-        assert_eq!(pool.count().await, 1);
-        assert_eq!(tuner.state(), ReaderState::Starting, "eviction must not have touched the in-flight startup");
-
-        // Every test that spawns a fake reader must stop and join it before
-        // returning — an un-joined `spawn_blocking` task otherwise wedges
-        // the whole test binary's shutdown (`BlockingPool::shutdown` waits
-        // for it indefinitely). `stop_reader()` requests the stop now, while
-        // the fake is still mid-`set_channel` (`Starting`); the reader must
-        // honor that instead of clobbering it back to `Running` once its
-        // startup delay elapses (see `SharedTuner::try_transition_starting_to_running`).
-        tuner.stop_reader().await;
-        assert_eq!(tuner.state(), ReaderState::Stopped);
-    }
-
-    /// The real "stop a running reader" branch of `evict_idle_on_path`,
-    /// exercised end-to-end via `FakeTsSource` — previously untestable (see
-    /// the removed comment above this test) because there was no way to
-    /// drive a `SharedTuner` into a genuinely running state without a real
-    /// BonDriver DLL.
-    #[tokio::test]
-    async fn evict_idle_on_path_stops_and_removes_running_idle_reader() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key = ChannelKey::simple("/dev/px4video0", 1);
-
-        let permit = test_permit(&pool, "/dev/px4video0").await;
-        let tuner = pool
-            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
-            .await
-            .unwrap();
-        let ready_rx = tuner
-            .spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config())
-            .await;
-        ready_rx.await.unwrap().unwrap();
-        assert_eq!(tuner.state(), ReaderState::Running);
-        assert!(!tuner.has_subscribers(), "no one has subscribed yet -> eligible for idle eviction");
-
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 1);
-        assert_eq!(pool.count().await, 0);
-        assert_eq!(tuner.state(), ReaderState::Stopped);
-    }
-
-    #[tokio::test]
-    async fn evict_idle_on_path_is_noop_when_nothing_on_path() {
-        let pool = Arc::new(TunerPool::new(10));
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0);
-    }
-
-    #[tokio::test]
-    async fn evict_idle_on_path_ignores_other_paths_and_subscribed_entries() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key_a = ChannelKey::simple("/dev/px4video0", 1);
-        let key_b = ChannelKey::simple("/dev/px4video1", 1);
-
-        let permit_a = test_permit(&pool, "/dev/px4video0").await;
-        let tuner_a = pool
-            .get_or_create(key_a.clone(), 2, permit_a, || async { Ok(()) })
-            .await
-            .unwrap();
-        // Keep tuner_a alive across get_or_create's own stale-entry eviction
-        // (a Starting/Stopped entry with no subscribers is otherwise treated
-        // as stale) by giving it a subscriber, matching the pattern the
-        // existing `test_pool_cleanup` test above uses.
-        let _sub_a = tuner_a.subscribe();
-
-        let permit_b = test_permit(&pool, "/dev/px4video1").await;
-        let tuner_b = pool
-            .get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) })
-            .await
-            .unwrap();
-        let _sub_b = tuner_b.subscribe();
-
-        assert_eq!(pool.count().await, 2);
-
-        // Neither entry is running (`Starting`, no real reader started), so
-        // evict_idle_on_path must not touch either regardless of path match:
-        // key_a's own path is excluded by `!is_running()`, key_b's by both
-        // `!is_running()` and the path filter.
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0);
-        assert_eq!(pool.count().await, 2);
-
-        // `except` filtering: even a hypothetical self-match must be skipped.
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", Some(&key_a)).await;
-        assert_eq!(evicted, 0);
-        assert_eq!(pool.count().await, 2);
     }
 
     // -----------------------------------------------------------------

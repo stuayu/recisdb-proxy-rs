@@ -43,6 +43,11 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/config", get(api::get_config))
         .route("/config", post(api::update_config))
         .route("/version", get(api::get_version))
+        // Distributed-node configuration and active path tests. These are
+        // dashboard operations and therefore inherit the normal /api auth.
+        .route("/nodes", get(api::get_nodes).post(api::upsert_node))
+        .route("/nodes/:id/probe", post(api::probe_node))
+        .route("/node-route-groups/member", post(api::set_route_group_member))
         // Update notification / self-update API (web/api/update.rs)
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))

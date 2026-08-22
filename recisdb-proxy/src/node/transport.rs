@@ -10,7 +10,6 @@
 //! callers distinguish this by endpoint scheme and policy.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,8 +20,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use bytes::Bytes;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, StreamExt};
 use recisdb_protocol::StreamClass;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -258,7 +256,7 @@ async fn stream_lease(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let mut live = lease.subscribe_live();
+    let live = lease.subscribe_live();
     let mut replay_frames = Vec::new();
     let mut last_sequence = query.from_seq.map(|seq| seq.saturating_sub(1));
 

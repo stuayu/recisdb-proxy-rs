@@ -22,7 +22,6 @@
 //!   present/following table_id, and reporting straight to the gate instead
 //!   of the DB).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
