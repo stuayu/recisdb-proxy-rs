@@ -21,6 +21,7 @@ pub mod logging;
 pub mod alert;
 pub mod epg_writer;
 pub mod nit_writer;
+pub mod node;
 pub mod preview_setup;
 pub mod px4_installer;
 pub mod scheduler;
