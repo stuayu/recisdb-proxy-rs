@@ -198,6 +198,36 @@ Consuming side (`RemoteMuxStream`):
 Status: both halves are implemented and reachable over the transport. What is
 still missing is the *arbitration* integration — see §12.
 
+### 4.3 Route advertisement sync (`GET /node/v3/routes`)
+
+`node/advertise.rs` builds what this node offers; `node/sync.rs` exchanges it
+on a 60-second tick.
+
+Outbound, one advertisement per (mux, driver, tuning) triple from the enabled
+`channels` rows. Three fields that are easy to get wrong:
+
+- `logical_broadcast` comes from the **NID** first (`classify_nid`), so a 4K
+  mux is 4K even on a row scanned before band classification existed — nothing
+  downstream may run B25 over it (`docs/FOURK_SETUP.md`).
+- `ingress_delivery` / `ultimate_delivery` are separate from the logical
+  family. A BS mux arriving over CATV is `logical_broadcast: bs` with a CATV
+  delivery, never "a CATV channel".
+- `available_slots = 0` is still advertised. "Busy" and "cannot receive this"
+  are different answers, and a peer needs to tell them apart.
+
+Inbound, each peer's list replaces that peer's rows in `reception_routes`
+wholesale — a route it stopped advertising must stop being a candidate. Route
+ids are namespaced per node (`<node>::<route_id>`) because two nodes can
+legitimately use the same DLL path and tuning. Advertisements that would route
+back through this node are dropped by `validate_for` (loop detection).
+
+Non-routable states (`Discovered`, `Quarantined`, `Disabled`) are stored but
+never returned as candidates, so a weak or duplicated relay can be re-probed
+later instead of being deleted and rediscovered forever (§2).
+
+The stored picture is a **cache, not an authority**: a peer can still refuse
+the lease, and `available_slots` may already be stale when it is read.
+
 ## 5. End-to-end request context
 
 Every inter-node acquisition carries one immutable arbitration context:
@@ -371,12 +401,10 @@ Done:
 - Lease supply and demand (§4.2): `POST /node/v3/lease`, the local pump, and
   `RemoteMuxStream` with renew / reconnect / `from_seq` resume and the RECORD
   no-silent-gap rule.
+- Route advertisement build/exchange/persistence (§4.3).
 
 Not done yet:
 
-- **Route advertisement sync.** `GET /node/v3/routes` exists, but nothing polls
-  peers on a timer or writes the results into `reception_routes`, so a node has
-  no persistent picture of what its peers can receive.
 - **Candidate discovery does not see remote routes.** `tuner::acquire` still
   only enumerates local drivers, so `RemoteMuxStream` has to be opened
   explicitly rather than being chosen by central policy against local

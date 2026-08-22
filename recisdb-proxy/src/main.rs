@@ -750,6 +750,16 @@ async fn run_server(
                         ),
                         Err(e) => warn!("Failed to load paired node credentials: {}", e),
                     }
+                    // Advertise our own reception routes and pull the peers'
+                    // back, so candidate discovery has a stored picture
+                    // instead of a round trip per request.
+                    recisdb_proxy::node::RouteSync::new(
+                        Arc::clone(&state),
+                        db.clone(),
+                        Arc::clone(server.tuner_pool()),
+                    )
+                    .spawn();
+
                     let serve_state = Arc::clone(&state);
                     tokio::spawn(async move {
                         if let Err(e) =

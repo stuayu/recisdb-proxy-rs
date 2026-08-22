@@ -9,7 +9,10 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{NodeCredential, NodeIdentity, PairingCode};
-use super::types::{NodeEndpoint, NodeId};
+use super::types::{
+    DeliveryType, LogicalBroadcastType, LogicalMuxId, NodeEndpoint, NodeId,
+    ReceptionRouteAdvertisement, ReceptionRouteState,
+};
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
 
@@ -21,6 +24,21 @@ pub struct StoredNode {
     pub enabled: bool,
     pub allow_transit: bool,
     pub auto_connect: bool,
+    pub last_seen_unix_ms: Option<i64>,
+}
+
+/// One remote physical route, as last advertised by its owning node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredRemoteRoute {
+    pub route_id: String,
+    pub node_id: NodeId,
+    pub mux: LogicalMuxId,
+    pub logical_broadcast: LogicalBroadcastType,
+    pub ingress_delivery: DeliveryType,
+    pub ultimate_delivery: DeliveryType,
+    pub state: ReceptionRouteState,
+    pub source_quality: f64,
+    pub confidence: f64,
     pub last_seen_unix_ms: Option<i64>,
 }
 
@@ -365,6 +383,134 @@ impl<'a> NodeStore<'a> {
         Ok(())
     }
 
+    /// Get-or-create the `logical_muxes` row for `mux`.
+    ///
+    /// The logical family is what a client asks for; how the mux physically
+    /// arrived lives on the individual `reception_routes` rows. Keeping them
+    /// in different tables is what stops "BS over CATV" from being recorded as
+    /// something other than BS.
+    pub fn upsert_logical_mux(
+        &self,
+        mux: LogicalMuxId,
+        logical_broadcast: LogicalBroadcastType,
+        network_name: Option<&str>,
+    ) -> Result<i64> {
+        let broadcast = serde_json::to_value(logical_broadcast)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        self.db.connection().execute(
+            "INSERT INTO logical_muxes (nid, tsid, logical_broadcast, network_name)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(nid, tsid) DO UPDATE SET
+                 logical_broadcast = excluded.logical_broadcast,
+                 network_name = COALESCE(excluded.network_name, logical_muxes.network_name)",
+            params![mux.nid as i64, mux.tsid as i64, broadcast, network_name],
+        )?;
+        let id = self.db.connection().query_row(
+            "SELECT id FROM logical_muxes WHERE nid = ?1 AND tsid = ?2",
+            params![mux.nid as i64, mux.tsid as i64],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Replace everything known about `peer`'s reception routes in one
+    /// transaction.
+    ///
+    /// Replace rather than merge: the peer's advertisement is the complete
+    /// current picture, and a route it stopped advertising must stop being a
+    /// candidate here. Local routes (`node_id IS NULL`) are untouched.
+    pub fn replace_remote_routes(
+        &self,
+        peer: &NodeId,
+        advertisements: &[ReceptionRouteAdvertisement],
+    ) -> Result<()> {
+        let conn = self.db.connection();
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| -> Result<()> {
+            conn.execute(
+                "DELETE FROM reception_routes WHERE node_id = ?1",
+                params![peer.as_str()],
+            )?;
+            for advertisement in advertisements {
+                let mux_id =
+                    self.upsert_logical_mux(advertisement.mux, advertisement.logical_broadcast, None)?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO reception_routes (
+                        route_id, mux_id, node_id, ingress_delivery, ultimate_delivery,
+                        routing_state, source_quality, confidence, last_seen_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        // Namespaced by peer: two nodes can legitimately use
+                        // the same local route id (same DLL path/tuning).
+                        format!("{}::{}", peer.as_str(), advertisement.route_id),
+                        mux_id,
+                        peer.as_str(),
+                        enum_str(advertisement.ingress_delivery),
+                        enum_str(advertisement.ultimate_delivery),
+                        enum_str(advertisement.state),
+                        advertisement.source_quality,
+                        advertisement.confidence,
+                        advertisement.observed_at_unix_ms,
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Remote routes currently known for `mux`, most trustworthy first.
+    ///
+    /// Only routable states are returned: `Discovered`/`Quarantined`/
+    /// `Disabled` routes stay in the table so they can be re-probed later
+    /// rather than being deleted and rediscovered forever.
+    pub fn remote_routes_for(&self, mux: LogicalMuxId) -> Result<Vec<StoredRemoteRoute>> {
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT r.route_id, r.node_id, r.ingress_delivery, r.ultimate_delivery,
+                    r.routing_state, r.source_quality, r.confidence, r.last_seen_unix_ms,
+                    m.logical_broadcast
+             FROM reception_routes r
+             JOIN logical_muxes m ON r.mux_id = m.id
+             JOIN remote_nodes n ON r.node_id = n.node_id
+             WHERE m.nid = ?1 AND m.tsid = ?2 AND r.node_id IS NOT NULL AND n.enabled = 1
+             ORDER BY r.configured_priority DESC, r.confidence DESC, r.source_quality DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![mux.nid as i64, mux.tsid as i64], |row| {
+                let node_id: String = row.get(1)?;
+                Ok(StoredRemoteRoute {
+                    route_id: row.get(0)?,
+                    node_id: NodeId::new(node_id).unwrap_or_else(|_| NodeId::random()),
+                    mux,
+                    logical_broadcast: parse_enum(&row.get::<_, String>(8)?)
+                        .unwrap_or(LogicalBroadcastType::Unknown),
+                    ingress_delivery: parse_enum(&row.get::<_, String>(2)?)
+                        .unwrap_or(DeliveryType::Unknown),
+                    ultimate_delivery: parse_enum(&row.get::<_, String>(3)?)
+                        .unwrap_or(DeliveryType::Unknown),
+                    state: parse_enum(&row.get::<_, String>(4)?)
+                        .unwrap_or(ReceptionRouteState::Discovered),
+                    source_quality: row.get(5)?,
+                    confidence: row.get(6)?,
+                    last_seen_unix_ms: row.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().filter(|r| r.state.routable()).collect())
+    }
+
     /// Record a pairing code this node just issued. Only its digest is kept.
     pub fn create_pending_pairing(
         &self,
@@ -518,6 +664,146 @@ mod tests {
         assert!(store.consume_pending_pairing(&issued).unwrap());
     }
 
+    fn advertisement(
+        node: &NodeId,
+        route_id: &str,
+        mux: LogicalMuxId,
+        state: ReceptionRouteState,
+    ) -> ReceptionRouteAdvertisement {
+        ReceptionRouteAdvertisement {
+            route_id: route_id.into(),
+            origin_node: node.clone(),
+            mux,
+            logical_broadcast: LogicalBroadcastType::Bs,
+            // BS delivered over CATV: logically still BS, physically not.
+            ingress_delivery: DeliveryType::CatvTransmodulation,
+            ultimate_delivery: DeliveryType::IsdbSDirect,
+            path: Vec::new(),
+            state,
+            available_slots: 1,
+            total_slots: 2,
+            predicted_ready_ms: 0,
+            source_quality: 0.7,
+            confidence: 0.9,
+            generation: 1,
+            observed_at_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn paired_node(store: &NodeStore, id: &str) -> NodeId {
+        let node_id = NodeId::new(id).unwrap();
+        store
+            .upsert_node(
+                &StoredNode {
+                    node_id: node_id.clone(),
+                    display_name: id.into(),
+                    site_name: None,
+                    enabled: true,
+                    allow_transit: false,
+                    auto_connect: true,
+                    last_seen_unix_ms: None,
+                },
+                Some(&NodeCredential::random()),
+            )
+            .unwrap();
+        node_id
+    }
+
+    #[test]
+    fn peer_routes_round_trip_and_keep_logical_and_physical_apart() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let peer = paired_node(&store, "tokyo");
+        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+
+        store
+            .replace_remote_routes(
+                &peer,
+                &[advertisement(&peer, "/dev/px4video0#0:0", mux, ReceptionRouteState::Usable)],
+            )
+            .unwrap();
+
+        let routes = store.remote_routes_for(mux).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].node_id, peer);
+        assert_eq!(routes[0].logical_broadcast, LogicalBroadcastType::Bs);
+        assert_eq!(routes[0].ingress_delivery, DeliveryType::CatvTransmodulation);
+        assert_eq!(routes[0].ultimate_delivery, DeliveryType::IsdbSDirect);
+    }
+
+    /// A peer's advertisement is the complete current picture: a route it
+    /// stopped advertising must stop being a candidate here.
+    #[test]
+    fn replacing_peer_routes_drops_what_is_no_longer_advertised() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let peer = paired_node(&store, "tokyo");
+        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+
+        store
+            .replace_remote_routes(
+                &peer,
+                &[
+                    advertisement(&peer, "a", mux, ReceptionRouteState::Usable),
+                    advertisement(&peer, "b", mux, ReceptionRouteState::Usable),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.remote_routes_for(mux).unwrap().len(), 2);
+
+        store
+            .replace_remote_routes(&peer, &[advertisement(&peer, "a", mux, ReceptionRouteState::Usable)])
+            .unwrap();
+        let routes = store.remote_routes_for(mux).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].route_id.ends_with("::a"));
+    }
+
+    /// Non-routable routes stay in the table (so they can be re-probed) but
+    /// are never offered as candidates.
+    #[test]
+    fn quarantined_routes_are_kept_but_not_offered() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let peer = paired_node(&store, "tokyo");
+        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+
+        store
+            .replace_remote_routes(
+                &peer,
+                &[advertisement(&peer, "weak", mux, ReceptionRouteState::Quarantined)],
+            )
+            .unwrap();
+
+        assert!(store.remote_routes_for(mux).unwrap().is_empty());
+        let still_there: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM reception_routes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(still_there, 1, "a quarantined route must remain re-probeable");
+    }
+
+    /// Two nodes may legitimately use the same local route id.
+    #[test]
+    fn route_ids_are_namespaced_per_node() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let tokyo = paired_node(&store, "tokyo");
+        let gunma = paired_node(&store, "gunma");
+        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let shared_id = "/dev/px4video0#0:0";
+
+        store
+            .replace_remote_routes(&tokyo, &[advertisement(&tokyo, shared_id, mux, ReceptionRouteState::Usable)])
+            .unwrap();
+        store
+            .replace_remote_routes(&gunma, &[advertisement(&gunma, shared_id, mux, ReceptionRouteState::Usable)])
+            .unwrap();
+
+        let routes = store.remote_routes_for(mux).unwrap();
+        assert_eq!(routes.len(), 2, "one node must not overwrite the other's route");
+    }
+
     /// The plaintext code must not be recoverable from the database.
     #[test]
     fn only_the_digest_is_persisted() {
@@ -535,4 +821,17 @@ mod tests {
         assert_ne!(stored, code.as_str());
         assert_eq!(stored, code.digest());
     }
+}
+
+/// Serde is the single spelling of these enums, so the database and the wire
+/// can never drift apart.
+fn enum_str<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_enum<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
 }
