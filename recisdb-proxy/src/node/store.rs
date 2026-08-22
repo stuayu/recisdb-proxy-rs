@@ -511,6 +511,25 @@ impl<'a> NodeStore<'a> {
         Ok(rows.into_iter().filter(|r| r.state.routable()).collect())
     }
 
+    /// How many muxes this peer currently advertises, split into routable and
+    /// total. The dashboard needs both: "12 routes, 0 usable" is a very
+    /// different situation from "no routes at all".
+    pub fn remote_route_counts(&self, node_id: &NodeId) -> Result<(i64, i64)> {
+        let conn = self.db.connection();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reception_routes WHERE node_id = ?1",
+            params![node_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let routable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reception_routes
+             WHERE node_id = ?1 AND routing_state IN ('usable', 'preferred', 'degraded')",
+            params![node_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok((routable, total))
+    }
+
     /// Record a pairing code this node just issued. Only its digest is kept.
     pub fn create_pending_pairing(
         &self,

@@ -85,11 +85,16 @@ pub async fn get_nodes(
     let mut entries = Vec::with_capacity(nodes.len());
     for node in nodes {
         let endpoints = store.endpoints(&node.node_id)?;
+        // Both numbers: "12 routes, 0 usable" and "no routes at all" are
+        // different problems and the operator has to tell them apart.
+        let (routable_routes, total_routes) = store.remote_route_counts(&node.node_id)?;
         entries.push(json!({
             "node": node,
             "endpoints": endpoints,
             // Never expose the shared credential back to the browser.
             "paired": store.credential_for(&node.node_id)?.is_some(),
+            "routable_routes": routable_routes,
+            "total_routes": total_routes,
         }));
     }
     let route_groups = store.list_route_groups()?;

@@ -33,6 +33,11 @@ type NodeEntry = {
   node: StoredNode
   endpoints: NodeEndpoint[]
   paired: boolean
+  /// Advertised routes this node can currently be asked for.
+  routable_routes: number
+  /// Everything it advertised, including quarantined/disabled routes that are
+  /// kept for re-probing.
+  total_routes: number
 }
 
 type RouteGroup = { id: number; name: string }
@@ -397,6 +402,9 @@ onMounted(load)
           </div>
           <div class="actions compact">
             <span :class="['status-pill', entry.paired ? 'ok' : 'warn']">{{ entry.paired ? 'ペア済み' : '未ペア' }}</span>
+            <span :class="['status-pill', entry.routable_routes > 0 ? 'ok' : 'warn']">
+              受信可 {{ entry.routable_routes }}/{{ entry.total_routes }}
+            </span>
             <button class="button secondary" @click="edit(entry)">編集</button>
             <button class="button" :disabled="probing === entry.node.node_id || !entry.paired" @click="probe(entry)">
               {{ probing === entry.node.node_id ? 'テスト中…' : '通信テスト' }}
