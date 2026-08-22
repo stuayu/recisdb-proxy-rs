@@ -90,7 +90,10 @@ impl RemoteMuxLease {
             stream_class,
             claim,
             generation,
-            replay: Arc::new(Mutex::new(ReplayBuffer::new(replay_budget))),
+            replay: Arc::new(Mutex::new(ReplayBuffer::new_for_generation(
+                replay_budget,
+                generation,
+            ))),
             live_tx,
             state: Arc::new(Mutex::new(LeaseTimes {
                 created_at: now,
@@ -265,6 +268,7 @@ mod tests {
         let resumed = manager.get(&lease.id).await.unwrap();
         assert_eq!(resumed.id, lease.id);
         assert_eq!(resumed.claim, EffectiveClaim::new(2, false));
+        assert!(resumed.replay.lock().await.replay_from(1, 0).unwrap().is_empty());
     }
 
     #[tokio::test]
