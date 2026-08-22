@@ -16,6 +16,7 @@ pub mod path;
 pub mod qualification;
 pub mod replay;
 pub mod route;
+pub mod store;
 pub mod transport;
 pub mod types;
 
@@ -29,5 +30,6 @@ pub use qualification::{
 };
 pub use replay::{ReplayBudget, ReplayBuffer, ReplayError};
 pub use route::{select_route, ReceptionCandidate, RouteDecision};
+pub use store::{NodeStore, RouteGroup, StoredNode};
 pub use transport::{NodeCapabilities, NodeHello, NodeTransportClient, NodeTransportState};
 pub use types::*;
