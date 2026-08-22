@@ -2,22 +2,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use super::{BonDriverRecord, Database, DriverQualityStats, Result};
-
-/// Runtime-health sample for a BonDriver. Packet integrity remains in
-/// `driver_quality_stats`; this captures "technically succeeds but is too
-/// slow/stall-prone" behaviour which otherwise looked perfectly healthy.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DriverRuntimeSample {
-    pub open_ms: Option<u64>,
-    pub tune_ms: Option<u64>,
-    pub first_ts_ms: Option<u64>,
-    pub stalled: bool,
-    pub open_failed: bool,
-    pub tune_failed: bool,
-    pub first_ts_timeout: bool,
-    pub worker_restart: bool,
-}
+use super::{BonDriverRecord, Database, DriverQualityStats, DriverRuntimeSample, Result};
 
 impl Database {
     /// Get driver quality stats by BonDriver ID.
