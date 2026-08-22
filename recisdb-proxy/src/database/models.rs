@@ -211,6 +211,22 @@ pub struct DriverQualityStats {
     pub last_updated: i64,
 }
 
+/// Runtime-health sample for a BonDriver. Packet integrity is intentionally
+/// separate: this captures "technically succeeds but is too slow/stall-prone"
+/// behaviour so the route selector can demote it before users repeatedly pay
+/// the startup delay.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriverRuntimeSample {
+    pub open_ms: Option<u64>,
+    pub tune_ms: Option<u64>,
+    pub first_ts_ms: Option<u64>,
+    pub stalled: bool,
+    pub open_failed: bool,
+    pub tune_failed: bool,
+    pub first_ts_timeout: bool,
+    pub worker_restart: bool,
+}
+
 /// Result of merging scan results into database.
 #[derive(Debug, Default, Clone)]
 pub struct MergeResult {
