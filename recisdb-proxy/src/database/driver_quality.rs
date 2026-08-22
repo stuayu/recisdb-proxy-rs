@@ -1,6 +1,6 @@
 //! Driver quality stats database operations.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::{BonDriverRecord, Database, DriverQualityStats, Result};
 
