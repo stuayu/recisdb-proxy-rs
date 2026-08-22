@@ -199,6 +199,10 @@ impl RemoteLeaseManager {
         lease
     }
 
+    pub fn policy(&self) -> LeasePolicy {
+        self.policy
+    }
+
     pub async fn get(&self, id: &RemoteLeaseId) -> Option<Arc<RemoteMuxLease>> {
         let lease = self.leases.read().await.get(id).cloned()?;
         if lease.is_expired(Instant::now()).await {

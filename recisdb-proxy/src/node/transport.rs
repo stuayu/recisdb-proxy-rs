@@ -28,8 +28,9 @@ use tokio::sync::RwLock;
 use super::frame::{FrameFlags, NodeTsFrame};
 use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 use super::lease::{RemoteLeaseId, RemoteLeaseManager};
+use super::serve::{LocalMuxServer, ServeError};
 use super::store::{NodeStore, StoredNode};
-use super::types::{NodeEndpoint, NodeId, ReceptionRouteAdvertisement};
+use super::types::{LogicalMuxId, NodeEndpoint, NodeId, ReceptionRouteAdvertisement, RequestContext};
 use crate::server::listener::DatabaseHandle;
 
 pub const NODE_PROTOCOL_VERSION: u16 = 3;
@@ -105,6 +106,36 @@ struct LeaseReply {
     ok: bool,
 }
 
+/// What a peer sends to open a lease on one of this node's tuners.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenLeaseRequest {
+    /// Carried unchanged across every hop: claim, stream class, remaining
+    /// end-to-end budget, visited nodes.
+    pub context: RequestContext,
+    pub mux: LogicalMuxId,
+    #[serde(default)]
+    pub sid: Option<u16>,
+    /// Milliseconds the caller already spent reaching this node. Subtracted
+    /// from `context.remaining_ms`; a hop never restarts a full timeout.
+    #[serde(default)]
+    pub spent_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenLeaseReply {
+    pub lease_id: String,
+    pub generation: u32,
+    pub owner_node: NodeId,
+    pub route_id: String,
+    pub stream_class: StreamClass,
+    /// How long the lease survives without a renew. Clients must renew well
+    /// inside this window; it is *not* tied to the transport connection.
+    pub ttl_ms: u64,
+    /// The context as this node saw it after `enter_node`, so the caller can
+    /// see the remaining budget and hop count actually charged.
+    pub context: RequestContext,
+}
+
 /// What the redeeming node sends to `/node/v3/pair`.
 #[derive(Debug, Deserialize)]
 pub struct PairingRequest {
@@ -154,6 +185,10 @@ pub struct NodeTransportState {
     pub routes: Arc<RwLock<Vec<ReceptionRouteAdvertisement>>>,
     pub peers: Arc<RwLock<HashMap<NodeId, NodeCredential>>>,
     pub leases: Arc<RemoteLeaseManager>,
+    /// Turns peer lease requests into local tuner acquisitions. `None` on a
+    /// node that only consumes remote tuners (or in unit tests), in which
+    /// case `POST /node/v3/lease` answers 503.
+    pub mux_server: Option<Arc<LocalMuxServer>>,
     /// Needed to redeem pairing codes and persist the resulting peer. When
     /// absent (unit tests), `/node/v3/pair` answers 503 instead of pairing
     /// against nothing.
@@ -170,6 +205,7 @@ impl NodeTransportState {
             routes: Arc::new(RwLock::new(Vec::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             leases,
+            mux_server: None,
             database: None,
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttempts::default())),
         }
@@ -178,6 +214,12 @@ impl NodeTransportState {
     /// Attach the database so this node can accept pairing requests.
     pub fn with_database(mut self, database: DatabaseHandle) -> Self {
         self.database = Some(database);
+        self
+    }
+
+    /// Offer this node's own tuners to peers.
+    pub fn with_mux_server(mut self, mux_server: Arc<LocalMuxServer>) -> Self {
+        self.mux_server = Some(mux_server);
         self
     }
 
@@ -238,6 +280,7 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/routes", get(routes))
         .route("/node/v3/probe/ping", get(probe_ping))
         .route("/node/v3/probe/download", get(probe_download))
+        .route("/node/v3/lease", post(open_lease))
         .route("/node/v3/lease/:id/renew", post(renew_lease))
         .route("/node/v3/lease/:id", delete(release_lease))
         .route("/node/v3/stream/:id", get(stream_lease))
@@ -384,6 +427,62 @@ async fn probe_download(
     response
 }
 
+/// Open a lease on one of this node's tuners for a peer.
+///
+/// The request goes through the ordinary local arbitration path, carrying the
+/// peer's claim verbatim — a remote recording contends with local viewers
+/// under the same policy, and priority is never reinterpreted per hop.
+async fn open_lease(
+    State(state): State<Arc<NodeTransportState>>,
+    headers: HeaderMap,
+    Json(payload): Json<OpenLeaseRequest>,
+) -> Response {
+    let Ok(peer) = state.authorize(&headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(server) = state.mux_server.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node does not offer local tuners",
+        )
+            .into_response();
+    };
+
+    let mut context = payload.context;
+    match server
+        .open_lease(&mut context, payload.mux, payload.sid, payload.spent_ms)
+        .await
+    {
+        Ok(lease) => Json(OpenLeaseReply {
+            lease_id: lease.id.as_str().to_owned(),
+            generation: lease.generation,
+            owner_node: lease.owner_node.clone(),
+            route_id: lease.route_id.clone(),
+            stream_class: lease.stream_class,
+            ttl_ms: state.leases.policy().ttl(lease.stream_class).as_millis() as u64,
+            context,
+        })
+        .into_response(),
+        // Loop/hop/deadline problems are the caller's request being wrong,
+        // not this node failing — and they must never be retried blindly.
+        Err(e @ ServeError::Hop(_)) => {
+            log::warn!("[node] lease request from {peer} rejected: {e}");
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+        Err(e @ ServeError::NoRoute(_)) => {
+            (StatusCode::NOT_FOUND, e.to_string()).into_response()
+        }
+        Err(e @ ServeError::Unavailable(_)) => {
+            log::info!("[node] lease request from {peer} could not be served: {e}");
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
+        }
+        Err(e @ ServeError::Database(_)) => {
+            log::error!("[node] lease request from {peer} failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn renew_lease(
     State(state): State<Arc<NodeTransportState>>,
     headers: HeaderMap,
@@ -519,6 +618,20 @@ async fn stream_lease(
     response
 }
 
+/// Why a lease stream could not be opened. `ReplayGap` and `LeaseGone` are
+/// terminal for a RECORD consumer: there is no way to continue without a hole.
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseStreamError {
+    #[error("transport error: {0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("replay history no longer covers the requested sequence")]
+    ReplayGap,
+    #[error("the peer no longer holds this lease")]
+    LeaseGone,
+    #[error("unexpected status {0}")]
+    Status(u16),
+}
+
 /// Minimal client used by discovery/path-probe code. HTTPS endpoints use
 /// ordinary ALPN negotiation; `http://` endpoints use HTTP/2 prior knowledge
 /// and are only valid for trusted encrypted overlays.
@@ -593,6 +706,92 @@ impl NodeTransportClient {
             .error_for_status()?
             .json()
             .await
+    }
+
+    /// Open a lease on `base`'s tuners.
+    pub async fn open_lease(
+        &self,
+        base: &str,
+        request: &OpenLeaseRequest,
+    ) -> Result<OpenLeaseReply, reqwest::Error> {
+        self.request(
+            reqwest::Method::POST,
+            format!("{}/node/v3/lease", base.trim_end_matches('/')),
+        )
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+    }
+
+    /// Keep a lease alive. Returns `false` when the peer no longer has it —
+    /// the lease is gone and a RECORD consumer must treat that as failure,
+    /// not as something to keep retrying against.
+    pub async fn renew_lease(&self, base: &str, lease_id: &str) -> Result<bool, reqwest::Error> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/node/v3/lease/{}/renew",
+                    base.trim_end_matches('/'),
+                    lease_id
+                ),
+            )
+            .send()
+            .await?;
+        Ok(response.status().is_success())
+    }
+
+    pub async fn release_lease(&self, base: &str, lease_id: &str) -> Result<(), reqwest::Error> {
+        self.request(
+            reqwest::Method::DELETE,
+            format!("{}/node/v3/lease/{}", base.trim_end_matches('/'), lease_id),
+        )
+        .send()
+        .await?;
+        Ok(())
+    }
+
+    /// Open the frame stream for a lease.
+    ///
+    /// `from_seq` requests lossless resume from the peer's replay buffer.
+    /// The peer answers `410 Gone` when that history is no longer available;
+    /// callers must surface that rather than silently restarting from live
+    /// (`docs/DISTRIBUTED_TUNER_FABRIC.md` §7).
+    pub async fn open_lease_stream(
+        &self,
+        base: &str,
+        lease_id: &str,
+        generation: Option<u32>,
+        from_seq: Option<u64>,
+    ) -> Result<reqwest::Response, LeaseStreamError> {
+        let mut url = format!(
+            "{}/node/v3/stream/{}",
+            base.trim_end_matches('/'),
+            lease_id
+        );
+        if let Some(from_seq) = from_seq {
+            url.push_str(&format!("?from_seq={from_seq}"));
+            if let Some(generation) = generation {
+                url.push_str(&format!("&generation={generation}"));
+            }
+        }
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .send()
+            .await
+            .map_err(LeaseStreamError::Transport)?;
+        // `reqwest` (http 0.2) and `axum` (http 1.x) have distinct
+        // `StatusCode` types, so compare numerically rather than importing
+        // both under one name.
+        match response.status().as_u16() {
+            200 => Ok(response),
+            410 => Err(LeaseStreamError::ReplayGap),
+            404 => Err(LeaseStreamError::LeaseGone),
+            other => Err(LeaseStreamError::Status(other)),
+        }
     }
 
     pub async fn hello(&self, base: &str) -> Result<NodeHello, reqwest::Error> {

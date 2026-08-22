@@ -160,6 +160,44 @@ Rules that must not be relaxed:
 Configuration lives in `[node]` (`recisdb-proxy.toml.example`): `enabled`,
 `listen` (h2c — bind to a trusted overlay or loopback), `display_name`.
 
+### 4.2 Leases (`POST /node/v3/lease`)
+
+`node/serve.rs` (supply) and `node/consume.rs` (demand) are the two halves of
+using a peer's tuner.
+
+Serving side (`LocalMuxServer::open_lease`):
+
+1. `RequestContext::enter_node` runs first — loop detection, hop cap and the
+   shared end-to-end budget. The caller subtracts what it already spent
+   (`spent_ms`); a hop never restarts a full timeout.
+2. The logical mux is resolved to **every** local physical route and handed to
+   `tuner::acquire::acquire` as one request, carrying the peer's
+   `EffectiveClaim` verbatim. A remote recording therefore contends with local
+   viewers under exactly the same policy — no per-hop reinterpretation.
+3. A `RemoteMuxLease` is created and a pump task takes a `TunerSubscription`
+   *before* returning, so the reader never looks idle in the window between
+   acquire and the task being scheduled.
+4. The pump re-aligns broadcast chunks to 188-byte boundaries and publishes
+   `NodeTsFrame`s into the lease's replay buffer and live fanout.
+
+The pump follows the RECORD rule: a `broadcast` `Lagged` on a RECORD lease
+closes the lease loudly (`record_broadcast_lag`) rather than emitting a stream
+with an unannounced hole. VIEW/PREVIEW clear the carry buffer, set
+`DISCONTINUITY` on the next frame and continue.
+
+Consuming side (`RemoteMuxStream`):
+
+- Republishes into a plain `broadcast::Sender<Bytes>` — the same shape
+  `SharedTuner` hands local consumers, so downstream needs no remote branch.
+- Renews at half the lease TTL, and releases explicitly on drop (the TTL is the
+  backstop if that request never lands).
+- On connection loss it reconnects with `from_seq = last_sequence + 1`. If the
+  peer's replay buffer no longer covers that point it answers `410 Gone`:
+  **RECORD ends with an error**, VIEW/PREVIEW restart from live.
+
+Status: both halves are implemented and reachable over the transport. What is
+still missing is the *arbitration* integration — see §12.
+
 ## 5. End-to-end request context
 
 Every inter-node acquisition carries one immutable arbitration context:
@@ -330,11 +368,22 @@ Done:
   `EffectiveClaim` per request, all-candidates acquire, no caller-side
   preselection, `Stopping` never reused, RAII slot-permit transfer.
 
+- Lease supply and demand (§4.2): `POST /node/v3/lease`, the local pump, and
+  `RemoteMuxStream` with renew / reconnect / `from_seq` resume and the RECORD
+  no-silent-gap rule.
+
 Not done yet:
 
-- Remote `ReceptionRoute`s are not yet fed into candidate discovery, so
-  `tuner::acquire` still only sees local drivers. `RemoteMuxLease` exists and
-  can stream, but nothing acquires one from the arbitration path.
+- **Route advertisement sync.** `GET /node/v3/routes` exists, but nothing polls
+  peers on a timer or writes the results into `reception_routes`, so a node has
+  no persistent picture of what its peers can receive.
+- **Candidate discovery does not see remote routes.** `tuner::acquire` still
+  only enumerates local drivers, so `RemoteMuxStream` has to be opened
+  explicitly rather than being chosen by central policy against local
+  candidates. Unifying them needs one lease type covering both a local
+  `SharedTuner` and a remote stream (the TunerManager step below).
+- **The HTTP/Mirakurun paths cannot yet be fed by a remote source**:
+  `channel_resolve` returns `Arc<SharedTuner>` specifically.
 - No BonDriver process isolation (`recisdb-driver-worker`) or circuit breaker;
   `DriverHealth` collects the inputs but nothing acts on them yet.
 - Route-group weights are stored but not consulted during candidate generation.

@@ -9,6 +9,7 @@
 //! This makes RF quality, tuner health and WAN/VPN/tunnel health independent
 //! failure domains and is the basis for stable multi-site recording.
 
+pub mod consume;
 pub mod discovery;
 pub mod frame;
 pub mod identity;
@@ -17,10 +18,12 @@ pub mod path;
 pub mod qualification;
 pub mod replay;
 pub mod route;
+pub mod serve;
 pub mod store;
 pub mod transport;
 pub mod types;
 
+pub use consume::{ConsumeError, RemoteMuxStream};
 pub use discovery::{
     classify_tailscale_ping, discover_tailscale_endpoint, inspect_tailscale_path,
     probe_endpoint, ProbeConfig,
@@ -37,8 +40,10 @@ pub use qualification::{
 };
 pub use replay::{ReplayBudget, ReplayBuffer, ReplayError};
 pub use route::{select_route, ReceptionCandidate, RouteDecision};
+pub use serve::{LocalMuxServer, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode};
 pub use transport::{
+    LeaseStreamError, OpenLeaseReply, OpenLeaseRequest,
     serve_h2c, NodeCapabilities, NodeHello, NodeTransportClient, NodeTransportState,
     PAIRING_CODE_TTL,
 };
