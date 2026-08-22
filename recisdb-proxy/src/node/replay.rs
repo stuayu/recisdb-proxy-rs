@@ -60,6 +60,16 @@ impl ReplayBuffer {
         }
     }
 
+    /// Create a replay window already associated with a source generation.
+    /// This matters before the first TS packet arrives: a reconnect against a
+    /// newly-created lease should yield an empty replay, not a false
+    /// GenerationMismatch.
+    pub fn new_for_generation(budget: ReplayBudget, generation: u32) -> Self {
+        let mut this = Self::new(budget);
+        this.generation = Some(generation);
+        this
+    }
+
     pub fn generation(&self) -> Option<u32> {
         self.generation
     }
@@ -173,6 +183,12 @@ mod tests {
             flags: Default::default(),
             payload: Bytes::from(vec![0x47; 188]),
         }
+    }
+
+    #[test]
+    fn empty_initialized_generation_can_resume_before_first_packet() {
+        let mut replay = ReplayBuffer::new_for_generation(ReplayBudget::default(), 7);
+        assert!(replay.replay_from(7, 0).unwrap().is_empty());
     }
 
     #[test]
