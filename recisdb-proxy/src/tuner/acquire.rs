@@ -41,17 +41,20 @@
 //! giving up with
 //! [`AcquireError::Conflict`].
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::database::DriverRuntimeSample;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
 use crate::tuner::pool::TunerPoolError;
-use crate::tuner::shared::{ReaderStartupConfig, StopReason};
+#[cfg(unix)]
+use crate::tuner::timing;
+use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason};
 use crate::tuner::{
     CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle,
 };
@@ -201,7 +204,160 @@ impl From<RejectReason> for AcquireError {
 /// three concurrent viewers. The `+ 2` covers races that are not
 /// self-inflicted (another process taking a slot, an entry vanishing).
 fn max_attempts(candidates: usize) -> usize {
-    candidates + 2
+    // One retry budget per candidate, plus the single extra EALREADY retry a
+    // candidate may consume (see `is_ealready`), plus slack for a stale
+    // snapshot round.
+    candidates * 2 + 2
+}
+
+/// Write one runtime-health observation for `tuner_path`, if the driver is
+/// still in the database.
+///
+/// Failures here are logged and swallowed: health statistics must never turn
+/// a working tune into an error.
+async fn record_runtime_sample(
+    database: &DatabaseHandle,
+    tuner_path: &str,
+    sample: DriverRuntimeSample,
+) {
+    let db = database.lock().await;
+    let driver_id = match db.get_bon_driver_by_path(tuner_path) {
+        Ok(Some(driver)) => driver.id,
+        Ok(None) => return,
+        Err(e) => {
+            debug!("[acquire] cannot look up {tuner_path} for health sample: {e}");
+            return;
+        }
+    };
+    if let Err(e) = db.record_driver_runtime_sample(driver_id, sample) {
+        debug!("[acquire] failed to record health sample for {tuner_path}: {e}");
+    }
+}
+
+/// Watch a freshly started reader until it stops, then record what its whole
+/// life said about the driver.
+///
+/// Recorded at the *end* rather than at startup because stalls and no-data
+/// timeouts only accumulate while the reader runs, and a "technically works
+/// but is unusable" driver is exactly the one whose problems show up later
+/// (`docs/DISTRIBUTED_TUNER_FABRIC.md` §9). Open/tune failures are recorded
+/// immediately instead — see the error branch above — so a driver that cannot
+/// start at all is demoted without waiting for anything.
+fn spawn_runtime_health_recorder(
+    database: DatabaseHandle,
+    tuner: Arc<SharedTuner>,
+    tuner_path: String,
+    tune_ms: u64,
+) {
+    tokio::spawn(async move {
+        let mut states = tuner.subscribe_state();
+        // `changed()` only fires on transitions, so check the current value
+        // first: the reader may already have stopped.
+        while !matches!(*states.borrow(), ReaderState::Stopped | ReaderState::Idle) {
+            if states.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let first_ts_ms = tuner.first_ts_latency_ms();
+        let sample = DriverRuntimeSample {
+            tune_ms: Some(tune_ms),
+            first_ts_ms,
+            // No TS at all over the reader's whole life is a startup failure
+            // of the kind packet statistics can never show: the driver said
+            // yes and then delivered nothing.
+            first_ts_timeout: first_ts_ms.is_none(),
+            stalled: tuner.stall_events() > 0 || tuner.no_data_timeouts() > 0,
+            ..Default::default()
+        };
+        record_runtime_sample(&database, &tuner_path, sample).await;
+    });
+}
+
+/// Detect `EALREADY` from `start_reader`, which does NOT preserve
+/// `raw_os_error`: the blocking open thread stringifies the original
+/// `io::Error` into the `ready_tx` channel and the awaiting side rebuilds it
+/// as `io::Error::new(kind, String)` (see `tuner/shared.rs`), so only the
+/// Display text ("... (os error 114)") survives. Check both the raw code (in
+/// case that path ever starts preserving it) and the stringified form.
+///
+/// This is the Unix single-open-per-device-path constraint (px4-drv character
+/// devices): the configured `max_instances` can say there is room while the
+/// device itself tolerates exactly one open, so policy's capacity rules never
+/// see the conflict. The recovery is deliberately narrow — reclaim only
+/// *proven* keep-alive leftovers on that path
+/// (`TunerPool::reclaim_keepalive_leftovers_on_path`) and retry the same
+/// candidate once.
+#[cfg(unix)]
+fn is_ealready(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EALREADY)
+        || e.to_string()
+            .contains(&format!("(os error {})", libc::EALREADY))
+}
+
+/// RAII carrier for a slot permit detached from the caller's current tuner.
+/// If acquire exits with an error before consuming/returning it, Drop puts the
+/// permit back on the still-active owner. This closes the failure path where
+/// a channel switch left a live BonDriver open while its semaphore permit had
+/// already been dropped.
+struct CarriedPermitGuard {
+    permit: Option<SlotPermit>,
+    owner: Option<Arc<SharedTuner>>,
+}
+
+impl CarriedPermitGuard {
+    fn new(permit: Option<SlotPermit>, owner: Option<Arc<SharedTuner>>) -> Self {
+        Self { permit, owner }
+    }
+
+    fn is_on_path(&self, path: &str) -> bool {
+        self.permit.as_ref().is_some_and(|p| p.dll_path() == path)
+    }
+
+    /// Successful acquire hands an unused permit back to the caller; disable
+    /// automatic restoration in that case because the caller owns it again.
+    fn take_unused(&mut self) -> Option<SlotPermit> {
+        self.owner = None;
+        self.permit.take()
+    }
+}
+
+impl CarriedSlotPermit for CarriedPermitGuard {
+    fn take_if_on_path(&mut self, dll_path: &str) -> Option<SlotPermit> {
+        if self.is_on_path(dll_path) {
+            self.permit.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for CarriedPermitGuard {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        if let Some(owner) = self.owner.as_ref() {
+            if owner.occupies_slot() && owner.key.tuner_path == permit.dll_path() {
+                // `restore_slot_permit`, not `set_slot_permit`: never clobber a
+                // reservation the owner picked up again in the meantime.
+                match owner.restore_slot_permit(permit) {
+                    None => return,
+                    Some(returned) => {
+                        warn!(
+                            "[acquire] carried permit for {} could not be restored to {:?} (slot already refilled); releasing",
+                            returned.dll_path(),
+                            owner.key
+                        );
+                        drop(returned);
+                        return;
+                    }
+                }
+            }
+        }
+        // No live owner remains; dropping the permit is the correct release.
+        drop(permit);
+    }
 }
 
 /// Build a [`TunerSnapshot`] of `dll_paths`' driver rows plus every pool
@@ -270,15 +426,16 @@ pub(crate) async fn snapshot(
             ChannelKeySpec::SpaceChannel { space, channel } => (*space, *channel),
             ChannelKeySpec::Simple(c) => (0, *c as u32),
         };
+        // Read the incumbent rank atomically with respect to the claims
+        // mutex. Calling incumbent_claim() twice can combine priority from one
+        // subscription set with exclusive from a later one.
+        let incumbent = tuner.incumbent_claim();
         raw_entries.push(RawEntry {
             key,
             state: tuner.state(),
             subscribers: tuner.subscriber_count(),
-            priority: tuner.incumbent_claim().map(|c| c.priority).unwrap_or(0),
-            incumbent_exclusive: tuner
-                .incumbent_claim()
-                .map(|c| c.exclusive)
-                .unwrap_or(false),
+            priority: incumbent.map(|c| c.priority).unwrap_or(0),
+            incumbent_exclusive: incumbent.map(|c| c.exclusive).unwrap_or(false),
             held_for: tuner.held_for(),
             space,
             channel,
@@ -344,9 +501,9 @@ pub(crate) async fn snapshot(
 /// case `SharedTuner::start_reader` can actually activate (a mismatched or
 /// permit-donating-only warm handle has nothing left for `start_reader` to
 /// do with it).
-async fn take_permit_for_path(
+async fn take_permit_for_path<P: CarriedSlotPermit>(
     dll_path: &str,
-    carried_permit: &mut Option<SlotPermit>,
+    carried_permit: &mut P,
     warm: &mut Option<WarmTunerHandle>,
 ) -> Option<(SlotPermit, Option<WarmTunerHandle>)> {
     if let Some(permit) = carried_permit.take_if_on_path(dll_path) {
@@ -438,8 +595,20 @@ pub(crate) async fn acquire(
     // snapshot→decide→act sequence, including the reader start.
     let _channel_guard = pool.acquire_channel_lock(&request.candidates).await;
 
-    let mut carried_permit = request.carried_permit;
+    let carried_owner = if request.carried_permit.is_some() {
+        match request.own_key.as_ref() {
+            Some(key) => pool.get(key).await,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut carried_permit = CarriedPermitGuard::new(request.carried_permit, carried_owner);
     let mut warm = request.warm;
+    // One EALREADY recovery per DLL path per acquire, so a device that keeps
+    // refusing opens cannot spin this loop.
+    #[cfg(unix)]
+    let mut ealready_retried: Vec<String> = Vec::new();
 
     let attempts = max_attempts(request.candidates.len());
     let mut exhausted: Vec<String> = Vec::new();
@@ -515,20 +684,29 @@ pub(crate) async fn acquire(
                 // permit may be taken here (docs/TUNER_PIPELINE_REDESIGN.md
                 // P1b §6) — a permit is never even asked for on this branch.
                 match pool.get(&key).await {
-                    Some(tuner) => {
+                    Some(tuner)
+                        if matches!(tuner.state(), ReaderState::Starting | ReaderState::Running) =>
+                    {
                         pool.reject_gate().clear(&gate_key);
                         return Ok(AcquireOutcome {
                             tuner,
                             key,
                             reused: true,
-                            unused_permit: carried_permit,
+                            unused_permit: carried_permit.take_unused(),
                             unused_warm: warm,
                         });
                     }
+                    Some(tuner) => {
+                        info!(
+                            "[acquire] stale reuse decision for {:?}: reader moved to {:?}; retrying",
+                            key,
+                            tuner.state()
+                        );
+                        continue;
+                    }
                     None => {
-                        // The entry `decide` saw as running vanished (raced
-                        // stop/evict elsewhere) between snapshot and now —
-                        // stale snapshot, try again.
+                        // The entry `decide` saw as joinable vanished between
+                        // snapshot and execution — stale snapshot, try again.
                         continue;
                     }
                 }
@@ -545,6 +723,25 @@ pub(crate) async fn acquire(
                     .find(|d| d.dll_path == key.tuner_path)
                     .map(|d| d.max_instances)
                     .unwrap_or(1);
+
+                let transferring_own_slot = carried_permit.is_on_path(&key.tuner_path)
+                    && request.own_key.as_ref().is_some_and(|own| {
+                        own != &key && own.tuner_path == key.tuner_path
+                    });
+                if transferring_own_slot {
+                    if let Some(own_key) = request.own_key.as_ref() {
+                        if let Some(old) = pool.get(own_key).await {
+                            info!(
+                                "[acquire] stopping caller's old reader {:?} before same-DLL slot transfer to {:?}",
+                                own_key, key
+                            );
+                            pool.cancel_idle_close(own_key).await;
+                            old.set_stop_reason(StopReason::Released);
+                            old.stop_reader().await;
+                            pool.remove(own_key).await;
+                        }
+                    }
+                }
 
                 let (permit, warm_to_use) =
                     match take_permit_for_path(&key.tuner_path, &mut carried_permit, &mut warm).await {
@@ -642,7 +839,8 @@ pub(crate) async fn acquire(
                 // dozens of times a second forever. Checked right before the
                 // actual open so a cooldown that expires between rounds is
                 // picked up promptly rather than only at the top of `acquire`.
-                if let Some(retry_in) = pool.open_backoff().cooldown_remaining(&key.tuner_path) {
+                let admission = pool.open_backoff().try_admit(&key.tuner_path);
+                if let crate::tuner::open_backoff::Admission::Reject { retry_in } = admission {
                     drop(start_permit);
                     if let Some(w) = warm_to_use {
                         w.shutdown().await;
@@ -665,6 +863,7 @@ pub(crate) async fn acquire(
                     continue;
                 }
 
+                let start_began = std::time::Instant::now();
                 if let Err(e) = tuner
                     .start_reader(
                         pool,
@@ -677,6 +876,21 @@ pub(crate) async fn acquire(
                     )
                     .await
                 {
+                    // Health, not just backoff: a driver that fails to open
+                    // stays demoted for future selection even after its
+                    // cooldown expires. `AddrNotAvailable` is a tuning problem
+                    // ("no such channel here"), everything else is the driver.
+                    record_runtime_sample(
+                        database,
+                        &key.tuner_path,
+                        DriverRuntimeSample {
+                            tune_ms: Some(start_began.elapsed().as_millis() as u64),
+                            open_failed: e.kind() != std::io::ErrorKind::AddrNotAvailable,
+                            tune_failed: e.kind() == std::io::ErrorKind::AddrNotAvailable,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                     if tuner.is_orphanable() {
                         pool.remove(&key).await;
                     }
@@ -697,6 +911,25 @@ pub(crate) async fn acquire(
                             );
                         }
                     }
+                    #[cfg(unix)]
+                    if is_ealready(&e) && !ealready_retried.contains(&key.tuner_path) {
+                        ealready_retried.push(key.tuner_path.clone());
+                        let reclaimed = pool
+                            .reclaim_keepalive_leftovers_on_path(&key.tuner_path, Some(&key))
+                            .await;
+                        if reclaimed > 0 {
+                            info!(
+                                "[acquire] {} refused a second open (EALREADY); reclaimed {} keep-alive reader(s) and retrying that candidate",
+                                key.tuner_path, reclaimed
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                timing::EALREADY_RETRY_SLEEP_MS,
+                            ))
+                            .await;
+                            last_start_failure = Some(AcquireError::ReaderStart(e));
+                            continue;
+                        }
+                    }
                     info!(
                         "[acquire] candidate unavailable: {} failed to start; trying another candidate: {}",
                         key.tuner_path,
@@ -706,13 +939,23 @@ pub(crate) async fn acquire(
                     last_start_failure = Some(AcquireError::ReaderStart(e));
                     continue;
                 }
-                pool.open_backoff().record_success(&key.tuner_path);
+                // Latency, not just success: a driver that always answers but
+                // takes ten seconds is Degraded, and gets less rope before the
+                // next failure streak opens its circuit.
+                pool.open_backoff()
+                    .record_success_with_latency(&key.tuner_path, start_began.elapsed().as_millis() as u64);
+                spawn_runtime_health_recorder(
+                    database.clone(),
+                    Arc::clone(&tuner),
+                    key.tuner_path.clone(),
+                    start_began.elapsed().as_millis() as u64,
+                );
 
                 return Ok(AcquireOutcome {
                     tuner,
                     key,
                     reused: false,
-                    unused_permit: carried_permit,
+                    unused_permit: carried_permit.take_unused(),
                     unused_warm: warm,
                 });
             }
@@ -1151,6 +1394,83 @@ mod tests {
         assert_eq!(unused.dll_path(), carried_path);
 
         tuner.stop_reader().await;
+    }
+
+    /// A detached slot permit must never evaporate on an error path. The
+    /// caller's old reader is still holding the device open, so releasing its
+    /// permit would let an unrelated task open a second instance on a driver
+    /// that only has room for one.
+    #[tokio::test]
+    async fn carried_permit_is_returned_to_the_still_live_owner_when_acquire_fails() {
+        let pool = Arc::new(TunerPool::new(10));
+        let old_path = "/dev/old-driver";
+        let new_path = "/nonexistent/recisdb-proxy-test-device";
+        let database = db_handle_with_driver(old_path, 1);
+        {
+            let db = database.lock().await;
+            db.insert_bon_driver(&NewBonDriver::new(new_path).with_max_instances(1)).unwrap();
+        }
+
+        let old_key = ChannelKey::space_channel(old_path, 0, 1);
+        let permit = pool.acquire_slot(old_path, 1).await.unwrap();
+        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
+        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        ready_rx.await.unwrap().unwrap();
+
+        // What a session does before switching channels: detach the slot so
+        // it can be handed to the replacement reader.
+        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        assert!(old.take_slot_permit().is_none());
+
+        // The winner is on a different, nonexistent driver, so the reader
+        // start fails and `acquire` returns an error without ever consuming
+        // the carried permit.
+        let mut request = empty_request(vec![ChannelKey::space_channel(new_path, 0, 7)]);
+        request.carried_permit = Some(carried);
+        request.own_key = Some(old_key.clone());
+        request.own_key_will_free_slot = true;
+
+        let result = acquire(&pool, &database, request).await;
+        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+
+        let restored = old.take_slot_permit().expect("permit must be back on the still-running old reader");
+        assert_eq!(restored.dll_path(), old_path);
+
+        old.stop_reader().await;
+    }
+
+    /// One permit backs at most one live native reader. When the winner is a
+    /// different channel on the *same* DLL, the old reader has to be stopped
+    /// before its slot is handed over — otherwise a `max_instances = 1`
+    /// driver briefly has two opens against a single reservation.
+    #[tokio::test]
+    async fn same_dll_slot_transfer_stops_the_old_reader_first() {
+        let pool = Arc::new(TunerPool::new(10));
+        // Nonexistent so the *new* reader start fails; the old reader must
+        // already be gone by then, which is what this asserts.
+        let path = "/nonexistent/recisdb-proxy-test-device";
+        let database = db_handle_with_driver(path, 1);
+
+        let old_key = ChannelKey::space_channel(path, 0, 1);
+        let permit = pool.acquire_slot(path, 1).await.unwrap();
+        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
+        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        ready_rx.await.unwrap().unwrap();
+
+        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        let mut request = empty_request(vec![ChannelKey::space_channel(path, 0, 2)]);
+        request.carried_permit = Some(carried);
+        request.own_key = Some(old_key.clone());
+        request.own_key_will_free_slot = true;
+
+        let result = acquire(&pool, &database, request).await;
+        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+
+        assert!(
+            pool.get(&old_key).await.is_none(),
+            "the old same-DLL reader must have been stopped and removed before its slot was reused"
+        );
+        assert!(!old.is_running(), "the old reader must not still be running on the transferred slot");
     }
 
     // -----------------------------------------------------------------

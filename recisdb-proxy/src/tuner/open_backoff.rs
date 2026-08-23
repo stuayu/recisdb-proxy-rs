@@ -36,6 +36,26 @@ use std::time::{Duration, Instant};
 /// or the device behind it, is actually unhealthy.
 const FAILURE_THRESHOLD: u32 = 3;
 
+/// Failure threshold once a path is [`BreakerState::Degraded`]. A driver that
+/// is already answering far too slowly gets less rope before it is cut off.
+const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
+
+/// An open that succeeds but takes longer than this is a *soft* failure. The
+/// hard deadline is the caller's own timeout; this is the "works, but nobody
+/// wants to wait for it" line, and repeatedly crossing it is what moves a path
+/// to [`BreakerState::Degraded`] (`docs/DISTRIBUTED_TUNER_FABRIC.md` §9).
+const SLOW_OPEN_MS: u64 = 5_000;
+
+/// Consecutive slow opens before a path is considered degraded.
+const SLOW_OPEN_THRESHOLD: u32 = 3;
+
+/// How long a half-open trial may be outstanding before it is assumed lost.
+///
+/// The caller that was admitted may never report back — it could fail to get a
+/// slot permit, or its task could be dropped. Without this, one lost trial
+/// would keep the path closed forever.
+const HALF_OPEN_TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Cap on the exponential backoff, so a permanently broken driver still
 /// gets retried at a human-visible cadence rather than being abandoned.
 const MAX_COOLDOWN: Duration = Duration::from_secs(30);
@@ -44,6 +64,48 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(30);
 /// which suppressed occurrences between two log lines are counted.
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Circuit state of one DLL path.
+///
+/// ```text
+/// Healthy ──repeated slow opens──▶ Degraded
+///    │                                │
+///    └────repeated failures───────────┴──▶ Open
+///                                          │ cooldown elapsed
+///                                          ▼
+///                                       HalfOpen ──success──▶ Healthy
+///                                          │ failure
+///                                          └──────────────▶ Open
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerState {
+    /// Normal. Every request is admitted.
+    Healthy,
+    /// Answering, but too slowly. Still admitted — a slow tuner beats no
+    /// tuner — but it trips to `Open` after fewer failures, and
+    /// `tuner::policy` already ranks it below its healthy siblings through
+    /// the driver quality score.
+    Degraded,
+    /// Refusing requests until the cooldown elapses.
+    Open,
+    /// Cooldown elapsed; exactly one trial request is admitted to find out
+    /// whether the driver recovered. Everyone else keeps waiting, so a queue
+    /// of clients does not all hit a just-maybe-recovered DLL at once.
+    HalfOpen,
+}
+
+/// What a caller may do with a path right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Proceed normally.
+    Allow,
+    /// Proceed as the single half-open trial. The caller **must** report the
+    /// outcome via `record_success*`/`record_failure`, or the trial is only
+    /// released after [`HALF_OPEN_TRIAL_TIMEOUT`].
+    Trial,
+    /// Do not touch this driver yet.
+    Reject { retry_in: Duration },
+}
+
 /// Per-path failure bookkeeping.
 struct DriverFailures {
     consecutive: u32,
@@ -51,11 +113,41 @@ struct DriverFailures {
     /// Failures observed since the last time this path logged.
     suppressed: u32,
     last_logged: Option<Instant>,
+    /// Consecutive successful-but-slow opens.
+    consecutive_slow: u32,
+    degraded: bool,
+    /// When the outstanding half-open trial was admitted, if any.
+    trial_started: Option<Instant>,
 }
 
 impl DriverFailures {
     fn new() -> Self {
-        Self { consecutive: 0, cooldown_until: None, suppressed: 0, last_logged: None }
+        Self {
+            consecutive: 0,
+            cooldown_until: None,
+            suppressed: 0,
+            last_logged: None,
+            consecutive_slow: 0,
+            degraded: false,
+            trial_started: None,
+        }
+    }
+
+    fn failure_threshold(&self) -> u32 {
+        if self.degraded {
+            DEGRADED_FAILURE_THRESHOLD
+        } else {
+            FAILURE_THRESHOLD
+        }
+    }
+
+    fn state_at(&self, now: Instant) -> BreakerState {
+        match self.cooldown_until {
+            Some(until) if until > now => BreakerState::Open,
+            Some(_) => BreakerState::HalfOpen,
+            None if self.degraded => BreakerState::Degraded,
+            None => BreakerState::Healthy,
+        }
     }
 }
 
@@ -119,6 +211,59 @@ impl OpenFailureBackoff {
         }
     }
 
+    /// Circuit state of `tuner_path` right now, for diagnostics and the
+    /// dashboard. Does not admit anything — use [`Self::try_admit`].
+    pub(crate) fn state(&self, tuner_path: &str) -> BreakerState {
+        self.state_at(tuner_path, Instant::now())
+    }
+
+    pub(crate) fn state_at(&self, tuner_path: &str, now: Instant) -> BreakerState {
+        self.lock_state()
+            .get(tuner_path)
+            .map(|e| e.state_at(now))
+            .unwrap_or(BreakerState::Healthy)
+    }
+
+    /// Decide whether a caller may touch `tuner_path` now.
+    ///
+    /// This *takes* the half-open trial slot when it returns [`Admission::Trial`],
+    /// so it must be called once per attempt, not speculatively.
+    pub(crate) fn try_admit(&self, tuner_path: &str) -> Admission {
+        self.try_admit_at(tuner_path, Instant::now())
+    }
+
+    pub(crate) fn try_admit_at(&self, tuner_path: &str, now: Instant) -> Admission {
+        let mut state = self.lock_state();
+        let Some(entry) = state.get_mut(tuner_path) else {
+            return Admission::Allow;
+        };
+        match entry.state_at(now) {
+            BreakerState::Healthy | BreakerState::Degraded => Admission::Allow,
+            BreakerState::Open => Admission::Reject {
+                retry_in: entry
+                    .cooldown_until
+                    .map(|until| until.saturating_duration_since(now))
+                    .unwrap_or_default(),
+            },
+            BreakerState::HalfOpen => {
+                let trial_free = match entry.trial_started {
+                    None => true,
+                    // A trial nobody ever reported back on must not keep the
+                    // path closed forever.
+                    Some(started) => now.duration_since(started) >= HALF_OPEN_TRIAL_TIMEOUT,
+                };
+                if trial_free {
+                    entry.trial_started = Some(now);
+                    Admission::Trial
+                } else {
+                    Admission::Reject {
+                        retry_in: HALF_OPEN_TRIAL_TIMEOUT,
+                    }
+                }
+            }
+        }
+    }
+
     /// Record one more open failure and return what the caller should do
     /// about it.
     pub(crate) fn record_failure(&self, tuner_path: &str) -> FailureReport {
@@ -130,9 +275,14 @@ impl OpenFailureBackoff {
         let entry = state.entry(tuner_path.to_string()).or_insert_with(DriverFailures::new);
 
         entry.consecutive += 1;
+        // A failing open is not a slow one; the slow streak restarts.
+        entry.consecutive_slow = 0;
+        // Whatever the half-open trial was, it has now reported back.
+        entry.trial_started = None;
 
-        let cooldown = if entry.consecutive >= FAILURE_THRESHOLD {
-            let shift = entry.consecutive - FAILURE_THRESHOLD;
+        let threshold = entry.failure_threshold();
+        let cooldown = if entry.consecutive >= threshold {
+            let shift = entry.consecutive - threshold;
             let scaled = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
             Duration::from_secs(scaled).min(MAX_COOLDOWN)
         } else {
@@ -160,13 +310,35 @@ impl OpenFailureBackoff {
     /// Clear all failure state for `tuner_path` — a successful open means
     /// whatever was wrong is over, and the next failure (if any) should be
     /// judged fresh rather than continuing an old streak.
-    pub(crate) fn record_success(&self, tuner_path: &str) {
-        self.record_success_at(tuner_path);
-    }
-
+    ///
+    /// Production goes through [`Self::record_success_with_latency`], which
+    /// also feeds the slow-open half of the breaker; this is the plain form
+    /// used where latency is not measured.
     pub(crate) fn record_success_at(&self, tuner_path: &str) {
         let mut state = self.lock_state();
         state.remove(tuner_path);
+    }
+
+    /// A successful open, with how long it took.
+    ///
+    /// Fast enough closes the breaker completely. Repeatedly slow keeps the
+    /// path admitted — a slow tuner still beats no tuner — but marks it
+    /// [`BreakerState::Degraded`], which halves the rope it gets before the
+    /// next failure streak opens the circuit.
+    pub(crate) fn record_success_with_latency(&self, tuner_path: &str, open_ms: u64) {
+        let mut state = self.lock_state();
+        if open_ms < SLOW_OPEN_MS {
+            state.remove(tuner_path);
+            return;
+        }
+        let entry = state
+            .entry(tuner_path.to_string())
+            .or_insert_with(DriverFailures::new);
+        entry.consecutive = 0;
+        entry.cooldown_until = None;
+        entry.trial_started = None;
+        entry.consecutive_slow = entry.consecutive_slow.saturating_add(1);
+        entry.degraded = entry.consecutive_slow >= SLOW_OPEN_THRESHOLD;
     }
 
     /// Consecutive failures currently on record for `tuner_path` (0 if
@@ -175,6 +347,166 @@ impl OpenFailureBackoff {
     /// e.g. [`crate::tuner::acquire::AcquireError::OpenCooldown`].
     pub(crate) fn consecutive_failures(&self, tuner_path: &str) -> u32 {
         self.lock_state().get(tuner_path).map(|e| e.consecutive).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod breaker_tests {
+    use super::*;
+
+    const PATH: &str = "/dev/test-tuner";
+
+    fn open_the_circuit(backoff: &OpenFailureBackoff, t0: Instant) -> Duration {
+        let mut cooldown = Duration::ZERO;
+        for _ in 0..FAILURE_THRESHOLD {
+            cooldown = backoff.record_failure_at(PATH, t0).cooldown;
+        }
+        assert!(!cooldown.is_zero(), "the circuit should be open by now");
+        cooldown
+    }
+
+    #[test]
+    fn an_unknown_path_is_healthy_and_always_admitted() {
+        let backoff = OpenFailureBackoff::new();
+        assert_eq!(backoff.state(PATH), BreakerState::Healthy);
+        assert_eq!(backoff.try_admit(PATH), Admission::Allow);
+    }
+
+    #[test]
+    fn an_open_circuit_rejects_until_the_cooldown_elapses() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        let cooldown = open_the_circuit(&backoff, t0);
+
+        assert_eq!(backoff.state_at(PATH, t0), BreakerState::Open);
+        assert!(matches!(
+            backoff.try_admit_at(PATH, t0),
+            Admission::Reject { .. }
+        ));
+
+        // Still open just before the cooldown expires.
+        let almost = t0 + cooldown - Duration::from_millis(1);
+        assert!(matches!(
+            backoff.try_admit_at(PATH, almost),
+            Admission::Reject { .. }
+        ));
+    }
+
+    /// The point of half-open: a queue of waiting clients must not all hit a
+    /// just-maybe-recovered DLL at once.
+    #[test]
+    fn only_one_caller_is_admitted_when_the_cooldown_elapses() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        let cooldown = open_the_circuit(&backoff, t0);
+        let after = t0 + cooldown + Duration::from_millis(1);
+
+        assert_eq!(backoff.state_at(PATH, after), BreakerState::HalfOpen);
+        assert_eq!(backoff.try_admit_at(PATH, after), Admission::Trial);
+        for _ in 0..5 {
+            assert!(
+                matches!(backoff.try_admit_at(PATH, after), Admission::Reject { .. }),
+                "a second caller must wait for the trial's outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_trial_closes_the_circuit() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        let cooldown = open_the_circuit(&backoff, t0);
+        let after = t0 + cooldown + Duration::from_millis(1);
+        assert_eq!(backoff.try_admit_at(PATH, after), Admission::Trial);
+
+        backoff.record_success_with_latency(PATH, 200);
+        assert_eq!(backoff.state_at(PATH, after), BreakerState::Healthy);
+        assert_eq!(backoff.try_admit_at(PATH, after), Admission::Allow);
+    }
+
+    #[test]
+    fn a_failed_trial_reopens_the_circuit_for_longer() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        let first_cooldown = open_the_circuit(&backoff, t0);
+        let after = t0 + first_cooldown + Duration::from_millis(1);
+        assert_eq!(backoff.try_admit_at(PATH, after), Admission::Trial);
+
+        let second_cooldown = backoff.record_failure_at(PATH, after).cooldown;
+        assert!(
+            second_cooldown > first_cooldown,
+            "backoff must grow: {second_cooldown:?} vs {first_cooldown:?}"
+        );
+        assert_eq!(backoff.state_at(PATH, after), BreakerState::Open);
+        assert!(matches!(
+            backoff.try_admit_at(PATH, after),
+            Admission::Reject { .. }
+        ));
+    }
+
+    /// A caller that never reports back must not close the path forever.
+    #[test]
+    fn a_lost_trial_is_released_after_the_timeout() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        let cooldown = open_the_circuit(&backoff, t0);
+        let after = t0 + cooldown + Duration::from_millis(1);
+        assert_eq!(backoff.try_admit_at(PATH, after), Admission::Trial);
+
+        let much_later = after + HALF_OPEN_TRIAL_TIMEOUT;
+        assert_eq!(backoff.try_admit_at(PATH, much_later), Admission::Trial);
+    }
+
+    /// "Works, but nobody wants to wait for it" has to be visible. It stays
+    /// admitted — a slow tuner beats no tuner — but gets less rope.
+    #[test]
+    fn repeated_slow_opens_degrade_a_path_without_blocking_it() {
+        let backoff = OpenFailureBackoff::new();
+        for _ in 0..SLOW_OPEN_THRESHOLD {
+            backoff.record_success_with_latency(PATH, SLOW_OPEN_MS + 1);
+        }
+        assert_eq!(backoff.state(PATH), BreakerState::Degraded);
+        assert_eq!(
+            backoff.try_admit(PATH),
+            Admission::Allow,
+            "degraded is still usable"
+        );
+    }
+
+    #[test]
+    fn a_degraded_path_opens_after_fewer_failures() {
+        let backoff = OpenFailureBackoff::new();
+        let t0 = Instant::now();
+        for _ in 0..SLOW_OPEN_THRESHOLD {
+            backoff.record_success_with_latency(PATH, SLOW_OPEN_MS + 1);
+        }
+        assert_eq!(backoff.state(PATH), BreakerState::Degraded);
+
+        for _ in 0..DEGRADED_FAILURE_THRESHOLD {
+            backoff.record_failure_at(PATH, t0);
+        }
+        assert_eq!(
+            backoff.state_at(PATH, t0),
+            BreakerState::Open,
+            "a degraded path must trip before a healthy one would"
+        );
+        // A healthy path survives the same number of failures.
+        let healthy = OpenFailureBackoff::new();
+        for _ in 0..DEGRADED_FAILURE_THRESHOLD {
+            healthy.record_failure_at(PATH, t0);
+        }
+        assert_eq!(healthy.state_at(PATH, t0), BreakerState::Healthy);
+    }
+
+    #[test]
+    fn a_fast_open_clears_a_previous_slow_streak() {
+        let backoff = OpenFailureBackoff::new();
+        for _ in 0..SLOW_OPEN_THRESHOLD {
+            backoff.record_success_with_latency(PATH, SLOW_OPEN_MS + 1);
+        }
+        assert_eq!(backoff.state(PATH), BreakerState::Degraded);
+        backoff.record_success_with_latency(PATH, 100);
+        assert_eq!(backoff.state(PATH), BreakerState::Healthy);
     }
 }
 

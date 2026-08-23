@@ -1372,6 +1372,28 @@ textarea:focus-visible,
   color: #f0b429;
 }
 
+/* ドライバのサーキットブレーカー状態。「遅い」と「開けない」は別の障害なので
+   別の色にする。どちらもチューナーが使えない理由として一覧に出す。 */
+.badge-degraded {
+  border-color: #d08700;
+  color: #d08700;
+}
+
+.app.dark .badge-degraded {
+  border-color: #f0b429;
+  color: #f0b429;
+}
+
+.badge-breaker-open {
+  border-color: #c0392b;
+  color: #c0392b;
+}
+
+.app.dark .badge-breaker-open {
+  border-color: #ff6b6b;
+  color: #ff6b6b;
+}
+
 .genre-badge {
   padding: 2px 8px;
   border: 2px solid var(--muted);

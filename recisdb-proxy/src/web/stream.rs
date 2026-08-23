@@ -89,13 +89,19 @@ struct EncoderCleanup {
 pub(crate) enum BodyReceiver {
     Tuner(TunerSubscription),
     Encoder(broadcast::Receiver<Bytes>),
+    /// TS republished from a lease on a peer's tuner (`node::consume`). The
+    /// lease handle itself lives in [`StreamCleanup`], so the receiver here
+    /// closing means the remote stream ended — which for a RECORD lease is a
+    /// failure, exactly as a closed local broadcast is.
+    Remote(broadcast::Receiver<Bytes>),
 }
 
 impl BodyReceiver {
-    async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
+    pub(crate) async fn recv(&mut self) -> Result<Bytes, broadcast::error::RecvError> {
         match self {
             BodyReceiver::Tuner(sub) => sub.recv().await,
             BodyReceiver::Encoder(rx) => rx.recv().await,
+            BodyReceiver::Remote(rx) => rx.recv().await,
         }
     }
 }
@@ -119,7 +125,12 @@ impl BodyReceiver {
 /// disconnect mid-stream); see the unit test below for the closest available
 /// proxy: dropping the guard decrements `SharedTuner`'s subscriber_count.
 pub(crate) struct StreamCleanup {
-    tuner: Arc<SharedTuner>,
+    /// `None` when the TS comes from a peer rather than a local tuner.
+    tuner: Option<Arc<SharedTuner>>,
+    /// Holding this handle is what keeps the peer's lease alive; dropping it
+    /// releases the lease (and the peer's tuner) — the remote equivalent of
+    /// dropping a `TunerSubscription`.
+    remote: Option<Arc<crate::node::RemoteMuxStream>>,
     tuner_pool: Arc<TunerPool>,
     /// Present only in `?profile=preview` mode, where the actual data comes
     /// from [`BodyReceiver::Encoder`] rather than from a `TunerSubscription`
@@ -148,7 +159,19 @@ impl StreamCleanup {
     /// (無変換) が既定"). The subscription itself is expected to live in the
     /// sibling `BodyReceiver::Tuner`, not here.
     pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
-        Self { tuner, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+        Self { tuner: Some(tuner), remote: None, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+    }
+
+    /// Cleanup guard for a stream fed by a lease on a peer's tuner.
+    ///
+    /// There is no local reader to keep warm, so there is no idle-close to
+    /// schedule: the lease's own TTL is what protects the peer's tuner across
+    /// a reconnect, and dropping the handle releases it.
+    pub(crate) fn remote_only(
+        remote: Arc<crate::node::RemoteMuxStream>,
+        tuner_pool: Arc<TunerPool>,
+    ) -> Self {
+        Self { tuner: None, remote: Some(remote), tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
     }
 
     /// Attach the dashboard registration for this stream, together with the
@@ -171,6 +194,14 @@ impl StreamCleanup {
             session.record_sent(len);
         }
     }
+
+    /// Record why this stream is ending, for `session_history`. No-op for
+    /// unregistered streams (tests, peer-less requests).
+    pub(crate) fn set_disconnect_reason(&self, reason: &str) {
+        if let Some(session) = self.session.as_ref() {
+            session.set_disconnect_reason(reason);
+        }
+    }
 }
 
 impl Drop for StreamCleanup {
@@ -182,15 +213,21 @@ impl Drop for StreamCleanup {
         // check below could run (in the spawned task) before this decrement
         // actually happens.
         let _ = self.parked_tuner_sub.take();
+        // Releases the peer's lease. Synchronous: there is nothing async to
+        // do, and the peer frees its tuner as soon as the release lands (or
+        // when the lease TTL expires, whichever comes first).
+        let _ = self.remote.take();
 
-        let tuner = Arc::clone(&self.tuner);
+        let tuner = self.tuner.clone();
         let tuner_pool = Arc::clone(&self.tuner_pool);
         let encoder = self.encoder.take();
         tokio::spawn(async move {
-            if !tuner.has_subscribers() {
-                tuner_pool
-                    .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
-                    .await;
+            if let Some(tuner) = tuner {
+                if !tuner.has_subscribers() {
+                    tuner_pool
+                        .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
+                        .await;
+                }
             }
             if let Some(EncoderCleanup { pool, key, encoder }) = encoder {
                 pool.release(&key, &encoder).await;
@@ -336,6 +373,21 @@ impl TsAligner {
     }
 }
 
+/// What a stream does when the broadcast channel reports `Lagged`.
+///
+/// STREAMING_DESIGN.md §2 / CLAUDE.md: a recording must never lose data
+/// silently. A viewer would rather resynchronize than be disconnected, but a
+/// recording that skips bytes produces a file whose corruption is only
+/// discovered on playback, so the recording is failed loudly instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossPolicy {
+    /// VIEW/PREVIEW: drop the torn carry buffer, resynchronize, keep going.
+    Recover,
+    /// RECORD: terminate the response with an error and record the reason in
+    /// `session_history`.
+    Fatal,
+}
+
 /// State for [`service_filtered_body_stream`]. Field order matters for the
 /// same reason [`StreamState`]'s does: `rx` must drop before `_cleanup`.
 struct FilteredStreamState {
@@ -344,6 +396,10 @@ struct FilteredStreamState {
     shutdown_rx: Option<mpsc::Receiver<()>>,
     filter: TsServiceFilter,
     aligner: TsAligner,
+    loss_policy: LossPolicy,
+    /// Set once [`LossPolicy::Fatal`] has yielded its error, so the stream
+    /// ends instead of being polled again.
+    fatal: bool,
     _cleanup: StreamCleanup,
 }
 
@@ -377,16 +433,22 @@ pub(crate) fn service_filtered_body_stream(
     rx: BodyReceiver,
     mut cleanup: StreamCleanup,
     target_sid: u16,
+    loss_policy: LossPolicy,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let state = FilteredStreamState {
         rx,
         shutdown_rx: cleanup.take_shutdown(),
         filter: TsServiceFilter::new(target_sid),
         aligner: TsAligner::new(),
+        loss_policy,
+        fatal: false,
         _cleanup: cleanup,
     };
 
     stream::unfold(state, |mut state| async move {
+        if state.fatal {
+            return None;
+        }
         loop {
             let received = match state.shutdown_rx.as_mut() {
                 Some(shutdown_rx) => {
@@ -412,11 +474,48 @@ pub(crate) fn service_filtered_body_stream(
                     return Some((Ok(Bytes::from(filtered)), state));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
                     state.aligner.on_gap();
-                    continue;
+                    match state.loss_policy {
+                        LossPolicy::Recover => {
+                            debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
+                            continue;
+                        }
+                        LossPolicy::Fatal => {
+                            warn!(
+                                "[HTTP stream] RECORD receiver lagged by {} chunks; terminating rather than silently corrupting the recording",
+                                n
+                            );
+                            state._cleanup.set_disconnect_reason("record_broadcast_lag");
+                            state.fatal = true;
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("record stream lost {n} broadcast chunk(s)"),
+                            );
+                            return Some((Err(error), state));
+                        }
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Closed) => match state.loss_policy {
+                    // The source ended. For a viewer that is an ordinary EOF.
+                    LossPolicy::Recover => return None,
+                    // For a recording it is not: the response has already been
+                    // sent as `200 OK`, so ending the body normally would look
+                    // to EPGStation like a complete recording that just
+                    // happens to stop early. Fail the body instead, and leave
+                    // the reason in `session_history`.
+                    LossPolicy::Fatal => {
+                        warn!(
+                            "[HTTP stream] RECORD source closed mid-stream; failing the response rather than reporting a truncated recording as complete"
+                        );
+                        state._cleanup.set_disconnect_reason("record_source_closed");
+                        state.fatal = true;
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "record stream source closed",
+                        );
+                        return Some((Err(error), state));
+                    }
+                },
             }
         }
     })
@@ -656,7 +755,50 @@ pub(crate) fn session_info_for(
     tuner: &SharedTuner,
     stream_class: StreamClass,
 ) -> HttpStreamSessionInfo {
+    session_info_for_source(
+        protocol,
+        peer,
+        resolved,
+        Some(tuner),
+        None,
+        stream_class,
+    )
+}
+
+/// Same, for a stream that may be fed by a peer instead of a local tuner.
+///
+/// The dashboard must always show *why* a tuner is busy (CLAUDE.md, Web
+/// ダッシュボード). For a remote stream the honest answer is which node and
+/// lease are holding it, so that is what goes in the tuner column.
+pub(crate) fn session_info_for_source(
+    protocol: SessionProtocol,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    resolved: &channel_resolve::ResolvedService,
+    tuner: Option<&SharedTuner>,
+    remote: Option<&crate::node::RemoteMuxStream>,
+    stream_class: StreamClass,
+) -> HttpStreamSessionInfo {
     let channel = &resolved.channel;
+    let (tuner_path, channel_info) = match (tuner, remote) {
+        (Some(tuner), _) => (
+            Some(tuner.key.tuner_path.clone()),
+            match &tuner.key.channel {
+                ChannelKeySpec::SpaceChannel { space, channel } => {
+                    Some(format!("Space {}, Ch {}", space, channel))
+                }
+                ChannelKeySpec::Simple(ch) => Some(format!("Ch {}", ch)),
+            },
+        ),
+        (None, Some(remote)) => (
+            Some(format!(
+                "node:{} ({})",
+                remote.lease().owner_node,
+                remote.base_url()
+            )),
+            Some(format!("remote route {}", remote.lease().route_id)),
+        ),
+        (None, None) => (None, None),
+    };
 
     HttpStreamSessionInfo {
         protocol,
@@ -666,12 +808,9 @@ pub(crate) fn session_info_for(
         // never fail with 500 just because the peer address is unavailable,
         // the same treatment the access log gives it.
         addr: peer.map(|ConnectInfo(addr)| addr),
-        tuner_path: Some(tuner.key.tuner_path.clone()),
+        tuner_path,
         channel_name: channel.channel_name.clone().or_else(|| channel.raw_name.clone()),
-        channel_info: match &tuner.key.channel {
-            ChannelKeySpec::SpaceChannel { space, channel } => Some(format!("Space {}, Ch {}", space, channel)),
-            ChannelKeySpec::Simple(ch) => Some(format!("Ch {}", ch)),
-        },
+        channel_info,
         nid: Some(channel.nid),
         sid: Some(channel.sid),
         stream_class,
@@ -696,6 +835,7 @@ async fn stream_resolved(
     // (`web/http_session.rs`).
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
+        Arc::clone(&web_state.database),
         session_info_for(SessionProtocol::Http, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
@@ -766,7 +906,8 @@ async fn stream_resolved(
             );
             let enc_rx = encoder.subscribe();
             let cleanup = StreamCleanup {
-                tuner: Arc::clone(&tuner),
+                tuner: Some(Arc::clone(&tuner)),
+                remote: None,
                 tuner_pool: Arc::clone(&web_state.tuner_pool),
                 // The actual data comes from `enc_rx` below; this is only
                 // here to keep `tuner_rx`'s refcount alive for the response's
@@ -931,7 +1072,8 @@ mod tests {
         // shape): the subscription lives in `StreamCleanup`, not in a
         // sibling `BodyReceiver::Tuner`.
         let cleanup = StreamCleanup {
-            tuner: Arc::clone(&tuner),
+            tuner: Some(Arc::clone(&tuner)),
+            remote: None,
             tuner_pool: Arc::clone(&tuner_pool),
             parked_tuner_sub: Some(sub),
             encoder: None,
@@ -944,6 +1086,116 @@ mod tests {
         // `StreamCleanup::drop`, so this is already true with no yield
         // needed — asserted immediately to prove that.
         assert!(!tuner.has_subscribers(), "dropping StreamCleanup must release the tracked subscription");
+    }
+
+    /// Build a receiver that has already fallen behind, so the next `recv`
+    /// returns `Lagged` — the shape a slow client produces in production.
+    fn lagged_receiver(packets: usize) -> (broadcast::Sender<Bytes>, broadcast::Receiver<Bytes>) {
+        // Capacity 2 so a handful of sends is guaranteed to overrun it.
+        let (tx, rx) = broadcast::channel::<Bytes>(2);
+        let packet = {
+            let mut p = vec![0u8; 188];
+            p[0] = 0x47;
+            Bytes::from(p)
+        };
+        for _ in 0..packets {
+            let _ = tx.send(packet.clone());
+        }
+        (tx, rx)
+    }
+
+    fn test_cleanup() -> StreamCleanup {
+        StreamCleanup::tuner_only(
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2),
+            Arc::new(TunerPool::new(4)),
+        )
+    }
+
+    /// CLAUDE.md / STREAMING_DESIGN.md §2: a recording must never lose data
+    /// silently. A lagging RECORD consumer has to see an error, because a
+    /// file with an unannounced hole is only discovered on playback.
+    #[tokio::test]
+    async fn a_lagging_record_stream_fails_instead_of_skipping_bytes() {
+        use futures::StreamExt;
+
+        let (_tx, rx) = lagged_receiver(16);
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            test_cleanup(),
+            1024,
+            LossPolicy::Fatal,
+        );
+        futures::pin_mut!(stream);
+
+        let first = stream.next().await.expect("a fatal loss must be reported, not swallowed");
+        let err = first.expect_err("the RECORD stream must terminate with an error");
+        assert!(
+            err.to_string().contains("record stream lost"),
+            "the reason must say what happened: {err}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after the fatal error rather than resuming mid-recording"
+        );
+    }
+
+    /// A remote node going away (its lease stream ending, the peer being
+    /// killed) closes the receiver. For a recording that is a failure, not an
+    /// EOF: the response has already been sent as `200 OK`, so ending the
+    /// body normally would report a truncated recording as a complete one.
+    #[tokio::test]
+    async fn a_record_stream_fails_when_the_remote_source_closes() {
+        use futures::StreamExt;
+
+        let (tx, rx) = broadcast::channel::<Bytes>(4);
+        let cleanup = test_cleanup();
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            cleanup,
+            1024,
+            LossPolicy::Fatal,
+        );
+        futures::pin_mut!(stream);
+
+        // The peer disappears without releasing its lease first.
+        drop(tx);
+
+        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let err = first.expect_err("the RECORD stream must terminate with an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("source closed"),
+            "the reason must say what happened: {err}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after the fatal error"
+        );
+    }
+
+    /// A viewer would rather resynchronize than be disconnected, so the same
+    /// event must *not* be fatal for VIEW/PREVIEW.
+    #[tokio::test]
+    async fn a_lagging_view_stream_resynchronizes_and_keeps_going() {
+        use futures::StreamExt;
+
+        let (tx, rx) = lagged_receiver(16);
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            test_cleanup(),
+            1024,
+            LossPolicy::Recover,
+        );
+        futures::pin_mut!(stream);
+
+        // Nothing is yielded for the gap itself; the stream simply waits for
+        // the next chunk. Dropping the sender ends it cleanly, which proves
+        // the `Lagged` did not terminate it with an error.
+        drop(tx);
+        assert!(
+            stream.next().await.is_none(),
+            "VIEW must end only when the source closes, never with a lag error"
+        );
     }
 
     #[tokio::test]

@@ -70,15 +70,14 @@
 
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::info;
 
 use crate::database::{ChannelRecord, Database};
 use crate::server::listener::DatabaseHandle;
 use crate::server::session_capacity::count_running_instances_on_driver;
 use crate::tuner::acquire::{self, AcquireError, AcquireRequest};
 use crate::tuner::pool::TunerPoolError;
-use crate::tuner::timing;
-use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
+use crate::tuner::{ChannelKey, EffectiveClaim, SharedTuner, TunerPool};
 
 /// `bondriver_version` passed to `TunerPool::get_or_create`. HTTP streaming
 /// always addresses channels via space+channel (never the legacy v1
@@ -306,128 +305,125 @@ fn resolve_candidate_rows(
     Ok(ResolvedService { channel: channel.unwrap_or(representative), candidates })
 }
 
-/// Detect `EALREADY` from `start_reader`, which does NOT preserve
-/// `raw_os_error`: the blocking open thread stringifies the original
-/// `io::Error` into the `ready_tx` channel and the awaiting side rebuilds it
-/// as `io::Error::new(kind, String)` (see `tuner/shared.rs`), so only the
-/// Display text ("... (os error 114)") survives. Check both the raw code
-/// (in case that path ever starts preserving it) and the stringified form.
-#[cfg(unix)]
-fn is_ealready(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EALREADY)
-        || e.to_string().contains(&format!("(os error {})", libc::EALREADY))
-}
-
-/// Get-or-create the `SharedTuner` for `resolved` and ensure its BonDriver
-/// reader is running, starting it if needed.
-///
-/// docs/TUNER_PIPELINE_REDESIGN.md P2b-1: the actual selection/eviction/
-/// start sequence now goes entirely through `tuner::acquire::acquire` (the
-/// single executor also used by every other selection path once P2b-2/-3
-/// land) — this function is left with exactly the two things that are
-/// genuinely specific to HTTP/Mirakurun streaming and are *not* part of
-/// `decide`'s policy (see module doc comment above):
-///
-/// 1. The Unix single-open-per-device-path idle eviction
-///    (`evict_idle_on_path`), both proactively (here, before ever calling
-///    `acquire`) and reactively (on `EALREADY`, after `acquire` fails).
-/// 2. Translating [`crate::tuner::acquire::AcquireError`] into this module's
-///    own [`ChannelResolveError`] (in particular, `Busy`'s `running`/`max`
-///    diagnostic fields, which `AcquireError` has no reason to know about).
-///
-/// The request built for `acquire` carries every candidate in `resolved`
-/// (module doc comment: the same `(nid, sid)` can be scanned into more than
-/// one BonDriver's rows), `exclusive: false` (an HTTP viewer never preempts
-/// another session's live reader — same guarantee as before this refactor,
-/// now enforced structurally by `decide`'s exclusive-eviction branch simply
-/// never being reachable with `exclusive: false`), and
-/// `priority: resolved.channel.priority` (this channel's own DB-configured
-/// priority — the same value a session's `SetChannelSpace` uses when the
-/// client did not explicitly override it; HTTP has no equivalent of a
-/// client-supplied priority to plumb through). No `carried_permit`/`warm`:
-/// an HTTP request never already holds either. Which candidate `decide`
-/// actually settles on is reported back via `AcquireOutcome::key` /
-/// `finish_outcome`'s return value (`SharedTuner::key`) — callers must use
-/// that, not `resolved.channel_key()`, since they can differ.
+/// Get-or-create the `SharedTuner` for `resolved` using the channel's
+/// configured DB priority and a non-exclusive claim. Stateless dashboard HTTP
+/// callers use this compatibility entry point; Mirakurun can supply its
+/// request priority via [`start_tuner_for_service_with_claim`].
 pub async fn start_tuner_for_service(
     tuner_pool: &Arc<TunerPool>,
     database: &DatabaseHandle,
     resolved: &ResolvedService,
 ) -> Result<Arc<SharedTuner>, ChannelResolveError> {
-    // Proactive idle eviction: only when EVERY candidate driver already
-    // looks at/over its own `max_instances` is there no point trying
-    // `acquire` without first freeing something up — if even one candidate
-    // has room, `decide` will simply pick it (or join an existing reader on
-    // it) without needing any eviction at all, so evicting here would only
-    // risk killing an idle reader on a driver this request may not even end
-    // up using. This is the Unix single-open-per-device-path workaround
-    // (module doc comment) and is independent of `decide`'s own
-    // (priority-gated) capacity-limit eviction below `acquire` — a request
-    // for a channel that is already running still joins it for free via
-    // `acquire`'s `Reuse` path regardless of what happens here.
-    let mut all_full = true;
-    for c in &resolved.candidates {
-        let running = count_running_instances_on_driver(tuner_pool, &c.dll_path, Some(&c.channel_key)).await;
-        if running < c.max_instances {
-            all_full = false;
-            break;
+    start_tuner_for_service_with_claim(
+        tuner_pool,
+        database,
+        resolved,
+        EffectiveClaim::new(resolved.channel.priority, false),
+    )
+    .await
+}
+
+/// Where an HTTP/Mirakurun stream's TS is coming from.
+///
+/// A remote source behaves like a local one downstream: both hand out a
+/// `broadcast::Receiver<Bytes>` of raw TS. The distinction only matters for
+/// lifetime management, which is why it survives as far as `StreamCleanup`.
+pub enum StreamSource {
+    Local(Arc<SharedTuner>),
+    /// A lease on a peer's tuner (`node::consume`). The stream is kept alive
+    /// by holding this handle: dropping it releases the peer's lease.
+    Remote(Arc<crate::node::RemoteMuxStream>),
+}
+
+/// End-to-end budget for finding a remote node that can serve a request.
+///
+/// Deliberately generous relative to a local acquire: it covers a peer's own
+/// tuner open. It is a single budget for the whole search, not per peer.
+const REMOTE_SEARCH_BUDGET_MS: u64 = 20_000;
+
+/// Resolve a service to a TS source, preferring a local tuner and falling back
+/// to a paired node that advertises the same mux.
+///
+/// The fallback is *only* tried when no local tuner could serve the request.
+/// A locally receivable channel is never sent over the network just because a
+/// peer also has it: the local path has no transport failure domain at all.
+pub async fn start_source_for_service_with_claim(
+    tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    resolved: &ResolvedService,
+    claim: EffectiveClaim,
+    stream_class: recisdb_protocol::StreamClass,
+) -> Result<StreamSource, ChannelResolveError> {
+    let local = start_tuner_for_service_with_claim(tuner_pool, database, resolved, claim).await;
+    let local_error = match local {
+        Ok(tuner) => return Ok(StreamSource::Local(tuner)),
+        Err(e) => e,
+    };
+
+    let mux = crate::node::LogicalMuxId {
+        nid: resolved.channel.nid,
+        tsid: resolved.channel.tsid,
+    };
+    let local_identity = {
+        let db = database.lock().await;
+        match crate::node::NodeStore::new(&db).and_then(|s| s.local_identity()) {
+            Ok(identity) => identity,
+            // The fabric was never initialised on this node; the local error
+            // is the only answer there is.
+            Err(_) => return Err(local_error),
+        }
+    };
+
+    match crate::node::RemoteMuxStream::open_best(
+        database,
+        &local_identity,
+        mux,
+        Some(resolved.channel.sid),
+        stream_class,
+        claim,
+        REMOTE_SEARCH_BUDGET_MS,
+    )
+    .await
+    {
+        Ok(stream) => {
+            info!(
+                "[HTTP stream] service id={} served from remote lease {} ({})",
+                resolved.channel.id,
+                stream.lease().lease_id,
+                stream.base_url()
+            );
+            Ok(StreamSource::Remote(Arc::new(stream)))
+        }
+        Err(remote_error) => {
+            // Report the *local* failure: it is what the operator can act on,
+            // and "no remote node has this either" is a detail, not the cause.
+            info!(
+                "[HTTP stream] no remote node could serve service id={} either: {}",
+                resolved.channel.id, remote_error
+            );
+            Err(local_error)
         }
     }
-    if all_full {
-        evict_idle_on_all_candidates(tuner_pool, resolved, "service").await;
-    }
+}
 
-    match try_acquire(tuner_pool, database, resolved).await {
+/// Same resolver with an explicit canonical contention claim.
+///
+/// Reclamation is intentionally left to `tuner::policy`: the former HTTP
+/// EALREADY workaround stopped any Running+0-subscriber reader, which also
+/// describes a freshly-started reader in the short window before its first
+/// subscriber attaches. That race could kill another request's new tuner.
+pub async fn start_tuner_for_service_with_claim(
+    tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    resolved: &ResolvedService,
+    claim: EffectiveClaim,
+) -> Result<Arc<SharedTuner>, ChannelResolveError> {
+    match try_acquire(tuner_pool, database, resolved, claim).await {
         Ok(outcome) => {
             tuner_pool.cancel_idle_close(&outcome.key).await;
             Ok(finish_outcome(outcome, resolved))
         }
-        #[cfg(unix)]
-        Err(AcquireError::ReaderStart(e)) if is_ealready(&e) => {
-            // Last-resort insurance: the capacity check above is keyed off
-            // `max_instances`, a *configured* slot count independent of the
-            // physical single-open-per-device-path constraint some Unix
-            // character-device BonDrivers enforce (module doc comment). If
-            // the driver open still raced against an idle reader that
-            // hadn't been counted as "at capacity" (e.g. `max_instances` > 1
-            // but the device itself only tolerates one open), evict any
-            // idle reader on every candidate path unconditionally and retry
-            // once.
-            warn!(
-                "[HTTP stream] BonDriver open failed with EALREADY for service id={} \
-                 ({} candidate(s)); evicting idle readers and retrying once",
-                resolved.channel.id, resolved.candidates.len()
-            );
-            evict_idle_on_all_candidates(tuner_pool, resolved, "service").await;
-            tokio::time::sleep(std::time::Duration::from_millis(timing::EALREADY_RETRY_SLEEP_MS)).await;
-            match try_acquire(tuner_pool, database, resolved).await {
-                Ok(outcome) => {
-                    tuner_pool.cancel_idle_close(&outcome.key).await;
-                    Ok(finish_outcome(outcome, resolved))
-                }
-                Err(e) => Err(map_acquire_error(tuner_pool, resolved, e).await),
-            }
-        }
         Err(e) => Err(map_acquire_error(tuner_pool, resolved, e).await),
-    }
-}
-
-/// Evict idle (subscriber-less) readers on every distinct `dll_path` among
-/// `resolved`'s candidates. `label` is only used for the log line.
-async fn evict_idle_on_all_candidates(tuner_pool: &Arc<TunerPool>, resolved: &ResolvedService, label: &str) {
-    let mut seen_paths: Vec<&str> = Vec::new();
-    for c in &resolved.candidates {
-        if seen_paths.contains(&c.dll_path.as_str()) {
-            continue;
-        }
-        seen_paths.push(&c.dll_path);
-        let evicted = tuner_pool.evict_idle_on_path(&c.dll_path, Some(&c.channel_key)).await;
-        if evicted > 0 {
-            info!(
-                "[HTTP stream] evicted {} idle reader(s) on {} to free capacity for {} id={}",
-                evicted, c.dll_path, label, resolved.channel.id
-            );
-        }
     }
 }
 
@@ -456,14 +452,15 @@ async fn try_acquire(
     tuner_pool: &Arc<TunerPool>,
     database: &DatabaseHandle,
     resolved: &ResolvedService,
+    claim: EffectiveClaim,
 ) -> Result<acquire::AcquireOutcome, AcquireError> {
     acquire::acquire(
         tuner_pool,
         database,
         AcquireRequest {
             candidates: resolved.candidates.iter().map(|c| c.channel_key.clone()).collect(),
-            priority: resolved.channel.priority,
-            exclusive: false,
+            priority: claim.priority,
+            exclusive: claim.exclusive,
             client_host: "http".to_string(),
             // HTTP requests are stateless: there is no "the tuner this
             // caller was already on" to exclude from capacity, and nothing
@@ -617,26 +614,6 @@ mod tests {
         let (db, _ch_id) = setup_db_with_channel(Some(0), Some(13), false);
         let err = resolve_service_by_nid_sid(&db, 1, 100).unwrap_err();
         assert!(matches!(err, ChannelResolveError::Disabled(_)));
-    }
-
-    /// `start_reader` loses `raw_os_error` (the open error is
-    /// stringified through the ready channel — see `is_ealready`'s doc), so
-    /// the retry guard must match the stringified form too.
-    #[cfg(unix)]
-    #[test]
-    fn is_ealready_matches_both_raw_and_stringified_errors() {
-        let raw = std::io::Error::from_raw_os_error(libc::EALREADY);
-        assert!(is_ealready(&raw));
-
-        let stringified = std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("BonDriver error: {}", raw),
-        );
-        assert!(stringified.raw_os_error().is_none(), "precondition: stringification drops the raw code");
-        assert!(is_ealready(&stringified));
-
-        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "BonDriver not found");
-        assert!(!is_ealready(&other));
     }
 
     #[tokio::test]

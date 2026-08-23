@@ -504,6 +504,11 @@ pub struct WebState {
     /// every terrestrial station is `GR`. Resolved from `[mirakurun]
     /// home_region` in `app_config.rs`.
     pub mirakurun_home_regions: Vec<u8>,
+    /// Smallest `X-Mirakurun-Priority` treated as a recording on
+    /// `GET /mirakurun/api/services/:id/stream` (`[mirakurun]
+    /// record_priority_threshold`, default `1`). See
+    /// `web/mirakurun.rs::stream_class_for_priority`.
+    pub mirakurun_record_priority_threshold: i32,
     /// Fan-out for `GET /mirakurun/api/events/stream`
     /// (`web/mirakurun_events.rs`, `docs/EPGSTATION_COMPAT.md` §3/§6): every
     /// handler call does `.subscribe()` on this to get its own receiver.
@@ -514,6 +519,14 @@ pub struct WebState {
     /// each independently creating a dead one. See `main.rs` for the
     /// capacity-1024 rationale.
     pub epg_events_tx: broadcast::Sender<ProgramUpsert>,
+    /// Live state of the dedicated node-to-node transport listener
+    /// (`node::transport`), when the distributed fabric is enabled. The
+    /// dashboard needs it to trust a newly paired peer immediately, without
+    /// waiting for a restart. `None` when `[node] enabled = false`.
+    pub node_transport: Option<Arc<crate::node::NodeTransportState>>,
+    /// `[node] listen` as configured, shown next to a freshly issued pairing
+    /// code so the operator knows which URL to type on the other node.
+    pub node_listen_addr: Option<String>,
 }
 
 impl WebState {
@@ -540,12 +553,15 @@ impl WebState {
             proxy_listen_addr: None,
             config_path: None,
             mirakurun_home_regions: Vec::new(),
+            mirakurun_record_priority_threshold: 1,
             update_check_cache: RwLock::new(None),
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,
             log_dir,
             log_level,
             epg_events_tx,
+            node_transport: None,
+            node_listen_addr: None,
             scan_config: RwLock::new(ScanSchedulerInfo {
                 check_interval_secs: 60,
                 max_concurrent_scans: 1,

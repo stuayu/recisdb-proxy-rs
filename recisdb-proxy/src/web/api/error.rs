@@ -42,6 +42,12 @@ impl ApiError {
         Self { status: StatusCode::CONFLICT, message: message.into() }
     }
 
+    /// 502 — an upstream this server had to talk to failed (e.g. the remote
+    /// node's pairing endpoint, `web/api/nodes.rs`).
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::BAD_GATEWAY, message: message.into() }
+    }
+
     /// 501 — the server (or this platform's build) does not implement the
     /// requested capability (e.g. self-update on macOS, `web/api/update.rs`).
     pub fn not_implemented(message: impl Into<String>) -> Self {

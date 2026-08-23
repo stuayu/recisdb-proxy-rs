@@ -62,6 +62,7 @@ rust-embed = "8.7"
 # present in Cargo.lock as a transitive dependency (via rustls/ring), so this
 # direct dependency adds no new crate to the build.
 getrandom = "0.2"
+sha2 = "0.10"
 chrono = "0.4"
 reqwest = { version = "0.11", features = ["json", "blocking"] }
 dns-lookup = "1.0"

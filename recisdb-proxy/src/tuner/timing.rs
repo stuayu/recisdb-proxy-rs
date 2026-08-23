@@ -98,3 +98,34 @@ mod tests {
         );
     }
 }
+
+/// Soft stall threshold derived from the hard no-data timeout.
+///
+/// Half the hard deadline, floored at 3 s so a very short configured timeout
+/// does not turn every normal inter-chunk gap into a stall, and capped at 10 s
+/// so a very long one still notices trouble promptly. `0` (timeout disabled)
+/// still gets a fixed soft threshold: health measurement is useful even when
+/// the reader is deliberately never killed.
+pub(crate) fn soft_stall_threshold_ms(no_data_timeout_secs: u64) -> u64 {
+    if no_data_timeout_secs == 0 {
+        return 10_000;
+    }
+    (no_data_timeout_secs * 1_000 / 2).clamp(3_000, 10_000)
+}
+
+#[cfg(test)]
+mod soft_stall_tests {
+    use super::soft_stall_threshold_ms;
+
+    #[test]
+    fn soft_threshold_is_below_the_hard_deadline_and_bounded() {
+        // Typical: 30 s hard -> 10 s soft (capped).
+        assert_eq!(soft_stall_threshold_ms(30), 10_000);
+        // 8 s hard -> 4 s soft, comfortably below the hard deadline.
+        assert_eq!(soft_stall_threshold_ms(8), 4_000);
+        // A very short timeout must not make every gap a stall.
+        assert_eq!(soft_stall_threshold_ms(2), 3_000);
+        // Disabled hard timeout still measures stalls.
+        assert_eq!(soft_stall_threshold_ms(0), 10_000);
+    }
+}

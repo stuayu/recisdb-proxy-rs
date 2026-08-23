@@ -33,7 +33,7 @@ pub(super) async fn driver_max_instances(
 /// started over `max_instances`. (Before `ReaderState` existed, the old
 /// `is_running` flag was set to `true` at the very top of the reader body,
 /// so it covered the init window too — `occupies_slot()` preserves that.)
-pub(super) async fn count_running_instances_on_driver(
+pub(crate) async fn count_running_instances_on_driver(
     tuner_pool: &Arc<TunerPool>,
     tuner_path: &str,
     exclude_key: Option<&ChannelKey>,

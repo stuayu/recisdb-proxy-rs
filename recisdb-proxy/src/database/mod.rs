@@ -183,7 +183,37 @@ impl Database {
         ("021_github_token", Database::migration_021_github_token),
         ("022_log_config", Database::migration_022_log_config),
         ("023_tuner_livelock_config", Database::migration_023_tuner_livelock_config),
+        (
+            "024_driver_runtime_health",
+            Database::migration_024_driver_runtime_health,
+        ),
     ];
+
+    /// Migration 024: BonDriver runtime health (startup latency, stalls,
+    /// failures). Previously created lazily on first access, which worked but
+    /// put a schema definition outside this ledger; CLAUDE.md requires every
+    /// schema change to be an entry here so a pre-ledger database replays it
+    /// from `user_version = 0`. Idempotent, like every other entry.
+    fn migration_024_driver_runtime_health(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS driver_runtime_health (
+                bon_driver_id INTEGER PRIMARY KEY,
+                samples INTEGER NOT NULL DEFAULT 0,
+                open_latency_ewma_ms REAL,
+                tune_latency_ewma_ms REAL,
+                first_ts_latency_ewma_ms REAL,
+                stall_count INTEGER NOT NULL DEFAULT 0,
+                open_failures INTEGER NOT NULL DEFAULT 0,
+                tune_failures INTEGER NOT NULL DEFAULT 0,
+                first_ts_timeouts INTEGER NOT NULL DEFAULT 0,
+                worker_restarts INTEGER NOT NULL DEFAULT 0,
+                runtime_score REAL NOT NULL DEFAULT 1.0,
+                last_updated INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
+            );",
+        )?;
+        Ok(())
+    }
 
     /// Migration 022: log level/retention, moved from the TOML `[logging]`
     /// section into the database so the Web dashboard can change them

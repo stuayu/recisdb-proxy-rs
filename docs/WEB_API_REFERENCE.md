@@ -112,6 +112,35 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 
 サービスの**登録・削除はWeb APIにはありません**。管理者権限が必要な操作であり、任意の実行ファイルをネットワーク越しに常駐登録できると権限昇格の経路になるためです。登録はセットアップウィザードか `recisdb-proxy service install` から行います。
 
+### BonDriverの健全性
+
+`GET /api/bondrivers` の各行に次が入る。
+
+- `breaker_state` — `healthy` / `degraded`（開けるが毎回遅すぎる）/ `open`（連続失敗で一時停止中）/ `half_open`（復旧確認の1件だけ通している）
+- `breaker_retry_in_secs` — `open` のとき、次に試すまでの秒数
+- `quality_score` — ストリーム品質 × 実行時ヘルス（起動レイテンシ・stall・失敗）の積。`1.0` は「観測がまだ無い」も意味する
+
+ダッシュボードの「状態」列に出る。詳細: `docs/DISTRIBUTED_TUNER_FABRIC.md` §9。
+
+## 分散ノード
+
+`[node] enabled = true` のときに使う。これらは**ダッシュボード側**のAPIで、通常の `/api/*` 認証に従う。
+ノード間通信そのものは別リスナー・別名前空間 (`/node/v3/*`、`NodeCredential` 認証) で、
+ダッシュボードのBearerトークンとは無関係。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/api/nodes` | ローカルID・登録ノード・エンドポイント・ルートグループ・発行済みペアリング・ノードごとの受信可能経路数の一覧 |
+| POST | `/api/nodes` | リモートノードの手動登録・編集（エンドポイントは丸ごと置換） |
+| POST | `/api/nodes/:id/probe` | 全エンドポイントを実測し、VIEW/PREVIEW/RECORD ごとの最良経路を返す |
+| POST | `/api/nodes/pairing` | ワンタイムのペアリングコードを発行する |
+| POST | `/api/nodes/pairing/redeem` | 相手ノードのURLとコードを指定してペアリングする |
+| POST | `/api/node-route-groups/member` | ルートグループを作成し、ノードを重み付きで追加・更新する |
+
+**クレデンシャルはレスポンスに出さない。** `GET /api/nodes` が返すのは `paired: true/false` だけ。
+`POST /api/nodes/pairing` が返す平文コードは**その1回だけ**で、サーバーにはSHA-256しか保存しない
+（失くしたら再発行する）。有効期限10分・1回限り。詳細は `docs/DISTRIBUTED_TUNER_FABRIC.md` §4.1。
+
 ## ストリームと静的資産
 
 | Method | Path | 用途 |

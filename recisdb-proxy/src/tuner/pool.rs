@@ -236,6 +236,11 @@ impl Drop for ScanReservation {
 struct DriverSlotEntry {
     semaphore: Arc<Semaphore>,
     capacity: i32,
+    /// Permits a shrink could not remove yet because they were checked out at
+    /// the time. Carried until they can actually be taken back, so lowering
+    /// `max_instances` while readers are running is eventually enforced
+    /// instead of silently lost.
+    pending_shrink: usize,
 }
 
 /// Per-DLL-path semaphores enforcing `max_instances` (docs/TUNER_PIPELINE_REDESIGN.md
@@ -262,16 +267,16 @@ impl DriverSlots {
     /// Get (creating if needed) the semaphore for `dll_path`, resizing it to
     /// `max_instances` if that has changed since the last call.
     ///
-    /// Resizing is a plain `add_permits`/`forget_permits` delta against the
-    /// previously recorded `capacity` — increases take effect immediately;
-    /// decreases only remove *currently available* permits. If `max_instances`
-    /// is lowered while every existing permit is checked out, the excess
-    /// capacity is not clawed back until those permits are naturally returned
-    /// (each returned permit hands one slot back to whoever is waiting/next
-    /// to ask, rather than shrinking the pool further) — acceptable per
-    /// docs/TUNER_PIPELINE_REDESIGN.md P1b §1 ("減少しきれない分は次の解放時に
-    /// 自然に吸収される形でよい"): this is a rare admin reconfiguration, not a
-    /// safety property `acquire_slot` depends on.
+    /// Increases take effect immediately. Decreases can only remove permits
+    /// that are *currently available*, so a shrink applied while readers are
+    /// running is remembered in `pending_shrink` and absorbed as those permits
+    /// come back — the behaviour docs/TUNER_PIPELINE_REDESIGN.md P1b §1
+    /// describes ("減少しきれない分は次の解放時に自然に吸収される形でよい").
+    ///
+    /// Without carrying the remainder, a `forget_permits` that found nothing
+    /// available would simply be lost: once the running readers finished, the
+    /// driver would be back at its *old* capacity and could open more
+    /// instances than the operator had just configured.
     async fn semaphore_for(&self, dll_path: &str, max_instances: i32) -> Arc<Semaphore> {
         let max_instances = max_instances.max(0);
         let mut entries = self.entries.lock().await;
@@ -279,14 +284,30 @@ impl DriverSlots {
             Some(entry) => {
                 match max_instances.cmp(&entry.capacity) {
                     std::cmp::Ordering::Greater => {
-                        entry.semaphore.add_permits((max_instances - entry.capacity) as usize);
+                        let grow = (max_instances - entry.capacity) as usize;
+                        // Growing again cancels an outstanding shrink before
+                        // it adds anything: the two must not both apply.
+                        let cancelled = grow.min(entry.pending_shrink);
+                        entry.pending_shrink -= cancelled;
+                        if grow > cancelled {
+                            entry.semaphore.add_permits(grow - cancelled);
+                        }
                     }
                     std::cmp::Ordering::Less => {
-                        entry.semaphore.forget_permits((entry.capacity - max_instances) as usize);
+                        entry.pending_shrink += (entry.capacity - max_instances) as usize;
                     }
                     std::cmp::Ordering::Equal => {}
                 }
                 entry.capacity = max_instances;
+                // Take back as much of any outstanding shrink as is available
+                // right now. This runs on every lookup, so a permit returned
+                // after the reconfiguration is absorbed at the next attempt to
+                // use the driver — which is exactly when it would otherwise
+                // have been handed out over the new limit.
+                if entry.pending_shrink > 0 {
+                    let removed = entry.semaphore.forget_permits(entry.pending_shrink);
+                    entry.pending_shrink -= removed;
+                }
                 Arc::clone(&entry.semaphore)
             }
             None => {
@@ -296,6 +317,7 @@ impl DriverSlots {
                     DriverSlotEntry {
                         semaphore: Arc::clone(&semaphore),
                         capacity: max_instances,
+                        pending_shrink: 0,
                     },
                 );
                 semaphore
@@ -776,7 +798,7 @@ impl TunerPool {
 
         // Create the shared tuner wrapper. Mark it `Reserved` immediately —
         // before it is even inserted into the map — so no concurrent
-        // `cleanup`/`evict_idle_on_path`/capacity-retain call can ever
+        // `cleanup`/capacity-retain call can ever
         // observe it as `Idle` (reclaimable) between insertion and whichever
         // caller-side `start_bondriver_reader`/`WarmTunerHandle::activate`
         // call is about to happen (SYSTEM_REVIEW_2026-07.md M8).
@@ -846,57 +868,49 @@ impl TunerPool {
         self.tuners.read().await.keys().cloned().collect()
     }
 
-    /// Evict all idle (running, no-subscriber) tuners on `tuner_path`, except
-    /// `except`.
+    /// Stop and remove *proven* keep-alive leftovers on `tuner_path`.
     ///
-    /// Unlike [`Self::cleanup`] (which only removes *stopped* tuners with no
-    /// subscribers), this stops and removes tuners that are still *running*
-    /// but currently have zero subscribers — i.e. readers kept warm only by
-    /// `schedule_idle_close`'s keep-alive window. This exists for physical
-    /// devices that allow only a single concurrent `open()` per device path
-    /// (e.g. px4-drv character devices returning `EALREADY`/errno 114 on a
-    /// second open): an idle-but-still-open reader on the same path blocks a
-    /// brand new one from opening at all, so it must be evicted before retrying,
-    /// not just left to expire on its own keep-alive timer.
+    /// "Running with zero subscribers" alone is NOT a safe idle test: a
+    /// reader that has just been started also has zero subscribers until its
+    /// requester attaches, and stopping it kills someone else's in-flight
+    /// tune. The extra condition here is an armed idle-close timer
+    /// (`keys_pending_idle_close`), which is only ever set after a reader
+    /// actually lost its last subscriber.
     ///
-    /// Returns the number of tuners stopped and removed.
-    pub async fn evict_idle_on_path(
+    /// Used only for the Unix single-open-per-device-path constraint (px4-drv
+    /// character devices return `EALREADY` on a second open even when the
+    /// configured `max_instances` says there is room). Capacity-driven
+    /// eviction belongs to `tuner::policy`, not here.
+    pub async fn reclaim_keepalive_leftovers_on_path(
         self: &Arc<Self>,
         tuner_path: &str,
         except: Option<&ChannelKey>,
     ) -> usize {
-        let keys = self.keys().await;
-        let mut evicted = 0usize;
+        let pending: Vec<ChannelKey> = self
+            .keys_pending_idle_close()
+            .await
+            .into_iter()
+            .filter(|k| k.tuner_path == tuner_path && except != Some(k))
+            .collect();
 
-        for key in keys {
-            if key.tuner_path != tuner_path {
-                continue;
-            }
-            if except == Some(&key) {
-                continue;
-            }
-
+        let mut reclaimed = 0usize;
+        for key in pending {
             let Some(tuner) = self.get(&key).await else {
                 continue;
             };
-            // Deliberately `state() == Running` (i.e. `is_running()`), not
-            // `occupies_slot()`: a `Starting` entry has not finished opening
-            // the DLL yet, so stopping it here would race the in-flight
-            // `SetChannel` rather than free up an already-idle reader.
             if !tuner.is_running() || tuner.has_subscribers() {
                 continue;
             }
 
             info!(
-                "evict_idle_on_path: evicting idle reader {:?} to free device path {}",
+                "reclaim_keepalive_leftovers_on_path: stopping keep-alive reader {:?} to free device path {}",
                 key, tuner_path
             );
             self.cancel_idle_close(&key).await;
             tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
-            // stop_reader() is async and yields; a concurrent subscribe() may
-            // have raced in during that await window, so re-check identity
-            // (not just presence) before removing the pool entry — mirrors
-            // the same pattern in schedule_idle_close() above.
+            // stop_reader() yields; a subscribe() may have raced in during
+            // that window, so re-check identity (not just presence) before
+            // removing the entry — same pattern as schedule_idle_close().
             tuner.stop_reader().await;
             {
                 let mut tuners = self.tuners.write().await;
@@ -906,10 +920,9 @@ impl TunerPool {
                     }
                 }
             }
-            evicted += 1;
+            reclaimed += 1;
         }
-
-        evicted
+        reclaimed
     }
 }
 
@@ -1072,119 +1085,67 @@ mod tests {
         assert!(pool.get(&key_a).await.is_some());
     }
 
-    /// M8 corollary: `evict_idle_on_path` must never touch a `Starting`
-    /// entry (it isn't even open yet, let alone idle) — driven through a
-    /// real `spawn_fake_reader` with a long startup delay so the entry is
-    /// genuinely mid-`SetChannel` when eviction is attempted.
-    #[tokio::test]
-    async fn evict_idle_on_path_does_not_touch_starting_entry() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key = ChannelKey::simple("/dev/px4video0", 1);
-
-        let permit = test_permit(&pool, "/dev/px4video0").await;
-        let tuner = pool
-            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
-            .await
-            .unwrap();
-        let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
-        let _ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
-        assert_eq!(tuner.state(), ReaderState::Starting);
-        assert!(!tuner.has_subscribers());
-
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0, "a Starting reader must not be evicted as if it were idle");
-        assert_eq!(pool.count().await, 1);
-        assert_eq!(tuner.state(), ReaderState::Starting, "eviction must not have touched the in-flight startup");
-
-        // Every test that spawns a fake reader must stop and join it before
-        // returning — an un-joined `spawn_blocking` task otherwise wedges
-        // the whole test binary's shutdown (`BlockingPool::shutdown` waits
-        // for it indefinitely). `stop_reader()` requests the stop now, while
-        // the fake is still mid-`set_channel` (`Starting`); the reader must
-        // honor that instead of clobbering it back to `Running` once its
-        // startup delay elapses (see `SharedTuner::try_transition_starting_to_running`).
-        tuner.stop_reader().await;
-        assert_eq!(tuner.state(), ReaderState::Stopped);
-    }
-
-    /// The real "stop a running reader" branch of `evict_idle_on_path`,
-    /// exercised end-to-end via `FakeTsSource` — previously untestable (see
-    /// the removed comment above this test) because there was no way to
-    /// drive a `SharedTuner` into a genuinely running state without a real
-    /// BonDriver DLL.
-    #[tokio::test]
-    async fn evict_idle_on_path_stops_and_removes_running_idle_reader() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key = ChannelKey::simple("/dev/px4video0", 1);
-
-        let permit = test_permit(&pool, "/dev/px4video0").await;
-        let tuner = pool
-            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
-            .await
-            .unwrap();
-        let ready_rx = tuner
-            .spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config())
-            .await;
-        ready_rx.await.unwrap().unwrap();
-        assert_eq!(tuner.state(), ReaderState::Running);
-        assert!(!tuner.has_subscribers(), "no one has subscribed yet -> eligible for idle eviction");
-
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 1);
-        assert_eq!(pool.count().await, 0);
-        assert_eq!(tuner.state(), ReaderState::Stopped);
-    }
-
-    #[tokio::test]
-    async fn evict_idle_on_path_is_noop_when_nothing_on_path() {
-        let pool = Arc::new(TunerPool::new(10));
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0);
-    }
-
-    #[tokio::test]
-    async fn evict_idle_on_path_ignores_other_paths_and_subscribed_entries() {
-        let pool = Arc::new(TunerPool::new(10));
-        let key_a = ChannelKey::simple("/dev/px4video0", 1);
-        let key_b = ChannelKey::simple("/dev/px4video1", 1);
-
-        let permit_a = test_permit(&pool, "/dev/px4video0").await;
-        let tuner_a = pool
-            .get_or_create(key_a.clone(), 2, permit_a, || async { Ok(()) })
-            .await
-            .unwrap();
-        // Keep tuner_a alive across get_or_create's own stale-entry eviction
-        // (a Starting/Stopped entry with no subscribers is otherwise treated
-        // as stale) by giving it a subscriber, matching the pattern the
-        // existing `test_pool_cleanup` test above uses.
-        let _sub_a = tuner_a.subscribe();
-
-        let permit_b = test_permit(&pool, "/dev/px4video1").await;
-        let tuner_b = pool
-            .get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) })
-            .await
-            .unwrap();
-        let _sub_b = tuner_b.subscribe();
-
-        assert_eq!(pool.count().await, 2);
-
-        // Neither entry is running (`Starting`, no real reader started), so
-        // evict_idle_on_path must not touch either regardless of path match:
-        // key_a's own path is excluded by `!is_running()`, key_b's by both
-        // `!is_running()` and the path filter.
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", None).await;
-        assert_eq!(evicted, 0);
-        assert_eq!(pool.count().await, 2);
-
-        // `except` filtering: even a hypothetical self-match must be skipped.
-        let evicted = pool.evict_idle_on_path("/dev/px4video0", Some(&key_a)).await;
-        assert_eq!(evicted, 0);
-        assert_eq!(pool.count().await, 2);
-    }
-
     // -----------------------------------------------------------------
     // P1b: driver slot reservation (docs/TUNER_PIPELINE_REDESIGN.md §4 P1b)
     // -----------------------------------------------------------------
+    /// Lowering `max_instances` while every permit is checked out cannot take
+    /// them back immediately. It must not be *lost* either: once the running
+    /// readers finish, the driver would otherwise be back at its old capacity
+    /// and happily open more instances than the operator configured.
+    #[tokio::test]
+    async fn shrinking_max_instances_while_permits_are_held_is_enforced_later() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/shrink-test";
+
+        let a = pool.acquire_slot(path, 2).await.expect("first of two slots");
+        let b = pool.acquire_slot(path, 2).await.expect("second of two slots");
+
+        // Operator drops the driver to a single instance. Nothing is
+        // available, so nothing can be taken back yet.
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "already over the new limit: no slot may be handed out"
+        );
+
+        drop(a);
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "the returned permit must be absorbed by the pending shrink, not re-issued"
+        );
+
+        drop(b);
+        let c = pool
+            .acquire_slot(path, 1)
+            .await
+            .expect("with everything returned, exactly one slot exists again");
+        assert!(
+            pool.acquire_slot(path, 1).await.is_none(),
+            "and only one: the shrink must not have been lost"
+        );
+        drop(c);
+    }
+
+    /// Raising the limit again before the shrink could be applied must cancel
+    /// it rather than both taking effect.
+    #[tokio::test]
+    async fn regrowing_cancels_a_pending_shrink() {
+        let pool = TunerPool::new(10);
+        let path = "/dev/regrow-test";
+
+        let a = pool.acquire_slot(path, 2).await.unwrap();
+        let b = pool.acquire_slot(path, 2).await.unwrap();
+        assert!(pool.acquire_slot(path, 1).await.is_none());
+
+        // Back to 2 before anything was returned.
+        drop(a);
+        drop(b);
+        let a = pool.acquire_slot(path, 2).await.expect("first slot back");
+        let b = pool.acquire_slot(path, 2).await.expect("second slot back");
+        assert!(pool.acquire_slot(path, 2).await.is_none(), "still only two");
+        drop(a);
+        drop(b);
+    }
+
 
     /// §1: capacity is now *taken*, not counted. A second slot on a
     /// `max_instances = 1` driver is simply unavailable — no snapshot, no

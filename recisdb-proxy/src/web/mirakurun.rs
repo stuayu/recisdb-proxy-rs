@@ -70,9 +70,9 @@
 //!   logo file and so reports `hasLogoData: false`.
 //! - `X-Mirakurun-Priority` (sent on both stream endpoints, real and EPG-
 //!   Station-specific: `recPriority`/`conflictPriority`/`streamingPriority`)
-//!   is accepted and parsed but **not** fed into tuner-contention decisions
-//!   (`tuner/policy.rs::decide()`) — that requires a design decision outside
-//!   this pass's scope. See [`stream_service_by_mirakurun_id`].
+//!   is parsed and propagated as the request's contention priority while
+//!   exclusivity remains a separate rank component. See
+//!   [`stream_service_by_mirakurun_id`].
 //!
 //! # Data mapping
 //!
@@ -142,9 +142,11 @@ use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
 use crate::web::stream::{
     broadcast_to_body_stream, channel_resolve_error_response, error_response, respond_with_stream,
-    service_filtered_body_stream, session_info_for, BodyReceiver, StreamCleanup,
+    service_filtered_body_stream, session_info_for, session_info_for_source, BodyReceiver,
+    LossPolicy, StreamCleanup,
 };
 use recisdb_protocol::{BandType, StreamClass};
+use crate::tuner::EffectiveClaim;
 
 // ============================================================================
 // Service id <-> (nid, sid) conversion
@@ -935,6 +937,34 @@ pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
     Json(result).into_response()
 }
 
+/// Ceiling applied to `X-Mirakurun-Priority` before it becomes an
+/// `EffectiveClaim` priority.
+///
+/// The Mirakurun-compatible API is served **without authentication** (real
+/// Mirakurun clients send no `Authorization` header — see `web/mod.rs`), and
+/// that claim is what `tuner/policy.rs::decide()` compares when it looks for
+/// a tuner to evict. Passing the header through unbounded would let anyone
+/// who can reach the port send `X-Mirakurun-Priority: 2147483647` and evict
+/// a recording in progress.
+///
+/// The value is deliberately below `server::session_backpressure`'s
+/// `RECORD_PRIORITY_THRESHOLD` (200), the point at which a BNDP session is
+/// treated as a recording: an unauthenticated request must not be able to
+/// outrank an authenticated recording, however large a number it sends. It is
+/// well above every priority EPGStation actually uses (`recPriority` /
+/// `conflictPriority` / `streamingPriority`, single digits in practice), so
+/// no legitimate client is affected.
+///
+/// Negative values are clamped to `0` for the same reason `tuner/policy.rs`
+/// treats `0` as "no explicit priority, fall back to the DB default": a
+/// client should not be able to push a request *below* that floor either.
+///
+/// Note that the two priority scales are not the same scale — BNDP carries
+/// BonDriver's 0..255, Mirakurun's is single digits — and this cap only
+/// bounds the damage rather than reconciling them; see
+/// `docs/EPGSTATION_COMPAT.md` §5.6.
+const MIRAKURUN_PRIORITY_CAP: i32 = 100;
+
 /// Parse the `X-Mirakurun-Priority` header EPGStation (and real Mirakurun
 /// clients generally) attach to both stream endpoints — `recPriority` /
 /// `conflictPriority` / `streamingPriority` depending on which reservation
@@ -943,18 +973,44 @@ pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
 /// same rather than rejecting the request — a malformed header should not
 /// break streaming.
 ///
-/// The parsed value is presently only logged, **not** wired into
-/// `tuner/policy.rs::decide()`: feeding stream priority into tuner
-/// contention is a policy decision (which stream loses when tuners are
-/// full) that belongs in a dedicated design pass, not folded into this
-/// EPGStation-compat task. Until then, a recording request and a live-view
-/// request compete for tuners exactly as any two ordinary clients do.
+/// The parsed value is used twice: it becomes the `EffectiveClaim` priority
+/// handed to `tuner/acquire.rs`, and (via [`stream_class_for_priority`]) it
+/// decides whether this stream is treated as a recording.
 fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
     headers
         .get("X-Mirakurun-Priority")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(0)
+        .clamp(0, MIRAKURUN_PRIORITY_CAP)
+}
+
+/// Decide whether a `/services/:id/stream` request is a recording, from its
+/// `X-Mirakurun-Priority` and the configured threshold (`[mirakurun]
+/// record_priority_threshold`, default `1`).
+///
+/// The endpoint serves both recording and live viewing and the header is the
+/// only thing separating them: EPGStation sends `recPriority` /
+/// `conflictPriority` (defaults 2/1) when recording and `streamingPriority`
+/// (default 0) when viewing. The classification is not cosmetic — a `Record`
+/// stream is failed on broadcast lag or a closed source rather than
+/// resynchronizing (`LossPolicy::Fatal`), which is right for a recording and
+/// wrong for a viewer.
+///
+/// Nothing in Mirakurun's protocol guarantees "positive means recording",
+/// though: any client may set the header, so a live viewer sending `1` would
+/// be disconnected on the first lag. Sites whose other clients send positive
+/// priorities for viewing raise the threshold instead of losing live streams.
+///
+/// A threshold of `0` or below would classify *every* request (including the
+/// default `0`) as a recording, which is never what an operator means; it is
+/// clamped to `1`.
+fn stream_class_for_priority(priority: i32, threshold: i32) -> StreamClass {
+    if priority >= threshold.max(1) {
+        StreamClass::Record
+    } else {
+        StreamClass::View
+    }
 }
 
 /// `GET /mirakurun/api/services/:id/stream`.
@@ -974,8 +1030,8 @@ fn parse_mirakurun_priority(headers: &HeaderMap) -> i32 {
 /// the whole multiplex: Mirakurun's per-service stream carries one service,
 /// and EPGStation records straight off this endpoint.
 ///
-/// `X-Mirakurun-Priority` is parsed and logged (see
-/// [`parse_mirakurun_priority`]) but not otherwise acted on.
+/// `X-Mirakurun-Priority` is the contention priority passed to the central
+/// tuner policy (see [`parse_mirakurun_priority`]).
 pub async fn stream_service_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -1001,21 +1057,66 @@ pub async fn stream_service_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
-        Ok(t) => t,
+    // See `stream_class_for_priority` for why the header decides this and
+    // why the threshold is configurable.
+    let stream_class =
+        stream_class_for_priority(priority, web_state.mirakurun_record_priority_threshold);
+    let loss_policy = if stream_class == StreamClass::Record {
+        LossPolicy::Fatal
+    } else {
+        LossPolicy::Recover
+    };
+
+    // Local tuner first; a paired node advertising the same mux is the
+    // fallback, never a preference (`server/channel_resolve.rs`).
+    let source = match channel_resolve::start_source_for_service_with_claim(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+        EffectiveClaim::new(priority, false),
+        stream_class,
+    )
+    .await
+    {
+        Ok(source) => source,
         Err(e) => return channel_resolve_error_response(id, &e),
+    };
+
+    let (rx, cleanup, info) = match &source {
+        channel_resolve::StreamSource::Local(tuner) => (
+            BodyReceiver::Tuner(tuner.subscribe()),
+            StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                Some(tuner),
+                None,
+                stream_class,
+            ),
+        ),
+        channel_resolve::StreamSource::Remote(remote) => (
+            BodyReceiver::Remote(remote.subscribe()),
+            StreamCleanup::remote_only(Arc::clone(remote), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                None,
+                Some(remote),
+                stream_class,
+            ),
+        ),
     };
 
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
+        Arc::clone(&web_state.database),
+        info,
     )
     .await;
-
-    let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
-        .with_session(session, shutdown_rx);
-    respond_with_stream(service_filtered_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup, sid))
+    let cleanup = cleanup.with_session(session, shutdown_rx);
+    respond_with_stream(service_filtered_body_stream(rx, cleanup, sid, loss_policy))
 }
 
 /// `GET /mirakurun/api/channels/:type/:channel/stream`.
@@ -1090,6 +1191,7 @@ pub async fn stream_channel_by_type(
 
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
+        Arc::clone(&web_state.database),
         session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
     )
     .await;
@@ -1262,8 +1364,7 @@ pub async fn get_logo(Path(id): Path<u64>) -> Response {
 /// otherwise consulted (in particular, the *content* of the recording comes
 /// live off the tuner, not from anything stored about the program).
 ///
-/// `X-Mirakurun-Priority` is parsed and logged (see
-/// [`parse_mirakurun_priority`]) but not otherwise acted on, same as
+/// `X-Mirakurun-Priority` is propagated to tuner contention, same as
 /// [`stream_service_by_mirakurun_id`].
 pub async fn stream_program_by_mirakurun_id(
     State(web_state): State<Arc<WebState>>,
@@ -1308,23 +1409,58 @@ pub async fn stream_program_by_mirakurun_id(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
-        Ok(t) => t,
+    // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
+    // ローカルのチューナーが取れないときだけ、同じ mux を広告している
+    // ペアリング済みノードへフォールバックする。
+    let source = match channel_resolve::start_source_for_service_with_claim(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+        EffectiveClaim::new(priority, false),
+        StreamClass::Record,
+    )
+    .await
+    {
+        Ok(source) => source,
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    // 番組ストリームは録画クライアント (EPGStation) 用なので record 扱い。
+    let (rx, cleanup, info) = match &source {
+        channel_resolve::StreamSource::Local(tuner) => (
+            BodyReceiver::Tuner(tuner.subscribe()),
+            StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                Some(tuner),
+                None,
+                StreamClass::Record,
+            ),
+        ),
+        channel_resolve::StreamSource::Remote(remote) => (
+            BodyReceiver::Remote(remote.subscribe()),
+            StreamCleanup::remote_only(Arc::clone(remote), Arc::clone(&web_state.tuner_pool)),
+            session_info_for_source(
+                SessionProtocol::Mirakurun,
+                peer,
+                &resolved,
+                None,
+                Some(remote),
+                StreamClass::Record,
+            ),
+        ),
+    };
+
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::Record),
+        Arc::clone(&web_state.database),
+        info,
     )
     .await;
-
-    let tuner_rx = tuner.subscribe();
-    let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
-        .with_session(session, shutdown_rx);
+    let cleanup = cleanup.with_session(session, shutdown_rx);
     respond_with_stream(mirakurun_program_stream::gated_program_stream(
-        tuner_rx, cleanup, sid, event_id, deadline,
+        rx, cleanup, sid, event_id, deadline,
     ))
 }
 
@@ -1916,6 +2052,56 @@ mod tests {
     // ------------------------------------------------------------------
     // X-Mirakurun-Priority parsing
     // ------------------------------------------------------------------
+
+    /// The header is the only signal separating recording from live viewing
+    /// on `/services/:id/stream`, and it is a *client-supplied* one: any
+    /// client may set it. The threshold is what keeps a live viewer that
+    /// sends `1` from being classified as a recording (and then disconnected
+    /// on the first lag).
+    /// `/mirakurun/api/*` is unauthenticated, and the parsed priority is a
+    /// real tuner claim: an unbounded value would be a way for anyone who can
+    /// reach the port to evict a recording in progress.
+    #[test]
+    fn priority_is_clamped_so_an_unauthenticated_client_cannot_outrank_a_recording() {
+        let priority_of = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Mirakurun-Priority", value.parse().unwrap());
+            parse_mirakurun_priority(&headers)
+        };
+
+        // Ordinary EPGStation values pass through untouched.
+        assert_eq!(priority_of("0"), 0);
+        assert_eq!(priority_of("2"), 2);
+
+        // A hostile (or merely confused) value cannot exceed the cap, which
+        // is itself below the BNDP RECORD threshold.
+        assert_eq!(priority_of("2147483647"), MIRAKURUN_PRIORITY_CAP);
+        assert!(MIRAKURUN_PRIORITY_CAP < 200, "must stay under RECORD_PRIORITY_THRESHOLD");
+
+        // Nor push itself below the "no explicit priority" floor.
+        assert_eq!(priority_of("-5"), 0);
+    }
+
+    #[test]
+    fn record_class_follows_the_configured_priority_threshold() {
+        // Default threshold 1: EPGStation's recPriority/conflictPriority
+        // defaults (2/1) record, its streamingPriority default (0) views.
+        assert_eq!(stream_class_for_priority(2, 1), StreamClass::Record);
+        assert_eq!(stream_class_for_priority(1, 1), StreamClass::Record);
+        assert_eq!(stream_class_for_priority(0, 1), StreamClass::View);
+        assert_eq!(stream_class_for_priority(-1, 1), StreamClass::View);
+
+        // A site whose other clients send positive priorities for viewing
+        // raises the bar rather than losing live streams to LossPolicy::Fatal.
+        assert_eq!(stream_class_for_priority(1, 3), StreamClass::View);
+        assert_eq!(stream_class_for_priority(3, 3), StreamClass::Record);
+
+        // A threshold of 0 or below would make *every* request a recording,
+        // including the default `0`; clamped to 1 instead.
+        assert_eq!(stream_class_for_priority(0, 0), StreamClass::View);
+        assert_eq!(stream_class_for_priority(0, -5), StreamClass::View);
+        assert_eq!(stream_class_for_priority(1, 0), StreamClass::Record);
+    }
 
     #[test]
     fn priority_header_parses_a_valid_integer() {

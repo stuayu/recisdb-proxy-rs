@@ -6,7 +6,7 @@
 use log::{debug, error};
 
 use crate::server::listener::DatabaseHandle;
-use crate::server::session_driver_selection::DriverCandidate;
+use crate::tuner::policy::DriverCandidate;
 
 pub(super) async fn collect_group_channel_candidates(
     database: &DatabaseHandle,

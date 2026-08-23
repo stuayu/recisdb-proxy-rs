@@ -16,13 +16,13 @@
 //! - [`ProgramGate`]: pure state machine — "has the target event become
 //!   present yet, and has it since stopped being present".
 //! - [`gated_program_stream`]: wires a [`ProgramGate`] to a live
-//!   [`TunerSubscription`], parsing EIT out of each chunk with a
+//!   [`BodyReceiver`] (a local tuner or a lease on a peer's tuner),
+//!   parsing EIT out of each chunk with a
 //!   purpose-built lightweight [`EitPfCollector`] (same TS/PSI reassembly
 //!   pattern as `tuner/epg_collector.rs::EpgCollector`, but keeping only the
 //!   present/following table_id, and reporting straight to the gate instead
 //!   of the DB).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,10 +31,9 @@ use futures::stream::{self, Stream};
 use log::{debug, warn};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::tuner::TunerSubscription;
 use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
-use crate::web::stream::{StreamCleanup, TsAligner};
+use crate::web::stream::{BodyReceiver, StreamCleanup, TsAligner};
 
 /// How long past `programs.start_at + duration_secs` this gate keeps waiting
 /// for the target event to become present before giving up. Programs
@@ -206,7 +205,7 @@ impl EitPfCollector {
 // ============================================================================
 
 struct GatedStreamState {
-    rx: TunerSubscription,
+    rx: BodyReceiver,
     /// Fires when the dashboard asks this client to disconnect
     /// (`POST /api/clients/{id}/disconnect`). `None` for unregistered
     /// streams, which then simply have no remote-shutdown path — see
@@ -217,6 +216,10 @@ struct GatedStreamState {
     collector: EitPfCollector,
     gate: ProgramGate,
     deadline: DateTime<Utc>,
+    /// RECORD must never continue after a broadcast receiver gap.  Once set,
+    /// the stream yields one explicit I/O error and then remains terminated
+    /// even if the HTTP body implementation polls it again.
+    fatal: bool,
     /// Same single-service filter `GET /services/:id/stream` applies — see
     /// [`crate::web::stream::service_filtered_body_stream`]. Fed on *every*
     /// chunk, including those the gate withholds, so its PAT/PMT whitelist is
@@ -232,6 +235,12 @@ struct GatedStreamState {
 /// Mirakurun's per-service stream — see
 /// [`crate::web::stream::service_filtered_body_stream`]) until a *different*
 /// event becomes present, at which point the stream ends.
+///
+/// This endpoint is a RECORD path. If the underlying broadcast receiver
+/// reports `Lagged`, silently skipping bytes would create a corrupt recording
+/// while the HTTP request still looks successful. Such a gap is therefore a
+/// fatal body error; the client may retry/reacquire, but recisdb-proxy never
+/// pretends the recording remained lossless.
 ///
 /// The chunk in which the gate transitions Waiting -> Streaming is forwarded
 /// in full, not trimmed to start exactly at the EIT boundary: TS chunks are
@@ -254,7 +263,7 @@ struct GatedStreamState {
 /// `tuner/shared.rs`), so an actively broken tuner is not this function's
 /// problem to solve twice.
 pub(crate) fn gated_program_stream(
-    rx: TunerSubscription,
+    rx: BodyReceiver,
     mut cleanup: StreamCleanup,
     target_sid: u16,
     target_event_id: u16,
@@ -268,13 +277,14 @@ pub(crate) fn gated_program_stream(
         collector: EitPfCollector::new(),
         gate: ProgramGate::new(target_sid, target_event_id),
         deadline,
+        fatal: false,
         filter: TsServiceFilter::new(target_sid),
         aligner: TsAligner::new(),
     };
 
     stream::unfold(state, |mut state| async move {
         loop {
-            if state.gate.is_ended() {
+            if state.fatal || state.gate.is_ended() {
                 return None;
             }
 
@@ -346,16 +356,38 @@ pub(crate) fn gated_program_stream(
                     continue;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // Same "log and continue" convention as
-                    // `web/stream.rs::broadcast_to_body_stream` — losing a
-                    // few chunks of a multiplex the gate hasn't opened for
-                    // yet (or is mid-programme on) is harmless; the next
-                    // successful recv picks up wherever the live edge is.
-                    debug!("[mirakurun program stream] receiver lagged, skipped {} chunks", n);
+                    warn!(
+                        "[mirakurun program stream] RECORD receiver lagged by {} chunks; terminating rather than silently corrupting the recording",
+                        n
+                    );
                     state.aligner.on_gap();
-                    continue;
+                    state._cleanup.set_disconnect_reason("record_broadcast_lag");
+                    state.fatal = true;
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("record stream lost {n} broadcast chunk(s)"),
+                    );
+                    return Some((Err(error), state));
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                // This endpoint is unconditionally RECORD, and the normal end
+                // of a recording is the gate reaching `Ended` (handled at the
+                // top of the loop), never the source disappearing. A closed
+                // broadcast therefore means the tuner reader stopped under
+                // us; ending the body normally would report a truncated
+                // recording as a complete one.
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!(
+                        "[mirakurun program stream] RECORD source closed before sid={} event_id={} ended; failing the response",
+                        state.gate.target_sid, state.gate.target_event_id
+                    );
+                    state._cleanup.set_disconnect_reason("record_source_closed");
+                    state.fatal = true;
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "record stream source closed",
+                    );
+                    return Some((Err(error), state));
+                }
             }
         }
     })
@@ -364,6 +396,35 @@ pub(crate) fn gated_program_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/programs/:id/stream` is unconditionally RECORD: the source
+    /// disappearing (tuner reader stopped, peer node killed) must fail the
+    /// body, not end it as if the programme had finished. EPGStation reads a
+    /// clean end of a `200 OK` body as a successful recording.
+    #[tokio::test]
+    async fn a_closed_source_fails_the_record_body() {
+        use futures::StreamExt;
+        use tokio::sync::broadcast;
+
+        let (tx, rx) = broadcast::channel::<bytes::Bytes>(4);
+        let cleanup = StreamCleanup::tuner_only(
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2),
+            std::sync::Arc::new(crate::tuner::TunerPool::new(4)),
+        );
+        // Far-future deadline so the "gave up waiting" branch cannot be what
+        // ends this stream.
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let stream =
+            gated_program_stream(BodyReceiver::Remote(rx), cleanup, 1024, 5, deadline);
+        futures::pin_mut!(stream);
+
+        drop(tx);
+
+        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let err = first.expect_err("the body must terminate with an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(stream.next().await.is_none(), "the stream must end after the fatal error");
+    }
 
     // ------------------------------------------------------------------
     // ProgramGate
@@ -413,7 +474,7 @@ mod tests {
 
     #[test]
     fn state_is_stable_with_no_observations() {
-        let mut gate = ProgramGate::new(100, 5);
+        let gate = ProgramGate::new(100, 5);
         assert!(!gate.is_streaming());
         assert!(!gate.is_ended());
         // No `observe_*` calls at all -> state never changes on its own.
