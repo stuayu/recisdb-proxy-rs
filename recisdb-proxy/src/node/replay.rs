@@ -130,7 +130,20 @@ impl ReplayBuffer {
             });
         }
         let oldest = self.oldest_sequence();
-        if oldest.is_some_and(|seq| from_sequence < seq) {
+        // With an empty window there is no oldest entry to compare against,
+        // but "empty" does not mean "nothing was lost": `prune` drops every
+        // entry once the source has been quiet for `max_age`. Falling back to
+        // `next_sequence` (the number the *next* frame will carry) is what
+        // catches that case — without it a RECORD consumer reconnecting with
+        // a stale `from_seq` would be answered `Ok(vec![])`, i.e. "you missed
+        // nothing", and would resume from the live edge with a silent hole.
+        //
+        // `next_sequence == from_sequence` is not a loss: the consumer is
+        // caught up and waiting for a frame that has not been produced yet.
+        // `None` means nothing was ever published on this generation, so
+        // there is nothing to have missed.
+        let floor = oldest.or(self.next_sequence);
+        if floor.is_some_and(|seq| from_sequence < seq) {
             return Err(ReplayError::TooOld {
                 requested: from_sequence,
                 oldest,
@@ -189,6 +202,34 @@ mod tests {
     fn empty_initialized_generation_can_resume_before_first_packet() {
         let mut replay = ReplayBuffer::new_for_generation(ReplayBudget::default(), 7);
         assert!(replay.replay_from(7, 0).unwrap().is_empty());
+    }
+
+    /// The window going *empty* is not the same as nothing having been lost:
+    /// `prune` drops every entry once the source has been quiet for
+    /// `max_age`. A RECORD consumer reconnecting with a stale `from_seq` must
+    /// still be told it fell behind, or it resumes from the live edge with an
+    /// unannounced hole — exactly what this module exists to prevent.
+    #[test]
+    fn an_emptied_window_still_reports_a_consumer_that_fell_behind() {
+        let mut replay = ReplayBuffer::new(ReplayBudget {
+            max_bytes: usize::MAX,
+            max_age: Duration::from_millis(1),
+        });
+        for seq in 1..4 {
+            replay.push(frame(1, seq)).unwrap();
+        }
+        // Everything ages out; `push` prunes, so the window is now empty.
+        std::thread::sleep(Duration::from_millis(20));
+        replay.push(frame(1, 4)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(replay.replay_from(1, 5).unwrap().is_empty(), "a caught-up consumer is fine");
+        assert_eq!(replay.oldest_sequence(), None, "the window really is empty");
+
+        assert_eq!(
+            replay.replay_from(1, 2).unwrap_err(),
+            ReplayError::TooOld { requested: 2, oldest: None },
+            "a stale resume point must fail, not be answered 'you missed nothing'"
+        );
     }
 
     #[test]

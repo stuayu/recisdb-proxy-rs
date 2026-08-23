@@ -369,7 +369,25 @@ pub(crate) fn gated_program_stream(
                     );
                     return Some((Err(error), state));
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                // This endpoint is unconditionally RECORD, and the normal end
+                // of a recording is the gate reaching `Ended` (handled at the
+                // top of the loop), never the source disappearing. A closed
+                // broadcast therefore means the tuner reader stopped under
+                // us; ending the body normally would report a truncated
+                // recording as a complete one.
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!(
+                        "[mirakurun program stream] RECORD source closed before sid={} event_id={} ended; failing the response",
+                        state.gate.target_sid, state.gate.target_event_id
+                    );
+                    state._cleanup.set_disconnect_reason("record_source_closed");
+                    state.fatal = true;
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "record stream source closed",
+                    );
+                    return Some((Err(error), state));
+                }
             }
         }
     })
@@ -378,6 +396,35 @@ pub(crate) fn gated_program_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/programs/:id/stream` is unconditionally RECORD: the source
+    /// disappearing (tuner reader stopped, peer node killed) must fail the
+    /// body, not end it as if the programme had finished. EPGStation reads a
+    /// clean end of a `200 OK` body as a successful recording.
+    #[tokio::test]
+    async fn a_closed_source_fails_the_record_body() {
+        use futures::StreamExt;
+        use tokio::sync::broadcast;
+
+        let (tx, rx) = broadcast::channel::<bytes::Bytes>(4);
+        let cleanup = StreamCleanup::tuner_only(
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2),
+            std::sync::Arc::new(crate::tuner::TunerPool::new(4)),
+        );
+        // Far-future deadline so the "gave up waiting" branch cannot be what
+        // ends this stream.
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let stream =
+            gated_program_stream(BodyReceiver::Remote(rx), cleanup, 1024, 5, deadline);
+        futures::pin_mut!(stream);
+
+        drop(tx);
+
+        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let err = first.expect_err("the body must terminate with an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(stream.next().await.is_none(), "the stream must end after the fatal error");
+    }
 
     // ------------------------------------------------------------------
     // ProgramGate

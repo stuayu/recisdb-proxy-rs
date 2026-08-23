@@ -504,6 +504,11 @@ pub struct WebState {
     /// every terrestrial station is `GR`. Resolved from `[mirakurun]
     /// home_region` in `app_config.rs`.
     pub mirakurun_home_regions: Vec<u8>,
+    /// Smallest `X-Mirakurun-Priority` treated as a recording on
+    /// `GET /mirakurun/api/services/:id/stream` (`[mirakurun]
+    /// record_priority_threshold`, default `1`). See
+    /// `web/mirakurun.rs::stream_class_for_priority`.
+    pub mirakurun_record_priority_threshold: i32,
     /// Fan-out for `GET /mirakurun/api/events/stream`
     /// (`web/mirakurun_events.rs`, `docs/EPGSTATION_COMPAT.md` §3/§6): every
     /// handler call does `.subscribe()` on this to get its own receiver.
@@ -548,6 +553,7 @@ impl WebState {
             proxy_listen_addr: None,
             config_path: None,
             mirakurun_home_regions: Vec::new(),
+            mirakurun_record_priority_threshold: 1,
             update_check_cache: RwLock::new(None),
             update_status: Mutex::new(UpdateStatus::Idle),
             log_buffer,

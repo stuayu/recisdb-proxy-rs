@@ -460,19 +460,39 @@ EPGStation は Mirakurun 互換 API の `GET /services/{id}/stream` (視聴) と
 1. **優先度の伝搬**: `channel_resolve::start_tuner_for_service_with_claim()` を追加し、
    ヘッダ値を `EffectiveClaim { priority, exclusive: false }` として `acquire` へ渡す。
    ヘッダが無い/不正な場合は 0 になり、従来どおり `channels.priority` の DB 既定値が使われる。
-   **Mirakurun の優先度で DB 優先度を上書きしない**(明示指定が無いときだけ DB を見る)
+   **Mirakurun の優先度で DB 優先度を上書きしない**(明示指定が無いときだけ DB を見る)。
+   ヘッダ値は `0..=MIRAKURUN_PRIORITY_CAP` (100) にクランプする。
+   **`/mirakurun/api/*` は無認証で公開されており**(実 Mirakurun クライアントは
+   `Authorization` を送らないため)、この claim は `tuner/policy.rs::decide()` の退避判定に
+   実際に使われる。クランプが無いと、ポートに到達できる誰でも
+   `X-Mirakurun-Priority: 2147483647` を送るだけで進行中の録画を退避させられる。
+   上限 100 は BNDP 側の録画閾値 (`server::session_backpressure::RECORD_PRIORITY_THRESHOLD` = 200)
+   より下に置いてあり、無認証の要求が認証済みの録画を追い越せないようにしている。
+   **注意: 2つの優先度は同じ尺度ではない** — BNDP は BonDriver 由来の 0..255、Mirakurun は
+   実質1桁。このクランプは被害を抑えるだけで、尺度の統一はしていない(別途の設計課題)
 2. **ストリームクラスの判定**: `/programs/{id}/stream` は無条件で `Record`。
-   `/services/{id}/stream` は **`priority > 0` なら `Record`、それ以外は `View`** として登録する。
-   このエンドポイントには録画か視聴かを区別する他の手がかりが無いため、EPGStation の既定値
-   (録画 2 / 競合 1 / 視聴 0) を根拠にしたヒューリスティック。判定はダッシュボードの
-   「チューナーが埋まっている理由」表示と、次項の欠損時の扱いの両方に効く
-3. **RECORD の欠損を無音にしない**: `Record` と判定したストリームは
-   `broadcast::error::RecvError::Lagged` で応答を打ち切る (`web/stream.rs::LossPolicy::Fatal`)。
-   `View` は従来どおり再同期して継続する
+   `/services/{id}/stream` は **`priority >= 閾値` なら `Record`、それ以外は `View`** として
+   登録する (`web/mirakurun.rs::stream_class_for_priority`)。閾値は
+   `[mirakurun] record_priority_threshold` (既定 1) で設定でき、既定値のままなら EPGStation の
+   既定値 (録画 2 / 競合 1 / 視聴 0) がそのまま録画/視聴に分かれる。
+   このエンドポイントには録画か視聴かを区別する他の手がかりが無いためのヒューリスティックだが、
+   **ヘッダはクライアントが自由に付けられる**。Mirakurun の仕様に「正の値なら録画」という保証は
+   無く、TVTest 系フロントエンド・Kodi・自作スクリプトがライブ視聴で正の値を送る環境では、
+   視聴が次項の打ち切り対象になってしまう。その場合は閾値を上げて分離する。
+   0 以下の閾値は 1 に丸める (すべての要求が録画扱いになるため)。
+   判定はダッシュボードの「チューナーが埋まっている理由」表示と、次項の欠損時の扱いの両方に効く
+3. **RECORD の欠損を無音にしない**: `Record` と判定したストリームは、
+   `broadcast::error::RecvError::Lagged` (取りこぼし) だけでなく `Closed` (配信元の停止:
+   チューナーリーダーが落ちた、リモートノードが落ちた) でも応答を打ち切る
+   (`web/stream.rs::LossPolicy::Fatal` / `web/mirakurun_program_stream.rs`)。
+   **`Closed` を正常終了として body を閉じると、EPGStation からは「200 OK が正常に終わった
+   = 録画成功」に見えてしまう**ため、`UnexpectedEof` のボディエラーで終わらせ
+   `disconnect_reason = record_source_closed` を残す。
+   `View` は従来どおり、`Lagged` は再同期して継続・`Closed` は正常な EOF として扱う
 4. **HTTP ストリームも `session_history` に残す**: 従来 BNDP セッションしか履歴行を作っておらず、
    EPGStation の録画が落ちても理由が残らなかった。`HttpStreamSession` が開始時に
    `insert_session_start`、Drop 時に `update_session_end` を行い、上記の打ち切りでは
-   `disconnect_reason = record_broadcast_lag` を記録する
+   `disconnect_reason = record_broadcast_lag` / `record_source_closed` を記録する
 
 ### 未確認
 
@@ -516,7 +536,7 @@ EPGStation から見た差は無い (同じエンドポイント・同じレス�
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
 | `remoteControlKeyId` の欠損 | 実装済み (2026-08-14) | 手動登録 (CSV インポート / `POST /api/channels`) した行は `remote_control_key` が NULL で、EPGStation の番組表・放映中で末尾に回されていた。視聴・EPG 収集中の NIT から NULL の列だけ補完する (`tuner/nit_collector.rs` → `nit_writer.rs`)。**一度も選局していない局は埋まらない**。§5.4 |
 | ダッシュボードのクライアント表示 | 実装済み (2026-08-14) | EPGStation の視聴・録画ストリームがクライアント一覧に出るようになった (`protocol` = `mirakurun`)。切断・グラフ・プレビューも同じ行から使える。§5.5 |
-| `X-Mirakurun-Priority` | 実装済み (2026-08-22) | `/services/{id}/stream` と `/programs/{id}/stream` の両方で、ヘッダ値をそのまま `EffectiveClaim.priority` として `tuner::acquire::acquire` へ渡す (`channel_resolve::start_tuner_for_service_with_claim`)。**DB のチャンネル優先度を置き換えるのではなく、明示指定が無いときだけ DB 既定値へフォールバックする**。exclusive は同順位時の比較軸のままで、優先度へ畳み込まない。§5.6 |
+| `X-Mirakurun-Priority` | 実装済み (2026-08-22、閾値設定を 2026-08-23 追加) | `/services/{id}/stream` と `/programs/{id}/stream` の両方で、ヘッダ値をそのまま `EffectiveClaim.priority` として `tuner::acquire::acquire` へ渡す (`channel_resolve::start_tuner_for_service_with_claim`)。**DB のチャンネル優先度を置き換えるのではなく、明示指定が無いときだけ DB 既定値へフォールバックする**。exclusive は同順位時の比較軸のままで、優先度へ畳み込まない。録画判定の閾値は `[mirakurun] record_priority_threshold` (既定 1)。§5.6 |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` / `video` / `audio` / `relatedItems` | 無し | 番組詳細が埋まらない・イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 (`EPGUpdateManageModel.ts:144-147`) |
 | `isFree` | 常に `true` 固定 | 無料/有料の判別ができない |

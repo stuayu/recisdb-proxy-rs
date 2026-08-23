@@ -152,8 +152,18 @@ Rules that must not be relaxed:
 - The credential is never logged, never rendered in `Debug`
   (`NodeCredential`'s impl prints `**redacted**`), and never serialized back to
   the browser. `GET /api/nodes` reports `paired: true/false` only.
-- `/node/v3/pair` is rate limited (10 failures/minute) and answers `401`
-  identically for a malformed code, an unknown code and an expired one.
+- `/node/v3/pair` is rate limited (10 failures per 60s fixed window,
+  `PAIRING_ATTEMPT_LIMIT`/`PAIRING_ATTEMPT_WINDOW`) and answers `401`
+  identically for a malformed code, an unknown code and an expired one; once
+  the window's budget is spent every further attempt is `429`, again without
+  distinguishing the cases. Every rejected attempt counts towards the same
+  budget — a malformed code and the self-pairing check included — or the
+  limiter would be bypassed by interleaving requests that take a cheaper exit.
+  A *successful* redemption clears the failure count (those failures were an
+  operator mistyping the code, and the next node to pair must not be locked
+  out by them) but **not** the window itself: restarting the window would hand
+  a fresh full budget of guesses to anyone who obtains, or merely observes,
+  one valid pairing.
 - On startup `NodeTransportState::reload_peers()` repopulates the in-memory
   credential map from `remote_nodes`, so pairings survive restarts.
 
@@ -190,7 +200,15 @@ Consuming side (`RemoteMuxStream`):
 - Republishes into a plain `broadcast::Sender<Bytes>` — the same shape
   `SharedTuner` hands local consumers, so downstream needs no remote branch.
 - Renews at half the lease TTL, and releases explicitly on drop (the TTL is the
-  backstop if that request never lands).
+  backstop if that request never lands). TTLs are per stream class
+  (`LeasePolicy`: VIEW 8s, PREVIEW 10s, RECORD 25s) — RECORD gets the longest
+  window because it is the one that must survive a transport flap, VIEW the
+  shortest because a dead viewer should free the peer's tuner quickly.
+- A consumer that crashes sends no release at all. Its lease then expires on
+  its own: the serving side's pump re-checks the lease every second and stops
+  when it is gone, and a janitor task (`main.rs`, every 5s,
+  `RemoteLeaseManager::reap_expired`) is the backstop for a lease whose pump is
+  no longer running.
 - On connection loss it reconnects with `from_seq = last_sequence + 1`. If the
   peer's replay buffer no longer covers that point it answers `410 Gone`:
   **RECORD ends with an error**, VIEW/PREVIEW restart from live.
@@ -338,6 +356,13 @@ The reconnecting node requests `from_seq=N`. If the requested generation and
 sequence remain in the replay window, the same source can resume without a
 silent gap.
 
+An **empty** window is not the same as "nothing was lost": `prune` drops every
+entry once the source has been quiet for `max_age`. `replay_from` therefore
+compares against `next_sequence` (the number the next frame will carry) when
+there is no oldest entry, so a stale `from_seq` is still answered `TooOld`
+rather than an empty success that would resume at the live edge with an
+unannounced hole.
+
 Replay limits are both time- and byte-bounded; message count is not a memory
 budget.
 
@@ -355,9 +380,13 @@ discontinuity and the receiver may continue.
 
 ### RECORD
 
-Silent loss is forbidden. A broadcast receiver lag, node-frame sequence gap,
-expired replay request or unrecoverable source change terminates the stream
-with an explicit error. Upstream EPGStation/Mirakurun can then retry instead of
+Silent loss is forbidden. A broadcast receiver lag, a **closed source**
+(the tuner reader stopped, or the peer node went away), a node-frame sequence
+gap, an expired replay request or an unrecoverable source change terminates the
+stream with an explicit error. Ending the HTTP body *normally* on a closed
+source is not acceptable either: the response is already `200 OK`, so a clean
+EOF reads downstream as a complete recording that happens to be short
+(`disconnect_reason = record_source_closed`). Upstream EPGStation/Mirakurun can then retry instead of
 producing a file that looks successful but contains an unknown hole.
 
 The existing Mirakurun program-recording endpoint follows this rule as well.

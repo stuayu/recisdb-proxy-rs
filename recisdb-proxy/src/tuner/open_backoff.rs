@@ -310,10 +310,10 @@ impl OpenFailureBackoff {
     /// Clear all failure state for `tuner_path` — a successful open means
     /// whatever was wrong is over, and the next failure (if any) should be
     /// judged fresh rather than continuing an old streak.
-    pub(crate) fn record_success(&self, tuner_path: &str) {
-        self.record_success_at(tuner_path);
-    }
-
+    ///
+    /// Production goes through [`Self::record_success_with_latency`], which
+    /// also feeds the slow-open half of the breaker; this is the plain form
+    /// used where latency is not measured.
     pub(crate) fn record_success_at(&self, tuner_path: &str) {
         let mut state = self.lock_state();
         state.remove(tuner_path);

@@ -275,6 +275,86 @@ mod tests {
         assert!(resumed.replay.lock().await.replay_from(1, 0).unwrap().is_empty());
     }
 
+    /// A consumer that crashes never sends its release. The lease TTL is the
+    /// only thing that then frees the peer's tuner, so it must expire on its
+    /// own, disappear from lookups, and be reaped by the janitor.
+    #[tokio::test]
+    async fn a_lease_nobody_renews_expires_and_is_reaped() {
+        // `RemoteMuxLease` measures expiry with `std::time::Instant`, which
+        // `tokio::time::pause()` cannot advance, so this has to be real time.
+        // The TTL is kept well clear of scheduler jitter on a loaded machine
+        // rather than shaved to the shortest value that would work locally.
+        let ttl = Duration::from_millis(600);
+        let manager = RemoteLeaseManager::new(LeasePolicy {
+            view_ttl: ttl,
+            preview_ttl: ttl,
+            record_ttl: ttl,
+            replay_budget: ReplayBudget::default(),
+        });
+        let lease = manager
+            .create(
+                NodeId::new("fukushima").unwrap(),
+                "gunma-route".into(),
+                LogicalMuxId { nid: 1, tsid: 1 },
+                None,
+                StreamClass::Record,
+                EffectiveClaim::new(2, false),
+                1,
+            )
+            .await;
+
+        // Renewing keeps it alive across the original expiry, which is what a
+        // live consumer's renew loop does at TTL/2.
+        tokio::time::sleep(ttl / 2).await;
+        assert!(manager.renew(&lease.id).await);
+        tokio::time::sleep(ttl / 2).await;
+        assert!(manager.get(&lease.id).await.is_some(), "a renewed lease must survive");
+
+        // The consumer dies: no more renewals.
+        tokio::time::sleep(ttl * 2).await;
+        assert!(manager.get(&lease.id).await.is_none(), "an unrenewed lease must expire");
+        assert!(!manager.renew(&lease.id).await, "an expired lease cannot be renewed back to life");
+    }
+
+    /// The janitor is the backstop for a lease whose pump is no longer
+    /// running to notice the expiry itself.
+    #[tokio::test]
+    async fn reap_expired_returns_only_the_expired_leases() {
+        // Real time, for the same reason as the test above.
+        let view_ttl = Duration::from_millis(600);
+        let manager = RemoteLeaseManager::new(LeasePolicy {
+            view_ttl,
+            preview_ttl: view_ttl,
+            record_ttl: Duration::from_secs(30),
+            replay_budget: ReplayBudget::default(),
+        });
+        let make = |class| {
+            manager.create(
+                NodeId::new("fukushima").unwrap(),
+                "gunma-route".into(),
+                LogicalMuxId { nid: 1, tsid: 1 },
+                None,
+                class,
+                EffectiveClaim::new(2, false),
+                1,
+            )
+        };
+        let view = make(StreamClass::View).await;
+        let record = make(StreamClass::Record).await;
+
+        assert!(manager.reap_expired().await.is_empty(), "nothing is expired yet");
+        tokio::time::sleep(view_ttl * 2).await;
+
+        let reaped = manager.reap_expired().await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].id, view.id);
+        assert!(
+            manager.get(&record.id).await.is_some(),
+            "a RECORD lease well inside its (much longer) TTL must not be reaped"
+        );
+        assert!(manager.reap_expired().await.is_empty(), "reaping twice must not double-release");
+    }
+
     #[tokio::test]
     async fn publish_populates_live_and_replay_from_same_sequence() {
         let manager = RemoteLeaseManager::new(LeasePolicy::default());

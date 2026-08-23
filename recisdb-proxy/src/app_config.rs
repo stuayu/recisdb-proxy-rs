@@ -84,6 +84,24 @@ pub struct MirakurunSection {
     /// `recisdb_protocol::broadcast_region`; the wide-area Kanto network is
     /// `"東京"`.
     pub home_region: Option<String>,
+
+    /// Smallest `X-Mirakurun-Priority` that makes `GET /services/:id/stream`
+    /// count as a recording (RECORD stream class + fatal loss policy).
+    ///
+    /// That endpoint serves both recording and live viewing, and the header
+    /// is the only signal telling them apart: EPGStation sends
+    /// `recPriority`/`conflictPriority` (defaults 2/1) when recording and
+    /// `streamingPriority` (default 0) when viewing. Other clients (TVTest
+    /// front ends, Kodi, home-grown scripts) are free to send whatever they
+    /// like, and a live viewer that sends `1` would otherwise be disconnected
+    /// on the first broadcast lag instead of resynchronizing — hence the
+    /// threshold is configurable per site.
+    ///
+    /// Default `1`: keeps EPGStation's recording defaults on the recording
+    /// path and its `streamingPriority = 0` on the viewing path. Raise it
+    /// (e.g. to `2`) when other clients on the network also send positive
+    /// priorities for live viewing.
+    pub record_priority_threshold: Option<i32>,
 }
 
 /// tsreplace (external encoder) configuration that must only be settable via
@@ -267,6 +285,8 @@ pub struct ResolvedConfig {
     /// over a display-level setting). One name can cover several IDs; see
     /// `recisdb_protocol::broadcast_region::region_ids_from_prefecture_name`.
     pub mirakurun_home_regions: Vec<u8>,
+    /// `[mirakurun] record_priority_threshold`, defaulted to `1`.
+    pub mirakurun_record_priority_threshold: i32,
     /// `[node] enabled` — serve the node-to-node transport listener.
     pub node_enabled: bool,
     /// `[node] listen`, parsed. `None` when the fabric is off or the value
@@ -306,6 +326,8 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
 
     let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
     let mirakurun_enabled = file_config.mirakurun.enabled.unwrap_or(false);
+    let mirakurun_record_priority_threshold =
+        file_config.mirakurun.record_priority_threshold.unwrap_or(1);
     let mirakurun_home_regions = match file_config.mirakurun.home_region.as_deref() {
         None => Vec::new(),
         Some(name) => {
@@ -410,6 +432,7 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
         web_auth_enabled,
         mirakurun_enabled,
         mirakurun_home_regions,
+        mirakurun_record_priority_threshold,
         node_enabled,
         node_listen_addr,
         node_display_name,

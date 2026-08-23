@@ -260,6 +260,20 @@ mod tests {
         assert_eq!(best.id, "b");
     }
 
+    /// Two peers that differ only in RTT: the near one wins for every stream
+    /// class (RECORD weights RTT least, but nothing else separates them).
+    #[test]
+    fn identical_paths_are_separated_by_rtt_alone() {
+        let near = path("near", EndpointKind::Tailscale, 100, 10.0, 0.0);
+        let far = path("far", EndpointKind::Tailscale, 100, 100.0, 0.0);
+        let candidates = vec![far, near];
+        for class in [StreamClass::View, StreamClass::Preview, StreamClass::Record] {
+            let best =
+                select_best_path(&candidates, class, 20_000_000, PathPolicy::default()).unwrap();
+            assert_eq!(best.id, "near", "{class:?} must take the nearer of two equal paths");
+        }
+    }
+
     #[test]
     fn view_can_prefer_low_latency() {
         let fast = path("fast", EndpointKind::InternetDirect, 100, 8.0, 0.0);

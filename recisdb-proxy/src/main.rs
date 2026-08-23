@@ -423,6 +423,7 @@ async fn run_server(
     // is actually about to be nested in.
     let mirakurun_enabled = resolved.mirakurun_enabled;
     let mirakurun_home_regions = resolved.mirakurun_home_regions.clone();
+    let mirakurun_record_priority_threshold = resolved.mirakurun_record_priority_threshold;
 
     // TLS config, resolved from args × TOML by app_config::load above.
     #[cfg(feature = "tls")]
@@ -738,6 +739,26 @@ async fn run_server(
                         db.clone(),
                         Arc::clone(&leases),
                     ));
+                    // Expired leases are normally noticed by their own pump
+                    // (it re-checks the lease every second and stops when it
+                    // is gone). This janitor is the backstop for a lease whose
+                    // pump is no longer running — otherwise the entry would
+                    // sit in the map forever, and `GET /api/nodes` would keep
+                    // reporting a lease nobody holds.
+                    let reaper = Arc::clone(&leases);
+                    tokio::spawn(async move {
+                        let mut ticker =
+                            tokio::time::interval(std::time::Duration::from_secs(5));
+                        loop {
+                            ticker.tick().await;
+                            for lease in reaper.reap_expired().await {
+                                warn!(
+                                    "[node] lease {} expired without a renew; released",
+                                    lease.id.as_str()
+                                );
+                            }
+                        }
+                    });
                     let state = Arc::new(
                         recisdb_proxy::node::NodeTransportState::new(identity.clone(), leases)
                             .with_database(db.clone())
@@ -794,6 +815,7 @@ async fn run_server(
             web_log_level_handle,
             mirakurun_enabled,
             mirakurun_home_regions,
+            mirakurun_record_priority_threshold,
             Some(listen_addr),
             config_path_for_web,
             web_epg_events_tx,

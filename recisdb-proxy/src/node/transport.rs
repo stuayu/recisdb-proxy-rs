@@ -175,6 +175,18 @@ impl PairingAttempts {
         }
         self.failures += 1;
     }
+
+    /// A code was actually redeemed, so the failures before it were an
+    /// operator mistyping rather than a scan: clear the failure count instead
+    /// of leaving the next legitimate pairing locked out.
+    ///
+    /// The *window* is deliberately left where it was. Restarting it would
+    /// mean an attacker who obtains one valid code (or watches a legitimate
+    /// pairing happen) gets a fresh full budget of guesses on top of the one
+    /// already running.
+    fn record_success(&mut self) {
+        self.failures = 0;
+    }
 }
 
 #[derive(Clone)]
@@ -319,6 +331,10 @@ async fn pair(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     if payload.identity.node_id == state.identity.node_id {
+        // Costs budget like any other rejected attempt: a branch that answers
+        // before the code is checked and *without* counting would be a free
+        // way to keep the limiter's window from ever mattering.
+        state.pairing_attempts.lock().unwrap().record_failure();
         return (StatusCode::BAD_REQUEST, "a node cannot pair with itself").into_response();
     }
 
@@ -366,6 +382,7 @@ async fn pair(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    state.pairing_attempts.lock().unwrap().record_success();
     state.trust_peer(peer.node_id.clone(), credential.clone()).await;
     // The credential itself is never logged.
     log::info!("Node pairing accepted: {} ({})", peer.node_id, peer.display_name);
@@ -940,6 +957,81 @@ mod tests {
         // Replaying the same code must not pair anything else.
         let replay = pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await;
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/node/v3/pair` is the one unauthenticated endpoint, so guessing the
+    /// code is the attack it has to survive. The fixed window caps how many
+    /// guesses a scanner gets, and a wrong guess is answered exactly like a
+    /// stale one (never "the code was wrong" vs "you are rate limited").
+    #[tokio::test]
+    async fn pairing_locks_out_after_repeated_wrong_codes() {
+        let (state, _database) = test_state_with_db();
+
+        for _ in 0..PAIRING_ATTEMPT_LIMIT {
+            let guess = PairingCode::random();
+            assert_eq!(
+                pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let guess = PairingCode::random();
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a scanner must be cut off, not merely told 'wrong' forever"
+        );
+    }
+
+    /// Malformed codes must count against the same budget: otherwise the
+    /// limiter is trivially bypassed by sending garbage in between guesses.
+    #[tokio::test]
+    async fn malformed_pairing_codes_count_towards_the_lockout() {
+        let (state, _database) = test_state_with_db();
+
+        for _ in 0..PAIRING_ATTEMPT_LIMIT {
+            assert_eq!(
+                pair(State(Arc::clone(&state)), Json(peer_request("not-a-code"))).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request("not-a-code"))).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// Failures before a *successful* pairing were an operator mistyping the
+    /// code, not a scan: pairing a second node right after must not be locked
+    /// out by them.
+    #[tokio::test]
+    async fn a_successful_pairing_clears_earlier_failures() {
+        let (state, database) = test_state_with_db();
+
+        for _ in 0..(PAIRING_ATTEMPT_LIMIT - 1) {
+            let guess = PairingCode::random();
+            let _ = pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await;
+        }
+
+        let code = PairingCode::random();
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .unwrap();
+        }
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await.status(),
+            StatusCode::OK
+        );
+
+        // The budget is back: the next wrong code is a plain 401, not a 429.
+        let guess = PairingCode::random();
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

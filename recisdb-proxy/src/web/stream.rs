@@ -495,7 +495,27 @@ pub(crate) fn service_filtered_body_stream(
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Closed) => match state.loss_policy {
+                    // The source ended. For a viewer that is an ordinary EOF.
+                    LossPolicy::Recover => return None,
+                    // For a recording it is not: the response has already been
+                    // sent as `200 OK`, so ending the body normally would look
+                    // to EPGStation like a complete recording that just
+                    // happens to stop early. Fail the body instead, and leave
+                    // the reason in `session_history`.
+                    LossPolicy::Fatal => {
+                        warn!(
+                            "[HTTP stream] RECORD source closed mid-stream; failing the response rather than reporting a truncated recording as complete"
+                        );
+                        state._cleanup.set_disconnect_reason("record_source_closed");
+                        state.fatal = true;
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "record stream source closed",
+                        );
+                        return Some((Err(error), state));
+                    }
+                },
             }
         }
     })
@@ -1116,6 +1136,40 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "the stream must end after the fatal error rather than resuming mid-recording"
+        );
+    }
+
+    /// A remote node going away (its lease stream ending, the peer being
+    /// killed) closes the receiver. For a recording that is a failure, not an
+    /// EOF: the response has already been sent as `200 OK`, so ending the
+    /// body normally would report a truncated recording as a complete one.
+    #[tokio::test]
+    async fn a_record_stream_fails_when_the_remote_source_closes() {
+        use futures::StreamExt;
+
+        let (tx, rx) = broadcast::channel::<Bytes>(4);
+        let cleanup = test_cleanup();
+        let stream = service_filtered_body_stream(
+            BodyReceiver::Remote(rx),
+            cleanup,
+            1024,
+            LossPolicy::Fatal,
+        );
+        futures::pin_mut!(stream);
+
+        // The peer disappears without releasing its lease first.
+        drop(tx);
+
+        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let err = first.expect_err("the RECORD stream must terminate with an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("source closed"),
+            "the reason must say what happened: {err}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after the fatal error"
         );
     }
 

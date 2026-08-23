@@ -208,8 +208,15 @@ impl HttpStreamSession {
     /// First writer wins: the fatal cause (e.g. `record_broadcast_lag`) is
     /// set before the body stream terminates, and the generic teardown that
     /// follows must not overwrite it.
+    ///
+    /// Poison-tolerant on purpose: the only reader is `Drop`, and a panic
+    /// while holding this lock must not turn into a second panic during
+    /// unwinding (a panic in `Drop` aborts the process).
     pub fn set_disconnect_reason(&self, reason: &str) {
-        let mut slot = self.disconnect_reason.lock().unwrap();
+        let mut slot = self
+            .disconnect_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.is_none() {
             *slot = Some(reason.to_string());
         }
@@ -253,7 +260,12 @@ impl Drop for HttpStreamSession {
         } else {
             None
         };
-        let reason = self.disconnect_reason.lock().unwrap().clone();
+        // See `set_disconnect_reason`: never unwrap a lock inside `Drop`.
+        let reason = self
+            .disconnect_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let tuner_path = self.tuner_path.clone();
         let channel_info = self.channel_info.clone();
         let channel_name = self.channel_name.clone();
