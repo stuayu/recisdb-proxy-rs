@@ -226,8 +226,12 @@ impl<'a> NodeStore<'a> {
             )
             .optional()?;
         if let Some((node_id, display_name)) = existing {
-            let node_id = NodeId::new(node_id).map_err(|e| DatabaseError::MigrationFailed(e.into()))?;
-            return Ok(NodeIdentity { node_id, display_name });
+            let node_id =
+                NodeId::new(node_id).map_err(|e| DatabaseError::MigrationFailed(e.into()))?;
+            return Ok(NodeIdentity {
+                node_id,
+                display_name,
+            });
         }
 
         let identity = NodeIdentity {
@@ -241,7 +245,11 @@ impl<'a> NodeStore<'a> {
         Ok(identity)
     }
 
-    pub fn update_local_identity(&self, identity: &NodeIdentity, listen_addr: Option<&str>) -> Result<()> {
+    pub fn update_local_identity(
+        &self,
+        identity: &NodeIdentity,
+        listen_addr: Option<&str>,
+    ) -> Result<()> {
         self.db.connection().execute(
             "INSERT INTO node_local_identity (id, node_id, display_name, node_listen_addr, updated_at)
              VALUES (1, ?1, ?2, ?3, strftime('%s','now') * 1000)
@@ -255,7 +263,11 @@ impl<'a> NodeStore<'a> {
         Ok(())
     }
 
-    pub fn upsert_node(&self, node: &StoredNode, credential: Option<&NodeCredential>) -> Result<()> {
+    pub fn upsert_node(
+        &self,
+        node: &StoredNode,
+        credential: Option<&NodeCredential>,
+    ) -> Result<()> {
         self.db.connection().execute(
             "INSERT INTO remote_nodes
              (node_id, display_name, site_name, enabled, allow_transit, auto_connect, credential, last_seen_unix_ms, updated_at)
@@ -302,8 +314,17 @@ impl<'a> NodeStore<'a> {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (node_id, display_name, site_name, enabled, allow_transit, auto_connect, last_seen_unix_ms) = row?;
-            let node_id = NodeId::new(node_id).map_err(|e| DatabaseError::MigrationFailed(e.into()))?;
+            let (
+                node_id,
+                display_name,
+                site_name,
+                enabled,
+                allow_transit,
+                auto_connect,
+                last_seen_unix_ms,
+            ) = row?;
+            let node_id =
+                NodeId::new(node_id).map_err(|e| DatabaseError::MigrationFailed(e.into()))?;
             out.push(StoredNode {
                 node_id,
                 display_name,
@@ -315,6 +336,44 @@ impl<'a> NodeStore<'a> {
             });
         }
         Ok(out)
+    }
+
+    /// Enable or suspend one paired node without deleting its credentials and
+    /// route history. Suspended nodes remain visible for later reactivation.
+    pub fn set_node_enabled(&self, node_id: &NodeId, enabled: bool) -> Result<()> {
+        self.db.connection().execute(
+            "UPDATE remote_nodes SET enabled = ?2, updated_at = strftime('%s','now') * 1000
+             WHERE node_id = ?1",
+            params![node_id.as_str(), enabled as i32],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a remote node and all data owned by it. Explicit child cleanup
+    /// keeps this safe on databases created before foreign keys were enabled.
+    pub fn delete_node(&self, node_id: &NodeId) -> Result<()> {
+        let conn = self.db.connection();
+        conn.execute(
+            "DELETE FROM route_group_members WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM node_path_health WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM reception_routes WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM node_endpoints WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM remote_nodes WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
+        Ok(())
     }
 
     pub fn credential_for(&self, node_id: &NodeId) -> Result<Option<NodeCredential>> {
@@ -329,13 +388,18 @@ impl<'a> NodeStore<'a> {
             .optional()?
             .flatten();
         value
-            .map(|value| NodeCredential::parse(value).map_err(|e| DatabaseError::MigrationFailed(e.into())))
+            .map(|value| {
+                NodeCredential::parse(value).map_err(|e| DatabaseError::MigrationFailed(e.into()))
+            })
             .transpose()
     }
 
     pub fn replace_endpoints(&self, node_id: &NodeId, endpoints: &[NodeEndpoint]) -> Result<()> {
         let conn = self.db.connection();
-        conn.execute("DELETE FROM node_endpoints WHERE node_id = ?1", params![node_id.as_str()])?;
+        conn.execute(
+            "DELETE FROM node_endpoints WHERE node_id = ?1",
+            params![node_id.as_str()],
+        )?;
         for endpoint in endpoints {
             let json = serde_json::to_string(endpoint)
                 .map_err(|e| DatabaseError::MigrationFailed(e.to_string()))?;
@@ -348,9 +412,10 @@ impl<'a> NodeStore<'a> {
     }
 
     pub fn endpoints(&self, node_id: &NodeId) -> Result<Vec<NodeEndpoint>> {
-        let mut stmt = self.db.connection().prepare(
-            "SELECT endpoint_json FROM node_endpoints WHERE node_id = ?1 ORDER BY id",
-        )?;
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare("SELECT endpoint_json FROM node_endpoints WHERE node_id = ?1 ORDER BY id")?;
         let rows = stmt.query_map(params![node_id.as_str()], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -367,11 +432,14 @@ impl<'a> NodeStore<'a> {
             "INSERT OR IGNORE INTO route_groups (name) VALUES (?1)",
             params![name],
         )?;
-        self.db.connection().query_row(
-            "SELECT id FROM route_groups WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        ).map_err(DatabaseError::from)
+        self.db
+            .connection()
+            .query_row(
+                "SELECT id FROM route_groups WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::from)
     }
 
     pub fn set_group_member(&self, group_id: i64, node_id: &NodeId, weight: i32) -> Result<()> {
@@ -434,8 +502,11 @@ impl<'a> NodeStore<'a> {
                 params![peer.as_str()],
             )?;
             for advertisement in advertisements {
-                let mux_id =
-                    self.upsert_logical_mux(advertisement.mux, advertisement.logical_broadcast, None)?;
+                let mux_id = self.upsert_logical_mux(
+                    advertisement.mux,
+                    advertisement.logical_broadcast,
+                    None,
+                )?;
                 conn.execute(
                     "INSERT OR REPLACE INTO reception_routes (
                         route_id, mux_id, node_id, ingress_delivery, ultimate_delivery,
@@ -540,9 +611,10 @@ impl<'a> NodeStore<'a> {
         let now = chrono::Utc::now().timestamp_millis();
         // Housekeeping here rather than on a timer: pairing is rare and this
         // is the only place that grows the table.
-        self.db
-            .connection()
-            .execute("DELETE FROM node_pending_pairings WHERE expires_at_unix_ms <= ?1", params![now])?;
+        self.db.connection().execute(
+            "DELETE FROM node_pending_pairings WHERE expires_at_unix_ms <= ?1",
+            params![now],
+        )?;
         self.db.connection().execute(
             "INSERT OR REPLACE INTO node_pending_pairings (code_hash, label, expires_at_unix_ms, created_at_unix_ms) VALUES (?1, ?2, ?3, ?4)",
             params![code.digest(), label, expires_at_unix_ms, now],
@@ -595,8 +667,16 @@ impl<'a> NodeStore<'a> {
     }
 
     pub fn list_route_groups(&self) -> Result<Vec<RouteGroup>> {
-        let mut stmt = self.db.connection().prepare("SELECT id, name FROM route_groups ORDER BY name")?;
-        let rows = stmt.query_map([], |row| Ok(RouteGroup { id: row.get(0)?, name: row.get(1)? }))?;
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare("SELECT id, name FROM route_groups ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RouteGroup {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
@@ -624,20 +704,25 @@ mod tests {
         };
         let credential = NodeCredential::random();
         store.upsert_node(&node, Some(&credential)).unwrap();
-        store.replace_endpoints(
-            &node.node_id,
-            &[NodeEndpoint {
-                kind: EndpointKind::Tailscale,
-                address: "http://gunma.tailnet:4512".into(),
-                enabled: true,
-                record_allowed: true,
-                metered: false,
-                user_priority: 0,
-            }],
-        ).unwrap();
+        store
+            .replace_endpoints(
+                &node.node_id,
+                &[NodeEndpoint {
+                    kind: EndpointKind::Tailscale,
+                    address: "http://gunma.tailnet:4512".into(),
+                    enabled: true,
+                    record_allowed: true,
+                    metered: false,
+                    user_priority: 0,
+                }],
+            )
+            .unwrap();
         assert_eq!(store.list_nodes().unwrap().len(), 1);
         assert_eq!(store.endpoints(&node.node_id).unwrap().len(), 1);
-        assert_eq!(store.credential_for(&node.node_id).unwrap().unwrap(), credential);
+        assert_eq!(
+            store.credential_for(&node.node_id).unwrap().unwrap(),
+            credential
+        );
     }
 
     #[test]
@@ -647,7 +732,9 @@ mod tests {
         let code = PairingCode::random();
         let expires = chrono::Utc::now().timestamp_millis() + 600_000;
 
-        store.create_pending_pairing(&code, Some("東京"), expires).unwrap();
+        store
+            .create_pending_pairing(&code, Some("東京"), expires)
+            .unwrap();
         assert_eq!(store.pending_pairings().unwrap().len(), 1);
 
         assert!(store.consume_pending_pairing(&code).unwrap());
@@ -663,7 +750,9 @@ mod tests {
         let code = PairingCode::random();
         let already_expired = chrono::Utc::now().timestamp_millis() - 1;
 
-        store.create_pending_pairing(&code, None, already_expired).unwrap();
+        store
+            .create_pending_pairing(&code, None, already_expired)
+            .unwrap();
         assert!(store.pending_pairings().unwrap().is_empty());
         assert!(!store.consume_pending_pairing(&code).unwrap());
     }
@@ -675,7 +764,11 @@ mod tests {
         let issued = PairingCode::random();
         let guessed = PairingCode::random();
         store
-            .create_pending_pairing(&issued, None, chrono::Utc::now().timestamp_millis() + 600_000)
+            .create_pending_pairing(
+                &issued,
+                None,
+                chrono::Utc::now().timestamp_millis() + 600_000,
+            )
             .unwrap();
 
         assert!(!store.consume_pending_pairing(&guessed).unwrap());
@@ -733,12 +826,20 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
         let peer = paired_node(&store, "tokyo");
-        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let mux = LogicalMuxId {
+            nid: 0x0004,
+            tsid: 0x4010,
+        };
 
         store
             .replace_remote_routes(
                 &peer,
-                &[advertisement(&peer, "/dev/px4video0#0:0", mux, ReceptionRouteState::Usable)],
+                &[advertisement(
+                    &peer,
+                    "/dev/px4video0#0:0",
+                    mux,
+                    ReceptionRouteState::Usable,
+                )],
             )
             .unwrap();
 
@@ -746,7 +847,10 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].node_id, peer);
         assert_eq!(routes[0].logical_broadcast, LogicalBroadcastType::Bs);
-        assert_eq!(routes[0].ingress_delivery, DeliveryType::CatvTransmodulation);
+        assert_eq!(
+            routes[0].ingress_delivery,
+            DeliveryType::CatvTransmodulation
+        );
         assert_eq!(routes[0].ultimate_delivery, DeliveryType::IsdbSDirect);
     }
 
@@ -757,7 +861,10 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
         let peer = paired_node(&store, "tokyo");
-        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let mux = LogicalMuxId {
+            nid: 0x0004,
+            tsid: 0x4010,
+        };
 
         store
             .replace_remote_routes(
@@ -771,7 +878,10 @@ mod tests {
         assert_eq!(store.remote_routes_for(mux).unwrap().len(), 2);
 
         store
-            .replace_remote_routes(&peer, &[advertisement(&peer, "a", mux, ReceptionRouteState::Usable)])
+            .replace_remote_routes(
+                &peer,
+                &[advertisement(&peer, "a", mux, ReceptionRouteState::Usable)],
+            )
             .unwrap();
         let routes = store.remote_routes_for(mux).unwrap();
         assert_eq!(routes.len(), 1);
@@ -785,21 +895,34 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
         let peer = paired_node(&store, "tokyo");
-        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let mux = LogicalMuxId {
+            nid: 0x0004,
+            tsid: 0x4010,
+        };
 
         store
             .replace_remote_routes(
                 &peer,
-                &[advertisement(&peer, "weak", mux, ReceptionRouteState::Quarantined)],
+                &[advertisement(
+                    &peer,
+                    "weak",
+                    mux,
+                    ReceptionRouteState::Quarantined,
+                )],
             )
             .unwrap();
 
         assert!(store.remote_routes_for(mux).unwrap().is_empty());
         let still_there: i64 = db
             .connection()
-            .query_row("SELECT COUNT(*) FROM reception_routes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM reception_routes", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(still_there, 1, "a quarantined route must remain re-probeable");
+        assert_eq!(
+            still_there, 1,
+            "a quarantined route must remain re-probeable"
+        );
     }
 
     /// Two nodes may legitimately use the same local route id.
@@ -809,18 +932,41 @@ mod tests {
         let store = NodeStore::new(&db).unwrap();
         let tokyo = paired_node(&store, "tokyo");
         let gunma = paired_node(&store, "gunma");
-        let mux = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let mux = LogicalMuxId {
+            nid: 0x0004,
+            tsid: 0x4010,
+        };
         let shared_id = "/dev/px4video0#0:0";
 
         store
-            .replace_remote_routes(&tokyo, &[advertisement(&tokyo, shared_id, mux, ReceptionRouteState::Usable)])
+            .replace_remote_routes(
+                &tokyo,
+                &[advertisement(
+                    &tokyo,
+                    shared_id,
+                    mux,
+                    ReceptionRouteState::Usable,
+                )],
+            )
             .unwrap();
         store
-            .replace_remote_routes(&gunma, &[advertisement(&gunma, shared_id, mux, ReceptionRouteState::Usable)])
+            .replace_remote_routes(
+                &gunma,
+                &[advertisement(
+                    &gunma,
+                    shared_id,
+                    mux,
+                    ReceptionRouteState::Usable,
+                )],
+            )
             .unwrap();
 
         let routes = store.remote_routes_for(mux).unwrap();
-        assert_eq!(routes.len(), 2, "one node must not overwrite the other's route");
+        assert_eq!(
+            routes.len(),
+            2,
+            "one node must not overwrite the other's route"
+        );
     }
 
     /// The plaintext code must not be recoverable from the database.
@@ -835,7 +981,9 @@ mod tests {
 
         let stored: String = db
             .connection()
-            .query_row("SELECT code_hash FROM node_pending_pairings", [], |row| row.get(0))
+            .query_row("SELECT code_hash FROM node_pending_pairings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_ne!(stored, code.as_str());
         assert_eq!(stored, code.digest());

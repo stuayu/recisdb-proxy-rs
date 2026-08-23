@@ -1,13 +1,13 @@
 //! Web server shared state.
 
+use dns_lookup::lookup_addr;
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
-use serde::Serialize;
-use dns_lookup::lookup_addr;
 
 use recisdb_protocol::StreamClass;
 
@@ -183,19 +183,41 @@ pub struct SessionMetricsHistory {
 
 impl SessionMetricsHistory {
     /// Push a sample and trim to last 60 seconds.
-    pub fn push_sample(&mut self, timestamp_ms: i64, bitrate_mbps: f64, packet_loss_rate: f64, signal_level: f32) {
+    pub fn push_sample(
+        &mut self,
+        timestamp_ms: i64,
+        bitrate_mbps: f64,
+        packet_loss_rate: f64,
+        signal_level: f32,
+    ) {
         self.bitrate_history.push_back((timestamp_ms, bitrate_mbps));
-        self.packet_loss_history.push_back((timestamp_ms, packet_loss_rate));
+        self.packet_loss_history
+            .push_back((timestamp_ms, packet_loss_rate));
         self.signal_history.push_back((timestamp_ms, signal_level));
 
         let cutoff = timestamp_ms - 60_000;
-        while self.bitrate_history.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+        while self
+            .bitrate_history
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
             self.bitrate_history.pop_front();
         }
-        while self.packet_loss_history.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+        while self
+            .packet_loss_history
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
             self.packet_loss_history.pop_front();
         }
-        while self.signal_history.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+        while self
+            .signal_history
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
             self.signal_history.pop_front();
         }
     }
@@ -214,11 +236,17 @@ impl SessionRegistry {
     /// Allocate the next session id. Shared by every transport — see
     /// [`SessionRegistry::next_id`].
     pub fn allocate_id(&self) -> u64 {
-        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a new session.
-    pub async fn register(&self, id: u64, addr: SocketAddr, protocol: SessionProtocol) -> mpsc::Receiver<()> {
+    pub async fn register(
+        &self,
+        id: u64,
+        addr: SocketAddr,
+        protocol: SessionProtocol,
+    ) -> mpsc::Receiver<()> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let ip = addr.ip();
         let host = tokio::task::spawn_blocking(move || lookup_addr(&ip).ok())
@@ -398,8 +426,12 @@ impl SessionRegistry {
         signal_level: f32,
     ) {
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
-            info.metrics_history
-                .push_sample(timestamp_ms, bitrate_mbps, packet_loss_rate, signal_level);
+            info.metrics_history.push_sample(
+                timestamp_ms,
+                bitrate_mbps,
+                packet_loss_rate,
+                signal_level,
+            );
         }
     }
 
@@ -522,9 +554,10 @@ pub struct WebState {
     /// Live state of the dedicated node-to-node transport listener
     /// (`node::transport`), when the distributed fabric is enabled. The
     /// dashboard needs it to trust a newly paired peer immediately, without
-    /// waiting for a restart. `None` when `[node] enabled = false`.
+    /// The live node transport, normally always present. `None` only when the
+    /// local identity/database could not be initialized.
     pub node_transport: Option<Arc<crate::node::NodeTransportState>>,
-    /// `[node] listen` as configured, shown next to a freshly issued pairing
+    /// Derived node listener address, shown next to a freshly issued pairing
     /// code so the operator knows which URL to type on the other node.
     pub node_listen_addr: Option<String>,
 }
@@ -618,15 +651,18 @@ mod tests {
                 2,
                 1,
                 18.5,
-                7,   // loss_broadcast_lag_chunks
-                3,   // loss_ts_queue_chunks
-                2,   // loss_encoder_stall_events
+                7, // loss_broadcast_lag_chunks
+                3, // loss_ts_queue_chunks
+                2, // loss_encoder_stall_events
                 vec![(0x0100, 5), (0x0200, 2)],
             )
             .await;
 
         let sessions = registry.get_all().await;
-        let info = sessions.into_iter().find(|s| s.id == 1).expect("session present");
+        let info = sessions
+            .into_iter()
+            .find(|s| s.id == 1)
+            .expect("session present");
         assert_eq!(info.loss_broadcast_lag_chunks, 7);
         assert_eq!(info.loss_ts_queue_chunks, 3);
         assert_eq!(info.loss_encoder_stall_events, 2);

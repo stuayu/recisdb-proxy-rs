@@ -7,20 +7,20 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use log::{error, info, warn};
 use std::sync::Arc;
-use log::{info, warn, error};
 
-use recisdb_proxy::database;
-use recisdb_proxy::logging;
 use recisdb_proxy::alert;
+use recisdb_proxy::database;
 use recisdb_proxy::epg_writer;
+use recisdb_proxy::logging;
 use recisdb_proxy::nit_writer;
 use recisdb_proxy::scheduler;
 use recisdb_proxy::server;
 use recisdb_proxy::tuner;
 use recisdb_proxy::web;
 
-use scheduler::{ScanScheduler, scan_scheduler::ScanSchedulerConfig};
+use scheduler::{scan_scheduler::ScanSchedulerConfig, ScanScheduler};
 
 use server::{Server, ServerConfig};
 use tuner::TunerPoolConfig;
@@ -173,7 +173,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| recisdb_proxy::service::DEFAULT_SERVICE_NAME.to_string());
         let args_for_body = args.clone();
         recisdb_proxy::service::windows_scm::run_dispatcher(&name, move |should_stop| {
-            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("failed to build tokio runtime: {e}");
@@ -290,7 +293,10 @@ async fn run_server(
             match db_guard.get_log_config() {
                 Ok(config) => config,
                 Err(e) => {
-                    warn!("Failed to load log config from database, keeping startup level: {}", e);
+                    warn!(
+                        "Failed to load log config from database, keeping startup level: {}",
+                        e
+                    );
                     (log_level_handle.current(), args.log_retention_days)
                 }
             }
@@ -327,8 +333,14 @@ async fn run_server(
     if let Some(command_path) = &file_config.tsreplace.command_path {
         let db_guard = db.lock().await;
         match db_guard.set_tsreplace_command_path(command_path) {
-            Ok(()) => info!("tsreplace command_path set from config file: {}", command_path),
-            Err(e) => error!("Failed to set tsreplace command_path from config file: {}", e),
+            Ok(()) => info!(
+                "tsreplace command_path set from config file: {}",
+                command_path
+            ),
+            Err(e) => error!(
+                "Failed to set tsreplace command_path from config file: {}",
+                e
+            ),
         }
     }
     // Same trust boundary as command_path (REVIEW S1): the optional stage-1
@@ -336,8 +348,14 @@ async fn run_server(
     if let Some(preprocessor_path) = &file_config.tsreplace.preprocessor_path {
         let db_guard = db.lock().await;
         match db_guard.set_tsreplace_preprocessor_path(preprocessor_path) {
-            Ok(()) => info!("tsreplace preprocessor_path set from config file: {}", preprocessor_path),
-            Err(e) => error!("Failed to set tsreplace preprocessor_path from config file: {}", e),
+            Ok(()) => info!(
+                "tsreplace preprocessor_path set from config file: {}",
+                preprocessor_path
+            ),
+            Err(e) => error!(
+                "Failed to set tsreplace preprocessor_path from config file: {}",
+                e
+            ),
         }
     }
 
@@ -346,15 +364,24 @@ async fn run_server(
     if let Some(command_path) = &file_config.preview.command_path {
         let db_guard = db.lock().await;
         match db_guard.set_preview_command_path(command_path) {
-            Ok(()) => info!("preview command_path set from config file: {}", command_path),
+            Ok(()) => info!(
+                "preview command_path set from config file: {}",
+                command_path
+            ),
             Err(e) => error!("Failed to set preview command_path from config file: {}", e),
         }
     }
     if let Some(preprocessor_path) = &file_config.preview.preprocessor_path {
         let db_guard = db.lock().await;
         match db_guard.set_preview_preprocessor_path(preprocessor_path) {
-            Ok(()) => info!("preview preprocessor_path set from config file: {}", preprocessor_path),
-            Err(e) => error!("Failed to set preview preprocessor_path from config file: {}", e),
+            Ok(()) => info!(
+                "preview preprocessor_path set from config file: {}",
+                preprocessor_path
+            ),
+            Err(e) => error!(
+                "Failed to set preview preprocessor_path from config file: {}",
+                e
+            ),
         }
     }
 
@@ -387,7 +414,10 @@ async fn run_server(
         let db_guard = db.lock().await;
         if let Some(token) = &file_config.web.auth_token {
             if let Err(e) = db_guard.set_web_auth_token(token) {
-                warn!("Failed to persist web auth token override to database: {}", e);
+                warn!(
+                    "Failed to persist web auth token override to database: {}",
+                    e
+                );
             }
             token.clone()
         } else {
@@ -396,7 +426,10 @@ async fn run_server(
                 Ok(None) => {
                     let generated = web::auth::generate_token();
                     if let Err(e) = db_guard.set_web_auth_token(&generated) {
-                        warn!("Failed to persist generated web auth token to database: {}", e);
+                        warn!(
+                            "Failed to persist generated web auth token to database: {}",
+                            e
+                        );
                     }
                     info!("Generated a new Web API auth token (persisted to the database).");
                     generated
@@ -464,8 +497,9 @@ async fn run_server(
                     signal_poll_interval_ms,
                     signal_wait_timeout_ms
                 );
-                let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) =
-                    db_lock.get_tuner_livelock_config().unwrap_or((10, 2_000, 30));
+                let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) = db_lock
+                    .get_tuner_livelock_config()
+                    .unwrap_or((10, 2_000, 30));
                 info!(
                     "Loaded prefill config from database: view={}ms, preview={}ms, record={}ms, safety_factor={}",
                     prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor
@@ -484,7 +518,12 @@ async fn run_server(
                         no_data_timeout_secs,
                         mmt_converter: Default::default(),
                     },
-                    (prefill_view_ms, prefill_preview_ms, prefill_record_ms, jitter_safety_factor),
+                    (
+                        prefill_view_ms,
+                        prefill_preview_ms,
+                        prefill_record_ms,
+                        jitter_safety_factor,
+                    ),
                 )
             }
             Err(e) => {
@@ -688,117 +727,114 @@ async fn run_server(
     let web_log_level_handle = Arc::clone(&log_level_handle);
     let web_epg_events_tx = epg_events_tx.clone();
 
-    // Distributed tuner fabric (`[node]`). The node-to-node transport is a
-    // dedicated listener: long-lived inter-node TS streams must not share a
-    // connection pool or failure domain with dashboard/Mirakurun polling.
-    let (node_transport_for_web, node_listen_display) = match (
-        resolved.node_enabled,
-        resolved.node_listen_addr,
-    ) {
-        (true, Some(node_addr)) => {
-            let identity = {
-                let db_lock = db.lock().await;
-                match recisdb_proxy::node::NodeStore::new(&db_lock) {
-                    Ok(store) => match store.local_identity() {
-                        Ok(mut identity) => {
+    // Distributed tuner fabric (`[node]`). The node-to-node transport is
+    // always present on its dedicated listener. An unpaired node only waits
+    // for pairing and does not expose any remote tuner to peers.
+    let (node_transport_for_web, node_listen_display) = {
+        let node_addr = resolved.node_listen_addr;
+        let identity = {
+            let db_lock = db.lock().await;
+            match recisdb_proxy::node::NodeStore::new(&db_lock) {
+                Ok(store) => match store.local_identity() {
+                    Ok(mut identity) => {
+                        // TOML display_name is a bootstrap default. Once the
+                        // dashboard has saved a name, the DB is authoritative
+                        // so a restart cannot silently undo a GUI edit.
+                        if identity.display_name == "recisdb-proxy" {
                             if let Some(name) = resolved.node_display_name.clone() {
                                 if name != identity.display_name {
                                     identity.display_name = name;
-                                    if let Err(e) = store
-                                        .update_local_identity(&identity, Some(&node_addr.to_string()))
-                                    {
+                                    if let Err(e) = store.update_local_identity(
+                                        &identity,
+                                        Some(&node_addr.to_string()),
+                                    ) {
                                         warn!("Failed to persist node display name: {}", e);
                                     }
                                 }
                             }
-                            Some(identity)
                         }
-                        Err(e) => {
-                            error!("Node fabric disabled: cannot load local node identity: {}", e);
-                            None
-                        }
-                    },
+                        Some(identity)
+                    }
                     Err(e) => {
-                        error!("Node fabric disabled: cannot open node store: {}", e);
+                        error!(
+                            "Node fabric unavailable: cannot load local node identity: {}",
+                            e
+                        );
                         None
                     }
+                },
+                Err(e) => {
+                    error!("Node fabric unavailable: cannot open node store: {}", e);
+                    None
                 }
-            };
-
-            match identity {
-                Some(identity) => {
-                    let leases = Arc::new(recisdb_proxy::node::RemoteLeaseManager::new(
-                        recisdb_proxy::node::LeasePolicy::default(),
-                    ));
-                    // Offering local tuners to peers goes through the same
-                    // `tuner::acquire` path as every local request, so a
-                    // remote recording contends under the same policy.
-                    let mux_server = Arc::new(recisdb_proxy::node::LocalMuxServer::new(
-                        identity.clone(),
-                        Arc::clone(server.tuner_pool()),
-                        db.clone(),
-                        Arc::clone(&leases),
-                    ));
-                    // Expired leases are normally noticed by their own pump
-                    // (it re-checks the lease every second and stops when it
-                    // is gone). This janitor is the backstop for a lease whose
-                    // pump is no longer running — otherwise the entry would
-                    // sit in the map forever, and `GET /api/nodes` would keep
-                    // reporting a lease nobody holds.
-                    let reaper = Arc::clone(&leases);
-                    tokio::spawn(async move {
-                        let mut ticker =
-                            tokio::time::interval(std::time::Duration::from_secs(5));
-                        loop {
-                            ticker.tick().await;
-                            for lease in reaper.reap_expired().await {
-                                warn!(
-                                    "[node] lease {} expired without a renew; released",
-                                    lease.id.as_str()
-                                );
-                            }
-                        }
-                    });
-                    let state = Arc::new(
-                        recisdb_proxy::node::NodeTransportState::new(identity.clone(), leases)
-                            .with_database(db.clone())
-                            .with_mux_server(mux_server),
-                    );
-                    match state.reload_peers().await {
-                        Ok(count) => info!(
-                            "Node fabric enabled as {} (\"{}\"), {} paired peer(s)",
-                            identity.node_id, identity.display_name, count
-                        ),
-                        Err(e) => warn!("Failed to load paired node credentials: {}", e),
-                    }
-                    // Advertise our own reception routes and pull the peers'
-                    // back, so candidate discovery has a stored picture
-                    // instead of a round trip per request.
-                    recisdb_proxy::node::RouteSync::new(
-                        Arc::clone(&state),
-                        db.clone(),
-                        Arc::clone(server.tuner_pool()),
-                    )
-                    .spawn();
-
-                    let serve_state = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            recisdb_proxy::node::serve_h2c(node_addr, serve_state).await
-                        {
-                            error!("Node transport listener stopped: {}", e);
-                        }
-                    });
-                    (Some(state), Some(node_addr.to_string()))
-                }
-                None => (None, None),
             }
+        };
+
+        match identity {
+            Some(identity) => {
+                let leases = Arc::new(recisdb_proxy::node::RemoteLeaseManager::new(
+                    recisdb_proxy::node::LeasePolicy::default(),
+                ));
+                // Offering local tuners to peers goes through the same
+                // `tuner::acquire` path as every local request, so a
+                // remote recording contends under the same policy.
+                let mux_server = Arc::new(recisdb_proxy::node::LocalMuxServer::new(
+                    identity.clone(),
+                    Arc::clone(server.tuner_pool()),
+                    db.clone(),
+                    Arc::clone(&leases),
+                ));
+                // Expired leases are normally noticed by their own pump
+                // (it re-checks the lease every second and stops when it
+                // is gone). This janitor is the backstop for a lease whose
+                // pump is no longer running — otherwise the entry would
+                // sit in the map forever, and `GET /api/nodes` would keep
+                // reporting a lease nobody holds.
+                let reaper = Arc::clone(&leases);
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        ticker.tick().await;
+                        for lease in reaper.reap_expired().await {
+                            warn!(
+                                "[node] lease {} expired without a renew; released",
+                                lease.id.as_str()
+                            );
+                        }
+                    }
+                });
+                let state = Arc::new(
+                    recisdb_proxy::node::NodeTransportState::new(identity.clone(), leases)
+                        .with_database(db.clone())
+                        .with_mux_server(mux_server),
+                );
+                match state.reload_peers().await {
+                    Ok(count) => info!(
+                        "Node fabric listening as {} (\"{}\"), {} paired peer(s)",
+                        identity.node_id, identity.display_name, count
+                    ),
+                    Err(e) => warn!("Failed to load paired node credentials: {}", e),
+                }
+                // Advertise our own reception routes and pull the peers'
+                // back, so candidate discovery has a stored picture
+                // instead of a round trip per request.
+                recisdb_proxy::node::RouteSync::new(
+                    Arc::clone(&state),
+                    db.clone(),
+                    Arc::clone(server.tuner_pool()),
+                )
+                .spawn();
+
+                let serve_state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(e) = recisdb_proxy::node::serve_h2c(node_addr, serve_state).await {
+                        error!("Node transport listener stopped: {}", e);
+                    }
+                });
+                (Some(state), Some(node_addr.to_string()))
+            }
+            None => (None, None),
         }
-        (true, None) => {
-            warn!("[node] enabled = true but no usable listen address; node transport not started");
-            (None, None)
-        }
-        (false, _) => (None, None),
     };
     tokio::spawn(async move {
         match web::start_web_server(
@@ -821,7 +857,9 @@ async fn run_server(
             web_epg_events_tx,
             node_transport_for_web,
             node_listen_display,
-        ).await {
+        )
+        .await
+        {
             Ok(_) => info!("Web dashboard server stopped"),
             Err(e) => error!("Web dashboard error: {}", e),
         }
@@ -830,7 +868,13 @@ async fn run_server(
     info!("Web dashboard listening on http://{}", web_listen_addr);
 
     // Load scan scheduler configuration from database
-    let (db_check_interval, db_max_concurrent, db_timeout, db_signal_lock_wait_ms, db_ts_read_timeout_ms) = {
+    let (
+        db_check_interval,
+        db_max_concurrent,
+        db_timeout,
+        db_signal_lock_wait_ms,
+        db_ts_read_timeout_ms,
+    ) = {
         let db_lock = db.lock().await;
         match db_lock.get_scan_scheduler_config() {
             Ok(config) => {
@@ -846,7 +890,13 @@ async fn run_server(
             }
             Err(e) => {
                 warn!("Failed to load scan scheduler config from database: {}", e);
-                (args.scan_interval, args.max_concurrent_scans, 900, 500, 300000)
+                (
+                    args.scan_interval,
+                    args.max_concurrent_scans,
+                    900,
+                    500,
+                    300000,
+                )
             }
         }
     };
@@ -867,8 +917,10 @@ async fn run_server(
             scan_config,
         ));
 
-        info!("Starting channel scan scheduler (interval: {}s, max concurrent: {})", 
-              db_check_interval, db_max_concurrent);
+        info!(
+            "Starting channel scan scheduler (interval: {}s, max concurrent: {})",
+            db_check_interval, db_max_concurrent
+        );
         let _scheduler_handle = Arc::clone(&scheduler).start();
 
         // Trigger immediate scan if requested

@@ -56,6 +56,16 @@ pub struct IssuePairingRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateLocalNodeRequest {
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateNodeStateRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RedeemPairingRequest {
     /// Base URL of the *issuing* node's transport listener, e.g.
     /// `http://tokyo.tailnet.ts.net:20773`.
@@ -110,6 +120,94 @@ pub async fn get_nodes(
     })))
 }
 
+/// Update this node's peer-visible display name without editing TOML or
+/// restarting the process.
+pub async fn update_local_node(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<UpdateLocalNodeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let display_name = payload.display_name.trim();
+    if display_name.is_empty() {
+        return Err(ApiError::bad_request("display_name must not be empty"));
+    }
+    let identity = {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        let mut identity = store.local_identity()?;
+        identity.display_name = display_name.to_owned();
+        store.update_local_identity(&identity, web_state.node_listen_addr.as_deref())?;
+        identity
+    };
+    if let Some(state) = web_state.node_transport.as_ref() {
+        state.set_display_name(identity.display_name.clone()).await;
+    }
+    Ok(Json(json!({ "success": true, "local": identity })))
+}
+
+/// Enable or suspend a paired node while retaining its route and credential
+/// records for later use.
+pub async fn update_node_state(
+    State(web_state): State<Arc<WebState>>,
+    Path(node_id): Path<String>,
+    Json(payload): Json<UpdateNodeStateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let node_id = NodeId::new(node_id).map_err(ApiError::bad_request)?;
+    let credential = {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        if !store
+            .list_nodes()?
+            .iter()
+            .any(|node| node.node_id == node_id)
+        {
+            return Err(ApiError::not_found(format!("node {node_id} not found")));
+        }
+        store.set_node_enabled(&node_id, payload.enabled)?;
+        if payload.enabled {
+            store.credential_for(&node_id)?
+        } else {
+            None
+        }
+    };
+    // `enabled` is an admission control switch, not just a display flag:
+    // remove disabled peers from the live authorization map so inbound lease
+    // requests stop immediately. Reinsert the persisted credential on enable.
+    if let Some(state) = web_state.node_transport.as_ref() {
+        if let Some(credential) = credential {
+            state.trust_peer(node_id.clone(), credential).await;
+        } else if !payload.enabled {
+            state.peers.write().await.remove(&node_id);
+        }
+    }
+    Ok(Json(
+        json!({ "success": true, "node_id": node_id, "enabled": payload.enabled }),
+    ))
+}
+
+/// Remove a remote node, its credentials, endpoints and cached route data.
+pub async fn delete_node(
+    State(web_state): State<Arc<WebState>>,
+    Path(node_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let node_id = NodeId::new(node_id).map_err(ApiError::bad_request)?;
+    {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        if !store
+            .list_nodes()?
+            .iter()
+            .any(|node| node.node_id == node_id)
+        {
+            return Err(ApiError::not_found(format!("node {node_id} not found")));
+        }
+        store.delete_node(&node_id)?;
+    }
+    if let Some(state) = web_state.node_transport.as_ref() {
+        state.peers.write().await.remove(&node_id);
+    }
+    Ok(Json(json!({ "success": true, "node_id": node_id })))
+}
+
 /// Issue a one-time pairing code for another node to redeem.
 ///
 /// The plaintext code is returned **once, here**. Only its SHA-256 is stored,
@@ -118,7 +216,10 @@ pub async fn issue_pairing_code(
     State(web_state): State<Arc<WebState>>,
     Json(payload): Json<IssuePairingRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let label = payload.label.map(|l| l.trim().to_owned()).filter(|l| !l.is_empty());
+    let label = payload
+        .label
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty());
     let code = PairingCode::random();
     let expires_at_unix_ms =
         chrono::Utc::now().timestamp_millis() + PAIRING_CODE_TTL.as_millis() as i64;
@@ -216,8 +317,7 @@ pub async fn upsert_node(
     State(web_state): State<Arc<WebState>>,
     Json(payload): Json<UpsertNodeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let node_id = NodeId::new(payload.node_id)
-        .map_err(ApiError::bad_request)?;
+    let node_id = NodeId::new(payload.node_id).map_err(ApiError::bad_request)?;
     let display_name = payload.display_name.trim();
     if display_name.is_empty() {
         return Err(ApiError::bad_request("display_name must not be empty"));
@@ -274,9 +374,9 @@ pub async fn probe_node(
             return Err(ApiError::not_found(format!("node {node_id} not found")));
         }
         let local = store.local_identity()?;
-        let credential = store
-            .credential_for(&node_id)?
-            .ok_or_else(|| ApiError::conflict("node is not paired; no application credential is stored"))?;
+        let credential = store.credential_for(&node_id)?.ok_or_else(|| {
+            ApiError::conflict("node is not paired; no application credential is stored")
+        })?;
         let endpoints = store.endpoints(&node_id)?;
         (local, credential, endpoints)
     };
@@ -297,12 +397,12 @@ pub async fn probe_node(
 
     let bitrate = payload.bitrate_bps.unwrap_or(20_000_000);
     let policy = PathPolicy::default();
-    let selected_view = select_best_path(&paths, StreamClass::View, bitrate, policy)
-        .map(|p| p.id.clone());
-    let selected_preview = select_best_path(&paths, StreamClass::Preview, bitrate, policy)
-        .map(|p| p.id.clone());
-    let selected_record = select_best_path(&paths, StreamClass::Record, bitrate, policy)
-        .map(|p| p.id.clone());
+    let selected_view =
+        select_best_path(&paths, StreamClass::View, bitrate, policy).map(|p| p.id.clone());
+    let selected_preview =
+        select_best_path(&paths, StreamClass::Preview, bitrate, policy).map(|p| p.id.clone());
+    let selected_record =
+        select_best_path(&paths, StreamClass::Record, bitrate, policy).map(|p| p.id.clone());
 
     Ok(Json(json!({
         "success": true,

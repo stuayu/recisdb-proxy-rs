@@ -186,11 +186,14 @@ pub struct DatabaseSection {
 /// share a connection pool or failure domain with UI polling.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct NodeSection {
-    /// Serve the node-to-node transport. Off by default.
+    /// Legacy compatibility field. Node transport is always started now;
+    /// this value is accepted from old TOML files and deliberately ignored.
+    /// Keeping it deserializable makes upgrading an existing installation
+    /// safe without preserving the old ON/OFF behaviour.
     pub enabled: Option<bool>,
-    /// Address for the node transport listener (HTTP/2 prior knowledge).
-    /// **Cleartext h2c — bind it to a trusted overlay (Tailscale) or
-    /// loopback, never to a public interface.**
+    /// Legacy per-node listener override. Accepted so old TOML remains
+    /// readable, but ignored: the node listener follows `[server] listen`
+    /// using the next port.
     pub listen: Option<String>,
     /// Name shown to peers instead of the generated node id.
     pub display_name: Option<String>,
@@ -287,11 +290,10 @@ pub struct ResolvedConfig {
     pub mirakurun_home_regions: Vec<u8>,
     /// `[mirakurun] record_priority_threshold`, defaulted to `1`.
     pub mirakurun_record_priority_threshold: i32,
-    /// `[node] enabled` — serve the node-to-node transport listener.
-    pub node_enabled: bool,
-    /// `[node] listen`, parsed. `None` when the fabric is off or the value
-    /// could not be parsed (which warns rather than failing startup).
-    pub node_listen_addr: Option<SocketAddr>,
+    /// Node listener derived from the resolved BonDriver proxy listener:
+    /// same IP, port + 1. The transport is always available, even when no
+    /// peer has been paired yet.
+    pub node_listen_addr: SocketAddr,
     /// `[node] display_name`, applied to this node's stored identity.
     pub node_display_name: Option<String>,
     #[cfg(feature = "tls")]
@@ -301,7 +303,10 @@ pub struct ResolvedConfig {
 /// Resolves CLI args against the TOML file for everything except logging.
 /// Must be called after `logging::init_logging` (TLS resolution logs via
 /// `info!`/`error!`, matching the original `main.rs` behavior/ordering).
-pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box<dyn std::error::Error>> {
+pub fn load(
+    args: &Args,
+    file_config: &ConfigFile,
+) -> Result<ResolvedConfig, Box<dyn std::error::Error>> {
     let listen_addr = if let Some(addr_str) = &file_config.server.listen {
         addr_str.parse::<SocketAddr>().unwrap_or(args.listen)
     } else {
@@ -312,7 +317,10 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
     } else {
         args.web_listen
     };
-    let default_tuner = args.tuner.clone().or_else(|| file_config.server.tuner.clone());
+    let default_tuner = args
+        .tuner
+        .clone()
+        .or_else(|| file_config.server.tuner.clone());
     let max_connections = file_config
         .server
         .max_connections
@@ -331,7 +339,8 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
     let mirakurun_home_regions = match file_config.mirakurun.home_region.as_deref() {
         None => Vec::new(),
         Some(name) => {
-            let resolved = recisdb_protocol::broadcast_region::region_ids_from_prefecture_name(name);
+            let resolved =
+                recisdb_protocol::broadcast_region::region_ids_from_prefecture_name(name);
             if resolved.is_empty() {
                 warn!(
                     "[mirakurun] home_region = \"{}\" matches no prefecture; every terrestrial \
@@ -343,18 +352,16 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
         }
     };
 
-    let node_enabled = file_config.node.enabled.unwrap_or(false);
-    let node_listen_addr = match (node_enabled, file_config.node.listen.as_deref()) {
-        (false, _) => None,
-        (true, None) => Some(SocketAddr::from(([127, 0, 0, 1], 20773))),
-        (true, Some(addr)) => match addr.parse::<SocketAddr>() {
-            Ok(parsed) => Some(parsed),
-            Err(e) => {
-                warn!("[node] listen = \"{addr}\" is not a valid address ({e}); the node transport will not start");
-                None
-            }
-        },
-    };
+    // The node transport is always started. `enabled = false` and `listen`
+    // from older configs are intentionally ignored: an unpaired node only
+    // waits for pairing and does not offer any remote tuner until paired.
+    if file_config.node.enabled.is_some() {
+        warn!("[node] enabled is deprecated and ignored; node transport is always available");
+    }
+    if file_config.node.listen.is_some() {
+        warn!("[node] listen is deprecated and ignored; using server.listen port + 1");
+    }
+    let node_listen_addr = derive_node_listen_addr(listen_addr);
     let node_display_name = file_config
         .node
         .display_name
@@ -404,23 +411,19 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
             }
         }
     } else {
-        file_config
-            .tls
-            .enabled
-            .filter(|&e| e)
-            .and_then(|_| {
-                let ca = file_config.tls.ca_cert.clone()?;
-                let cert = file_config.tls.server_cert.clone()?;
-                let key = file_config.tls.server_key.clone()?;
-                let require_client_cert = file_config.tls.require_client_cert.unwrap_or(false);
-                info!("TLS enabled from config file");
-                Some(recisdb_proxy::server::TlsConfig {
-                    ca_cert_path: ca,
-                    server_cert_path: cert,
-                    server_key_path: key,
-                    require_client_cert,
-                })
+        file_config.tls.enabled.filter(|&e| e).and_then(|_| {
+            let ca = file_config.tls.ca_cert.clone()?;
+            let cert = file_config.tls.server_cert.clone()?;
+            let key = file_config.tls.server_key.clone()?;
+            let require_client_cert = file_config.tls.require_client_cert.unwrap_or(false);
+            info!("TLS enabled from config file");
+            Some(recisdb_proxy::server::TlsConfig {
+                ca_cert_path: ca,
+                server_cert_path: cert,
+                server_key_path: key,
+                require_client_cert,
             })
+        })
     };
 
     Ok(ResolvedConfig {
@@ -433,12 +436,29 @@ pub fn load(args: &Args, file_config: &ConfigFile) -> Result<ResolvedConfig, Box
         mirakurun_enabled,
         mirakurun_home_regions,
         mirakurun_record_priority_threshold,
-        node_enabled,
         node_listen_addr,
         node_display_name,
         #[cfg(feature = "tls")]
         tls_config,
     })
+}
+
+/// Derive the node transport address from the main BonDriver proxy listener.
+/// Keeping the same bind IP makes loopback/LAN/overlay deployments behave the
+/// same for both listeners, while the adjacent port avoids another setting.
+pub(crate) fn derive_node_listen_addr(server_listen_addr: SocketAddr) -> SocketAddr {
+    const FALLBACK_NODE_PORT: u16 = 20773;
+    let port = server_listen_addr
+        .port()
+        .checked_add(1)
+        .unwrap_or(FALLBACK_NODE_PORT);
+    if server_listen_addr.port() == u16::MAX {
+        warn!(
+            "server.listen uses port 65535; node transport cannot use port + 1, falling back to {}",
+            FALLBACK_NODE_PORT
+        );
+    }
+    SocketAddr::new(server_listen_addr.ip(), port)
 }
 
 #[cfg(test)]
@@ -513,5 +533,39 @@ mod tests {
     fn log_dir_falls_back_to_default_without_arg() {
         let args = default_args();
         assert_eq!(resolve_log_dir(&args), PathBuf::from("logs"));
+    }
+
+    #[test]
+    fn node_transport_is_on_and_follows_proxy_listener() {
+        let args = default_args();
+        let mut file_config = ConfigFile::default();
+        file_config.node.enabled = Some(false);
+
+        let resolved = load(&args, &file_config).expect("load should succeed");
+        assert_eq!(
+            resolved.node_listen_addr,
+            "0.0.0.0:40071".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn node_listener_port_overflow_uses_safe_fallback() {
+        assert_eq!(
+            derive_node_listen_addr("127.0.0.1:65535".parse().unwrap()),
+            "127.0.0.1:20773".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_node_listen_is_ignored() {
+        let args = default_args();
+        let mut file_config = ConfigFile::default();
+        file_config.node.listen = Some("127.0.0.1:9999".into());
+
+        let resolved = load(&args, &file_config).expect("load should succeed");
+        assert_eq!(
+            resolved.node_listen_addr,
+            "0.0.0.0:40071".parse::<SocketAddr>().unwrap()
+        );
     }
 }

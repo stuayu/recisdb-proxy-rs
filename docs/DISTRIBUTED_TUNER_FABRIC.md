@@ -90,8 +90,9 @@ RF/source quality and network path health are independent failure domains.
 ## 4. Node transport
 
 The dashboard/Mirakurun HTTP server and the inter-node transport do not share a
-listener or connection pool. Node transport has its own listener and is disabled
-until configured.
+listener or connection pool. Node transport has its own listener and starts
+automatically. A node with no paired peers only waits for pairing requests and
+does not offer a tuner remotely.
 
 Baseline transport is HTTP/2. It is used as framing/multiplex infrastructure,
 not as a REST design constraint and not through gRPC.
@@ -167,8 +168,14 @@ Rules that must not be relaxed:
 - On startup `NodeTransportState::reload_peers()` repopulates the in-memory
   credential map from `remote_nodes`, so pairings survive restarts.
 
-Configuration lives in `[node]` (`recisdb-proxy.toml.example`): `enabled`,
-`listen` (h2c — bind to a trusted overlay or loopback), `display_name`.
+The node listener is derived automatically from `[server] listen`: it uses the
+same IP and the next port (the standard `0.0.0.0:40070` becomes
+`0.0.0.0:40071`). If the proxy uses port 65535, the node listener uses the safe
+fallback port 20773. The old `[node] enabled` and `[node] listen` keys are
+accepted for configuration-file compatibility but ignored. Restrict the
+resulting h2c listener with a firewall or trusted overlay. The display name can
+be changed at runtime from the dashboard's 「分散ノード」 screen, so a new
+installation needs no TOML editing.
 
 ### 4.2 Leases (`POST /node/v3/lease`)
 
@@ -508,8 +515,9 @@ each commit.
 Done:
 
 - Node domain types, store schema, path scoring, qualification, replay/framing.
-- Node transport listener (`[node]` in the config file), wired into `main.rs`
-  and served on its own port.
+- Node transport listener (always-on, derived from `[server] listen` port + 1),
+  wired into `main.rs` and served on its own port. A bind failure is logged while
+  the dashboard and local proxy continue running.
 - One-time pairing (§4.1), dashboard API and the 分散ノード dashboard tab,
   including issuing/redeeming codes and per-class path probes.
 - Central arbitration correctness the fabric depends on: a single canonical

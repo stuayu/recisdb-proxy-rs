@@ -116,6 +116,8 @@ const pairRedeemForm = ref({ base_url: '', code: '' })
 // there is no endpoint that can hand it back.
 const issuedCode = ref<IssuedPairing | null>(null)
 const pairing = ref(false)
+const savingLocal = ref(false)
+const localDisplayName = ref('')
 const endpointKinds: Array<{ value: EndpointKind; label: string }> = [
   { value: 'lan', label: 'LAN' },
   { value: 'tailscale', label: 'Tailscale' },
@@ -139,16 +141,55 @@ function pathLabel(path: ProbePath) {
   return `${path.endpoint.kind}${via}`
 }
 
+function nodeListenUrl(address: string | null) {
+  if (!address) return null
+  try {
+    const parsed = new URL(address.includes('://') ? address : `http://${address}`)
+    const parsedHost = parsed.hostname.replace(/^\[|\]$/g, '')
+    const host = parsedHost === '0.0.0.0' || parsedHost === '::'
+      ? window.location.hostname.replace(/^\[|\]$/g, '')
+      : parsedHost
+    const displayHost = host.includes(':') ? `[${host}]` : host
+    return `${parsed.protocol}//${displayHost}:${parsed.port}`
+  } catch {
+    return address
+  }
+}
+
 async function load() {
   loading.value = true
   try {
     data.value = await api<NodesResponse>('/nodes')
+    localDisplayName.value = data.value.local.display_name
     error.value = ''
     if (!groupForm.value.node_id && nodes.value[0]) groupForm.value.node_id = nodes.value[0].node.node_id
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
     loading.value = false
+  }
+}
+
+async function saveLocalNode() {
+  const displayName = localDisplayName.value.trim()
+  if (!displayName) {
+    error.value = '表示名を入力してください。'
+    return
+  }
+  savingLocal.value = true
+  try {
+    const result = await api<{ local: { node_id: string; display_name: string } }>('/nodes/local', {
+      method: 'POST',
+      body: JSON.stringify({ display_name: displayName }),
+    })
+    if (data.value) data.value.local = result.local
+    localDisplayName.value = result.local.display_name
+    message.value = 'このノードの表示名を更新しました。'
+    error.value = ''
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    savingLocal.value = false
   }
 }
 
@@ -225,6 +266,32 @@ async function probe(entry: NodeEntry) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
     probing.value = null
+  }
+}
+
+async function setNodeEnabled(entry: NodeEntry, enabled: boolean) {
+  try {
+    await api(`/nodes/${encodeURIComponent(entry.node.node_id)}/state`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+    message.value = enabled ? `${entry.node.display_name} を有効化しました。` : `${entry.node.display_name} を停止しました。`
+    error.value = ''
+    await load()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  }
+}
+
+async function removeNode(entry: NodeEntry) {
+  if (!window.confirm(`${entry.node.display_name} を削除しますか？`)) return
+  try {
+    await api(`/nodes/${encodeURIComponent(entry.node.node_id)}`, { method: 'DELETE' })
+    message.value = `${entry.node.display_name} を削除しました。`
+    error.value = ''
+    await load()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
 
@@ -309,7 +376,10 @@ onMounted(load)
 
     <div v-if="data" class="local-node-card">
       <strong>このノード</strong>
-      <span v-text="data.local.display_name" />
+      <label class="local-name">表示名<input v-model="localDisplayName" autocomplete="off" /></label>
+      <button class="button secondary" :disabled="savingLocal" @click="saveLocalNode">
+        {{ savingLocal ? '保存中…' : '表示名を保存' }}
+      </button>
       <code v-text="data.local.node_id" />
     </div>
 
@@ -331,7 +401,7 @@ onMounted(load)
           <code class="pairing-code-value" v-text="issuedCode.code" />
           <span class="muted">
             有効期限 {{ Math.round(issuedCode.ttl_secs / 60) }} 分・1回限り<template v-if="issuedCode.node_listen_addr">
-            / 相手が入力するURL: <code v-text="issuedCode.node_listen_addr" /></template>
+            / 相手が入力するURL: <code v-text="nodeListenUrl(issuedCode.node_listen_addr)" /></template>
           </span>
         </div>
         <ul v-if="data?.pending_pairings?.length" class="pending-list">
@@ -402,6 +472,7 @@ onMounted(load)
           </div>
           <div class="actions compact">
             <span :class="['status-pill', entry.paired ? 'ok' : 'warn']">{{ entry.paired ? 'ペア済み' : '未ペア' }}</span>
+            <span :class="['status-pill', entry.node.enabled ? 'ok' : 'warn']">{{ entry.node.enabled ? '有効' : '停止' }}</span>
             <span :class="['status-pill', entry.routable_routes > 0 ? 'ok' : 'warn']">
               受信可 {{ entry.routable_routes }}/{{ entry.total_routes }}
             </span>
@@ -409,6 +480,10 @@ onMounted(load)
             <button class="button" :disabled="probing === entry.node.node_id || !entry.paired" @click="probe(entry)">
               {{ probing === entry.node.node_id ? 'テスト中…' : '通信テスト' }}
             </button>
+            <button class="button secondary" @click="setNodeEnabled(entry, !entry.node.enabled)">
+              {{ entry.node.enabled ? '停止' : '有効化' }}
+            </button>
+            <button class="button secondary" @click="removeNode(entry)">削除</button>
           </div>
         </div>
 
@@ -445,6 +520,8 @@ onMounted(load)
 .view-heading p, .muted { color: var(--text-muted, #6b7280); }
 .local-node-card, .node-panel, .node-card { border: 1px solid var(--border, #d9dee7); border-radius: 12px; padding: 1rem; background: var(--surface, rgba(255,255,255,.04)); }
 .local-node-card { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+.local-name { display: inline-flex; gap: .4rem; align-items: center; font-weight: 600; }
+.local-name input { min-width: 10rem; box-sizing: border-box; padding: .5rem .6rem; border: 1px solid var(--border, #cbd5e1); border-radius: 8px; background: inherit; color: inherit; }
 .node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
 .node-panel { display: grid; gap: .75rem; align-content: start; }
 .node-panel label { display: grid; gap: .35rem; font-weight: 600; }
@@ -471,5 +548,5 @@ onMounted(load)
 .chips { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .4rem; }
 .chip { background: rgba(59,130,246,.14); }
 code { font-size: .86em; }
-@media (max-width: 720px) { .node-card-head { align-items: flex-start; } .actions.compact { justify-content: flex-start; } }
+@media (max-width: 720px) { .node-card-head { align-items: flex-start; } .actions.compact { justify-content: flex-start; } .local-name { width: 100%; } .local-name input { min-width: 0; flex: 1; } }
 </style>

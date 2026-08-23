@@ -30,7 +30,9 @@ use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCo
 use super::lease::{RemoteLeaseId, RemoteLeaseManager};
 use super::serve::{LocalMuxServer, ServeError};
 use super::store::{NodeStore, StoredNode};
-use super::types::{LogicalMuxId, NodeEndpoint, NodeId, ReceptionRouteAdvertisement, RequestContext};
+use super::types::{
+    LogicalMuxId, NodeEndpoint, NodeId, ReceptionRouteAdvertisement, RequestContext,
+};
 use crate::server::listener::DatabaseHandle;
 
 pub const NODE_PROTOCOL_VERSION: u16 = 3;
@@ -157,7 +159,10 @@ struct PairingAttempts {
 
 impl Default for PairingAttempts {
     fn default() -> Self {
-        Self { window_started: std::time::Instant::now(), failures: 0 }
+        Self {
+            window_started: std::time::Instant::now(),
+            failures: 0,
+        }
     }
 }
 
@@ -192,6 +197,9 @@ impl PairingAttempts {
 #[derive(Clone)]
 pub struct NodeTransportState {
     pub identity: NodeIdentity,
+    /// Mutable display name. The node id is immutable for the lifetime of a
+    /// process, while the dashboard may rename a node without restarting it.
+    pub display_name: Arc<RwLock<String>>,
     pub capabilities: NodeCapabilities,
     pub endpoints: Arc<RwLock<Vec<NodeEndpoint>>>,
     pub routes: Arc<RwLock<Vec<ReceptionRouteAdvertisement>>>,
@@ -211,6 +219,7 @@ pub struct NodeTransportState {
 impl NodeTransportState {
     pub fn new(identity: NodeIdentity, leases: Arc<RemoteLeaseManager>) -> Self {
         Self {
+            display_name: Arc::new(RwLock::new(identity.display_name.clone())),
             identity,
             capabilities: NodeCapabilities::default(),
             endpoints: Arc::new(RwLock::new(Vec::new())),
@@ -221,6 +230,19 @@ impl NodeTransportState {
             database: None,
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttempts::default())),
         }
+    }
+
+    /// Return the current identity advertised to peers.
+    pub async fn current_identity(&self) -> NodeIdentity {
+        NodeIdentity {
+            node_id: self.identity.node_id.clone(),
+            display_name: self.display_name.read().await.clone(),
+        }
+    }
+
+    /// Update the display name advertised by this process immediately.
+    pub async fn set_display_name(&self, display_name: String) {
+        *self.display_name.write().await = display_name;
     }
 
     /// Attach the database so this node can accept pairing requests.
@@ -246,6 +268,9 @@ impl NodeTransportState {
             let store = NodeStore::new(&db)?;
             let mut pairs = Vec::new();
             for node in store.list_nodes()? {
+                if !node.enabled {
+                    continue;
+                }
                 if let Some(credential) = store.credential_for(&node.node_id)? {
                     pairs.push((node.node_id, credential));
                 }
@@ -304,7 +329,10 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
 /// encrypted overlays only; InternetDirect endpoints must use a TLS wrapper.
 pub async fn serve_h2c(addr: SocketAddr, state: Arc<NodeTransportState>) -> io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)", addr);
+    log::info!(
+        "Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)",
+        addr
+    );
     axum::serve(listener, router(state)).await
 }
 
@@ -319,7 +347,11 @@ async fn pair(
     Json(payload): Json<PairingRequest>,
 ) -> Response {
     let Some(database) = state.database.clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "pairing is not configured on this node").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pairing is not configured on this node",
+        )
+            .into_response();
     };
     if state.pairing_attempts.lock().unwrap().blocked() {
         // Never say whether the code was wrong or the limiter tripped.
@@ -383,12 +415,18 @@ async fn pair(
     }
 
     state.pairing_attempts.lock().unwrap().record_success();
-    state.trust_peer(peer.node_id.clone(), credential.clone()).await;
+    state
+        .trust_peer(peer.node_id.clone(), credential.clone())
+        .await;
     // The credential itself is never logged.
-    log::info!("Node pairing accepted: {} ({})", peer.node_id, peer.display_name);
+    log::info!(
+        "Node pairing accepted: {} ({})",
+        peer.node_id,
+        peer.display_name
+    );
 
     Json(PairingAcceptance {
-        identity: state.identity.clone(),
+        identity: state.current_identity().await,
         credential,
     })
     .into_response()
@@ -399,7 +437,7 @@ async fn hello(State(state): State<Arc<NodeTransportState>>, headers: HeaderMap)
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(NodeHello {
-        identity: state.identity.clone(),
+        identity: state.current_identity().await,
         capabilities: state.capabilities.clone(),
         endpoints: state.endpoints.read().await.clone(),
     })
@@ -438,9 +476,10 @@ async fn probe_download(
     }
     let len = query.bytes.min(MAX_ACTIVE_PROBE_BYTES);
     let mut response = Response::new(Body::from(vec![0xA5; len]));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/octet-stream"));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
     response
 }
 
@@ -486,9 +525,7 @@ async fn open_lease(
             log::warn!("[node] lease request from {peer} rejected: {e}");
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
-        Err(e @ ServeError::NoRoute(_)) => {
-            (StatusCode::NOT_FOUND, e.to_string()).into_response()
-        }
+        Err(e @ ServeError::NoRoute(_)) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
         Err(e @ ServeError::Unavailable(_)) => {
             log::info!("[node] lease request from {peer} could not be served: {e}");
             (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
@@ -512,7 +549,15 @@ async fn renew_lease(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let ok = state.leases.renew(&id).await;
-    (if ok { StatusCode::OK } else { StatusCode::NOT_FOUND }, Json(LeaseReply { ok })).into_response()
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        },
+        Json(LeaseReply { ok }),
+    )
+        .into_response()
 }
 
 async fn release_lease(
@@ -527,7 +572,15 @@ async fn release_lease(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let ok = state.leases.release(&id).await.is_some();
-    (if ok { StatusCode::OK } else { StatusCode::NOT_FOUND }, Json(LeaseReply { ok })).into_response()
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        },
+        Json(LeaseReply { ok }),
+    )
+        .into_response()
 }
 
 async fn stream_lease(
@@ -592,11 +645,15 @@ async fn stream_lease(
             loop {
                 match state.rx.recv().await {
                     Ok(mut frame) => {
-                        if state.last_sequence.is_some_and(|last| frame.sequence <= last) {
+                        if state
+                            .last_sequence
+                            .is_some_and(|last| frame.sequence <= last)
+                        {
                             continue;
                         }
                         if state.discontinuity_pending {
-                            frame.flags = FrameFlags::new(frame.flags.bits() | FrameFlags::DISCONTINUITY);
+                            frame.flags =
+                                FrameFlags::new(frame.flags.bits() | FrameFlags::DISCONTINUITY);
                             state.discontinuity_pending = false;
                         }
                         state.last_sequence = Some(frame.sequence);
@@ -784,11 +841,7 @@ impl NodeTransportClient {
         generation: Option<u32>,
         from_seq: Option<u64>,
     ) -> Result<reqwest::Response, LeaseStreamError> {
-        let mut url = format!(
-            "{}/node/v3/stream/{}",
-            base.trim_end_matches('/'),
-            lease_id
-        );
+        let mut url = format!("{}/node/v3/stream/{}", base.trim_end_matches('/'), lease_id);
         if let Some(from_seq) = from_seq {
             url.push_str(&format!("?from_seq={from_seq}"));
             if let Some(generation) = generation {
@@ -812,21 +865,30 @@ impl NodeTransportClient {
     }
 
     pub async fn hello(&self, base: &str) -> Result<NodeHello, reqwest::Error> {
-        self.request(reqwest::Method::GET, format!("{}/node/v3/hello", base.trim_end_matches('/')))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
+        self.request(
+            reqwest::Method::GET,
+            format!("{}/node/v3/hello", base.trim_end_matches('/')),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
     }
 
-    pub async fn routes(&self, base: &str) -> Result<Vec<ReceptionRouteAdvertisement>, reqwest::Error> {
-        self.request(reqwest::Method::GET, format!("{}/node/v3/routes", base.trim_end_matches('/')))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
+    pub async fn routes(
+        &self,
+        base: &str,
+    ) -> Result<Vec<ReceptionRouteAdvertisement>, reqwest::Error> {
+        self.request(
+            reqwest::Method::GET,
+            format!("{}/node/v3/routes", base.trim_end_matches('/')),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
     }
 
     pub async fn ping(&self, base: &str, nonce: &str) -> Result<ProbeReply, reqwest::Error> {
@@ -843,7 +905,11 @@ impl NodeTransportClient {
             .await
     }
 
-    pub async fn probe_download(&self, base: &str, bytes: usize) -> Result<(usize, std::time::Duration), reqwest::Error> {
+    pub async fn probe_download(
+        &self,
+        base: &str,
+        bytes: usize,
+    ) -> Result<(usize, std::time::Duration), reqwest::Error> {
         let bytes = bytes.min(MAX_ACTIVE_PROBE_BYTES);
         let url = format!(
             "{}/node/v3/probe/download?bytes={bytes}",
@@ -877,12 +943,20 @@ mod tests {
             Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
         ));
         let peer = NodeId::new("fukushima").unwrap();
-        state.trust_peer(peer.clone(), NodeCredential::random()).await;
+        state
+            .trust_peer(peer.clone(), NodeCredential::random())
+            .await;
 
         let mut headers = HeaderMap::new();
         headers.insert("x-recisdb-node-id", peer.as_str().parse().unwrap());
-        headers.insert(header::AUTHORIZATION, "Bearer definitely-wrong".parse().unwrap());
-        assert_eq!(state.authorize(&headers).await, Err(StatusCode::UNAUTHORIZED));
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer definitely-wrong".parse().unwrap(),
+        );
+        assert_eq!(
+            state.authorize(&headers).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
     }
 
     fn test_state_with_db() -> (Arc<NodeTransportState>, DatabaseHandle) {
@@ -932,7 +1006,11 @@ mod tests {
             let db = database.lock().await;
             NodeStore::new(&db)
                 .unwrap()
-                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .create_pending_pairing(
+                    &code,
+                    None,
+                    chrono::Utc::now().timestamp_millis() + 600_000,
+                )
                 .unwrap();
         }
 
@@ -970,14 +1048,24 @@ mod tests {
         for _ in 0..PAIRING_ATTEMPT_LIMIT {
             let guess = PairingCode::random();
             assert_eq!(
-                pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+                pair(
+                    State(Arc::clone(&state)),
+                    Json(peer_request(guess.as_str()))
+                )
+                .await
+                .status(),
                 StatusCode::UNAUTHORIZED
             );
         }
 
         let guess = PairingCode::random();
         assert_eq!(
-            pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+            pair(
+                State(Arc::clone(&state)),
+                Json(peer_request(guess.as_str()))
+            )
+            .await
+            .status(),
             StatusCode::TOO_MANY_REQUESTS,
             "a scanner must be cut off, not merely told 'wrong' forever"
         );
@@ -991,12 +1079,16 @@ mod tests {
 
         for _ in 0..PAIRING_ATTEMPT_LIMIT {
             assert_eq!(
-                pair(State(Arc::clone(&state)), Json(peer_request("not-a-code"))).await.status(),
+                pair(State(Arc::clone(&state)), Json(peer_request("not-a-code")))
+                    .await
+                    .status(),
                 StatusCode::UNAUTHORIZED
             );
         }
         assert_eq!(
-            pair(State(Arc::clone(&state)), Json(peer_request("not-a-code"))).await.status(),
+            pair(State(Arc::clone(&state)), Json(peer_request("not-a-code")))
+                .await
+                .status(),
             StatusCode::TOO_MANY_REQUESTS
         );
     }
@@ -1010,7 +1102,11 @@ mod tests {
 
         for _ in 0..(PAIRING_ATTEMPT_LIMIT - 1) {
             let guess = PairingCode::random();
-            let _ = pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await;
+            let _ = pair(
+                State(Arc::clone(&state)),
+                Json(peer_request(guess.as_str())),
+            )
+            .await;
         }
 
         let code = PairingCode::random();
@@ -1018,18 +1114,29 @@ mod tests {
             let db = database.lock().await;
             NodeStore::new(&db)
                 .unwrap()
-                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .create_pending_pairing(
+                    &code,
+                    None,
+                    chrono::Utc::now().timestamp_millis() + 600_000,
+                )
                 .unwrap();
         }
         assert_eq!(
-            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await.status(),
+            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str())))
+                .await
+                .status(),
             StatusCode::OK
         );
 
         // The budget is back: the next wrong code is a plain 401, not a 429.
         let guess = PairingCode::random();
         assert_eq!(
-            pair(State(Arc::clone(&state)), Json(peer_request(guess.as_str()))).await.status(),
+            pair(
+                State(Arc::clone(&state)),
+                Json(peer_request(guess.as_str()))
+            )
+            .await
+            .status(),
             StatusCode::UNAUTHORIZED
         );
     }
@@ -1042,18 +1149,27 @@ mod tests {
             let db = database.lock().await;
             NodeStore::new(&db)
                 .unwrap()
-                .create_pending_pairing(&code, None, chrono::Utc::now().timestamp_millis() + 600_000)
+                .create_pending_pairing(
+                    &code,
+                    None,
+                    chrono::Utc::now().timestamp_millis() + 600_000,
+                )
                 .unwrap();
         }
         assert_eq!(
-            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await.status(),
+            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str())))
+                .await
+                .status(),
             StatusCode::OK
         );
 
         // A "restarted" node sharing the same database.
         let restarted = Arc::new(
-            NodeTransportState::new(state.identity.clone(), Arc::new(RemoteLeaseManager::new(LeasePolicy::default())))
-                .with_database(database.clone()),
+            NodeTransportState::new(
+                state.identity.clone(),
+                Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
+            )
+            .with_database(database.clone()),
         );
         assert_eq!(restarted.reload_peers().await.unwrap(), 1);
 
@@ -1066,6 +1182,44 @@ mod tests {
             format!("Bearer {}", credential.expose()).parse().unwrap(),
         );
         assert_eq!(restarted.authorize(&headers).await, Ok(peer));
+    }
+
+    #[tokio::test]
+    async fn reload_peers_does_not_restore_disabled_nodes() {
+        let (state, database) = test_state_with_db();
+        let code = PairingCode::random();
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .create_pending_pairing(
+                    &code,
+                    None,
+                    chrono::Utc::now().timestamp_millis() + 600_000,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            pair(State(Arc::clone(&state)), Json(peer_request(code.as_str())))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db).unwrap();
+            store
+                .set_node_enabled(&NodeId::new("tokyo").unwrap(), false)
+                .unwrap();
+        }
+        let restarted = Arc::new(
+            NodeTransportState::new(
+                state.identity.clone(),
+                Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
+            )
+            .with_database(database),
+        );
+        assert_eq!(restarted.reload_peers().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1083,6 +1237,12 @@ mod tests {
             )
             .await;
         assert_eq!(lease.stream_class, StreamClass::Record);
-        assert!(lease.replay.lock().await.replay_from(1, 0).unwrap().is_empty());
+        assert!(lease
+            .replay
+            .lock()
+            .await
+            .replay_from(1, 0)
+            .unwrap()
+            .is_empty());
     }
 }

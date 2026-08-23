@@ -12,11 +12,11 @@ pub mod state;
 pub mod stream;
 
 use axum::{
-    Router,
     extract::{ConnectInfo, Request},
     middleware::Next,
     response::Response,
     routing::{delete, get, post},
+    Router,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -46,12 +46,18 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Distributed-node configuration and active path tests. These are
         // dashboard operations and therefore inherit the normal /api auth.
         .route("/nodes", get(api::get_nodes).post(api::upsert_node))
+        .route("/nodes/local", post(api::update_local_node))
+        .route("/nodes/:id/state", post(api::update_node_state))
+        .route("/nodes/:id", delete(api::delete_node))
         .route("/nodes/:id/probe", post(api::probe_node))
         // Pairing. Issuing returns the plaintext code exactly once; redeeming
         // talks to the *other* node's transport listener.
         .route("/nodes/pairing", post(api::issue_pairing_code))
         .route("/nodes/pairing/redeem", post(api::redeem_pairing_code))
-        .route("/node-route-groups/member", post(api::set_route_group_member))
+        .route(
+            "/node-route-groups/member",
+            post(api::set_route_group_member),
+        )
         // Update notification / self-update API (web/api/update.rs)
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))
@@ -59,8 +65,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Development builds from CI artifacts (web/api/update.rs)
         .route("/update/dev-builds", get(api::dev_builds))
         .route("/update/dev-build", post(api::apply_dev_build))
-        .route("/update/github-token", get(api::get_github_token_status).post(api::set_github_token))
-
+        .route(
+            "/update/github-token",
+            get(api::get_github_token_status).post(api::set_github_token),
+        )
         // OSサービス連携 (service/mod.rs)。登録/削除は権限昇格の経路に
         // なるため Web からは行わない (CLI とセットアップGUIのみ)。
         .route("/service/status", get(api::get_service_status))
@@ -78,7 +86,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/stats", get(api::get_stats))
         .route("/events", get(api::dashboard_events))
         .route("/client/:id/quality", get(api::get_client_quality))
-        .route("/client/:id/metrics-history", get(api::get_client_metrics_history))
+        .route(
+            "/client/:id/metrics-history",
+            get(api::get_client_metrics_history),
+        )
         .route("/client/:id/disconnect", post(api::disconnect_client))
         .route("/client/:id/controls", post(api::override_client_controls))
         .route("/session-history", get(api::get_session_history))
@@ -139,7 +150,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // `build_app`'s `route_layer(...require_auth)`) — §6.5.
         .route("/stream/service/:sid", get(stream::stream_service))
         // Same stream, keyed by the real broadcast service_id (dashboard UI).
-        .route("/stream/service/by-sid/:sid", get(stream::stream_service_by_sid))
+        .route(
+            "/stream/service/by-sid/:sid",
+            get(stream::stream_service_by_sid),
+        )
 }
 
 /// Build the `/mirakurun/api/*` router (STREAMING_DESIGN.md §7.1, P6).
@@ -162,10 +176,19 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
         .route("/programs", get(mirakurun::get_programs))
         .route("/tuners", get(mirakurun::get_tuners))
         .route("/config/server", get(mirakurun::get_server_config))
-        .route("/services/:id/stream", get(mirakurun::stream_service_by_mirakurun_id))
+        .route(
+            "/services/:id/stream",
+            get(mirakurun::stream_service_by_mirakurun_id),
+        )
         .route("/services/:id/logo", get(mirakurun::get_logo))
-        .route("/channels/:type/:channel/stream", get(mirakurun::stream_channel_by_type))
-        .route("/programs/:id/stream", get(mirakurun::stream_program_by_mirakurun_id))
+        .route(
+            "/channels/:type/:channel/stream",
+            get(mirakurun::stream_channel_by_type),
+        )
+        .route(
+            "/programs/:id/stream",
+            get(mirakurun::stream_program_by_mirakurun_id),
+        )
         // Incremental EPG update stream — see `mirakurun_events.rs` module
         // doc comment for the wire format EPGStation requires.
         .route("/events/stream", get(mirakurun_events::stream_events))
@@ -268,8 +291,10 @@ fn is_dashboard_poll(method: &axum::http::Method, path_and_query: &str) -> bool 
 ///   (and is never accidentally covered by the auth `route_layer` bound to)
 ///   `/api/*` — see `build_mirakurun_router` and `web/mirakurun.rs`.
 fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
-    let api_router = build_api_router()
-        .route_layer(axum::middleware::from_fn_with_state(web_state.clone(), auth::require_auth));
+    let api_router = build_api_router().route_layer(axum::middleware::from_fn_with_state(
+        web_state.clone(),
+        auth::require_auth,
+    ));
 
     let mut router = Router::new()
         .nest("/api", api_router)
@@ -359,9 +384,12 @@ pub async fn start_web_server(
 
     // `with_connect_info` makes the client's SocketAddr available to the
     // access-log middleware (see `access_log`) via `ConnectInfo`.
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(web_shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(web_shutdown_signal())
+    .await?;
 
     Ok(())
 }
@@ -419,7 +447,10 @@ mod tests {
     /// (`enabled` / `preprocessor_arguments` / `read_timeout_ms`) apply.
     #[tokio::test]
     async fn preview_config_api_ignores_executable_paths() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         {
             // Paths arrive via the TOML-only setters (main.rs `[preview]`).
             let db = state.database.lock().await;
@@ -451,15 +482,28 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         let res = app
-            .oneshot(Request::builder().uri("/api/preview-config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/preview-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let cfg = &json["config"];
-        assert_eq!(cfg["command_path"], "C:/toml/enc.exe", "TOML-only path must be untouched");
-        assert_eq!(cfg["preprocessor_path"], "C:/toml/pre.exe", "TOML-only path must be untouched");
+        assert_eq!(
+            cfg["command_path"], "C:/toml/enc.exe",
+            "TOML-only path must be untouched"
+        );
+        assert_eq!(
+            cfg["preprocessor_path"], "C:/toml/pre.exe",
+            "TOML-only path must be untouched"
+        );
         assert_eq!(cfg["enabled"], true);
         assert_eq!(cfg["preprocessor_arguments"], "-x 18 -n {SID} -");
         assert_eq!(cfg["read_timeout_ms"], 5000);
@@ -467,11 +511,19 @@ mod tests {
 
     #[tokio::test]
     async fn api_request_without_token_is_rejected() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
-            .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -480,7 +532,10 @@ mod tests {
 
     #[tokio::test]
     async fn api_request_with_wrong_token_is_rejected() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
@@ -499,7 +554,10 @@ mod tests {
 
     #[tokio::test]
     async fn api_request_with_correct_token_is_accepted() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
@@ -521,7 +579,10 @@ mod tests {
     /// with client-facing indices and physical mappings.
     #[tokio::test]
     async fn client_view_reports_what_a_client_will_enumerate() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         {
             let db = state.database.lock().await;
             let d1 = db
@@ -553,20 +614,30 @@ mod tests {
             };
             // Same logical channel (NID+TSID) on both drivers with different
             // physical bon_channel values, plus one BS channel on driver A.
-            db.insert_channel(d1, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 27)).unwrap();
-            db.insert_channel(d2, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 5)).unwrap();
-            db.insert_channel(d1, &mk(4, 101, 0x4010, "BS朝日", 1, 0)).unwrap();
+            db.insert_channel(d1, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 27))
+                .unwrap();
+            db.insert_channel(d2, &mk(0x7FE8, 1024, 0x7FE8, "NHK総合", 0, 5))
+                .unwrap();
+            db.insert_channel(d1, &mk(4, 101, 0x4010, "BS朝日", 1, 0))
+                .unwrap();
         }
         let app = build_app(state, false);
 
         // Targets: the group comes first (recommended), then the drivers.
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/client-view/targets").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view/targets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true);
         let targets = json["targets"].as_array().unwrap();
@@ -575,18 +646,27 @@ mod tests {
         // Distinct (NID, TSID) across the group — the shared NHK channel on
         // both drivers counts once, matching what STEP 3 enumerates.
         assert_eq!(targets[0]["enabled_channels"], 2);
-        assert!(targets.iter().any(|t| t["type"] == "driver" && t["name"] == "BonDriver_A.dll"));
+        assert!(targets
+            .iter()
+            .any(|t| t["type"] == "driver" && t["name"] == "BonDriver_A.dll"));
 
         // Client view for the group: terrestrial space first, then BS, with
         // 0-based client-facing indices and both physical mappings for the
         // shared logical channel.
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/client-view?tuner=PX").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view?tuner=PX")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true, "body: {json}");
         assert_eq!(json["resolved_type"], "group");
@@ -612,19 +692,32 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true);
-        assert_eq!(json["spaces"].as_array().unwrap().len(), 1, "driver B has no BS channel");
+        assert_eq!(
+            json["spaces"].as_array().unwrap().len(),
+            1,
+            "driver B has no BS channel"
+        );
 
         // Unknown tuner names are an explicit error, never someone else's
         // channel list.
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/client-view?tuner=nope").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-view?tuner=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], false);
 
@@ -648,12 +741,20 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(disposition.contains("BonDriver_NetworkProxy.ch2"), "{disposition}");
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            disposition.contains("BonDriver_NetworkProxy.ch2"),
+            "{disposition}"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(&body);
         assert!(decoded.contains(";#SPACE(0,地デジ （関東）)"), "{decoded}");
         // NHK on terrestrial space 0 channel 0, enabled.
-        assert!(decoded.contains("NHK総合,0,0,0,,1024,32744,32744,1"), "{decoded}");
+        assert!(
+            decoded.contains("NHK総合,0,0,0,,1024,32744,32744,1"),
+            "{decoded}"
+        );
         // BS asahi in space 1.
         assert!(decoded.contains(";#SPACE(1,BS)"), "{decoded}");
 
@@ -671,7 +772,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body.to_vec())).unwrap();
         let names: Vec<String> = (0..zip.len())
             .map(|i| zip.by_index(i).unwrap().name().to_string())
@@ -683,11 +786,17 @@ mod tests {
             "ChSet5.txt",
             "README.txt",
         ] {
-            assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected} in {names:?}"
+            );
         }
         let mut ini = String::new();
-        std::io::Read::read_to_string(&mut zip.by_name("BonDriver_NetworkProxy.ini").unwrap(), &mut ini)
-            .unwrap();
+        std::io::Read::read_to_string(
+            &mut zip.by_name("BonDriver_NetworkProxy.ini").unwrap(),
+            &mut ini,
+        )
+        .unwrap();
         assert!(ini.contains("Tuner = PX"), "{ini}");
         // Host header host + default proxy port (proxy_listen_addr is None in tests).
         assert!(ini.contains("Address = 192.168.10.20:40070"), "{ini}");
@@ -707,11 +816,19 @@ mod tests {
 
     #[tokio::test]
     async fn auth_disabled_bypasses_token_check() {
-        let state = test_web_state(AuthConfig { enabled: false, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
-            .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -720,17 +837,27 @@ mod tests {
 
     #[tokio::test]
     async fn stats_reports_process_uptime() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         let started_at = state.started_at;
         let app = build_app(state, false);
 
         let res = app
-            .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let uptime = json["stats"]["uptime_seconds"].as_u64().unwrap();
         assert!(uptime <= started_at.elapsed().as_secs());
@@ -740,7 +867,10 @@ mod tests {
     async fn stream_endpoint_requires_auth_like_every_other_api_route() {
         // STREAMING_DESIGN.md §6.5: the streaming endpoint must sit behind
         // the exact same auth gate as the rest of `/api/*`.
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
@@ -758,7 +888,10 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_root_is_reachable_without_token() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
@@ -771,13 +904,21 @@ mod tests {
 
     #[tokio::test]
     async fn version_api_requires_auth_and_reports_crate_version() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         // Same auth gate as every other `/api/*` route.
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/version").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -793,7 +934,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["version"], crate::VERSION);
     }
@@ -803,7 +946,10 @@ mod tests {
         // STREAMING_DESIGN.md §7.1 (P6): opt-in, default disabled — the
         // whole `/mirakurun/api/*` prefix must be unreachable (404, not
         // "reachable but empty") when the router was never nested in.
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
@@ -824,7 +970,10 @@ mod tests {
         // Auth is enabled for `/api/*` here specifically to prove this test
         // isn't just exercising a globally-disabled auth config — the
         // `/mirakurun/api/*` router must bypass auth on its own.
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, true);
 
         let res = app
@@ -839,17 +988,30 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("current").is_some(), "expected a `current` field: {:?}", json);
+        assert!(
+            json.get("current").is_some(),
+            "expected a `current` field: {:?}",
+            json
+        );
     }
 
     #[tokio::test]
     async fn mirakurun_services_and_channels_are_reachable_without_auth_when_enabled() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, true);
 
-        for path in ["/mirakurun/api/services", "/mirakurun/api/channels", "/mirakurun/api/status"] {
+        for path in [
+            "/mirakurun/api/services",
+            "/mirakurun/api/channels",
+            "/mirakurun/api/status",
+        ] {
             let res = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -869,7 +1031,10 @@ mod tests {
     /// a real client's resolved request actually lands somewhere.
     #[tokio::test]
     async fn mirakurun_docs_tuners_and_config_server_are_reachable_without_auth_when_enabled() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, true);
 
         for path in ["/mirakurun/api/tuners", "/mirakurun/api/config/server"] {
@@ -883,13 +1048,29 @@ mod tests {
 
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/mirakurun/api/docs").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/mirakurun/api/docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let content_type = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
-        assert!(content_type.starts_with("application/json"), "{content_type}");
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let docs: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let stream_path = &docs["paths"]["/services/{id}/stream"];
         assert_eq!(stream_path["get"]["operationId"], "getServiceStream");
@@ -905,12 +1086,30 @@ mod tests {
         // stream) is both correct and sufficient.
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/mirakurun/api/events/stream").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/mirakurun/api/events/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "GET /events/stream should be 200");
-        let content_type = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
-        assert!(content_type.starts_with("application/json"), "{content_type}");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "GET /events/stream should be 200"
+        );
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
 
         // `/programs/:id/stream` is now implemented — with no matching
         // program in the (empty, in-memory) test DB, it must resolve
@@ -919,19 +1118,36 @@ mod tests {
         // from "implemented, nothing to stream".
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/mirakurun/api/programs/1/stream").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/mirakurun/api/programs/1/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND, "GET /programs/1/stream should be 404 (no such program)");
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "GET /programs/1/stream should be 404 (no such program)"
+        );
     }
 
     #[tokio::test]
     async fn logs_api_requires_auth_like_every_other_api_route() {
-        let state = test_web_state(AuthConfig { enabled: true, token: "secret-token".to_string() });
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
         let app = build_app(state, false);
 
         let res = app
-            .oneshot(Request::builder().uri("/api/logs").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -940,7 +1156,10 @@ mod tests {
 
     #[tokio::test]
     async fn logs_api_returns_entries_pushed_to_the_shared_buffer() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         // Simulate what LogBufferLayer::on_event does, without spinning up a
         // whole tracing subscriber for this test.
         state.log_buffer.query(crate::logging::LogQuery::default()); // sanity: starts empty
@@ -953,7 +1172,9 @@ mod tests {
         // through a real tracing event routed at this buffer.
         use tracing_subscriber::layer::SubscriberExt;
         tracing::subscriber::with_default(
-            tracing_subscriber::registry().with(crate::logging::LogBufferLayer::new(Arc::clone(&state.log_buffer))),
+            tracing_subscriber::registry().with(crate::logging::LogBufferLayer::new(Arc::clone(
+                &state.log_buffer,
+            ))),
             || {
                 tracing::warn!(target: "recisdb_proxy::test", "something happened");
             },
@@ -961,12 +1182,19 @@ mod tests {
 
         let app = build_app(Arc::clone(&state), false);
         let res = app
-            .oneshot(Request::builder().uri("/api/logs").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let entries = json["entries"].as_array().expect("entries array");
         assert_eq!(entries.len(), 1);
@@ -979,7 +1207,10 @@ mod tests {
     /// and must not touch the persisted DB config.
     #[tokio::test]
     async fn log_config_api_rejects_invalid_level() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         let app = build_app(Arc::clone(&state), false);
 
         let res = app
@@ -988,7 +1219,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/log-config")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::json!({ "level": "verbose" }).to_string()))
+                    .body(Body::from(
+                        serde_json::json!({ "level": "verbose" }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1007,7 +1240,10 @@ mod tests {
     /// to the database.
     #[tokio::test]
     async fn log_config_api_accepts_valid_level_and_retention() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         let app = build_app(Arc::clone(&state), false);
 
         let res = app
@@ -1016,11 +1252,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/log-config")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(
-                        Body::from(
-                            serde_json::json!({ "level": "debug", "retention_days": 14 }).to_string(),
-                        ),
-                    )
+                    .body(Body::from(
+                        serde_json::json!({ "level": "debug", "retention_days": 14 }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
