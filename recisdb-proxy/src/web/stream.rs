@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     /// BS4K is progressive 2160p: encoding it with the 1080i template
-    /// (`--vpp-deinterlace` + no downscale) is what made the 4K preview
+    /// (deinterlace + no downscale) is what made the 4K preview
     /// break up. 4K channels must get their own template, and every other
     /// band must keep the ordinary one.
     #[test]
@@ -1316,12 +1316,12 @@ mod tests {
 
         let (four_k, _) = load_preview_encoder_config(&db, PreviewBand::FourK).unwrap();
         assert!(
-            !four_k.arguments.contains("--vpp-deinterlace"),
+            !four_k.arguments.contains("deinterlace") && !four_k.arguments.contains("yadif"),
             "4K is progressive; the template must not deinterlace: {}",
             four_k.arguments
         );
         assert!(
-            four_k.arguments.contains("--output-res"),
+            four_k.arguments.contains("scale=1920:1080"),
             "4K must be downscaled before encoding: {}",
             four_k.arguments
         );

@@ -105,6 +105,8 @@ pub(crate) struct FakeTsSource {
     /// own join timeout to actually fire (docs/TUNER_PIPELINE_REDESIGN.md
     /// P2a item 5).
     get_ts_stream_gate: Option<BlockingGate>,
+    get_ts_stream_error: Option<io::ErrorKind>,
+    wait_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Two-way rendezvous a test uses to know a fake `get_ts_stream` call has
@@ -176,6 +178,8 @@ impl FakeTsSource {
             signal_level: 0.0,
             panic_on_set_channel: false,
             get_ts_stream_gate: None,
+            get_ts_stream_error: None,
+            wait_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -188,6 +192,11 @@ impl FakeTsSource {
     /// reader is actually stuck.
     pub(crate) fn with_get_ts_stream_gate(mut self, gate: BlockingGate) -> Self {
         self.get_ts_stream_gate = Some(gate);
+        self
+    }
+
+    pub(crate) fn with_get_ts_stream_error(mut self, kind: io::ErrorKind) -> Self {
+        self.get_ts_stream_error = Some(kind);
         self
     }
 
@@ -218,6 +227,10 @@ impl FakeTsSource {
         self.chunks.lock().unwrap().push_back(data);
         self
     }
+
+    pub(crate) fn wait_call_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.wait_calls.clone()
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +251,8 @@ impl TsSource for FakeTsSource {
     fn purge_ts_stream(&self) {}
 
     fn wait_ts_stream(&self, timeout_ms: u32) -> bool {
+        self.wait_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Short, bounded sleep so the reader loop's poll cadence stays fast
         // in tests regardless of the real `timeout_ms` value passed in.
         std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(5) as u64));
@@ -245,15 +260,23 @@ impl TsSource for FakeTsSource {
     }
 
     fn get_ts_stream(&self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
+        if let Some(kind) = self.get_ts_stream_error {
+            return Err(io::Error::new(kind, "FakeTsSource: configured read error"));
+        }
         if let Some(gate) = &self.get_ts_stream_gate {
             gate.block_until_released();
         }
         let mut chunks = self.chunks.lock().unwrap();
-        match chunks.pop_front() {
+        match chunks.front_mut() {
             Some(chunk) => {
                 let n = chunk.len().min(buf.len());
                 buf[..n].copy_from_slice(&chunk[..n]);
-                Ok((n, chunks.len()))
+                chunk.drain(..n);
+                if chunk.is_empty() {
+                    chunks.pop_front();
+                }
+                let remaining = chunks.iter().map(Vec::len).sum();
+                Ok((n, remaining))
             }
             None => Ok((0, 0)),
         }

@@ -838,7 +838,7 @@ fn write_preview_paths_to_toml(config_path: &Path, command_path: &str, preproces
 // Top-level entry point
 // ============================================================================
 
-/// Updates the `preview-h264` encode profile's `extra_args` to the freshly
+/// Updates the seeded preview encode profiles' `extra_args` to the freshly
 /// selected ffmpeg template, but only if the row is still at a value this
 /// codebase generated automatically (the QSVEncC seed, the pre-two-stage
 /// legacy template, or a previously auto-generated ffmpeg template for any
@@ -847,17 +847,33 @@ fn write_preview_paths_to_toml(config_path: &Path, command_path: &str, preproces
 /// migrating the legacy template.
 fn update_preview_profile_args_if_default(db: &Database, video_encoder: &str) -> Result<(), String> {
     let profiles = db.get_all_encode_profiles().map_err(|e| e.to_string())?;
-    let Some(profile) = profiles.into_iter().find(|p| p.name == "preview-h264") else {
+    let Some(profile) = profiles.iter().find(|p| p.name == "preview-h264") else {
         return Err("preview-h264 プロファイルが見つかりません".to_string());
     };
 
-    if !crate::database::preview_extra_args_is_auto_generated(profile.extra_args.as_deref()) {
-        return Ok(());
+    if crate::database::preview_extra_args_is_auto_generated(profile.extra_args.as_deref()) {
+        let new_args = crate::database::preview_encode_args_ffmpeg(video_encoder);
+        db.update_encode_profile(profile.id, None, None, None, None, None, Some(Some(&new_args)), None)
+            .map_err(|e| e.to_string())?;
     }
 
-    let new_args = crate::database::preview_encode_args_ffmpeg(video_encoder);
-    db.update_encode_profile(profile.id, None, None, None, None, None, Some(Some(&new_args)), None)
-        .map_err(|e| e.to_string())
+    if let Some(profile_4k) = profiles.iter().find(|p| p.name == "preview-4k") {
+        if crate::database::preview_4k_extra_args_is_auto_generated(profile_4k.extra_args.as_deref()) {
+            let new_args = crate::database::preview_4k_encode_args_ffmpeg(video_encoder);
+            db.update_encode_profile(
+                profile_4k.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&new_args)),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Detects (or downloads) an encoder and a preprocessor for the browser
@@ -1185,6 +1201,11 @@ enabled = false
             updated.extra_args.as_deref(),
             Some(crate::database::preview_encode_args_ffmpeg("h264_videotoolbox").as_str())
         );
+        let updated_4k = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-4k").unwrap();
+        assert_eq!(
+            updated_4k.extra_args.as_deref(),
+            Some(crate::database::preview_4k_encode_args_ffmpeg("h264_videotoolbox").as_str())
+        );
 
         // Re-running with a different encoder must still replace it (this
         // is still a value the tool itself generated, not an admin edit).
@@ -1198,8 +1219,13 @@ enabled = false
         // An admin's own edit must never be overwritten.
         db.update_encode_profile(updated.id, None, None, None, None, None, Some(Some("--my-custom-args")), None)
             .unwrap();
+        db.update_encode_profile(updated_4k.id, None, None, None, None, None, Some(Some("--my-custom-4k-args")), None)
+            .unwrap();
         update_preview_profile_args_if_default(&db, "libx264").unwrap();
-        let after = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
+        let profiles = db.get_all_encode_profiles().unwrap();
+        let after = profiles.iter().find(|p| p.name == "preview-h264").unwrap();
         assert_eq!(after.extra_args.as_deref(), Some("--my-custom-args"));
+        let after_4k = profiles.iter().find(|p| p.name == "preview-4k").unwrap();
+        assert_eq!(after_4k.extra_args.as_deref(), Some("--my-custom-4k-args"));
     }
 }

@@ -345,8 +345,8 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 再生がブツブツ途切れる。
 
 対応: `purpose = 'preview4k'` の専用プロファイル `preview-4k` を seed し
-(`database/encode_profile.rs::DEFAULT_PREVIEW_4K_ENCODE_ARGS`、デインタレース
-なし + `--output-res 1920x1080` へ縮小 + VBR 4Mbps)、`?profile=preview` の
+(`database/encode_profile.rs::preview_4k_encode_args_ffmpeg`、デインタレース
+なし + `scale=1920:1080` へ縮小 + VBR 4Mbps)、`?profile=preview` の
 プロファイル選択をチャンネルの帯域で分岐させた
 (`web/stream.rs::PreviewBand`)。判定は `band_type` ではなく **NID**
 (`classify_nid`) で行う — `band_type` はスキャンでしか埋まらず手動投入行では
@@ -354,8 +354,21 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 場合は通常プロファイルへフォールバックする (途切れるプレビューでも、
 再生できないよりはよい)。
 
-seed は名前 (`preview-4k`) で存在確認する冪等処理なので、管理者が編集した
-引数は再起動しても上書きされない。**実機のエンコーダでの検証は未実施。**
+`preview_setup` が選んだ映像エンコーダを通常プレビューと4Kプレビューの両方へ
+反映する。旧版が seed した rigaya 形式の既定値と完全一致する既存行だけを ffmpeg
+形式へ移行する。管理者が編集した値は上書きしない。
+
+2026-08-30 の実機検証では、旧 rigaya 引数は ffmpeg が `-avhw` を拒否し、HTTP
+200の直後に0バイトで終了した。ffmpeg形式へ一時変更すると H.264 1920x1080/
+59.94p、AAC、timed ID3を含むTSを生成し、実効ビットレートは3.56〜3.64Mbpsだった。
+映像PTSの最大間隔は66.7msで、100ms超の間隔は0件だった。
+
+ただし実機の `h264_qsv` はHEVCのsoftware decodeとsoftware scaleを含む構成で、
+20秒の取得中に9.18秒分しか生成できず、処理速度は約0.46倍だった。QSVのhardware
+decodeと`scale_qsv`も試したが、GPUのtexture生成が`80070057`で失敗した。この実機
+では1080p/59.94p・4Mbpsという出力設定だけではリアルタイム処理に足りない。
+ゼロバイト終了は解消するが、連続プレビューには対応GPU/ドライバー、または別の
+ハードウェア変換構成が必要である。
 
 ## 未対応 / 要確認
 
@@ -373,9 +386,13 @@ seed は名前 (`preview-4k`) で存在確認する冪等処理なので、管�
 - **実測**: `/mirakurun/api/services/1100141/stream` は競合時503、再試行時も実TS未取得。
   視聴成功、H.265映像、EIT/H-EIT、WOWOWのACAS復号は未確認。
 
-- **配信 (視聴・録画) は未検証。** 実機はラッパー方式なので `MmtPipe` の検証結果を
-  そのまま適用できない。ラッパーのTS出力、B25無効化、プレイヤーのH.265/2160p対応が
-  検証対象。
+- **生TS配信は検証済み。** f4824d0適用後、25秒で56,783,676 bytes (18.17Mbps)、
+  302,040 TS packets、同期不良0、continuity counter不連続0だった。BonDriverが返す
+  chunkは放置中に62,582,380 bytes、pending peakは62,320,236 bytesまで単調増加した。
+  原因はpendingを256KBずつdrainする各iterationで`WaitTsStream(100ms)`を呼び、driver側
+  に次のchunkを蓄積させる正のfeedbackだった。readerは`remaining > 0`中のwaitを省略し、
+  bufferを実測chunkへ追従させる。256MiB超過時は任意位置で捨てて継続せず、reader全体を
+  `ReaderFailed`として再openする。録画とプレイヤーのH.265/2160p表示は未検証。
 - **修正版 dantto4k のビルド確認**。手元では tsduck が無くビルドできていない
 - **ダッシュボード (Vue) のフォーム露出**。Web API 側は対応済みで、
   `GET/POST/PATCH /api/bondrivers` が `stream_format` と `disable_b25` を

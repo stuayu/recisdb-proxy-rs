@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cpp_utils::{DynamicCast, MutPtr, Ptr};
 use log::{debug, info, error};
 
+// Keep this in sync with tuner/shared.rs::MAX_TS_READ_BUFFER_SIZE. This
+// FFI-side guard runs before allocating the native chunk's carry-over.
+const MAX_TS_NATIVE_CHUNK_SIZE: usize = 256 * 1024 * 1024;
+
 // Include generated bindings
 include!(concat!(env!("OUT_DIR"), "/BonDriver_binding.rs"));
 
@@ -144,6 +148,10 @@ struct IBon {
     /// chunks than a hardware driver, which is why this only bites in a
     /// cascaded setup.
     pending: std::sync::Mutex<Vec<u8>>,
+    /// Driver-reported remaining-data hint behind the current native chunk.
+    /// Preserve the hint while `pending` is drained without another native
+    /// call so the reader continues to skip `WaitTsStream`.
+    native_remaining_hint: AtomicU64,
     read_calls: AtomicU64,
     read_bytes: AtomicU64,
     max_chunk: AtomicU64,
@@ -234,7 +242,12 @@ impl IBon {
             let n = pending.len().min(buf.len());
             buf[..n].copy_from_slice(&pending[..n]);
             pending.drain(..n);
-            return Ok((n, pending.len()));
+            return Ok((
+                n,
+                pending.len().saturating_add(
+                    self.native_remaining_hint.load(Ordering::Relaxed) as usize,
+                ),
+            ));
         }
 
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -258,11 +271,22 @@ impl IBon {
             if size_usize == 0 {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream size=0"));
             }
+            if size_usize > MAX_TS_NATIVE_CHUNK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GetTsStream native chunk {} exceeds safety limit {}",
+                        size_usize, MAX_TS_NATIVE_CHUNK_SIZE
+                    ),
+                ));
+            }
 
             self.read_calls.fetch_add(1, Ordering::Relaxed);
             self.read_bytes
                 .fetch_add(size_usize as u64, Ordering::Relaxed);
             self.max_chunk.fetch_max(size_usize as u64, Ordering::Relaxed);
+            self.native_remaining_hint
+                .store(remaining as u64, Ordering::Relaxed);
 
             // Copy from BonDriver's internal buffer to caller's buffer
             let copy_len = size_usize.min(buf.len());
@@ -283,7 +307,7 @@ impl IBon {
                     .fetch_max(pending.len() as u64, Ordering::Relaxed);
             }
 
-            Ok((copy_len, pending.len() + remaining as usize))
+            Ok((copy_len, pending.len().saturating_add(remaining as usize)))
         }
     }
 
@@ -295,6 +319,7 @@ impl IBon {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.native_remaining_hint.store(0, Ordering::Relaxed);
         unsafe {
             ib1::C_PurgeTsStream(self.ibon1.as_ptr());
         }
@@ -405,6 +430,7 @@ impl BonDriverTuner {
                 ibon2,
                 ibon3,
                 pending: std::sync::Mutex::new(Vec::new()),
+                native_remaining_hint: AtomicU64::new(0),
                 read_calls: AtomicU64::new(0),
                 read_bytes: AtomicU64::new(0),
                 max_chunk: AtomicU64::new(0),

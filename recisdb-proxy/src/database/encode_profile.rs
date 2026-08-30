@@ -10,6 +10,15 @@
 use super::{Database, EncodeProfileRecord, Result};
 use rusqlite::{params, OptionalExtension};
 
+const KNOWN_PREVIEW_ENCODERS: &[&str] = &[
+    "libx264",
+    "h264_videotoolbox",
+    "h264_qsv",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_vaapi",
+];
+
 /// Recommended encoder arguments for the seeded `preview-h264` profile.
 ///
 /// A direct QSVEncC invocation (the `[preview] command_path` executable runs
@@ -27,16 +36,10 @@ pub(crate) const DEFAULT_PREVIEW_ENCODE_ARGS: &str =
      --audio-codec aac --audio-bitrate 192 --audio-samplerate 48000 \
      --data-copy timed_id3 --output-format mpegts -o -";
 
-/// Preview arguments for BS4K (`purpose = 'preview4k'`).
+/// Broken BS4K preview arguments seeded before the ffmpeg pipeline was used.
 ///
-/// BS4K is 2160/59.94**p** H.265 — progressive, and four times the pixels of
-/// a 1080i broadcast. Running it through the ordinary preview profile is
-/// wrong twice over: `--interlace tff --vpp-deinterlace normal` deinterlaces
-/// a progressive source, and encoding 2160p in real time is far more work
-/// than a browser preview needs, so the encoder falls behind and the picture
-/// breaks up. This template drops the deinterlacer and downscales to 1080p
-/// before encoding; everything else matches
-/// `DEFAULT_PREVIEW_ENCODE_ARGS` so the two profiles behave alike.
+/// This is retained only as a migration sentinel. It is rigaya syntax and
+/// cannot be passed to the ffmpeg executable selected by `preview_setup`.
 pub(crate) const DEFAULT_PREVIEW_4K_ENCODE_ARGS: &str =
     "--avhw -i - --input-format mpegts --input-analyze 0.6 --input-probesize 1000K \
      --vpp-resize algo=auto --output-res 1920x1080 -c h264 --profile high \
@@ -83,6 +86,38 @@ pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
         tuning = video_encoder_tuning(video_encoder)
     )
+}
+
+/// Build ffmpeg arguments for BS4K preview. The tsreadex input and stream
+/// mapping match the normal preview, but progressive 2160p is scaled to
+/// 1920x1080 without deinterlacing.
+pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
+    format!(
+        "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+         -analyzeduration 600000 -probesize 1000000 -f mpegts -i pipe:0 \
+         -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+         -vf scale=1920:1080 \
+         -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
+         -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
+         -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
+         -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
+        tuning = video_encoder_tuning(video_encoder)
+    )
+}
+
+pub fn preview_4k_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool {
+    let Some(args) = extra_args else { return true; };
+    let args = args.trim();
+    if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS { return true; }
+    KNOWN_PREVIEW_ENCODERS.iter().any(|enc| args == preview_4k_encode_args_ffmpeg(enc))
+}
+
+fn preview_video_encoder_from_auto_generated(extra_args: Option<&str>) -> Option<&'static str> {
+    let args = extra_args?.trim();
+    KNOWN_PREVIEW_ENCODERS
+        .iter()
+        .copied()
+        .find(|enc| args == preview_encode_args_ffmpeg(enc))
 }
 
 /// エンコーダごとの最適化オプション。
@@ -136,15 +171,7 @@ pub fn preview_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool {
     }
     // 過去の自動生成 ffmpeg テンプレートかどうかは、エンコーダ名を差し替えた
     // 全候補と突き合わせて判定する。エンコーダが増えたらここに足すこと。
-    const KNOWN_ENCODERS: &[&str] = &[
-        "libx264",
-        "h264_videotoolbox",
-        "h264_qsv",
-        "h264_nvenc",
-        "h264_amf",
-        "h264_vaapi",
-    ];
-    KNOWN_ENCODERS
+    KNOWN_PREVIEW_ENCODERS
         .iter()
         .any(|enc| args == preview_encode_args_ffmpeg(enc))
 }
@@ -346,18 +373,41 @@ impl Database {
             |row| row.get(0),
         )?;
         if !four_k_exists {
+            let extra_args = preview_4k_encode_args_ffmpeg("libx264");
             self.insert_encode_profile(
                 "preview-4k",
                 "preview4k",
                 "h264",
                 "mpegts",
                 Some(4_000_000),
-                Some(DEFAULT_PREVIEW_4K_ENCODE_ARGS),
+                Some(&extra_args),
                 true,
             )?;
             log::info!(
                 "Seeded default encode profile 'preview-4k' (1080p downscale, no deinterlace, purpose=preview4k)"
             );
+        } else {
+            // Exact-match migration preserves every administrator-edited row.
+            let preview_args: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT extra_args FROM encode_profiles WHERE name = 'preview-h264' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let encoder = preview_video_encoder_from_auto_generated(preview_args.as_deref())
+                .unwrap_or("libx264");
+            let replacement = preview_4k_encode_args_ffmpeg(encoder);
+            let updated = self.conn.execute(
+                "UPDATE encode_profiles SET extra_args = ?1
+                 WHERE name = 'preview-4k' AND extra_args = ?2",
+                params![replacement, DEFAULT_PREVIEW_4K_ENCODE_ARGS],
+            )?;
+            if updated > 0 {
+                log::info!("Migrated encode profile 'preview-4k' from the broken rigaya template to ffmpeg");
+            }
         }
         Ok(())
     }
@@ -417,6 +467,41 @@ mod tests {
         db.seed_default_encode_profiles().unwrap(); // called again on top of open()'s own seed
         let all = db.get_all_encode_profiles().unwrap();
         assert_eq!(all.iter().filter(|p| p.name == "preview-h264").count(), 1);
+        assert_eq!(all.iter().filter(|p| p.name == "preview-4k").count(), 1);
+    }
+
+    #[test]
+    fn four_k_ffmpeg_args_preserve_pipeline_without_deinterlacing() {
+        let args = super::preview_4k_encode_args_ffmpeg("h264_qsv");
+        assert!(args.contains("-f mpegts -i pipe:0"));
+        assert!(args.contains("-map 0:d?"));
+        assert!(args.contains("-c:d copy"));
+        assert!(args.contains("-vf scale=1920:1080"));
+        assert!(args.contains("-c:v h264_qsv"));
+        assert!(!args.contains("yadif"));
+        assert!(!args.contains("--avhw"));
+    }
+
+    #[test]
+    fn seed_migrates_only_untouched_broken_four_k_template() {
+        let db = Database::open_in_memory().unwrap();
+        let ordinary = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        let ordinary_args = super::preview_encode_args_ffmpeg("h264_qsv");
+        db.update_encode_profile(ordinary.id, None, None, None, None, None,
+            Some(Some(&ordinary_args)), None).unwrap();
+        let profile = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+        db.update_encode_profile(profile.id, None, None, None, None, None,
+            Some(Some(super::DEFAULT_PREVIEW_4K_ENCODE_ARGS)), None).unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+        assert_eq!(migrated.extra_args.as_deref(),
+            Some(super::preview_4k_encode_args_ffmpeg("h264_qsv").as_str()));
+
+        db.update_encode_profile(migrated.id, None, None, None, None, None,
+            Some(Some("--avhw --administrator-customized")), None).unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let preserved = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+        assert_eq!(preserved.extra_args.as_deref(), Some("--avhw --administrator-customized"));
     }
 
     #[test]

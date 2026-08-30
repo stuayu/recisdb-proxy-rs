@@ -34,7 +34,7 @@ tsreplace 複数ストリームの高速化、ブラウザプレビュー、お�
 ```
 BonDriver DLL / char device
    │  spawn_blocking 内の読み取りループ (SharedTuner)
-   │  256KB チャンク (TS_CHUNK_SIZE = 262144)
+   │  初期256KB、native chunk実測値へ動的拡張
    │  読む → B25 デコード → 配る だけ (SI 収集はここではやらない)
    ▼
 broadcast::channel(4096)               ← 全購読セッションへファンアウト (BROADCAST_CAPACITY)
@@ -396,8 +396,13 @@ CREATE TABLE encode_profiles(
 | **P6** | Mirakurun 互換 API サブセット + WebSocket ダッシュボード | P5 | エコシステム連携 | Mirakurun 互換 API サブセットのみ ✅ 実装済 (2026-07-04)。WebSocket ダッシュボードは未着手 |
 
 実装メモ (P1/P4):
+- P1 reader: `GetTsStream`の`remaining > 0`は、既にnative driverから受領済みの
+  carry-overがあることを示す。この間は`WaitTsStream(100ms)`を呼ばず、即座に
+  pendingをdrainする。read bufferは`n + remaining`の実測値へ追従する。256MiBを
+  超える要求は部分データを配信せず`ReaderFailed`としてreaderを再openする。
+  carry-overを任意位置で切り捨てて同じstreamを継続することは禁止する。
 - P1: 既存 `TsPacketAnalyzer` を per-PID 化 (上限 256 PID + overflow 集約)。CC 判定に duplicate 許容・discontinuity_indicator 抑止を追加。broadcast `Lagged(count)` の count はチャンク数であり `packets_dropped` に混ぜる従来動作は単位バグとして分離 (`loss_broadcast_lag_chunks`)。損失源別カウンタ + top PID を `/api/client/:id/quality`・ダッシュボード・`session_history.loss_summary`(JSON) に公開。
-- P4: `tuner/encoder_pool.rs` 新設。EncodeKey = (channel_key, sids ソート済, config_generation=設定内容ハッシュ)。同一 key は permit 消費なしで合流。飽和時は生 TS passthrough。watchdog は「入力あり・出力 read_timeout 超停止」で kill → セッションは passthrough_on_error に従う。エンコーダのチューナー購読は subscriber_count 非加算 (`subscribe_untracked`) とし、チューナーの keep-alive 会計はセッション駆動を維持 (§5.2 からの意図的逸脱)。RECORD 優先確保は P2 のストリームクラス導入後に実装。
+- P4: `tuner/encoder_pool.rs` 新設。EncodeKey = (channel_key, sids ソート済, config_generation=設定内容ハッシュ)。同一 key は permit 消費なしで合流。飽和時は生 TS passthrough。watchdog は「入力あり・出力 read_timeout 超停止」で kill → セッションは passthrough_on_error に従う。エンコーダのチューナー購読は subscriber_count 非加算 (`subscribe_untracked`) とし、チューナーの keep-alive 会計はセッション駆動を維持 (§5.2 からの意図的逸脱)。入力broadcastの`Lagged`は累積chunk数を保持し、最長10秒間隔のWARNと停止ログへ出す。RECORD 優先確保は P2 のストリームクラス導入後に実装。
 
 実装メモ (P3):
 - `server/prefill.rs` 新設。`PrefillBuffer` は `Filling{queued, queued_bytes, target_bytes}` / `Passthrough` の2状態のみを持つ独立ステートマシン (Session 非依存、単体テスト可)。挿入位置は `send_ts_data_raw()` 内、BNDP ヘッダ付与直後・`send_ts_frame()` 直前 — プリフィル中のフレームはクラス別バックプレッシャ方針を一切通らない (RECORD の無損失オーバーフロータイマーもプリフィル解放後から起算)。

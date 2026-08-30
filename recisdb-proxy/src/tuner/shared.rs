@@ -170,6 +170,10 @@ pub(crate) const BROADCAST_CAPACITY: usize = 4096;
 /// Increased to 256KB to handle BonDrivers (like FukuDLL) that may return
 /// data in larger chunks than standard 64KB.
 const TS_CHUNK_SIZE: usize = 262144; // 256KB buffer
+/// A corrupt or runaway driver must not make the reader allocate without
+/// bound. Crossing this limit fails the whole reader so the tuner is reopened;
+/// no prefix of the oversized native chunk is broadcast or silently dropped.
+const MAX_TS_READ_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 /// B25 デコーダの初期化を待つ上限。
 ///
@@ -1275,7 +1279,7 @@ impl SharedTuner {
 
         // Use a larger initial buffer, and expand dynamically if needed
         let mut buf = vec![0u8; TS_CHUNK_SIZE];
-        let mut buf_size = TS_CHUNK_SIZE;
+        let mut remaining_hint = 0usize;
         let mut consecutive_empty = 0u64;
         let mut total_bytes_read = 0u64;
         let mut last_log_time = std::time::Instant::now();
@@ -1334,19 +1338,25 @@ impl SharedTuner {
                 }
             }
 
-            // Wait for TS data to be available.
+            // Wait for TS data to be available, except while draining bytes
+            // already consumed from the native driver into IBon::pending.
+            // Waiting in that state makes proxy BonDrivers sleep the full
+            // timeout for every reader-sized slice and creates an unbounded
+            // positive feedback loop in their native buffer.
             // timing::WAIT_TS_STREAM_POLL_MS (100 ms) instead of 1000 ms so
             // the stop-check at the top of the loop is reached quickly after
             // stop_reader() sets the state to Stopping.  This makes channel
             // switches faster and keeps stop_reader()'s own join timeout
             // (timing::STOP_READER_TIMEOUT_MS) comfortably longer than one
             // iteration.
-            let wait_result = tuner.wait_ts_stream(timing::WAIT_TS_STREAM_POLL_MS as u32);
-            if !wait_result {
-                consecutive_empty = consecutive_empty.saturating_add(1);
-                if should_log_empty_streak(consecutive_empty) {
-                    info!("[SharedTuner] wait_ts_stream returned false ({} times), total_bytes={}, elapsed={}ms",
-                          consecutive_empty, total_bytes_read, reader_start_time.elapsed().as_millis());
+            if remaining_hint == 0 {
+                let wait_result = tuner.wait_ts_stream(timing::WAIT_TS_STREAM_POLL_MS as u32);
+                if !wait_result {
+                    consecutive_empty = consecutive_empty.saturating_add(1);
+                    if should_log_empty_streak(consecutive_empty) {
+                        info!("[SharedTuner] wait_ts_stream returned false ({} times), total_bytes={}, elapsed={}ms",
+                              consecutive_empty, total_bytes_read, reader_start_time.elapsed().as_millis());
+                    }
                 }
             }
 
@@ -1355,27 +1365,26 @@ impl SharedTuner {
                 tuner.get_ts_stream(&mut buf)
             })) {
                 Ok(Ok((n, remaining))) => {
-                    // Check if BonDriver is requesting more buffer space
-                    if n > buf.len() {
-                        // BonDriver returned a size larger than our current buffer
-                        // Expand the buffer to accommodate this size, plus some headroom
-                        let new_size = (n * 2).max(buf_size * 2).min(16 * 1024 * 1024); // Cap at 16MB
-                        info!("[SharedTuner] Expanding buffer from {} to {} bytes due to BonDriver request: n={}",
-                              buf_size, new_size, n);
-                        buf.resize(new_size, 0);
-                        buf_size = new_size;
-
-                        // Retry with larger buffer
-                        if remaining > 0 {
-                            warn!("[SharedTuner] GetTsStream returned size {} exceeds buffer {}, remaining={}. Retrying with expanded buffer...",
-                                  n, buf.len(), remaining);
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
+                    remaining_hint = remaining;
+                    let requested_size = n.saturating_add(remaining);
+                    if requested_size > MAX_TS_READ_BUFFER_SIZE {
+                        error!(
+                            "[SharedTuner] GetTsStream requires {} bytes (n={}, remaining={}), above safety limit {}; restarting reader without discarding a partial TS chunk",
+                            requested_size, n, remaining, MAX_TS_READ_BUFFER_SIZE
+                        );
+                        shared.set_stop_reason(StopReason::ReaderFailed);
+                        break;
                     }
-
-                    // Clip the returned size to buffer size (safety measure)
-                    let n = std::cmp::min(n, buf.len());
+                    if requested_size > buf.len() {
+                        let new_size = requested_size
+                            .next_power_of_two()
+                            .min(MAX_TS_READ_BUFFER_SIZE);
+                        info!(
+                            "[SharedTuner] Expanding TS read buffer from {} to {} bytes (n={}, remaining={})",
+                            buf.len(), new_size, n, remaining
+                        );
+                        buf.resize(new_size, 0);
+                    }
 
                     // Log at INFO level only if we got significant data
                     if n > 0 && n % 327680 == 0 {
@@ -1587,6 +1596,18 @@ impl SharedTuner {
                     }
                 }
                 Ok(Err(e)) => {
+                    // A driver may report a stale non-zero ready count. Once
+                    // the corresponding read says there is no data, resume
+                    // the bounded wait instead of spinning on the old hint.
+                    remaining_hint = 0;
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        error!(
+                            "[SharedTuner] Fatal TS source data error for {:?}: {}",
+                            shared.key, e
+                        );
+                        shared.set_stop_reason(StopReason::ReaderFailed);
+                        break;
+                    }
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         consecutive_empty = consecutive_empty.saturating_add(1);
                         if should_log_empty_streak(consecutive_empty) && !reader_first_read {
@@ -2397,6 +2418,71 @@ mod tests {
         shared.stop_reader().await;
         assert_eq!(shared.state(), ReaderState::Stopped);
         assert!(!shared.is_running());
+    }
+
+    #[tokio::test]
+    async fn reader_drains_large_native_chunk_without_waiting_between_slices() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/large-chunk", 1), 8);
+        let mut subscription = shared.subscribe_untracked();
+        let expected: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = FakeTsSource::new().with_chunk(expected.clone());
+        let wait_calls = source.wait_call_counter();
+        let config = ReaderStartupConfig {
+            b25_enabled: false,
+            ..test_startup_config()
+        };
+
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, config).await;
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("ready signal timed out")
+            .expect("ready channel closed unexpectedly");
+        assert!(ready.is_ok());
+
+        let mut received = 0usize;
+        let mut actual = Vec::with_capacity(expected.len());
+        while received < 4 * 1024 * 1024 {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                subscription.recv(),
+            )
+            .await
+            .expect("large chunk drain timed out")
+            .expect("reader stopped before draining the chunk");
+            received += chunk.len();
+            actual.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(received, expected.len());
+        assert_eq!(actual, expected, "large native chunk byte order changed");
+        assert!(
+            wait_calls.load(Ordering::SeqCst) <= 2,
+            "pending slices must be drained without a WaitTsStream call between them"
+        );
+        shared.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_data_read_error_stops_reader_without_startup_retry() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/fatal-read", 1), 2);
+        let source = FakeTsSource::new()
+            .with_chunk(vec![0u8; 188])
+            .with_get_ts_stream_error(std::io::ErrorKind::InvalidData);
+        let config = ReaderStartupConfig {
+            b25_enabled: false,
+            ..test_startup_config()
+        };
+
+        let ready_rx = shared.spawn_fake_reader(source, 0, 1, config).await;
+        assert!(ready_rx.await.expect("ready channel closed").is_ok());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while shared.state() != ReaderState::Stopped {
+            assert!(std::time::Instant::now() < deadline, "reader did not stop");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(shared.stop_reason(), StopReason::ReaderFailed);
+        shared.stop_reader().await;
     }
 
     #[test]

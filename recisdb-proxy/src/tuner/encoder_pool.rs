@@ -58,6 +58,10 @@ const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(5);
 /// Chunk size used when reading the chain's final stdout.
 const OUTPUT_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Minimum interval between source-broadcast lag warnings. Every skipped
+/// chunk is counted; only the repetitive log line is throttled.
+const INPUT_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Key identifying "the same shared encode".
 ///
 /// Two sessions that resolve to an equal `EncodeKey` share a single running
@@ -550,6 +554,7 @@ pub struct SharedEncoder {
     tx_slot: std::sync::Mutex<Option<broadcast::Sender<Bytes>>>,
     subscriber_count: AtomicU32,
     is_running: AtomicBool,
+    input_lagged_chunks: AtomicU64,
     last_input_at: std::sync::Mutex<Instant>,
     last_output_at: std::sync::Mutex<Instant>,
     read_timeout: Duration,
@@ -605,6 +610,7 @@ impl SharedEncoder {
             tx_slot: std::sync::Mutex::new(Some(tx)),
             subscriber_count: AtomicU32::new(0),
             is_running: AtomicBool::new(true),
+            input_lagged_chunks: AtomicU64::new(0),
             last_input_at: std::sync::Mutex::new(now),
             last_output_at: std::sync::Mutex::new(now),
             read_timeout,
@@ -632,6 +638,7 @@ impl SharedEncoder {
     }
 
     async fn run_feeder(shared: Arc<Self>, mut tuner_rx: UntrackedSubscription, mut stdin: ChildStdin) {
+        let mut last_lag_warning = None;
         loop {
             match tuner_rx.recv().await {
                 Ok(data) => {
@@ -642,7 +649,23 @@ impl SharedEncoder {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("[SharedEncoder {:?}] input lagged, skipped {} chunks", shared.key.channel_key, n);
+                    let previous = shared
+                        .input_lagged_chunks
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                            Some(total.saturating_add(n))
+                        })
+                        .unwrap_or_else(|total| total);
+                    let total = previous.saturating_add(n);
+                    let now = Instant::now();
+                    if last_lag_warning
+                        .map_or(true, |last| now.duration_since(last) >= INPUT_LAG_WARN_INTERVAL)
+                    {
+                        warn!(
+                            "[SharedEncoder {:?}] input lagged, skipped {} chunks (total={})",
+                            shared.key.channel_key, n, total
+                        );
+                        last_lag_warning = Some(now);
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!("[SharedEncoder {:?}] source tuner broadcast closed", shared.key.channel_key);
@@ -721,7 +744,12 @@ impl SharedEncoder {
             return;
         }
 
-        info!("[SharedEncoder {:?}] stopping ({})", self.key.channel_key, reason);
+        info!(
+            "[SharedEncoder {:?}] stopping ({}, input_lagged_chunks={})",
+            self.key.channel_key,
+            reason,
+            self.input_lagged_chunks()
+        );
 
         // Drop the last Sender: any subscriber's next `recv()` observes
         // `RecvError::Closed` once its buffered backlog is drained.
@@ -812,6 +840,11 @@ impl SharedEncoder {
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
     }
+
+    /// Source-broadcast chunks skipped because the encoder feeder fell behind.
+    pub fn input_lagged_chunks(&self) -> u64 {
+        self.input_lagged_chunks.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for SharedEncoder {
@@ -820,6 +853,7 @@ impl std::fmt::Debug for SharedEncoder {
             .field("key", &self.key)
             .field("subscribers", &self.subscriber_count())
             .field("is_running", &self.is_running())
+            .field("input_lagged_chunks", &self.input_lagged_chunks())
             .finish_non_exhaustive()
     }
 }
