@@ -22,3 +22,5 @@ logs/*
 logos/*
 # ffmpeg / tsreadex fetched by the preview auto-setup
 /thirdparty
+# ARIB規格PDF(再配布不可・ローカル参照用)
+docs/refs/*.pdf

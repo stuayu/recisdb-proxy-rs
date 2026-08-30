@@ -5,6 +5,7 @@
 use std::io;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cpp_utils::{DynamicCast, MutPtr, Ptr};
 use log::{debug, info, error};
@@ -116,10 +117,14 @@ impl DynamicCast<IBonDriver3> for IBonDriver2 {
     }
 }
 
-/// Upper bound on the carry-over buffer (see [`IBon::pending`]).  Far above any
-/// plausible single-call overshoot; exists only so a pathological driver cannot
-/// grow it without limit.
-const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+/// Counters for diagnosing large proxy-driver reads and carry-over.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GetTsStreamStats {
+    pub calls: u64,
+    pub bytes: u64,
+    pub max_chunk: u64,
+    pub pending_peak: u64,
+}
 
 /// Internal BonDriver interface wrapper.
 struct IBon {
@@ -139,6 +144,10 @@ struct IBon {
     /// chunks than a hardware driver, which is why this only bites in a
     /// cascaded setup.
     pending: std::sync::Mutex<Vec<u8>>,
+    read_calls: AtomicU64,
+    read_bytes: AtomicU64,
+    max_chunk: AtomicU64,
+    pending_peak: AtomicU64,
 }
 
 impl Drop for IBon {
@@ -250,6 +259,11 @@ impl IBon {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream size=0"));
             }
 
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            self.read_bytes
+                .fetch_add(size_usize as u64, Ordering::Relaxed);
+            self.max_chunk.fetch_max(size_usize as u64, Ordering::Relaxed);
+
             // Copy from BonDriver's internal buffer to caller's buffer
             let copy_len = size_usize.min(buf.len());
             std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
@@ -258,15 +272,15 @@ impl IBon {
             // did not fit instead of dropping it mid-packet.
             if size_usize > copy_len {
                 let tail = std::slice::from_raw_parts(ptr.add(copy_len), size_usize - copy_len);
-                if pending.len() + tail.len() > MAX_PENDING_BYTES {
-                    error!(
-                        "[BonDriver] GetTsStream carry-over exceeded {} bytes; discarding {} buffered bytes",
-                        MAX_PENDING_BYTES,
-                        pending.len()
-                    );
-                    pending.clear();
-                }
+                // C_GetTsStream2 has already consumed the complete driver
+                // buffer. Never discard the old pending bytes: doing so loses
+                // an arbitrary byte offset and permanently breaks TS sync.
+                // The caller drains pending before the next native read, so
+                // its size is bounded by the driver's returned chunk plus one
+                // reader buffer in normal operation.
                 pending.extend_from_slice(tail);
+                self.pending_peak
+                    .fetch_max(pending.len() as u64, Ordering::Relaxed);
             }
 
             Ok((copy_len, pending.len() + remaining as usize))
@@ -299,6 +313,15 @@ impl IBon {
         unsafe {
             let ptr = ib2::C_EnumChannelName2(iface.as_ptr(), space, ch);
             ib_utils::from_wide_ptr(ptr)
+        }
+    }
+
+    fn read_stats(&self) -> GetTsStreamStats {
+        GetTsStreamStats {
+            calls: self.read_calls.load(Ordering::Relaxed),
+            bytes: self.read_bytes.load(Ordering::Relaxed),
+            max_chunk: self.max_chunk.load(Ordering::Relaxed),
+            pending_peak: self.pending_peak.load(Ordering::Relaxed),
         }
     }
 }
@@ -382,6 +405,10 @@ impl BonDriverTuner {
                 ibon2,
                 ibon3,
                 pending: std::sync::Mutex::new(Vec::new()),
+                read_calls: AtomicU64::new(0),
+                read_bytes: AtomicU64::new(0),
+                max_chunk: AtomicU64::new(0),
+                pending_peak: AtomicU64::new(0),
             }
         };
 
@@ -421,6 +448,12 @@ impl BonDriverTuner {
     pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
         let ibon: &IBon = &*self.ibon;
         ibon.GetTsStream(buf)
+    }
+
+    /// Read-side counters for runtime diagnostics.
+    pub fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        let stats = self.ibon.read_stats();
+        Some((stats.calls, stats.bytes, stats.max_chunk, stats.pending_peak))
     }
 
     /// Purge the TS stream buffer.

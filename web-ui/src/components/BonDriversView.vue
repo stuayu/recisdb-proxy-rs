@@ -20,6 +20,7 @@ const listColumns: ColumnDef[] = [
   { key: 'group', label: 'グループ' },
   { key: 'max_instances', label: '最大数' },
   { key: 'stream_format', label: '形式' },
+  { key: 'converter', label: '4K変換器' },
   { key: 'state', label: '状態' },
 ]
 const {
@@ -46,11 +47,24 @@ const form = reactive({
 })
 async function load() {
   try {
-    const [drivers, rankingResult] = await Promise.all([
+    const [drivers, rankingResult, tunerResult] = await Promise.all([
       api<unknown>('/bondrivers'),
       api<unknown>('/bondrivers/ranking'),
+      api<unknown>('/tuners'),
     ])
-    rows.value = unwrapArray(drivers, ['bondrivers'])
+    const tunerRows = unwrapArray(tunerResult, ['tuners'])
+    const converterByPath = new Map<string, JsonRecord | undefined>(
+      tunerRows.map((row) => [
+        String(row.dll_path ?? ''),
+        row.mmt_converter && typeof row.mmt_converter === 'object'
+          ? (row.mmt_converter as JsonRecord)
+          : undefined,
+      ]),
+    )
+    rows.value = unwrapArray(drivers, ['bondrivers']).map((row) => ({
+      ...row,
+      mmt_converter: converterByPath.get(String(row.dll_path ?? '')),
+    }))
     ranking.value = unwrapArray(rankingResult, ['items', 'ranking', 'data'])
     error.value = ''
   } catch (e) {
@@ -101,6 +115,18 @@ async function scan(id: unknown) {
 function rankedDriver(item: JsonRecord): JsonRecord {
   const value = item.driver
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : {}
+}
+function converter(row: JsonRecord): JsonRecord {
+  return row.mmt_converter && typeof row.mmt_converter === 'object'
+    ? (row.mmt_converter as JsonRecord)
+    : {}
+}
+function converterText(row: JsonRecord): string {
+  const value = converter(row)
+  return `${String(value.output_bytes ?? 0)}B出力 / 待ち${String(value.queued_chunks ?? 0)} / Drop${String(value.dropped_chunks ?? 0)}`
+}
+function converterActive(row: JsonRecord): boolean {
+  return converter(row).active === true
 }
 onMounted(load)
 </script>
@@ -177,6 +203,7 @@ onMounted(load)
               <th v-if="listIsVisible('group')">グループ</th>
               <th v-if="listIsVisible('max_instances')">最大数</th>
               <th v-if="listIsVisible('stream_format')">形式</th>
+              <th v-if="listIsVisible('converter')">4K変換器</th>
               <th v-if="listIsVisible('state')">状態</th>
               <th>操作</th>
             </tr>
@@ -202,6 +229,13 @@ onMounted(load)
                 <span v-if="row.stream_format === 'mmttlv'" class="badge">4K MMT/TLV</span>
                 <span v-else>TS</span>
                 <span v-if="row.disable_b25" class="badge muted">B25無効</span>
+              </td>
+              <td v-if="listIsVisible('converter')" data-label="4K変換器">
+                <span v-if="row.stream_format !== 'mmttlv'">—</span>
+                <span v-else-if="converterActive(row)">
+                  {{ converterText(row) }}
+                </span>
+                <span v-else class="badge muted">停止中</span>
               </td>
               <!-- スキャンは視聴と同じくチューナー枠を1つ占有する。
                    占有されている理由が分からないと、視聴できない原因を

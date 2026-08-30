@@ -583,7 +583,18 @@ EPGStation から見た差は無い (同じエンドポイント・同じレス�
   `tunerServerType` の明示指定、`/docs` 取得失敗時のログ) は**実装は完了しているが未コミット**であり、
   いつ・どのバージョンで正式リリースに取り込まれるかは未確定。本ファイルの当該記述は
   2026-08-09 時点の作業ツリーの状態に基づく (`git status` で未コミットの差分として確認済み)。
-  いずれも実起動での疎通確認はまだ行われていない
+  EPGStation側の実起動は未確認。互換APIの実機疎通は下記§7に追記。
 - §1 に記した上流 Mirakurun (`/Users/ayumu/prog/Mirakurun`, `stuayu-main`) の `api.yml` 修正
   (`Service.channel` の配列化) も**未コミット**であり、EPGStation の `node_modules/mirakurun` に反映される
   タイミングは未確定。反映前の EPGStation 環境では `/docs` 相当の同梱定義は依然として単数を宣言している
+
+### 2026-08-30 実機4K疎通メモ
+
+`http://100.100.164.86:40080` で実起動APIを確認した。`GET /mirakurun/api/services` は
+4K 5サービスを NID=11/SID=141,151,161,171,181 として返した一方、SI未取得の
+BonDriverラベル「ＮＨＫ ＢＳ８Ｋ」を `id=0`, `networkId=0`, `serviceId=0` のサービスとして
+返していた。原因は `recisdb-proxy/src/scheduler/scan_scheduler.rs:1089-1101` の
+SIなし仮登録。修正後はこの行をDBへ登録しないため、EPGStationへ偽サービスを広告しない。
+
+同実機の `GET /mirakurun/api/services/1100141/stream` はチューナー競合時503を返し、
+再試行では実TSを取得できなかった。視聴成功・録画成功・H.265再生は未確認。

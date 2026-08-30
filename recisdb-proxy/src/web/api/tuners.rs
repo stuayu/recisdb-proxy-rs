@@ -15,18 +15,42 @@ use super::error::ApiError;
 pub async fn get_tuners(
     State(web_state): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let runtime = web_state.tuner_pool.keys().await;
+    let mut runtime_by_path = std::collections::HashMap::new();
+    for key in runtime {
+        if let Some(tuner) = web_state.tuner_pool.get(&key).await {
+            runtime_by_path
+                .entry(key.tuner_path.clone())
+                .or_insert(tuner);
+        }
+    }
     let db = web_state.database.lock().await;
-
     let drivers = db.get_all_bon_drivers()?;
     let tuners: Vec<serde_json::Value> = drivers
         .iter()
-        .map(|d| json!({
+        .map(|d| {
+            let runtime_tuner = runtime_by_path.get(&d.dll_path);
+            let converter = runtime_tuner.and_then(|t| t.mmt_status());
+            json!({
             "id": d.id,
             "dll_path": d.dll_path,
             "display_name": d.driver_name,
             "group_name": d.group_name,
-            "max_instances": d.max_instances
-        }))
+            "max_instances": d.max_instances,
+            "stream_format": db.driver_stream_format(&d.dll_path).as_db_value(),
+                "mmt_converter": converter.map(|s| json!({
+                "active": runtime_tuner.map(|t| matches!(t.state(), crate::tuner::shared::ReaderState::Starting | crate::tuner::shared::ReaderState::Running)).unwrap_or(false),
+                "input_bytes": s.received_bytes(),
+                "output_bytes": s.read_bytes(),
+                "queued_chunks": s.queued_chunks(),
+                "backlog_capacity": crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity(),
+                "dropped_chunks": s.dropped_chunks(),
+                "descramble_errors": s.descramble_error_count(),
+                "exit_code": s.process_exit_code(),
+                "last_message": s.last_message()
+            })).unwrap_or_else(|| json!({"active": false}))
+            })
+        })
         .collect();
 
     Ok(Json(json!({

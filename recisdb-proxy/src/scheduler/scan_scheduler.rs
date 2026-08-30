@@ -19,9 +19,9 @@
 //! - `scan_interval_hours`: How often to rescan (0 = disabled)
 //! - `scan_priority`: Priority order for scanning
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::BTreeMap;
 
 use log::{debug, error, info, warn};
 use tokio::sync::Mutex;
@@ -51,9 +51,9 @@ pub struct ScanSchedulerConfig {
 impl Default for ScanSchedulerConfig {
     fn default() -> Self {
         Self {
-            check_interval_secs: 60,        // Check every minute
-            max_concurrent_scans: 1,         // One scan at a time
-            scan_timeout_secs: 900,          // 15 minute timeout
+            check_interval_secs: 60, // Check every minute
+            max_concurrent_scans: 1, // One scan at a time
+            scan_timeout_secs: 900,  // 15 minute timeout
             signal_lock_wait_ms: 500,
             ts_read_timeout_ms: 300000,
         }
@@ -110,8 +110,10 @@ impl ScanScheduler {
 
     /// Run the scheduler loop.
     async fn run(&self) {
-        info!("ScanScheduler: Starting with check interval {} seconds",
-              self.config.check_interval_secs);
+        info!(
+            "ScanScheduler: Starting with check interval {} seconds",
+            self.config.check_interval_secs
+        );
 
         let mut check_interval = interval(Duration::from_secs(self.config.check_interval_secs));
 
@@ -161,7 +163,10 @@ impl ScanScheduler {
             return Ok(());
         }
 
-        info!("ScanScheduler: {} BonDriver(s) due for scanning", due_drivers.len());
+        info!(
+            "ScanScheduler: {} BonDriver(s) due for scanning",
+            due_drivers.len()
+        );
 
         // Process each due driver
         for driver in due_drivers {
@@ -269,12 +274,7 @@ impl ScanScheduler {
 
                     // Record failure in scan history
                     let db = database.lock().await;
-                    let _ = db.insert_scan_history(
-                        driver.id,
-                        0,
-                        false,
-                        Some(&e.to_string()),
-                    );
+                    let _ = db.insert_scan_history(driver.id, 0, false, Some(&e.to_string()));
                 }
                 Err(_) => {
                     error!(
@@ -284,12 +284,7 @@ impl ScanScheduler {
 
                     // Record timeout in scan history
                     let db = database.lock().await;
-                    let _ = db.insert_scan_history(
-                        driver.id,
-                        0,
-                        false,
-                        Some("Scan timed out"),
-                    );
+                    let _ = db.insert_scan_history(driver.id, 0, false, Some("Scan timed out"));
                 }
             }
 
@@ -370,7 +365,6 @@ const MIN_PACKETS_PER_FEED: usize = 10;
 /// WaitTsStream が false のときでも、一定回数に1回は Get を試す（実装差対策）
 const FORCE_GET_EVERY: usize = 10;
 
-
 /// Result from scanning a single channel.
 #[derive(Debug)]
 struct ScanChannelResult {
@@ -414,13 +408,16 @@ struct ServiceInfo {
     service_type: Option<u8>,
 }
 
-use crate::ts_analyzer::{TsAnalyzer, AnalyzerConfig};
+use crate::ts_analyzer::{AnalyzerConfig, TsAnalyzer};
 
 /// Enumerate available spaces and channels from BonDriver in one pass.
 fn enumerate_spaces_and_channels_blocking(
     dll_path: &str,
 ) -> Result<Vec<(u32, String, Vec<(u32, String)>)>, Box<dyn std::error::Error + Send + Sync>> {
-    info!("enumerate_spaces_and_channels: Loading BonDriver {}", dll_path);
+    info!(
+        "enumerate_spaces_and_channels: Loading BonDriver {}",
+        dll_path
+    );
     let tuner = BonDriverTuner::new(dll_path)?;
     info!(
         "enumerate_spaces_and_channels: BonDriver loaded, version {}",
@@ -446,10 +443,17 @@ fn enumerate_spaces_and_channels_blocking(
                     consecutive_none = 0;
                 }
                 None => {
-                    // Some BonDrivers have gaps in channel indices.
-                    // Allow up to 3 consecutive Nones before stopping.
+                    // Some BonDrivers have gaps in channel indices. Four-K
+                    // drivers commonly expose sparse/virtual channel lists;
+                    // three misses can otherwise hide a later TSID (notably
+                    // NHK BS4K). Keep probing a bounded gap and log why the
+                    // enumeration ended.
                     consecutive_none += 1;
-                    if consecutive_none > 3 {
+                    if consecutive_none > 16 {
+                        info!(
+                            "enumerate_spaces_and_channels: stopping space {} at channel {} after {} consecutive empty channel names",
+                            space_idx, ch_idx, consecutive_none
+                        );
                         break;
                     }
                 }
@@ -483,7 +487,10 @@ fn scan_space_blocking(
 ) -> Result<Vec<ScanChannelResult>, Box<dyn std::error::Error + Send + Sync>> {
     info!("scan_space_blocking: Loading BonDriver {}", dll_path);
     let tuner = BonDriverTuner::new(dll_path)?;
-    info!("scan_space_blocking: BonDriver loaded, version {}", tuner.version());
+    info!(
+        "scan_space_blocking: BonDriver loaded, version {}",
+        tuner.version()
+    );
 
     info!(
         "scan_space_blocking: Space {} scanning {} channels from pre-fetched list",
@@ -504,7 +511,10 @@ fn scan_space_blocking(
     for (channel, channel_name) in channels {
         let channel = *channel;
 
-        debug!("scan_space_blocking: Trying space={}, channel={} ({})", space, channel, channel_name);
+        debug!(
+            "scan_space_blocking: Trying space={}, channel={} ({})",
+            space, channel, channel_name
+        );
 
         // Set channel
         if let Err(e) = tuner.set_channel(space, channel) {
@@ -546,7 +556,9 @@ fn scan_space_blocking(
             consecutive_set_channel_failures += 1;
             total_set_channel_failures += 1;
 
-            if results.is_empty() && total_set_channel_failures >= MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS {
+            if results.is_empty()
+                && total_set_channel_failures >= MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS
+            {
                 warn!(
                     "scan_space_blocking: Aborting space {} after {} SetChannel failures with no successful lock",
                     space,
@@ -599,7 +611,11 @@ fn scan_space_blocking(
         const SIGNAL_SAMPLE_INTERVAL_MS: u64 = 200;
         const SIGNAL_SAMPLE_WINDOW_MS: u64 = 2000;
         let may_be_receivable = tuner.last_channel_locked().unwrap_or(true);
-        let sample_window_ms = if may_be_receivable { SIGNAL_SAMPLE_WINDOW_MS } else { 0 };
+        let sample_window_ms = if may_be_receivable {
+            SIGNAL_SAMPLE_WINDOW_MS
+        } else {
+            0
+        };
         let mut signal_level = tuner.get_signal_level();
         let mut sampled_ms = 0u64;
         while signal_level < MIN_SIGNAL_LEVEL && sampled_ms < sample_window_ms {
@@ -610,7 +626,10 @@ fn scan_space_blocking(
                 signal_level = level;
             }
         }
-        debug!("scan_space_blocking: Signal level = {:.2} dB (after {} ms of sampling)", signal_level, sampled_ms);
+        debug!(
+            "scan_space_blocking: Signal level = {:.2} dB (after {} ms of sampling)",
+            signal_level, sampled_ms
+        );
 
         if signal_level < MIN_SIGNAL_LEVEL {
             if may_be_receivable {
@@ -632,8 +651,10 @@ fn scan_space_blocking(
             continue;
         }
 
-        info!("scan_space_blocking: ✓ Found channel - Space={} CH={} Name=\"{}\" Signal={:.2}dB",
-              space, channel, channel_name, signal_level);
+        info!(
+            "scan_space_blocking: ✓ Found channel - Space={} CH={} Name=\"{}\" Signal={:.2}dB",
+            space, channel, channel_name, signal_level
+        );
 
         // Purge again AFTER the signal-lock wait: deep-buffered drivers
         // (BonDriverProxyEx etc.) can keep flushing the PREVIOUS channel's
@@ -653,14 +674,21 @@ fn scan_space_blocking(
             })) {
                 Ok(r) => r,
                 Err(panic_err) => {
-                    error!("scan_space_blocking: PANIC in analyze_ts_stream (attempt {}/3): {:?}", attempt + 1, panic_err);
+                    error!(
+                        "scan_space_blocking: PANIC in analyze_ts_stream (attempt {}/3): {:?}",
+                        attempt + 1,
+                        panic_err
+                    );
                     Err("panic in analyze_ts_stream".into())
                 }
             };
-            
+
             match result {
                 Ok(a) if a.network_id == Some(0x0000) => {
-                    warn!("scan_space_blocking: NID is 0x0000 (attempt {}/3), retrying...", attempt + 1);
+                    warn!(
+                        "scan_space_blocking: NID is 0x0000 (attempt {}/3), retrying...",
+                        attempt + 1
+                    );
                     // Purge and wait before retry
                     tuner.purge_ts_stream();
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -668,7 +696,10 @@ fn scan_space_blocking(
                 }
                 Ok(a) if a.network_id.is_none() => {
                     // NID not detected, retry
-                    warn!("scan_space_blocking: NID not detected (attempt {}/3), retrying...", attempt + 1);
+                    warn!(
+                        "scan_space_blocking: NID not detected (attempt {}/3), retrying...",
+                        attempt + 1
+                    );
                     tuner.purge_ts_stream();
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if attempt < 2 {
@@ -691,7 +722,11 @@ fn scan_space_blocking(
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         continue;
                     } else {
-                        warn!("scan_space_blocking:   → TS analysis failed after {} attempts: {}", attempt + 1, e);
+                        warn!(
+                            "scan_space_blocking:   → TS analysis failed after {} attempts: {}",
+                            attempt + 1,
+                            e
+                        );
                         analysis_result = Some(TsAnalysis::default());
                         break;
                     }
@@ -701,10 +736,20 @@ fn scan_space_blocking(
 
         let analysis = match analysis_result {
             Some(a) => {
-                let nid_str = a.network_id.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
-                let tsid_str = a.transport_stream_id.map(|n| format!("0x{:04X}", n)).unwrap_or_else(|| "N/A".to_string());
-                info!("scan_space_blocking:   → NID={} TSID={} ({} services detected)",
-                      nid_str, tsid_str, a.services.len());
+                let nid_str = a
+                    .network_id
+                    .map(|n| format!("0x{:04X}", n))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let tsid_str = a
+                    .transport_stream_id
+                    .map(|n| format!("0x{:04X}", n))
+                    .unwrap_or_else(|| "N/A".to_string());
+                info!(
+                    "scan_space_blocking:   → NID={} TSID={} ({} services detected)",
+                    nid_str,
+                    tsid_str,
+                    a.services.len()
+                );
                 for (idx, svc) in a.services.iter().enumerate() {
                     let svc_type = match svc.service_type {
                         Some(0x01) => "TV",
@@ -714,8 +759,14 @@ fn scan_space_blocking(
                         None => "Unknown",
                     };
                     let svc_name = svc.service_name.as_deref().unwrap_or("(unnamed)");
-                    info!("scan_space_blocking:     [{}/{}] SID=0x{:04X} Type={} Name=\"{}\"",
-                          idx + 1, a.services.len(), svc.service_id, svc_type, svc_name);
+                    info!(
+                        "scan_space_blocking:     [{}/{}] SID=0x{:04X} Type={} Name=\"{}\"",
+                        idx + 1,
+                        a.services.len(),
+                        svc.service_id,
+                        svc_type,
+                        svc_name
+                    );
                 }
                 a
             }
@@ -880,10 +931,16 @@ fn analyze_ts_stream(
         // resync（sync byte 0x47 を探す）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
         if !carry.is_empty() && carry[0] != 0x47 {
             if let Some(pos) = carry.iter().position(|&b| b == 0x47) {
-                debug!("analyze_ts_stream: resync drop {} bytes (0x47 at {})", pos, pos);
+                debug!(
+                    "analyze_ts_stream: resync drop {} bytes (0x47 at {})",
+                    pos, pos
+                );
                 carry.drain(0..pos);
             } else {
-                debug!("analyze_ts_stream: resync failed, dropping {} bytes", carry.len());
+                debug!(
+                    "analyze_ts_stream: resync failed, dropping {} bytes",
+                    carry.len()
+                );
                 carry.clear();
                 continue;
             }
@@ -940,8 +997,27 @@ fn analyze_ts_stream(
     }
     info!(
         "analyze_ts_stream: PAT:{} NIT:{} SDT:{} complete:{}",
-        result.pat.is_some(), result.nit.is_some(), result.sdt.is_some(), result.complete
+        result.pat.is_some(),
+        result.nit.is_some(),
+        result.sdt.is_some(),
+        result.complete
     );
+    if !result.complete {
+        let reason = match (
+            result.pat.is_some(),
+            result.nit.is_some(),
+            result.sdt.is_some(),
+        ) {
+            (false, _, _) => "PAT missing",
+            (true, false, _) => "PAT received but NIT missing",
+            (true, true, false) => "PAT/NIT received but SDT missing",
+            _ => "analyzer did not mark complete",
+        };
+        warn!(
+            "analyze_ts_stream: 4K/TS scan stopped without complete tables: {}",
+            reason
+        );
+    }
 
     build_ts_analysis(result)
 }
@@ -974,17 +1050,17 @@ fn satellite_remote_control_key(nid: u16, sid: u16) -> Option<u16> {
 /// BS remote-control key (ARIB TR-B15 fixed assignment per SID).
 fn bs_remote_control_key(sid: u16) -> Option<u16> {
     Some(match sid {
-        101 | 102 => 1,       // NHK BS
-        103 | 104 => 3,       // NHK BSプレミアム
-        141..=143 => 4,       // BS日テレ
-        151..=153 => 5,       // BS朝日
-        161..=163 => 6,       // BS-TBS
-        171..=173 => 7,       // BSテレ東
-        181..=183 => 8,       // BSフジ
-        191..=193 => 9,       // WOWOW
-        200..=202 => 10,      // スターチャンネル
-        211 | 212 => 11,      // BS11
-        222 => 12,            // BS12トゥエルビ
+        101 | 102 => 1,  // NHK BS
+        103 | 104 => 3,  // NHK BSプレミアム
+        141..=143 => 4,  // BS日テレ
+        151..=153 => 5,  // BS朝日
+        161..=163 => 6,  // BS-TBS
+        171..=173 => 7,  // BSテレ東
+        181..=183 => 8,  // BSフジ
+        191..=193 => 9,  // WOWOW
+        200..=202 => 10, // スターチャンネル
+        211 | 212 => 11, // BS11
+        222 => 12,       // BS12トゥエルビ
         _ => return None,
     })
 }
@@ -1011,27 +1087,28 @@ fn scan_results_to_channel_infos(
         let physical_ch = physical_ch_for(nid, tsid, r.physical_ch);
 
         if r.services.is_empty() {
-            // No services found, create entry with minimal info
-            // This shouldn't happen if TS analysis succeeded
-            warn!("scan_results_to_channel_infos: No services found for space={}, channel={}",
-                  r.space, r.channel);
-            let mut info = recisdb_protocol::ChannelInfo::new(nid, 0, tsid);
-            info.raw_name = Some(r.channel_name.clone());
-            info.channel_name = Some(r.channel_name.clone());
-            info.physical_ch = physical_ch;
-            info.network_name = r.network_name.clone();
-            info.remote_control_key = r.remote_control_key.map(u16::from);
-            info.terrestrial_region = region_for_band(nid);
-            info.bon_space = Some(r.space);
-            info.bon_channel = Some(r.channel);
-            channel_infos.push(info);
+            // A channel name from EnumChannelName2 is only a driver label.
+            // Without PAT/SDT service identity this is not a discovered
+            // service; inserting NID/SID/TSID=0 creates false channels such
+            // as the observed NHK BS8K/WOWOW 4K placeholders.
+            warn!(
+                "scan_results_to_channel_infos: rejecting channel without SI services: space={}, channel={}, name={:?}, nid={:?}, tsid={:?}",
+                r.space,
+                r.channel,
+                r.channel_name,
+                r.network_id,
+                r.transport_stream_id
+            );
         } else {
             // Create a ChannelInfo entry for each service
             for svc in &r.services {
                 let mut info = recisdb_protocol::ChannelInfo::new(nid, svc.service_id, tsid);
                 // raw_name preserves the scanned SDT service name verbatim;
                 // channel_name starts identical but is the user-editable one.
-                let name = svc.service_name.clone().unwrap_or_else(|| r.channel_name.clone());
+                let name = svc
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| r.channel_name.clone());
                 info.raw_name = Some(name.clone());
                 info.channel_name = Some(name);
                 info.physical_ch = physical_ch;
@@ -1136,8 +1213,7 @@ async fn perform_scan(
             if channels.is_empty() {
                 warn!(
                     "perform_scan: Space {} ({}) has no channels from BonDriver enumeration",
-                    space,
-                    space_name
+                    space, space_name
                 );
                 continue;
             }
@@ -1149,7 +1225,14 @@ async fn perform_scan(
                 channels.len()
             );
 
-            match scan_space_blocking(&dll, space, &channels, signal_lock_wait_ms, ts_read_timeout_ms, mmt_converter.as_ref()) {
+            match scan_space_blocking(
+                &dll,
+                space,
+                &channels,
+                signal_lock_wait_ms,
+                ts_read_timeout_ms,
+                mmt_converter.as_ref(),
+            ) {
                 Ok(r) => results.extend(r),
                 Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
             }
@@ -1171,7 +1254,10 @@ async fn perform_scan(
         let mut db = database.lock().await;
         match db.merge_scan_results(driver_id, &channel_infos) {
             Ok(result) => {
-                info!("perform_scan: Merged {} inserted, {} updated", result.inserted, result.updated);
+                info!(
+                    "perform_scan: Merged {} inserted, {} updated",
+                    result.inserted, result.updated
+                );
             }
             Err(crate::database::DatabaseError::BonDriverNotFound(detail)) => {
                 // Driver was deleted/replaced while the (minutes-long) scan
@@ -1187,12 +1273,7 @@ async fn perform_scan(
         }
 
         // Record successful scan in history
-        let _ = db.insert_scan_history(
-            driver_id,
-            total as i32,
-            true,
-            None,
-        );
+        let _ = db.insert_scan_history(driver_id, total as i32, true, None);
     }
 
     info!(
@@ -1273,6 +1354,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_results_reject_driver_label_without_si_service() {
+        let result = ScanChannelResult {
+            space: 0,
+            channel: 2,
+            channel_name: "ＮＨＫ　ＢＳ８Ｋ".to_string(),
+            signal_level: 100.0,
+            network_id: None,
+            transport_stream_id: None,
+            network_name: None,
+            remote_control_key: None,
+            physical_ch: None,
+            services: Vec::new(),
+        };
+
+        assert!(scan_results_to_channel_infos(&[result]).is_empty());
+    }
+
+    #[test]
     fn test_scan_scheduler_config_default() {
         let config = ScanSchedulerConfig::default();
         assert_eq!(config.check_interval_secs, 60);
@@ -1336,14 +1435,15 @@ fn log_scan_results(channel_infos: &[recisdb_protocol::ChannelInfo], total: usiz
             let band_type = BandType::from_nid(ch.nid);
             let band_name = band_type.display_name();
             let region = ch.terrestrial_region.as_deref().unwrap_or("N/A");
-            let service_type = ch.service_type.map(|st| {
-                match st {
+            let service_type = ch
+                .service_type
+                .map(|st| match st {
                     0x01 => "TV",
                     0x02 => "Radio",
                     0xC0 => "Data",
                     _ => "Other",
-                }
-            }).unwrap_or("Unknown");
+                })
+                .unwrap_or("Unknown");
 
             let service_name = ch.channel_name.as_deref().unwrap_or("(unnamed)");
 
@@ -1353,12 +1453,14 @@ fn log_scan_results(channel_infos: &[recisdb_protocol::ChannelInfo], total: usiz
             );
         }
     } else {
-        info!("perform_scan: (Omitting detailed list - {} channels)", channel_infos.len());
+        info!(
+            "perform_scan: (Omitting detailed list - {} channels)",
+            channel_infos.len()
+        );
     }
 
     info!("perform_scan: ==== End of Results ====");
 }
-
 
 /// Turn a finished analyzer result into the scan's `TsAnalysis`.
 ///
@@ -1385,7 +1487,11 @@ fn build_ts_analysis(
                     })
                     .unwrap_or((None, None));
 
-                ServiceInfo { service_id: sid, service_name, service_type }
+                ServiceInfo {
+                    service_id: sid,
+                    service_name,
+                    service_type,
+                }
             })
             .collect()
     } else {
@@ -1396,16 +1502,17 @@ fn build_ts_analysis(
     // Terrestrial NIT actual normally lists only the tuned TS; the
     // find_map fallback covers streams that omit the TSID match (BS/CS
     // carry no TS情報記述子, so this stays None there).
-    let remote_control_key = result
-        .nit
-        .as_ref()
-        .and_then(|nit| {
-            result
-                .transport_stream_id
-                .and_then(|tsid| nit.find_transport_stream(tsid))
-                .and_then(|ts| ts.remote_control_key)
-                .or_else(|| nit.transport_streams.iter().find_map(|ts| ts.remote_control_key))
-        });
+    let remote_control_key = result.nit.as_ref().and_then(|nit| {
+        result
+            .transport_stream_id
+            .and_then(|tsid| nit.find_transport_stream(tsid))
+            .and_then(|ts| ts.remote_control_key)
+            .or_else(|| {
+                nit.transport_streams
+                    .iter()
+                    .find_map(|ts| ts.remote_control_key)
+            })
+    });
 
     // Physical UHF channel from the NIT 地上分配システム記述子 (terrestrial
     // only; BS/CS derive theirs from the TSID in scan_results_to_channel_infos).

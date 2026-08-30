@@ -129,6 +129,17 @@ mod dispatch {
             }
         }
 
+        /// Windows-only native read diagnostics. Other backends have no
+        /// caller-buffer carry-over and return `None`.
+        pub fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
+            match self {
+                BonDriverTuner::CharDev(_) => None,
+                BonDriverTuner::Px4Daemon(_) => None,
+                #[cfg(target_os = "linux")]
+                BonDriverTuner::DvbV5(_) => None,
+            }
+        }
+
         pub fn purge_ts_stream(&self) {
             match self {
                 BonDriverTuner::CharDev(t) => t.purge_ts_stream(),
@@ -210,6 +221,10 @@ mod stub {
                 io::ErrorKind::Unsupported,
                 "BonDriver/chardev tuner is only supported on Windows and Linux",
             ))
+        }
+
+        pub fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
+            None
         }
 
         pub fn purge_ts_stream(&self) {}

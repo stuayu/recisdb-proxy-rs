@@ -1,6 +1,6 @@
 # BS4K (高度BSデジタル) 対応
 
-## 方式: 生MMT/TLVは本体で読み、変換だけdantto4kに渡す
+## 方式: 生MMT/TLV方式とBonDriverラッパー方式
 
 4K放送は MMT/TLV 多重で、MPEG-2 TS ではない。recisdb-proxy のパイプライン
 (TS解析・EPG・ロゴ・チャンネル列挙・録画・全セッション) はすべて TS 前提なので、
@@ -25,6 +25,15 @@ flowchart LR
 
 4K以外の経路は一切変わらない。変換器が挟まるのは
 `stream_format = 'mmttlv'` のドライバだけ。
+
+実機の `BonDriver_dantto4k.dll` は `stream_format = 'ts'` で登録され、BonDriver内部で
+MMT/TLVをTSへ変換するラッパー方式で動作している。実測ではBS日テレ4K、BS朝日4K、
+BS-TBS 4K、BSテレ東4K、BSフジ4KでNID=0x000BとSID/TSID/SDTを取得できた。
+この構成では `MmtPipe` は通らず、`[mmttlv]` の外部変換器設定も使わない。
+
+ラッパー方式では `stream_format = 'ts'` は通常TSと同じ扱いになる。SI取得に失敗した
+チャンネルは4Kと自動判定できないため、既に復号済みのラッパーなら `disable_b25 = true`
+をドライバ単位で設定する。設定変更後はリーダーを再起動し、検証後に元へ戻す。
 
 変換器は [dantto4k](https://github.com/nekohkr/dantto4k) (Apache-2.0) の CLI。
 
@@ -59,17 +68,33 @@ FIFO で実測した結果 (修正前 → 修正後): `tellg()` が `-1` → 正
 **この修正を入れた変換器が必要。** 素のビルドでは標準入力から何も読まないため、
 `MmtPipe` の停滞検出がエラーを出して止まる。
 
-### なぜ BonDriver ラッパーを使わないのか
+### ラッパー方式の制約
 
 dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の BonDriver を
 ロードしてインラインで変換する。理屈の上ではこちらなら proxy 側の変更はゼロで済む。
 
-しかし**実際に試すと、MMT/TLV は流れているのに何も出力されない**状態になった。
-そのため生の読み出しは本体が行い、dantto4k には変換機能だけを使わせる。
+過去の別環境では、MMT/TLVは流れているのにラッパー出力が無い事例があった。その場合は
+生の読み出し + 外部変換方式へ切り替える。TSを返す環境を一律に `mmttlv` と登録すると
+二重変換で壊れる。
 
 補足: dantto4k は**復調しない**。復調はチューナーのハードと BonDriver が行う。
 
 ## セットアップ
+
+## 障害診断ログ
+
+4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued/capacity` はstdin待ち行列、`dropped` は投入できず破棄したチャンク。`no_output_for` が30秒に達した場合は変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。
+
+`GET /api/tuners` に `mmt_converter` 診断を載せる。`active=false` はそのBonDriverの実行中リーダーに変換器状態が無い、`output_bytes=0` かつ `input_bytes>0` は変換器が入力を受けたがTSを返していない状態を示す。ダッシュボードのBonDriver画面にも表示する。
+
+実機では次を実行し、スキャン対象の全BonDriver列挙とNHK BS4Kのログを保存する。
+
+```sh
+curl -sS https://<host>/api/tuners
+curl -sS http://<host>/api/logs?limit=1000
+```
+
+スキャン完了後、`enumerate_spaces_and_channels` のspace/channel数、`NID=0x000B` の各 `TSID`、`PAT/NIT/SDT`、`input/output/dropped` を突き合わせる。ラッパー方式では `MmtPipe` の値は出ないため、`PAT/NITは有るがSDT無し` と `NID/TSID/SID=0` の仮登録を確認する。`output=0` は外部変換方式でのACASまたは古いdantto4k、`dropped>0` は変換器スループット不足を示す。
 
 1. dantto4k を配置する
 2. **ACAS 復号の手段を用意する** (下記「復号が最大のハマりどころ」)
@@ -334,11 +359,23 @@ seed は名前 (`preview-4k`) で存在確認する冪等処理なので、管�
 
 ## 未対応 / 要確認
 
-- **配信 (視聴・録画) は未検証。** スキャンと同じ `MmtPipe` を通るので方式としては
-  そのまま動くはずだが、実ストリームで確認していない。懸念は変換のスループット:
-  スキャン時の観測ではバックログが埋まり続けており、リアルタイムに追いついて
-  いない可能性がある。読み込み単位の修正 (5MB → 64KB) で改善するかもしれないが、
-  復号のカード往復が律速なら残る
+### 2026-08-30 実機検証メモ
+
+- **実測**: `/api/channels` は4K 5サービスを NID=11、`band_type=FourK` で返した。
+  ch2「ＮＨＫ ＢＳ８Ｋ」とch7「ＷＯＷＯＷ ４Ｋ」は名前だけで、NID/TSID/SID=0。
+- **実測**: ch2選局はsignal=100.0dBでも45秒間TS 0バイト。B25有効時は30秒で
+  `no TS data` 停止。`disable_b25=true` の実験ではB25無効ログが出たが、TS 0バイトは
+  変わらず、B25だけではch2の無出力を説明できない。
+- **実測**: 実験後 `disable_b25=false` へ復元済み。実機の `stream_format=ts` は維持。
+- **推測**: ch2はラッパー内部の8K入力または当該サービス出力に未対応の可能性がある。
+  NHK BS4Kが同一トランスポンダに同居するかは、ラッパーがTSを返す状態でPAT/SDT/NITを
+  採取して確認する必要がある。
+- **実測**: `/mirakurun/api/services/1100141/stream` は競合時503、再試行時も実TS未取得。
+  視聴成功、H.265映像、EIT/H-EIT、WOWOWのACAS復号は未確認。
+
+- **配信 (視聴・録画) は未検証。** 実機はラッパー方式なので `MmtPipe` の検証結果を
+  そのまま適用できない。ラッパーのTS出力、B25無効化、プレイヤーのH.265/2160p対応が
+  検証対象。
 - **修正版 dantto4k のビルド確認**。手元では tsduck が無くビルドできていない
 - **ダッシュボード (Vue) のフォーム露出**。Web API 側は対応済みで、
   `GET/POST/PATCH /api/bondrivers` が `stream_format` と `disable_b25` を

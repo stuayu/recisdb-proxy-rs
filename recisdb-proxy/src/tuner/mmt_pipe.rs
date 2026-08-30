@@ -40,7 +40,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
@@ -54,6 +54,7 @@ const WRITE_BACKLOG_CHUNKS: usize = 64;
 
 /// Size of each read from the converter's stdout.
 const STDOUT_CHUNK: usize = 256 * 1024;
+const NO_OUTPUT_ERROR_AFTER: Duration = Duration::from_secs(30);
 
 /// Give up once this many chunks have been dropped without a single byte of
 /// converted output coming back.
@@ -175,8 +176,13 @@ pub struct ConverterStatus {
     /// produced nothing" — two very different faults that otherwise look
     /// identical from the outside (no TS either way).
     written_bytes: AtomicU64,
+    received_bytes: AtomicU64,
     /// Bytes read back from the converter's stdout.
     read_bytes: AtomicU64,
+    queued_chunks: AtomicU64,
+    input_started_at: Mutex<Option<Instant>>,
+    last_output_at: Mutex<Option<Instant>>,
+    process_exit_code: std::sync::atomic::AtomicI32,
     /// The most recent unrecognised stderr line, for diagnostics.
     last_message: Mutex<Option<String>>,
 }
@@ -198,8 +204,40 @@ impl ConverterStatus {
         self.written_bytes.load(Ordering::Relaxed)
     }
 
+    pub fn received_bytes(&self) -> u64 {
+        self.received_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn process_exit_code(&self) -> Option<i32> {
+        match self.process_exit_code.load(Ordering::Relaxed) {
+            -2 => None,
+            -1 => Some(-1),
+            code => Some(code),
+        }
+    }
+
     pub fn read_bytes(&self) -> u64 {
         self.read_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn queued_chunks(&self) -> u64 {
+        self.queued_chunks.load(Ordering::Relaxed)
+    }
+
+    pub fn backlog_capacity() -> u64 {
+        WRITE_BACKLOG_CHUNKS as u64
+    }
+
+    pub fn no_output_for(&self) -> Option<Duration> {
+        let started = *self
+            .input_started_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let output = *self
+            .last_output_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        started.filter(|_| output.is_none()).map(|t| t.elapsed())
     }
 
     pub fn last_message(&self) -> Option<String> {
@@ -229,10 +267,8 @@ impl ConverterStatus {
                 // 出す。変換器は毎秒何かを吐くわけではないので、そのまま流して
                 // 問題ない (進捗表示は --no-progress で止めてある)。
                 warn!("[MmtPipe] converter: {}", line);
-                *self
-                    .last_message
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(line.to_string());
+                *self.last_message.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(line.to_string());
             }
         }
     }
@@ -271,7 +307,11 @@ impl MmtPipe {
     /// Split out from [`Self::new`] so the process plumbing can be exercised
     /// against a stand-in command whose options differ from the converter's.
     fn spawn(command_path: &str, args: &[String]) -> std::io::Result<Self> {
-        info!("[MmtPipe] Starting converter: {} {}", command_path, args.join(" "));
+        info!(
+            "[MmtPipe] Starting converter: {} {}",
+            command_path,
+            args.join(" ")
+        );
 
         let mut child = Command::new(command_path)
             .args(args)
@@ -281,16 +321,28 @@ impl MmtPipe {
             .spawn()?;
 
         let mut stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "converter stdin unavailable")
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "converter stdin unavailable",
+            )
         })?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "converter stdout unavailable")
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "converter stdout unavailable",
+            )
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "converter stderr unavailable")
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "converter stderr unavailable",
+            )
         })?;
 
         let status = Arc::new(ConverterStatus::default());
+        // AtomicI32::default() is zero, but zero is a valid successful exit
+        // code. Keep the running state distinct from exit(0).
+        status.process_exit_code.store(-2, Ordering::Relaxed);
         let (to_child, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_BACKLOG_CHUNKS);
         let (read_tx, from_child) = std::sync::mpsc::channel::<Vec<u8>>();
 
@@ -308,6 +360,9 @@ impl MmtPipe {
                 // Counted only after the write returns: a converter that never
                 // drains stdin leaves this at zero while the backlog overflows,
                 // which is exactly the signature we need to see.
+                status_for_stdin
+                    .queued_chunks
+                    .fetch_sub(1, Ordering::Relaxed);
                 status_for_stdin
                     .written_bytes
                     .fetch_add(len, Ordering::Relaxed);
@@ -327,6 +382,10 @@ impl MmtPipe {
                         status_for_stdout
                             .read_bytes
                             .fetch_add(n as u64, Ordering::Relaxed);
+                        *status_for_stdout
+                            .last_output_at
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                         if read_tx.send(buf[..n].to_vec()).is_err() {
                             break; // pipe dropped
                         }
@@ -370,6 +429,14 @@ impl MmtPipe {
         &self.status
     }
 
+    pub fn refresh_process_status(&mut self) {
+        if let Ok(Some(exit)) = self.child.try_wait() {
+            self.status
+                .process_exit_code
+                .store(exit.code().unwrap_or(-1), Ordering::Relaxed);
+        }
+    }
+
     /// Feed raw MMT/TLV and collect whatever TS is ready.
     ///
     /// Never blocks on the converter. The returned buffer is empty whenever
@@ -383,13 +450,22 @@ impl MmtPipe {
                 ));
             };
             match tx.try_send(input.to_vec()) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    let n = self
+                Ok(()) => {
+                    self.status
+                        .received_bytes
+                        .fetch_add(input.len() as u64, Ordering::Relaxed);
+                    self.status.queued_chunks.fetch_add(1, Ordering::Relaxed);
+                    let mut started = self
                         .status
-                        .dropped_chunks
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
+                        .input_started_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if started.is_none() {
+                        *started = Some(Instant::now());
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    let n = self.status.dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || n % 100 == 0 {
                         // A full backlog means we never attempt a write, and a
                         // write is the only thing that would surface a dead
@@ -483,6 +559,20 @@ impl MmtPipe {
         let mut out = Vec::new();
         while let Ok(chunk) = self.from_child.try_recv() {
             out.extend_from_slice(&chunk);
+        }
+        if out.is_empty()
+            && self
+                .status
+                .no_output_for()
+                .is_some_and(|d| d >= NO_OUTPUT_ERROR_AFTER)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "MMT/TLV converter produced no stdout for {}s",
+                    NO_OUTPUT_ERROR_AFTER.as_secs()
+                ),
+            ));
         }
         Ok(out)
     }
@@ -651,8 +741,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_converter_that_exits_immediately_is_reported() {
-        let mut pipe = MmtPipe::spawn("/bin/sh", &["-c".to_string(), "exit 3".to_string()])
-            .expect("spawn sh");
+        let mut pipe =
+            MmtPipe::spawn("/bin/sh", &["-c".to_string(), "exit 3".to_string()]).expect("spawn sh");
 
         // Give it a moment to actually exit before pushing.
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -711,8 +801,7 @@ mod tests {
         // `cat -` reads stdin and writes stdout, which is the same contract
         // the converter is driven under. Its own option set differs, so this
         // goes through `spawn` rather than `build_args`.
-        let mut pipe =
-            MmtPipe::spawn("/bin/cat", &["-".to_string()]).expect("spawn cat");
+        let mut pipe = MmtPipe::spawn("/bin/cat", &["-".to_string()]).expect("spawn cat");
 
         let payload = vec![0x7Fu8; 4096];
         pipe.push(&payload).expect("push");

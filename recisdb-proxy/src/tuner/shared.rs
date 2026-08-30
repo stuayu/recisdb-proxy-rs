@@ -14,9 +14,9 @@ use tokio::sync::{broadcast, watch};
 
 use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
+use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
-use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::nit_collector::NitCollector;
 use crate::tuner::pool::{SlotPermit, TunerPool, TunerPoolConfig};
 use crate::tuner::timing;
@@ -251,7 +251,10 @@ pub fn probe_b25_availability() {
 /// 判定が済んでいて、かつ「使える」だったか。読み取りループが作り直しの
 /// 要否を判断するのに使う。
 fn b25_known_available() -> bool {
-    matches!(*B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()), Some(true))
+    matches!(
+        *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()),
+        Some(true)
+    )
 }
 
 fn init_b25_with_deadline(opt: DecoderOptions) -> Option<B25Pipe> {
@@ -375,6 +378,8 @@ pub struct SharedTuner {
     lock: TunerLock,
     /// Counter for received TS packets.
     packets_received: AtomicU64,
+    /// Runtime status of the 4K MMT/TLV converter, if this reader uses one.
+    mmt_status: std::sync::Mutex<Option<Arc<crate::tuner::mmt_pipe::ConverterStatus>>>,
     /// This entry's reservation against its DLL's `max_instances` capacity
     /// (docs/TUNER_PIPELINE_REDESIGN.md P1b), if it currently holds one.
     ///
@@ -419,6 +424,7 @@ impl SharedTuner {
             bondriver_version,
             lock: TunerLock::new(),
             packets_received: AtomicU64::new(0),
+            mmt_status: std::sync::Mutex::new(None),
             slot: std::sync::Mutex::new(None),
         })
     }
@@ -924,7 +930,10 @@ impl SharedTuner {
                 true
             }
         } else {
-            error!("[SharedTuner] Failed to acquire reader handle lock for {:?}", self.key);
+            error!(
+                "[SharedTuner] Failed to acquire reader handle lock for {:?}",
+                self.key
+            );
             false
         };
 
@@ -963,10 +972,16 @@ impl SharedTuner {
     /// prevent for the *open* phase but cannot prevent once an old reader is
     /// already past it.
     async fn stop_existing_reader_before_restart(&self) -> Result<(), std::io::Error> {
-        if !matches!(self.state(), ReaderState::Starting | ReaderState::Running | ReaderState::Stopping) {
+        if !matches!(
+            self.state(),
+            ReaderState::Starting | ReaderState::Running | ReaderState::Stopping
+        ) {
             return Ok(());
         }
-        info!("[SharedTuner] Stopping existing reader for {:?} before restart", self.key);
+        info!(
+            "[SharedTuner] Stopping existing reader for {:?} before restart",
+            self.key
+        );
         if self.stop_reader().await {
             Ok(())
         } else {
@@ -1005,7 +1020,10 @@ impl SharedTuner {
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
         // Set channel with retry for network-latency environments
-        info!("[SharedTuner] Setting channel: space={}, channel={}", space, channel);
+        info!(
+            "[SharedTuner] Setting channel: space={}, channel={}",
+            space, channel
+        );
         let set_start = std::time::Instant::now();
         let mut set_attempts: u32 = 0;
 
@@ -1100,7 +1118,12 @@ impl SharedTuner {
         let mut mmt = match startup_config.mmt_converter.as_ref() {
             Some(cfg) => match crate::tuner::mmt_pipe::MmtPipe::new(cfg) {
                 Ok(pipe) => {
-                    info!("[SharedTuner] MMT/TLV converter started for {:?}", shared.key);
+                    *shared.mmt_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Arc::clone(pipe.status()));
+                    info!(
+                        "[SharedTuner] MMT/TLV converter started for {:?}",
+                        shared.key
+                    );
                     Some(pipe)
                 }
                 Err(e) => {
@@ -1111,10 +1134,7 @@ impl SharedTuner {
                         "[SharedTuner] Failed to start MMT/TLV converter for {:?}: {}",
                         shared.key, e
                     );
-                    let _ = ready_tx.send(Err(format!(
-                        "MMT/TLV converter failed to start: {}",
-                        e
-                    )));
+                    let _ = ready_tx.send(Err(format!("MMT/TLV converter failed to start: {}", e)));
                     shared.stop_and_release_slot();
                     return;
                 }
@@ -1260,6 +1280,7 @@ impl SharedTuner {
         let mut total_bytes_read = 0u64;
         let mut last_log_time = std::time::Instant::now();
         let mut last_status_log = std::time::Instant::now();
+        let mut last_mmt_status_log = std::time::Instant::now();
         let mut reader_first_read = true;
         let reader_start_time = std::time::Instant::now();
         let mut broadcast_send_errors: u64 = 0;
@@ -1267,7 +1288,10 @@ impl SharedTuner {
         loop {
             // Check if we should stop due to explicit stop signal
             if shared.state() != ReaderState::Running {
-                info!("[SharedTuner] BREAK: Stop signal received for {:?}", shared.key);
+                info!(
+                    "[SharedTuner] BREAK: Stop signal received for {:?}",
+                    shared.key
+                );
                 break;
             }
 
@@ -1276,7 +1300,38 @@ impl SharedTuner {
                 let level = tuner.get_signal_level();
                 info!("[SharedTuner] LOOP_STATUS: total_bytes={}, consecutive_empty={}, signal={:.1}dB, subscribers={}, state={:?}, elapsed={}s",
                       total_bytes_read, consecutive_empty, level, shared.subscriber_count(), shared.state(), reader_start_time.elapsed().as_secs());
+                if let Some((calls, bytes, max_chunk, pending_peak)) = tuner.get_ts_stream_stats() {
+                    info!(
+                        "[BonDriver] GetTsStream stats: calls={}, bytes={}, max_chunk={}, pending_peak={}",
+                        calls, bytes, max_chunk, pending_peak
+                    );
+                }
                 last_status_log = std::time::Instant::now();
+            }
+
+            if mmt.is_some() {
+                if last_mmt_status_log.elapsed().as_secs() >= 10 {
+                    // Refresh Child::try_wait without touching the reader's
+                    // blocking I/O path. Exit code distinguishes a dead
+                    // converter from one that is merely producing no TS.
+                    // (The mutable borrow is limited to this diagnostic.)
+                    if let Some(pipe) = mmt.as_mut() {
+                        pipe.refresh_process_status();
+                    }
+                    let Some(pipe) = mmt.as_ref() else { continue };
+                    info!("[MmtPipe] status tuner={:?} input={}B output={}B queued={}/{} ({:.0}%) dropped={} no_output_for={:?}",
+                        shared.key, pipe.status().received_bytes(), pipe.status().read_bytes(),
+                        pipe.status().queued_chunks(), crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity(),
+                        pipe.status().queued_chunks() as f64 * 100.0 / crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity() as f64,
+                        pipe.status().dropped_chunks(), pipe.status().no_output_for());
+                    if let Some(code) = pipe.status().process_exit_code() {
+                        error!(
+                            "[MmtPipe] converter exited for {:?}: code={}",
+                            shared.key, code
+                        );
+                    }
+                    last_mmt_status_log = std::time::Instant::now();
+                }
             }
 
             // Wait for TS data to be available.
@@ -1323,8 +1378,12 @@ impl SharedTuner {
                     let n = std::cmp::min(n, buf.len());
 
                     // Log at INFO level only if we got significant data
-                    if n > 0 && n % 327680 == 0 {  // Log every 5MB
-                        info!("[SharedTuner] GetTsStream: n={} bytes, remaining={}", n, remaining);
+                    if n > 0 && n % 327680 == 0 {
+                        // Log every 5MB
+                        info!(
+                            "[SharedTuner] GetTsStream: n={} bytes, remaining={}",
+                            n, remaining
+                        );
                     }
 
                     if n == 0 {
@@ -1355,7 +1414,10 @@ impl SharedTuner {
                         shared.mark_first_ts();
                         reader_first_read = false;
                     } else if consecutive_empty > 0 {
-                        debug!("[SharedTuner] Got data after {} empty reads: {} bytes", consecutive_empty, n);
+                        debug!(
+                            "[SharedTuner] Got data after {} empty reads: {} bytes",
+                            consecutive_empty, n
+                        );
                     }
                     consecutive_empty = 0;
                     total_bytes_read += n as u64;
@@ -1424,9 +1486,10 @@ impl SharedTuner {
                     if let Some(b25_decoder) = &mut b25 {
                         if !b25_needs_reset {
                             // Wrap B25 push in panic safety
-                            let push_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                b25_decoder.push(raw)
-                            }));
+                            let push_result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    b25_decoder.push(raw)
+                                }));
 
                             match push_result {
                                 Ok(Ok(decoded)) => {
@@ -1463,7 +1526,9 @@ impl SharedTuner {
                                     }
 
                                     if consecutive_b25_errors >= 10 {
-                                        error!("[SharedTuner] Too many B25 errors, resetting decoder");
+                                        error!(
+                                            "[SharedTuner] Too many B25 errors, resetting decoder"
+                                        );
                                         b25_needs_reset = true;
                                     }
 
@@ -1514,8 +1579,10 @@ impl SharedTuner {
                     if last_log_time.elapsed().as_secs() >= 5 {
                         let level = tuner.get_signal_level();
                         shared.set_signal_level(level);
-                        info!("[SharedTuner] {:?}: {} bytes sent, signal={:.1}dB",
-                              shared.key, total_bytes_read, level);
+                        info!(
+                            "[SharedTuner] {:?}: {} bytes sent, signal={:.1}dB",
+                            shared.key, total_bytes_read, level
+                        );
                         last_log_time = std::time::Instant::now();
                     }
                 }
@@ -1523,7 +1590,10 @@ impl SharedTuner {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         consecutive_empty = consecutive_empty.saturating_add(1);
                         if should_log_empty_streak(consecutive_empty) && !reader_first_read {
-                            info!("[SharedTuner] get_ts_stream WouldBlock ({} times), total_bytes={}", consecutive_empty, total_bytes_read);
+                            info!(
+                                "[SharedTuner] get_ts_stream WouldBlock ({} times), total_bytes={}",
+                                consecutive_empty, total_bytes_read
+                            );
                         }
                         let max_attempts = if reader_first_read { 40000 } else { 1000 };
                         if consecutive_empty > max_attempts {
@@ -1542,7 +1612,12 @@ impl SharedTuner {
                         continue;
                     }
 
-                    warn!("[SharedTuner] Error reading TS data: {} (kind={:?}), total_bytes={}", e, e.kind(), total_bytes_read);
+                    warn!(
+                        "[SharedTuner] Error reading TS data: {} (kind={:?}), total_bytes={}",
+                        e,
+                        e.kind(),
+                        total_bytes_read
+                    );
                     consecutive_empty = consecutive_empty.saturating_add(1);
                     if consecutive_empty > 1000 {
                         error!("[SharedTuner] Too many consecutive errors ({} times), stopping reader for {:?}", consecutive_empty, shared.key);
@@ -1561,7 +1636,10 @@ impl SharedTuner {
         }
 
         shared.stop_and_release_slot();
-        info!("[SharedTuner] Reader task stopped for {:?}, total bytes: {}", shared.key, total_bytes_read);
+        info!(
+            "[SharedTuner] Reader task stopped for {:?}, total bytes: {}",
+            shared.key, total_bytes_read
+        );
     }
 
     /// Single entry point for starting this tuner's reader
@@ -1863,7 +1941,10 @@ impl SharedTuner {
                     info!("[SharedTuner] Reader task completed normally");
                 }
                 Err(panic_err) => {
-                    error!("[SharedTuner] CRITICAL PANIC in reader task: {:?}", panic_err);
+                    error!(
+                        "[SharedTuner] CRITICAL PANIC in reader task: {:?}",
+                        panic_err
+                    );
                     shared.set_stop_reason(StopReason::ReaderFailed);
                     shared.stop_and_release_slot();
                 }
@@ -1995,6 +2076,13 @@ impl SharedTuner {
     /// check now that [`ReaderState::Starting`] exists).
     pub fn is_running(&self) -> bool {
         self.state() == ReaderState::Running
+    }
+
+    pub fn mmt_status(&self) -> Option<Arc<crate::tuner::mmt_pipe::ConverterStatus>> {
+        self.mmt_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -2282,7 +2370,9 @@ mod tests {
         let source = FakeTsSource::new()
             .with_startup_delay(std::time::Duration::from_millis(150))
             .with_chunk(vec![0u8; 188]);
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
 
         // `spawn_fake_reader` sets Starting synchronously, before the
         // blocking task is even scheduled.
@@ -2338,7 +2428,10 @@ mod tests {
             .expect("ready channel closed unexpectedly");
         assert!(ready.is_err(), "expected startup failure");
         assert_eq!(shared.state(), ReaderState::Stopped);
-        assert!(shared.is_reclaimable(), "a failed startup with no subscribers must be reclaimable");
+        assert!(
+            shared.is_reclaimable(),
+            "a failed startup with no subscribers must be reclaimable"
+        );
 
         // The blocking task has already returned by this point (it sends
         // `ready_tx` right before its final `return`), but every test that
@@ -2357,8 +2450,11 @@ mod tests {
         let key = ChannelKey::simple("/dev/test", 1);
         let shared = SharedTuner::new(key, 2);
 
-        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::AddrNotAvailable);
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let source =
+            FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::AddrNotAvailable);
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
 
         let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
             .await
@@ -2379,13 +2475,18 @@ mod tests {
         let shared = SharedTuner::new(key, 2);
 
         let source = FakeTsSource::new().with_panic_on_set_channel();
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
 
         let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
             .await
             .expect("ready signal timed out")
             .expect("ready channel closed unexpectedly");
-        assert!(ready.is_err(), "expected the panic to surface as a startup failure");
+        assert!(
+            ready.is_err(),
+            "expected the panic to surface as a startup failure"
+        );
         assert_eq!(shared.state(), ReaderState::Stopped);
         assert!(shared.is_reclaimable());
         shared.stop_reader().await;
@@ -2406,7 +2507,9 @@ mod tests {
         let shared = SharedTuner::new(key, 2);
 
         let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
         assert_eq!(shared.state(), ReaderState::Starting);
 
         // Request a stop while still inside the fake's 200ms `set_channel`
@@ -2421,7 +2524,11 @@ mod tests {
             .expect("ready signal timed out")
             .expect("ready channel closed unexpectedly");
         assert!(ready.is_ok(), "ready_tx still fires (startup itself succeeded); the state, not this value, is authoritative");
-        assert_eq!(shared.state(), ReaderState::Stopped, "must not have been resurrected to Running");
+        assert_eq!(
+            shared.state(),
+            ReaderState::Stopped,
+            "must not have been resurrected to Running"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2456,7 +2563,9 @@ mod tests {
         let source = FakeTsSource::new()
             .with_startup_delay(std::time::Duration::from_millis(200))
             .with_chunk(vec![0u8; 188]);
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
         assert_eq!(shared.state(), ReaderState::Starting);
 
         // Simulate the caller's own ready-wait timing out and giving up —
@@ -2538,7 +2647,9 @@ mod tests {
         let shared = SharedTuner::new(key, 2);
 
         let source = FakeTsSource::new().with_chunk(vec![0u8; 188]);
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
         let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
             .await
             .expect("ready signal timed out")
@@ -2579,7 +2690,9 @@ mod tests {
         let source = FakeTsSource::new()
             .with_chunk(vec![0u8; 188])
             .with_get_ts_stream_gate(gate.clone());
-        let ready_rx = shared.spawn_fake_reader(source, 0, 1, test_startup_config()).await;
+        let ready_rx = shared
+            .spawn_fake_reader(source, 0, 1, test_startup_config())
+            .await;
         let ready = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
             .await
             .expect("ready signal timed out")
@@ -2596,10 +2709,7 @@ mod tests {
             result.is_err(),
             "a reader stuck past stop_reader's timeout must surface as an error, not be silently ignored"
         );
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::TimedOut
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
 
         // `stop_and_release_slot` inside `stop_reader` unconditionally marks
         // this `Stopped` even on a timeout (see that method's doc comment on

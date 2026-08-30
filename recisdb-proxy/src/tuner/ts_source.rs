@@ -39,6 +39,10 @@ pub(crate) trait TsSource {
     /// Read available TS data into `buf`. Returns `(bytes_written,
     /// bytes_remaining)`. Mirrors `IBonDriver2::GetTsStream2`.
     fn get_ts_stream(&self, buf: &mut [u8]) -> io::Result<(usize, usize)>;
+    /// Optional native read diagnostics (calls, bytes, max chunk, pending peak).
+    fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        None
+    }
     /// Current signal level in dB. Mirrors `IBonDriver::GetSignalLevel`.
     fn get_signal_level(&self) -> f32;
 }
@@ -61,6 +65,10 @@ impl TsSource for crate::bondriver::BonDriverTuner {
 
     fn get_ts_stream(&self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
         self.get_ts_stream(buf)
+    }
+
+    fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        self.get_ts_stream_stats()
     }
 
     fn get_signal_level(&self) -> f32 {
