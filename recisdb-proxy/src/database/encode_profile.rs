@@ -88,16 +88,83 @@ pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
     )
 }
 
-/// Build ffmpeg arguments for BS4K preview. The tsreadex input and stream
-/// mapping match the normal preview, but progressive 2160p is scaled to
-/// 1920x1080 without deinterlacing.
+/// Superseded ffmpeg BS4K templates, kept only as migration sentinels so a
+/// row still holding one is recognized as this codebase's own output and
+/// upgraded. See [`preview_4k_encode_args_ffmpeg`] for the measurements that
+/// retired each of them.
+fn legacy_preview_4k_encode_args_ffmpeg(video_encoder: &str) -> [String; 2] {
+    let tuning = video_encoder_tuning(video_encoder);
+    [
+        // 1st: plain software decode. 0.27x realtime, 17.3s to first byte.
+        format!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+             -analyzeduration 600000 -probesize 1000000 -f mpegts -i pipe:0 \
+             -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+             -vf scale=1920:1080 \
+             -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
+             -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
+             -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
+             -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        ),
+        // 2nd: throttled decode but still 1080p. 0.99x over 40s, but only
+        // 0.88x sustained over 120s, so it still drifts behind.
+        format!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+             -analyzeduration 600000 -probesize 1000000 \
+             -skip_loop_filter:v all -skip_frame:v noref \
+             -f mpegts -i pipe:0 \
+             -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+             -vf scale=1920:1080:flags=fast_bilinear \
+             -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
+             -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
+             -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
+             -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        ),
+    ]
+}
+
+/// Build ffmpeg arguments for BS4K preview.
+///
+/// The tsreadex input and stream mapping match the normal preview, but the
+/// source is progressive 2160/59.94p HEVC Main10, so there is no deinterlacer
+/// and the picture is scaled to 1920x1080.
+///
+/// **The decoder side is what costs, not the encoder.** Measured on the
+/// verification machine (Intel iGPU, `h264_qsv` available):
+///
+/// | template | realtime (40s) | realtime (120s) | first byte |
+/// |---|---|---|---|
+/// | 1080p, plain software decode | 0.27x | — | 17.3s |
+/// | 1080p, `-skip_loop_filter:v all` only | 0.66x | — | 2.1s |
+/// | 1080p, + `-skip_frame:v noref` | 0.99x | 0.88x | 1.6s |
+/// | **720p, + `-skip_frame:v noref`** (this one) | 0.99x | **0.99x** | 2.3s |
+///
+/// 1080p looks fine over a short sample and then drifts ~12% behind over two
+/// minutes, which is exactly the "breaks up after a while" complaint. 720p is
+/// the resolution this machine actually sustains. An administrator with a
+/// faster decoder can raise it; the seed leaves an edited row alone.
+///
+/// Hardware HEVC decode is not an option to fall back on: `hevc_qsv` reports
+/// `Error decoding stream header: unsupported (-3)`, `-init_hw_device qsv=hw`
+/// fails with `Error creating a MFX session: -9`, and `-hwaccel d3d11va`
+/// silently falls back to the software decoder. Only the **encoder** side of
+/// QSV works there.
+///
+/// So the decode work itself is cut down: deblocking/SAO is skipped and
+/// non-reference frames are dropped, which halves the preview to ~30fps
+/// (1151 frames in 39.7s measured). That is a deliberate trade — a browser
+/// preview that keeps up at 30fps beats one that falls behind at 60.
+/// Both options are scoped to `:v` because an unscoped `-skip_frame` is also
+/// applied to the AAC decoder, which rejects it and aborts the whole command.
 pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
     format!(
         "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
-         -analyzeduration 600000 -probesize 1000000 -f mpegts -i pipe:0 \
+         -analyzeduration 600000 -probesize 1000000 \
+         -skip_loop_filter:v all -skip_frame:v noref \
+         -f mpegts -i pipe:0 \
          -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
-         -vf scale=1920:1080 \
-         -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
+         -vf scale=1280:720:flags=fast_bilinear \
+         -c:v {video_encoder} {tuning} -b:v 3000k -maxrate 4500k -bufsize 6000k \
          -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
          -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
@@ -109,7 +176,12 @@ pub fn preview_4k_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool
     let Some(args) = extra_args else { return true; };
     let args = args.trim();
     if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS { return true; }
-    KNOWN_PREVIEW_ENCODERS.iter().any(|enc| args == preview_4k_encode_args_ffmpeg(enc))
+    KNOWN_PREVIEW_ENCODERS.iter().any(|enc| {
+        args == preview_4k_encode_args_ffmpeg(enc)
+            || legacy_preview_4k_encode_args_ffmpeg(enc)
+                .iter()
+                .any(|legacy| args == legacy.as_str())
+    })
 }
 
 fn preview_video_encoder_from_auto_generated(extra_args: Option<&str>) -> Option<&'static str> {
@@ -400,13 +472,29 @@ impl Database {
             let encoder = preview_video_encoder_from_auto_generated(preview_args.as_deref())
                 .unwrap_or("libx264");
             let replacement = preview_4k_encode_args_ffmpeg(encoder);
-            let updated = self.conn.execute(
-                "UPDATE encode_profiles SET extra_args = ?1
-                 WHERE name = 'preview-4k' AND extra_args = ?2",
-                params![replacement, DEFAULT_PREVIEW_4K_ENCODE_ARGS],
-            )?;
-            if updated > 0 {
-                log::info!("Migrated encode profile 'preview-4k' from the broken rigaya template to ffmpeg");
+            // Any value this codebase generated itself is fair game to
+            // replace: the rigaya seed that ffmpeg cannot parse at all, and
+            // the first ffmpeg template that could not keep up with 2160p60.
+            // An administrator's own edit matches neither and is left alone.
+            let current: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT extra_args FROM encode_profiles WHERE name = 'preview-4k' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if preview_4k_extra_args_is_auto_generated(current.as_deref())
+                && current.as_deref() != Some(replacement.as_str())
+            {
+                self.conn.execute(
+                    "UPDATE encode_profiles SET extra_args = ?1 WHERE name = 'preview-4k'",
+                    params![replacement],
+                )?;
+                log::info!(
+                    "Migrated encode profile 'preview-4k' to the current ffmpeg template"
+                );
             }
         }
         Ok(())
@@ -476,10 +564,47 @@ mod tests {
         assert!(args.contains("-f mpegts -i pipe:0"));
         assert!(args.contains("-map 0:d?"));
         assert!(args.contains("-c:d copy"));
-        assert!(args.contains("-vf scale=1920:1080"));
+        assert!(args.contains("-vf scale=1280:720"));
         assert!(args.contains("-c:v h264_qsv"));
         assert!(!args.contains("yadif"));
         assert!(!args.contains("--avhw"));
+    }
+
+    /// Software HEVC 2160p60 decode is the bottleneck, not the encoder, and
+    /// no hardware decoder is available on the verification machine. The
+    /// decode-side throttles are what get the preview to realtime, and both
+    /// must be scoped to `:v` — an unscoped `-skip_frame` is handed to the
+    /// AAC decoder too, which rejects it and aborts the whole command.
+    #[test]
+    fn four_k_args_throttle_the_decoder_and_scope_it_to_video() {
+        let args = super::preview_4k_encode_args_ffmpeg("h264_qsv");
+        assert!(args.contains("-skip_loop_filter:v all"), "{args}");
+        assert!(args.contains("-skip_frame:v noref"), "{args}");
+        assert!(!args.contains("-skip_frame noref"), "{args}");
+        assert!(!args.contains("-skip_loop_filter all"), "{args}");
+        // The throttles are decoder options: they only take effect before -i.
+        let input_at = args.find("-i pipe:0").expect("input");
+        assert!(args.find("-skip_frame:v").unwrap() < input_at, "{args}");
+        assert!(args.find("-skip_loop_filter:v").unwrap() < input_at, "{args}");
+    }
+
+    /// Every earlier ffmpeg 4K template (0.27x, then 0.88x sustained) was
+    /// generated by this codebase, so the seed must upgrade a row still
+    /// holding one rather than treat it as an administrator's choice.
+    #[test]
+    fn seed_upgrades_every_superseded_ffmpeg_four_k_template() {
+        for slow in super::legacy_preview_4k_encode_args_ffmpeg("libx264") {
+            let db = Database::open_in_memory().unwrap();
+            let profile = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+            db.update_encode_profile(profile.id, None, None, None, None, None,
+                Some(Some(&slow)), None).unwrap();
+            assert!(super::preview_4k_extra_args_is_auto_generated(Some(&slow)));
+            db.seed_default_encode_profiles().unwrap();
+            let migrated = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+            let args = migrated.extra_args.as_deref().unwrap();
+            assert!(args.contains("-skip_frame:v noref"), "{args}");
+            assert!(args.contains("scale=1280:720"), "{args}");
+        }
     }
 
     #[test]
@@ -537,3 +662,4 @@ mod tests {
         assert!(db.get_encode_profile_by_purpose("preview").unwrap().is_none());
     }
 }
+

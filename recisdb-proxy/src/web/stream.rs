@@ -1321,7 +1321,7 @@ mod tests {
             four_k.arguments
         );
         assert!(
-            four_k.arguments.contains("scale=1920:1080"),
+            four_k.arguments.contains("scale=1280:720"),
             "4K must be downscaled before encoding: {}",
             four_k.arguments
         );

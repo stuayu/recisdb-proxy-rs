@@ -345,8 +345,7 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 再生がブツブツ途切れる。
 
 対応: `purpose = 'preview4k'` の専用プロファイル `preview-4k` を seed し
-(`database/encode_profile.rs::preview_4k_encode_args_ffmpeg`、デインタレース
-なし + `scale=1920:1080` へ縮小 + VBR 4Mbps)、`?profile=preview` の
+(`database/encode_profile.rs::preview_4k_encode_args_ffmpeg`)、`?profile=preview` の
 プロファイル選択をチャンネルの帯域で分岐させた
 (`web/stream.rs::PreviewBand`)。判定は `band_type` ではなく **NID**
 (`classify_nid`) で行う — `band_type` はスキャンでしか埋まらず手動投入行では
@@ -355,20 +354,48 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 再生できないよりはよい)。
 
 `preview_setup` が選んだ映像エンコーダを通常プレビューと4Kプレビューの両方へ
-反映する。旧版が seed した rigaya 形式の既定値と完全一致する既存行だけを ffmpeg
-形式へ移行する。管理者が編集した値は上書きしない。
+反映する。**このコードベース自身が生成した既定値と完全一致する行だけ**を現行
+テンプレートへ移行する (旧 rigaya 形式、および過去の ffmpeg テンプレート)。
+管理者が編集した値は上書きしない。
 
-2026-08-30 の実機検証では、旧 rigaya 引数は ffmpeg が `-avhw` を拒否し、HTTP
-200の直後に0バイトで終了した。ffmpeg形式へ一時変更すると H.264 1920x1080/
-59.94p、AAC、timed ID3を含むTSを生成し、実効ビットレートは3.56〜3.64Mbpsだった。
-映像PTSの最大間隔は66.7msで、100ms超の間隔は0件だった。
+#### 何が律速なのか (2026-08-30 実機検証)
 
-ただし実機の `h264_qsv` はHEVCのsoftware decodeとsoftware scaleを含む構成で、
-20秒の取得中に9.18秒分しか生成できず、処理速度は約0.46倍だった。QSVのhardware
-decodeと`scale_qsv`も試したが、GPUのtexture生成が`80070057`で失敗した。この実機
-では1080p/59.94p・4Mbpsという出力設定だけではリアルタイム処理に足りない。
-ゼロバイト終了は解消するが、連続プレビューには対応GPU/ドライバー、または別の
-ハードウェア変換構成が必要である。
+旧 rigaya 引数は ffmpeg が `-avhw` を拒否し、HTTP 200 の直後に0バイトで終了して
+いた。ffmpeg 形式に直すと出力自体は出るようになったが、今度はリアルタイムに
+追いつかない。
+
+**律速はエンコーダではなくデコーダ側**だった。この実機ではハードウェア HEVC
+デコードが一切使えない:
+
+| 試した経路 | 結果 |
+|---|---|
+| `-c:v hevc_qsv` (QSVデコード) | `Error decoding stream header: unsupported (-3)` |
+| `-init_hw_device qsv=hw` (フルQSVパイプライン) | `Error creating a MFX session: -9` → `Device creation failed` |
+| `-hwaccel d3d11va` | エラーなく**ソフトウェアデコーダへフォールバック** |
+| `-c:v h264_qsv` (**エンコード**) | 動作する |
+
+つまり QSV はエンコード側しか使えず、2160/59.94p の HEVC Main10 を CPU で
+デコードする必要がある。実測 (BS朝日4K / SID 151):
+
+| テンプレート | 実時間比 (40秒) | 実時間比 (120秒) | 初バイトまで |
+|---|---|---|---|
+| 1080p、素のソフトデコード | 0.27x | — | 17.3秒 |
+| 1080p、`-skip_loop_filter:v all` のみ | 0.66x | — | 2.1秒 |
+| 1080p、`+ -skip_frame:v noref` | 0.99x | 0.88x | 1.6秒 |
+| **720p、`+ -skip_frame:v noref`** (現行) | 0.99x | **0.99x** | 2.3秒 |
+
+デコード作業そのものを削る: デブロッキング/SAO を飛ばし、非参照フレームを
+捨てる。プレビューは約30fpsになる (39.7秒で1151フレーム)。**追いつかない60fps
+より、追いつく30fps を採る**という判断。
+
+**1080p は短時間だと 0.99x に見えるが、2分間流すと 0.88x まで落ちて遅れが
+溜まり続ける。**「しばらく見ていると途切れ出す」の正体はこれ。この実機が実際に
+維持できる解像度は 720p。より速いデコーダを積んだ機なら管理者が引き上げれば
+よい (編集した行は seed が上書きしない)。
+
+`-skip_loop_filter` と `-skip_frame` は**必ず `:v` でスコープする**。スコープ
+しないと AAC デコーダにも渡り、`Unable to parse "skip_frame" option value` で
+コマンド全体が起動に失敗する。
 
 ## 未対応 / 要確認
 
