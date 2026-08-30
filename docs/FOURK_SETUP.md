@@ -438,8 +438,28 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
   変わらず、B25だけではch2の無出力を説明できない。
 - **実測**: 実験後 `disable_b25=false` へ復元済み。実機の `stream_format=ts` は維持。
 - **推測**: ch2はラッパー内部の8K入力または当該サービス出力に未対応の可能性がある。
-  NHK BS4Kが同一トランスポンダに同居するかは、ラッパーがTSを返す状態でPAT/SDT/NITを
-  採取して確認する必要がある。
+- **判明 (2026-08-30 追記)**: **NHK BS4K が検出されなかった理由は ch2 とは別**。
+  NHK BS4K はドライバの **CH=0** に「ＮＨＫ　ＢＳＰ４Ｋ」として存在していて、
+  スキャンの信号ゲートで落とされていた。
+
+  ```text
+  ✗ Skipped Space=0 CH=0 Name="ＮＨＫ　ＢＳＰ４Ｋ" - locked but signal too weak (0.00 < 3.00 dB after 2000 ms)
+  ✓ Found channel - Space=0 CH=1 Name="ＢＳ日テレ　４Ｋ" Signal=100.00dB
+  ```
+
+  CH=0 はスキャンで最初に選局するチャンネル。**冷えた BonDriver は最初の
+  `SetChannel` のあと数秒間 `GetSignalLevel` に 0.00 を返し続ける**(実際には
+  選局できている)。次の CH=1 は即座に 100.00 を返しているとおり、遅いのは
+  暖機の一度きり。2秒の窓では足りなかった。
+
+  対応: **そのスキャンでまだ一度も使える信号を見ていない間だけ、窓を 15 秒へ
+  延ばす** (`scan_scheduler.rs::signal_sample_window_ms`)。一度でも信号を見たら
+  以後は元の 2 秒へ戻す。窓を一律に延ばせない理由は、Windows の
+  `last_channel_locked()` が常に `None` を返すこと
+  (`bondriver/windows.rs`) — 全チャンネルが「受信できるかもしれない」扱いに
+  なるので、UHF 全帯域スキャンでは空き約40チャンネル全部が延長分を払う。
+  暖機モードの総時間には 45 秒の上限を置いて、最初のチャンネルが本当に空だった
+  場合も数チャンネルで打ち切る。
 - **実測**: `/mirakurun/api/services/1100141/stream` は競合時503、再試行時も実TS未取得。
   視聴成功、H.265映像、EIT/H-EIT、WOWOWのACAS復号は未確認。
 

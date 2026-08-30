@@ -344,6 +344,60 @@ impl ScanScheduler {
 /// Minimum signal level to consider a channel as having signal.
 const MIN_SIGNAL_LEVEL: f32 = 3.0;
 
+/// How often [`scan_space_blocking`] re-reads `GetSignalLevel` while waiting
+/// for a channel to come up.
+const SIGNAL_SAMPLE_INTERVAL_MS: u64 = 200;
+
+/// Signal sampling window once the driver is known to be awake.
+const SIGNAL_SAMPLE_WINDOW_MS: u64 = 2000;
+
+/// Signal sampling window used until this scan has seen one usable reading.
+///
+/// A cold BonDriver reports `0.00 dB` for several seconds after the first
+/// `SetChannel`, even though it has tuned. Observed on the BS4K wrapper:
+///
+/// ```text
+/// ✗ Skipped Space=0 CH=0 Name="ＮＨＫ　ＢＳＰ４Ｋ" - locked but signal too weak (0.00 < 3.00 dB after 2000 ms)
+/// ✓ Found channel - Space=0 CH=1 Name="ＢＳ日テレ　４Ｋ" Signal=100.00dB
+/// ```
+///
+/// CH=0 is the first channel tuned in the scan, and NHK BS4K was dropped
+/// from the channel list entirely because of it — the next channel answered
+/// instantly. Two seconds is not enough to cover the first tune.
+const SIGNAL_SAMPLE_WARMUP_WINDOW_MS: u64 = 15000;
+
+/// Ceiling on the total time the warm-up window may spend before the scan
+/// stops believing the driver is merely cold.
+///
+/// The warm-up window cannot simply be the default: `last_channel_locked()`
+/// returns `None` on Windows (`bondriver/windows.rs`), so every channel
+/// looks "maybe receivable" there, and a full UHF scan would pay it on the
+/// ~40 empty channels. This budget bounds the damage to a few channels
+/// while still covering a driver whose first channels happen to be empty.
+const SIGNAL_SAMPLE_WARMUP_BUDGET_MS: u64 = 45000;
+
+/// How long to keep sampling `GetSignalLevel` for one channel.
+///
+/// - a channel the backend says never locked: don't sample at all
+/// - before this scan has seen any usable signal, and while the warm-up
+///   budget lasts: the long window, so a cold driver's first tune is not
+///   mistaken for an empty channel
+/// - otherwise: the ordinary window
+fn signal_sample_window_ms(
+    may_be_receivable: bool,
+    saw_usable_signal: bool,
+    warmup_spent_ms: u64,
+) -> u64 {
+    if !may_be_receivable {
+        return 0;
+    }
+    if !saw_usable_signal && warmup_spent_ms < SIGNAL_SAMPLE_WARMUP_BUDGET_MS {
+        SIGNAL_SAMPLE_WARMUP_WINDOW_MS
+    } else {
+        SIGNAL_SAMPLE_WINDOW_MS
+    }
+}
+
 /// TS パケット長
 const TS_PACKET_SIZE: usize = 188;
 
@@ -508,6 +562,13 @@ fn scan_space_blocking(
     // the satellite link is fully unavailable and skip remaining channels.
     const MAX_CONSECUTIVE_EAGAIN: u32 = 3;
 
+    // Warm-up state for the signal gate below. A cold BonDriver — and the
+    // 4K wrapper in particular — answers GetSignalLevel with 0.00 for
+    // several seconds after the very first SetChannel, long after it has
+    // actually tuned. See `signal_sample_window_ms`.
+    let mut saw_usable_signal = false;
+    let mut warmup_spent_ms = 0u64;
+
     for (channel, channel_name) in channels {
         let channel = *channel;
 
@@ -608,14 +669,12 @@ fn scan_space_blocking(
         // in a full-band scan ~40 of the 50 UHF channels are empty, and
         // paying the sample window on each of those would add over a minute
         // for nothing.
-        const SIGNAL_SAMPLE_INTERVAL_MS: u64 = 200;
-        const SIGNAL_SAMPLE_WINDOW_MS: u64 = 2000;
         let may_be_receivable = tuner.last_channel_locked().unwrap_or(true);
-        let sample_window_ms = if may_be_receivable {
-            SIGNAL_SAMPLE_WINDOW_MS
-        } else {
-            0
-        };
+        let sample_window_ms = signal_sample_window_ms(
+            may_be_receivable,
+            saw_usable_signal,
+            warmup_spent_ms,
+        );
         let mut signal_level = tuner.get_signal_level();
         let mut sampled_ms = 0u64;
         while signal_level < MIN_SIGNAL_LEVEL && sampled_ms < sample_window_ms {
@@ -626,9 +685,21 @@ fn scan_space_blocking(
                 signal_level = level;
             }
         }
+        if !saw_usable_signal {
+            warmup_spent_ms = warmup_spent_ms.saturating_add(sampled_ms);
+        }
+        if signal_level >= MIN_SIGNAL_LEVEL {
+            if !saw_usable_signal && sampled_ms > SIGNAL_SAMPLE_WINDOW_MS {
+                info!(
+                    "scan_space_blocking: driver needed {} ms to report a usable signal on the first channel; later channels go back to the {} ms window",
+                    sampled_ms, SIGNAL_SAMPLE_WINDOW_MS
+                );
+            }
+            saw_usable_signal = true;
+        }
         debug!(
-            "scan_space_blocking: Signal level = {:.2} dB (after {} ms of sampling)",
-            signal_level, sampled_ms
+            "scan_space_blocking: Signal level = {:.2} dB (after {} ms of sampling, window {} ms)",
+            signal_level, sampled_ms, sample_window_ms
         );
 
         if signal_level < MIN_SIGNAL_LEVEL {
@@ -1351,6 +1422,55 @@ mod tests {
         assert_eq!(info.physical_ch, Some(1)); // BS01 → TP1
         assert_eq!(info.remote_control_key, Some(5)); // TR-B15: BS朝日 = 5
         assert_eq!(info.terrestrial_region.as_deref(), Some("全国"));
+    }
+
+    /// NHK BS4K sat at CH=0 — the first channel of the scan — and the cold
+    /// 4K wrapper answered 0.00 dB for longer than the ordinary window, so
+    /// the channel was dropped before its TS was ever analyzed.
+    #[test]
+    fn first_channel_of_a_scan_gets_the_warmup_window() {
+        assert_eq!(
+            signal_sample_window_ms(true, false, 0),
+            SIGNAL_SAMPLE_WARMUP_WINDOW_MS
+        );
+    }
+
+    /// Once the driver has answered once it is awake, and every later
+    /// channel goes back to the short window. Otherwise a BS scan would pay
+    /// the warm-up window on every empty slot.
+    #[test]
+    fn later_channels_go_back_to_the_short_window() {
+        assert_eq!(
+            signal_sample_window_ms(true, true, 0),
+            SIGNAL_SAMPLE_WINDOW_MS
+        );
+    }
+
+    /// `last_channel_locked()` returns `None` on Windows, so every channel
+    /// there looks receivable. The budget is what stops a full UHF scan from
+    /// paying the warm-up window on ~40 empty channels.
+    #[test]
+    fn warmup_window_is_abandoned_once_the_budget_runs_out() {
+        assert_eq!(
+            signal_sample_window_ms(true, false, SIGNAL_SAMPLE_WARMUP_BUDGET_MS),
+            SIGNAL_SAMPLE_WINDOW_MS
+        );
+        // The budget must allow more than one full warm-up window, or a
+        // driver whose first channel is genuinely empty never gets a second
+        // chance.
+        assert!(SIGNAL_SAMPLE_WARMUP_BUDGET_MS > SIGNAL_SAMPLE_WARMUP_WINDOW_MS);
+        assert_eq!(
+            signal_sample_window_ms(true, false, SIGNAL_SAMPLE_WARMUP_WINDOW_MS),
+            SIGNAL_SAMPLE_WARMUP_WINDOW_MS
+        );
+    }
+
+    /// A backend that can report the frontend never locked still skips
+    /// sampling entirely — that is what keeps terrestrial scans fast.
+    #[test]
+    fn channels_that_never_locked_are_not_sampled_even_during_warmup() {
+        assert_eq!(signal_sample_window_ms(false, false, 0), 0);
+        assert_eq!(signal_sample_window_ms(false, true, 0), 0);
     }
 
     #[test]
