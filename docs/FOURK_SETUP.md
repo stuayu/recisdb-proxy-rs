@@ -386,13 +386,31 @@ decodeと`scale_qsv`も試したが、GPUのtexture生成が`80070057`で失敗�
 - **実測**: `/mirakurun/api/services/1100141/stream` は競合時503、再試行時も実TS未取得。
   視聴成功、H.265映像、EIT/H-EIT、WOWOWのACAS復号は未確認。
 
-- **生TS配信は検証済み。** f4824d0適用後、25秒で56,783,676 bytes (18.17Mbps)、
-  302,040 TS packets、同期不良0、continuity counter不連続0だった。BonDriverが返す
-  chunkは放置中に62,582,380 bytes、pending peakは62,320,236 bytesまで単調増加した。
-  原因はpendingを256KBずつdrainする各iterationで`WaitTsStream(100ms)`を呼び、driver側
-  に次のchunkを蓄積させる正のfeedbackだった。readerは`remaining > 0`中のwaitを省略し、
-  bufferを実測chunkへ追従させる。256MiB超過時は任意位置で捨てて継続せず、reader全体を
-  `ReaderFailed`として再openする。録画とプレイヤーのH.265/2160p表示は未検証。
+- **生TS配信は検証済み。** 実機 (BonDriver_dantto4k ラッパー、`stream_format=ts`) で
+  同一チャンネル (BS朝日4K / SID 151) を 150 秒流し、f4824d0 と 70dce4c を比較した。
+
+  | 指標 | f4824d0 (修正前) | 70dce4c (修正後) |
+  |---|---|---|
+  | ネイティブ `GetTsStream` 呼び出し | 399MB に対し **15 回** | 484MB に対し **1287 回** |
+  | `max_chunk` | 8.7MB → 68,391,204 と**単調増加** | **1,084,384 で一定** |
+  | `pending_peak` | 68,129,060 まで増加 | **822,240 で一定** |
+  | 滞留時間 (18Mbps 換算) | 約 30 秒 | 約 0.4 秒 |
+  | 到着間隔 90ms 以上 | 229 / 4627 回 | 139 / 4551 回 |
+  | 到着間隔 p99 | 173ms | 144ms |
+
+  修正前は pending を 256KB ずつ drain する各 iteration で `WaitTsStream(100ms)` を
+  呼び、その間にドライバ側が次の chunk を溜める正のフィードバックで遅延とメモリが
+  発散していた。reader は `remaining > 0` の間 wait を省略し、read buffer を実測
+  chunk へ追従させる (実機では 262144 → 2097152 へ一度だけ拡張し、以後不変)。
+  256MiB 超過時は任意位置で捨てて継続せず、reader 全体を `ReaderFailed` として
+  再 open する。
+
+  TS の内容も検証済み: 223,101 packets すべて `transport_scrambling_control = 0`
+  (復号済み)、continuity counter の不連続 0 件。
+
+  残っている挙動: 300〜450ms の到着間隔が数十秒おきに十数回まとまって出ることがある
+  (180 秒の測定で t=155〜168s に集中)。発散は止まったが原因は未特定。
+  録画とプレイヤーの H.265/2160p 表示は未検証。
 - **修正版 dantto4k のビルド確認**。手元では tsduck が無くビルドできていない
 - **ダッシュボード (Vue) のフォーム露出**。Web API 側は対応済みで、
   `GET/POST/PATCH /api/bondrivers` が `stream_format` と `disable_b25` を
