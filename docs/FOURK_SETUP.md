@@ -397,6 +397,36 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 しないと AAC デコーダにも渡り、`Unable to parse "skip_frame" option value` で
 コマンド全体が起動に失敗する。
 
+#### ハードウェアデコードが動く機では削らない
+
+上の削り込みは**ハードウェア HEVC デコードが使えない機だけの話**。使える機で
+720p/30fps に落とすのは劣化でしかないので、`preview_setup` が
+**エンコーダとは別に HEVC デコーダをプローブする**
+(`preview_setup.rs::select_working_hevc_hw_decoder`)。
+
+| 結果 | seed されるテンプレート |
+|---|---|
+| ハードウェアHEVCデコーダあり | `preview_4k_encode_args_ffmpeg_hwdec` — `-c:v <デコーダ>` + 1920x1080 + 削り込みなし |
+| なし | `preview_4k_encode_args_ffmpeg` — ソフトデコード + 削り込み + 1280x720 |
+
+候補は OS ごとに `hevc_hw_decoder_candidates` で持つ (Windows:
+`hevc_qsv` / `hevc_cuvid`、Linux: + `hevc_vaapi`、macOS: `hevc_videotoolbox`)。
+
+プローブの作り方に2点、実機で踏んだ理由がある。
+
+- **`-hwaccel` ではなく「名前付きデコーダ」で試す。** `-hwaccel d3d11va` は
+  デコーダが無くても**無言でソフトウェアへフォールバックして成功扱いになる**
+  ので、プローブとして使うと「動く」と誤判定する。
+- **10bit のサンプルで試す。** BS4K は HEVC **Main10**。Main は通っても Main10
+  は通らない GPU があるため、プローブ用クリップは `-pix_fmt yuv420p10le` で
+  作る。作るための HEVC エンコーダがこの ffmpeg に無ければプローブを諦め、
+  安全側 (削り込みテンプレート) に倒す。
+
+エンコーダ側のプローブ (`test_encode_works`) と同じ思想で、`-decoders` に
+載っていることは動く保証にならないため実際に1回デコードさせる。
+ドライバのロールバック等でデコーダが消えた場合は、次回のセットアップで
+削り込みテンプレートへ戻る。
+
 ## 未対応 / 要確認
 
 ### 2026-08-30 実機検証メモ

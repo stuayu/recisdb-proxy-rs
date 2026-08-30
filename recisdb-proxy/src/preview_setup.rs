@@ -338,6 +338,116 @@ fn select_working_video_encoder(ffmpeg_path: &Path, encoders_output: &str) -> St
         .to_string()
 }
 
+/// HEVC **decoder** candidates in priority order for `os`.
+///
+/// BS4K is 2160/59.94p HEVC Main10. Decoding that in software is what makes
+/// the 4K preview fall behind (0.27x realtime measured), so whether a
+/// hardware decoder works decides which BS4K template gets seeded — see
+/// `database::encode_profile::preview_4k_encode_args_ffmpeg`. This is a
+/// separate question from the *encoder*: on the verification machine
+/// `h264_qsv` encodes fine while `hevc_qsv` reports
+/// `Error decoding stream header: unsupported (-3)`.
+fn hevc_hw_decoder_candidates(os: HostOs) -> &'static [&'static str] {
+    match os {
+        HostOs::MacOs => &["hevc_videotoolbox"],
+        HostOs::Windows => &["hevc_qsv", "hevc_cuvid"],
+        HostOs::Linux => &["hevc_qsv", "hevc_cuvid", "hevc_vaapi"],
+    }
+}
+
+fn run_ffmpeg_decoders(ffmpeg_path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-decoders"])
+        .output()
+        .map_err(|e| format!("ffmpeg -decoders の実行に失敗しました: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Encode a short **10-bit** HEVC clip to a temp file so the decoder probe
+/// has something representative to chew on.
+///
+/// 10-bit matters: several GPUs decode HEVC Main but not Main10, and BS4K is
+/// Main10. Returns `None` when this ffmpeg build has no HEVC encoder to make
+/// the sample with, in which case the caller must assume no hardware decode
+/// (the throttled software template still plays, just at 720p/30fps).
+fn make_hevc_probe_sample(ffmpeg_path: &Path, encoders_output: &str) -> Option<PathBuf> {
+    let hevc_encoder = ["libx265", "hevc_qsv", "hevc_nvenc", "hevc_videotoolbox"]
+        .into_iter()
+        .find(|name| encoders_output.contains(name))?;
+    let path = std::env::temp_dir().join(format!(
+        "recisdb-hevc-probe-{}.hevc",
+        std::process::id()
+    ));
+    let ok = std::process::Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:d=0.5",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            hevc_encoder,
+            "-f",
+            "hevc",
+        ])
+        .arg(&path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok && path.exists() {
+        Some(path)
+    } else {
+        let _ = std::fs::remove_file(&path);
+        None
+    }
+}
+
+/// Does `hevc_decoder` actually decode the probe clip on this machine?
+///
+/// Same reasoning as [`test_encode_works`]: being listed by the build proves
+/// nothing. On the verification machine every QSV path fails here — the
+/// decoder with `unsupported (-3)`, the device with
+/// `Error creating a MFX session: -9` — while `-hwaccel d3d11va` silently
+/// falls back to software, which is why this probes the **named decoder**
+/// rather than an `-hwaccel` flag: a silent software fallback would look
+/// like success.
+fn test_hevc_decode_works(ffmpeg_path: &Path, hevc_decoder: &str, sample: &Path) -> bool {
+    std::process::Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-loglevel", "error", "-c:v", hevc_decoder, "-i"])
+        .arg(sample)
+        .args(["-f", "null", "-"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Picks a hardware HEVC decoder for the BS4K preview, or `None` when this
+/// machine has none that works. `None` is the safe answer: the caller then
+/// seeds the throttled software template, which plays everywhere.
+fn select_working_hevc_hw_decoder(ffmpeg_path: &Path, encoders_output: &str) -> Option<String> {
+    let decoders_output = run_ffmpeg_decoders(ffmpeg_path).ok()?;
+    let candidates: Vec<&'static str> = hevc_hw_decoder_candidates(current_host_os())
+        .iter()
+        .copied()
+        .filter(|name| decoders_output.contains(name))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let sample = make_hevc_probe_sample(ffmpeg_path, encoders_output)?;
+    let chosen = candidates
+        .into_iter()
+        .find(|candidate| test_hevc_decode_works(ffmpeg_path, candidate, &sample))
+        .map(str::to_string);
+    let _ = std::fs::remove_file(&sample);
+    chosen
+}
+
 // ============================================================================
 // ffmpeg: download (network — requires the `webhook` feature)
 // ============================================================================
@@ -845,7 +955,11 @@ fn write_preview_paths_to_toml(config_path: &Path, command_path: &str, preproces
 /// encoder). An admin's own edit is left completely untouched — same rule
 /// `database::encode_profile::seed_default_encode_profiles` applies when
 /// migrating the legacy template.
-fn update_preview_profile_args_if_default(db: &Database, video_encoder: &str) -> Result<(), String> {
+fn update_preview_profile_args_if_default(
+    db: &Database,
+    video_encoder: &str,
+    hevc_hw_decoder: Option<&str>,
+) -> Result<(), String> {
     let profiles = db.get_all_encode_profiles().map_err(|e| e.to_string())?;
     let Some(profile) = profiles.iter().find(|p| p.name == "preview-h264") else {
         return Err("preview-h264 プロファイルが見つかりません".to_string());
@@ -859,7 +973,14 @@ fn update_preview_profile_args_if_default(db: &Database, video_encoder: &str) ->
 
     if let Some(profile_4k) = profiles.iter().find(|p| p.name == "preview-4k") {
         if crate::database::preview_4k_extra_args_is_auto_generated(profile_4k.extra_args.as_deref()) {
-            let new_args = crate::database::preview_4k_encode_args_ffmpeg(video_encoder);
+            // A machine with a working hardware HEVC decoder gets the full
+            // 1080p/60 template; everything else gets the throttled one.
+            let new_args = match hevc_hw_decoder {
+                Some(decoder) => {
+                    crate::database::preview_4k_encode_args_ffmpeg_hwdec(video_encoder, decoder)
+                }
+                None => crate::database::preview_4k_encode_args_ffmpeg(video_encoder),
+            };
             db.update_encode_profile(
                 profile_4k.id,
                 None,
@@ -890,6 +1011,9 @@ pub fn ensure_preview_ready(db: &Database, install_dir: &Path, config_path: Opti
 
     let (encoder_path, encoder_source, encoders_output) = resolve_ffmpeg(install_dir)?;
     let video_encoder = select_working_video_encoder(&encoder_path, &encoders_output);
+    // Decided separately from the encoder: BS4K is 2160/59.94p HEVC Main10,
+    // and it is the *decode* side that the 4K preview lives or dies on.
+    let hevc_hw_decoder = select_working_hevc_hw_decoder(&encoder_path, &encoders_output);
 
     let preprocessor_path = match resolve_tsreadex_ready(install_dir) {
         Ok(path) => path.to_string_lossy().into_owned(),
@@ -906,7 +1030,7 @@ pub fn ensure_preview_ready(db: &Database, install_dir: &Path, config_path: Opti
     db.set_preview_command_path(&encoder_path_str).map_err(|e| e.to_string())?;
     db.set_preview_preprocessor_path(&preprocessor_path).map_err(|e| e.to_string())?;
 
-    if let Err(e) = update_preview_profile_args_if_default(db, &video_encoder) {
+    if let Err(e) = update_preview_profile_args_if_default(db, &video_encoder, hevc_hw_decoder.as_deref()) {
         warnings.push(format!("エンコードプロファイルの更新に失敗しました(手動で確認してください): {e}"));
     }
 
@@ -1195,7 +1319,7 @@ enabled = false
         let seeded = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
         assert!(crate::database::preview_extra_args_is_auto_generated(seeded.extra_args.as_deref()));
 
-        update_preview_profile_args_if_default(&db, "h264_videotoolbox").unwrap();
+        update_preview_profile_args_if_default(&db, "h264_videotoolbox", None).unwrap();
         let updated = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
         assert_eq!(
             updated.extra_args.as_deref(),
@@ -1209,7 +1333,7 @@ enabled = false
 
         // Re-running with a different encoder must still replace it (this
         // is still a value the tool itself generated, not an admin edit).
-        update_preview_profile_args_if_default(&db, "h264_qsv").unwrap();
+        update_preview_profile_args_if_default(&db, "h264_qsv", None).unwrap();
         let updated = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
         assert_eq!(
             updated.extra_args.as_deref(),
@@ -1221,11 +1345,81 @@ enabled = false
             .unwrap();
         db.update_encode_profile(updated_4k.id, None, None, None, None, None, Some(Some("--my-custom-4k-args")), None)
             .unwrap();
-        update_preview_profile_args_if_default(&db, "libx264").unwrap();
+        update_preview_profile_args_if_default(&db, "libx264", None).unwrap();
         let profiles = db.get_all_encode_profiles().unwrap();
         let after = profiles.iter().find(|p| p.name == "preview-h264").unwrap();
         assert_eq!(after.extra_args.as_deref(), Some("--my-custom-args"));
         let after_4k = profiles.iter().find(|p| p.name == "preview-4k").unwrap();
         assert_eq!(after_4k.extra_args.as_deref(), Some("--my-custom-4k-args"));
+    }
+
+    /// A machine whose ffmpeg really can decode HEVC in hardware must not be
+    /// handed the throttled template: it keeps 1080p at the source frame
+    /// rate, with no `-skip_frame` and no downscale past 1080p. Only the
+    /// BS4K row changes — the ordinary preview is 1080i MPEG-2 and has
+    /// nothing to do with HEVC decoding.
+    #[test]
+    fn hardware_hevc_decode_gets_the_full_quality_four_k_template() {
+        use crate::database::Database;
+
+        let db = Database::open_in_memory().unwrap();
+        update_preview_profile_args_if_default(&db, "h264_qsv", Some("hevc_qsv")).unwrap();
+
+        let profiles = db.get_all_encode_profiles().unwrap();
+        let four_k = profiles.iter().find(|p| p.name == "preview-4k").unwrap();
+        let args = four_k.extra_args.as_deref().unwrap();
+        assert_eq!(
+            args,
+            crate::database::preview_4k_encode_args_ffmpeg_hwdec("h264_qsv", "hevc_qsv")
+        );
+        assert!(args.contains("-c:v hevc_qsv"), "{args}");
+        assert!(!args.contains("-skip_frame"), "{args}");
+        assert!(!args.contains("-skip_loop_filter"), "{args}");
+        assert!(args.contains("scale=1920:1080"), "{args}");
+
+        let ordinary = profiles.iter().find(|p| p.name == "preview-h264").unwrap();
+        assert_eq!(
+            ordinary.extra_args.as_deref(),
+            Some(crate::database::preview_encode_args_ffmpeg("h264_qsv").as_str())
+        );
+    }
+
+    /// Re-running setup on a machine that has lost its hardware decoder (a
+    /// driver rollback, a GPU moved to another VM) must fall back to the
+    /// throttled template rather than leaving a row that cannot decode.
+    #[test]
+    fn losing_the_hardware_decoder_falls_back_to_the_throttled_template() {
+        use crate::database::Database;
+
+        let db = Database::open_in_memory().unwrap();
+        update_preview_profile_args_if_default(&db, "h264_qsv", Some("hevc_qsv")).unwrap();
+        update_preview_profile_args_if_default(&db, "h264_qsv", None).unwrap();
+
+        let profiles = db.get_all_encode_profiles().unwrap();
+        let four_k = profiles.iter().find(|p| p.name == "preview-4k").unwrap();
+        assert_eq!(
+            four_k.extra_args.as_deref(),
+            Some(crate::database::preview_4k_encode_args_ffmpeg("h264_qsv").as_str())
+        );
+    }
+
+    #[test]
+    fn hevc_decoder_candidates_are_decoders_not_encoders() {
+        for os in [HostOs::MacOs, HostOs::Windows, HostOs::Linux] {
+            let candidates = hevc_hw_decoder_candidates(os);
+            assert!(!candidates.is_empty(), "{os:?}");
+            for name in candidates {
+                assert!(name.starts_with("hevc_"), "{name} is not an HEVC decoder");
+                // Every candidate must be one the profile layer can
+                // recognize later, or a seeded row stops being detected as
+                // auto-generated and never gets upgraded again.
+                assert!(
+                    crate::database::preview_4k_extra_args_is_auto_generated(Some(
+                        &crate::database::preview_4k_encode_args_ffmpeg_hwdec("h264_qsv", name)
+                    )),
+                    "{name} missing from KNOWN_HEVC_HW_DECODERS"
+                );
+            }
+        }
     }
 }

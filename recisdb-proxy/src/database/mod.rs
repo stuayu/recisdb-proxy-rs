@@ -17,8 +17,9 @@ mod schema;
 
 pub use models::*;
 pub use encode_profile::{
-    preview_4k_encode_args_ffmpeg, preview_4k_extra_args_is_auto_generated,
-    preview_encode_args_ffmpeg, preview_extra_args_is_auto_generated, video_encoder_tuning,
+    preview_4k_encode_args_ffmpeg, preview_4k_encode_args_ffmpeg_hwdec,
+    preview_4k_extra_args_is_auto_generated, preview_encode_args_ffmpeg,
+    preview_extra_args_is_auto_generated, video_encoder_tuning,
 };
 
 use rusqlite::{Connection, Result as SqliteResult};

@@ -10,6 +10,17 @@
 use super::{Database, EncodeProfileRecord, Result};
 use rusqlite::{params, OptionalExtension};
 
+/// HEVC hardware decoders `preview_setup` may pick for the BS4K template.
+/// Kept here (not in `preview_setup`) because
+/// [`preview_4k_extra_args_is_auto_generated`] has to recognize every
+/// template this codebase can generate, and that includes one per decoder.
+pub(crate) const KNOWN_HEVC_HW_DECODERS: &[&str] = &[
+    "hevc_qsv",
+    "hevc_cuvid",
+    "hevc_vaapi",
+    "hevc_videotoolbox",
+];
+
 const KNOWN_PREVIEW_ENCODERS: &[&str] = &[
     "libx264",
     "h264_videotoolbox",
@@ -123,7 +134,34 @@ fn legacy_preview_4k_encode_args_ffmpeg(video_encoder: &str) -> [String; 2] {
     ]
 }
 
-/// Build ffmpeg arguments for BS4K preview.
+/// BS4K preview arguments for a machine whose ffmpeg can decode HEVC in
+/// hardware.
+///
+/// This is the good case: the 2160/59.94p Main10 source is decoded on the
+/// GPU, so none of the decode-side throttles in
+/// [`preview_4k_encode_args_ffmpeg`] are needed and the preview keeps full
+/// 1080p at the source frame rate. `preview_setup` only selects a decoder
+/// here after actually decoding a sample HEVC clip with it, because being
+/// listed in `-decoders` says nothing about whether a GPU backs it.
+pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &str) -> String {
+    format!(
+        "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+         -analyzeduration 600000 -probesize 1000000 \
+         -c:v {hevc_decoder} \
+         -f mpegts -i pipe:0 \
+         -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+         -vf scale=1920:1080 \
+         -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
+         -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
+         -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
+         -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
+        tuning = video_encoder_tuning(video_encoder)
+    )
+}
+
+/// Build ffmpeg arguments for BS4K preview **when no hardware HEVC decoder
+/// is available**. Use [`preview_4k_encode_args_ffmpeg_hwdec`] when there is
+/// one; `preview_setup` decides which by probing.
 ///
 /// The tsreadex input and stream mapping match the normal preview, but the
 /// source is progressive 2160/59.94p HEVC Main10, so there is no deinterlacer
@@ -178,6 +216,9 @@ pub fn preview_4k_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool
     if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS { return true; }
     KNOWN_PREVIEW_ENCODERS.iter().any(|enc| {
         args == preview_4k_encode_args_ffmpeg(enc)
+            || KNOWN_HEVC_HW_DECODERS
+                .iter()
+                .any(|dec| args == preview_4k_encode_args_ffmpeg_hwdec(enc, dec))
             || legacy_preview_4k_encode_args_ffmpeg(enc)
                 .iter()
                 .any(|legacy| args == legacy.as_str())
