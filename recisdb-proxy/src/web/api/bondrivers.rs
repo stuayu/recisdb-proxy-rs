@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::web::state::WebState;
 use crate::database::NewBonDriver;
+use crate::web::state::WebState;
 
 use super::channels::ChannelQuery;
 use super::error::ApiError;
@@ -129,11 +129,16 @@ pub async fn get_bondrivers(
             next_scan_at: d.next_scan_at,
             passive_scan_enabled: d.passive_scan_enabled,
             max_instances: d.max_instances,
-            stream_format: db.driver_stream_format(&d.dll_path).as_db_value().to_string(),
+            stream_format: db
+                .driver_stream_format(&d.dll_path)
+                .as_db_value()
+                .to_string(),
             disable_b25: db.driver_disables_b25(&d.dll_path),
             breaker_state: breaker_state_str(&web_state, &d.dll_path),
             breaker_retry_in_secs: breaker_retry_in_secs(&web_state, &d.dll_path),
-            quality_score: db.get_driver_quality_score_by_path(&d.dll_path).unwrap_or(1.0),
+            quality_score: db
+                .get_driver_quality_score_by_path(&d.dll_path)
+                .unwrap_or(1.0),
             is_scanning: web_state.tuner_pool.is_scanning(&d.dll_path),
             created_at: d.created_at,
             updated_at: d.updated_at,
@@ -221,7 +226,12 @@ pub async fn create_bondriver(
     }
 
     let mut new_driver = NewBonDriver::new(dll_path.to_string());
-    if let Some(name) = payload.driver_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(name) = payload
+        .driver_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         new_driver.driver_name = Some(name.to_string());
     }
     if let Some(max_instances) = payload.max_instances {
@@ -232,7 +242,12 @@ pub async fn create_bondriver(
 
     let id = db.insert_bon_driver(&new_driver)?;
 
-    if let Some(group) = payload.group_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(group) = payload
+        .group_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         db.set_group_name(id, Some(group))
             .map_err(|e| ApiError::internal(format!("Failed to set group_name: {}", e)))?;
     }
@@ -259,8 +274,14 @@ pub async fn create_bondriver(
         let priority = payload.scan_priority.unwrap_or(0);
         let passive = payload.passive_scan_enabled.unwrap_or(false);
 
-        db.update_scan_config(id, Some(auto_scan), Some(interval), Some(priority), Some(passive))
-            .map_err(|e| ApiError::internal(format!("Failed to update scan config: {}", e)))?;
+        db.update_scan_config(
+            id,
+            Some(auto_scan),
+            Some(interval),
+            Some(priority),
+            Some(passive),
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to update scan config: {}", e)))?;
     }
 
     Ok(Json(json!({
@@ -278,7 +299,12 @@ pub async fn update_bondriver(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    if let Some(path) = payload.dll_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(path) = payload
+        .dll_path
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         db.update_bon_driver_path(id, path)
             .map_err(|e| ApiError::internal(format!("Failed to update dll_path: {}", e)))?;
     }
@@ -311,7 +337,9 @@ pub async fn update_bondriver(
         if let Some(format) = &payload.stream_format {
             let parsed = StreamFormat::from_db_value(format);
             db.set_driver_stream_format(&dll_path, parsed)
-                .map_err(|e| ApiError::internal(format!("Failed to update stream_format: {}", e)))?;
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to update stream_format: {}", e))
+                })?;
         }
         if let Some(disable) = payload.disable_b25 {
             db.set_driver_disable_b25(&dll_path, disable)
@@ -332,13 +360,25 @@ pub async fn update_bondriver(
             Err(e) => return Err(e.into()),
         };
 
-        let auto_scan = payload.auto_scan_enabled.unwrap_or(current.auto_scan_enabled);
-        let interval = payload.scan_interval_hours.unwrap_or(current.scan_interval_hours);
+        let auto_scan = payload
+            .auto_scan_enabled
+            .unwrap_or(current.auto_scan_enabled);
+        let interval = payload
+            .scan_interval_hours
+            .unwrap_or(current.scan_interval_hours);
         let priority = payload.scan_priority.unwrap_or(current.scan_priority);
-        let passive = payload.passive_scan_enabled.unwrap_or(current.passive_scan_enabled);
+        let passive = payload
+            .passive_scan_enabled
+            .unwrap_or(current.passive_scan_enabled);
 
-        db.update_scan_config(id, Some(auto_scan), Some(interval), Some(priority), Some(passive))
-            .map_err(|e| ApiError::internal(format!("Failed to update scan config: {}", e)))?;
+        db.update_scan_config(
+            id,
+            Some(auto_scan),
+            Some(interval),
+            Some(priority),
+            Some(passive),
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to update scan config: {}", e)))?;
     }
 
     Ok(Json(json!({

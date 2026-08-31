@@ -76,7 +76,9 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 fn find_file_named(dir: &Path, file_name: &str) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -92,7 +94,9 @@ fn find_file_named(dir: &Path, file_name: &str) -> Option<PathBuf> {
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perm = std::fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    let mut perm = std::fs::metadata(path)
+        .map_err(|e| e.to_string())?
+        .permissions();
     perm.set_mode(0o755);
     std::fs::set_permissions(path, perm).map_err(|e| e.to_string())
 }
@@ -116,9 +120,15 @@ mod fetch {
 
     pub(super) fn download_file(url: &str, dest: &Path) -> Result<(), String> {
         let client = http_client()?;
-        let mut resp = client.get(url).send().map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
+        let mut resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("ダウンロードに失敗しました (HTTP {})", resp.status()));
+            return Err(format!(
+                "ダウンロードに失敗しました (HTTP {})",
+                resp.status()
+            ));
         }
         let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
         resp.copy_to(&mut file).map_err(|e| e.to_string())?;
@@ -133,7 +143,10 @@ mod fetch {
             .send()
             .map_err(|e| format!("GitHubへの問い合わせに失敗しました: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("GitHubへの問い合わせに失敗しました (HTTP {})", resp.status()));
+            return Err(format!(
+                "GitHubへの問い合わせに失敗しました (HTTP {})",
+                resp.status()
+            ));
         }
         resp.json().map_err(|e| e.to_string())
     }
@@ -141,7 +154,9 @@ mod fetch {
     pub(super) fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        archive.extract(dest_dir).map_err(|e| format!("展開に失敗しました: {e}"))
+        archive
+            .extract(dest_dir)
+            .map_err(|e| format!("展開に失敗しました: {e}"))
     }
 
     /// `flag` is the `tar` extraction flag including the compression letter
@@ -150,7 +165,11 @@ mod fetch {
     /// No `xz`/`tar` crate in the dependency graph; shell out to the system
     /// `tar`, which supports both on every macOS/Linux this project targets
     /// (constraint: no new crate dependencies).
-    pub(super) fn extract_tar(archive_path: &Path, dest_dir: &Path, flag: &str) -> Result<(), String> {
+    pub(super) fn extract_tar(
+        archive_path: &Path,
+        dest_dir: &Path,
+        flag: &str,
+    ) -> Result<(), String> {
         let status = std::process::Command::new("tar")
             .arg(flag)
             .arg(archive_path)
@@ -159,7 +178,10 @@ mod fetch {
             .status()
             .map_err(|e| format!("tar の実行に失敗しました: {e}"))?;
         if !status.success() {
-            return Err(format!("tar の展開に失敗しました (終了コード: {:?})", status.code()));
+            return Err(format!(
+                "tar の展開に失敗しました (終了コード: {:?})",
+                status.code()
+            ));
         }
         Ok(())
     }
@@ -167,7 +189,10 @@ mod fetch {
     /// Extracts by archive shape: `.zip` via the `zip` crate, `.tar.xz` /
     /// `.tar.gz` via the system `tar`.
     pub(super) fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
-        let name = archive_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = archive_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.ends_with(".zip") {
             extract_zip(archive_path, dest_dir)
         } else if name.ends_with(".tar.xz") {
@@ -185,16 +210,23 @@ mod fetch {
 // ============================================================================
 
 fn managed_ffmpeg_path(install_dir: &Path) -> PathBuf {
-    install_dir.join("thirdparty").join("ffmpeg").join(exe_file_name("ffmpeg"))
+    install_dir
+        .join("thirdparty")
+        .join("ffmpeg")
+        .join(exe_file_name("ffmpeg"))
 }
 
 /// KonomiTV bundles its own ffmpeg build; reuse it if present rather than
 /// downloading a second copy. KonomiTV does not ship a macOS build.
 fn konomitv_ffmpeg_path() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
-        Some(PathBuf::from(r"C:\DTV\KonomiTV\server\thirdparty\FFmpeg\bin\ffmpeg.exe"))
+        Some(PathBuf::from(
+            r"C:\DTV\KonomiTV\server\thirdparty\FFmpeg\bin\ffmpeg.exe",
+        ))
     } else if cfg!(target_os = "linux") {
-        Some(PathBuf::from("/opt/KonomiTV/server/thirdparty/FFmpeg/bin/ffmpeg"))
+        Some(PathBuf::from(
+            "/opt/KonomiTV/server/thirdparty/FFmpeg/bin/ffmpeg",
+        ))
     } else {
         None
     }
@@ -220,7 +252,12 @@ fn run_ffmpeg_encoders(ffmpeg_path: &Path) -> Result<String, String> {
     let output = std::process::Command::new(ffmpeg_path)
         .args(["-hide_banner", "-encoders"])
         .output()
-        .map_err(|e| format!("ffmpeg の実行に失敗しました ({}): {e}", ffmpeg_path.display()))?;
+        .map_err(|e| {
+            format!(
+                "ffmpeg の実行に失敗しました ({}): {e}",
+                ffmpeg_path.display()
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
             "ffmpeg -encoders が失敗しました (終了コード: {:?})",
@@ -374,10 +411,7 @@ fn make_hevc_probe_sample(ffmpeg_path: &Path, encoders_output: &str) -> Option<P
     let hevc_encoder = ["libx265", "hevc_qsv", "hevc_nvenc", "hevc_videotoolbox"]
         .into_iter()
         .find(|name| encoders_output.contains(name))?;
-    let path = std::env::temp_dir().join(format!(
-        "recisdb-hevc-probe-{}.hevc",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("recisdb-hevc-probe-{}.hevc", std::process::id()));
     let ok = std::process::Command::new(ffmpeg_path)
         .args([
             "-hide_banner",
@@ -418,7 +452,14 @@ fn make_hevc_probe_sample(ffmpeg_path: &Path, encoders_output: &str) -> Option<P
 /// like success.
 fn test_hevc_decode_works(ffmpeg_path: &Path, hevc_decoder: &str, sample: &Path) -> bool {
     std::process::Command::new(ffmpeg_path)
-        .args(["-hide_banner", "-loglevel", "error", "-c:v", hevc_decoder, "-i"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-c:v",
+            hevc_decoder,
+            "-i",
+        ])
         .arg(sample)
         .args(["-f", "null", "-"])
         .status()
@@ -458,8 +499,10 @@ mod ffmpeg_download {
 
     use super::fetch::{download_file, extract_archive};
 
-    const BTBN_RELEASE_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest";
-    const BTBN_DOWNLOAD_BASE: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
+    const BTBN_RELEASE_API: &str =
+        "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest";
+    const BTBN_DOWNLOAD_BASE: &str =
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
 
     /// BtbN's static builds cover Windows/Linux x86_64/aarch64. No macOS
     /// build exists there, so macOS goes through Homebrew instead (see
@@ -485,12 +528,20 @@ mod ffmpeg_download {
     /// `-gpl-shared`, which needs the accompanying `lib/` directory and so
     /// cannot be copied out as a single binary.
     pub(super) fn is_static_gpl_asset(name: &str, prefix: &str, platform: &str, ext: &str) -> bool {
-        let Some(rest) = name.strip_prefix(prefix) else { return false };
-        let Some(rest) = rest.strip_suffix(ext) else { return false };
+        let Some(rest) = name.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_suffix(ext) else {
+            return false;
+        };
         // rest is e.g. "win64-gpl" or "win64-gpl-8.1" (release-branch builds
         // carry a version suffix) or "win64-gpl-shared".
-        let Some(rest) = rest.strip_prefix(platform) else { return false };
-        let Some(rest) = rest.strip_prefix("-gpl") else { return false };
+        let Some(rest) = rest.strip_prefix(platform) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix("-gpl") else {
+            return false;
+        };
         !rest.contains("shared")
     }
 
@@ -508,29 +559,44 @@ mod ffmpeg_download {
         let (platform, ext) = btbn_platform()?;
         let fallback = format!("{BTBN_DOWNLOAD_BASE}/ffmpeg-master-latest-{platform}-gpl{ext}");
 
-        let Ok(body) = super::fetch::get_json(BTBN_RELEASE_API) else { return Ok(fallback) };
-        let Some(assets) = body.get("assets").and_then(|v| v.as_array()) else { return Ok(fallback) };
+        let Ok(body) = super::fetch::get_json(BTBN_RELEASE_API) else {
+            return Ok(fallback);
+        };
+        let Some(assets) = body.get("assets").and_then(|v| v.as_array()) else {
+            return Ok(fallback);
+        };
 
         let mut best: Option<(String, String)> = None; // (version key, url)
         let mut master_url: Option<String> = None;
         for asset in assets {
-            let Some(name) = asset.get("name").and_then(|v| v.as_str()) else { continue };
-            let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else { continue };
+            let Some(name) = asset.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
+                continue;
+            };
 
             if is_static_gpl_asset(name, "ffmpeg-master-latest-", platform, ext) {
                 master_url = Some(url.to_string());
                 continue;
             }
             // Release-branch builds: "ffmpeg-n<ver>-latest-<platform>-gpl...".
-            let Some(rest) = name.strip_prefix("ffmpeg-n") else { continue };
-            let Some((version, _)) = rest.split_once("-latest-") else { continue };
+            let Some(rest) = name.strip_prefix("ffmpeg-n") else {
+                continue;
+            };
+            let Some((version, _)) = rest.split_once("-latest-") else {
+                continue;
+            };
             let prefix = format!("ffmpeg-n{version}-latest-");
             if !is_static_gpl_asset(name, &prefix, platform, ext) {
                 continue;
             }
             // Zero-pad each numeric component so "n8.1" sorts above "n10.0"
             // correctly under plain string comparison.
-            let key: String = version.split('.').map(|part| format!("{part:0>4}.")).collect();
+            let key: String = version
+                .split('.')
+                .map(|part| format!("{part:0>4}."))
+                .collect();
             if best.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
                 best = Some((key, url.to_string()));
             }
@@ -555,8 +621,9 @@ mod ffmpeg_download {
                 status.code()
             ));
         }
-        which_on_path("ffmpeg")
-            .ok_or_else(|| "`brew install ffmpeg` の後もffmpegがPATH上に見つかりませんでした".to_string())
+        which_on_path("ffmpeg").ok_or_else(|| {
+            "`brew install ffmpeg` の後もffmpegがPATH上に見つかりませんでした".to_string()
+        })
     }
 
     /// Downloads (or, on macOS, `brew install`s) ffmpeg and returns its
@@ -572,14 +639,19 @@ mod ffmpeg_download {
         let dest_dir = install_dir.join("thirdparty").join("ffmpeg");
         std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
 
-        let tmp_dir = std::env::temp_dir().join(format!("recisdb-proxy-ffmpeg-dl-{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("recisdb-proxy-ffmpeg-dl-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         };
 
         let is_zip = url.ends_with(".zip");
-        let archive_path = tmp_dir.join(if is_zip { "ffmpeg.zip" } else { "ffmpeg.tar.xz" });
+        let archive_path = tmp_dir.join(if is_zip {
+            "ffmpeg.zip"
+        } else {
+            "ffmpeg.tar.xz"
+        });
         if let Err(e) = download_file(url, &archive_path) {
             cleanup();
             return Err(e);
@@ -632,7 +704,11 @@ fn resolve_ffmpeg(install_dir: &Path) -> Result<(PathBuf, &'static str, String),
 
     let downloaded = ffmpeg_download::download_ffmpeg(install_dir)?;
     let encoders = verify_ffmpeg_binary(&downloaded)?;
-    let source = if cfg!(target_os = "macos") { "homebrew" } else { "downloaded" };
+    let source = if cfg!(target_os = "macos") {
+        "homebrew"
+    } else {
+        "downloaded"
+    };
     Ok((downloaded, source, encoders))
 }
 
@@ -641,14 +717,21 @@ fn resolve_ffmpeg(install_dir: &Path) -> Result<(PathBuf, &'static str, String),
 // ============================================================================
 
 fn managed_tsreadex_path(install_dir: &Path) -> PathBuf {
-    install_dir.join("thirdparty").join("tsreadex").join(exe_file_name("tsreadex"))
+    install_dir
+        .join("thirdparty")
+        .join("tsreadex")
+        .join(exe_file_name("tsreadex"))
 }
 
 fn konomitv_tsreadex_path() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
-        Some(PathBuf::from(r"C:\DTV\KonomiTV\server\thirdparty\tsreadex\tsreadex.exe"))
+        Some(PathBuf::from(
+            r"C:\DTV\KonomiTV\server\thirdparty\tsreadex\tsreadex.exe",
+        ))
     } else if cfg!(target_os = "linux") {
-        Some(PathBuf::from("/opt/KonomiTV/server/thirdparty/tsreadex/tsreadex"))
+        Some(PathBuf::from(
+            "/opt/KonomiTV/server/thirdparty/tsreadex/tsreadex",
+        ))
     } else {
         None
     }
@@ -679,7 +762,8 @@ mod tsreadex_setup {
     /// platform we support (see `.github/workflows/tsreadex.yml`). Preferred
     /// over upstream because upstream ships Windows x86/x64 binaries only —
     /// every other platform would otherwise need a local C++ toolchain.
-    const OWN_RELEASES_API: &str = "https://api.github.com/repos/stuayu/recisdb-proxy-rs/releases?per_page=15";
+    const OWN_RELEASES_API: &str =
+        "https://api.github.com/repos/stuayu/recisdb-proxy-rs/releases?per_page=15";
 
     struct ReleaseAsset {
         tag_name: String,
@@ -691,11 +775,17 @@ mod tsreadex_setup {
     /// (the known real-world shape: `tsreadex-master-YYMMDD.zip`).
     fn fetch_latest_release_with_asset() -> Result<ReleaseAsset, String> {
         let body = get_json(RELEASES_API)?;
-        let releases = body.as_array().ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
+        let releases = body
+            .as_array()
+            .ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
 
         for release in releases {
-            let Some(tag_name) = release.get("tag_name").and_then(|v| v.as_str()) else { continue };
-            let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else { continue };
+            let Some(tag_name) = release.get("tag_name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else {
+                continue;
+            };
             let asset = assets.iter().find(|a| {
                 a.get("name")
                     .and_then(|n| n.as_str())
@@ -703,8 +793,14 @@ mod tsreadex_setup {
                     .unwrap_or(false)
             });
             if let Some(asset) = asset {
-                let asset_name = asset.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-                let asset_url = asset.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or_default();
+                let asset_name = asset
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                let asset_url = asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or_default();
                 if !asset_name.is_empty() && !asset_url.is_empty() {
                     return Ok(ReleaseAsset {
                         tag_name: tag_name.to_string(),
@@ -745,20 +841,30 @@ mod tsreadex_setup {
         let suffix = own_asset_suffix(std::env::consts::OS, std::env::consts::ARCH)
             .ok_or_else(|| "この環境向けのtsreadexビルドは配布されていません".to_string())?;
         let body = get_json(OWN_RELEASES_API)?;
-        let releases = body.as_array().ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
+        let releases = body
+            .as_array()
+            .ok_or_else(|| "GitHub APIの応答が予期しない形式でした".to_string())?;
 
         for release in releases {
-            let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else { continue };
+            let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else {
+                continue;
+            };
             for asset in assets {
-                let Some(name) = asset.get("name").and_then(|n| n.as_str()) else { continue };
+                let Some(name) = asset.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
                 if !name.starts_with("tsreadex-") || !name.ends_with(&suffix) {
                     continue;
                 }
-                let Some(url) = asset.get("browser_download_url").and_then(|u| u.as_str()) else { continue };
+                let Some(url) = asset.get("browser_download_url").and_then(|u| u.as_str()) else {
+                    continue;
+                };
                 return Ok((name.to_string(), url.to_string()));
             }
         }
-        Err(format!("tsreadexの配布ファイル (*{suffix}) が見つかりませんでした"))
+        Err(format!(
+            "tsreadexの配布ファイル (*{suffix}) が見つかりませんでした"
+        ))
     }
 
     /// Installs from our own prebuilt asset — a single archive holding
@@ -770,8 +876,8 @@ mod tsreadex_setup {
         extract_archive(&archive_path, tmp_dir)?;
 
         let file_name = exe_file_name("tsreadex");
-        let extracted =
-            find_file_named(tmp_dir, &file_name).ok_or_else(|| format!("展開後に {file_name} が見つかりませんでした"))?;
+        let extracted = find_file_named(tmp_dir, &file_name)
+            .ok_or_else(|| format!("展開後に {file_name} が見つかりませんでした"))?;
         std::fs::copy(&extracted, dest_file).map_err(|e| e.to_string())?;
         make_executable(dest_file)
     }
@@ -779,7 +885,11 @@ mod tsreadex_setup {
     /// Windows: the release zip already contains prebuilt `tsreadex.exe`
     /// binaries (`x64/tsreadex.exe`, `x86/tsreadex.exe`) — just pick the one
     /// matching this build's pointer width.
-    fn install_windows(release: &ReleaseAsset, tmp_dir: &Path, dest_file: &Path) -> Result<(), String> {
+    fn install_windows(
+        release: &ReleaseAsset,
+        tmp_dir: &Path,
+        dest_file: &Path,
+    ) -> Result<(), String> {
         let zip_path = tmp_dir.join(&release.asset_name);
         download_file(&release.asset_url, &zip_path)?;
         extract_zip(&zip_path, tmp_dir)?;
@@ -787,7 +897,11 @@ mod tsreadex_setup {
         // The zip holds both `x64/tsreadex.exe` and `x86/tsreadex.exe`;
         // `find_file_named` walks in unspecified order, so scan for the
         // matching bitness explicitly before falling back to any copy.
-        let bitness_dir = if cfg!(target_pointer_width = "64") { "x64" } else { "x86" };
+        let bitness_dir = if cfg!(target_pointer_width = "64") {
+            "x64"
+        } else {
+            "x86"
+        };
         let extracted = find_file_named(&tmp_dir.join(bitness_dir), "tsreadex.exe")
             .or_else(|| find_file_named(tmp_dir, "tsreadex.exe"))
             .ok_or_else(|| format!("展開後に {bitness_dir}/tsreadex.exe が見つかりませんでした"))?;
@@ -798,8 +912,13 @@ mod tsreadex_setup {
     /// Unix: the release zip only contains Windows binaries, so fetch the
     /// tagged *source* archive instead and build it locally with `make`
     /// (verified to build cleanly, no extra dependencies, in a few seconds).
-    fn install_unix(release: &ReleaseAsset, tmp_dir: &Path, dest_file: &Path) -> Result<(), String> {
-        which_on_path("make").ok_or_else(|| "make が見つかりません(tsreadexのビルドをスキップします)".to_string())?;
+    fn install_unix(
+        release: &ReleaseAsset,
+        tmp_dir: &Path,
+        dest_file: &Path,
+    ) -> Result<(), String> {
+        which_on_path("make")
+            .ok_or_else(|| "make が見つかりません(tsreadexのビルドをスキップします)".to_string())?;
 
         let src_url = format!(
             "https://github.com/xtne6f/tsreadex/archive/refs/tags/{}.zip",
@@ -809,15 +928,21 @@ mod tsreadex_setup {
         download_file(&src_url, &zip_path)?;
         extract_zip(&zip_path, tmp_dir)?;
 
-        let makefile = find_file_named(tmp_dir, "Makefile").ok_or_else(|| "展開後にMakefileが見つかりませんでした".to_string())?;
-        let src_dir = makefile.parent().ok_or_else(|| "Makefileの親ディレクトリを特定できませんでした".to_string())?;
+        let makefile = find_file_named(tmp_dir, "Makefile")
+            .ok_or_else(|| "展開後にMakefileが見つかりませんでした".to_string())?;
+        let src_dir = makefile
+            .parent()
+            .ok_or_else(|| "Makefileの親ディレクトリを特定できませんでした".to_string())?;
 
         let status = std::process::Command::new("make")
             .current_dir(src_dir)
             .status()
             .map_err(|e| format!("make の実行に失敗しました: {e}"))?;
         if !status.success() {
-            return Err(format!("tsreadexのビルドに失敗しました (make 終了コード: {:?})", status.code()));
+            return Err(format!(
+                "tsreadexのビルドに失敗しました (make 終了コード: {:?})",
+                status.code()
+            ));
         }
 
         let built = src_dir.join("tsreadex");
@@ -853,12 +978,14 @@ mod tsreadex_setup {
         std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
         let dest_file = dest_dir.join(exe_file_name("tsreadex"));
 
-        let tmp_dir = std::env::temp_dir().join(format!("recisdb-proxy-tsreadex-dl-{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("recisdb-proxy-tsreadex-dl-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
         let result = install_from_own_release(&tmp_dir, &dest_file).or_else(|own_err| {
-            install_from_upstream(&tmp_dir, &dest_file)
-                .map_err(|upstream_err| format!("{own_err} / 上流からの取得も失敗しました: {upstream_err}"))
+            install_from_upstream(&tmp_dir, &dest_file).map_err(|upstream_err| {
+                format!("{own_err} / 上流からの取得も失敗しました: {upstream_err}")
+            })
         });
         let _ = std::fs::remove_dir_all(&tmp_dir);
         result?;
@@ -920,10 +1047,15 @@ fn toml_section_has_key(toml: &str, section: &str, key: &str) -> bool {
 /// Rewrites `[preview] command_path`/`preprocessor_path` in the config file
 /// at `config_path` to the resolved paths, leaving every other line
 /// (including comments and other sections) untouched.
-fn write_preview_paths_to_toml(config_path: &Path, command_path: &str, preprocessor_path: &str) -> Result<(), String> {
+fn write_preview_paths_to_toml(
+    config_path: &Path,
+    command_path: &str,
+    preprocessor_path: &str,
+) -> Result<(), String> {
     let contents = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
 
-    if !toml_section_has_key(&contents, "preview", "command_path") || !toml_section_has_key(&contents, "preview", "preprocessor_path")
+    if !toml_section_has_key(&contents, "preview", "command_path")
+        || !toml_section_has_key(&contents, "preview", "preprocessor_path")
     {
         return Err(format!(
             "{} の [preview] セクションに command_path / preprocessor_path が見つかりませんでした。\
@@ -938,8 +1070,18 @@ fn write_preview_paths_to_toml(config_path: &Path, command_path: &str, preproces
     let command_path = crate::setup_helpers::escape_toml_basic_string(command_path);
     let preprocessor_path = crate::setup_helpers::escape_toml_basic_string(preprocessor_path);
 
-    let rewritten = crate::setup_helpers::replace_scalar_in_section(&contents, "preview", "command_path", &command_path);
-    let rewritten = crate::setup_helpers::replace_scalar_in_section(&rewritten, "preview", "preprocessor_path", &preprocessor_path);
+    let rewritten = crate::setup_helpers::replace_scalar_in_section(
+        &contents,
+        "preview",
+        "command_path",
+        &command_path,
+    );
+    let rewritten = crate::setup_helpers::replace_scalar_in_section(
+        &rewritten,
+        "preview",
+        "preprocessor_path",
+        &preprocessor_path,
+    );
 
     std::fs::write(config_path, rewritten).map_err(|e| e.to_string())
 }
@@ -967,12 +1109,23 @@ fn update_preview_profile_args_if_default(
 
     if crate::database::preview_extra_args_is_auto_generated(profile.extra_args.as_deref()) {
         let new_args = crate::database::preview_encode_args_ffmpeg(video_encoder);
-        db.update_encode_profile(profile.id, None, None, None, None, None, Some(Some(&new_args)), None)
-            .map_err(|e| e.to_string())?;
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&new_args)),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     if let Some(profile_4k) = profiles.iter().find(|p| p.name == "preview-4k") {
-        if crate::database::preview_4k_extra_args_is_auto_generated(profile_4k.extra_args.as_deref()) {
+        if crate::database::preview_4k_extra_args_is_auto_generated(
+            profile_4k.extra_args.as_deref(),
+        ) {
             // A machine with a working hardware HEVC decoder gets the full
             // 1080p/60 template; everything else gets the throttled one.
             let new_args = match hevc_hw_decoder {
@@ -1006,7 +1159,11 @@ fn update_preview_profile_args_if_default(
 /// `warnings` and preview is still enabled (with `preprocessor_path` left
 /// empty). ffmpeg (the encoder) is not optional: failure there is returned
 /// as `Err` and nothing is written to the DB.
-pub fn ensure_preview_ready(db: &Database, install_dir: &Path, config_path: Option<&Path>) -> Result<PreviewSetupReport, String> {
+pub fn ensure_preview_ready(
+    db: &Database,
+    install_dir: &Path,
+    config_path: Option<&Path>,
+) -> Result<PreviewSetupReport, String> {
     let mut warnings = Vec::new();
 
     let (encoder_path, encoder_source, encoders_output) = resolve_ffmpeg(install_dir)?;
@@ -1027,19 +1184,30 @@ pub fn ensure_preview_ready(db: &Database, install_dir: &Path, config_path: Opti
 
     let encoder_path_str = encoder_path.to_string_lossy().into_owned();
 
-    db.set_preview_command_path(&encoder_path_str).map_err(|e| e.to_string())?;
-    db.set_preview_preprocessor_path(&preprocessor_path).map_err(|e| e.to_string())?;
+    db.set_preview_command_path(&encoder_path_str)
+        .map_err(|e| e.to_string())?;
+    db.set_preview_preprocessor_path(&preprocessor_path)
+        .map_err(|e| e.to_string())?;
 
-    if let Err(e) = update_preview_profile_args_if_default(db, &video_encoder, hevc_hw_decoder.as_deref()) {
-        warnings.push(format!("エンコードプロファイルの更新に失敗しました(手動で確認してください): {e}"));
+    if let Err(e) =
+        update_preview_profile_args_if_default(db, &video_encoder, hevc_hw_decoder.as_deref())
+    {
+        warnings.push(format!(
+            "エンコードプロファイルの更新に失敗しました(手動で確認してください): {e}"
+        ));
     }
 
-    db.update_preview_encoder_config(true, crate::database::DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS, 10_000)
-        .map_err(|e| e.to_string())?;
+    db.update_preview_encoder_config(
+        true,
+        crate::database::DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS,
+        10_000,
+    )
+    .map_err(|e| e.to_string())?;
 
     match config_path {
         Some(path) if path.exists() => {
-            if let Err(e) = write_preview_paths_to_toml(path, &encoder_path_str, &preprocessor_path) {
+            if let Err(e) = write_preview_paths_to_toml(path, &encoder_path_str, &preprocessor_path)
+            {
                 warnings.push(format!(
                     "{} の書き換えに失敗しました。次回起動時にこの設定が失われる可能性があります: {e}",
                     path.display()
@@ -1088,8 +1256,18 @@ mod tests {
         use ffmpeg_download::is_static_gpl_asset as m;
 
         // Release-branch build, with and without the version suffix.
-        assert!(m("ffmpeg-n8.1-latest-win64-gpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
-        assert!(m("ffmpeg-n8.1-latest-win64-gpl.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(m(
+            "ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+            "ffmpeg-n8.1-latest-",
+            "win64",
+            ".zip"
+        ));
+        assert!(m(
+            "ffmpeg-n8.1-latest-win64-gpl.zip",
+            "ffmpeg-n8.1-latest-",
+            "win64",
+            ".zip"
+        ));
         assert!(m(
             "ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz",
             "ffmpeg-n8.1-latest-",
@@ -1097,16 +1275,46 @@ mod tests {
             ".tar.xz"
         ));
         // master build (the offline fallback's shape).
-        assert!(m("ffmpeg-master-latest-win64-gpl.zip", "ffmpeg-master-latest-", "win64", ".zip"));
+        assert!(m(
+            "ffmpeg-master-latest-win64-gpl.zip",
+            "ffmpeg-master-latest-",
+            "win64",
+            ".zip"
+        ));
 
         // Shared builds need an accompanying lib/ dir -> must be rejected.
-        assert!(!m("ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
-        assert!(!m("ffmpeg-master-latest-win64-gpl-shared.zip", "ffmpeg-master-latest-", "win64", ".zip"));
+        assert!(!m(
+            "ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip",
+            "ffmpeg-n8.1-latest-",
+            "win64",
+            ".zip"
+        ));
+        assert!(!m(
+            "ffmpeg-master-latest-win64-gpl-shared.zip",
+            "ffmpeg-master-latest-",
+            "win64",
+            ".zip"
+        ));
         // LGPL builds lack libx264, which verify_ffmpeg_binary requires.
-        assert!(!m("ffmpeg-n8.1-latest-win64-lgpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
+        assert!(!m(
+            "ffmpeg-n8.1-latest-win64-lgpl-8.1.zip",
+            "ffmpeg-n8.1-latest-",
+            "win64",
+            ".zip"
+        ));
         // Wrong platform / wrong extension.
-        assert!(!m("ffmpeg-n8.1-latest-winarm64-gpl-8.1.zip", "ffmpeg-n8.1-latest-", "win64", ".zip"));
-        assert!(!m("ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz", "ffmpeg-n8.1-latest-", "linux64", ".zip"));
+        assert!(!m(
+            "ffmpeg-n8.1-latest-winarm64-gpl-8.1.zip",
+            "ffmpeg-n8.1-latest-",
+            "win64",
+            ".zip"
+        ));
+        assert!(!m(
+            "ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
+            "ffmpeg-n8.1-latest-",
+            "linux64",
+            ".zip"
+        ));
     }
 
     // -- tsreadex asset naming (pure, no network) --------------------------
@@ -1124,9 +1332,15 @@ mod tests {
         assert_eq!(s("windows", "x86").as_deref(), Some("-win-x86.zip"));
         assert_eq!(s("windows", "aarch64").as_deref(), Some("-win-arm64.zip"));
         assert_eq!(s("linux", "x86_64").as_deref(), Some("-linux-amd64.tar.gz"));
-        assert_eq!(s("linux", "aarch64").as_deref(), Some("-linux-arm64.tar.gz"));
+        assert_eq!(
+            s("linux", "aarch64").as_deref(),
+            Some("-linux-arm64.tar.gz")
+        );
         assert_eq!(s("macos", "x86_64").as_deref(), Some("-macos-amd64.tar.gz"));
-        assert_eq!(s("macos", "aarch64").as_deref(), Some("-macos-arm64.tar.gz"));
+        assert_eq!(
+            s("macos", "aarch64").as_deref(),
+            Some("-macos-arm64.tar.gz")
+        );
 
         // Unreleased platforms must fall through to the upstream path
         // instead of fetching a wrong-architecture binary.
@@ -1143,7 +1357,10 @@ mod tests {
     #[test]
     fn macos_prefers_videotoolbox_when_listed() {
         let listing = " V..... h264_videotoolbox    VideoToolbox H.264 Encoder\n V..... libx264              libx264 H.264\n";
-        assert_eq!(listed_hardware_encoders(HostOs::MacOs, listing), vec!["h264_videotoolbox"]);
+        assert_eq!(
+            listed_hardware_encoders(HostOs::MacOs, listing),
+            vec!["h264_videotoolbox"]
+        );
     }
 
     #[test]
@@ -1170,7 +1387,10 @@ mod tests {
     #[test]
     fn windows_falls_back_to_whatever_subset_is_listed() {
         let listing = "h264_amf\nlibx264\n";
-        assert_eq!(listed_hardware_encoders(HostOs::Windows, listing), vec!["h264_amf"]);
+        assert_eq!(
+            listed_hardware_encoders(HostOs::Windows, listing),
+            vec!["h264_amf"]
+        );
     }
 
     #[test]
@@ -1186,9 +1406,15 @@ mod tests {
     fn no_hardware_candidates_listed_anywhere_means_libx264_fallback() {
         let listing = "libx264\nmpeg4\n";
         for os in [HostOs::MacOs, HostOs::Windows, HostOs::Linux] {
-            assert!(listed_hardware_encoders(os, listing).is_empty(), "{os:?} should have no candidates");
+            assert!(
+                listed_hardware_encoders(os, listing).is_empty(),
+                "{os:?} should have no candidates"
+            );
         }
-        assert_eq!(select_working_video_encoder(Path::new("/nonexistent/ffmpeg"), listing), "libx264");
+        assert_eq!(
+            select_working_video_encoder(Path::new("/nonexistent/ffmpeg"), listing),
+            "libx264"
+        );
     }
 
     // -- ffmpeg argument template --------------------------------------
@@ -1196,14 +1422,26 @@ mod tests {
     #[test]
     fn ffmpeg_args_target_stdin_stdout_mpegts_with_requested_encoder() {
         let args = crate::database::preview_encode_args_ffmpeg("h264_qsv");
-        assert!(args.contains("-f mpegts -i pipe:0"), "must read mpegts from stdin: {args}");
-        assert!(args.contains("-c:v h264_qsv"), "must use the requested encoder: {args}");
+        assert!(
+            args.contains("-f mpegts -i pipe:0"),
+            "must read mpegts from stdin: {args}"
+        );
+        assert!(
+            args.contains("-c:v h264_qsv"),
+            "must use the requested encoder: {args}"
+        );
         assert!(args.contains("pipe:1"), "must write to stdout: {args}");
-        assert!(args.contains("-map 0:d?"), "must pass through the ID3 timed-metadata stream: {args}");
+        assert!(
+            args.contains("-map 0:d?"),
+            "must pass through the ID3 timed-metadata stream: {args}"
+        );
         // x264 固有のオプションがハードウェアエンコーダに漏れていないこと。
         // (`-preset veryfast` は QSV にも同名のプリセットがあるので、判定材料に
         // 使えるのは x264 にしかない `-tune zerolatency` の方。)
-        assert!(!args.contains("zerolatency"), "libx264 専用のオプションが漏れている: {args}");
+        assert!(
+            !args.contains("zerolatency"),
+            "libx264 専用のオプションが漏れている: {args}"
+        );
     }
 
     #[test]
@@ -1211,7 +1449,13 @@ mod tests {
         // 本番の引数に埋まる調整オプションと、候補選定のテストエンコードで
         // 使うものが同一であること。ここがずれると「選定は通ったのに視聴開始で
         // 落ちる」状態になる。
-        for encoder in ["libx264", "h264_videotoolbox", "h264_qsv", "h264_nvenc", "h264_amf"] {
+        for encoder in [
+            "libx264",
+            "h264_videotoolbox",
+            "h264_qsv",
+            "h264_nvenc",
+            "h264_amf",
+        ] {
             let tuning = crate::database::video_encoder_tuning(encoder);
             assert!(!tuning.is_empty(), "{encoder} の調整オプションが空");
             let args = crate::database::preview_encode_args_ffmpeg(encoder);
@@ -1225,7 +1469,10 @@ mod tests {
     #[test]
     fn libx264_is_tuned_for_low_latency() {
         let args = crate::database::preview_encode_args_ffmpeg("libx264");
-        assert!(args.contains("-c:v libx264 -preset veryfast -tune zerolatency"), "{args}");
+        assert!(
+            args.contains("-c:v libx264 -preset veryfast -tune zerolatency"),
+            "{args}"
+        );
     }
 
     #[test]
@@ -1242,7 +1489,10 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("recisdb-proxy-preview-setup-test-{label}-{n}-{}.toml", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "recisdb-proxy-preview-setup-test-{label}-{n}-{}.toml",
+            std::process::id()
+        ))
     }
 
     const SAMPLE_TOML: &str = r#"# sample config
@@ -1263,12 +1513,22 @@ enabled = false
         let path = unique_temp_path("rewrite-both");
         std::fs::write(&path, SAMPLE_TOML).unwrap();
 
-        write_preview_paths_to_toml(&path, "/opt/recisdb-proxy/thirdparty/ffmpeg/ffmpeg", "/opt/recisdb-proxy/thirdparty/tsreadex/tsreadex").unwrap();
+        write_preview_paths_to_toml(
+            &path,
+            "/opt/recisdb-proxy/thirdparty/ffmpeg/ffmpeg",
+            "/opt/recisdb-proxy/thirdparty/tsreadex/tsreadex",
+        )
+        .unwrap();
 
         let updated = std::fs::read_to_string(&path).unwrap();
-        assert!(updated.contains(r#"command_path = "/opt/recisdb-proxy/thirdparty/ffmpeg/ffmpeg""#), "{updated}");
         assert!(
-            updated.contains(r#"preprocessor_path = "/opt/recisdb-proxy/thirdparty/tsreadex/tsreadex""#),
+            updated.contains(r#"command_path = "/opt/recisdb-proxy/thirdparty/ffmpeg/ffmpeg""#),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(
+                r#"preprocessor_path = "/opt/recisdb-proxy/thirdparty/tsreadex/tsreadex""#
+            ),
             "{updated}"
         );
         // Untouched sections/lines.
@@ -1284,14 +1544,19 @@ enabled = false
         let path = unique_temp_path("rewrite-escape");
         std::fs::write(&path, SAMPLE_TOML).unwrap();
 
-        write_preview_paths_to_toml(&path, r"C:\recisdb-proxy\thirdparty\ffmpeg\ffmpeg.exe", "").unwrap();
+        write_preview_paths_to_toml(&path, r"C:\recisdb-proxy\thirdparty\ffmpeg\ffmpeg.exe", "")
+            .unwrap();
 
         let updated = std::fs::read_to_string(&path).unwrap();
         assert!(
-            updated.contains(r#"command_path = "C:\\recisdb-proxy\\thirdparty\\ffmpeg\\ffmpeg.exe""#),
+            updated
+                .contains(r#"command_path = "C:\\recisdb-proxy\\thirdparty\\ffmpeg\\ffmpeg.exe""#),
             "{updated}"
         );
-        assert!(updated.contains(r#"preprocessor_path = """#), "empty preprocessor path should be written verbatim: {updated}");
+        assert!(
+            updated.contains(r#"preprocessor_path = """#),
+            "empty preprocessor path should be written verbatim: {updated}"
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -1316,16 +1581,33 @@ enabled = false
         let db = Database::open_in_memory().unwrap();
 
         // Freshly seeded row (QSVEncC default) must count as replaceable.
-        let seeded = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
-        assert!(crate::database::preview_extra_args_is_auto_generated(seeded.extra_args.as_deref()));
+        let seeded = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "preview-h264")
+            .unwrap();
+        assert!(crate::database::preview_extra_args_is_auto_generated(
+            seeded.extra_args.as_deref()
+        ));
 
         update_preview_profile_args_if_default(&db, "h264_videotoolbox", None).unwrap();
-        let updated = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
+        let updated = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "preview-h264")
+            .unwrap();
         assert_eq!(
             updated.extra_args.as_deref(),
             Some(crate::database::preview_encode_args_ffmpeg("h264_videotoolbox").as_str())
         );
-        let updated_4k = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-4k").unwrap();
+        let updated_4k = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "preview-4k")
+            .unwrap();
         assert_eq!(
             updated_4k.extra_args.as_deref(),
             Some(crate::database::preview_4k_encode_args_ffmpeg("h264_videotoolbox").as_str())
@@ -1334,17 +1616,40 @@ enabled = false
         // Re-running with a different encoder must still replace it (this
         // is still a value the tool itself generated, not an admin edit).
         update_preview_profile_args_if_default(&db, "h264_qsv", None).unwrap();
-        let updated = db.get_all_encode_profiles().unwrap().into_iter().find(|p| p.name == "preview-h264").unwrap();
+        let updated = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "preview-h264")
+            .unwrap();
         assert_eq!(
             updated.extra_args.as_deref(),
             Some(crate::database::preview_encode_args_ffmpeg("h264_qsv").as_str())
         );
 
         // An admin's own edit must never be overwritten.
-        db.update_encode_profile(updated.id, None, None, None, None, None, Some(Some("--my-custom-args")), None)
-            .unwrap();
-        db.update_encode_profile(updated_4k.id, None, None, None, None, None, Some(Some("--my-custom-4k-args")), None)
-            .unwrap();
+        db.update_encode_profile(
+            updated.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--my-custom-args")),
+            None,
+        )
+        .unwrap();
+        db.update_encode_profile(
+            updated_4k.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--my-custom-4k-args")),
+            None,
+        )
+        .unwrap();
         update_preview_profile_args_if_default(&db, "libx264", None).unwrap();
         let profiles = db.get_all_encode_profiles().unwrap();
         let after = profiles.iter().find(|p| p.name == "preview-h264").unwrap();

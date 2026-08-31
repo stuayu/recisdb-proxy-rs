@@ -92,7 +92,9 @@ pub fn assemble_spaces<F: Fn(&str) -> bool + Copy>(
                 .map(|(channel_index, ch)| FileChannel {
                     index: channel_index as u32,
                     name: ch.name,
-                    services: services_by_ts.remove(&(ch.nid, ch.tsid)).unwrap_or_default(),
+                    services: services_by_ts
+                        .remove(&(ch.nid, ch.tsid))
+                        .unwrap_or_default(),
                 })
                 .collect(),
         })
@@ -158,7 +160,11 @@ pub fn generate_tvtest_ch2(spaces: &[FileSpace]) -> String {
         "; 名称,チューニング空間,チャンネル,リモコン番号,サービスタイプ,サービスID,ネットワークID,TSID,状態\r\n",
     );
     for space in spaces {
-        out.push_str(&format!(";#SPACE({},{})\r\n", space.index, ch2_space_name(&space.name)));
+        out.push_str(&format!(
+            ";#SPACE({},{})\r\n",
+            space.index,
+            ch2_space_name(&space.name)
+        ));
         for ch in &space.channels {
             for svc in &ch.services {
                 // TVTest writes 0-valued type/ids as empty fields.
@@ -196,10 +202,7 @@ pub fn generate_chset4(spaces: &[FileSpace]) -> String {
         for ch in &space.channels {
             for svc in &ch.services {
                 let service_type = svc.service_type.unwrap_or(1);
-                let network_name = svc
-                    .ts_name
-                    .clone()
-                    .unwrap_or_else(|| space.name.clone());
+                let network_name = svc.ts_name.clone().unwrap_or_else(|| space.name.clone());
                 out.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\r\n",
                     sanitize_name(&ch.name),
@@ -238,10 +241,7 @@ pub fn generate_chset5(spaces: &[FileSpace]) -> String {
                 }
                 let service_type = svc.service_type.unwrap_or(1);
                 let viewable = i32::from(is_viewable(svc.service_type));
-                let network_name = svc
-                    .ts_name
-                    .clone()
-                    .unwrap_or_else(|| space.name.clone());
+                let network_name = svc.ts_name.clone().unwrap_or_else(|| space.name.clone());
                 out.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\r\n",
                     sanitize_name(&svc.name),
@@ -321,11 +321,35 @@ mod tests {
                     index: 0,
                     name: "NHK総合".to_string(),
                     services: vec![
-                        svc(32736, 32736, 1024, "NHK総合・東京", Some(1), Some(1), Some("関東広域")),
-                        svc(32736, 32736, 1408, "NHK携帯G", Some(192), Some(1), Some("関東広域")),
+                        svc(
+                            32736,
+                            32736,
+                            1024,
+                            "NHK総合・東京",
+                            Some(1),
+                            Some(1),
+                            Some("関東広域"),
+                        ),
+                        svc(
+                            32736,
+                            32736,
+                            1408,
+                            "NHK携帯G",
+                            Some(192),
+                            Some(1),
+                            Some("関東広域"),
+                        ),
                         // Gガイド-style data service: type 0xC0 but NOT in
                         // the one-seg SID block → partial=0, not viewable.
-                        svc(32736, 32736, 1175, "Gガイド", Some(192), Some(1), Some("関東広域")),
+                        svc(
+                            32736,
+                            32736,
+                            1175,
+                            "Gガイド",
+                            Some(192),
+                            Some(1),
+                            Some("関東広域"),
+                        ),
                     ],
                 }],
             },
@@ -402,9 +426,18 @@ mod tests {
         }
         // Viewable services: epgCap=1, search=1. One-seg: partial=1, flags 0.
         // Data service: partial=0, flags 0. (Matches real EDCB output.)
-        assert_eq!(lines[0], "NHK総合・東京\t関東広域\t32736\t32736\t1024\t1\t0\t1\t1");
-        assert_eq!(lines[1], "NHK携帯G\t関東広域\t32736\t32736\t1408\t192\t1\t0\t0");
-        assert_eq!(lines[2], "Gガイド\t関東広域\t32736\t32736\t1175\t192\t0\t0\t0");
+        assert_eq!(
+            lines[0],
+            "NHK総合・東京\t関東広域\t32736\t32736\t1024\t1\t0\t1\t1"
+        );
+        assert_eq!(
+            lines[1],
+            "NHK携帯G\t関東広域\t32736\t32736\t1408\t192\t1\t0\t0"
+        );
+        assert_eq!(
+            lines[2],
+            "Gガイド\t関東広域\t32736\t32736\t1175\t192\t0\t0\t0"
+        );
         assert_eq!(lines[3], "NHKBS\tBS\t4\t16400\t101\t1\t0\t1\t1");
     }
 

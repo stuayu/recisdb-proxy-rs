@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use log::{debug, warn};
 
 use crate::ts_analyzer::{
-    descriptor_tag, parse_descriptor_loop, PsiSection, SdtTable, SectionCollector, TsPacket,
-    TS_PACKET_SIZE, table_id,
+    descriptor_tag, parse_descriptor_loop, table_id, PsiSection, SdtTable, SectionCollector,
+    TsPacket, TS_PACKET_SIZE,
 };
 
 const SDT_PID: u16 = 0x0011;
@@ -86,8 +86,12 @@ pub fn collected_logo_keys_in(dir: &std::path::Path) -> HashSet<(u16, u16)> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(stem) = name.strip_suffix(".png") else { continue };
-        let Some((nid, sid)) = stem.split_once('_') else { continue };
+        let Some(stem) = name.strip_suffix(".png") else {
+            continue;
+        };
+        let Some((nid, sid)) = stem.split_once('_') else {
+            continue;
+        };
         let (Ok(nid), Ok(sid)) = (nid.parse::<u16>(), sid.parse::<u16>()) else {
             continue;
         };
@@ -101,7 +105,10 @@ impl ChannelLogoCollector {
     pub fn new() -> Self {
         let output_dir = logo_dir();
         if let Err(e) = fs::create_dir_all(&output_dir) {
-            warn!("[LogoCollector] Failed to create logo directory {:?}: {}", output_dir, e);
+            warn!(
+                "[LogoCollector] Failed to create logo directory {:?}: {}",
+                output_dir, e
+            );
         }
 
         Self {
@@ -132,7 +139,10 @@ impl ChannelLogoCollector {
     }
 
     fn process_packet(&mut self, packet: &TsPacket<'_>) {
-        if packet.header.transport_error || packet.header.is_scrambled() || !packet.header.has_payload() {
+        if packet.header.transport_error
+            || packet.header.is_scrambled()
+            || !packet.header.has_payload()
+        {
             return;
         }
 
@@ -179,7 +189,8 @@ impl ChannelLogoCollector {
 
         for svc in &sdt.services {
             if let Some(logo_id) = extract_logo_id_from_sdt_descriptors(&svc.descriptors) {
-                self.current_service_logo_ids.insert(svc.service_id, logo_id);
+                self.current_service_logo_ids
+                    .insert(svc.service_id, logo_id);
             }
         }
     }
@@ -221,7 +232,13 @@ impl ChannelLogoCollector {
             let matched: Vec<u16> = self
                 .current_service_logo_ids
                 .iter()
-                .filter_map(|(sid, lid)| if *lid == logo.logo_id { Some(*sid) } else { None })
+                .filter_map(|(sid, lid)| {
+                    if *lid == logo.logo_id {
+                        Some(*sid)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             if matched.is_empty() {
@@ -443,7 +460,8 @@ fn convert_arib_png_to_standard(data: &[u8]) -> Vec<u8> {
     let mut pos = ihdr_chunk_end;
     let mut has_plte = false;
     while pos + 8 <= data.len() {
-        let chunk_len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let chunk_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let chunk_type = &data[pos + 4..pos + 8];
         if chunk_type == b"PLTE" {
             has_plte = true;
@@ -469,7 +487,11 @@ fn convert_arib_png_to_standard(data: &[u8]) -> Vec<u8> {
     plte_data.extend_from_slice(&(768u32).to_be_bytes()); // length
     plte_data.extend_from_slice(b"PLTE");
     for i in 0..256u16 {
-        let c = if i < 128 { &ARIB_CLUT[i as usize] } else { &ARIB_CLUT[8] };
+        let c = if i < 128 {
+            &ARIB_CLUT[i as usize]
+        } else {
+            &ARIB_CLUT[8]
+        };
         plte_data.push(c[0]); // R
         plte_data.push(c[1]); // G
         plte_data.push(c[2]); // B
@@ -482,7 +504,11 @@ fn convert_arib_png_to_standard(data: &[u8]) -> Vec<u8> {
     trns_data.extend_from_slice(&(256u32).to_be_bytes()); // length
     trns_data.extend_from_slice(b"tRNS");
     for i in 0..256u16 {
-        let c = if i < 128 { &ARIB_CLUT[i as usize] } else { &ARIB_CLUT[8] };
+        let c = if i < 128 {
+            &ARIB_CLUT[i as usize]
+        } else {
+            &ARIB_CLUT[8]
+        };
         trns_data.push(c[3]); // Alpha
     }
     let crc = png_crc32(&trns_data[4..]);

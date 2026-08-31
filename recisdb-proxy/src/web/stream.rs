@@ -45,7 +45,9 @@ use crate::server::channel_resolve::{self, ChannelResolveError};
 use crate::ts_analyzer::service_filter::TsServiceFilter;
 use crate::ts_analyzer::{SYNC_BYTE, TS_PACKET_SIZE};
 use crate::tuner::channel_key::ChannelKeySpec;
-use crate::tuner::encoder_pool::{self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder};
+use crate::tuner::encoder_pool::{
+    self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
+};
 use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::http_session::{HttpStreamSession, HttpStreamSessionInfo};
 use crate::web::state::{SessionProtocol, WebState};
@@ -159,7 +161,15 @@ impl StreamCleanup {
     /// (無変換) が既定"). The subscription itself is expected to live in the
     /// sibling `BodyReceiver::Tuner`, not here.
     pub(crate) fn tuner_only(tuner: Arc<SharedTuner>, tuner_pool: Arc<TunerPool>) -> Self {
-        Self { tuner: Some(tuner), remote: None, tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+        Self {
+            tuner: Some(tuner),
+            remote: None,
+            tuner_pool,
+            parked_tuner_sub: None,
+            encoder: None,
+            session: None,
+            shutdown_rx: None,
+        }
     }
 
     /// Cleanup guard for a stream fed by a lease on a peer's tuner.
@@ -171,12 +181,24 @@ impl StreamCleanup {
         remote: Arc<crate::node::RemoteMuxStream>,
         tuner_pool: Arc<TunerPool>,
     ) -> Self {
-        Self { tuner: None, remote: Some(remote), tuner_pool, parked_tuner_sub: None, encoder: None, session: None, shutdown_rx: None }
+        Self {
+            tuner: None,
+            remote: Some(remote),
+            tuner_pool,
+            parked_tuner_sub: None,
+            encoder: None,
+            session: None,
+            shutdown_rx: None,
+        }
     }
 
     /// Attach the dashboard registration for this stream, together with the
     /// remote-disconnect receiver it was given.
-    pub(crate) fn with_session(mut self, session: HttpStreamSession, shutdown_rx: mpsc::Receiver<()>) -> Self {
+    pub(crate) fn with_session(
+        mut self,
+        session: HttpStreamSession,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Self {
         self.session = Some(session);
         self.shutdown_rx = Some(shutdown_rx);
         self
@@ -269,37 +291,44 @@ pub(crate) fn broadcast_to_body_stream(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let shutdown_rx = cleanup.take_shutdown();
 
-    stream::unfold(StreamState { rx, shutdown_rx, _cleanup: cleanup }, |mut state| async move {
-        loop {
-            let received = match state.shutdown_rx.as_mut() {
-                Some(shutdown_rx) => {
-                    tokio::select! {
-                        // Dashboard-initiated disconnect: end the body, which
-                        // drops the cleanup guard (tuner subscription and
-                        // dashboard registration) just like a client hangup.
-                        _ = shutdown_rx.recv() => {
-                            debug!("[HTTP stream] disconnect requested from the dashboard");
-                            return None;
+    stream::unfold(
+        StreamState {
+            rx,
+            shutdown_rx,
+            _cleanup: cleanup,
+        },
+        |mut state| async move {
+            loop {
+                let received = match state.shutdown_rx.as_mut() {
+                    Some(shutdown_rx) => {
+                        tokio::select! {
+                            // Dashboard-initiated disconnect: end the body, which
+                            // drops the cleanup guard (tuner subscription and
+                            // dashboard registration) just like a client hangup.
+                            _ = shutdown_rx.recv() => {
+                                debug!("[HTTP stream] disconnect requested from the dashboard");
+                                return None;
+                            }
+                            received = state.rx.recv() => received,
                         }
-                        received = state.rx.recv() => received,
                     }
-                }
-                None => state.rx.recv().await,
-            };
+                    None => state.rx.recv().await,
+                };
 
-            match received {
-                Ok(data) => {
-                    state._cleanup.record_sent(data.len());
-                    return Some((Ok(data), state));
+                match received {
+                    Ok(data) => {
+                        state._cleanup.record_sent(data.len());
+                        return Some((Ok(data), state));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!("[HTTP stream] receiver lagged, skipped {} chunks", n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("[HTTP stream] receiver lagged, skipped {} chunks", n);
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    })
+        },
+    )
 }
 
 /// Re-aligns a stream of arbitrary byte chunks into whole 188-byte TS
@@ -337,7 +366,10 @@ impl TsAligner {
         let aligned_len = self.carry.len() - (self.carry.len() % TS_PACKET_SIZE);
         if aligned_len == 0 {
             if self.carry.len() > Self::MAX_CARRY {
-                debug!("[HTTP stream] dropping {} unsynchronized bytes", self.carry.len());
+                debug!(
+                    "[HTTP stream] dropping {} unsynchronized bytes",
+                    self.carry.len()
+                );
                 self.carry.clear();
             }
             return None;
@@ -465,7 +497,9 @@ pub(crate) fn service_filtered_body_stream(
 
             match received {
                 Ok(data) => {
-                    let Some(chunk) = state.aligner.push(&data) else { continue };
+                    let Some(chunk) = state.aligner.push(&data) else {
+                        continue;
+                    };
                     let filtered = state.filter.filter(&chunk);
                     if filtered.is_empty() {
                         continue;
@@ -477,7 +511,10 @@ pub(crate) fn service_filtered_body_stream(
                     state.aligner.on_gap();
                     match state.loss_policy {
                         LossPolicy::Recover => {
-                            debug!("[HTTP stream] filtered receiver lagged, skipped {} chunks", n);
+                            debug!(
+                                "[HTTP stream] filtered receiver lagged, skipped {} chunks",
+                                n
+                            );
                             continue;
                         }
                         LossPolicy::Fatal => {
@@ -522,7 +559,11 @@ pub(crate) fn service_filtered_body_stream(
 }
 
 pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(json!({ "success": false, "error": message.into() }))).into_response()
+    (
+        status,
+        Json(json!({ "success": false, "error": message.into() })),
+    )
+        .into_response()
 }
 
 /// `context` is only used for the log line (e.g. the `channels.id` or the
@@ -553,7 +594,10 @@ pub(crate) fn channel_resolve_error_response(
 /// before handing the subscription to [`broadcast_to_body_stream`]). Takes
 /// the subscription by value and drops it explicitly so the
 /// `has_subscribers()` check below observes the post-release count.
-pub(crate) async fn release_tuner_subscription(tuner_pool: &Arc<TunerPool>, tuner_sub: TunerSubscription) {
+pub(crate) async fn release_tuner_subscription(
+    tuner_pool: &Arc<TunerPool>,
+    tuner_sub: TunerSubscription,
+) {
     let tuner = Arc::clone(tuner_sub.tuner());
     drop(tuner_sub);
     if !tuner.has_subscribers() {
@@ -716,14 +760,25 @@ pub async fn stream_service_by_sid(
 /// genuinely-ambiguous case).
 fn ambiguous_sid_response(db: &Database, sid: u16) -> Option<Response> {
     let rows = db.get_channels_by_sid(sid).ok()?;
-    let mut nids: Vec<u16> = rows.iter().filter(|c| c.is_enabled).map(|c| c.nid).collect();
+    let mut nids: Vec<u16> = rows
+        .iter()
+        .filter(|c| c.is_enabled)
+        .map(|c| c.nid)
+        .collect();
     nids.sort_unstable();
     nids.dedup();
     if nids.len() < 2 {
         return None;
     }
-    let nid_list = nids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-    warn!("[HTTP stream] SID {} is ambiguous across NID {} without a nid= hint", sid, nid_list);
+    let nid_list = nids
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        "[HTTP stream] SID {} is ambiguous across NID {} without a nid= hint",
+        sid, nid_list
+    );
     Some(error_response(
         StatusCode::CONFLICT,
         format!(
@@ -755,14 +810,7 @@ pub(crate) fn session_info_for(
     tuner: &SharedTuner,
     stream_class: StreamClass,
 ) -> HttpStreamSessionInfo {
-    session_info_for_source(
-        protocol,
-        peer,
-        resolved,
-        Some(tuner),
-        None,
-        stream_class,
-    )
+    session_info_for_source(protocol, peer, resolved, Some(tuner), None, stream_class)
 }
 
 /// Same, for a stream that may be fed by a peer instead of a local tuner.
@@ -809,7 +857,10 @@ pub(crate) fn session_info_for_source(
         // the same treatment the access log gives it.
         addr: peer.map(|ConnectInfo(addr)| addr),
         tuner_path,
-        channel_name: channel.channel_name.clone().or_else(|| channel.raw_name.clone()),
+        channel_name: channel
+            .channel_name
+            .clone()
+            .or_else(|| channel.raw_name.clone()),
         channel_info,
         nid: Some(channel.nid),
         sid: Some(channel.sid),
@@ -826,7 +877,13 @@ async fn stream_resolved(
     sid: i64,
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Response {
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(sid, &e),
     };
@@ -836,7 +893,13 @@ async fn stream_resolved(
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
         Arc::clone(&web_state.database),
-        session_info_for(SessionProtocol::Http, peer, &resolved, &tuner, StreamClass::View),
+        session_info_for(
+            SessionProtocol::Http,
+            peer,
+            &resolved,
+            &tuner,
+            StreamClass::View,
+        ),
     )
     .await;
 
@@ -858,10 +921,17 @@ async fn stream_resolved(
     let profile = query.profile.as_deref().unwrap_or("");
 
     if profile.is_empty() {
-        info!("[HTTP stream] service {} -> raw passthrough (tuner={:?})", sid, tuner.key);
-        let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
-            .with_session(session, shutdown_rx);
-        return respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup));
+        info!(
+            "[HTTP stream] service {} -> raw passthrough (tuner={:?})",
+            sid, tuner.key
+        );
+        let cleanup =
+            StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
+                .with_session(session, shutdown_rx);
+        return respond_with_stream(broadcast_to_body_stream(
+            BodyReceiver::Tuner(tuner_rx),
+            cleanup,
+        ));
     }
 
     if profile != "preview" {
@@ -902,7 +972,9 @@ async fn stream_resolved(
         Ok(encoder) => {
             info!(
                 "[HTTP stream] service {} -> preview encoder {:?} (subscribers={})",
-                sid, key, encoder.subscriber_count()
+                sid,
+                key,
+                encoder.subscriber_count()
             );
             let enc_rx = encoder.subscribe();
             let cleanup = StreamCleanup {
@@ -923,7 +995,10 @@ async fn stream_resolved(
                 shutdown_rx: None,
             }
             .with_session(session, shutdown_rx);
-            respond_with_stream(broadcast_to_body_stream(BodyReceiver::Encoder(enc_rx), cleanup))
+            respond_with_stream(broadcast_to_body_stream(
+                BodyReceiver::Encoder(enc_rx),
+                cleanup,
+            ))
         }
         Err(EncoderPoolError::Saturated) => {
             release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
@@ -939,7 +1014,10 @@ async fn stream_resolved(
         }
         Err(EncoderPoolError::SpawnFailed(e)) => {
             release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
-            warn!("[HTTP stream] service {} preview encoder spawn failed: {}", sid, e);
+            warn!(
+                "[HTTP stream] service {} preview encoder spawn failed: {}",
+                sid, e
+            );
             error_response(StatusCode::SERVICE_UNAVAILABLE, e)
         }
     }
@@ -1033,7 +1111,10 @@ mod tests {
         let data = ts_packets(2);
         let mut aligner = TsAligner::new();
 
-        assert_eq!(aligner.push(&data[..TS_PACKET_SIZE + 50]), Some(data[..TS_PACKET_SIZE].to_vec()));
+        assert_eq!(
+            aligner.push(&data[..TS_PACKET_SIZE + 50]),
+            Some(data[..TS_PACKET_SIZE].to_vec())
+        );
         aligner.on_gap();
 
         let next = ts_packets(1);
@@ -1053,7 +1134,10 @@ mod tests {
             tuner_pool,
             encoder_pool,
             session_registry,
-            AuthConfig { enabled: false, token: String::new() },
+            AuthConfig {
+                enabled: false,
+                token: String::new(),
+            },
             log_buffer,
             std::path::PathBuf::from("logs"),
             log_level,
@@ -1063,7 +1147,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_stream_cleanup_releases_tuner_subscription() {
-        let tuner = crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2);
+        let tuner =
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2);
         let tuner_pool = Arc::new(TunerPool::new(4));
         let sub = tuner.subscribe();
         assert!(tuner.has_subscribers());
@@ -1085,7 +1170,10 @@ mod tests {
         // The parked subscription is dropped synchronously inside
         // `StreamCleanup::drop`, so this is already true with no yield
         // needed — asserted immediately to prove that.
-        assert!(!tuner.has_subscribers(), "dropping StreamCleanup must release the tracked subscription");
+        assert!(
+            !tuner.has_subscribers(),
+            "dropping StreamCleanup must release the tracked subscription"
+        );
     }
 
     /// Build a receiver that has already fallen behind, so the next `recv`
@@ -1127,7 +1215,10 @@ mod tests {
         );
         futures::pin_mut!(stream);
 
-        let first = stream.next().await.expect("a fatal loss must be reported, not swallowed");
+        let first = stream
+            .next()
+            .await
+            .expect("a fatal loss must be reported, not swallowed");
         let err = first.expect_err("the RECORD stream must terminate with an error");
         assert!(
             err.to_string().contains("record stream lost"),
@@ -1160,7 +1251,10 @@ mod tests {
         // The peer disappears without releasing its lease first.
         drop(tx);
 
-        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let first = stream
+            .next()
+            .await
+            .expect("a closed RECORD source must be reported");
         let err = first.expect_err("the RECORD stream must terminate with an error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(
@@ -1202,7 +1296,10 @@ mod tests {
     async fn stream_service_returns_404_for_unknown_sid() {
         let state = test_web_state();
         let app = axum::Router::new()
-            .route("/api/stream/service/:sid", axum::routing::get(stream_service))
+            .route(
+                "/api/stream/service/:sid",
+                axum::routing::get(stream_service),
+            )
             .with_state(state);
 
         let res = app
@@ -1223,7 +1320,9 @@ mod tests {
         let state = test_web_state();
         let ch_id = {
             let db = state.database.lock().await;
-            let driver_id = db.insert_bon_driver(&NewBonDriver::new("/dev/test-tuner")).unwrap();
+            let driver_id = db
+                .insert_bon_driver(&NewBonDriver::new("/dev/test-tuner"))
+                .unwrap();
             let info = recisdb_protocol::ChannelInfo {
                 nid: 1,
                 sid: 100,
@@ -1244,7 +1343,10 @@ mod tests {
         };
 
         let app = axum::Router::new()
-            .route("/api/stream/service/:sid", axum::routing::get(stream_service))
+            .route(
+                "/api/stream/service/:sid",
+                axum::routing::get(stream_service),
+            )
             .with_state(state);
 
         let res = app
@@ -1273,8 +1375,17 @@ mod tests {
 
         // Scribble garbage into the BNDP-side tsreplace_config (enabled=true
         // with a bogus command) — it must have zero influence on preview.
-        db.update_tsreplace_config(true, "bndp-garbage-cmd", "--bndp", 1, true, 2, "bndp-pre", "--bndp-pre")
-            .unwrap();
+        db.update_tsreplace_config(
+            true,
+            "bndp-garbage-cmd",
+            "--bndp",
+            1,
+            true,
+            2,
+            "bndp-pre",
+            "--bndp-pre",
+        )
+        .unwrap();
 
         // preview_encoder_config disabled (default) -> rejected, message
         // names the actual gate.
@@ -1285,7 +1396,8 @@ mod tests {
         );
 
         // Enabled but command_path unset -> rejected with the TOML hint.
-        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000)
+            .unwrap();
         let err = load_preview_encoder_config(&db, PreviewBand::Other).unwrap_err();
         assert!(
             err.contains("command_path"),
@@ -1296,8 +1408,8 @@ mod tests {
         // preview table, none from the (garbage) tsreplace_config.
         db.set_preview_command_path("preview-enc").unwrap();
         db.set_preview_preprocessor_path("preview-pre").unwrap();
-        let (cfg, _generation) =
-            load_preview_encoder_config(&db, PreviewBand::Other).expect("configured preview should pass the gate");
+        let (cfg, _generation) = load_preview_encoder_config(&db, PreviewBand::Other)
+            .expect("configured preview should pass the gate");
         assert_eq!(cfg.command_path, "preview-enc");
         assert_eq!(cfg.preprocessor_path, "preview-pre");
         assert_eq!(cfg.preprocessor_arguments, "-x 18 -n {SID} -");
@@ -1311,7 +1423,8 @@ mod tests {
     #[test]
     fn preview_picks_the_4k_template_only_for_4k_channels() {
         let db = Database::open_in_memory().unwrap();
-        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000)
+            .unwrap();
         db.set_preview_command_path("preview-enc").unwrap();
 
         let (four_k, _) = load_preview_encoder_config(&db, PreviewBand::FourK).unwrap();
@@ -1345,7 +1458,8 @@ mod tests {
     #[test]
     fn a_4k_channel_falls_back_to_the_ordinary_template_when_no_4k_profile_exists() {
         let db = Database::open_in_memory().unwrap();
-        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000).unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000)
+            .unwrap();
         db.set_preview_command_path("preview-enc").unwrap();
         let four_k_id = db
             .get_encode_profile_by_purpose("preview4k")
@@ -1356,7 +1470,10 @@ mod tests {
             .unwrap();
 
         let (cfg, _) = load_preview_encoder_config(&db, PreviewBand::FourK).unwrap();
-        assert!(cfg.arguments.contains("--vpp-deinterlace"), "must fall back to the ordinary template");
+        assert!(
+            cfg.arguments.contains("--vpp-deinterlace"),
+            "must fall back to the ordinary template"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1365,7 +1482,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn insert_channel_with_nid_sid(db: &Database, driver_name: &str, nid: u16, sid: u16) -> i64 {
-        let driver_id = db.insert_bon_driver(&NewBonDriver::new(driver_name)).unwrap();
+        let driver_id = db
+            .insert_bon_driver(&NewBonDriver::new(driver_name))
+            .unwrap();
         let info = recisdb_protocol::ChannelInfo {
             nid,
             sid,
@@ -1397,7 +1516,10 @@ mod tests {
         }
 
         let app = axum::Router::new()
-            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .route(
+                "/api/stream/service/by-sid/:sid",
+                axum::routing::get(stream_service_by_sid),
+            )
             .with_state(state);
 
         let res = app
@@ -1423,7 +1545,10 @@ mod tests {
         }
 
         let app = axum::Router::new()
-            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .route(
+                "/api/stream/service/by-sid/:sid",
+                axum::routing::get(stream_service_by_sid),
+            )
             .with_state(state);
 
         // No real BonDriver DLL exists in this test environment, so tuner
@@ -1441,7 +1566,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(res.status(), StatusCode::CONFLICT, "nid= must disambiguate instead of 409ing");
+        assert_ne!(
+            res.status(),
+            StatusCode::CONFLICT,
+            "nid= must disambiguate instead of 409ing"
+        );
     }
 
     #[tokio::test]
@@ -1456,7 +1585,10 @@ mod tests {
         }
 
         let app = axum::Router::new()
-            .route("/api/stream/service/by-sid/:sid", axum::routing::get(stream_service_by_sid))
+            .route(
+                "/api/stream/service/by-sid/:sid",
+                axum::routing::get(stream_service_by_sid),
+            )
             .with_state(state);
 
         let res = app
@@ -1469,6 +1601,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(res.status(), StatusCode::CONFLICT, "a single-network SID must not be treated as ambiguous");
+        assert_ne!(
+            res.status(),
+            StatusCode::CONFLICT,
+            "a single-network SID must not be treated as ambiguous"
+        );
     }
 }

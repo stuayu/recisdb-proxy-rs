@@ -198,7 +198,10 @@ pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u3
 /// `@<ctrl_sock>` for a non-default socket path.
 fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
     let rest = path.strip_prefix(PATH_PREFIX).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("not a px4daemon path: {}", path))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a px4daemon path: {}", path),
+        )
     })?;
 
     let (index_part, ctrl_sock) = match rest.split_once('@') {
@@ -387,7 +390,14 @@ impl Px4DaemonTuner {
         let mut buf = vec![0u8; CAPTURE_CMD_SIZE];
         buf[..HEADER_SIZE].copy_from_slice(&header(cmd::SET_CAPTURE));
         buf[8] = on as u8;
-        self.transact_checked(&mut buf, if on { "SET_CAPTURE(true)" } else { "SET_CAPTURE(false)" })?;
+        self.transact_checked(
+            &mut buf,
+            if on {
+                "SET_CAPTURE(true)"
+            } else {
+                "SET_CAPTURE(false)"
+            },
+        )?;
         self.capturing.store(on, Ordering::Release);
         Ok(())
     }
@@ -408,7 +418,10 @@ impl Px4DaemonTuner {
         put_u32(&mut buf, 8, if want { 15 } else { 0 });
         self.transact_checked(&mut buf, "SET_LNB_VOLTAGE")?;
         self.lnb_on.store(want, Ordering::Release);
-        info!("[px4daemon] LNB power {}", if want { "on (15V)" } else { "off" });
+        info!(
+            "[px4daemon] LNB power {}",
+            if want { "on (15V)" } else { "off" }
+        );
         Ok(())
     }
 
@@ -573,7 +586,9 @@ impl Px4DaemonTuner {
             Ok(g) => g,
             Err(_) => return false,
         };
-        let Some(sock) = guard.as_ref() else { return false };
+        let Some(sock) = guard.as_ref() else {
+            return false;
+        };
 
         let fd = sock.as_raw_fd();
         // SAFETY: fd stays valid while `guard` holds the socket open.
@@ -703,7 +718,12 @@ mod tests {
     fn parses_index_and_socket_overrides() {
         assert_eq!(
             parse_path("px4daemon:3").unwrap(),
-            (3, false, DEFAULT_CTRL_SOCK.to_string(), DEFAULT_DATA_SOCK.to_string())
+            (
+                3,
+                false,
+                DEFAULT_CTRL_SOCK.to_string(),
+                DEFAULT_DATA_SOCK.to_string()
+            )
         );
         assert_eq!(parse_path("px4daemon:any").unwrap().0, -1);
         assert_eq!(parse_path("px4daemon:").unwrap().0, -1);
@@ -733,14 +753,32 @@ mod tests {
     #[test]
     fn maps_space_channel_to_the_same_frequencies_px4rec_uses() {
         // GR channel 0 → UHF 13 → 473143 kHz; channel 49 → UHF 62 → 767143.
-        assert_eq!(space_channel_to_freq(0, 0).unwrap(), (system::ISDB_T, 473_143));
-        assert_eq!(space_channel_to_freq(0, 49).unwrap(), (system::ISDB_T, 767_143));
+        assert_eq!(
+            space_channel_to_freq(0, 0).unwrap(),
+            (system::ISDB_T, 473_143)
+        );
+        assert_eq!(
+            space_channel_to_freq(0, 49).unwrap(),
+            (system::ISDB_T, 767_143)
+        );
         // BS transponder 0 and 11.
-        assert_eq!(space_channel_to_freq(1, 0).unwrap(), (system::ISDB_S, 1_049_480));
-        assert_eq!(space_channel_to_freq(1, 11).unwrap(), (system::ISDB_S, 1_471_440));
+        assert_eq!(
+            space_channel_to_freq(1, 0).unwrap(),
+            (system::ISDB_S, 1_049_480)
+        );
+        assert_eq!(
+            space_channel_to_freq(1, 11).unwrap(),
+            (system::ISDB_S, 1_471_440)
+        );
         // CS110 transponder 0 and 11.
-        assert_eq!(space_channel_to_freq(2, 0).unwrap(), (system::ISDB_S, 1_613_000));
-        assert_eq!(space_channel_to_freq(2, 11).unwrap(), (system::ISDB_S, 2_053_000));
+        assert_eq!(
+            space_channel_to_freq(2, 0).unwrap(),
+            (system::ISDB_S, 1_613_000)
+        );
+        assert_eq!(
+            space_channel_to_freq(2, 11).unwrap(),
+            (system::ISDB_S, 2_053_000)
+        );
     }
 
     /// End-to-end smoke test against real hardware. Requires a running
@@ -768,7 +806,11 @@ mod tests {
 
         let cnr = tuner.get_signal_level();
         println!("CNR = {:.2} dB", cnr);
-        assert!(cnr > 0.0, "CNR should be positive on a locked channel, got {}", cnr);
+        assert!(
+            cnr > 0.0,
+            "CNR should be positive on a locked channel, got {}",
+            cnr
+        );
 
         let mut buf = vec![0u8; 256 * 1024];
         let mut total = 0usize;
@@ -804,8 +846,15 @@ mod tests {
             }
         }
 
-        println!("read {} bytes, {}/{} sync strides held", total, sync_ok, sync_seen);
-        assert!(total > 188 * 1000, "expected a real TS flow, got {} bytes", total);
+        println!(
+            "read {} bytes, {}/{} sync strides held",
+            total, sync_ok, sync_seen
+        );
+        assert!(
+            total > 188 * 1000,
+            "expected a real TS flow, got {} bytes",
+            total
+        );
         assert!(
             sync_ok * 10 >= sync_seen * 9,
             "TS sync stride held for only {}/{} candidates — data looks corrupt",
@@ -835,7 +884,9 @@ mod tests {
         let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
 
         for (round, &ch) in channels.iter().enumerate() {
-            tuner.set_channel(0, ch).unwrap_or_else(|e| panic!("tune round {round} ch {ch}: {e}"));
+            tuner
+                .set_channel(0, ch)
+                .unwrap_or_else(|e| panic!("tune round {round} ch {ch}: {e}"));
 
             let mut buf = vec![0u8; 256 * 1024];
             let mut total = 0usize;

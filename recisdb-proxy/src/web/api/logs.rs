@@ -85,7 +85,9 @@ fn is_log_file_name(name: &str) -> bool {
 
 /// `GET /api/logs/files` — list rotated log files in `log_dir`, newest
 /// (by name, which sorts by date) first.
-pub async fn list_log_files(State(web_state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn list_log_files(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let log_dir = web_state.log_dir.clone();
     let files = tokio::task::spawn_blocking(move || read_log_files(&log_dir))
         .await
@@ -104,7 +106,8 @@ fn read_log_files(log_dir: &StdPath) -> Result<Vec<LogFileInfo>, ApiError> {
 
     let mut files = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| ApiError::internal(format!("failed to read log_dir entry: {e}")))?;
+        let entry =
+            entry.map_err(|e| ApiError::internal(format!("failed to read log_dir entry: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !is_log_file_name(&name) {
             continue;
@@ -120,7 +123,11 @@ fn read_log_files(log_dir: &StdPath) -> Result<Vec<LogFileInfo>, ApiError> {
             .modified()
             .ok()
             .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339());
-        files.push(LogFileInfo { name, size: metadata.len(), modified });
+        files.push(LogFileInfo {
+            name,
+            size: metadata.len(),
+            modified,
+        });
     }
     // Descending by name: the daily suffix (YYYY-MM-DD) sorts lexically the
     // same as chronologically, so this puts the newest file first.
@@ -148,20 +155,24 @@ pub async fn download_log_file(
 
     let log_dir = web_state.log_dir.clone();
     let requested_name = name.clone();
-    let result = tokio::task::spawn_blocking(move || read_log_file_for_download(&log_dir, &requested_name))
-        .await
-        .map_err(|e| ApiError::internal(format!("log file read task panicked: {e}")))?;
+    let result =
+        tokio::task::spawn_blocking(move || read_log_file_for_download(&log_dir, &requested_name))
+            .await
+            .map_err(|e| ApiError::internal(format!("log file read task panicked: {e}")))?;
     let bytes = result?;
 
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     let disposition = format!("attachment; filename=\"{name}\"");
     let value = HeaderValue::from_str(&disposition)
         .map_err(|_| ApiError::bad_request("invalid log file name"))?;
-    response.headers_mut().insert(header::CONTENT_DISPOSITION, value);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, value);
     Ok(response)
 }
 
@@ -170,8 +181,8 @@ fn read_log_file_for_download(log_dir: &StdPath, name: &str) -> Result<Vec<u8>, 
 
     let canonical_dir = std::fs::canonicalize(log_dir)
         .map_err(|e| ApiError::internal(format!("failed to canonicalize log_dir: {e}")))?;
-    let canonical_file = std::fs::canonicalize(&candidate)
-        .map_err(|_| ApiError::not_found("log file not found"))?;
+    let canonical_file =
+        std::fs::canonicalize(&candidate).map_err(|_| ApiError::not_found("log file not found"))?;
     if !canonical_file.starts_with(&canonical_dir) {
         return Err(ApiError::bad_request("invalid log file name"));
     }
@@ -185,7 +196,8 @@ fn read_log_file_for_download(log_dir: &StdPath, name: &str) -> Result<Vec<u8>, 
         return Err(ApiError::not_found("log file not found"));
     }
 
-    std::fs::read(&canonical_file).map_err(|e| ApiError::internal(format!("failed to read log file: {e}")))
+    std::fs::read(&canonical_file)
+        .map_err(|e| ApiError::internal(format!("failed to read log file: {e}")))
 }
 
 /// `GET /api/log-config` — current log level/retention (`log_config` table,
@@ -262,9 +274,10 @@ pub async fn update_log_config(
     // `main.rs` does at startup — otherwise a lowered retention_days only
     // takes effect on the next server restart.
     let log_dir = web_state.log_dir.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || crate::logging::rotate_logs(&log_dir, retention_days))
-        .await
-        .map_err(|e| ApiError::internal(format!("log rotation task panicked: {e}")))?
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || crate::logging::rotate_logs(&log_dir, retention_days))
+            .await
+            .map_err(|e| ApiError::internal(format!("log rotation task panicked: {e}")))?
     {
         log::warn!("Failed to rotate logs after /api/log-config update: {e}");
     }
@@ -298,10 +311,16 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal_attempts() {
-        assert!(!is_log_file_name("recisdb-proxy.log.2026-07-19/../../etc/passwd"));
-        assert!(!is_log_file_name("recisdb-proxy.log...%2f..%2fetc%2fpasswd"));
+        assert!(!is_log_file_name(
+            "recisdb-proxy.log.2026-07-19/../../etc/passwd"
+        ));
+        assert!(!is_log_file_name(
+            "recisdb-proxy.log...%2f..%2fetc%2fpasswd"
+        ));
         assert!(!is_log_file_name("..\\recisdb-proxy.log.2026-07-19"));
-        assert!(!is_log_file_name("recisdb-proxy.log.2026-07-19\\..\\..\\secret"));
+        assert!(!is_log_file_name(
+            "recisdb-proxy.log.2026-07-19\\..\\..\\secret"
+        ));
     }
 
     #[test]
@@ -337,7 +356,8 @@ mod tests {
 
     #[test]
     fn list_log_files_returns_empty_for_missing_dir() {
-        let missing = std::env::temp_dir().join(format!("recisdb-logs-missing-{}", std::process::id()));
+        let missing =
+            std::env::temp_dir().join(format!("recisdb-logs-missing-{}", std::process::id()));
         let result = read_log_files(&missing).unwrap();
         assert!(result.is_empty());
     }

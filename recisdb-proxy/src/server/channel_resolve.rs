@@ -111,8 +111,16 @@ pub enum ChannelResolveError {
     /// enforce — see `start_tuner_for_service`) are occupied by readers that
     /// are still actively subscribed to, so there was nothing idle left to
     /// evict to make room.
-    #[error("service {id}: all {drivers} candidate driver(s) are full ({running}/{max} on {path})")]
-    Busy { id: i64, running: i32, max: i32, drivers: usize, path: String },
+    #[error(
+        "service {id}: all {drivers} candidate driver(s) are full ({running}/{max} on {path})"
+    )]
+    Busy {
+        id: i64,
+        running: i32,
+        max: i32,
+        drivers: usize,
+        path: String,
+    },
 }
 
 /// One physical selection target for a service: a driver + space/channel a
@@ -225,7 +233,10 @@ fn resolve_single_channel_record(
 
     let target = channel_record_to_candidate(db, &channel)?;
 
-    Ok(ResolvedService { channel, candidates: vec![target] })
+    Ok(ResolvedService {
+        channel,
+        candidates: vec![target],
+    })
 }
 
 /// Resolve `driver_id`/`bon_space`/`bon_channel` on an already-enabled row
@@ -249,7 +260,11 @@ fn channel_record_to_candidate(
     let channel_key = ChannelKey::space_channel(&driver.dll_path, space, bon_channel);
     let max_instances = db.get_max_instances_for_path(&driver.dll_path).unwrap_or(1);
 
-    Ok(CandidateTarget { dll_path: driver.dll_path, channel_key, max_instances })
+    Ok(CandidateTarget {
+        dll_path: driver.dll_path,
+        channel_key,
+        max_instances,
+    })
 }
 
 /// Shared multi-row resolution body for [`resolve_service_by_sid`] and
@@ -282,7 +297,10 @@ fn resolve_candidate_rows(
         // sid/tsid bookkeeping) can still resolve to the same
         // (dll_path, space, channel) — acquire() only needs one entry per
         // actual physical tuning target. Keep first-seen (highest priority).
-        if candidates.iter().any(|c: &CandidateTarget| c.channel_key == target.channel_key) {
+        if candidates
+            .iter()
+            .any(|c: &CandidateTarget| c.channel_key == target.channel_key)
+        {
             continue;
         }
         if channel.is_none() {
@@ -302,7 +320,10 @@ fn resolve_candidate_rows(
         });
     }
 
-    Ok(ResolvedService { channel: channel.unwrap_or(representative), candidates })
+    Ok(ResolvedService {
+        channel: channel.unwrap_or(representative),
+        candidates,
+    })
 }
 
 /// Get-or-create the `SharedTuner` for `resolved` using the channel's
@@ -435,14 +456,33 @@ pub async fn start_tuner_for_service_with_claim(
 /// so a future change that starts threading either of them through this
 /// module is forced to notice and decide what to do with the "unused" case
 /// instead of it leaking unnoticed.
-fn finish_outcome(outcome: acquire::AcquireOutcome, resolved: &ResolvedService) -> Arc<SharedTuner> {
+fn finish_outcome(
+    outcome: acquire::AcquireOutcome,
+    resolved: &ResolvedService,
+) -> Arc<SharedTuner> {
     if outcome.reused {
-        info!("[HTTP stream] joined existing reader for {:?} (service id={}, {} candidate(s))", outcome.key, resolved.channel.id, resolved.candidates.len());
+        info!(
+            "[HTTP stream] joined existing reader for {:?} (service id={}, {} candidate(s))",
+            outcome.key,
+            resolved.channel.id,
+            resolved.candidates.len()
+        );
     } else {
-        info!("[HTTP stream] started BonDriver reader for {:?} (service id={}, {} candidate(s))", outcome.key, resolved.channel.id, resolved.candidates.len());
+        info!(
+            "[HTTP stream] started BonDriver reader for {:?} (service id={}, {} candidate(s))",
+            outcome.key,
+            resolved.channel.id,
+            resolved.candidates.len()
+        );
     }
-    debug_assert!(outcome.unused_permit.is_none(), "HTTP requests never carry a permit into acquire()");
-    debug_assert!(outcome.unused_warm.is_none(), "HTTP requests never carry a warm handle into acquire()");
+    debug_assert!(
+        outcome.unused_permit.is_none(),
+        "HTTP requests never carry a permit into acquire()"
+    );
+    debug_assert!(
+        outcome.unused_warm.is_none(),
+        "HTTP requests never carry a warm handle into acquire()"
+    );
     outcome.tuner
 }
 
@@ -458,7 +498,11 @@ async fn try_acquire(
         tuner_pool,
         database,
         AcquireRequest {
-            candidates: resolved.candidates.iter().map(|c| c.channel_key.clone()).collect(),
+            candidates: resolved
+                .candidates
+                .iter()
+                .map(|c| c.channel_key.clone())
+                .collect(),
             priority: claim.priority,
             exclusive: claim.exclusive,
             client_host: "http".to_string(),
@@ -532,9 +576,15 @@ mod tests {
     use crate::database::{Database, NewBonDriver};
     use recisdb_protocol::ChannelInfo;
 
-    fn setup_db_with_channel(space: Option<u32>, channel: Option<u32>, enabled: bool) -> (Database, i64) {
+    fn setup_db_with_channel(
+        space: Option<u32>,
+        channel: Option<u32>,
+        enabled: bool,
+    ) -> (Database, i64) {
         let db = Database::open_in_memory().unwrap();
-        let driver_id = db.insert_bon_driver(&NewBonDriver::new("/dev/test-tuner")).unwrap();
+        let driver_id = db
+            .insert_bon_driver(&NewBonDriver::new("/dev/test-tuner"))
+            .unwrap();
 
         let info = ChannelInfo {
             nid: 1,
@@ -569,7 +619,11 @@ mod tests {
             ChannelKey::space_channel("/dev/test-tuner", 0, 13)
         );
         assert_eq!(resolved.channel.sid, 100);
-        assert_eq!(resolved.candidates.len(), 1, "resolve_service (by channels.id) never widens to multiple candidates");
+        assert_eq!(
+            resolved.candidates.len(),
+            1,
+            "resolve_service (by channels.id) never widens to multiple candidates"
+        );
     }
 
     #[test]
@@ -597,7 +651,8 @@ mod tests {
     fn resolves_by_nid_sid_same_as_by_id() {
         let (db, ch_id) = setup_db_with_channel(Some(0), Some(13), true);
         let by_id = resolve_service(&db, ch_id).expect("should resolve by id");
-        let by_nid_sid = resolve_service_by_nid_sid(&db, 1, 100).expect("should resolve by (nid, sid)");
+        let by_nid_sid =
+            resolve_service_by_nid_sid(&db, 1, 100).expect("should resolve by (nid, sid)");
         assert_eq!(by_id.channel_key(), by_nid_sid.channel_key());
         assert_eq!(by_id.channel.id, by_nid_sid.channel.id);
     }
@@ -633,7 +688,9 @@ mod tests {
             .await
             .expect("first slot on an empty driver must be available");
         let tuner_a = pool
-            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_a, || async { Ok(()) })
+            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_a, || async {
+                Ok(())
+            })
             .await
             .unwrap();
         let _sub = tuner_a.subscribe();
@@ -645,7 +702,9 @@ mod tests {
         // of getting a 503. Here the driver is already saturated by
         // `permit_a`, so a permit is genuinely unavailable...
         assert!(
-            pool.acquire_slot(resolved.dll_path(), resolved.max_instances()).await.is_none(),
+            pool.acquire_slot(resolved.dll_path(), resolved.max_instances())
+                .await
+                .is_none(),
             "precondition: the driver is saturated by tuner_a's permit"
         );
 
@@ -657,10 +716,15 @@ mod tests {
             .await
             .expect("widened capacity for the sake of constructing a spare permit");
         let tuner_b = pool
-            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_b, || async { Ok(()) })
+            .get_or_create(key.clone(), HTTP_BONDRIVER_VERSION, permit_b, || async {
+                Ok(())
+            })
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&tuner_a, &tuner_b), "same channel key must share one SharedTuner");
+        assert!(
+            Arc::ptr_eq(&tuner_a, &tuner_b),
+            "same channel key must share one SharedTuner"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -682,7 +746,9 @@ mod tests {
         priority: i32,
         enabled: bool,
     ) -> i64 {
-        let driver_id = db.insert_bon_driver(&NewBonDriver::new(driver_name)).unwrap();
+        let driver_id = db
+            .insert_bon_driver(&NewBonDriver::new(driver_name))
+            .unwrap();
         let info = ChannelInfo {
             nid,
             sid,
@@ -700,7 +766,8 @@ mod tests {
             terrestrial_region: None,
         };
         let ch_id = db.insert_channel(driver_id, &info).unwrap();
-        db.update_channel_fields(ch_id, None, Some(priority), Some(enabled)).unwrap();
+        db.update_channel_fields(ch_id, None, Some(priority), Some(enabled))
+            .unwrap();
         ch_id
     }
 
@@ -726,7 +793,8 @@ mod tests {
         insert_channel_on_driver(&db, "driver-a.dll", 1, 100, Some(0), Some(13), 10, true);
         insert_channel_on_driver(&db, "driver-b.dll", 1, 100, Some(0), Some(14), 5, false);
 
-        let resolved = resolve_service_by_sid(&db, 100).expect("should resolve via the enabled row");
+        let resolved =
+            resolve_service_by_sid(&db, 100).expect("should resolve via the enabled row");
         assert_eq!(resolved.candidates.len(), 1);
         assert_eq!(resolved.candidates[0].dll_path, "driver-a.dll");
     }
@@ -739,7 +807,9 @@ mod tests {
         // land on the very same driver/space/channel e.g. via a stray
         // duplicate scan) resolving to the same physical target must
         // collapse to one candidate.
-        let driver_id = db.insert_bon_driver(&NewBonDriver::new("driver.dll")).unwrap();
+        let driver_id = db
+            .insert_bon_driver(&NewBonDriver::new("driver.dll"))
+            .unwrap();
         let mut info = ChannelInfo::new(1, 100, 200);
         info.bon_space = Some(0);
         info.bon_channel = Some(13);
@@ -753,7 +823,11 @@ mod tests {
         db.insert_channel(driver_id, &info2).unwrap();
 
         let resolved = resolve_service_by_nid_sid(&db, 1, 100).expect("should resolve");
-        assert_eq!(resolved.candidates.len(), 1, "identical physical targets must collapse to one candidate");
+        assert_eq!(
+            resolved.candidates.len(),
+            1,
+            "identical physical targets must collapse to one candidate"
+        );
     }
 
     #[test]

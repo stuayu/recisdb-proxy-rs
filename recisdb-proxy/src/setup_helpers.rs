@@ -339,8 +339,7 @@ fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
                         group_name: group.to_string(),
                         terrestrial_count: known.map_or(0, |k| k.terrestrial_count),
                         satellite_count: known.map_or(0, |k| k.satellite_count),
-                        bondriver_url: known
-                            .map_or(String::new(), |k| k.bondriver_url.to_string()),
+                        bondriver_url: known.map_or(String::new(), |k| k.bondriver_url.to_string()),
                         px4_model_pid: None,
                         px4_device_count: None,
                     });
@@ -357,7 +356,10 @@ fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
     // find_staged_px4_bondriver により専用の配置場所を確認し、正しい
     // device_paths を埋める。
     for (model, count) in crate::px4_installer::detect_connected_px4_devices() {
-        if let Some(existing) = detected.iter_mut().find(|d| d.group_name == model.bondriver_folder) {
+        if let Some(existing) = detected
+            .iter_mut()
+            .find(|d| d.group_name == model.bondriver_folder)
+        {
             existing.px4_device_count = Some(count as i32);
             continue;
         }
@@ -391,10 +393,17 @@ fn detect_tuners_windows(install_dir: &Path) -> Vec<DetectedTuner> {
 /// カレントディレクトリ相対のパスは後方互換のフォールバックとする。
 /// 見つかった場合は絶対パスのリストを返す(空なら未インストール)。
 #[cfg(target_os = "windows")]
-fn find_staged_px4_bondriver(model: &crate::px4_installer::Px4Model, install_dir: &Path) -> Vec<String> {
+fn find_staged_px4_bondriver(
+    model: &crate::px4_installer::Px4Model,
+    install_dir: &Path,
+) -> Vec<String> {
     find_staged_px4_bondriver_in(
         model,
-        &[install_dir.to_path_buf(), PathBuf::from("."), PathBuf::from("..")],
+        &[
+            install_dir.to_path_buf(),
+            PathBuf::from("."),
+            PathBuf::from(".."),
+        ],
     )
 }
 
@@ -414,12 +423,8 @@ fn find_staged_px4_bondriver_in(
             .iter()
             .filter_map(|dll_name| {
                 let p = candidate_dir.join(dll_name);
-                p.exists().then(|| {
-                    p.canonicalize()
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .to_string()
-                })
+                p.exists()
+                    .then(|| p.canonicalize().unwrap_or(p).to_string_lossy().to_string())
             })
             .collect();
 
@@ -481,7 +486,12 @@ const CONFIG_TEMPLATE: &str = include_str!("../recisdb-proxy.toml.example");
 /// テンプレート側の構造が変わってキーが見つからなかった場合、値が反映されない
 /// まま古い既定値が黙って使われる事故を防ぐため panic する(セットアップ時に
 /// すぐ気付けるように)。
-pub(crate) fn replace_scalar_in_section(template: &str, section: &str, key: &str, new_value: &str) -> String {
+pub(crate) fn replace_scalar_in_section(
+    template: &str,
+    section: &str,
+    key: &str,
+    new_value: &str,
+) -> String {
     let key_prefix = format!("{key} = ");
     let mut current_section = String::new();
     let mut replaced = false;
@@ -796,7 +806,10 @@ pub enum BinarySyncAction {
 /// 判定する(実行ファイルのサイズは数MB程度でありハッシュ計算より単純・
 /// 確実なため)。設定ファイル・データベース・BonDriverなどのユーザーデータ
 /// には一切触れず、実行ファイル本体のみを対象とする。
-pub fn sync_program_binary(source_dir: &Path, install_dir: &Path) -> Result<BinarySyncAction, String> {
+pub fn sync_program_binary(
+    source_dir: &Path,
+    install_dir: &Path,
+) -> Result<BinarySyncAction, String> {
     let exe_name = if cfg!(windows) {
         "recisdb-proxy.exe"
     } else {
@@ -902,7 +915,9 @@ pub fn register_manual_tuner(
     group_name: &str,
     max_instances: i32,
 ) -> Result<i64, String> {
-    let id = db.get_or_create_bon_driver(path).map_err(|e| e.to_string())?;
+    let id = db
+        .get_or_create_bon_driver(path)
+        .map_err(|e| e.to_string())?;
     if max_instances > 1 {
         let _ = db.update_max_instances(id, max_instances);
     }
@@ -933,12 +948,19 @@ mod tests {
         let install_dir = unique_temp_dir("sync-dst-a");
         std::fs::create_dir_all(&source_dir).unwrap();
 
-        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_name = if cfg!(windows) {
+            "recisdb-proxy.exe"
+        } else {
+            "recisdb-proxy"
+        };
         std::fs::write(source_dir.join(exe_name), b"version-1").unwrap();
 
         let action = sync_program_binary(&source_dir, &install_dir).unwrap();
         assert_eq!(action, BinarySyncAction::FreshInstall);
-        assert_eq!(std::fs::read(install_dir.join(exe_name)).unwrap(), b"version-1");
+        assert_eq!(
+            std::fs::read(install_dir.join(exe_name)).unwrap(),
+            b"version-1"
+        );
 
         std::fs::remove_dir_all(&source_dir).unwrap();
         std::fs::remove_dir_all(&install_dir).unwrap();
@@ -951,7 +973,11 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
 
-        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_name = if cfg!(windows) {
+            "recisdb-proxy.exe"
+        } else {
+            "recisdb-proxy"
+        };
         std::fs::write(source_dir.join(exe_name), b"same-content").unwrap();
         std::fs::write(install_dir.join(exe_name), b"same-content").unwrap();
 
@@ -969,7 +995,11 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
 
-        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_name = if cfg!(windows) {
+            "recisdb-proxy.exe"
+        } else {
+            "recisdb-proxy"
+        };
         std::fs::write(source_dir.join(exe_name), b"version-2-new").unwrap();
         std::fs::write(install_dir.join(exe_name), b"version-1-old").unwrap();
 
@@ -999,10 +1029,13 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_root = std::env::temp_dir()
-            .join(format!("recisdb-proxy-test-staged-px4-{n}-{}", std::process::id()));
+        let tmp_root = std::env::temp_dir().join(format!(
+            "recisdb-proxy-test-staged-px4-{n}-{}",
+            std::process::id()
+        ));
         // PX-MLT5PE (0x024e): 単一DLLで検証が簡単なため。
-        let model = crate::px4_installer::find_model(0x024e).expect("PX-MLT5PE must be a known model");
+        let model =
+            crate::px4_installer::find_model(0x024e).expect("PX-MLT5PE must be a known model");
 
         // まだ何もステージングされていない状態では見つからない。
         let none_found = find_staged_px4_bondriver_in(model, &[tmp_root.clone()]);
@@ -1031,7 +1064,8 @@ mod tests {
             "recisdb-proxy-test-custom-install-dir-{}",
             std::process::id()
         ));
-        let model = crate::px4_installer::find_model(0x0052).expect("DTV03A-1TU must be a known model");
+        let model =
+            crate::px4_installer::find_model(0x0052).expect("DTV03A-1TU must be a known model");
 
         let staged_dir = install_dir.join("BonDriver").join(model.bondriver_folder);
         std::fs::create_dir_all(&staged_dir).unwrap();
@@ -1052,7 +1086,10 @@ mod tests {
             escape_toml_basic_string(r"C:\DTV\recisdb-proxy-rs\recisdb-proxy.db"),
             r"C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.db"
         );
-        assert_eq!(escape_toml_basic_string("no_backslashes.db"), "no_backslashes.db");
+        assert_eq!(
+            escape_toml_basic_string("no_backslashes.db"),
+            "no_backslashes.db"
+        );
     }
 
     #[test]
@@ -1104,14 +1141,18 @@ mod tests {
         )
         .unwrap();
         assert!(log2.iter().any(|l| l.contains("INI と README のみ")));
-        assert!(install_dir2.join(CLIENT_CONFIG_DIR).join("BonDriver_NetworkProxy.ini").exists());
+        assert!(install_dir2
+            .join(CLIENT_CONFIG_DIR)
+            .join("BonDriver_NetworkProxy.ini")
+            .exists());
 
         std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn bulk_update_bondriver_dlls_updates_matching_files_in_subfolders() {
-        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 1));
+        let base =
+            std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 1));
         let source_dll = base.join("BonDriver_NetworkProxy.dll");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(&source_dll, b"new dll contents").unwrap();
@@ -1146,7 +1187,8 @@ mod tests {
 
     #[test]
     fn bulk_update_bondriver_dlls_reports_when_nothing_matches() {
-        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 2));
+        let base =
+            std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 2));
         let source_dll = base.join("BonDriver_NetworkProxy.dll");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(&source_dll, b"new dll contents").unwrap();
@@ -1162,7 +1204,8 @@ mod tests {
 
     #[test]
     fn bulk_update_bondriver_dlls_errors_when_source_missing() {
-        let base = std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 3));
+        let base =
+            std::env::temp_dir().join(format!("bulk_dll_update_test_{}_{}", std::process::id(), 3));
         std::fs::create_dir_all(&base).unwrap();
         let missing_source = base.join("does_not_exist.dll");
 
@@ -1225,7 +1268,10 @@ mod tests {
         }
         // 冒頭の案内コメント1行 + listen / web_listen / database.path の3行、
         // 合計4行だけが変わっているはず。
-        assert_eq!(differing_lines, 4, "only the wizard-controlled lines should differ from the template");
+        assert_eq!(
+            differing_lines, 4,
+            "only the wizard-controlled lines should differ from the template"
+        );
     }
 
     #[test]
@@ -1253,7 +1299,10 @@ mod tests {
             .and_then(|d| d.get("path"))
             .and_then(|p| p.as_str())
             .expect("database.path must be a string");
-        assert_eq!(roundtripped_path, db_path, "path must round-trip exactly, not be mangled by escape sequences");
+        assert_eq!(
+            roundtripped_path, db_path,
+            "path must round-trip exactly, not be mangled by escape sequences"
+        );
     }
 
     #[test]
@@ -1296,7 +1345,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].outcome.is_ok());
 
-        let max_instances = db.get_max_instances_for_path("BonDriver_PX4-T.dll").unwrap();
+        let max_instances = db
+            .get_max_instances_for_path("BonDriver_PX4-T.dll")
+            .unwrap();
         assert_eq!(max_instances, 4); // 2台 x 2ch/台
     }
 
@@ -1321,8 +1372,16 @@ mod tests {
 
         register_tuners_to_db(&db, &tuners, &[0]);
 
-        assert_eq!(db.get_max_instances_for_path("BonDriver_PX4-S.dll").unwrap(), 4);
-        assert_eq!(db.get_max_instances_for_path("BonDriver_PX4-T.dll").unwrap(), 4);
+        assert_eq!(
+            db.get_max_instances_for_path("BonDriver_PX4-S.dll")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.get_max_instances_for_path("BonDriver_PX4-T.dll")
+                .unwrap(),
+            4
+        );
     }
 
     #[test]

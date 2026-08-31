@@ -29,7 +29,11 @@ fn parse_stream_class(raw: &str) -> StreamClass {
         "preview" => return StreamClass::Preview,
         _ => {}
     }
-    match trimmed.parse::<u8>().ok().and_then(|v| StreamClass::try_from(v).ok()) {
+    match trimmed
+        .parse::<u8>()
+        .ok()
+        .and_then(|v| StreamClass::try_from(v).ok())
+    {
         Some(class) => class,
         None => {
             warn!("Unknown StreamClass value '{}', defaulting to View", raw);
@@ -63,10 +67,10 @@ pub fn load_log_level() -> log::LevelFilter {
         .unwrap_or_else(|| "warn".to_string());
 
     match level_str.to_lowercase().as_str() {
-        "off"   => log::LevelFilter::Off,
+        "off" => log::LevelFilter::Off,
         "error" => log::LevelFilter::Error,
-        "warn"  => log::LevelFilter::Warn,
-        "info"  => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
         "debug" => log::LevelFilter::Debug,
         "trace" => log::LevelFilter::Trace,
         _ => log::LevelFilter::Warn,
@@ -196,15 +200,17 @@ fn parse_ini(content: &str) -> HashMap<String, HashMap<String, String>> {
 
         // Section header
         if line.starts_with('[') && line.ends_with(']') {
-            current_section = line[1..line.len()-1].to_string();
-            sections.entry(current_section.clone()).or_insert_with(HashMap::new);
+            current_section = line[1..line.len() - 1].to_string();
+            sections
+                .entry(current_section.clone())
+                .or_insert_with(HashMap::new);
             continue;
         }
 
         // Key=Value
         if let Some(eq_pos) = line.find('=') {
             let key = line[..eq_pos].trim().to_string();
-            let value = line[eq_pos+1..].trim().to_string();
+            let value = line[eq_pos + 1..].trim().to_string();
 
             sections
                 .entry(current_section.clone())
@@ -306,7 +312,10 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
         .map(|s| parse_stream_class(s))
         .unwrap_or(StreamClass::View);
 
-    debug!("Configuration loaded: server={}, tuner={}", server_addr, tuner_path);
+    debug!(
+        "Configuration loaded: server={}, tuner={}",
+        server_addr, tuner_path
+    );
 
     Some(ConnectionConfig {
         server_addr,
@@ -326,11 +335,10 @@ fn load_from_ini(path: &PathBuf) -> Option<ConnectionConfig> {
 
 /// Load configuration from environment variables.
 fn load_from_env() -> ConnectionConfig {
-    let server_addr = std::env::var("BONDRIVER_PROXY_SERVER")
-        .unwrap_or_else(|_| "127.0.0.1:40070".to_string());
+    let server_addr =
+        std::env::var("BONDRIVER_PROXY_SERVER").unwrap_or_else(|_| "127.0.0.1:40070".to_string());
 
-    let tuner_path = std::env::var("BONDRIVER_PROXY_TUNER")
-        .unwrap_or_default();
+    let tuner_path = std::env::var("BONDRIVER_PROXY_TUNER").unwrap_or_default();
 
     let defaults = ConnectionConfig::default();
 
@@ -358,7 +366,10 @@ fn load_from_env() -> ConnectionConfig {
         })
         .unwrap_or(false);
 
-    debug!("Using environment/default config: server={}, tuner={}", server_addr, tuner_path);
+    debug!(
+        "Using environment/default config: server={}, tuner={}",
+        server_addr, tuner_path
+    );
 
     ConnectionConfig {
         server_addr,

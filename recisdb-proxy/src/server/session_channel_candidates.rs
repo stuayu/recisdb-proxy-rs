@@ -33,7 +33,8 @@ pub(super) async fn collect_group_channel_candidates(
                     if !group_driver_paths.contains(&bd.dll_path) {
                         return None;
                     }
-                    if ch.nid as u16 != entry_nid || ch.tsid as u16 != entry_tsid || !ch.is_enabled {
+                    if ch.nid as u16 != entry_nid || ch.tsid as u16 != entry_tsid || !ch.is_enabled
+                    {
                         return None;
                     }
                     let candidate = (bd.dll_path, ch.space, ch.channel);
@@ -97,10 +98,24 @@ mod tests {
             collect_group_channel_candidates(&database, 1, &group_paths, 0x7FE8, 0x7FE8).await;
 
         assert_eq!(candidates.len(), 2);
-        let a = candidates.iter().find(|c| c.0 == "A.dll").expect("A.dll candidate");
-        assert_eq!((a.1, a.2), (0, 27), "A.dll must keep its own channel 27, not B.dll's 5");
-        let b = candidates.iter().find(|c| c.0 == "B.dll").expect("B.dll candidate");
-        assert_eq!((b.1, b.2), (0, 5), "B.dll must keep its own channel 5, not A.dll's 27");
+        let a = candidates
+            .iter()
+            .find(|c| c.0 == "A.dll")
+            .expect("A.dll candidate");
+        assert_eq!(
+            (a.1, a.2),
+            (0, 27),
+            "A.dll must keep its own channel 27, not B.dll's 5"
+        );
+        let b = candidates
+            .iter()
+            .find(|c| c.0 == "B.dll")
+            .expect("B.dll candidate");
+        assert_eq!(
+            (b.1, b.2),
+            (0, 5),
+            "B.dll must keep its own channel 5, not A.dll's 27"
+        );
     }
 
     /// A TS carrying multiple services produces one DB row per SID, but the

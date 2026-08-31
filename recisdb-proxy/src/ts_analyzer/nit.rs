@@ -111,8 +111,8 @@ impl NitTable {
         let network_descriptors = data[2..2 + network_descriptors_length].to_vec();
 
         // Parse network name from descriptors
-        let network_name =
-            find_descriptor(&network_descriptors, descriptor_tag::NETWORK_NAME).and_then(|d| {
+        let network_name = find_descriptor(&network_descriptors, descriptor_tag::NETWORK_NAME)
+            .and_then(|d| {
                 NetworkNameDescriptor::parse(&d)
                     .ok()
                     .map(|n| n.network_name)
@@ -210,10 +210,8 @@ mod tests {
             // ESC 0x28 0x4A + "Net001"
             0x40, 0x09, 0x1b, 0x28, 0x4a, b'N', b'e', b't', b'0', b'0', b'1',
             // Transport stream loop length = 8
-            0xF0, 0x08,
-            // TS entry: TSID=0x7FE1, ONID=0x7FE0, descriptors_length=2
-            0x7F, 0xE1, 0x7F, 0xE0, 0xF0, 0x02,
-            // Dummy descriptor
+            0xF0, 0x08, // TS entry: TSID=0x7FE1, ONID=0x7FE0, descriptors_length=2
+            0x7F, 0xE1, 0x7F, 0xE0, 0xF0, 0x02, // Dummy descriptor
             0xFF, 0x00,
         ];
 

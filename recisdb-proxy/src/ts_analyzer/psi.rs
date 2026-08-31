@@ -350,7 +350,11 @@ mod tests {
     /// (section_syntax_indicator + high nibble of length) + length low byte
     /// + `data_after_header` (extended header fields + payload, if any) + a
     /// correct trailing CRC32.
-    fn make_section(table_id: u8, section_syntax_indicator: bool, data_after_header: &[u8]) -> Vec<u8> {
+    fn make_section(
+        table_id: u8,
+        section_syntax_indicator: bool,
+        data_after_header: &[u8],
+    ) -> Vec<u8> {
         let section_length = data_after_header.len() + 4; // + CRC
         assert!(section_length <= MAX_SECTION_LENGTH);
 
@@ -415,15 +419,26 @@ mod tests {
     fn test_tail_and_head_share_pusi_packet() {
         let mut collector = SectionCollector::new();
 
-        let section1 = make_section(0x4E, true, &[0x00, 0x01, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        let section2 = make_section(0x4E, true, &[0x00, 0x02, 0xE1, 0x00, 0x00, 0x11, 0x22, 0x33]);
+        let section1 = make_section(
+            0x4E,
+            true,
+            &[0x00, 0x01, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00],
+        );
+        let section2 = make_section(
+            0x4E,
+            true,
+            &[0x00, 0x02, 0xE1, 0x00, 0x00, 0x11, 0x22, 0x33],
+        );
 
         // Packet A: PUSI, pointer=0, only the first part of section1 (rest
         // arrives in packet B).
         let split = section1.len() - 3;
         let payload_a = pusi_payload(0, &section1[..split]);
         let sections_a = collector.add_data(&payload_a, 0, true);
-        assert!(sections_a.is_empty(), "section1 is still incomplete after packet A");
+        assert!(
+            sections_a.is_empty(),
+            "section1 is still incomplete after packet A"
+        );
 
         // Packet B: PUSI, pointer = remaining bytes of section1, followed by
         // section2 in full.

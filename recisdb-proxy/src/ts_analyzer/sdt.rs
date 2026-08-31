@@ -180,20 +180,13 @@ mod tests {
         // decode to mojibake.
         let data = [
             // Original network ID = 0x7FE0
-            0x7F, 0xE0,
-            // Reserved byte
-            0xFF,
-            // Service entry: service_id=0x0101
-            0x01, 0x01,
-            // flags (EIT schedule=0, EIT p/f=1)
-            0x01,
-            // running_status=4 (running), free_ca=0, descriptors_length=18
-            0x80, 0x12,
-            // Service descriptor: tag=0x48, length=16
-            0x48, 0x10,
-            // service_type=0x01
-            0x01,
-            // provider_name_length=6, ESC 0x28 0x4A + "ABC"
+            0x7F, 0xE0, // Reserved byte
+            0xFF, // Service entry: service_id=0x0101
+            0x01, 0x01, // flags (EIT schedule=0, EIT p/f=1)
+            0x01, // running_status=4 (running), free_ca=0, descriptors_length=18
+            0x80, 0x12, // Service descriptor: tag=0x48, length=16
+            0x48, 0x10, // service_type=0x01
+            0x01, // provider_name_length=6, ESC 0x28 0x4A + "ABC"
             0x06, 0x1b, 0x28, 0x4a, b'A', b'B', b'C',
             // service_name_length=7, ESC 0x28 0x4A + "CH01"
             0x07, 0x1b, 0x28, 0x4a, b'C', b'H', b'0', b'1',

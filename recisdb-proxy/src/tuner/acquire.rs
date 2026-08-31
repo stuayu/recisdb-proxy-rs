@@ -52,9 +52,9 @@ use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
 use crate::tuner::pool::TunerPoolError;
+use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason};
 #[cfg(unix)]
 use crate::tuner::timing;
-use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason};
 use crate::tuner::{
     CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle,
 };
@@ -446,7 +446,9 @@ pub(crate) async fn snapshot(
     let (drivers, priorities): (Vec<DriverState>, Vec<i32>) = {
         let db = database.lock().await;
 
-        let exclusive_counts = db.get_exclusive_channel_counts(&dll_paths).unwrap_or_default();
+        let exclusive_counts = db
+            .get_exclusive_channel_counts(&dll_paths)
+            .unwrap_or_default();
         let drivers = dll_paths
             .iter()
             .map(|path| DriverState {
@@ -685,7 +687,10 @@ pub(crate) async fn acquire(
                 // P1b §6) — a permit is never even asked for on this branch.
                 match pool.get(&key).await {
                     Some(tuner)
-                        if matches!(tuner.state(), ReaderState::Starting | ReaderState::Running) =>
+                        if matches!(
+                            tuner.state(),
+                            ReaderState::Starting | ReaderState::Running
+                        ) =>
                     {
                         pool.reject_gate().clear(&gate_key);
                         return Ok(AcquireOutcome {
@@ -725,9 +730,10 @@ pub(crate) async fn acquire(
                     .unwrap_or(1);
 
                 let transferring_own_slot = carried_permit.is_on_path(&key.tuner_path)
-                    && request.own_key.as_ref().is_some_and(|own| {
-                        own != &key && own.tuner_path == key.tuner_path
-                    });
+                    && request
+                        .own_key
+                        .as_ref()
+                        .is_some_and(|own| own != &key && own.tuner_path == key.tuner_path);
                 if transferring_own_slot {
                     if let Some(own_key) = request.own_key.as_ref() {
                         if let Some(old) = pool.get(own_key).await {
@@ -744,7 +750,9 @@ pub(crate) async fn acquire(
                 }
 
                 let (permit, warm_to_use) =
-                    match take_permit_for_path(&key.tuner_path, &mut carried_permit, &mut warm).await {
+                    match take_permit_for_path(&key.tuner_path, &mut carried_permit, &mut warm)
+                        .await
+                    {
                         Some((permit, warm_to_use)) => (permit, warm_to_use),
                         None => match pool.acquire_slot(&key.tuner_path, max_instances).await {
                             Some(permit) => (permit, None),
@@ -761,7 +769,9 @@ pub(crate) async fn acquire(
                     };
 
                 let tuner = match pool
-                    .get_or_create(key.clone(), request.bondriver_version, permit, || async { Ok(()) })
+                    .get_or_create(key.clone(), request.bondriver_version, permit, || async {
+                        Ok(())
+                    })
                     .await
                 {
                     Ok(tuner) => tuner,
@@ -942,8 +952,10 @@ pub(crate) async fn acquire(
                 // Latency, not just success: a driver that always answers but
                 // takes ten seconds is Degraded, and gets less rope before the
                 // next failure streak opens its circuit.
-                pool.open_backoff()
-                    .record_success_with_latency(&key.tuner_path, start_began.elapsed().as_millis() as u64);
+                pool.open_backoff().record_success_with_latency(
+                    &key.tuner_path,
+                    start_began.elapsed().as_millis() as u64,
+                );
                 spawn_runtime_health_recorder(
                     database.clone(),
                     Arc::clone(&tuner),
@@ -961,10 +973,14 @@ pub(crate) async fn acquire(
             }
             Decision::Reject { reason } => {
                 if let Some(key) = request.candidates.iter().find(|key| {
-                    pool.open_backoff().cooldown_remaining(&key.tuner_path).is_some()
+                    pool.open_backoff()
+                        .cooldown_remaining(&key.tuner_path)
+                        .is_some()
                 }) {
                     if request.candidates.iter().all(|candidate| {
-                        pool.open_backoff().cooldown_remaining(&candidate.tuner_path).is_some()
+                        pool.open_backoff()
+                            .cooldown_remaining(&candidate.tuner_path)
+                            .is_some()
                     }) {
                         let retry_in = pool
                             .open_backoff()
@@ -1066,7 +1082,8 @@ mod tests {
 
     fn db_handle_with_driver(path: &str, max_instances: i32) -> DatabaseHandle {
         let db = Database::open_in_memory().unwrap();
-        db.insert_bon_driver(&NewBonDriver::new(path).with_max_instances(max_instances)).unwrap();
+        db.insert_bon_driver(&NewBonDriver::new(path).with_max_instances(max_instances))
+            .unwrap();
         Arc::new(tokio::sync::Mutex::new(db))
     }
 
@@ -1095,19 +1112,29 @@ mod tests {
 
         {
             let db = database.lock().await;
-            db.insert_bon_driver(&NewBonDriver::new("/dev/other")).unwrap();
+            db.insert_bon_driver(&NewBonDriver::new("/dev/other"))
+                .unwrap();
         }
 
         let key = ChannelKey::space_channel("/dev/test", 0, 5);
         let permit = pool.acquire_slot("/dev/test", 3).await.unwrap();
-        let tuner = pool.get_or_create(key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
-        let ready_rx = tuner.spawn_fake_reader(FakeTsSource::new(), 0, 5, fast_startup_config()).await;
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = tuner
+            .spawn_fake_reader(FakeTsSource::new(), 0, 5, fast_startup_config())
+            .await;
         ready_rx.await.unwrap().unwrap();
         let _sub = tuner.subscribe();
 
         let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
 
-        assert_eq!(snap.drivers.len(), 1, "only the requested dll_path's driver row is included");
+        assert_eq!(
+            snap.drivers.len(),
+            1,
+            "only the requested dll_path's driver row is included"
+        );
         assert_eq!(snap.drivers[0].dll_path, "/dev/test");
         assert_eq!(snap.drivers[0].max_instances, 3);
 
@@ -1119,12 +1146,8 @@ mod tests {
         tuner.stop_reader().await;
     }
 
-    async fn running_snapshot_fixture() -> (
-        Arc<TunerPool>,
-        DatabaseHandle,
-        Arc<SharedTuner>,
-        ChannelKey,
-    ) {
+    async fn running_snapshot_fixture(
+    ) -> (Arc<TunerPool>, DatabaseHandle, Arc<SharedTuner>, ChannelKey) {
         let pool = Arc::new(TunerPool::new(10));
         let database = db_handle_with_driver("/dev/test", 3);
         let key = ChannelKey::space_channel("/dev/test", 0, 5);
@@ -1168,7 +1191,13 @@ mod tests {
     async fn snapshot_drops_claim_when_subscription_is_dropped() {
         let (pool, database, tuner, _) = running_snapshot_fixture().await;
         let sub = tuner.subscribe_with_claim(9, false);
-        assert_eq!(snapshot(&pool, &database, &["/dev/test".to_string()]).await.entries[0].priority, 9);
+        assert_eq!(
+            snapshot(&pool, &database, &["/dev/test".to_string()])
+                .await
+                .entries[0]
+                .priority,
+            9
+        );
         drop(sub);
 
         let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
@@ -1225,7 +1254,10 @@ mod tests {
 
         let key_b = ChannelKey::space_channel("/dev/b", 0, 1);
         let permit_b = pool.acquire_slot("/dev/b", 1).await.unwrap();
-        let tuner_b = pool.get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) }).await.unwrap();
+        let tuner_b = pool
+            .get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) })
+            .await
+            .unwrap();
         let _sub = tuner_b.subscribe(); // keep it alive past get_or_create's stale sweep
 
         // Only "/dev/a" is requested; "/dev/b"'s entry must not appear.
@@ -1246,8 +1278,13 @@ mod tests {
 
         let key = ChannelKey::space_channel("/dev/test", 0, 5);
         let permit = pool.acquire_slot("/dev/test", 1).await.unwrap();
-        let tuner = pool.get_or_create(key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
-        let ready_rx = tuner.spawn_fake_reader(FakeTsSource::new(), 0, 5, fast_startup_config()).await;
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = tuner
+            .spawn_fake_reader(FakeTsSource::new(), 0, 5, fast_startup_config())
+            .await;
         ready_rx.await.unwrap().unwrap();
 
         // The driver's only slot is now held by `tuner` — a second
@@ -1256,7 +1293,9 @@ mod tests {
         // somehow still getting) a permit.
         assert!(pool.acquire_slot("/dev/test", 1).await.is_none());
 
-        let outcome = acquire(&pool, &database, empty_request(vec![key.clone()])).await.unwrap();
+        let outcome = acquire(&pool, &database, empty_request(vec![key.clone()]))
+            .await
+            .unwrap();
         assert!(outcome.reused);
         assert!(Arc::ptr_eq(&outcome.tuner, &tuner));
         assert_eq!(outcome.key, key);
@@ -1281,7 +1320,11 @@ mod tests {
             matches!(&result, Err(AcquireError::ReaderStart(_))),
             "opening a nonexistent device must fail at the reader-start step, not earlier: {result:?}"
         );
-        assert_eq!(pool.count().await, 0, "a failed Create must not leave an orphaned entry");
+        assert_eq!(
+            pool.count().await,
+            0,
+            "a failed Create must not leave an orphaned entry"
+        );
         assert!(
             pool.acquire_slot(path, 1).await.is_some(),
             "the permit taken for the failed attempt must have been released"
@@ -1377,8 +1420,13 @@ mod tests {
 
         let winning_key = ChannelKey::space_channel(winning_path, 0, 1);
         let permit = pool.acquire_slot(winning_path, 1).await.unwrap();
-        let tuner = pool.get_or_create(winning_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
-        let ready_rx = tuner.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        let tuner = pool
+            .get_or_create(winning_key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = tuner
+            .spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config())
+            .await;
         ready_rx.await.unwrap().unwrap();
 
         // `winning_key` is already running, so `decide` picks `Reuse` — the
@@ -1390,7 +1438,9 @@ mod tests {
 
         let outcome = acquire(&pool, &database, request).await.unwrap();
         assert!(outcome.reused);
-        let unused = outcome.unused_permit.expect("carried permit for an unrelated path must be returned");
+        let unused = outcome
+            .unused_permit
+            .expect("carried permit for an unrelated path must be returned");
         assert_eq!(unused.dll_path(), carried_path);
 
         tuner.stop_reader().await;
@@ -1408,18 +1458,26 @@ mod tests {
         let database = db_handle_with_driver(old_path, 1);
         {
             let db = database.lock().await;
-            db.insert_bon_driver(&NewBonDriver::new(new_path).with_max_instances(1)).unwrap();
+            db.insert_bon_driver(&NewBonDriver::new(new_path).with_max_instances(1))
+                .unwrap();
         }
 
         let old_key = ChannelKey::space_channel(old_path, 0, 1);
         let permit = pool.acquire_slot(old_path, 1).await.unwrap();
-        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
-        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        let old = pool
+            .get_or_create(old_key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = old
+            .spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config())
+            .await;
         ready_rx.await.unwrap().unwrap();
 
         // What a session does before switching channels: detach the slot so
         // it can be handed to the replacement reader.
-        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        let carried = old
+            .take_slot_permit()
+            .expect("running reader holds its permit");
         assert!(old.take_slot_permit().is_none());
 
         // The winner is on a different, nonexistent driver, so the reader
@@ -1431,9 +1489,14 @@ mod tests {
         request.own_key_will_free_slot = true;
 
         let result = acquire(&pool, &database, request).await;
-        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected the nonexistent driver to fail: {result:?}"
+        );
 
-        let restored = old.take_slot_permit().expect("permit must be back on the still-running old reader");
+        let restored = old
+            .take_slot_permit()
+            .expect("permit must be back on the still-running old reader");
         assert_eq!(restored.dll_path(), old_path);
 
         old.stop_reader().await;
@@ -1453,24 +1516,37 @@ mod tests {
 
         let old_key = ChannelKey::space_channel(path, 0, 1);
         let permit = pool.acquire_slot(path, 1).await.unwrap();
-        let old = pool.get_or_create(old_key.clone(), 2, permit, || async { Ok(()) }).await.unwrap();
-        let ready_rx = old.spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config()).await;
+        let old = pool
+            .get_or_create(old_key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let ready_rx = old
+            .spawn_fake_reader(FakeTsSource::new(), 0, 1, fast_startup_config())
+            .await;
         ready_rx.await.unwrap().unwrap();
 
-        let carried = old.take_slot_permit().expect("running reader holds its permit");
+        let carried = old
+            .take_slot_permit()
+            .expect("running reader holds its permit");
         let mut request = empty_request(vec![ChannelKey::space_channel(path, 0, 2)]);
         request.carried_permit = Some(carried);
         request.own_key = Some(old_key.clone());
         request.own_key_will_free_slot = true;
 
         let result = acquire(&pool, &database, request).await;
-        assert!(result.is_err(), "expected the nonexistent driver to fail: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected the nonexistent driver to fail: {result:?}"
+        );
 
         assert!(
             pool.get(&old_key).await.is_none(),
             "the old same-DLL reader must have been stopped and removed before its slot was reused"
         );
-        assert!(!old.is_running(), "the old reader must not still be running on the transferred slot");
+        assert!(
+            !old.is_running(),
+            "the old reader must not still be running on the transferred slot"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1486,11 +1562,19 @@ mod tests {
         let warm_permit = pool.acquire_slot(path, 2).await.unwrap();
         let mut warm = Some(WarmTunerHandle::spawn(path.to_string(), 1, warm_permit));
 
-        let (permit, warm_to_use) = take_permit_for_path(path, &mut carried, &mut warm).await.unwrap();
+        let (permit, warm_to_use) = take_permit_for_path(path, &mut carried, &mut warm)
+            .await
+            .unwrap();
         assert_eq!(permit.dll_path(), path);
-        assert!(warm_to_use.is_none(), "the carried permit wins; the warm handle is superseded, not activated");
+        assert!(
+            warm_to_use.is_none(),
+            "the carried permit wins; the warm handle is superseded, not activated"
+        );
         assert!(carried.is_none(), "the carried permit must be consumed");
-        assert!(warm.is_none(), "the superseded warm handle must be shut down and dropped, not left dangling");
+        assert!(
+            warm.is_none(),
+            "the superseded warm handle must be shut down and dropped, not left dangling"
+        );
     }
 
     #[tokio::test]
@@ -1502,9 +1586,14 @@ mod tests {
         let warm_permit = pool.acquire_slot(path, 1).await.unwrap();
         let mut warm = Some(WarmTunerHandle::spawn(path.to_string(), 1, warm_permit));
 
-        let (permit, warm_to_use) = take_permit_for_path(path, &mut carried, &mut warm).await.unwrap();
+        let (permit, warm_to_use) = take_permit_for_path(path, &mut carried, &mut warm)
+            .await
+            .unwrap();
         assert_eq!(permit.dll_path(), path);
-        assert!(warm_to_use.is_some(), "the warm handle's own permit is the one taken, so it is still activatable");
+        assert!(
+            warm_to_use.is_some(),
+            "the warm handle's own permit is the one taken, so it is still activatable"
+        );
 
         warm_to_use.unwrap().shutdown().await;
     }
@@ -1518,7 +1607,10 @@ mod tests {
 
         let result = take_permit_for_path("/dev/target", &mut carried, &mut warm).await;
         assert!(result.is_none());
-        assert!(carried.is_some(), "a permit for a different path must not be consumed");
+        assert!(
+            carried.is_some(),
+            "a permit for a different path must not be consumed"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1551,7 +1643,11 @@ mod tests {
             matches!(&result, Err(AcquireError::AtCapacity { .. })),
             "expected AtCapacity once the only candidate is known full, got {result:?}"
         );
-        assert_eq!(pool.count().await, 0, "no entry should have been left behind by the abandoned attempts");
+        assert_eq!(
+            pool.count().await,
+            0,
+            "no entry should have been left behind by the abandoned attempts"
+        );
     }
 
     // -----------------------------------------------------------------

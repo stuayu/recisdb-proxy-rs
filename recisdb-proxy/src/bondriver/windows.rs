@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cpp_utils::{DynamicCast, MutPtr, Ptr};
-use log::{debug, info, error};
+use log::{debug, error, info};
 
 // Keep this in sync with tuner/shared.rs::MAX_TS_READ_BUFFER_SIZE. This
 // FFI-side guard runs before allocating the native chunk's carry-over.
@@ -55,13 +55,13 @@ mod ib1 {
     }
 }
 
-
 mod ib2 {
     use super::{IBonDriver2, BOOL, DWORD, LPCTSTR};
 
     extern "C" {
         pub fn C_EnumTuningSpace(b: *mut IBonDriver2, dwSpace: DWORD) -> LPCTSTR;
-        pub fn C_EnumChannelName2(b: *mut IBonDriver2, dwSpace: DWORD, dwChannel: DWORD) -> LPCTSTR;
+        pub fn C_EnumChannelName2(b: *mut IBonDriver2, dwSpace: DWORD, dwChannel: DWORD)
+            -> LPCTSTR;
         pub fn C_SetChannel2(b: *mut IBonDriver2, dwSpace: DWORD, dwChannel: DWORD) -> BOOL;
     }
 }
@@ -90,8 +90,7 @@ mod ib_utils {
         }
         const MAX_WIDE_LEN: usize = 32768;
         unsafe {
-            let len = (0..MAX_WIDE_LEN as isize)
-                .position(|i| *ptr.offset(i) == 0)?;
+            let len = (0..MAX_WIDE_LEN as isize).position(|i| *ptr.offset(i) == 0)?;
             if len == 0 {
                 return None;
             }
@@ -175,7 +174,9 @@ impl IBon {
                 info!("[BonDriver] OpenTuner succeeded");
                 Ok(())
             } else {
-                let msg = format!("OpenTuner failed - tuner may be in use, not present, or hardware error");
+                let msg = format!(
+                    "OpenTuner failed - tuner may be in use, not present, or hardware error"
+                );
                 error!("[BonDriver] {}", msg);
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg))
             }
@@ -193,7 +194,10 @@ impl IBon {
             if ib1::C_SetChannel(self.ibon1.as_ptr(), ch) != 0 {
                 Ok(())
             } else {
-                let msg = format!("SetChannel failed for channel={} - channel may not exist or tuner not ready", ch);
+                let msg = format!(
+                    "SetChannel failed for channel={} - channel may not exist or tuner not ready",
+                    ch
+                );
                 debug!("[BonDriver] {}", msg);
                 Err(io::Error::new(io::ErrorKind::AddrNotAvailable, msg))
             }
@@ -202,7 +206,10 @@ impl IBon {
 
     fn set_channel_by_space(&self, space: u32, ch: u32) -> Result<(), io::Error> {
         let iface = self.ibon2.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "IBonDriver2 not supported by this driver")
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IBonDriver2 not supported by this driver",
+            )
         })?;
         unsafe {
             if ib2::C_SetChannel2(iface.as_ptr(), space, ch) != 0 {
@@ -223,14 +230,10 @@ impl IBon {
         unsafe { ib1::C_WaitTsStream(self.ibon1.as_ptr(), timeout_ms) != 0 }
     }
 
-
     /// GetTsStream using BYTE** version (zero-copy).
     /// Most BonDriver implementations (especially proxy-based ones like BonDriverProxyEx)
     /// only implement this version properly. The BYTE* copy version is often unimplemented.
-    pub(crate) fn GetTsStream(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<(usize, usize), io::Error> {
+    pub(crate) fn GetTsStream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
         let mut pending = self
             .pending
             .lock()
@@ -244,9 +247,9 @@ impl IBon {
             pending.drain(..n);
             return Ok((
                 n,
-                pending.len().saturating_add(
-                    self.native_remaining_hint.load(Ordering::Relaxed) as usize,
-                ),
+                pending
+                    .len()
+                    .saturating_add(self.native_remaining_hint.load(Ordering::Relaxed) as usize),
             ));
         }
 
@@ -264,12 +267,18 @@ impl IBon {
             ) != 0;
 
             if !ok || ptr.is_null() {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream no data"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "GetTsStream no data",
+                ));
             }
 
             let size_usize = size as usize;
             if size_usize == 0 {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "GetTsStream size=0"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "GetTsStream size=0",
+                ));
             }
             if size_usize > MAX_TS_NATIVE_CHUNK_SIZE {
                 return Err(io::Error::new(
@@ -284,7 +293,8 @@ impl IBon {
             self.read_calls.fetch_add(1, Ordering::Relaxed);
             self.read_bytes
                 .fetch_add(size_usize as u64, Ordering::Relaxed);
-            self.max_chunk.fetch_max(size_usize as u64, Ordering::Relaxed);
+            self.max_chunk
+                .fetch_max(size_usize as u64, Ordering::Relaxed);
             self.native_remaining_hint
                 .store(remaining as u64, Ordering::Relaxed);
 
@@ -310,7 +320,6 @@ impl IBon {
             Ok((copy_len, pending.len().saturating_add(remaining as usize)))
         }
     }
-
 
     fn purge_ts_stream(&self) {
         // Drop the carry-over too, otherwise the first read after a channel
@@ -375,35 +384,34 @@ impl BonDriverTuner {
         if !std::path::Path::new(path).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("BonDriver file not found: {}", path)
+                format!("BonDriver file not found: {}", path),
             ));
         }
 
-        let path_canonical = std::fs::canonicalize(path)
-            .map_err(|e| io::Error::new(
+        let path_canonical = std::fs::canonicalize(path).map_err(|e| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Cannot access BonDriver path {}: {}", path, e)
-            ))?;
+                format!("Cannot access BonDriver path {}: {}", path, e),
+            )
+        })?;
 
         info!("[BonDriver] Loading {:?}...", path_canonical);
 
         let dll = unsafe {
-            BonDriver::new(&path_canonical)
-                .map_err(|e| {
-                    let msg = format!("Failed to load BonDriver DLL {}: {}", path, e);
-                    error!("[BonDriver] {}", msg);
-                    io::Error::new(io::ErrorKind::NotFound, msg)
-                })?
+            BonDriver::new(&path_canonical).map_err(|e| {
+                let msg = format!("Failed to load BonDriver DLL {}: {}", path, e);
+                error!("[BonDriver] {}", msg);
+                io::Error::new(io::ErrorKind::NotFound, msg)
+            })?
         };
 
         let ibon = {
             let ptr = unsafe { dll.CreateBonDriver() };
-            let ibon1 = NonNull::new(ptr)
-                .ok_or_else(|| {
-                    let msg = format!("BonDriver.CreateBonDriver() returned null for {}", path);
-                    error!("[BonDriver] {}", msg);
-                    io::Error::new(io::ErrorKind::Other, msg)
-                })?;
+            let ibon1 = NonNull::new(ptr).ok_or_else(|| {
+                let msg = format!("BonDriver.CreateBonDriver() returned null for {}", path);
+                error!("[BonDriver] {}", msg);
+                io::Error::new(io::ErrorKind::Other, msg)
+            })?;
 
             let (ibon2, ibon3) = unsafe {
                 let ptr: MutPtr<IBonDriver> = MutPtr::from_raw(ibon1.as_ptr());
@@ -450,7 +458,10 @@ impl BonDriverTuner {
 
     /// Set the channel by space and channel number.
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
-        debug!("[BonDriver] SetChannel: space={}, channel={}", space, channel);
+        debug!(
+            "[BonDriver] SetChannel: space={}, channel={}",
+            space, channel
+        );
         self.ibon.set_channel_by_space(space, channel)
     }
 
@@ -479,7 +490,12 @@ impl BonDriverTuner {
     /// Read-side counters for runtime diagnostics.
     pub fn get_ts_stream_stats(&self) -> Option<(u64, u64, u64, u64)> {
         let stats = self.ibon.read_stats();
-        Some((stats.calls, stats.bytes, stats.max_chunk, stats.pending_peak))
+        Some((
+            stats.calls,
+            stats.bytes,
+            stats.max_chunk,
+            stats.pending_peak,
+        ))
     }
 
     /// Purge the TS stream buffer.

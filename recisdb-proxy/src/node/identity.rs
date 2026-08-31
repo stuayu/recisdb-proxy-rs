@@ -73,7 +73,13 @@ impl PairingCode {
     pub fn random() -> Self {
         // 64 bits of random material; format groups improve transcription.
         let raw = random_hex::<8>().to_ascii_uppercase();
-        Self(format!("{}-{}-{}-{}", &raw[0..4], &raw[4..8], &raw[8..12], &raw[12..16]))
+        Self(format!(
+            "{}-{}-{}-{}",
+            &raw[0..4],
+            &raw[4..8],
+            &raw[8..12],
+            &raw[12..16]
+        ))
     }
 
     pub fn parse(value: &str) -> Result<Self, &'static str> {

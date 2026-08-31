@@ -32,7 +32,9 @@ use log::{debug, warn};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::ts_analyzer::service_filter::TsServiceFilter;
-use crate::ts_analyzer::{table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
+use crate::ts_analyzer::{
+    table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE,
+};
 use crate::web::stream::{BodyReceiver, StreamCleanup, TsAligner};
 
 /// How long past `programs.start_at + duration_secs` this gate keeps waiting
@@ -82,7 +84,11 @@ pub(crate) struct ProgramGate {
 
 impl ProgramGate {
     pub(crate) fn new(target_sid: u16, target_event_id: u16) -> Self {
-        Self { target_sid, target_event_id, state: GateState::Waiting }
+        Self {
+            target_sid,
+            target_event_id,
+            state: GateState::Waiting,
+        }
     }
 
     pub(crate) fn is_streaming(&self) -> bool {
@@ -102,7 +108,12 @@ impl ProgramGate {
     /// `table_id == EIT_PF_ACTUAL` (0x4E) — 0x4F (other TS) and the
     /// 0x50-0x6F schedule range say nothing about what is present *right
     /// now* on *this* service and must never reach this method.
-    pub(crate) fn observe_eit_pf_actual(&mut self, section_number: u8, service_id: u16, event_id: u16) {
+    pub(crate) fn observe_eit_pf_actual(
+        &mut self,
+        section_number: u8,
+        service_id: u16,
+        event_id: u16,
+    ) {
         if self.state == GateState::Ended {
             return;
         }
@@ -152,7 +163,9 @@ struct EitPfCollector {
 
 impl EitPfCollector {
     fn new() -> Self {
-        Self { collector: SectionCollector::new() }
+        Self {
+            collector: SectionCollector::new(),
+        }
     }
 
     /// Feed a raw TS chunk, reporting every EIT p/f actual (0x4E) section's
@@ -188,14 +201,20 @@ impl EitPfCollector {
     }
 
     fn process_section(&mut self, section_data: &[u8], gate: &mut ProgramGate) {
-        let Ok(section) = PsiSection::parse(section_data) else { return };
+        let Ok(section) = PsiSection::parse(section_data) else {
+            return;
+        };
         // Only present/following, actual TS — see `ProgramGate::observe_eit_pf_actual`
         // doc comment on why 0x4F/schedule must never reach the gate.
         if section.header.table_id != table_id::EIT_PF_ACTUAL {
             return;
         }
-        let Ok(eit) = EitTable::parse(&section) else { return };
-        let Some(first_event) = eit.events.first() else { return };
+        let Ok(eit) = EitTable::parse(&section) else {
+            return;
+        };
+        let Some(first_event) = eit.events.first() else {
+            return;
+        };
         gate.observe_eit_pf_actual(eit.section_number, eit.service_id, first_event.event_id);
     }
 }
@@ -414,16 +433,21 @@ mod tests {
         // Far-future deadline so the "gave up waiting" branch cannot be what
         // ends this stream.
         let deadline = Utc::now() + chrono::Duration::hours(1);
-        let stream =
-            gated_program_stream(BodyReceiver::Remote(rx), cleanup, 1024, 5, deadline);
+        let stream = gated_program_stream(BodyReceiver::Remote(rx), cleanup, 1024, 5, deadline);
         futures::pin_mut!(stream);
 
         drop(tx);
 
-        let first = stream.next().await.expect("a closed RECORD source must be reported");
+        let first = stream
+            .next()
+            .await
+            .expect("a closed RECORD source must be reported");
         let err = first.expect_err("the body must terminate with an error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-        assert!(stream.next().await.is_none(), "the stream must end after the fatal error");
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after the fatal error"
+        );
     }
 
     // ------------------------------------------------------------------

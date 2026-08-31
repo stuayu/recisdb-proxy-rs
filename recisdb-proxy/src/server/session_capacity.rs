@@ -15,10 +15,7 @@ use crate::tuner::{ChannelKey, SharedTuner, TunerPool};
 
 pub(super) use crate::tuner::policy::should_sync_stop_old_reader;
 
-pub(super) async fn driver_max_instances(
-    database: &DatabaseHandle,
-    tuner_path: &str,
-) -> i32 {
+pub(super) async fn driver_max_instances(database: &DatabaseHandle, tuner_path: &str) -> i32 {
     let db = database.lock().await;
     db.get_max_instances_for_path(tuner_path).unwrap_or(1)
 }
@@ -105,15 +102,16 @@ pub(super) async fn cleanup_unused_tuner_after_switch(
     }
 
     let old_dll_max = driver_max_instances(database, &tuner.key.tuner_path).await;
-    let old_dll_running = count_running_instances_on_driver(
-        tuner_pool,
-        &tuner.key.tuner_path,
-        None,
-    )
-    .await;
+    let old_dll_running =
+        count_running_instances_on_driver(tuner_pool, &tuner.key.tuner_path, None).await;
     let same_dll_switch = replacement_tuner_path == Some(tuner.key.tuner_path.as_str());
 
-    if should_sync_stop_old_reader(same_dll_switch, force_stop_same_dll, old_dll_running, old_dll_max) {
+    if should_sync_stop_old_reader(
+        same_dll_switch,
+        force_stop_same_dll,
+        old_dll_running,
+        old_dll_max,
+    ) {
         info!(
             "[Session {}] {} stopping old reader for {:?} ({}/{})",
             session_id, log_prefix, tuner.key, old_dll_running, old_dll_max
@@ -125,10 +123,11 @@ pub(super) async fn cleanup_unused_tuner_after_switch(
             "[Session {}] {} scheduling idle close for {:?} ({}/{})",
             session_id, log_prefix, tuner.key, old_dll_running, old_dll_max
         );
-        tuner_pool.schedule_idle_close(tuner.key.clone(), tuner).await;
+        tuner_pool
+            .schedule_idle_close(tuner.key.clone(), tuner)
+            .await;
     }
 }
-
 
 // `should_sync_stop_old_reader`'s unit tests moved to `tuner::policy` along
 // with the function itself (docs/TUNER_PIPELINE_REDESIGN.md P0).

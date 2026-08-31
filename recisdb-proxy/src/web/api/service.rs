@@ -87,7 +87,8 @@ pub async fn restart_service(
         tracing::warn!("restart requested via Web API (method: {:?})", method);
         // 実際の再起動はブロッキング (exec / process::exit / spawn)。
         let result =
-            tokio::task::spawn_blocking(|| service::restart_self().map_err(|e| e.to_string())).await;
+            tokio::task::spawn_blocking(|| service::restart_self().map_err(|e| e.to_string()))
+                .await;
         match result {
             Ok(Ok(())) => tracing::info!("restart procedure started"),
             Ok(Err(e)) => tracing::error!("restart failed: {e}"),

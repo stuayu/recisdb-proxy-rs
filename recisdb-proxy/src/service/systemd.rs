@@ -96,9 +96,18 @@ pub fn install(spec: &ServiceSpec) -> Result<(), ServiceError> {
     let body = unit_text::systemd_unit_body(spec);
     std::fs::write(&path, body).map_err(io_err_to_service_err)?;
 
-    run_checked(systemctl(spec.scope).arg("daemon-reload"), "systemctl daemon-reload")?;
-    run_checked(systemctl(spec.scope).args(["enable", &spec.name]), "systemctl enable")?;
-    run_checked(systemctl(spec.scope).args(["start", &spec.name]), "systemctl start")?;
+    run_checked(
+        systemctl(spec.scope).arg("daemon-reload"),
+        "systemctl daemon-reload",
+    )?;
+    run_checked(
+        systemctl(spec.scope).args(["enable", &spec.name]),
+        "systemctl enable",
+    )?;
+    run_checked(
+        systemctl(spec.scope).args(["start", &spec.name]),
+        "systemctl start",
+    )?;
     Ok(())
 }
 
@@ -112,7 +121,10 @@ pub fn uninstall(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     if path.exists() {
         std::fs::remove_file(&path).map_err(io_err_to_service_err)?;
     }
-    run_checked(systemctl(scope).arg("daemon-reload"), "systemctl daemon-reload")?;
+    run_checked(
+        systemctl(scope).arg("daemon-reload"),
+        "systemctl daemon-reload",
+    )?;
     Ok(())
 }
 
@@ -125,7 +137,10 @@ pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
 }
 
 pub fn restart(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
-    run_checked(systemctl(scope).args(["restart", name]), "systemctl restart")
+    run_checked(
+        systemctl(scope).args(["restart", name]),
+        "systemctl restart",
+    )
 }
 
 pub fn status(name: &str, scope: ServiceScope) -> ServiceStatus {

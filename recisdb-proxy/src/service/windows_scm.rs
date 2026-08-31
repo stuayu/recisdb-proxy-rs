@@ -16,14 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
-    ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
-    ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::{ServiceError, ServiceScope, ServiceSpec, ServiceStatus, SERVICE_WORKDIR_FLAG};
-
 
 fn to_windows_service_error(e: windows_service::Error) -> ServiceError {
     // アクセス拒否 (ERROR_ACCESS_DENIED = 5) は「管理者として実行してください」
@@ -144,7 +142,9 @@ pub fn install(spec: &ServiceSpec) -> Result<(), ServiceError> {
     };
     let _ = service.update_failure_actions(failure_actions);
 
-    service.start(&Vec::<&OsStr>::new()).map_err(to_windows_service_error)?;
+    service
+        .start(&Vec::<&OsStr>::new())
+        .map_err(to_windows_service_error)?;
     Ok(())
 }
 
@@ -175,7 +175,9 @@ pub fn start(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     let service = manager
         .open_service(name, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
         .map_err(to_windows_service_error)?;
-    service.start(&Vec::<&OsStr>::new()).map_err(to_windows_service_error)?;
+    service
+        .start(&Vec::<&OsStr>::new())
+        .map_err(to_windows_service_error)?;
     wait_for_state(&service, ServiceState::Running)
 }
 
@@ -186,7 +188,10 @@ pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     let service = manager
         .open_service(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
         .map_err(to_windows_service_error)?;
-    if service.query_status().map_err(to_windows_service_error)?.current_state
+    if service
+        .query_status()
+        .map_err(to_windows_service_error)?
+        .current_state
         == ServiceState::Stopped
     {
         return Ok(());
@@ -214,7 +219,8 @@ pub fn status(name: &str, scope: ServiceScope) -> ServiceStatus {
         };
     }
 
-    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
         Ok(m) => m,
         Err(e) => {
             return ServiceStatus {
@@ -230,7 +236,10 @@ pub fn status(name: &str, scope: ServiceScope) -> ServiceStatus {
         }
     };
 
-    let service = match manager.open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+    let service = match manager.open_service(
+        name,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
         Ok(s) => s,
         Err(_) => {
             // 未登録 (または権限不足)。installed=false で返す。
@@ -313,7 +322,9 @@ pub fn spawn_detached_restart(name: &str) -> Result<(), ServiceError> {
 // ServiceMain として動く。
 // ---------------------------------------------------------------------
 
-use windows_service::service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStatus as WinServiceStatus};
+use windows_service::service::{
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStatus as WinServiceStatus,
+};
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 

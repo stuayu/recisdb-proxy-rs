@@ -336,7 +336,10 @@ pub enum ClientMessage {
     /// `stream_class` is a protocol v2 addition (STREAMING_DESIGN.md §10).
     /// v1 clients never set this explicitly; the codec fills in
     /// `StreamClass::View` when decoding a 2-byte (v1) payload.
-    Hello { version: u16, stream_class: StreamClass },
+    Hello {
+        version: u16,
+        stream_class: StreamClass,
+    },
     /// Ping for keep-alive.
     Ping,
     /// Open a tuner by path.
@@ -346,11 +349,26 @@ pub enum ClientMessage {
     /// Close the current tuner.
     CloseTuner,
     /// Set channel (IBonDriver v1 style).
-    SetChannel { channel: u8, priority: i32, exclusive: bool },
+    SetChannel {
+        channel: u8,
+        priority: i32,
+        exclusive: bool,
+    },
     /// Set channel by space (IBonDriver v2 style).
-    SetChannelSpace { space: u32, channel: u32, priority: i32, exclusive: bool },
+    SetChannelSpace {
+        space: u32,
+        channel: u32,
+        priority: i32,
+        exclusive: bool,
+    },
     /// Set channel by space within a group (auto-select driver).
-    SetChannelSpaceInGroup { group_name: String, space_idx: u32, channel: u32, priority: i32, exclusive: bool },
+    SetChannelSpaceInGroup {
+        group_name: String,
+        space_idx: u32,
+        channel: u32,
+        priority: i32,
+        exclusive: bool,
+    },
     /// Get signal level.
     GetSignalLevel,
     /// Enumerate tuning space.
@@ -373,15 +391,11 @@ pub enum ClientMessage {
         sid: Option<u16>,
     },
     /// Get channel list from server.
-    GetChannelList {
-        filter: Option<ChannelFilter>,
-    },
+    GetChannelList { filter: Option<ChannelFilter> },
     /// Set service filter mode.
     /// When single_service is true, the server will filter TS packets to only
     /// include the selected service's SID (determined from the tuned channel).
-    SetServiceFilter {
-        single_service: bool,
-    },
+    SetServiceFilter { single_service: bool },
 }
 
 /// Messages sent from server to client.
@@ -626,9 +640,7 @@ impl ChannelSelector {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChannelListMessage {
     /// Client to Server: Request channel list.
-    Request {
-        filter: Option<ChannelFilter>,
-    },
+    Request { filter: Option<ChannelFilter> },
 
     /// Server to Client: Full channel list response.
     Response {
@@ -718,11 +730,7 @@ pub struct ClientChannelInfo {
 
 impl ClientChannelInfo {
     /// Create from ChannelInfo with additional display fields.
-    pub fn from_channel_info(
-        info: &ChannelInfo,
-        space_name: String,
-        priority: i32,
-    ) -> Self {
+    pub fn from_channel_info(info: &ChannelInfo, space_name: String, priority: i32) -> Self {
         Self {
             nid: info.nid,
             sid: info.sid,

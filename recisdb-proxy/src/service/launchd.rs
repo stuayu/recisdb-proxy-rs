@@ -117,7 +117,9 @@ pub fn uninstall(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     // bootout がダメなら legacy unload -w。どちらも「未登録なら失敗して当然」
     // なのでベストエフォート。
     if !run_ok(Command::new("launchctl").args(["bootout", &format!("{domain}/{label}")])) {
-        let _ = Command::new("launchctl").args(["unload", "-w", &path_str]).output();
+        let _ = Command::new("launchctl")
+            .args(["unload", "-w", &path_str])
+            .output();
     }
 
     if path.exists() {
@@ -154,7 +156,8 @@ pub fn status(name: &str, scope: ServiceScope) -> ServiceStatus {
     let domain = domain_target(scope);
     let label = unit_text::launchd_label(name);
 
-    let output = run_capture_stdout(Command::new("launchctl").args(["print", &format!("{domain}/{label}")]));
+    let output =
+        run_capture_stdout(Command::new("launchctl").args(["print", &format!("{domain}/{label}")]));
     // `launchctl print` の出力に "state = running" のような行が含まれる。
     // 厳密なパーサーではなく、判断に十分な部分文字列マッチに留める。
     let running = output

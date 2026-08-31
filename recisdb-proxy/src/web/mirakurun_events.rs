@@ -203,47 +203,55 @@ fn event_body_stream(
     // The filter rides along in the `unfold` state rather than being
     // captured by the closure: the closure is called once per chunk, so an
     // `async move` body cannot own it.
-    stream::unfold((StreamState::Preamble(rx), filter), |(state, filter)| async move {
-        match state {
-            StreamState::Preamble(rx) => {
-                // Sent as its own chunk (module doc comment, point 3) — the
-                // next `unfold` call moves straight to `Streaming` so this
-                // branch runs exactly once per connection.
-                Some((Ok(Bytes::from_static(PREAMBLE)), (StreamState::Streaming(rx), filter)))
-            }
-            StreamState::Streaming(mut rx) => loop {
-                match rx.recv().await {
-                    Ok(record) => {
-                        let Some(chunk) = encode_event(&record, &filter) else { continue };
-                        return Some((Ok(chunk), (StreamState::Streaming(rx), filter)));
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // CLAUDE.md: `RecvError::Lagged` must be handled
-                        // explicitly, never silently ignored. Missing a few
-                        // program updates is harmless here — EPGStation
-                        // falls back to its periodic full `GET /programs`
-                        // poll regardless, so it will pick up whatever this
-                        // subscriber missed. Closing the stream over a lag
-                        // would be strictly worse: EPGStation treats a
-                        // closed connection as an error and throws
-                        // (module doc comment), so the correct response to
-                        // "we fell behind" is to log and keep going, not to
-                        // end the stream.
-                        warn!("[mirakurun events] receiver lagged, skipped {} event(s)", n);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Only happens if every `Sender` (the one
-                        // `EpgWriter` holds, shared via `WebState`) is
-                        // dropped — i.e. process shutdown. Ending the body
-                        // here is fine at that point; there is nothing left
-                        // to send it.
-                        return None;
-                    }
+    stream::unfold(
+        (StreamState::Preamble(rx), filter),
+        |(state, filter)| async move {
+            match state {
+                StreamState::Preamble(rx) => {
+                    // Sent as its own chunk (module doc comment, point 3) — the
+                    // next `unfold` call moves straight to `Streaming` so this
+                    // branch runs exactly once per connection.
+                    Some((
+                        Ok(Bytes::from_static(PREAMBLE)),
+                        (StreamState::Streaming(rx), filter),
+                    ))
                 }
-            },
-        }
-    })
+                StreamState::Streaming(mut rx) => loop {
+                    match rx.recv().await {
+                        Ok(record) => {
+                            let Some(chunk) = encode_event(&record, &filter) else {
+                                continue;
+                            };
+                            return Some((Ok(chunk), (StreamState::Streaming(rx), filter)));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // CLAUDE.md: `RecvError::Lagged` must be handled
+                            // explicitly, never silently ignored. Missing a few
+                            // program updates is harmless here — EPGStation
+                            // falls back to its periodic full `GET /programs`
+                            // poll regardless, so it will pick up whatever this
+                            // subscriber missed. Closing the stream over a lag
+                            // would be strictly worse: EPGStation treats a
+                            // closed connection as an error and throws
+                            // (module doc comment), so the correct response to
+                            // "we fell behind" is to log and keep going, not to
+                            // end the stream.
+                            warn!("[mirakurun events] receiver lagged, skipped {} event(s)", n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Only happens if every `Sender` (the one
+                            // `EpgWriter` holds, shared via `WebState`) is
+                            // dropped — i.e. process shutdown. Ending the body
+                            // here is fine at that point; there is nothing left
+                            // to send it.
+                            return None;
+                        }
+                    }
+                },
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -283,19 +291,24 @@ mod tests {
     #[test]
     fn event_chunk_ends_with_the_client_sentinel_and_reparses_via_the_client_algorithm() {
         let record = sample_upsert(Some("Test Program"));
-        let chunk = encode_event(&record, &EventsQuery::default()).expect("named record must encode");
+        let chunk =
+            encode_event(&record, &EventsQuery::default()).expect("named record must encode");
         let text = std::str::from_utf8(&chunk).unwrap();
 
         // Point 2 of the module doc comment: client recognizes completion by
         // the chunk/buffer ending in this exact 4-byte sequence.
-        assert!(text.ends_with("}\n,\n"), "chunk must end with '}}\\n,\\n', got: {:?}", text);
+        assert!(
+            text.ends_with("}\n,\n"),
+            "chunk must end with '}}\\n,\\n', got: {:?}",
+            text
+        );
 
         // Reproduce `tmp.slice(0, -3)` (drop the trailing 3 chars: \n , \n),
         // then the client's `"[" + ... + "]"` wrap, then JSON.parse.
         let sliced = &text[..text.len() - 3];
         let wrapped = format!("[{}]", sliced);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&wrapped).expect("client's slice(0,-3)+[]-wrap reconstruction must be valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&wrapped)
+            .expect("client's slice(0,-3)+[]-wrap reconstruction must be valid JSON");
 
         let arr = parsed.as_array().expect("must parse to a JSON array");
         assert_eq!(arr.len(), 1);
@@ -310,7 +323,8 @@ mod tests {
     }
 
     #[test]
-    fn full_two_chunk_connection_opening_reparses_correctly_when_concatenated_and_split_at_the_client_sentinel() {
+    fn full_two_chunk_connection_opening_reparses_correctly_when_concatenated_and_split_at_the_client_sentinel(
+    ) {
         // Simulates the client's actual receive loop: PREAMBLE arrives and
         // is recognized/discarded as its own chunk (never touching `tmp`),
         // then the event chunk arrives, gets appended to (empty) `tmp`, and
@@ -392,8 +406,14 @@ mod tests {
 
         // Exactly one trailing raw newline as part of the "\n,\n" sentinel
         // is expected; strip it and confirm nothing else remains.
-        let json_part = text.strip_suffix("\n,\n").expect("must end with the sentinel");
-        assert!(!json_part.contains('\n'), "JSON body must not contain a raw newline: {:?}", json_part);
+        let json_part = text
+            .strip_suffix("\n,\n")
+            .expect("must end with the sentinel");
+        assert!(
+            !json_part.contains('\n'),
+            "JSON body must not contain a raw newline: {:?}",
+            json_part
+        );
 
         // And it must still parse back with the escaped newline intact.
         let value: serde_json::Value = serde_json::from_str(json_part).unwrap();

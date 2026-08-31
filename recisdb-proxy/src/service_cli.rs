@@ -123,7 +123,11 @@ fn explain(err: &ServiceError, scope: ServiceScope) -> String {
             } else {
                 "`sudo` を付けて実行するか、`--user` でユーザー単位のサービスとして登録してください。"
             };
-            format!("権限が不足しています ({}スコープ)。{}", scope_label(scope), hint)
+            format!(
+                "権限が不足しています ({}スコープ)。{}",
+                scope_label(scope),
+                hint
+            )
         }
         ServiceError::NotSupported => {
             if cfg!(windows) && scope == ServiceScope::User {
@@ -141,9 +145,26 @@ fn print_status(status: &ServiceStatus) {
     println!("サービス名 : {}", status.name);
     println!("スコープ   : {}", scope_label(status.scope));
     println!("管理方式   : {}", status.manager);
-    println!("登録済み   : {}", if status.installed { "はい" } else { "いいえ" });
-    println!("稼働中     : {}", if status.running { "はい" } else { "いいえ" });
-    println!("自動起動   : {}", if status.enabled { "有効" } else { "無効" });
+    println!(
+        "登録済み   : {}",
+        if status.installed {
+            "はい"
+        } else {
+            "いいえ"
+        }
+    );
+    println!(
+        "稼働中     : {}",
+        if status.running {
+            "はい"
+        } else {
+            "いいえ"
+        }
+    );
+    println!(
+        "自動起動   : {}",
+        if status.enabled { "有効" } else { "無効" }
+    );
     if let Some(detail) = &status.detail {
         println!("詳細       : {}", detail);
     }
@@ -166,7 +187,14 @@ pub fn run(action: &ServiceAction, global_config: Option<&Path>) -> i32 {
             config,
             working_dir,
             extra_args,
-        } => install(name, *user, config.as_deref(), working_dir.as_deref(), extra_args, global_config),
+        } => install(
+            name,
+            *user,
+            config.as_deref(),
+            working_dir.as_deref(),
+            extra_args,
+            global_config,
+        ),
         ServiceAction::Uninstall { name, user } => {
             simple(name, *user, "登録を削除", service::uninstall)
         }
@@ -197,7 +225,12 @@ fn simple(
             0
         }
         Err(e) => {
-            eprintln!("サービス `{}` の{}に失敗しました: {}", name, verb, explain(&e, scope));
+            eprintln!(
+                "サービス `{}` の{}に失敗しました: {}",
+                name,
+                verb,
+                explain(&e, scope)
+            );
             1
         }
     }
@@ -247,13 +280,10 @@ fn install(
 
     // 設定ファイル: 明示指定 > グローバル `-f` > 作業ディレクトリ内の既定名。
     // どれも無ければ引数を付けない (サーバ側の CWD 自動検出に任せる)。
-    let config_path = action_config
-        .or(global_config)
-        .map(absolutize)
-        .or_else(|| {
-            let candidate = working_dir.join("recisdb-proxy.toml");
-            candidate.exists().then_some(candidate)
-        });
+    let config_path = action_config.or(global_config).map(absolutize).or_else(|| {
+        let candidate = working_dir.join("recisdb-proxy.toml");
+        candidate.exists().then_some(candidate)
+    });
 
     let mut args: Vec<String> = Vec::new();
     if let Some(config_path) = &config_path {
@@ -277,9 +307,11 @@ fn install(
     match service::install(&spec) {
         Ok(()) => {
             println!("サービス `{}` を登録し、開始しました。", spec.name);
-            println!("状態は `recisdb-proxy service status --name {}{}` で確認できます。",
+            println!(
+                "状態は `recisdb-proxy service status --name {}{}` で確認できます。",
                 spec.name,
-                if user { " --user" } else { "" });
+                if user { " --user" } else { "" }
+            );
             0
         }
         Err(e) => {

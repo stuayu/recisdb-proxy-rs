@@ -27,7 +27,10 @@ fn ensure_preview_ready_sets_everything_up() {
     let report =
         recisdb_proxy::preview_setup::ensure_preview_ready(&db, &tmp, Some(&config_path)).unwrap();
 
-    println!("encoder      : {} ({})", report.encoder_path, report.encoder_source);
+    println!(
+        "encoder      : {} ({})",
+        report.encoder_path, report.encoder_source
+    );
     println!("video encoder: {}", report.video_encoder);
     println!("preprocessor : {}", report.preprocessor_path);
     for w in &report.warnings {
@@ -35,7 +38,10 @@ fn ensure_preview_ready_sets_everything_up() {
     }
 
     assert!(report.enabled);
-    assert!(PathBuf::from(&report.encoder_path).exists(), "エンコーダの実体が無い");
+    assert!(
+        PathBuf::from(&report.encoder_path).exists(),
+        "エンコーダの実体が無い"
+    );
 
     // DB に書かれ、かつ有効になっていること。
     let (enabled, command_path, preprocessor_path, _args, _timeout) =
@@ -50,12 +56,21 @@ fn ensure_preview_ready_sets_everything_up() {
         .unwrap()
         .expect("preview プロファイルが無い");
     let args = profile.extra_args.unwrap_or_default();
-    assert!(args.contains("-f mpegts -i pipe:0"), "ffmpeg 用の引数になっていない: {args}");
-    assert!(args.contains(&report.video_encoder), "選ばれたエンコーダが引数に入っていない");
+    assert!(
+        args.contains("-f mpegts -i pipe:0"),
+        "ffmpeg 用の引数になっていない: {args}"
+    );
+    assert!(
+        args.contains(&report.video_encoder),
+        "選ばれたエンコーダが引数に入っていない"
+    );
 
     // TOML にも書き戻されていること。ここが抜けると起動時に DB が上書きされる。
     let toml = std::fs::read_to_string(&config_path).unwrap();
-    assert!(toml.contains(&report.encoder_path), "TOML にエンコーダのパスが無い:\n{toml}");
+    assert!(
+        toml.contains(&report.encoder_path),
+        "TOML にエンコーダのパスが無い:\n{toml}"
+    );
 
     std::fs::remove_dir_all(&tmp).ok();
 }

@@ -125,15 +125,24 @@ pub fn score_path(
         || path.health.state == PathState::Disabled
         || path.health.state == PathState::Unreachable
     {
-        return PathScore { admissible: false, score: f64::NEG_INFINITY };
+        return PathScore {
+            admissible: false,
+            score: f64::NEG_INFINITY,
+        };
     }
     if stream_class == StreamClass::Record && !path.endpoint.record_allowed {
-        return PathScore { admissible: false, score: f64::NEG_INFINITY };
+        return PathScore {
+            admissible: false,
+            score: f64::NEG_INFINITY,
+        };
     }
 
     let required = policy.required_bitrate(stream_class, bitrate_bps);
     if bitrate_bps > 0 && path.health.throughput_down_p10_bps < required {
-        return PathScore { admissible: false, score: f64::NEG_INFINITY };
+        return PathScore {
+            admissible: false,
+            score: f64::NEG_INFINITY,
+        };
     }
 
     let throughput_ratio = if required == 0 {
@@ -179,9 +188,17 @@ pub fn score_path(
     // DERP is intentionally a strong RECORD penalty. It remains admissible
     // when bandwidth is sufficient so it can be a last-resort path.
     if path.health.tailscale_path == Some(TailscalePathKind::Derp) {
-        score -= if stream_class == StreamClass::Record { 45.0 } else { 18.0 };
+        score -= if stream_class == StreamClass::Record {
+            45.0
+        } else {
+            18.0
+        };
     } else if path.health.tailscale_path == Some(TailscalePathKind::PeerRelay) {
-        score -= if stream_class == StreamClass::Record { 12.0 } else { 5.0 };
+        score -= if stream_class == StreamClass::Record {
+            12.0
+        } else {
+            5.0
+        };
     }
 
     if path.health.state == PathState::Degraded {
@@ -191,7 +208,10 @@ pub fn score_path(
         score -= 8.0;
     }
 
-    PathScore { admissible: true, score }
+    PathScore {
+        admissible: true,
+        score,
+    }
 }
 
 pub fn select_best_path<'a>(
@@ -207,8 +227,7 @@ pub fn select_best_path<'a>(
             score.admissible.then_some((path, score.score))
         })
         .max_by(|(a_path, a), (b_path, b)| {
-            a.total_cmp(b)
-                .then_with(|| b_path.id.cmp(&a_path.id)) // stable deterministic tie-break
+            a.total_cmp(b).then_with(|| b_path.id.cmp(&a_path.id)) // stable deterministic tie-break
         })
         .map(|(path, _)| path)
 }
@@ -256,7 +275,13 @@ mod tests {
         let low_rtt_unstable = path("a", EndpointKind::InternetDirect, 100, 8.0, 0.20);
         let stable = path("b", EndpointKind::CloudflarePrivate, 100, 35.0, 0.0);
         let candidates = vec![low_rtt_unstable, stable];
-        let best = select_best_path(&candidates, StreamClass::Record, 20_000_000, PathPolicy::default()).unwrap();
+        let best = select_best_path(
+            &candidates,
+            StreamClass::Record,
+            20_000_000,
+            PathPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(best.id, "b");
     }
 
@@ -270,7 +295,10 @@ mod tests {
         for class in [StreamClass::View, StreamClass::Preview, StreamClass::Record] {
             let best =
                 select_best_path(&candidates, class, 20_000_000, PathPolicy::default()).unwrap();
-            assert_eq!(best.id, "near", "{class:?} must take the nearer of two equal paths");
+            assert_eq!(
+                best.id, "near",
+                "{class:?} must take the nearer of two equal paths"
+            );
         }
     }
 
@@ -279,7 +307,13 @@ mod tests {
         let fast = path("fast", EndpointKind::InternetDirect, 100, 8.0, 0.0);
         let slower = path("slower", EndpointKind::CloudflarePrivate, 300, 80.0, 0.0);
         let candidates = vec![slower, fast];
-        let best = select_best_path(&candidates, StreamClass::View, 20_000_000, PathPolicy::default()).unwrap();
+        let best = select_best_path(
+            &candidates,
+            StreamClass::View,
+            20_000_000,
+            PathPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(best.id, "fast");
     }
 }

@@ -15,11 +15,12 @@
 /// のまま(このモジュールとは独立)。
 pub const VERSION: &str = env!("RECISDB_PROXY_VERSION");
 
+pub mod alert;
+pub mod aribb24;
 pub mod bondriver;
 pub mod database;
-pub mod logging;
-pub mod alert;
 pub mod epg_writer;
+pub mod logging;
 pub mod nit_writer;
 pub mod node;
 pub mod preview_setup;
@@ -30,7 +31,6 @@ pub mod service;
 pub mod setup_helpers;
 pub mod ts_analyzer;
 pub mod tuner;
-pub mod aribb24;
 pub mod web;
 
 /// 選択された PC/SC カードリーダー名を libaribb25 に反映する。
@@ -47,6 +47,9 @@ pub fn apply_card_reader_selection(name: &str) {
     } else {
         // 1024文字以上か内部にNULがある場合のみ。DBに入る経路では起きないが、
         // 黙って「自動」に落ちると原因が追えなくなるので必ず残す。
-        log::warn!("libaribb25 rejected the card reader name {:?}; falling back to probing every reader", name);
+        log::warn!(
+            "libaribb25 rejected the card reader name {:?}; falling back to probing every reader",
+            name
+        );
     }
 }

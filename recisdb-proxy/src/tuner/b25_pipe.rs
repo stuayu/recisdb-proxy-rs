@@ -50,7 +50,7 @@ impl B25Pipe {
             stash: Vec::with_capacity(TS_PACKET_SIZE * 32),
             // Output buffer for decoder drain. Larger buffer to handle bursts.
             // B25 decoder can output more than 262KB in one session, so use 1MB.
-            tmp: vec![0u8; 1024 * 1024],  // 1MB buffer
+            tmp: vec![0u8; 1024 * 1024], // 1MB buffer
         })
     }
 
@@ -118,8 +118,8 @@ impl B25Pipe {
         // Guard against pathological decoder behavior.
         let mut loops = 0usize;
         const MAX_DRAIN_LOOPS: usize = 256;
-        const MAX_SINGLE_READ: usize = 1024 * 1024;  // 1MB max per read (matches tmp buffer)
-        
+        const MAX_SINGLE_READ: usize = 1024 * 1024; // 1MB max per read (matches tmp buffer)
+
         loop {
             loops += 1;
             if loops > MAX_DRAIN_LOOPS {
@@ -169,8 +169,8 @@ impl B25Pipe {
     pub fn drain_all(&mut self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut loops = 0usize;
-        const MAX_DRAIN_LOOPS: usize = 512;  // Allow more loops for complete drain
-        
+        const MAX_DRAIN_LOOPS: usize = 512; // Allow more loops for complete drain
+
         loop {
             loops += 1;
             if loops > MAX_DRAIN_LOOPS {
@@ -189,8 +189,12 @@ impl B25Pipe {
                     if n > self.tmp.len() {
                         // Decoder is reporting more data than buffer - cap it
                         let capped = std::cmp::min(n, self.tmp.len());
-                        warn!("[B25Pipe] drain_all: decoder reported {} but buffer is {}, using {}", 
-                              n, self.tmp.len(), capped);
+                        warn!(
+                            "[B25Pipe] drain_all: decoder reported {} but buffer is {}, using {}",
+                            n,
+                            self.tmp.len(),
+                            capped
+                        );
                         out.extend_from_slice(&self.tmp[..capped]);
                     } else {
                         out.extend_from_slice(&self.tmp[..n]);

@@ -8,7 +8,8 @@ use futures_util::io::{AsyncBufRead, AsyncRead};
 use crate::channels::Channel;
 use crate::tuner::{Tunable, Voltage};
 
-const UNSUPPORTED_MSG: &str = "Tuner device access is not supported on this platform (supported: Linux/Windows)";
+const UNSUPPORTED_MSG: &str =
+    "Tuner device access is not supported on this platform (supported: Linux/Windows)";
 
 pub struct UnTunedTuner;
 
@@ -55,6 +56,5 @@ impl AsyncBufRead for Tuner {
         Poll::Ready(Ok(&[]))
     }
 
-    fn consume(self: Pin<&mut Self>, _amt: usize) {
-    }
+    fn consume(self: Pin<&mut Self>, _amt: usize) {}
 }

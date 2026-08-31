@@ -3,11 +3,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use log::{error, info, warn};
-use tokio::io::{AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use bytes::Bytes;
 
 use crate::database::Database;
 use crate::server::session::Session;
@@ -69,10 +69,7 @@ impl Server {
         let max_tuners = config.max_tuners.max(1);
         Self {
             config,
-            tuner_pool: Arc::new(TunerPool::new_with_config(
-                max_tuners,
-                tuner_config,
-            )),
+            tuner_pool: Arc::new(TunerPool::new_with_config(max_tuners, tuner_config)),
             // Shared tsreplace encoder pool (STREAMING_DESIGN.md §5 P4).
             // The concurrency cap is re-synced from tsreplace_config each time
             // a session starts an encoder, so the initial value here only
@@ -105,7 +102,18 @@ impl Server {
                     let session_registry = Arc::clone(&self.session_registry);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(socket, addr, session_id, pool, encoder_pool, database, default_tuner, session_registry).await {
+                        if let Err(e) = handle_connection(
+                            socket,
+                            addr,
+                            session_id,
+                            pool,
+                            encoder_pool,
+                            database,
+                            default_tuner,
+                            session_registry,
+                        )
+                        .await
+                        {
                             // Client-initiated socket teardown (TVTest exit,
                             // EDCB reconnect cycle, …) surfaces here as
                             // BrokenPipe/ConnectionReset/ConnectionAborted —
@@ -180,14 +188,17 @@ async fn handle_connection(
     // Control  :  bounded but generous, uses send().await (low volume).
     let (ts_write_queue, ts_write_rx, ts_queue_shared) =
         TsWriteQueue::new(crate::server::ts_queue::DEFAULT_BUDGET_BYTES);
-    let (ctrl_write_tx, ctrl_write_rx) = mpsc::channel::<Bytes>(
-        Session::CTRL_WRITE_BUFFER_CAPACITY,
-    );
+    let (ctrl_write_tx, ctrl_write_rx) =
+        mpsc::channel::<Bytes>(Session::CTRL_WRITE_BUFFER_CAPACITY);
 
     // Spawn the writer task – it owns the write-half of the socket.
-    let writer_handle = tokio::spawn(
-        session_writer(session_id, writer, ts_write_rx, ctrl_write_rx, ts_queue_shared),
-    );
+    let writer_handle = tokio::spawn(session_writer(
+        session_id,
+        writer,
+        ts_write_rx,
+        ctrl_write_rx,
+        ts_queue_shared,
+    ));
 
     // Register the session
     let shutdown_rx = session_registry
@@ -248,7 +259,10 @@ fn configure_keepalive(socket: &TcpStream, session_id: u64) {
     let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
 
     if let Err(e) = socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive) {
-        warn!("[Session {}] Failed to enable TCP keepalive: {}", session_id, e);
+        warn!(
+            "[Session {}] Failed to enable TCP keepalive: {}",
+            session_id, e
+        );
     }
 }
 

@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use log::{error, info, warn};
 
 use crate::context::{BroadcastType, OutputFormat};
-use crate::database::{
-    BonDriverRecord, ChannelRecord, Database, DatabaseError, NewBonDriver,
-};
+use crate::database::{BonDriverRecord, ChannelRecord, Database, DatabaseError, NewBonDriver};
 use crate::tuner::Voltage;
 
 use recisdb_protocol::broadcast_region::{classify_nid, BroadcastRegion};
@@ -43,7 +41,9 @@ fn default_database_path() -> PathBuf {
 
 /// Open database with optional path.
 fn open_database(path: Option<String>) -> Result<Database, DatabaseError> {
-    let db_path = path.map(PathBuf::from).unwrap_or_else(default_database_path);
+    let db_path = path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_database_path);
 
     // Create parent directory if needed
     if let Some(parent) = db_path.parent() {
@@ -390,11 +390,7 @@ pub fn cmd_query(
 }
 
 /// Driver add command.
-pub fn cmd_driver_add(
-    path: String,
-    name: Option<String>,
-    database_path: Option<String>,
-) -> i32 {
+pub fn cmd_driver_add(path: String, name: Option<String>, database_path: Option<String>) -> i32 {
     let mut db = match open_database(database_path) {
         Ok(db) => db,
         Err(e) => {
@@ -526,8 +522,18 @@ fn print_channels_table(channels: &[ChannelRecord]) {
             format!("0x{:04X}", ch.tsid),
             format!("0x{:04X}", ch.sid),
             ch.physical_ch.map(|c| c.to_string()).unwrap_or_default(),
-            ch.channel_name.as_deref().unwrap_or("-").chars().take(20).collect::<String>(),
-            ch.network_name.as_deref().unwrap_or("-").chars().take(12).collect::<String>(),
+            ch.channel_name
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(20)
+                .collect::<String>(),
+            ch.network_name
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(12)
+                .collect::<String>(),
             if ch.is_enabled { "Yes" } else { "No" }
         );
     }
@@ -545,9 +551,17 @@ fn print_channels_json(channels: &[ChannelRecord]) {
             ch.nid,
             ch.tsid,
             ch.sid,
-            ch.physical_ch.map(|c| c.to_string()).unwrap_or("null".to_string()),
-            ch.channel_name.as_ref().map(|s| format!("\"{}\"", s.replace('"', "\\\""))).unwrap_or("null".to_string()),
-            ch.network_name.as_ref().map(|s| format!("\"{}\"", s.replace('"', "\\\""))).unwrap_or("null".to_string()),
+            ch.physical_ch
+                .map(|c| c.to_string())
+                .unwrap_or("null".to_string()),
+            ch.channel_name
+                .as_ref()
+                .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+                .unwrap_or("null".to_string()),
+            ch.network_name
+                .as_ref()
+                .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+                .unwrap_or("null".to_string()),
             ch.is_enabled,
             comma
         );
@@ -578,7 +592,9 @@ fn print_channel_detail(ch: &ChannelRecord) {
     println!("  SID:              0x{:04X} ({})", ch.sid, ch.sid);
     println!(
         "  Physical Ch:      {}",
-        ch.physical_ch.map(|c| c.to_string()).unwrap_or("-".to_string())
+        ch.physical_ch
+            .map(|c| c.to_string())
+            .unwrap_or("-".to_string())
     );
     println!(
         "  Name:             {}",
@@ -594,13 +610,20 @@ fn print_channel_detail(ch: &ChannelRecord) {
     );
     println!(
         "  Service Type:     {}",
-        ch.service_type.map(|t| format!("0x{:02X}", t)).unwrap_or("-".to_string())
+        ch.service_type
+            .map(|t| format!("0x{:02X}", t))
+            .unwrap_or("-".to_string())
     );
     println!(
         "  Remote Key:       {}",
-        ch.remote_control_key.map(|k| k.to_string()).unwrap_or("-".to_string())
+        ch.remote_control_key
+            .map(|k| k.to_string())
+            .unwrap_or("-".to_string())
     );
-    println!("  Enabled:          {}", if ch.is_enabled { "Yes" } else { "No" });
+    println!(
+        "  Enabled:          {}",
+        if ch.is_enabled { "Yes" } else { "No" }
+    );
     println!("  Failure Count:    {}", ch.failure_count);
 
     // Broadcast region
@@ -614,10 +637,7 @@ fn print_drivers_table(drivers: &[BonDriverRecord]) {
         return;
     }
 
-    println!(
-        "{:<4} {:<40} {:<20} {}",
-        "ID", "Path", "Name", "Auto Scan"
-    );
+    println!("{:<4} {:<40} {:<20} {}", "ID", "Path", "Name", "Auto Scan");
     println!("{}", "-".repeat(70));
 
     for d in drivers {
@@ -625,7 +645,12 @@ fn print_drivers_table(drivers: &[BonDriverRecord]) {
             "{:<4} {:<40} {:<20} {}",
             d.id,
             d.dll_path.chars().take(40).collect::<String>(),
-            d.driver_name.as_deref().unwrap_or("-").chars().take(20).collect::<String>(),
+            d.driver_name
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(20)
+                .collect::<String>(),
             if d.auto_scan_enabled { "Yes" } else { "No" }
         );
     }
@@ -639,7 +664,10 @@ fn print_drivers_json(drivers: &[BonDriverRecord]) {
             r#"  {{"id": {}, "path": "{}", "name": {}, "auto_scan": {}}}{}"#,
             d.id,
             d.dll_path.replace('"', "\\\""),
-            d.driver_name.as_ref().map(|s| format!("\"{}\"", s.replace('"', "\\\""))).unwrap_or("null".to_string()),
+            d.driver_name
+                .as_ref()
+                .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+                .unwrap_or("null".to_string()),
             d.auto_scan_enabled,
             comma
         );

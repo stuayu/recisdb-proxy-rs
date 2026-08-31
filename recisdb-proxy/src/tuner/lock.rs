@@ -7,8 +7,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::tuner::ChannelKey;
 
@@ -106,7 +106,10 @@ impl TunerLock {
     ///
     /// Only succeeds if the tuner is already tuned to the same channel.
     /// Multiple clients can hold shared locks simultaneously.
-    pub async fn acquire_shared(&self, channel: &ChannelKey) -> Result<SharedLockGuard<'_>, LockError> {
+    pub async fn acquire_shared(
+        &self,
+        channel: &ChannelKey,
+    ) -> Result<SharedLockGuard<'_>, LockError> {
         // Check current channel
         {
             let current = self.current_channel.read().await;
@@ -142,9 +145,15 @@ impl TunerLock {
     }
 
     /// Try to acquire a shared lock without waiting.
-    pub fn try_acquire_shared(&self, channel: &ChannelKey) -> Result<SharedLockGuard<'_>, LockError> {
+    pub fn try_acquire_shared(
+        &self,
+        channel: &ChannelKey,
+    ) -> Result<SharedLockGuard<'_>, LockError> {
         // Check current channel (blocking read is OK for try_acquire)
-        let current = self.current_channel.try_read().map_err(|_| LockError::AcquireFailed)?;
+        let current = self
+            .current_channel
+            .try_read()
+            .map_err(|_| LockError::AcquireFailed)?;
         match &*current {
             Some(current_ch) if current_ch == channel => {}
             Some(_) => return Err(LockError::ChannelMismatch),
@@ -210,7 +219,9 @@ impl TunerLock {
         drop(permits);
 
         // Acquire one permit for shared lock (semaphore now has max_permits available)
-        let permit = semaphore.try_acquire_owned().expect("Should have permits available after downgrade");
+        let permit = semaphore
+            .try_acquire_owned()
+            .expect("Should have permits available after downgrade");
 
         lock_ref.shared_count.fetch_add(1, Ordering::SeqCst);
 

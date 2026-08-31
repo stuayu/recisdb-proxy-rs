@@ -140,8 +140,18 @@ pub fn launchd_plist_body(spec: &ServiceSpec) -> String {
     }
 
     let working_dir = spec.working_dir.display().to_string();
-    let out_path = spec.working_dir.join("logs").join("service.out").display().to_string();
-    let err_path = spec.working_dir.join("logs").join("service.err").display().to_string();
+    let out_path = spec
+        .working_dir
+        .join("logs")
+        .join("service.out")
+        .display()
+        .to_string();
+    let err_path = spec
+        .working_dir
+        .join("logs")
+        .join("service.err")
+        .display()
+        .to_string();
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

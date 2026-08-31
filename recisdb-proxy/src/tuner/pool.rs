@@ -204,7 +204,9 @@ impl CarriedSlotPermit for Option<SlotPermit> {
 
 impl std::fmt::Debug for SlotPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlotPermit").field("dll_path", &self.dll_path).finish()
+        f.debug_struct("SlotPermit")
+            .field("dll_path", &self.dll_path)
+            .finish()
     }
 }
 
@@ -475,7 +477,8 @@ impl TunerPool {
     pub async fn acquire_dll_init_lock(&self, dll_path: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let mutex = {
             let mut locks = self.dll_init_locks.lock().await;
-            locks.entry(dll_path.to_string())
+            locks
+                .entry(dll_path.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
@@ -569,7 +572,10 @@ impl TunerPool {
 
     /// Is this driver currently being scanned?
     pub fn is_scanning(&self, dll_path: &str) -> bool {
-        self.scanning.lock().map(|m| m.contains_key(dll_path)).unwrap_or(false)
+        self.scanning
+            .lock()
+            .map(|m| m.contains_key(dll_path))
+            .unwrap_or(false)
     }
 
     /// Cancel an idle-close timer if it exists.
@@ -609,7 +615,10 @@ impl TunerPool {
 
         self.cancel_idle_close(&key).await;
 
-        info!("Scheduling keep-alive close in {}s for {:?}", keep_alive_secs, key);
+        info!(
+            "Scheduling keep-alive close in {}s for {:?}",
+            keep_alive_secs, key
+        );
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         {
@@ -753,7 +762,10 @@ impl TunerPool {
         if let Some(tuner) = tuners.get(&key) {
             // Same stale check under write lock
             if tuner.is_reclaimable() {
-                warn!("get_or_create: evicting stale tuner for {:?} (under write lock)", key);
+                warn!(
+                    "get_or_create: evicting stale tuner for {:?} (under write lock)",
+                    key
+                );
                 self.cancel_idle_close(&key).await;
                 tuners.remove(&key);
             } else {
@@ -997,7 +1009,11 @@ mod tests {
         // because nothing has subscribed to it yet.
         assert_eq!(tuner.state(), ReaderState::Reserved);
         pool.cleanup().await;
-        assert_eq!(pool.count().await, 1, "a Starting entry must survive cleanup() even with 0 subscribers");
+        assert_eq!(
+            pool.count().await,
+            1,
+            "a Starting entry must survive cleanup() even with 0 subscribers"
+        );
 
         // Once the (fake) reader actually stops, the entry becomes
         // reclaimable and cleanup() removes it.
@@ -1024,10 +1040,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(tuner.state(), ReaderState::Reserved);
-        assert!(tuner.occupies_slot(), "Reserved must count against driver capacity");
-        assert!(tuner.needs_reader_start(), "nobody has started a reader yet");
-        assert!(!tuner.is_reclaimable(), "another task must not sweep it away (M8)");
-        assert!(tuner.is_orphanable(), "but its own creator may hand it back");
+        assert!(
+            tuner.occupies_slot(),
+            "Reserved must count against driver capacity"
+        );
+        assert!(
+            tuner.needs_reader_start(),
+            "nobody has started a reader yet"
+        );
+        assert!(
+            !tuner.is_reclaimable(),
+            "another task must not sweep it away (M8)"
+        );
+        assert!(
+            tuner.is_orphanable(),
+            "but its own creator may hand it back"
+        );
 
         pool.remove(&key).await;
         assert_eq!(pool.count().await, 0);
@@ -1047,14 +1075,19 @@ mod tests {
             .unwrap();
 
         let source = FakeTsSource::new().with_startup_delay(std::time::Duration::from_millis(200));
-        let _ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
+        let _ready_rx = tuner
+            .spawn_fake_reader(source, 0, 1, fast_startup_config())
+            .await;
         assert_eq!(tuner.state(), ReaderState::Starting);
         assert!(!tuner.needs_reader_start(), "a start is already in flight");
         assert!(!tuner.is_orphanable(), "an in-flight start owns this entry");
 
         tuner.stop_reader().await;
         assert_eq!(tuner.state(), ReaderState::Stopped);
-        assert!(tuner.needs_reader_start(), "a stopped entry may be started again");
+        assert!(
+            tuner.needs_reader_start(),
+            "a stopped entry may be started again"
+        );
     }
 
     /// M8 (SYSTEM_REVIEW_2026-07.md): a freshly created entry, still
@@ -1079,9 +1112,18 @@ mod tests {
         // dropped tuner_a (no subscribers, and `is_running()` was `false`
         // for a not-yet-started entry too) purely because it "looked" idle.
         let permit_b = test_permit(&pool, "/dev/test-b").await;
-        let result = pool.get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) }).await;
-        assert!(result.is_err(), "still at capacity: Reserved entry must count as occupying its slot");
-        assert_eq!(pool.count().await, 1, "tuner_a must not have been evicted while Reserved");
+        let result = pool
+            .get_or_create(key_b.clone(), 2, permit_b, || async { Ok(()) })
+            .await;
+        assert!(
+            result.is_err(),
+            "still at capacity: Reserved entry must count as occupying its slot"
+        );
+        assert_eq!(
+            pool.count().await,
+            1,
+            "tuner_a must not have been evicted while Reserved"
+        );
         assert!(pool.get(&key_a).await.is_some());
     }
 
@@ -1097,8 +1139,14 @@ mod tests {
         let pool = TunerPool::new(10);
         let path = "/dev/shrink-test";
 
-        let a = pool.acquire_slot(path, 2).await.expect("first of two slots");
-        let b = pool.acquire_slot(path, 2).await.expect("second of two slots");
+        let a = pool
+            .acquire_slot(path, 2)
+            .await
+            .expect("first of two slots");
+        let b = pool
+            .acquire_slot(path, 2)
+            .await
+            .expect("second of two slots");
 
         // Operator drops the driver to a single instance. Nothing is
         // available, so nothing can be taken back yet.
@@ -1146,7 +1194,6 @@ mod tests {
         drop(b);
     }
 
-
     /// §1: capacity is now *taken*, not counted. A second slot on a
     /// `max_instances = 1` driver is simply unavailable — no snapshot, no
     /// window between "looks free" and "reader actually opened".
@@ -1191,7 +1238,10 @@ mod tests {
         // ...but the existing entry is still reachable without one, which is
         // what every caller checks (`TunerPool::get`) before asking for a
         // permit at all.
-        let joined = pool.get(&key).await.expect("existing entry must be joinable");
+        let joined = pool
+            .get(&key)
+            .await
+            .expect("existing entry must be joinable");
         assert!(Arc::ptr_eq(&joined, &tuner));
     }
 
@@ -1210,12 +1260,20 @@ mod tests {
             .unwrap();
 
         // Hand the permit to the reader the same way the real start paths do.
-        let start_permit = tuner.take_slot_permit().expect("get_or_create stored the permit");
+        let start_permit = tuner
+            .take_slot_permit()
+            .expect("get_or_create stored the permit");
         tuner.set_slot_permit(start_permit);
 
-        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
-        let ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
-        assert!(ready_rx.await.unwrap().is_err(), "set_channel was configured to fail");
+        let source =
+            FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = tuner
+            .spawn_fake_reader(source, 0, 1, fast_startup_config())
+            .await;
+        assert!(
+            ready_rx.await.unwrap().is_err(),
+            "set_channel was configured to fail"
+        );
         assert_eq!(tuner.state(), ReaderState::Stopped);
 
         assert!(
@@ -1344,7 +1402,10 @@ mod tests {
         tuner.set_stop_reason(StopReason::Evicted);
         tuner.set_state(ReaderState::Stopping);
 
-        assert!(watch.has_changed().unwrap(), "the stop must be observable through the watch channel");
+        assert!(
+            watch.has_changed().unwrap(),
+            "the stop must be observable through the watch channel"
+        );
         assert_eq!(*watch.borrow_and_update(), ReaderState::Stopping);
         assert!(!tuner.is_running());
         assert_eq!(
@@ -1367,8 +1428,11 @@ mod tests {
             .await
             .unwrap();
 
-        let source = FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
-        let ready_rx = tuner.spawn_fake_reader(source, 0, 1, fast_startup_config()).await;
+        let source =
+            FakeTsSource::new().with_set_channel_error(std::io::ErrorKind::PermissionDenied);
+        let ready_rx = tuner
+            .spawn_fake_reader(source, 0, 1, fast_startup_config())
+            .await;
         assert!(ready_rx.await.unwrap().is_err());
 
         assert_eq!(tuner.state(), ReaderState::Stopped);
@@ -1390,7 +1454,10 @@ mod tests {
             pool.acquire_channel_lock(&b),
         )
         .await;
-        assert!(other.is_ok(), "a different channel must not wait on this one");
+        assert!(
+            other.is_ok(),
+            "a different channel must not wait on this one"
+        );
 
         // The same channel must wait.
         let same = tokio::time::timeout(
@@ -1398,13 +1465,19 @@ mod tests {
             pool.acquire_channel_lock(&a),
         )
         .await;
-        assert!(same.is_err(), "the same channel must serialise behind the holder");
+        assert!(
+            same.is_err(),
+            "the same channel must serialise behind the holder"
+        );
 
         drop(held);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire_channel_lock(&a))
-                .await
-                .is_ok(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                pool.acquire_channel_lock(&a)
+            )
+            .await
+            .is_ok(),
             "releasing must let the next requester through"
         );
     }
@@ -1429,7 +1502,10 @@ mod tests {
             pool.acquire_channel_lock(&reversed),
         )
         .await;
-        assert!(same.is_err(), "candidate order must not create a second lock");
+        assert!(
+            same.is_err(),
+            "candidate order must not create a second lock"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1445,7 +1521,10 @@ mod tests {
 
         assert!(!pool.is_scanning(path));
 
-        let reservation = pool.begin_scan(path, 1).await.expect("a free driver can be scanned");
+        let reservation = pool
+            .begin_scan(path, 1)
+            .await
+            .expect("a free driver can be scanned");
         assert!(pool.is_scanning(path), "a running scan must be visible");
         assert_eq!(pool.scanning_drivers().len(), 1);
         assert!(
@@ -1454,7 +1533,10 @@ mod tests {
         );
 
         drop(reservation);
-        assert!(!pool.is_scanning(path), "the marker must clear when the scan ends");
+        assert!(
+            !pool.is_scanning(path),
+            "the marker must clear when the scan ends"
+        );
         assert!(
             pool.acquire_slot(path, 1).await.is_some(),
             "the slot must come back when the scan ends"
@@ -1468,13 +1550,19 @@ mod tests {
         let pool = TunerPool::new(10);
         let path = "/dev/px4video0";
 
-        let _viewer = pool.acquire_slot(path, 1).await.expect("viewer takes the slot");
+        let _viewer = pool
+            .acquire_slot(path, 1)
+            .await
+            .expect("viewer takes the slot");
 
         assert!(
             pool.begin_scan(path, 1).await.is_none(),
             "a scan must not displace a viewer, nor exceed max_instances"
         );
-        assert!(!pool.is_scanning(path), "a scan that never started must not be reported");
+        assert!(
+            !pool.is_scanning(path),
+            "a scan that never started must not be reported"
+        );
     }
 
     /// A driver with room serves both at once.
@@ -1485,7 +1573,10 @@ mod tests {
 
         let _viewer = pool.acquire_slot(path, 2).await.expect("first slot");
         let scan = pool.begin_scan(path, 2).await;
-        assert!(scan.is_some(), "a second slot exists, so the scan may use it");
+        assert!(
+            scan.is_some(),
+            "a second slot exists, so the scan may use it"
+        );
         assert!(
             pool.acquire_slot(path, 2).await.is_none(),
             "both slots are now taken (one viewer, one scan)"

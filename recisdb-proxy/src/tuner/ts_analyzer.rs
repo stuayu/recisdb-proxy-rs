@@ -122,10 +122,8 @@ impl TsPacketAnalyzer {
 
             // discontinuity_indicator lives in the first adaptation-field byte
             // (packet[5]) when an adaptation field with nonzero length is present.
-            let discontinuity = has_adaptation
-                && packet.len() > 5
-                && packet[4] > 0
-                && (packet[5] & 0x80) != 0;
+            let discontinuity =
+                has_adaptation && packet.len() > 5 && packet[4] > 0 && (packet[5] & 0x80) != 0;
 
             let track = match self.pid_tracks.get_mut(&pid) {
                 Some(t) => Some(t),
@@ -242,7 +240,12 @@ mod tests {
     /// Build a minimal 188-byte TS packet with the given header fields.
     /// `adaptation_field_control`: 0b01 = payload only, 0b11 = adaptation + payload,
     /// 0b10 = adaptation only (no payload), 0b00 = reserved (no payload).
-    fn make_packet(pid: u16, adaptation_field_control: u8, cc: u8, discontinuity: bool) -> [u8; TS_PACKET_SIZE] {
+    fn make_packet(
+        pid: u16,
+        adaptation_field_control: u8,
+        cc: u8,
+        discontinuity: bool,
+    ) -> [u8; TS_PACKET_SIZE] {
         let mut pkt = [0xFFu8; TS_PACKET_SIZE];
         pkt[0] = SYNC_BYTE;
         pkt[1] = ((pid >> 8) as u8) & 0x1F; // transport_error=0, payload_unit_start=0
@@ -290,7 +293,10 @@ mod tests {
             make_packet(pid, 0b01, 1, false),
         ];
         let delta = analyzer.analyze(&concat_packets(&packets));
-        assert_eq!(delta.packets_dropped, 0, "no-payload packet must not trigger a CC error");
+        assert_eq!(
+            delta.packets_dropped, 0,
+            "no-payload packet must not trigger a CC error"
+        );
         let stat = analyzer.pid_stat(pid).unwrap();
         assert_eq!(stat.packets, 3);
         assert_eq!(stat.cc_errors, 0);
@@ -390,7 +396,10 @@ mod tests {
         // Next packet's CC is arbitrarily far from the previous one. Without
         // the mark this would count as 1 drop; after the mark it must not.
         let after = analyzer.analyze(&concat_packets(&[make_packet(pid, 0b01, 9, false)]));
-        assert_eq!(after.packets_dropped, 0, "resync after a known discontinuity must not count as loss");
+        assert_eq!(
+            after.packets_dropped, 0,
+            "resync after a known discontinuity must not count as loss"
+        );
 
         // Accumulated per-PID stats survive the mark (not a reset).
         let stat = analyzer.pid_stat(pid).unwrap();
@@ -399,7 +408,10 @@ mod tests {
 
         // A subsequent genuine mid-stream jump (no mark) still counts as a real drop.
         let real = analyzer.analyze(&concat_packets(&[make_packet(pid, 0b01, 5, false)]));
-        assert_eq!(real.packets_dropped, 1, "a genuine CC jump without a mark must still count as loss");
+        assert_eq!(
+            real.packets_dropped, 1,
+            "a genuine CC jump without a mark must still count as loss"
+        );
         assert_eq!(analyzer.pid_stat(pid).unwrap().cc_errors, 1);
     }
 

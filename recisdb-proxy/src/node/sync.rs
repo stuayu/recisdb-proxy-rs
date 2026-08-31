@@ -116,16 +116,14 @@ impl RouteSync {
         };
 
         for (node_id, credential, endpoints) in peers {
-            let client = match NodeTransportClient::new(
-                self.state.identity.node_id.clone(),
-                credential,
-            ) {
-                Ok(client) => client,
-                Err(e) => {
-                    log::warn!("[node] route sync: cannot build client for {node_id}: {e}");
-                    continue;
-                }
-            };
+            let client =
+                match NodeTransportClient::new(self.state.identity.node_id.clone(), credential) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        log::warn!("[node] route sync: cannot build client for {node_id}: {e}");
+                        continue;
+                    }
+                };
 
             // First endpoint that answers wins. Ranking paths by measured
             // health is `node::path`'s job and belongs to the lease request,

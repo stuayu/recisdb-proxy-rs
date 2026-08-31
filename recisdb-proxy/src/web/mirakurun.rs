@@ -141,6 +141,7 @@ use serde_json::json;
 use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
 use crate::tuner::logo_collector::{collected_logo_keys, logo_path};
+use crate::tuner::EffectiveClaim;
 use crate::web::http_session::HttpStreamSession;
 use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
@@ -150,7 +151,6 @@ use crate::web::stream::{
     LossPolicy, StreamCleanup,
 };
 use recisdb_protocol::{BandType, StreamClass};
-use crate::tuner::EffectiveClaim;
 
 // ============================================================================
 // Service id <-> (nid, sid) conversion
@@ -265,14 +265,22 @@ fn terrestrial_type_map(services: &[ChannelRecord], home_regions: &[u8]) -> Hash
 
     let mut regions: Vec<u8> = services
         .iter()
-        .filter(|c| matches!(band_type_from_db(c.band_type), BandType::Terrestrial | BandType::CATV))
+        .filter(|c| {
+            matches!(
+                band_type_from_db(c.band_type),
+                BandType::Terrestrial | BandType::CATV
+            )
+        })
         .filter_map(region_id_of)
         .filter(|id| !home_regions.contains(id))
         .collect();
     regions.sort_unstable();
     regions.dedup();
 
-    let mut map: HashMap<u8, String> = home_regions.iter().map(|id| (*id, "GR".to_string())).collect();
+    let mut map: HashMap<u8, String> = home_regions
+        .iter()
+        .map(|id| (*id, "GR".to_string()))
+        .collect();
     for (index, region) in regions.into_iter().enumerate() {
         let ty = if index < MAX_NW_INDEX {
             format!("NW{}", index + 1)
@@ -337,7 +345,9 @@ fn mirakurun_type_to_band_candidates(t: &str) -> Option<&'static [BandType]> {
 
 /// `NW1`..`NW40` exactly — not `NW0`, `NW41`, or `NW01`.
 fn is_nw_type(t: &str) -> bool {
-    let Some(index) = t.strip_prefix("NW") else { return false };
+    let Some(index) = t.strip_prefix("NW") else {
+        return false;
+    };
     if index.starts_with('0') {
         return false;
     }
@@ -361,7 +371,11 @@ fn channel_types_by_driver(channels: &[ChannelRecord]) -> HashMap<i64, Vec<&'sta
 
     seen.into_iter()
         .map(|(driver_id, types)| {
-            let ordered = TYPE_ORDER.iter().filter(|t| types.contains(*t)).copied().collect();
+            let ordered = TYPE_ORDER
+                .iter()
+                .filter(|t| types.contains(*t))
+                .copied()
+                .collect();
             (driver_id, ordered)
         })
         .collect()
@@ -554,7 +568,10 @@ fn build_mirakurun_program(
     let genres = genre
         .map(|g| {
             let g = g as u8;
-            vec![MirakurunGenre { lv1: (g >> 4) & 0x0F, lv2: g & 0x0F }]
+            vec![MirakurunGenre {
+                lv1: (g >> 4) & 0x0F,
+                lv2: g & 0x0F,
+            }]
         })
         .unwrap_or_default();
 
@@ -731,13 +748,17 @@ fn representative_rank(c: &ChannelRecord) -> (bool, bool, bool, bool, bool, i64,
 /// rows keep their real name and are not matched here). Missing/empty names
 /// count as placeholders too — anything is better than an empty service name.
 fn is_placeholder_name(c: &ChannelRecord) -> bool {
-    let Some(name) = c.channel_name.as_deref() else { return true };
+    let Some(name) = c.channel_name.as_deref() else {
+        return true;
+    };
     let name = name.trim();
     if name.is_empty() {
         return true;
     }
     // `<band><2-digit ch>/TS<n>` — e.g. "BS09/TS1", "CS02/TS0".
-    let Some((head, tail)) = name.split_once("/TS") else { return false };
+    let Some((head, tail)) = name.split_once("/TS") else {
+        return false;
+    };
     tail.chars().all(|ch| ch.is_ascii_digit())
         && !tail.is_empty()
         && head.len() > 2
@@ -861,7 +882,9 @@ pub async fn get_channels(State(web_state): State<Arc<WebState>>) -> Response {
 
     for c in &services {
         let mux = (c.nid, c.tsid);
-        let Some((ty, ch_str)) = channel_strings.get(&mux) else { continue };
+        let Some((ty, ch_str)) = channel_strings.get(&mux) else {
+            continue;
+        };
 
         groups
             .entry(mux)
@@ -959,7 +982,10 @@ pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
         }
     };
 
-    let result: Vec<MirakurunProgram> = programs.into_iter().map(program_record_to_mirakurun).collect();
+    let result: Vec<MirakurunProgram> = programs
+        .into_iter()
+        .map(program_record_to_mirakurun)
+        .collect();
     Json(result).into_response()
 }
 
@@ -1065,7 +1091,10 @@ pub async fn stream_service_by_mirakurun_id(
     headers: HeaderMap,
 ) -> Response {
     let priority = parse_mirakurun_priority(&headers);
-    debug!("mirakurun: GET /services/{}/stream (X-Mirakurun-Priority={})", id, priority);
+    debug!(
+        "mirakurun: GET /services/{}/stream (X-Mirakurun-Priority={})",
+        id, priority
+    );
 
     let Some((nid, sid)) = split_mirakurun_service_id(id) else {
         return error_response(
@@ -1162,7 +1191,10 @@ pub async fn stream_channel_by_type(
     let Some(candidates) = mirakurun_type_to_band_candidates(&channel_type) else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            format!("unknown channel type '{}' (expected GR/BS/CS/SKY)", channel_type),
+            format!(
+                "unknown channel type '{}' (expected GR/BS/CS/SKY)",
+                channel_type
+            ),
         );
     };
 
@@ -1210,7 +1242,13 @@ pub async fn stream_channel_by_type(
         Err(e) => return channel_resolve_error_response(id, &e),
     };
 
-    let tuner = match channel_resolve::start_tuner_for_service(&web_state.tuner_pool, &web_state.database, &resolved).await {
+    let tuner = match channel_resolve::start_tuner_for_service(
+        &web_state.tuner_pool,
+        &web_state.database,
+        &resolved,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => return channel_resolve_error_response(id, &e),
     };
@@ -1218,14 +1256,23 @@ pub async fn stream_channel_by_type(
     let (session, shutdown_rx) = HttpStreamSession::register(
         Arc::clone(&web_state.session_registry),
         Arc::clone(&web_state.database),
-        session_info_for(SessionProtocol::Mirakurun, peer, &resolved, &tuner, StreamClass::View),
+        session_info_for(
+            SessionProtocol::Mirakurun,
+            peer,
+            &resolved,
+            &tuner,
+            StreamClass::View,
+        ),
     )
     .await;
 
     let tuner_rx = tuner.subscribe();
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
         .with_session(session, shutdown_rx);
-    respond_with_stream(broadcast_to_body_stream(BodyReceiver::Tuner(tuner_rx), cleanup))
+    respond_with_stream(broadcast_to_body_stream(
+        BodyReceiver::Tuner(tuner_rx),
+        cleanup,
+    ))
 }
 
 /// `GET /mirakurun/api/tuners`.
@@ -1278,7 +1325,9 @@ pub async fn get_tuners(State(web_state): State<Arc<WebState>>) -> Response {
         let types = match usable_channels(&db) {
             Ok(channels) => channel_types_by_driver(&channels),
             Err(e) => {
-                debug!("mirakurun: /tuners could not read channels for `types` ({e}); reporting []");
+                debug!(
+                    "mirakurun: /tuners could not read channels for `types` ({e}); reporting []"
+                );
                 HashMap::new()
             }
         };
@@ -1355,7 +1404,10 @@ pub async fn get_server_config() -> Response {
 /// call this endpoint when that flag is true).
 pub async fn get_logo(Path(id): Path<u64>) -> Response {
     let Some((nid, sid)) = split_mirakurun_service_id(id) else {
-        return error_response(StatusCode::BAD_REQUEST, format!("invalid service id {}", id));
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid service id {}", id),
+        );
     };
 
     match tokio::fs::read(logo_path(nid, sid)).await {
@@ -1399,7 +1451,10 @@ pub async fn stream_program_by_mirakurun_id(
     headers: HeaderMap,
 ) -> Response {
     let priority = parse_mirakurun_priority(&headers);
-    debug!("mirakurun: GET /programs/{}/stream (X-Mirakurun-Priority={})", id, priority);
+    debug!(
+        "mirakurun: GET /programs/{}/stream (X-Mirakurun-Priority={})",
+        id, priority
+    );
 
     let Some((nid, sid, event_id)) = split_mirakurun_program_id(id) else {
         return error_response(
@@ -1509,7 +1564,10 @@ mod tests {
     #[test]
     fn service_id_matches_documented_formula() {
         assert_eq!(mirakurun_service_id(1, 100), 100_100);
-        assert_eq!(mirakurun_service_id(0x7fe8, 1024), 0x7fe8u64 * 100_000 + 1024);
+        assert_eq!(
+            mirakurun_service_id(0x7fe8, 1024),
+            0x7fe8u64 * 100_000 + 1024
+        );
     }
 
     #[test]
@@ -1538,7 +1596,10 @@ mod tests {
 
     #[test]
     fn program_id_matches_documented_formula() {
-        assert_eq!(mirakurun_program_id(1, 100, 5), mirakurun_service_id(1, 100) * 100_000 + 5);
+        assert_eq!(
+            mirakurun_program_id(1, 100, 5),
+            mirakurun_service_id(1, 100) * 100_000 + 5
+        );
     }
 
     #[test]
@@ -1596,9 +1657,14 @@ mod tests {
         ] {
             // Both 4K nids, so `FourK` is checked for `BS4K` and `CS4K`.
             for nid in [0x000B_u16, 0x000C] {
-            let ty = band_type_to_mirakurun(bt, nid);
-            let candidates = mirakurun_type_to_band_candidates(ty).unwrap();
-            assert!(candidates.contains(&bt), "{:?} -> {} not in reverse candidates", bt, ty);
+                let ty = band_type_to_mirakurun(bt, nid);
+                let candidates = mirakurun_type_to_band_candidates(ty).unwrap();
+                assert!(
+                    candidates.contains(&bt),
+                    "{:?} -> {} not in reverse candidates",
+                    bt,
+                    ty
+                );
             }
         }
     }
@@ -1607,7 +1673,10 @@ mod tests {
     fn unknown_type_string_has_no_candidates() {
         assert!(mirakurun_type_to_band_candidates("BS8K").is_none());
         assert!(mirakurun_type_to_band_candidates("").is_none());
-        assert!(mirakurun_type_to_band_candidates("bs4k").is_none(), "types are case-sensitive");
+        assert!(
+            mirakurun_type_to_band_candidates("bs4k").is_none(),
+            "types are case-sensitive"
+        );
     }
 
     /// `type=BS` must keep resolving 4K rows even now that they advertise
@@ -1651,7 +1720,11 @@ mod tests {
     // channel_string
     // ------------------------------------------------------------------
 
-    fn make_channel_record(band_type: Option<u8>, physical_ch: Option<u8>, bon_channel: Option<u32>) -> ChannelRecord {
+    fn make_channel_record(
+        band_type: Option<u8>,
+        physical_ch: Option<u8>,
+        bon_channel: Option<u32>,
+    ) -> ChannelRecord {
         ChannelRecord {
             id: 1,
             bon_driver_id: 1,
@@ -1739,7 +1812,17 @@ mod tests {
     #[test]
     fn placeholder_names_are_recognized() {
         let placeholder = |name: Option<&str>| {
-            is_placeholder_name(&service_row(1, 1, 4, 211, 16528, Some(1), None, Some(9), name))
+            is_placeholder_name(&service_row(
+                1,
+                1,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(9),
+                name,
+            ))
         };
         assert!(placeholder(Some("BS09/TS1")));
         assert!(placeholder(Some("CS02/TS0")));
@@ -1760,16 +1843,46 @@ mod tests {
             network_name: Some("ＢＳ　Ｄｉｇｉｔａｌ".to_string()),
             remote_control_key: Some(11),
             last_seen: Some(1_783_849_518),
-            ..service_row(41, 1, 4, 211, 16528, Some(1), Some(9), Some(8), Some("ＢＳ１１イレブン"))
+            ..service_row(
+                41,
+                1,
+                4,
+                211,
+                16528,
+                Some(1),
+                Some(9),
+                Some(8),
+                Some("ＢＳ１１イレブン"),
+            )
         };
         let placeholder = ChannelRecord {
             last_seen: Some(1_771_730_985),
-            ..service_row(193, 4, 4, 211, 16528, Some(1), None, Some(9), Some("BS09/TS1"))
+            ..service_row(
+                193,
+                4,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(9),
+                Some("BS09/TS1"),
+            )
         };
         let bare = ChannelRecord {
             service_type: Some(1),
             last_seen: Some(1_771_824_058),
-            ..service_row(877, 14, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１イレブン"))
+            ..service_row(
+                877,
+                14,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(8),
+                Some("ＢＳ１１イレブン"),
+            )
         };
 
         let unique = unique_services(vec![placeholder, bare, scanned]);
@@ -1779,9 +1892,39 @@ mod tests {
 
     #[test]
     fn unique_services_is_sorted_and_keeps_distinct_services() {
-        let a = service_row(1, 1, 4, 152, 16400, Some(1), None, Some(0), Some("ＢＳ朝日２"));
-        let b = service_row(2, 1, 4, 151, 16400, Some(1), None, Some(0), Some("ＢＳ朝日１"));
-        let c = service_row(3, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合"));
+        let a = service_row(
+            1,
+            1,
+            4,
+            152,
+            16400,
+            Some(1),
+            None,
+            Some(0),
+            Some("ＢＳ朝日２"),
+        );
+        let b = service_row(
+            2,
+            1,
+            4,
+            151,
+            16400,
+            Some(1),
+            None,
+            Some(0),
+            Some("ＢＳ朝日１"),
+        );
+        let c = service_row(
+            3,
+            1,
+            32416,
+            21504,
+            32416,
+            Some(0),
+            Some(15),
+            Some(2),
+            Some("ＮＨＫ総合"),
+        );
 
         let unique = unique_services(vec![a, b, c]);
         assert_eq!(
@@ -1802,7 +1945,17 @@ mod tests {
     const NID_TOKYO_WIDE: u16 = 32736; // region 1 (関東広域)
 
     fn gr_row(id: i64, nid: u16, sid: u16, physical_ch: u8) -> ChannelRecord {
-        service_row(id, 1, nid, sid, nid, Some(0), Some(physical_ch), Some(2), Some("局"))
+        service_row(
+            id,
+            1,
+            nid,
+            sid,
+            nid,
+            Some(0),
+            Some(physical_ch),
+            Some(2),
+            Some("局"),
+        )
     }
 
     #[test]
@@ -1812,7 +1965,10 @@ mod tests {
         assert_eq!(region_id_of(&row), Some(21));
 
         // An explicitly scanned value wins over the derivation.
-        let scanned = ChannelRecord { region_id: Some(9), ..gr_row(2, NID_FUKUSHIMA, 21504, 15) };
+        let scanned = ChannelRecord {
+            region_id: Some(9),
+            ..gr_row(2, NID_FUKUSHIMA, 21504, 15)
+        };
         assert_eq!(region_id_of(&scanned), Some(9));
     }
 
@@ -1868,7 +2024,17 @@ mod tests {
 
     #[test]
     fn satellite_rows_are_unaffected_by_the_split() {
-        let bs = service_row(1, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１"));
+        let bs = service_row(
+            1,
+            1,
+            4,
+            211,
+            16528,
+            Some(1),
+            None,
+            Some(8),
+            Some("ＢＳ１１"),
+        );
         let types = terrestrial_type_map(std::slice::from_ref(&bs), &[21]);
         assert_eq!(mirakurun_type_of(&bs, &types), "BS");
     }
@@ -1892,7 +2058,10 @@ mod tests {
         let assigned: Vec<&String> = types.values().collect();
         assert!(!assigned.iter().any(|t| t.as_str() == "NW41"));
         assert_eq!(assigned.iter().filter(|t| t.as_str() == "NW40").count(), 1);
-        assert!(assigned.iter().any(|t| t.as_str() == "GR"), "the overflow falls back to GR");
+        assert!(
+            assigned.iter().any(|t| t.as_str() == "GR"),
+            "the overflow falls back to GR"
+        );
     }
 
     #[test]
@@ -1922,8 +2091,14 @@ mod tests {
         let types = terrestrial_type_map(&services, &[21]);
         let assigned = assign_channel_strings(&services, &types);
 
-        assert_eq!(assigned[&(NID_FUKUSHIMA, NID_FUKUSHIMA)], ("GR".to_string(), "15".to_string()));
-        assert_eq!(assigned[&(NID_AKITA, NID_AKITA)], ("NW1".to_string(), "15".to_string()));
+        assert_eq!(
+            assigned[&(NID_FUKUSHIMA, NID_FUKUSHIMA)],
+            ("GR".to_string(), "15".to_string())
+        );
+        assert_eq!(
+            assigned[&(NID_AKITA, NID_AKITA)],
+            ("NW1".to_string(), "15".to_string())
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1933,12 +2108,38 @@ mod tests {
     #[test]
     fn channel_strings_stay_plain_when_nothing_collides() {
         let services = unique_services(vec![
-            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
-            service_row(2, 1, 32417, 21512, 32417, Some(0), Some(13), Some(1), Some("ＮＨＫEテレ")),
+            service_row(
+                1,
+                1,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合"),
+            ),
+            service_row(
+                2,
+                1,
+                32417,
+                21512,
+                32417,
+                Some(0),
+                Some(13),
+                Some(1),
+                Some("ＮＨＫEテレ"),
+            ),
         ]);
         let assigned = assign_channel_strings(&services, &HashMap::new());
-        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15".to_string()));
-        assert_eq!(assigned[&(32417, 32417)], ("GR".to_string(), "13".to_string()));
+        assert_eq!(
+            assigned[&(32416, 32416)],
+            ("GR".to_string(), "15".to_string())
+        );
+        assert_eq!(
+            assigned[&(32417, 32417)],
+            ("GR".to_string(), "13".to_string())
+        );
     }
 
     /// Multi-area reception: two networks on RF 15. Both must remain
@@ -1946,15 +2147,45 @@ mod tests {
     #[test]
     fn colliding_channel_strings_are_disambiguated_by_network_id() {
         let services = unique_services(vec![
-            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合・福島")),
-            service_row(2, 1, 32466, 18448, 32466, Some(0), Some(15), Some(3), Some("ＡＢＳ秋田放送")),
+            service_row(
+                1,
+                1,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合・福島"),
+            ),
+            service_row(
+                2,
+                1,
+                32466,
+                18448,
+                32466,
+                Some(0),
+                Some(15),
+                Some(3),
+                Some("ＡＢＳ秋田放送"),
+            ),
         ]);
         let assigned = assign_channel_strings(&services, &HashMap::new());
-        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15_32416".to_string()));
-        assert_eq!(assigned[&(32466, 32466)], ("GR".to_string(), "15_32466".to_string()));
+        assert_eq!(
+            assigned[&(32416, 32416)],
+            ("GR".to_string(), "15_32416".to_string())
+        );
+        assert_eq!(
+            assigned[&(32466, 32466)],
+            ("GR".to_string(), "15_32466".to_string())
+        );
 
         let all: HashSet<_> = assigned.values().collect();
-        assert_eq!(all.len(), 2, "every multiplex must get its own (type, channel)");
+        assert_eq!(
+            all.len(),
+            2,
+            "every multiplex must get its own (type, channel)"
+        );
     }
 
     /// Same number on two different bands is not a collision — Mirakurun keys
@@ -1962,11 +2193,34 @@ mod tests {
     #[test]
     fn same_channel_number_on_different_bands_is_not_a_collision() {
         let services = unique_services(vec![
-            service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
-            service_row(2, 1, 4, 211, 16528, Some(1), None, Some(15), Some("ＢＳ１１")),
+            service_row(
+                1,
+                1,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合"),
+            ),
+            service_row(
+                2,
+                1,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(15),
+                Some("ＢＳ１１"),
+            ),
         ]);
         let assigned = assign_channel_strings(&services, &HashMap::new());
-        assert_eq!(assigned[&(32416, 32416)], ("GR".to_string(), "15".to_string()));
+        assert_eq!(
+            assigned[&(32416, 32416)],
+            ("GR".to_string(), "15".to_string())
+        );
         assert_eq!(assigned[&(4, 16528)], ("BS".to_string(), "15".to_string()));
     }
 
@@ -1982,7 +2236,11 @@ mod tests {
         let a = &assigned[&(4, 16528)];
         let b = &assigned[&(4, 16530)];
         assert_ne!(a, b, "distinct multiplexes must not share (type, channel)");
-        assert!(b.1.starts_with("9_4"), "unexpected disambiguated form: {}", b.1);
+        assert!(
+            b.1.starts_with("9_4"),
+            "unexpected disambiguated form: {}",
+            b.1
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1993,7 +2251,17 @@ mod tests {
     fn remote_control_key_is_reported_for_terrestrial_only() {
         let terrestrial = ChannelRecord {
             remote_control_key: Some(1),
-            ..service_row(1, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合"))
+            ..service_row(
+                1,
+                1,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合"),
+            )
         };
         assert_eq!(remote_control_key_id(&terrestrial), Some(1));
 
@@ -2001,13 +2269,33 @@ mod tests {
         // remote-control key and must not be reported as one.
         let cs = ChannelRecord {
             remote_control_key: Some(161),
-            ..service_row(2, 1, 7, 301, 18224, Some(2), None, Some(1), Some("エンタメ〜テレ"))
+            ..service_row(
+                2,
+                1,
+                7,
+                301,
+                18224,
+                Some(2),
+                None,
+                Some(1),
+                Some("エンタメ〜テレ"),
+            )
         };
         assert_eq!(remote_control_key_id(&cs), None);
 
         let bs = ChannelRecord {
             remote_control_key: Some(11),
-            ..service_row(3, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１"))
+            ..service_row(
+                3,
+                1,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(8),
+                Some("ＢＳ１１"),
+            )
         };
         assert_eq!(remote_control_key_id(&bs), None);
     }
@@ -2021,7 +2309,10 @@ mod tests {
             name: "ＢＳ１１".to_string(),
             service_type: 1,
             remote_control_key_id: None,
-            channel: vec![MirakurunChannelRef { channel_type: "BS".to_string(), channel: "8".to_string() }],
+            channel: vec![MirakurunChannelRef {
+                channel_type: "BS".to_string(),
+                channel: "8".to_string(),
+            }],
             has_logo_data: false,
         };
         let value = serde_json::to_value(&service).unwrap();
@@ -2038,15 +2329,58 @@ mod tests {
     #[test]
     fn tuner_types_come_from_scanned_channels_in_band_order() {
         let channels = vec![
-            service_row(1, 1, 4, 211, 16528, Some(1), None, Some(8), Some("ＢＳ１１")),
-            service_row(2, 1, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
-            service_row(3, 1, 7, 301, 18224, Some(2), None, Some(1), Some("エンタメ〜テレ")),
-            service_row(4, 2, 32416, 21504, 32416, Some(0), Some(15), Some(2), Some("ＮＨＫ総合")),
+            service_row(
+                1,
+                1,
+                4,
+                211,
+                16528,
+                Some(1),
+                None,
+                Some(8),
+                Some("ＢＳ１１"),
+            ),
+            service_row(
+                2,
+                1,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合"),
+            ),
+            service_row(
+                3,
+                1,
+                7,
+                301,
+                18224,
+                Some(2),
+                None,
+                Some(1),
+                Some("エンタメ〜テレ"),
+            ),
+            service_row(
+                4,
+                2,
+                32416,
+                21504,
+                32416,
+                Some(0),
+                Some(15),
+                Some(2),
+                Some("ＮＨＫ総合"),
+            ),
         ];
         let types = channel_types_by_driver(&channels);
         assert_eq!(types[&1], vec!["GR", "BS", "CS"]);
         assert_eq!(types[&2], vec!["GR"]);
-        assert!(types.get(&3).is_none(), "a driver with no channels reports nothing");
+        assert!(
+            types.get(&3).is_none(),
+            "a driver with no channels reports nothing"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2062,11 +2396,16 @@ mod tests {
             name: "Test".to_string(),
             service_type: 1,
             remote_control_key_id: Some(1),
-            channel: vec![MirakurunChannelRef { channel_type: "GR".to_string(), channel: "27".to_string() }],
+            channel: vec![MirakurunChannelRef {
+                channel_type: "GR".to_string(),
+                channel: "27".to_string(),
+            }],
             has_logo_data: false,
         };
         let value = serde_json::to_value(&service).unwrap();
-        let channel = value["channel"].as_array().expect("channel must serialize as a JSON array");
+        let channel = value["channel"]
+            .as_array()
+            .expect("channel must serialize as a JSON array");
         assert_eq!(channel.len(), 1);
         assert_eq!(channel[0]["type"], "GR");
         assert_eq!(channel[0]["channel"], "27");
@@ -2085,7 +2424,10 @@ mod tests {
 
         // Same lookup `get_services` does per service.
         let keys = crate::tuner::logo_collector::collected_logo_keys_in(&dir);
-        assert!(keys.contains(&(32416, 21504)), "a collected logo is reported");
+        assert!(
+            keys.contains(&(32416, 21504)),
+            "a collected logo is reported"
+        );
         assert!(
             !keys.contains(&(32416, 21505)),
             "a service whose network has been tuned but that has no logo file of its own is not"
@@ -2099,7 +2441,10 @@ mod tests {
         // `get_logo` answers 400 (not 404) for these — the id could never have
         // named a service, so it is a malformed request rather than a miss.
         assert!(split_mirakurun_service_id(u64::MAX).is_none());
-        assert_eq!(split_mirakurun_service_id(mirakurun_service_id(32416, 21504)), Some((32416, 21504)));
+        assert_eq!(
+            split_mirakurun_service_id(mirakurun_service_id(32416, 21504)),
+            Some((32416, 21504))
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2129,7 +2474,10 @@ mod tests {
         // A hostile (or merely confused) value cannot exceed the cap, which
         // is itself below the BNDP RECORD threshold.
         assert_eq!(priority_of("2147483647"), MIRAKURUN_PRIORITY_CAP);
-        assert!(MIRAKURUN_PRIORITY_CAP < 200, "must stay under RECORD_PRIORITY_THRESHOLD");
+        assert!(
+            MIRAKURUN_PRIORITY_CAP < 200,
+            "must stay under RECORD_PRIORITY_THRESHOLD"
+        );
 
         // Nor push itself below the "no explicit priority" floor.
         assert_eq!(priority_of("-5"), 0);

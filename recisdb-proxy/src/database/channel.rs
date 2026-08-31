@@ -19,9 +19,10 @@ impl Database {
             .band_type
             .unwrap_or_else(|| recisdb_protocol::BandType::from_nid(info.nid) as u8);
         let region_id = get_region_id_from_nid(info.nid);
-        let terrestrial_region = info.terrestrial_region.clone().or_else(|| {
-            get_prefecture_name(info.nid).map(|s| s.to_string())
-        });
+        let terrestrial_region = info
+            .terrestrial_region
+            .clone()
+            .or_else(|| get_prefecture_name(info.nid).map(|s| s.to_string()));
 
         self.conn.execute(
             "INSERT INTO channels (
@@ -151,7 +152,13 @@ impl Database {
 
         let result = if let Some(ms) = manual_sheet {
             stmt.query_row(
-                params![bon_driver_id, nid as i32, sid as i32, tsid as i32, ms as i32],
+                params![
+                    bon_driver_id,
+                    nid as i32,
+                    sid as i32,
+                    tsid as i32,
+                    ms as i32
+                ],
                 Self::row_to_channel_record,
             )
         } else {
@@ -182,7 +189,10 @@ impl Database {
     }
 
     /// Get enabled channels by BonDriver ID.
-    pub fn get_enabled_channels_by_bon_driver(&self, bon_driver_id: i64) -> Result<Vec<ChannelRecord>> {
+    pub fn get_enabled_channels_by_bon_driver(
+        &self,
+        bon_driver_id: i64,
+    ) -> Result<Vec<ChannelRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM channels WHERE bon_driver_id = ?1 AND is_enabled = 1 ORDER BY priority DESC, nid, tsid, sid",
         )?;
@@ -394,12 +404,22 @@ impl Database {
                     driver_name: row.get("driver_name").ok().flatten(),
                     version: row.get("version").ok().flatten(),
                     group_name: row.get("group_name")?,
-                    auto_scan_enabled: row.get::<_, Option<i32>>("auto_scan_enabled").ok().flatten().unwrap_or(0) != 0,
+                    auto_scan_enabled: row
+                        .get::<_, Option<i32>>("auto_scan_enabled")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0)
+                        != 0,
                     scan_interval_hours: row.get("scan_interval_hours").unwrap_or(24),
                     scan_priority: row.get("scan_priority").unwrap_or(0),
                     last_scan: row.get("last_scan").ok().flatten(),
                     next_scan_at: row.get("next_scan_at").ok().flatten(),
-                    passive_scan_enabled: row.get::<_, Option<i32>>("passive_scan_enabled").ok().flatten().unwrap_or(1) != 0,
+                    passive_scan_enabled: row
+                        .get::<_, Option<i32>>("passive_scan_enabled")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(1)
+                        != 0,
                     max_instances: row.get::<_, Option<i32>>("max_instances")?.unwrap_or(1),
                     created_at: row.get("bd_created_at").unwrap_or(0),
                     updated_at: row.get("bd_updated_at").unwrap_or(0),
@@ -410,7 +430,8 @@ impl Database {
             Ok((channel, bon_driver))
         })?;
 
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
     }
 
     /// Same as [`Self::get_all_channels_with_drivers`] but filtered to a single
@@ -462,12 +483,22 @@ impl Database {
                     driver_name: row.get("driver_name").ok().flatten(),
                     version: row.get("version").ok().flatten(),
                     group_name: row.get("group_name")?,
-                    auto_scan_enabled: row.get::<_, Option<i32>>("auto_scan_enabled").ok().flatten().unwrap_or(0) != 0,
+                    auto_scan_enabled: row
+                        .get::<_, Option<i32>>("auto_scan_enabled")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0)
+                        != 0,
                     scan_interval_hours: row.get("scan_interval_hours").unwrap_or(24),
                     scan_priority: row.get("scan_priority").unwrap_or(0),
                     last_scan: row.get("last_scan").ok().flatten(),
                     next_scan_at: row.get("next_scan_at").ok().flatten(),
-                    passive_scan_enabled: row.get::<_, Option<i32>>("passive_scan_enabled").ok().flatten().unwrap_or(1) != 0,
+                    passive_scan_enabled: row
+                        .get::<_, Option<i32>>("passive_scan_enabled")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(1)
+                        != 0,
                     max_instances: row.get::<_, Option<i32>>("max_instances")?.unwrap_or(1),
                     created_at: row.get("bd_created_at").unwrap_or(0),
                     updated_at: row.get("bd_updated_at").unwrap_or(0),
@@ -478,7 +509,8 @@ impl Database {
             Ok((channel, bon_driver))
         })?;
 
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
     }
 
     /// For each driver in `group_paths`, count how many logical channels
@@ -497,8 +529,7 @@ impl Database {
     ) -> Result<std::collections::HashMap<String, i64>> {
         use std::collections::HashMap;
 
-        let mut counts: HashMap<String, i64> =
-            group_paths.iter().map(|p| (p.clone(), 0)).collect();
+        let mut counts: HashMap<String, i64> = group_paths.iter().map(|p| (p.clone(), 0)).collect();
         if group_paths.is_empty() {
             return Ok(counts);
         }
@@ -519,11 +550,13 @@ impl Database {
 
         // (nid, tsid) -> set of group driver paths that carry it.
         let mut carriers: HashMap<(i64, i64), HashSet<&str>> = HashMap::new();
-        let all: Vec<(String, i64, i64)> =
-            rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let all: Vec<(String, i64, i64)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         for (path, nid, tsid) in &all {
             if let Some(known) = group_paths.iter().find(|p| *p == path) {
-                carriers.entry((*nid, *tsid)).or_default().insert(known.as_str());
+                carriers
+                    .entry((*nid, *tsid))
+                    .or_default()
+                    .insert(known.as_str());
             }
         }
 
@@ -546,9 +579,10 @@ impl Database {
             .band_type
             .unwrap_or_else(|| recisdb_protocol::BandType::from_nid(info.nid) as u8);
         let region_id = get_region_id_from_nid(info.nid);
-        let terrestrial_region = info.terrestrial_region.clone().or_else(|| {
-            get_prefecture_name(info.nid).map(|s| s.to_string())
-        });
+        let terrestrial_region = info
+            .terrestrial_region
+            .clone()
+            .or_else(|| get_prefecture_name(info.nid).map(|s| s.to_string()));
 
         let sql = if info.manual_sheet.is_some() {
             "UPDATE channels SET
@@ -667,7 +701,18 @@ impl Database {
         priority: Option<i32>,
         is_enabled: Option<bool>,
     ) -> Result<()> {
-        self.update_channel_full(channel_id, channel_name, priority, is_enabled, None, None, None, None, None, None)
+        self.update_channel_full(
+            channel_id,
+            channel_name,
+            priority,
+            is_enabled,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Update all editable channel fields (full update used by GUI).
@@ -730,10 +775,7 @@ impl Database {
         }
 
         values.push(Box::new(channel_id));
-        let sql = format!(
-            "UPDATE channels SET {} WHERE id = ?",
-            updates.join(", ")
-        );
+        let sql = format!("UPDATE channels SET {} WHERE id = ?", updates.join(", "));
 
         let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, params.as_slice())?;
@@ -742,10 +784,8 @@ impl Database {
 
     /// Delete a channel.
     pub fn delete_channel(&self, channel_id: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM channels WHERE id = ?1",
-            [channel_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM channels WHERE id = ?1", [channel_id])?;
         Ok(())
     }
 
@@ -776,9 +816,7 @@ impl Database {
 
         // Get existing channels for this BonDriver
         let existing: Vec<ChannelRecord> = {
-            let mut stmt = tx.prepare(
-                "SELECT * FROM channels WHERE bon_driver_id = ?1",
-            )?;
+            let mut stmt = tx.prepare("SELECT * FROM channels WHERE bon_driver_id = ?1")?;
             let rows = stmt.query_map([bon_driver_id], Self::row_to_channel_record)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -802,9 +840,10 @@ impl Database {
                 .band_type
                 .unwrap_or_else(|| recisdb_protocol::BandType::from_nid(info.nid) as u8);
             let region_id = get_region_id_from_nid(info.nid);
-            let terrestrial_region = info.terrestrial_region.clone().or_else(|| {
-                get_prefecture_name(info.nid).map(|s| s.to_string())
-            });
+            let terrestrial_region = info
+                .terrestrial_region
+                .clone()
+                .or_else(|| get_prefecture_name(info.nid).map(|s| s.to_string()));
 
             if existing_keys.contains(&key) {
                 // Update existing
@@ -936,8 +975,13 @@ impl Database {
         let mut updated = 0;
 
         for info in channels {
-            let existing =
-                self.get_channel_by_key(bon_driver_id, info.nid, info.sid, info.tsid, info.manual_sheet)?;
+            let existing = self.get_channel_by_key(
+                bon_driver_id,
+                info.nid,
+                info.sid,
+                info.tsid,
+                info.manual_sheet,
+            )?;
 
             match existing {
                 Some(existing) => {
@@ -989,7 +1033,11 @@ impl Database {
     }
 
     /// Get scan history for a BonDriver.
-    pub fn get_scan_history(&self, bon_driver_id: i64, limit: i32) -> Result<Vec<ScanHistoryRecord>> {
+    pub fn get_scan_history(
+        &self,
+        bon_driver_id: i64,
+        limit: i32,
+    ) -> Result<Vec<ScanHistoryRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, bon_driver_id, scan_time, channel_count, success, error_message
              FROM scan_history WHERE bon_driver_id = ?1 ORDER BY id DESC LIMIT ?2",
@@ -1045,16 +1093,22 @@ impl Database {
         );
 
         match result {
-            Ok((band_type, terrestrial_region)) => {
-                Ok(Some(Self::generate_space_name(band_type, terrestrial_region, space as i32)))
-            }
+            Ok((band_type, terrestrial_region)) => Ok(Some(Self::generate_space_name(
+                band_type,
+                terrestrial_region,
+                space as i32,
+            ))),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
     /// Generate a space name from band_type and terrestrial_region.
-    fn generate_space_name(band_type: Option<i32>, terrestrial_region: Option<String>, space: i32) -> String {
+    fn generate_space_name(
+        band_type: Option<i32>,
+        terrestrial_region: Option<String>,
+        space: i32,
+    ) -> String {
         match band_type {
             Some(0) => {
                 // Terrestrial - use region name
@@ -1149,7 +1203,9 @@ impl Database {
             raw_name: row.get("raw_name")?,
             channel_name: row.get("channel_name")?,
             physical_ch: row.get::<_, Option<i32>>("physical_ch")?.map(|v| v as u8),
-            remote_control_key: row.get::<_, Option<i32>>("remote_control_key")?.map(|v| v as u16),
+            remote_control_key: row
+                .get::<_, Option<i32>>("remote_control_key")?
+                .map(|v| v as u16),
             service_type: row.get::<_, Option<i32>>("service_type")?.map(|v| v as u8),
             network_name: row.get("network_name")?,
             bon_space: row.get::<_, Option<i32>>("bon_space")?.map(|v| v as u32),
@@ -1221,8 +1277,13 @@ mod tests {
 
         // 2 回目は変更なし (NitWriter がここで打ち切れる)
         assert_eq!(
-            db.fill_missing_terrestrial_metadata(0x7E87, Some(9), Some(16), Some("ＴＯＫＹＯ　ＭＸ"))
-                .unwrap(),
+            db.fill_missing_terrestrial_metadata(
+                0x7E87,
+                Some(9),
+                Some(16),
+                Some("ＴＯＫＹＯ　ＭＸ")
+            )
+            .unwrap(),
             0
         );
     }
@@ -1235,7 +1296,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            db.fill_missing_terrestrial_metadata(0x7E88, Some(1), None, None).unwrap(),
+            db.fill_missing_terrestrial_metadata(0x7E88, Some(1), None, None)
+                .unwrap(),
             0
         );
         let record = db
@@ -1294,7 +1356,8 @@ mod tests {
         // them, so every row silently came back with group_name=None and
         // max_instances=1 regardless of the stored value.
         db.set_group_name(bon_driver_id, Some("GroupX")).unwrap();
-        db.update_bon_driver_max_instances(bon_driver_id, 4).unwrap();
+        db.update_bon_driver_max_instances(bon_driver_id, 4)
+            .unwrap();
 
         // Two channels with different NID (and different TSID) so we can
         // verify the WHERE nid=?/tsid=? filter narrows to a single group.
@@ -1326,7 +1389,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let bon_driver_id = db.get_or_create_bon_driver("Test.dll").unwrap();
         db.set_group_name(bon_driver_id, Some("GroupY")).unwrap();
-        db.update_bon_driver_max_instances(bon_driver_id, 2).unwrap();
+        db.update_bon_driver_max_instances(bon_driver_id, 2)
+            .unwrap();
         db.insert_channel(bon_driver_id, &create_test_channel(0x7FE8, 1024, 32736))
             .unwrap();
 
@@ -1344,10 +1408,15 @@ mod tests {
         let driver_b = db.get_or_create_bon_driver("B.dll").unwrap();
 
         // Same (nid, sid) scanned on two drivers, differing priority.
-        let id_a = db.insert_channel(driver_a, &create_test_channel(1, 100, 200)).unwrap();
-        let id_b = db.insert_channel(driver_b, &create_test_channel(1, 100, 201)).unwrap();
+        let id_a = db
+            .insert_channel(driver_a, &create_test_channel(1, 100, 200))
+            .unwrap();
+        let id_b = db
+            .insert_channel(driver_b, &create_test_channel(1, 100, 201))
+            .unwrap();
         db.update_channel_fields(id_a, None, Some(0), None).unwrap();
-        db.update_channel_fields(id_b, None, Some(10), None).unwrap();
+        db.update_channel_fields(id_b, None, Some(10), None)
+            .unwrap();
 
         let rows = db.get_channels_by_nid_sid(1, 100).unwrap();
         assert_eq!(rows.len(), 2);
@@ -1368,8 +1437,12 @@ mod tests {
         let driver_a = db.get_or_create_bon_driver("A.dll").unwrap();
         let driver_b = db.get_or_create_bon_driver("B.dll").unwrap();
 
-        let id_a = db.insert_channel(driver_a, &create_test_channel(1, 100, 200)).unwrap();
-        let id_b = db.insert_channel(driver_b, &create_test_channel(2, 100, 300)).unwrap();
+        let id_a = db
+            .insert_channel(driver_a, &create_test_channel(1, 100, 200))
+            .unwrap();
+        let id_b = db
+            .insert_channel(driver_b, &create_test_channel(2, 100, 300))
+            .unwrap();
         db.disable_channel(id_a).unwrap();
 
         let rows = db.get_channels_by_sid(100).unwrap();
@@ -1446,7 +1519,7 @@ mod tests {
             create_test_channel(0x7FE8, 1024, 32736), // existing
             create_test_channel(0x7FE8, 1032, 32736), // existing
             create_test_channel(0x7FE8, 1048, 32736), // new
-            // 1040 is missing -> should be disabled
+                                                      // 1040 is missing -> should be disabled
         ];
 
         let result2 = db.merge_scan_results(bon_driver_id, &channels2).unwrap();

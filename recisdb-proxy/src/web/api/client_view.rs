@@ -32,9 +32,7 @@ use crate::web::state::WebState;
 /// List the values a client can put in `Tuner=`: tuner groups first
 /// (recommended — the server picks the best free driver), then individual
 /// drivers.
-pub async fn get_client_view_targets(
-    State(web_state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+pub async fn get_client_view_targets(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
     let drivers = match db.get_all_bon_drivers() {
@@ -138,7 +136,10 @@ async fn resolve_client_view_scope(
     (
         Vec<String>,
         &'static str,
-        Vec<(crate::database::ClientChannelRecord, Option<crate::database::BonDriverRecord>)>,
+        Vec<(
+            crate::database::ClientChannelRecord,
+            Option<crate::database::BonDriverRecord>,
+        )>,
     ),
     Json<serde_json::Value>,
 > {
@@ -188,39 +189,38 @@ pub async fn get_client_view(
         .iter()
         .enumerate()
         .map(|(space_index, space)| {
-            let channels: Vec<serde_json::Value> =
-                channels_by_region
-                    .remove(space.region_key.as_str())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(channel_index, ch)| {
-                        let physical: Vec<serde_json::Value> = space_result
-                            .nid_tsid_mappings
-                            .get(&(ch.nid, ch.tsid))
-                            .map(|mappings| {
-                                mappings
-                                    .iter()
-                                    .map(|m| {
-                                        json!({
-                                            "driver": m.driver_path,
-                                            "space": m.actual_space,
-                                            "channel": m.actual_channel,
-                                        })
+            let channels: Vec<serde_json::Value> = channels_by_region
+                .remove(space.region_key.as_str())
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(channel_index, ch)| {
+                    let physical: Vec<serde_json::Value> = space_result
+                        .nid_tsid_mappings
+                        .get(&(ch.nid, ch.tsid))
+                        .map(|mappings| {
+                            mappings
+                                .iter()
+                                .map(|m| {
+                                    json!({
+                                        "driver": m.driver_path,
+                                        "space": m.actual_space,
+                                        "channel": m.actual_channel,
                                     })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        json!({
-                            "index": channel_index,
-                            "name": ch.name,
-                            "nid": ch.nid,
-                            "tsid": ch.tsid,
-                            "bon_channel": ch.bon_channel,
-                            "physical": physical,
+                                })
+                                .collect()
                         })
+                        .unwrap_or_default();
+                    json!({
+                        "index": channel_index,
+                        "name": ch.name,
+                        "nid": ch.nid,
+                        "tsid": ch.tsid,
+                        "bon_channel": ch.bon_channel,
+                        "physical": physical,
                     })
-                    .collect();
+                })
+                .collect();
             json!({
                 "index": space_index,
                 "name": space.display_name,
@@ -286,18 +286,16 @@ pub async fn get_client_view_file(
             "text/plain; charset=utf-8",
             cf::encode_utf8_bom(&cf::generate_chset5(&spaces)),
         ),
-        "bundle" => {
-            match build_client_bundle_zip(&web_state, &headers, &query.tuner, &spaces) {
-                Ok(bytes) => ("recisdb-proxy-client-config.zip", "application/zip", bytes),
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"success": false, "error": e})),
-                    )
-                        .into_response();
-                }
+        "bundle" => match build_client_bundle_zip(&web_state, &headers, &query.tuner, &spaces) {
+            Ok(bytes) => ("recisdb-proxy-client-config.zip", "application/zip", bytes),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"success": false, "error": e})),
+                )
+                    .into_response();
             }
-        }
+        },
         _ => {
             return (
                 StatusCode::NOT_FOUND,

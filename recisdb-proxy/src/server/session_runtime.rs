@@ -3,8 +3,8 @@
 //! Extracted from `session.rs` so DB-backed tsreplace/prefill policy and SID
 //! resolution can evolve independently of the core session state machine.
 
-use log::{debug, warn};
 use crate::server::listener::DatabaseHandle;
+use log::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub(super) struct TsreplaceRuntimeConfig {
@@ -75,7 +75,10 @@ pub(super) async fn load_ts_queue_runtime_config(
             record_ms,
         },
         Err(e) => {
-            warn!("[Session {}] Failed to load TS queue config: {}", session_id, e);
+            warn!(
+                "[Session {}] Failed to load TS queue config: {}",
+                session_id, e
+            );
             TsQueueRuntimeConfig::default()
         }
     }
@@ -87,7 +90,16 @@ pub(super) async fn load_tsreplace_runtime_config(
 ) -> TsreplaceRuntimeConfig {
     let db = database.lock().await;
     match db.get_tsreplace_config() {
-        Ok((enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments)) => TsreplaceRuntimeConfig {
+        Ok((
+            enabled,
+            command_path,
+            arguments,
+            read_timeout_ms,
+            passthrough_on_error,
+            max_concurrent_encoders,
+            preprocessor_path,
+            preprocessor_arguments,
+        )) => TsreplaceRuntimeConfig {
             enabled,
             command_path,
             arguments,
@@ -98,7 +110,10 @@ pub(super) async fn load_tsreplace_runtime_config(
             preprocessor_arguments,
         },
         Err(e) => {
-            warn!("[Session {}] Failed to load tsreplace config: {}", session_id, e);
+            warn!(
+                "[Session {}] Failed to load tsreplace config: {}",
+                session_id, e
+            );
             TsreplaceRuntimeConfig {
                 enabled: false,
                 command_path: "tsreplace".to_string(),
@@ -138,7 +153,10 @@ pub(super) async fn load_prefill_runtime_config(
             safety_factor: jitter_safety_factor,
         },
         Err(e) => {
-            warn!("[Session {}] Failed to load prefill config: {}", session_id, e);
+            warn!(
+                "[Session {}] Failed to load prefill config: {}",
+                session_id, e
+            );
             PrefillRuntimeConfig::default()
         }
     }

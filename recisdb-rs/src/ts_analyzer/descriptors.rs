@@ -3,7 +3,6 @@
 //! This module handles parsing of various descriptors found in
 //! NIT, SDT, and other tables.
 
-
 /// Service descriptor (0x48).
 #[derive(Debug, Clone, Default)]
 pub struct ServiceDescriptor {
@@ -283,13 +282,7 @@ fn decode_arib_string(data: &[u8]) -> String {
     slice
         .iter()
         .filter(|&&b| b >= 0x20 || b == 0x0A || b == 0x0D)
-        .map(|&b| {
-            if b.is_ascii() {
-                b as char
-            } else {
-                '?'
-            }
-        })
+        .map(|&b| if b.is_ascii() { b as char } else { '?' })
         .collect()
 }
 
@@ -349,10 +342,7 @@ mod tests {
 
     #[test]
     fn test_find_descriptor() {
-        let data = [
-            0x48, 0x02, 0xAA, 0xBB,
-            0x40, 0x03, 0xCC, 0xDD, 0xEE,
-        ];
+        let data = [0x48, 0x02, 0xAA, 0xBB, 0x40, 0x03, 0xCC, 0xDD, 0xEE];
 
         let found = find_descriptor(&data, 0x40);
         assert_eq!(found, Some(vec![0xCC, 0xDD, 0xEE]));

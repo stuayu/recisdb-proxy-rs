@@ -54,7 +54,13 @@ impl Database {
 
         let result = if let Some(ms) = manual_sheet {
             stmt.query_row(
-                params![bon_driver_id, nid as i32, sid as i32, tsid as i32, ms as i32],
+                params![
+                    bon_driver_id,
+                    nid as i32,
+                    sid as i32,
+                    tsid as i32,
+                    ms as i32
+                ],
                 Self::row_to_channel_record,
             )
         } else {
@@ -86,9 +92,9 @@ impl Database {
 
     /// Get all channels from the database.
     pub fn get_all_channels(&self) -> Result<Vec<ChannelRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM channels ORDER BY nid, tsid, sid",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM channels ORDER BY nid, tsid, sid")?;
 
         let records = stmt
             .query_map([], Self::row_to_channel_record)?
@@ -272,9 +278,7 @@ impl Database {
 
         // Get existing channels for this BonDriver
         let existing: Vec<ChannelRecord> = {
-            let mut stmt = tx.prepare(
-                "SELECT * FROM channels WHERE bon_driver_id = ?1",
-            )?;
+            let mut stmt = tx.prepare("SELECT * FROM channels WHERE bon_driver_id = ?1")?;
             stmt.query_map([bon_driver_id], Self::row_to_channel_record)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -411,8 +415,13 @@ impl Database {
         let mut updated = 0;
 
         for info in channels {
-            let existing =
-                self.get_channel_by_key(bon_driver_id, info.nid, info.sid, info.tsid, info.manual_sheet)?;
+            let existing = self.get_channel_by_key(
+                bon_driver_id,
+                info.nid,
+                info.sid,
+                info.tsid,
+                info.manual_sheet,
+            )?;
 
             match existing {
                 Some(existing) => {
@@ -464,7 +473,11 @@ impl Database {
     }
 
     /// Get scan history for a BonDriver.
-    pub fn get_scan_history(&self, bon_driver_id: i64, limit: i32) -> Result<Vec<ScanHistoryRecord>> {
+    pub fn get_scan_history(
+        &self,
+        bon_driver_id: i64,
+        limit: i32,
+    ) -> Result<Vec<ScanHistoryRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, bon_driver_id, scan_time, channel_count, success, error_message
              FROM scan_history WHERE bon_driver_id = ?1 ORDER BY scan_time DESC LIMIT ?2",
@@ -498,7 +511,9 @@ impl Database {
             raw_name: row.get("raw_name")?,
             channel_name: row.get("channel_name")?,
             physical_ch: row.get::<_, Option<i32>>("physical_ch")?.map(|v| v as u8),
-            remote_control_key: row.get::<_, Option<i32>>("remote_control_key")?.map(|v| v as u8),
+            remote_control_key: row
+                .get::<_, Option<i32>>("remote_control_key")?
+                .map(|v| v as u8),
             service_type: row.get::<_, Option<i32>>("service_type")?.map(|v| v as u8),
             network_name: row.get("network_name")?,
             bon_space: row.get::<_, Option<i32>>("bon_space")?.map(|v| v as u32),
@@ -587,7 +602,7 @@ mod tests {
             create_test_channel(0x7FE8, 1024, 32736), // existing
             create_test_channel(0x7FE8, 1032, 32736), // existing
             create_test_channel(0x7FE8, 1048, 32736), // new
-            // 1040 is missing -> should be disabled
+                                                      // 1040 is missing -> should be disabled
         ];
 
         let result2 = db.merge_scan_results(bon_driver_id, &channels2).unwrap();

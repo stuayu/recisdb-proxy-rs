@@ -49,11 +49,7 @@ pub fn get_region_id_from_nid(nid: u16) -> Option<u8> {
     }
 
     // Normalize NID by adding 0x0400 if 県複フラグ=1
-    let normalized_nid = if nid < 0x7C00 {
-        nid + 0x0400
-    } else {
-        nid
-    };
+    let normalized_nid = if nid < 0x7C00 { nid + 0x0400 } else { nid };
 
     // Calculate region ID
     // network_id = 0x7FF0 - 0x0010 × 地域識別 + 地域事業者識別
@@ -77,21 +73,21 @@ pub fn get_region_id_from_nid(nid: u16) -> Option<u8> {
 pub fn get_prefecture_name_from_region_id(region_id: u8) -> Option<&'static str> {
     match region_id {
         // 広域放送
-        1 => Some("東京"),       // 関東広域 → 東京
-        2 => Some("大阪"),       // 近畿広域 → 大阪
-        3 => Some("愛知"),       // 中京広域 → 愛知
-        4 => Some("北海道"),     // 北海道域
-        5 => Some("岡山"),       // 岡山香川 → 岡山
-        6 => Some("島根"),       // 島根鳥取 → 島根
+        1 => Some("東京"),   // 関東広域 → 東京
+        2 => Some("大阪"),   // 近畿広域 → 大阪
+        3 => Some("愛知"),   // 中京広域 → 愛知
+        4 => Some("北海道"), // 北海道域
+        5 => Some("岡山"),   // 岡山香川 → 岡山
+        6 => Some("島根"),   // 島根鳥取 → 島根
 
         // 北海道地域
-        10 => Some("北海道"),    // 札幌
-        11 => Some("北海道"),    // 函館
-        12 => Some("北海道"),    // 旭川
-        13 => Some("北海道"),    // 帯広
-        14 => Some("北海道"),    // 釧路
-        15 => Some("北海道"),    // 北見
-        16 => Some("北海道"),    // 室蘭
+        10 => Some("北海道"), // 札幌
+        11 => Some("北海道"), // 函館
+        12 => Some("北海道"), // 旭川
+        13 => Some("北海道"), // 帯広
+        14 => Some("北海道"), // 釧路
+        15 => Some("北海道"), // 北見
+        16 => Some("北海道"), // 室蘭
 
         // 東北
         17 => Some("宮城"),
@@ -345,7 +341,10 @@ fn classify_terrestrial_nid(nid: u16) -> (BroadcastType, Option<TerrestrialRegio
         (BroadcastType::Terrestrial, Some(region))
     } else {
         // Not a valid terrestrial NID
-        (BroadcastType::Terrestrial, Some(TerrestrialRegion::Unknown(nid)))
+        (
+            BroadcastType::Terrestrial,
+            Some(TerrestrialRegion::Unknown(nid)),
+        )
     }
 }
 
@@ -563,7 +562,7 @@ mod tests {
         assert_eq!(get_prefecture_name(0x7FC1), Some("愛知"));
 
         // Non-terrestrial should return None
-        assert_eq!(get_prefecture_name(4), None);   // BS
-        assert_eq!(get_prefecture_name(6), None);   // CS
+        assert_eq!(get_prefecture_name(4), None); // BS
+        assert_eq!(get_prefecture_name(6), None); // CS
     }
 }

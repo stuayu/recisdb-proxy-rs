@@ -232,8 +232,12 @@ mod tests {
                 path
             );
 
-            let get = entry.get("get").unwrap_or_else(|| panic!("path '{}' has no `get`", path));
-            let op_id = get["operationId"].as_str().unwrap_or_else(|| panic!("path '{}' has no operationId", path));
+            let get = entry
+                .get("get")
+                .unwrap_or_else(|| panic!("path '{}' has no `get`", path));
+            let op_id = get["operationId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("path '{}' has no operationId", path));
             assert!(
                 get.get("tags").is_some_and(|t| t.is_array()),
                 "operation '{}' is missing a `tags` array (client.js checks \
@@ -249,7 +253,12 @@ mod tests {
         }
 
         for expected in expected_operation_ids {
-            assert!(found.contains(&expected), "docs are missing operationId '{}': {:?}", expected, found);
+            assert!(
+                found.contains(&expected),
+                "docs are missing operationId '{}': {:?}",
+                expected,
+                found
+            );
         }
     }
 
@@ -262,13 +271,22 @@ mod tests {
         let docs = build_docs();
         let paths = docs["paths"].as_object().unwrap();
 
-        let expected_stream_operation_ids =
-            ["getServiceStream", "getProgramStream", "getEventsStream", "getChannelStream"];
+        let expected_stream_operation_ids = [
+            "getServiceStream",
+            "getProgramStream",
+            "getEventsStream",
+            "getChannelStream",
+        ];
 
         for (path, entry) in paths {
             let get = &entry["get"];
             let op_id = get["operationId"].as_str().unwrap();
-            let tags: Vec<&str> = get["tags"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+            let tags: Vec<&str> = get["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+                .collect();
             let is_tagged_stream = tags.contains(&"stream");
             let should_be_stream = expected_stream_operation_ids.contains(&op_id);
             assert_eq!(
@@ -291,7 +309,11 @@ mod tests {
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(content_type.starts_with("application/json"), "content-type was '{}'", content_type);
+        assert!(
+            content_type.starts_with("application/json"),
+            "content-type was '{}'",
+            content_type
+        );
     }
 
     /// `/programs/{id}/stream` and `/events/stream` are both fully

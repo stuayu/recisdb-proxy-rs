@@ -197,9 +197,15 @@ fn parse_duration(b: &[u8]) -> u32 {
     if b == [0xFF, 0xFF, 0xFF] {
         return 0;
     }
-    let Some(h) = bcd_byte_to_u32(b[0]) else { return 0 };
-    let Some(m) = bcd_byte_to_u32(b[1]) else { return 0 };
-    let Some(s) = bcd_byte_to_u32(b[2]) else { return 0 };
+    let Some(h) = bcd_byte_to_u32(b[0]) else {
+        return 0;
+    };
+    let Some(m) = bcd_byte_to_u32(b[1]) else {
+        return 0;
+    };
+    let Some(s) = bcd_byte_to_u32(b[2]) else {
+        return 0;
+    };
     if m >= 60 || s >= 60 {
         return 0;
     }
@@ -291,7 +297,10 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
             let text_len = data[text_offset] as usize;
             if data.len() >= text_offset + 1 + text_len {
                 if text_len != 0 {
-                    fields.push((false, data[text_offset + 1..text_offset + 1 + text_len].to_vec()));
+                    fields.push((
+                        false,
+                        data[text_offset + 1..text_offset + 1 + text_len].to_vec(),
+                    ));
                 }
             }
         }
@@ -326,7 +335,11 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
     }
 
     parts.sort_by_key(|(n, _)| *n);
-    parts.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join("")
+    parts
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Extract the genre byte from the first content_descriptor (0x54) entry,
@@ -494,7 +507,11 @@ mod tests {
             section_number: 0,
             last_section_number: 0,
         };
-        let section = PsiSection { header, data: &data, crc32: 0 };
+        let section = PsiSection {
+            header,
+            data: &data,
+            crc32: 0,
+        };
 
         let eit = EitTable::parse(&section).unwrap();
         assert_eq!(eit.service_id, 0x0408);
@@ -524,7 +541,11 @@ mod tests {
             last_section_number: 0,
         };
         let data = [0u8; 8];
-        let section = PsiSection { header, data: &data, crc32: 0 };
+        let section = PsiSection {
+            header,
+            data: &data,
+            crc32: 0,
+        };
         assert!(EitTable::parse(&section).is_err());
     }
 }

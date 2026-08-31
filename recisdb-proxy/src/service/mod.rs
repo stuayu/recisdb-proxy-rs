@@ -20,10 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod unit_text;
 
-#[cfg(target_os = "linux")]
-mod systemd;
 #[cfg(target_os = "macos")]
 mod launchd;
+#[cfg(target_os = "linux")]
+mod systemd;
 #[cfg(windows)]
 pub mod windows_scm;
 
@@ -406,7 +406,10 @@ mod tests {
 
     #[test]
     fn sanitize_accepts_normal_names() {
-        assert_eq!(sanitize_service_name("recisdb-proxy").unwrap(), "recisdb-proxy");
+        assert_eq!(
+            sanitize_service_name("recisdb-proxy").unwrap(),
+            "recisdb-proxy"
+        );
         assert_eq!(sanitize_service_name("a").unwrap(), "a");
         assert_eq!(sanitize_service_name("a.b_c-9").unwrap(), "a.b_c-9");
         assert_eq!(sanitize_service_name(&"a".repeat(64)).unwrap().len(), 64);

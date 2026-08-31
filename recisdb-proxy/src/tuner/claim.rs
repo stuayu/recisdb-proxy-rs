@@ -17,7 +17,10 @@ pub struct EffectiveClaim {
 
 impl EffectiveClaim {
     pub const fn new(priority: i32, exclusive: bool) -> Self {
-        Self { priority, exclusive }
+        Self {
+            priority,
+            exclusive,
+        }
     }
 
     /// Resolve client controls against the channel default once.
@@ -27,7 +30,11 @@ impl EffectiveClaim {
     /// `exclusive` remains a separate rank component.
     pub const fn resolve(client_priority: i32, exclusive: bool, channel_default: i32) -> Self {
         Self {
-            priority: if client_priority > 0 { client_priority } else { channel_default },
+            priority: if client_priority > 0 {
+                client_priority
+            } else {
+                channel_default
+            },
             exclusive,
         }
     }

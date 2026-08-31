@@ -7,6 +7,6 @@ pub mod channels;
 pub mod tuner;
 
 // Re-export commonly used types
-pub use channels::Channel;
 pub use channels::representation::{ChannelSpace, ChannelType};
+pub use channels::Channel;
 pub use tuner::{Tunable, Tuner, UnTunedTuner, Voltage};

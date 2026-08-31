@@ -197,14 +197,16 @@ impl LogBuffer {
         // still hold: at least one entry in between was evicted.
         let dropped = query.after_seq > 0 && oldest_seq > query.after_seq + 1;
 
-        let min_rank = query.level.and_then(|l| match l.to_ascii_uppercase().as_str() {
-            "ERROR" => Some(4),
-            "WARN" | "WARNING" => Some(3),
-            "INFO" => Some(2),
-            "DEBUG" => Some(1),
-            "TRACE" => Some(0),
-            _ => None,
-        });
+        let min_rank = query
+            .level
+            .and_then(|l| match l.to_ascii_uppercase().as_str() {
+                "ERROR" => Some(4),
+                "WARN" | "WARNING" => Some(3),
+                "INFO" => Some(2),
+                "DEBUG" => Some(1),
+                "TRACE" => Some(0),
+                _ => None,
+            });
         let target_needle = query.target.filter(|t| !t.is_empty());
         let q_needle = query.q.filter(|q| !q.is_empty()).map(|q| q.to_lowercase());
 
@@ -214,7 +216,11 @@ impl LogBuffer {
             .filter(|e| min_rank.is_none_or(|m| level_rank(&e.level) >= m))
             .filter(|e| target_needle.is_none_or(|t| e.target.contains(t)))
             .filter(|e| query.category.matches(&e.target))
-            .filter(|e| q_needle.as_deref().is_none_or(|kw| e.message.to_lowercase().contains(kw)))
+            .filter(|e| {
+                q_needle
+                    .as_deref()
+                    .is_none_or(|kw| e.message.to_lowercase().contains(kw))
+            })
             .cloned()
             .collect();
 
@@ -224,7 +230,11 @@ impl LogBuffer {
             entries.drain(..drop_from_front);
         }
 
-        LogQueryResult { entries, last_seq, dropped }
+        LogQueryResult {
+            entries,
+            last_seq,
+            dropped,
+        }
     }
 }
 
@@ -265,7 +275,8 @@ impl Visit for MessageVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.extra.push((field.name().to_string(), value.to_string()));
+            self.extra
+                .push((field.name().to_string(), value.to_string()));
         }
     }
 }
@@ -317,7 +328,8 @@ impl<S: Subscriber> Layer<S> for LogBufferLayer {
         // natively, which already carry correct metadata.
         let normalized = event.normalized_metadata();
         let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
-        self.buffer.push(*metadata.level(), metadata.target(), message);
+        self.buffer
+            .push(*metadata.level(), metadata.target(), message);
     }
 }
 
@@ -354,7 +366,10 @@ mod tests {
         buf.push(Level::INFO, "t", "c".into());
         buf.push(Level::INFO, "t", "d".into());
 
-        let result = buf.query(LogQuery { limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            limit: 100,
+            ..Default::default()
+        });
         let messages: Vec<&str> = result.entries.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, vec!["b", "c", "d"]);
         assert_eq!(result.last_seq, 4);
@@ -362,8 +377,17 @@ mod tests {
 
     #[test]
     fn level_filter_is_at_least_severity() {
-        let buf = buffer_with(vec![entry(1, "TRACE"), entry(2, "INFO"), entry(3, "WARN"), entry(4, "ERROR")]);
-        let result = buf.query(LogQuery { level: Some("warn"), limit: 100, ..Default::default() });
+        let buf = buffer_with(vec![
+            entry(1, "TRACE"),
+            entry(2, "INFO"),
+            entry(3, "WARN"),
+            entry(4, "ERROR"),
+        ]);
+        let result = buf.query(LogQuery {
+            level: Some("warn"),
+            limit: 100,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![3, 4]);
     }
@@ -373,7 +397,11 @@ mod tests {
         let mut e = entry(1, "INFO");
         e.target = "recisdb_proxy::tuner::pool".to_string();
         let buf = buffer_with(vec![e, entry(2, "INFO")]);
-        let result = buf.query(LogQuery { target: Some("tuner::pool"), limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            target: Some("tuner::pool"),
+            limit: 100,
+            ..Default::default()
+        });
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].seq, 1);
     }
@@ -383,14 +411,22 @@ mod tests {
         let mut e = entry(1, "INFO");
         e.message = "Signal LOCKED".to_string();
         let buf = buffer_with(vec![e]);
-        let result = buf.query(LogQuery { q: Some("locked"), limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            q: Some("locked"),
+            limit: 100,
+            ..Default::default()
+        });
         assert_eq!(result.entries.len(), 1);
     }
 
     #[test]
     fn after_seq_returns_only_newer_entries() {
         let buf = buffer_with(vec![entry(1, "INFO"), entry(2, "INFO"), entry(3, "INFO")]);
-        let result = buf.query(LogQuery { after_seq: 1, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            after_seq: 1,
+            limit: 100,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![2, 3]);
         assert!(!result.dropped);
@@ -400,7 +436,11 @@ mod tests {
     fn after_seq_older_than_buffer_reports_dropped() {
         // Buffer only holds seq 5..=7 (2..=4 were evicted); client last saw seq 2.
         let buf = buffer_with(vec![entry(5, "INFO"), entry(6, "INFO"), entry(7, "INFO")]);
-        let result = buf.query(LogQuery { after_seq: 2, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            after_seq: 2,
+            limit: 100,
+            ..Default::default()
+        });
         assert!(result.dropped);
         // Entries are still returned (best-effort) even though dropped=true.
         assert_eq!(result.entries.len(), 3);
@@ -409,7 +449,11 @@ mod tests {
     #[test]
     fn after_seq_zero_is_never_dropped() {
         let buf = buffer_with(vec![entry(50, "INFO"), entry(51, "INFO")]);
-        let result = buf.query(LogQuery { after_seq: 0, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            after_seq: 0,
+            limit: 100,
+            ..Default::default()
+        });
         assert!(!result.dropped);
     }
 
@@ -418,14 +462,21 @@ mod tests {
         // Client's last_seq (4) is exactly one before the oldest surviving
         // entry (5): no gap, nothing was missed.
         let buf = buffer_with(vec![entry(5, "INFO"), entry(6, "INFO")]);
-        let result = buf.query(LogQuery { after_seq: 4, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            after_seq: 4,
+            limit: 100,
+            ..Default::default()
+        });
         assert!(!result.dropped);
     }
 
     #[test]
     fn limit_keeps_the_most_recent_matches() {
         let buf = buffer_with((1..=10).map(|i| entry(i, "INFO")).collect());
-        let result = buf.query(LogQuery { limit: 3, ..Default::default() });
+        let result = buf.query(LogQuery {
+            limit: 3,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![8, 9, 10]);
     }
@@ -440,7 +491,11 @@ mod tests {
     #[test]
     fn category_server_excludes_access_log() {
         let buf = buffer_with(vec![access_entry(1), entry(2, "INFO"), access_entry(3)]);
-        let result = buf.query(LogQuery { category: LogCategory::Server, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            category: LogCategory::Server,
+            limit: 100,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![2]);
     }
@@ -448,7 +503,11 @@ mod tests {
     #[test]
     fn category_access_returns_only_access_log() {
         let buf = buffer_with(vec![access_entry(1), entry(2, "INFO"), access_entry(3)]);
-        let result = buf.query(LogQuery { category: LogCategory::Access, limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            category: LogCategory::Access,
+            limit: 100,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 3]);
     }
@@ -456,7 +515,10 @@ mod tests {
     #[test]
     fn category_all_by_default_returns_both() {
         let buf = buffer_with(vec![access_entry(1), entry(2, "INFO")]);
-        let result = buf.query(LogQuery { limit: 100, ..Default::default() });
+        let result = buf.query(LogQuery {
+            limit: 100,
+            ..Default::default()
+        });
         let seqs: Vec<u64> = result.entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 2]);
     }
@@ -518,8 +580,15 @@ mod tests {
             tracing_log::format_trace(&record).unwrap();
         });
 
-        let result = buffer.query(LogQuery { limit: 10, ..Default::default() });
-        assert_eq!(result.entries.len(), 1, "expected exactly one buffered entry");
+        let result = buffer.query(LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "expected exactly one buffered entry"
+        );
         result.entries.into_iter().next().unwrap()
     }
 

@@ -192,10 +192,7 @@ impl Database {
         }
 
         values.push(Box::new(id));
-        let sql = format!(
-            "UPDATE bon_drivers SET {} WHERE id = ?",
-            updates.join(", ")
-        );
+        let sql = format!("UPDATE bon_drivers SET {} WHERE id = ?", updates.join(", "));
 
         let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, params.as_slice())?;

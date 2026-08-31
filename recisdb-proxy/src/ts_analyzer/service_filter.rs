@@ -21,10 +21,10 @@ use std::collections::HashSet;
 
 use log::{debug, trace, warn};
 
-use super::packet::{TsPacket, TS_PACKET_SIZE, SYNC_BYTE};
-use super::pat::{PatTable, PatEntry};
+use super::packet::{TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
+use super::pat::{PatEntry, PatTable};
 use super::pmt::PmtTable;
-use super::psi::{PsiSection, SectionCollector, crc32_mpeg2};
+use super::psi::{crc32_mpeg2, PsiSection, SectionCollector};
 
 /// Well-known PIDs that are always passed through.
 ///
@@ -213,7 +213,9 @@ impl TsServiceFilter {
 
         debug!(
             "TsServiceFilter: PAT version {} -> {}, {} programs",
-            self.pat_version.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.pat_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             pat.version_number,
             pat.programs.len()
         );
@@ -239,7 +241,10 @@ impl TsServiceFilter {
                 self.pmt_collector.clear();
                 self.pmt_version = None;
                 self.ready = false;
-                debug!("TsServiceFilter: PMT PID for SID {} = 0x{:04X}", self.target_sid, pid);
+                debug!(
+                    "TsServiceFilter: PMT PID for SID {} = 0x{:04X}",
+                    self.target_sid, pid
+                );
             }
         } else {
             warn!(
@@ -292,7 +297,9 @@ impl TsServiceFilter {
 
         debug!(
             "TsServiceFilter: PMT version {} -> {}, {} streams, PCR PID=0x{:04X}",
-            self.pmt_version.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.pmt_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             pmt.version_number,
             pmt.streams.len(),
             pmt.pcr_pid,
@@ -451,7 +458,10 @@ mod tests {
 
         let mut filter = filter;
         filter.reset();
-        assert!(filter.allowed_pids.contains(&0x0024), "reset must restore it too");
+        assert!(
+            filter.allowed_pids.contains(&0x0024),
+            "reset must restore it too"
+        );
     }
 
     #[test]

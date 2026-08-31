@@ -205,8 +205,14 @@ impl DvbV5Tuner {
         // ioctl/read, which is exactly the bug this backend fixes (the old
         // fallback to CharDevTuner would "successfully" open
         // /dev/dvb/adapter0 and then fail every ioctl with ENOTTY).
-        let frontend_fd = OpenOptions::new().read(true).write(true).open(&frontend_path)?;
-        let demux_fd = OpenOptions::new().read(true).write(true).open(&demux_path)?;
+        let frontend_fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&frontend_path)?;
+        let demux_fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&demux_path)?;
         let dvr_fd = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -230,8 +236,7 @@ impl DvbV5Tuner {
         // cheapest way to tell that apart from an antenna problem.
         info!(
             "DvbV5Tuner: opened {} (ISDB-T supported: {})",
-            frontend_path,
-            supports_isdbt
+            frontend_path, supports_isdbt
         );
 
         Ok(Self {
@@ -393,7 +398,10 @@ impl DvbV5Tuner {
                 flags: DMX_IMMEDIATE_START,
             };
             unsafe {
-                dmx_set_pes_filter(self.demux_fd.as_raw_fd(), &filter as *const DmxPesFilterParams)
+                dmx_set_pes_filter(
+                    self.demux_fd.as_raw_fd(),
+                    &filter as *const DmxPesFilterParams,
+                )
             }
             .map_err(io::Error::from)?;
         }
@@ -415,11 +423,7 @@ impl DvbV5Tuner {
         };
         info!(
             "DvbV5Tuner: ch={} ({} Hz): {} after {} ms (fe_status=0x{:02x})",
-            channel,
-            freq_hz,
-            reason,
-            waited_ms,
-            last_status
+            channel, freq_hz, reason, waited_ms, last_status
         );
 
         Ok(())

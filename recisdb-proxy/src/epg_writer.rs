@@ -74,7 +74,11 @@ impl EpgWriter {
                  instance will receive no events (EpgWriter::new called more than once?)"
             );
         }
-        Self { database, rx, events_tx }
+        Self {
+            database,
+            rx,
+            events_tx,
+        }
     }
 
     /// Run the batching/UPSERT loop. Never returns during normal operation
@@ -127,7 +131,11 @@ impl EpgWriter {
         }
     }
 
-    async fn flush(&self, batch: &mut HashMap<(u16, u16, u16, u16), ProgramUpsert>, flush_count: &mut u32) {
+    async fn flush(
+        &self,
+        batch: &mut HashMap<(u16, u16, u16, u16), ProgramUpsert>,
+        flush_count: &mut u32,
+    ) {
         if batch.is_empty() {
             return;
         }
@@ -160,7 +168,10 @@ impl EpgWriter {
                     }
                 }
             }
-            Err(e) => error!("[EpgWriter] failed to upsert {} program row(s): {}", count, e),
+            Err(e) => error!(
+                "[EpgWriter] failed to upsert {} program row(s): {}",
+                count, e
+            ),
         }
 
         *flush_count += 1;

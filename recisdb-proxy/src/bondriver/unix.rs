@@ -63,8 +63,8 @@ fn space_channel_to_ioctl_freq(space: u32, channel: u32) -> Result<IoctlFreq, io
             }
             let bs_ch = (channel * 2 + 1) as i32; // 1, 3, 5, ..., 23
             Ok(IoctlFreq {
-                ch: bs_ch / 2,  // px4-drv: ch_num / 2
-                slot: -1,       // -1 = AsIs (pass all TS streams)
+                ch: bs_ch / 2, // px4-drv: ch_num / 2
+                slot: -1,      // -1 = AsIs (pass all TS streams)
             })
         }
         2 => {
@@ -135,10 +135,12 @@ impl CharDevTuner {
         // Ignore errors — older drivers that don't support this ioctl return EINVAL.
         match space {
             0 => {
-                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 0) }; // ISDB-T
+                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 0) };
+                // ISDB-T
             }
             _ => {
-                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 1) }; // ISDB-S
+                let _ = unsafe { ptx_set_sys_mode(self.ioctl_file.as_raw_fd(), 1) };
+                // ISDB-S
             }
         }
 
@@ -166,7 +168,10 @@ impl CharDevTuner {
             start_rec(self.ioctl_file.as_raw_fd()).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("start_rec ioctl failed (space={}, ch={}): {}", space, channel, e),
+                    format!(
+                        "start_rec ioctl failed (space={}, ch={}): {}",
+                        space, channel, e
+                    ),
                 )
             })?;
         }
@@ -188,8 +193,7 @@ impl CharDevTuner {
         if space == 0 {
             // Terrestrial (GR): CNR → C/N dB (px4-drv formula, matches recisdb-rs)
             let p = (5505024.0_f64 / (raw as f64)).log10() * 10.0;
-            let cn = (0.000024 * p * p * p * p)
-                - (0.0016 * p * p * p)
+            let cn = (0.000024 * p * p * p * p) - (0.0016 * p * p * p)
                 + (0.0398 * p * p)
                 + (0.5491 * p)
                 + 3.0965;
@@ -218,11 +222,10 @@ impl CharDevTuner {
             } else if sig >= 0xB0 {
                 0.0_f32
             } else {
-                let f_mix_rate =
-                    (((sig as u16 & 0x0F) << 8) | sig as u16) as f64 / 4096.0;
+                let f_mix_rate = (((sig as u16 & 0x0F) << 8) | sig as u16) as f64 / 4096.0;
                 let idx = (sig >> 4) as usize;
-                (AF_LEVEL_TABLE[idx] * (1.0 - f_mix_rate)
-                    + AF_LEVEL_TABLE[idx + 1] * f_mix_rate) as f32
+                (AF_LEVEL_TABLE[idx] * (1.0 - f_mix_rate) + AF_LEVEL_TABLE[idx + 1] * f_mix_rate)
+                    as f32
             }
         }
     }
@@ -247,8 +250,7 @@ impl CharDevTuner {
 
     /// Read TS data from the device. Returns (bytes_read, remaining=0).
     pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
-        let n = nix::unistd::read(self.file.as_raw_fd(), buf)
-            .map_err(io::Error::from)?;
+        let n = nix::unistd::read(self.file.as_raw_fd(), buf).map_err(io::Error::from)?;
         Ok((n, 0))
     }
 

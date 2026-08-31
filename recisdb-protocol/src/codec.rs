@@ -22,7 +22,10 @@ pub fn encode_client_message(msg: &ClientMessage) -> Result<Bytes, ProtocolError
     let mut payload = BytesMut::new();
 
     match msg {
-        ClientMessage::Hello { version, stream_class } => {
+        ClientMessage::Hello {
+            version,
+            stream_class,
+        } => {
             payload.put_u16_le(*version);
             payload.put_u8((*stream_class).into());
         }
@@ -42,18 +45,33 @@ pub fn encode_client_message(msg: &ClientMessage) -> Result<Bytes, ProtocolError
         ClientMessage::CloseTuner => {
             // Empty payload
         }
-        ClientMessage::SetChannel { channel, priority, exclusive } => {
+        ClientMessage::SetChannel {
+            channel,
+            priority,
+            exclusive,
+        } => {
             payload.put_u8(*channel);
             payload.put_i32_le(*priority);
             payload.put_u8(if *exclusive { 1 } else { 0 });
         }
-        ClientMessage::SetChannelSpace { space, channel, priority, exclusive } => {
+        ClientMessage::SetChannelSpace {
+            space,
+            channel,
+            priority,
+            exclusive,
+        } => {
             payload.put_u32_le(*space);
             payload.put_u32_le(*channel);
             payload.put_i32_le(*priority);
             payload.put_u8(if *exclusive { 1 } else { 0 });
         }
-        ClientMessage::SetChannelSpaceInGroup { group_name, space_idx, channel, priority, exclusive } => {
+        ClientMessage::SetChannelSpaceInGroup {
+            group_name,
+            space_idx,
+            channel,
+            priority,
+            exclusive,
+        } => {
             let name_bytes = group_name.as_bytes();
             payload.put_u16_le(name_bytes.len() as u16);
             payload.put_slice(name_bytes);
@@ -140,11 +158,17 @@ pub fn encode_server_message(msg: &ServerMessage) -> Result<Bytes, ProtocolError
         ServerMessage::CloseTunerAck { success } => {
             payload.put_u8(if *success { 1 } else { 0 });
         }
-        ServerMessage::SetChannelAck { success, error_code } => {
+        ServerMessage::SetChannelAck {
+            success,
+            error_code,
+        } => {
             payload.put_u8(if *success { 1 } else { 0 });
             payload.put_u16_le(*error_code);
         }
-        ServerMessage::SetChannelSpaceAck { success, error_code } => {
+        ServerMessage::SetChannelSpaceAck {
+            success,
+            error_code,
+        } => {
             payload.put_u8(if *success { 1 } else { 0 });
             payload.put_u16_le(*error_code);
         }
@@ -157,7 +181,10 @@ pub fn encode_server_message(msg: &ServerMessage) -> Result<Bytes, ProtocolError
         ServerMessage::EnumChannelNameAck { name } => {
             encode_optional_string(&mut payload, name);
         }
-        ServerMessage::StartStreamAck { success, error_code } => {
+        ServerMessage::StartStreamAck {
+            success,
+            error_code,
+        } => {
             payload.put_u8(if *success { 1 } else { 0 });
             payload.put_u16_le(*error_code);
         }
@@ -170,11 +197,17 @@ pub fn encode_server_message(msg: &ServerMessage) -> Result<Bytes, ProtocolError
         ServerMessage::PurgeStreamAck { success } => {
             payload.put_u8(if *success { 1 } else { 0 });
         }
-        ServerMessage::SetLnbPowerAck { success, error_code } => {
+        ServerMessage::SetLnbPowerAck {
+            success,
+            error_code,
+        } => {
             payload.put_u8(if *success { 1 } else { 0 });
             payload.put_u16_le(*error_code);
         }
-        ServerMessage::Error { error_code, message } => {
+        ServerMessage::Error {
+            error_code,
+            message,
+        } => {
             payload.put_u16_le(*error_code);
             let msg_bytes = message.as_bytes();
             payload.put_u16_le(msg_bytes.len() as u16);
@@ -193,7 +226,10 @@ pub fn encode_server_message(msg: &ServerMessage) -> Result<Bytes, ProtocolError
             encode_optional_u32(&mut payload, space);
             encode_optional_u32(&mut payload, channel);
         }
-        ServerMessage::GetChannelListAck { channels, timestamp } => {
+        ServerMessage::GetChannelListAck {
+            channels,
+            timestamp,
+        } => {
             payload.put_i64_le(*timestamp);
             payload.put_u32_le(channels.len() as u32);
             for ch in channels {
@@ -499,8 +535,7 @@ fn decode_string(buf: &mut Bytes) -> Result<String, ProtocolError> {
         });
     }
     let bytes = buf.copy_to_bytes(len);
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| ProtocolError::DecodeError(e.to_string()))
+    String::from_utf8(bytes.to_vec()).map_err(|e| ProtocolError::DecodeError(e.to_string()))
 }
 
 /// Frame header information.
@@ -531,8 +566,8 @@ pub fn decode_header(buf: &[u8]) -> Result<Option<FrameHeader>, ProtocolError> {
 
     // Read message type
     let type_val = u16::from_le_bytes(buf[8..10].try_into().unwrap());
-    let message_type = MessageType::try_from(type_val)
-        .map_err(|v| ProtocolError::UnknownMessageType(v))?;
+    let message_type =
+        MessageType::try_from(type_val).map_err(|v| ProtocolError::UnknownMessageType(v))?;
 
     Ok(Some(FrameHeader {
         payload_len,
@@ -572,7 +607,10 @@ pub fn decode_client_message(
             } else {
                 StreamClass::View
             };
-            Ok(ClientMessage::Hello { version, stream_class })
+            Ok(ClientMessage::Hello {
+                version,
+                stream_class,
+            })
         }
         MessageType::Ping => Ok(ClientMessage::Ping),
         MessageType::OpenTuner => {
@@ -592,7 +630,7 @@ pub fn decode_client_message(
             let path_bytes = payload.copy_to_bytes(path_len);
             let tuner_path = String::from_utf8(path_bytes.to_vec())
                 .map_err(|e| ProtocolError::DecodeError(e.to_string()))?;
-            
+
             // Check if this is actually an OpenTunerWithGroup message
             // (client should use proper message type, but handle both)
             if tuner_path.is_empty() {
@@ -612,7 +650,11 @@ pub fn decode_client_message(
             let channel = payload.get_u8();
             let priority = payload.get_i32_le();
             let exclusive = payload.get_u8() != 0;
-            Ok(ClientMessage::SetChannel { channel, priority, exclusive })
+            Ok(ClientMessage::SetChannel {
+                channel,
+                priority,
+                exclusive,
+            })
         }
         MessageType::SetChannelSpace => {
             if payload.remaining() < 13 {
@@ -625,7 +667,12 @@ pub fn decode_client_message(
             let channel = payload.get_u32_le();
             let priority = payload.get_i32_le();
             let exclusive = payload.get_u8() != 0;
-            Ok(ClientMessage::SetChannelSpace { space, channel, priority, exclusive })
+            Ok(ClientMessage::SetChannelSpace {
+                space,
+                channel,
+                priority,
+                exclusive,
+            })
         }
         MessageType::GetSignalLevel => Ok(ClientMessage::GetSignalLevel),
         MessageType::EnumTuningSpace => {
@@ -768,7 +815,10 @@ pub fn decode_server_message(
             }
             let success = payload.get_u8() != 0;
             let error_code = payload.get_u16_le();
-            Ok(ServerMessage::SetChannelAck { success, error_code })
+            Ok(ServerMessage::SetChannelAck {
+                success,
+                error_code,
+            })
         }
         MessageType::SetChannelSpaceAck => {
             if payload.remaining() < 3 {
@@ -779,7 +829,10 @@ pub fn decode_server_message(
             }
             let success = payload.get_u8() != 0;
             let error_code = payload.get_u16_le();
-            Ok(ServerMessage::SetChannelSpaceAck { success, error_code })
+            Ok(ServerMessage::SetChannelSpaceAck {
+                success,
+                error_code,
+            })
         }
         MessageType::GetSignalLevelAck => {
             if payload.remaining() < 4 {
@@ -808,7 +861,10 @@ pub fn decode_server_message(
             }
             let success = payload.get_u8() != 0;
             let error_code = payload.get_u16_le();
-            Ok(ServerMessage::StartStreamAck { success, error_code })
+            Ok(ServerMessage::StartStreamAck {
+                success,
+                error_code,
+            })
         }
         MessageType::StopStreamAck => {
             if payload.remaining() < 1 {
@@ -843,7 +899,10 @@ pub fn decode_server_message(
             }
             let success = payload.get_u8() != 0;
             let error_code = payload.get_u16_le();
-            Ok(ServerMessage::SetLnbPowerAck { success, error_code })
+            Ok(ServerMessage::SetLnbPowerAck {
+                success,
+                error_code,
+            })
         }
         MessageType::SelectLogicalChannelAck => {
             if payload.remaining() < 3 {
@@ -878,7 +937,10 @@ pub fn decode_server_message(
             for _ in 0..count {
                 channels.push(decode_client_channel_info(&mut payload)?);
             }
-            Ok(ServerMessage::GetChannelListAck { channels, timestamp })
+            Ok(ServerMessage::GetChannelListAck {
+                channels,
+                timestamp,
+            })
         }
         MessageType::SetServiceFilterAck => {
             if payload.remaining() < 1 {
@@ -908,7 +970,10 @@ pub fn decode_server_message(
             let msg_bytes = payload.copy_to_bytes(msg_len);
             let message = String::from_utf8(msg_bytes.to_vec())
                 .map_err(|e| ProtocolError::DecodeError(e.to_string()))?;
-            Ok(ServerMessage::Error { error_code, message })
+            Ok(ServerMessage::Error {
+                error_code,
+                message,
+            })
         }
         _ => Err(ProtocolError::UnknownMessageType(msg_type as u16)),
     }
@@ -920,7 +985,10 @@ mod tests {
 
     #[test]
     fn test_encode_decode_hello() {
-        let msg = ClientMessage::Hello { version: 2, stream_class: StreamClass::Record };
+        let msg = ClientMessage::Hello {
+            version: 2,
+            stream_class: StreamClass::Record,
+        };
         let encoded = encode_client_message(&msg).unwrap();
 
         // Verify header
@@ -946,7 +1014,10 @@ mod tests {
         let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
         assert_eq!(
             decoded,
-            ClientMessage::Hello { version: 1, stream_class: StreamClass::View }
+            ClientMessage::Hello {
+                version: 1,
+                stream_class: StreamClass::View
+            }
         );
     }
 
@@ -967,7 +1038,10 @@ mod tests {
             let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
             assert_eq!(
                 decoded,
-                ClientMessage::Hello { version: 2, stream_class: expected }
+                ClientMessage::Hello {
+                    version: 2,
+                    stream_class: expected
+                }
             );
         }
     }
@@ -984,7 +1058,10 @@ mod tests {
         let decoded = decode_client_message(MessageType::Hello, payload).unwrap();
         assert_eq!(
             decoded,
-            ClientMessage::Hello { version: 2, stream_class: StreamClass::View }
+            ClientMessage::Hello {
+                version: 2,
+                stream_class: StreamClass::View
+            }
         );
     }
 

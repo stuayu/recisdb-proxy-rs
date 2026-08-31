@@ -296,7 +296,10 @@ mod imp {
             .map_err(|e| format!("ダウンロードに失敗しました: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("ダウンロードに失敗しました (HTTP {})", resp.status()));
+            return Err(format!(
+                "ダウンロードに失敗しました (HTTP {})",
+                resp.status()
+            ));
         }
 
         let mut file = std::fs::File::create(dest_zip).map_err(|e| e.to_string())?;
@@ -316,7 +319,9 @@ mod imp {
             .filter_map(|e| e.ok())
             .find(|e| {
                 e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    && e.file_name().to_string_lossy().starts_with("px4_drv_winusb")
+                    && e.file_name()
+                        .to_string_lossy()
+                        .starts_with("px4_drv_winusb")
             })
             .map(|e| e.path())
             .ok_or_else(|| "展開後のフォルダが見つかりませんでした".to_string())
@@ -381,9 +386,9 @@ mod imp {
 
         match status.code() {
             Some(code) if is_pnputil_success_code(code) => Ok(()),
-            Some(1223) => Err(
-                "管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string(),
-            ),
+            Some(1223) => {
+                Err("管理者権限の許可がキャンセルされました。もう一度お試しください。".to_string())
+            }
             code => {
                 // 終了コードの取得経路(PowerShellのパイプライン越し等)に
                 // 環境依存の問題があっても取りこぼさないよう、ログの内容
@@ -393,7 +398,8 @@ mod imp {
                     return Ok(());
                 }
 
-                let mut msg = format!("ドライバのインストールに失敗しました (終了コード: {code:?})");
+                let mut msg =
+                    format!("ドライバのインストールに失敗しました (終了コード: {code:?})");
                 if let Some(detail) = read_install_log_tail(&log_path) {
                     msg.push_str("\n\n--- 詳細ログ (cert-install.jse / pnputil の出力) ---\n");
                     msg.push_str(&detail);
@@ -503,7 +509,10 @@ mod imp {
     ) -> Result<Vec<String>, String> {
         let model = find_model(usb_pid).ok_or_else(|| "対応していないデバイスです".to_string())?;
 
-        on_progress(&format!("{} 用ドライバの最新版を確認しています…", model.label));
+        on_progress(&format!(
+            "{} 用ドライバの最新版を確認しています…",
+            model.label
+        ));
         let (asset_name, url) = fetch_latest_release_asset()?;
 
         let cache_dir = install_dir.join("drivers").join("px4_drv_winusb");
@@ -545,7 +554,8 @@ mod imp {
         #[test]
         #[ignore]
         fn download_and_extract_latest_px4_drv_winusb() {
-            let (asset_name, url) = fetch_latest_release_asset().expect("asset lookup should succeed");
+            let (asset_name, url) =
+                fetch_latest_release_asset().expect("asset lookup should succeed");
             assert!(asset_name.starts_with("px4_drv_winusb-"));
             assert!(asset_name.ends_with(".zip"));
 
@@ -560,7 +570,10 @@ mod imp {
             let root = extract_zip(&zip_path, &dir).expect("extract should succeed");
             assert!(root.join("Driver").join("PX-W3U4.inf").exists());
             assert!(root.join("Driver").join("cert-install.jse").exists());
-            assert!(root.join("BonDriver_PX4_64bit").join("BonDriver_PX4-T.dll").exists());
+            assert!(root
+                .join("BonDriver_PX4_64bit")
+                .join("BonDriver_PX4-T.dll")
+                .exists());
 
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -662,7 +675,10 @@ mod tests {
         let model = find_model(0x083f).expect("PX-W3U4 should be a known model");
         assert_eq!(model.label, "PLEX PX-W3U4");
         assert_eq!(model.bondriver_folder, "BonDriver_PX4");
-        assert_eq!(model.dll_names, &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"]);
+        assert_eq!(
+            model.dll_names,
+            &["BonDriver_PX4-S.dll", "BonDriver_PX4-T.dll"]
+        );
     }
 
     #[test]
@@ -712,6 +728,9 @@ mod tests {
 
     #[test]
     fn instances_per_unit_for_returns_none_for_unknown_dll() {
-        assert_eq!(instances_per_unit_for(0x083f, "BonDriver_Unknown.dll"), None);
+        assert_eq!(
+            instances_per_unit_for(0x083f, "BonDriver_Unknown.dll"),
+            None
+        );
     }
 }

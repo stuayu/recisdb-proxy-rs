@@ -21,26 +21,26 @@
 //! }
 //! ```
 
-mod packet;
-mod psi;
-mod pat;
-mod pmt;
-mod nit;
-mod sdt;
-mod eit;
 mod analyzer;
 mod descriptors;
+mod eit;
+mod nit;
+mod packet;
+mod pat;
+mod pmt;
+mod psi;
+mod sdt;
 pub mod service_filter;
 
-pub use packet::{TsPacket, TsHeader, AdaptationField, TS_PACKET_SIZE, SYNC_BYTE};
-pub use psi::{PsiSection, PsiHeader, SectionCollector};
-pub use pat::{PatTable, PatEntry};
-pub use pmt::{PmtTable, PmtStream};
-pub use nit::{uhf_channel_from_frequency, NitTable, NitTransportStream};
-pub use sdt::{SdtTable, SdtService};
-pub use eit::{EitTable, EitEvent};
-pub use analyzer::{TsAnalyzer, AnalyzerConfig, AnalyzerResult};
+pub use analyzer::{AnalyzerConfig, AnalyzerResult, TsAnalyzer};
 pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliveryDescriptor};
+pub use eit::{EitEvent, EitTable};
+pub use nit::{uhf_channel_from_frequency, NitTable, NitTransportStream};
+pub use packet::{AdaptationField, TsHeader, TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
+pub use pat::{PatEntry, PatTable};
+pub use pmt::{PmtStream, PmtTable};
+pub use psi::{PsiHeader, PsiSection, SectionCollector};
+pub use sdt::{SdtService, SdtTable};
 
 /// Well-known PIDs in MPEG-TS.
 pub mod pid {

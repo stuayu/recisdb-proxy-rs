@@ -12,21 +12,21 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 
 use recisdb_protocol::{
-    decode_header, decode_server_message, encode_client_message, ClientMessage,
-    MessageType, ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
+    decode_header, decode_server_message, encode_client_message, ClientMessage, MessageType,
+    ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::client::buffer::TsRingBuffer;
 use crate::file_log;
 
 #[cfg(feature = "tls")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls")]
 use std::fs::File;
 #[cfg(feature = "tls")]
 use std::io::BufReader;
 #[cfg(feature = "tls")]
 use std::path::Path;
-#[cfg(feature = "tls")]
-use rustls::pki_types::ServerName;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
@@ -172,7 +172,12 @@ enum ChannelSel {
     /// IBonDriver v1 `SetChannel(BYTE)`.
     V1 { channel: u8 },
     /// IBonDriver v2 `SetChannel(space, channel)`.
-    V2 { space: u32, channel: u32, priority: i32, exclusive: bool },
+    V2 {
+        space: u32,
+        channel: u32,
+        priority: i32,
+        exclusive: bool,
+    },
 }
 
 /// Snapshot of the session state the client asked for, used to rebuild the
@@ -345,7 +350,11 @@ impl Connection {
                     self.disconnect();
                 }
                 other => {
-                    file_log!(warn, "connect: Already connected or connecting, state = {:?}", other);
+                    file_log!(
+                        warn,
+                        "connect: Already connected or connecting, state = {:?}",
+                        other
+                    );
                     return false;
                 }
             }
@@ -399,7 +408,11 @@ impl Connection {
         let config = self.config.clone();
         let buffer = Arc::clone(&self.buffer);
 
-        file_log!(info, "connect: Spawning connection supervisor to {}", config.server_addr);
+        file_log!(
+            info,
+            "connect: Spawning connection supervisor to {}",
+            config.server_addr
+        );
         runtime.spawn(async move {
             file_log!(info, "connect: Connection supervisor started");
             connection_supervisor(conn, config, req_rx, resp_tx, buffer).await;
@@ -427,15 +440,22 @@ impl Connection {
 
         // Send service filter preference if single-service mode is enabled
         if self.config.single_service {
-            file_log!(info, "connect: Sending SetServiceFilter (single_service=true)");
-            let resp = self.send_request(ClientMessage::SetServiceFilter { single_service: true });
+            file_log!(
+                info,
+                "connect: Sending SetServiceFilter (single_service=true)"
+            );
+            let resp = self.send_request(ClientMessage::SetServiceFilter {
+                single_service: true,
+            });
             match resp {
                 Some(ServerMessage::SetServiceFilterAck { success }) if success => {
                     file_log!(info, "connect: Service filter set to single-service mode");
                 }
                 _ => {
                     file_log!(warn, "connect: Server did not accept SetServiceFilter, continuing with all-service mode");
-                    warn!("Server did not accept SetServiceFilter, continuing with all-service mode");
+                    warn!(
+                        "Server did not accept SetServiceFilter, continuing with all-service mode"
+                    );
                 }
             }
         }
@@ -489,7 +509,11 @@ impl Connection {
     /// change: drop anything already queued before sending (it can only belong
     /// to an abandoned request), and skip replies whose type cannot answer the
     /// request we just sent.
-    fn send_request_with_timeout(&self, msg: ClientMessage, timeout: Duration) -> Option<ServerMessage> {
+    fn send_request_with_timeout(
+        &self,
+        msg: ClientMessage,
+        timeout: Duration,
+    ) -> Option<ServerMessage> {
         // Fast-fail while the link is known-down (the supervisor is backing off
         // or re-establishing).  Otherwise a request would sit in the channel
         // unprocessed and block the caller — and hold the response_rx lock — for
@@ -499,7 +523,12 @@ impl Connection {
         // those responsive.
         if self.link_status.load(Ordering::Acquire) == link::DOWN {
             debug!("[Connection] Link down; failing request fast");
-            file_log!(warn, "RPC {} skipped: link is down (state={:?})", client_message_name(&msg), self.state());
+            file_log!(
+                warn,
+                "RPC {} skipped: link is down (state={:?})",
+                client_message_name(&msg),
+                self.state()
+            );
             return None;
         }
 
@@ -523,18 +552,32 @@ impl Connection {
             stale += 1;
         }
         if stale > 0 {
-            warn!("[Connection] Discarded {} stale response(s) before sending", stale);
-            file_log!(warn, "[Connection] Discarded {} stale response(s) before sending", stale);
+            warn!(
+                "[Connection] Discarded {} stale response(s) before sending",
+                stale
+            );
+            file_log!(
+                warn,
+                "[Connection] Discarded {} stale response(s) before sending",
+                stale
+            );
         }
 
         // Send the request (briefly holds request_tx lock).
         {
             let tx = self.request_tx.lock();
             let tx = tx.as_ref()?;
-            debug!("[Connection] Sending message: {:?}", std::mem::discriminant(&msg));
+            debug!(
+                "[Connection] Sending message: {:?}",
+                std::mem::discriminant(&msg)
+            );
             if tx.blocking_send(msg.clone()).is_err() {
                 error!("[Connection] Failed to send request to server");
-                file_log!(error, "RPC {} failed: request channel is closed", client_message_name(&msg));
+                file_log!(
+                    error,
+                    "RPC {} failed: request channel is closed",
+                    client_message_name(&msg)
+                );
                 return None;
             }
         }
@@ -550,7 +593,13 @@ impl Connection {
             let now = Instant::now();
             if now >= deadline {
                 warn!("[Connection] Request timed out after {:?}", timeout);
-                file_log!(error, "RPC {} timed out after {:?} (state={:?})", client_message_name(&msg), timeout, self.state());
+                file_log!(
+                    error,
+                    "RPC {} timed out after {:?} (state={:?})",
+                    client_message_name(&msg),
+                    timeout,
+                    self.state()
+                );
                 return None;
             }
             let wait = SLICE.min(deadline - now);
@@ -567,8 +616,18 @@ impl Connection {
                         );
                         continue;
                     }
-                    if let ServerMessage::Error { error_code, message } = &resp {
-                        file_log!(error, "RPC {} rejected: error_code={} message={:?}", client_message_name(&msg), error_code, message);
+                    if let ServerMessage::Error {
+                        error_code,
+                        message,
+                    } = &resp
+                    {
+                        file_log!(
+                            error,
+                            "RPC {} rejected: error_code={} message={:?}",
+                            client_message_name(&msg),
+                            error_code,
+                            message
+                        );
                     }
                     debug!("[Connection] Received response");
                     return Some(resp);
@@ -578,14 +637,23 @@ impl Connection {
                     // waited, so we don't hold the lock for the full timeout.
                     if self.link_status.load(Ordering::Acquire) == link::DOWN {
                         debug!("[Connection] Link went down while waiting; failing request");
-                        file_log!(error, "RPC {} interrupted: link dropped while waiting (state={:?})", client_message_name(&msg), self.state());
+                        file_log!(
+                            error,
+                            "RPC {} interrupted: link dropped while waiting (state={:?})",
+                            client_message_name(&msg),
+                            self.state()
+                        );
                         return None;
                     }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     error!("[Connection] Response channel closed");
-                    file_log!(error, "RPC {} failed: response channel closed", client_message_name(&msg));
+                    file_log!(
+                        error,
+                        "RPC {} failed: response channel closed",
+                        client_message_name(&msg)
+                    );
                     return None;
                 }
             }
@@ -740,27 +808,61 @@ impl Connection {
     }
 
     /// Set channel by space (IBonDriver v2).
-    pub fn set_channel_space(&self, space: u32, channel: u32, priority: i32, exclusive: bool) -> bool {
+    pub fn set_channel_space(
+        &self,
+        space: u32,
+        channel: u32,
+        priority: i32,
+        exclusive: bool,
+    ) -> bool {
         self.invalidate_signal_cache();
 
-        let resp = self.send_request(ClientMessage::SetChannelSpace { space, channel, priority, exclusive });
+        let resp = self.send_request(ClientMessage::SetChannelSpace {
+            space,
+            channel,
+            priority,
+            exclusive,
+        });
 
         match resp {
             Some(ServerMessage::SetChannelSpaceAck { success, .. }) => {
                 if success {
-                    self.session.lock().channel =
-                        Some(ChannelSel::V2 { space, channel, priority, exclusive });
+                    self.session.lock().channel = Some(ChannelSel::V2 {
+                        space,
+                        channel,
+                        priority,
+                        exclusive,
+                    });
                 } else {
-                    file_log!(error, "SetChannelSpace rejected: space={} channel={} priority={} exclusive={}", space, channel, priority, exclusive);
+                    file_log!(
+                        error,
+                        "SetChannelSpace rejected: space={} channel={} priority={} exclusive={}",
+                        space,
+                        channel,
+                        priority,
+                        exclusive
+                    );
                 }
                 success
             }
             Some(other) => {
-                file_log!(error, "SetChannelSpace unexpected response: space={} channel={} response={:?}", space, channel, std::mem::discriminant(&other));
+                file_log!(
+                    error,
+                    "SetChannelSpace unexpected response: space={} channel={} response={:?}",
+                    space,
+                    channel,
+                    std::mem::discriminant(&other)
+                );
                 false
             }
             None => {
-                file_log!(error, "SetChannelSpace failed without response: space={} channel={} state={:?}", space, channel, self.state());
+                file_log!(
+                    error,
+                    "SetChannelSpace failed without response: space={} channel={} state={:?}",
+                    space,
+                    channel,
+                    self.state()
+                );
                 false
             }
         }
@@ -799,7 +901,11 @@ impl Connection {
     /// Start streaming.
     pub fn start_stream(&self) -> bool {
         if self.state() != ConnectionState::TunerOpen {
-            file_log!(error, "StartStream skipped: invalid client state {:?}", self.state());
+            file_log!(
+                error,
+                "StartStream skipped: invalid client state {:?}",
+                self.state()
+            );
             return false;
         }
 
@@ -817,11 +923,19 @@ impl Connection {
                 success
             }
             Some(other) => {
-                file_log!(error, "StartStream unexpected response: {:?}", std::mem::discriminant(&other));
+                file_log!(
+                    error,
+                    "StartStream unexpected response: {:?}",
+                    std::mem::discriminant(&other)
+                );
                 false
             }
             None => {
-                file_log!(error, "StartStream failed without response: client_state={:?}", self.state());
+                file_log!(
+                    error,
+                    "StartStream failed without response: client_state={:?}",
+                    self.state()
+                );
                 false
             }
         }
@@ -993,7 +1107,12 @@ fn configure_keepalive(stream: &TcpStream) {
 async fn establish(
     config: &ConnectionConfig,
 ) -> Result<(BoxReader, BoxWriter), Box<dyn std::error::Error + Send + Sync>> {
-    file_log!(debug, "establish: TCP connect to {} (timeout {:?})", config.server_addr, config.connect_timeout);
+    file_log!(
+        debug,
+        "establish: TCP connect to {} (timeout {:?})",
+        config.server_addr,
+        config.connect_timeout
+    );
     let stream = tokio::time::timeout(
         config.connect_timeout,
         TcpStream::connect(&config.server_addr),
@@ -1060,18 +1179,32 @@ fn process_frames(
                     ts_seen = true;
 
                     let count = TS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    TS_BYTES.fetch_add(ts_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    TS_BYTES.fetch_add(
+                        ts_payload.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
 
                     let written = buffer.write(&ts_payload);
 
                     if count % 100 == 0 {
                         let total_bytes = TS_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-                        crate::file_log!(info, "TsData #{}: {} bytes, written={}, buffer={}, total={}",
-                               count, ts_payload.len(), written, buffer.available(), total_bytes);
+                        crate::file_log!(
+                            info,
+                            "TsData #{}: {} bytes, written={}, buffer={}, total={}",
+                            count,
+                            ts_payload.len(),
+                            written,
+                            buffer.available(),
+                            total_bytes
+                        );
                     }
 
                     if written < ts_payload.len() {
-                        crate::file_log!(warn, "Buffer full, dropped {} bytes", ts_payload.len() - written);
+                        crate::file_log!(
+                            warn,
+                            "Buffer full, dropped {} bytes",
+                            ts_payload.len() - written
+                        );
                     }
 
                     continue;
@@ -1102,11 +1235,16 @@ async fn read_control_message(
 ) -> Result<ServerMessage, Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let mut found: Option<ServerMessage> = None;
-        process_frames(read_buf, buffer, |m| {
-            if found.is_none() {
-                found = Some(m);
-            }
-        }, true)?;
+        process_frames(
+            read_buf,
+            buffer,
+            |m| {
+                if found.is_none() {
+                    found = Some(m);
+                }
+            },
+            true,
+        )?;
         if let Some(m) = found {
             return Ok(m);
         }
@@ -1150,19 +1288,37 @@ async fn restore_session(
     let mut buf = BytesMut::with_capacity(262144);
 
     // --- Hello ---
-    send_control_message(writer, &ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
-        stream_class: config.stream_class,
-    }).await?;
+    send_control_message(
+        writer,
+        &ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            stream_class: config.stream_class,
+        },
+    )
+    .await?;
     match read_control_message(reader, &mut buf, buffer).await? {
         ServerMessage::HelloAck { success: true, .. } => {}
-        ServerMessage::HelloAck { success: false, .. } => return Err("server rejected Hello on reconnect".into()),
-        other => return Err(format!("unexpected reply to Hello: {:?}", std::mem::discriminant(&other)).into()),
+        ServerMessage::HelloAck { success: false, .. } => {
+            return Err("server rejected Hello on reconnect".into())
+        }
+        other => {
+            return Err(format!(
+                "unexpected reply to Hello: {:?}",
+                std::mem::discriminant(&other)
+            )
+            .into())
+        }
     }
 
     // --- Service filter (best effort, mirrors initial connect) ---
     if config.single_service {
-        send_control_message(writer, &ClientMessage::SetServiceFilter { single_service: true }).await?;
+        send_control_message(
+            writer,
+            &ClientMessage::SetServiceFilter {
+                single_service: true,
+            },
+        )
+        .await?;
         let _ = read_control_message(reader, &mut buf, buffer).await?;
     }
 
@@ -1171,11 +1327,19 @@ async fn restore_session(
 
     // --- OpenTuner ---
     if ctx.tuner_open {
-        send_control_message(writer, &ClientMessage::OpenTuner {
-            tuner_path: config.tuner_path.clone(),
-        }).await?;
+        send_control_message(
+            writer,
+            &ClientMessage::OpenTuner {
+                tuner_path: config.tuner_path.clone(),
+            },
+        )
+        .await?;
         match read_control_message(reader, &mut buf, buffer).await? {
-            ServerMessage::OpenTunerAck { success: true, bondriver_version, .. } => {
+            ServerMessage::OpenTunerAck {
+                success: true,
+                bondriver_version,
+                ..
+            } => {
                 *conn.bondriver_version.lock() = bondriver_version;
             }
             _ => return Err("server rejected OpenTuner on reconnect".into()),
@@ -1186,20 +1350,36 @@ async fn restore_session(
     if let Some(sel) = ctx.channel {
         match sel {
             ChannelSel::V1 { channel } => {
-                send_control_message(writer, &ClientMessage::SetChannel {
-                    channel,
-                    priority: config.client_priority,
-                    exclusive: config.client_exclusive,
-                }).await?;
+                send_control_message(
+                    writer,
+                    &ClientMessage::SetChannel {
+                        channel,
+                        priority: config.client_priority,
+                        exclusive: config.client_exclusive,
+                    },
+                )
+                .await?;
                 match read_control_message(reader, &mut buf, buffer).await? {
                     ServerMessage::SetChannelAck { success: true, .. } => {}
                     _ => return Err("server rejected SetChannel on reconnect".into()),
                 }
             }
-            ChannelSel::V2 { space, channel, priority, exclusive } => {
-                send_control_message(writer, &ClientMessage::SetChannelSpace {
-                    space, channel, priority, exclusive,
-                }).await?;
+            ChannelSel::V2 {
+                space,
+                channel,
+                priority,
+                exclusive,
+            } => {
+                send_control_message(
+                    writer,
+                    &ClientMessage::SetChannelSpace {
+                        space,
+                        channel,
+                        priority,
+                        exclusive,
+                    },
+                )
+                .await?;
                 match read_control_message(reader, &mut buf, buffer).await? {
                     ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
                     _ => return Err("server rejected SetChannelSpace on reconnect".into()),
@@ -1257,7 +1437,11 @@ async fn connection_supervisor(
                             *conn.state.lock() = st;
                             attempt = 0;
                             info!("Reconnected; session restored, state={:?}", st);
-                            file_log!(info, "supervisor: reconnected, session restored, state={:?}", st);
+                            file_log!(
+                                info,
+                                "supervisor: reconnected, session restored, state={:?}",
+                                st
+                            );
                             // Drop any pre-drop leftovers still queued from
                             // before the outage so we do not replay stale
                             // commands or desync the response channel.  This runs
@@ -1299,7 +1483,11 @@ async fn connection_supervisor(
                             break;
                         }
                         warn!("Connection dropped ({}); will reconnect", reason);
-                        file_log!(warn, "supervisor: connection dropped ({}); reconnecting", reason);
+                        file_log!(
+                            warn,
+                            "supervisor: connection dropped ({}); reconnecting",
+                            reason
+                        );
                         // Keep the public state at the last active state (so
                         // IsTunerOpening/GetActiveDeviceNum stay truthy while a
                         // tuner is open); use the transient Reconnecting state
@@ -1557,7 +1745,9 @@ impl Drop for Connection {
 
 /// Build TLS client configuration.
 #[cfg(feature = "tls")]
-fn build_tls_config(ca_cert_path: Option<&str>) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+fn build_tls_config(
+    ca_cert_path: Option<&str>,
+) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::RootCertStore;
     use rustls_pemfile::certs;
 
@@ -1651,16 +1841,13 @@ mod tests {
         let mut writer: BoxWriter = Box::new(writer);
 
         let config = conn.config.clone();
-        let restore = restore_session(
-            &conn,
-            &config,
-            &mut reader,
-            &mut writer,
-            &buffer,
-        );
+        let restore = restore_session(&conn, &config, &mut reader, &mut writer, &buffer);
         let _ = tokio::time::timeout(Duration::from_millis(50), restore).await;
 
-        assert!(buffer.is_empty(), "pre-outage TS must be discarded on reconnect");
+        assert!(
+            buffer.is_empty(),
+            "pre-outage TS must be discarded on reconnect"
+        );
     }
 
     /// Drive `connection_loop` against a transport that never delivers a byte.
@@ -1736,7 +1923,10 @@ mod tests {
             run_loop_against_a_silent_peer(false),
         )
         .await;
-        assert!(result.is_err(), "must keep waiting rather than drop the link");
+        assert!(
+            result.is_err(),
+            "must keep waiting rather than drop the link"
+        );
     }
 
     /// Wire up a Connection with hand-made request/response channels so the
@@ -1764,21 +1954,66 @@ mod tests {
     #[test]
     fn reply_pairing_accepts_the_matching_ack_and_any_error() {
         let req = ClientMessage::GetSignalLevel;
-        assert!(is_reply_to(&req, &ServerMessage::GetSignalLevelAck { signal_level: 1.0 }));
-        assert!(!is_reply_to(&req, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
+        assert!(is_reply_to(
+            &req,
+            &ServerMessage::GetSignalLevelAck { signal_level: 1.0 }
+        ));
+        assert!(!is_reply_to(
+            &req,
+            &ServerMessage::SetChannelAck {
+                success: true,
+                error_code: 0
+            }
+        ));
         // The server answers a refused request of any kind with Error.
-        assert!(is_reply_to(&req, &ServerMessage::Error {
-            error_code: 1,
-            message: "no".to_string()
-        }));
+        assert!(is_reply_to(
+            &req,
+            &ServerMessage::Error {
+                error_code: 1,
+                message: "no".to_string()
+            }
+        ));
 
         // v1 and v2 SetChannel have distinct acks and must not cross over.
-        let v1 = ClientMessage::SetChannel { channel: 1, priority: 0, exclusive: false };
-        let v2 = ClientMessage::SetChannelSpace { space: 0, channel: 1, priority: 0, exclusive: false };
-        assert!(is_reply_to(&v1, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
-        assert!(!is_reply_to(&v1, &ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }));
-        assert!(is_reply_to(&v2, &ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 }));
-        assert!(!is_reply_to(&v2, &ServerMessage::SetChannelAck { success: true, error_code: 0 }));
+        let v1 = ClientMessage::SetChannel {
+            channel: 1,
+            priority: 0,
+            exclusive: false,
+        };
+        let v2 = ClientMessage::SetChannelSpace {
+            space: 0,
+            channel: 1,
+            priority: 0,
+            exclusive: false,
+        };
+        assert!(is_reply_to(
+            &v1,
+            &ServerMessage::SetChannelAck {
+                success: true,
+                error_code: 0
+            }
+        ));
+        assert!(!is_reply_to(
+            &v1,
+            &ServerMessage::SetChannelSpaceAck {
+                success: true,
+                error_code: 0
+            }
+        ));
+        assert!(is_reply_to(
+            &v2,
+            &ServerMessage::SetChannelSpaceAck {
+                success: true,
+                error_code: 0
+            }
+        ));
+        assert!(!is_reply_to(
+            &v2,
+            &ServerMessage::SetChannelAck {
+                success: true,
+                error_code: 0
+            }
+        ));
     }
 
     /// A reply that arrived after its request gave up must not be handed to the
@@ -1790,7 +2025,10 @@ mod tests {
 
         // Left over from a SetChannel that already timed out.
         resp_tx
-            .send(ServerMessage::SetChannelSpaceAck { success: true, error_code: 0 })
+            .send(ServerMessage::SetChannelSpaceAck {
+                success: true,
+                error_code: 0,
+            })
             .unwrap();
 
         let sender = resp_tx.clone();
@@ -1826,7 +2064,9 @@ mod tests {
         let resp = conn.send_request(ClientMessage::EnumTuningSpace { space: 0 });
         assert_eq!(
             resp,
-            Some(ServerMessage::EnumTuningSpaceAck { name: Some("関東".to_string()) })
+            Some(ServerMessage::EnumTuningSpaceAck {
+                name: Some("関東".to_string())
+            })
         );
     }
 
@@ -1881,8 +2121,16 @@ mod tests {
         let mut prev = Duration::ZERO;
         for attempt in 0..64u32 {
             let d = backoff_delay(attempt);
-            assert!(d >= prev, "backoff must be non-decreasing at attempt {}", attempt);
-            assert!(d <= cap, "backoff must never exceed the cap at attempt {}", attempt);
+            assert!(
+                d >= prev,
+                "backoff must be non-decreasing at attempt {}",
+                attempt
+            );
+            assert!(
+                d <= cap,
+                "backoff must never exceed the cap at attempt {}",
+                attempt
+            );
             prev = d;
         }
         // Large attempt numbers must not panic (overflow) and stay clamped.
@@ -1909,11 +2157,17 @@ mod tests {
         // matters.
         *conn.signal_level.lock() = (24.5, Some(Instant::now()));
         conn.set_channel_space(0, 1, 0, false);
-        assert!(conn.signal_level.lock().1.is_none(), "SetChannel2 must invalidate");
+        assert!(
+            conn.signal_level.lock().1.is_none(),
+            "SetChannel2 must invalidate"
+        );
 
         *conn.signal_level.lock() = (24.5, Some(Instant::now()));
         conn.set_channel(7, false);
-        assert!(conn.signal_level.lock().1.is_none(), "SetChannel must invalidate");
+        assert!(
+            conn.signal_level.lock().1.is_none(),
+            "SetChannel must invalidate"
+        );
     }
 
     #[test]

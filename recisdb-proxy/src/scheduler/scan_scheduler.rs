@@ -670,11 +670,8 @@ fn scan_space_blocking(
         // paying the sample window on each of those would add over a minute
         // for nothing.
         let may_be_receivable = tuner.last_channel_locked().unwrap_or(true);
-        let sample_window_ms = signal_sample_window_ms(
-            may_be_receivable,
-            saw_usable_signal,
-            warmup_spent_ms,
-        );
+        let sample_window_ms =
+            signal_sample_window_ms(may_be_receivable, saw_usable_signal, warmup_spent_ms);
         let mut signal_level = tuner.get_signal_level();
         let mut sampled_ms = 0u64;
         while signal_level < MIN_SIGNAL_LEVEL && sampled_ms < sample_window_ms {

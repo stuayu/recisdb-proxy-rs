@@ -68,21 +68,21 @@ pub fn select_route(
                 return None;
             }
 
-            let chosen_path = if candidate.advertisement.ingress_delivery == DeliveryType::RemoteProxy {
-                candidate
-                    .transport_paths
-                    .iter()
-                    .filter_map(|path| {
-                        let score = score_path(path, stream_class, bitrate_bps, path_policy);
-                        score.admissible.then_some((path, score.score))
-                    })
-                    .max_by(|(a_path, a), (b_path, b)| {
-                        a.total_cmp(b)
-                            .then_with(|| b_path.id.cmp(&a_path.id))
-                    })
-            } else {
-                None
-            };
+            let chosen_path =
+                if candidate.advertisement.ingress_delivery == DeliveryType::RemoteProxy {
+                    candidate
+                        .transport_paths
+                        .iter()
+                        .filter_map(|path| {
+                            let score = score_path(path, stream_class, bitrate_bps, path_policy);
+                            score.admissible.then_some((path, score.score))
+                        })
+                        .max_by(|(a_path, a), (b_path, b)| {
+                            a.total_cmp(b).then_with(|| b_path.id.cmp(&a_path.id))
+                        })
+                } else {
+                    None
+                };
 
             if candidate.advertisement.ingress_delivery == DeliveryType::RemoteProxy
                 && chosen_path.is_none()
@@ -131,11 +131,15 @@ mod tests {
     use super::*;
     use crate::node::path::{PathHealth, PathState};
     use crate::node::types::{
-        EndpointKind, LogicalBroadcastType, LogicalMuxId, NodeEndpoint, NodeId,
-        TailscalePathKind,
+        EndpointKind, LogicalBroadcastType, LogicalMuxId, NodeEndpoint, NodeId, TailscalePathKind,
     };
 
-    fn ad(id: &str, delivery: DeliveryType, state: ReceptionRouteState, q: f64) -> ReceptionRouteAdvertisement {
+    fn ad(
+        id: &str,
+        delivery: DeliveryType,
+        state: ReceptionRouteState,
+        q: f64,
+    ) -> ReceptionRouteAdvertisement {
         ReceptionRouteAdvertisement {
             route_id: id.into(),
             origin_node: NodeId::new(id).unwrap(),
@@ -158,21 +162,36 @@ mod tests {
     #[test]
     fn quarantined_weak_repeater_is_never_selected() {
         let good = ReceptionCandidate {
-            advertisement: ad("good", DeliveryType::IsdbTDirect, ReceptionRouteState::Usable, 0.90),
+            advertisement: ad(
+                "good",
+                DeliveryType::IsdbTDirect,
+                ReceptionRouteState::Usable,
+                0.90,
+            ),
             mux_already_running: false,
             load_ratio: 0.5,
             transport_paths: vec![],
         };
         let weak = ReceptionCandidate {
-            advertisement: ad("weak", DeliveryType::IsdbTDirect, ReceptionRouteState::Quarantined, 0.20),
+            advertisement: ad(
+                "weak",
+                DeliveryType::IsdbTDirect,
+                ReceptionRouteState::Quarantined,
+                0.20,
+            ),
             mux_already_running: true,
             load_ratio: 0.0,
             transport_paths: vec![],
         };
         assert_eq!(
-            select_route(&[weak, good], StreamClass::View, 18_000_000, PathPolicy::default())
-                .unwrap()
-                .route_id,
+            select_route(
+                &[weak, good],
+                StreamClass::View,
+                18_000_000,
+                PathPolicy::default()
+            )
+            .unwrap()
+            .route_id,
             "good"
         );
     }
@@ -180,13 +199,23 @@ mod tests {
     #[test]
     fn healthy_direct_rf_is_preferred_over_catv_when_both_are_usable() {
         let rf = ReceptionCandidate {
-            advertisement: ad("rf", DeliveryType::IsdbSDirect, ReceptionRouteState::Usable, 0.85),
+            advertisement: ad(
+                "rf",
+                DeliveryType::IsdbSDirect,
+                ReceptionRouteState::Usable,
+                0.85,
+            ),
             mux_already_running: false,
             load_ratio: 0.3,
             transport_paths: vec![],
         };
         let catv = ReceptionCandidate {
-            advertisement: ad("catv", DeliveryType::CatvTsmf, ReceptionRouteState::Preferred, 1.0),
+            advertisement: ad(
+                "catv",
+                DeliveryType::CatvTsmf,
+                ReceptionRouteState::Preferred,
+                1.0,
+            ),
             mux_already_running: false,
             load_ratio: 0.0,
             transport_paths: vec![],
@@ -197,16 +226,26 @@ mod tests {
         let mut catv_usable = catv.clone();
         catv_usable.advertisement.state = ReceptionRouteState::Usable;
         assert_eq!(
-            select_route(&[catv_usable, rf], StreamClass::Record, 20_000_000, PathPolicy::default())
-                .unwrap()
-                .route_id,
+            select_route(
+                &[catv_usable, rf],
+                StreamClass::Record,
+                20_000_000,
+                PathPolicy::default()
+            )
+            .unwrap()
+            .route_id,
             "rf"
         );
     }
 
     #[test]
     fn remote_route_requires_admissible_transport() {
-        let mut remote_ad = ad("remote", DeliveryType::RemoteProxy, ReceptionRouteState::Usable, 1.0);
+        let mut remote_ad = ad(
+            "remote",
+            DeliveryType::RemoteProxy,
+            ReceptionRouteState::Usable,
+            1.0,
+        );
         remote_ad.ultimate_delivery = DeliveryType::IsdbTDirect;
         let remote = ReceptionCandidate {
             advertisement: remote_ad,
@@ -238,6 +277,12 @@ mod tests {
                 },
             }],
         };
-        assert!(select_route(&[remote], StreamClass::Record, 20_000_000, PathPolicy::default()).is_none());
+        assert!(select_route(
+            &[remote],
+            StreamClass::Record,
+            20_000_000,
+            PathPolicy::default()
+        )
+        .is_none());
     }
 }

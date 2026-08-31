@@ -115,14 +115,7 @@ impl RemoteMuxStream {
             lease.clone(),
             Arc::clone(&shutdown),
         );
-        spawn_pump(
-            client,
-            base_url,
-            lease,
-            tx,
-            last_sequence,
-            shutdown,
-        );
+        spawn_pump(client, base_url, lease, tx, last_sequence, shutdown);
 
         Ok(stream)
     }
@@ -415,7 +408,7 @@ async fn pump_once(
                 // discontinuity, not as a failure.
                 last_sequence.store(0, Ordering::Release);
                 ConsumeError::Transport("replay gap; restarting from live".into())
-            })
+            });
         }
         Err(LeaseStreamError::LeaseGone) => return Err(ConsumeError::LeaseGone),
         Err(e) => return Err(ConsumeError::Transport(e.to_string())),
@@ -511,8 +504,8 @@ const fn kind_rank(kind: EndpointKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::NodeId;
+    use super::*;
 
     fn context(class: StreamClass) -> RequestContext {
         RequestContext {
@@ -535,7 +528,10 @@ mod tests {
         let ctx = context(StreamClass::Record);
         let request = OpenLeaseRequest {
             context: ctx.clone(),
-            mux: LogicalMuxId { nid: 0x7FE0, tsid: 0x7FE0 },
+            mux: LogicalMuxId {
+                nid: 0x7FE0,
+                tsid: 0x7FE0,
+            },
             sid: Some(1024),
             spent_ms: 120,
         };
@@ -593,7 +589,11 @@ mod tests {
 
     #[test]
     fn record_refuses_the_public_http_fallback_even_when_allowed() {
-        let endpoints = vec![endpoint(EndpointKind::CloudflarePublic, "https://public", true)];
+        let endpoints = vec![endpoint(
+            EndpointKind::CloudflarePublic,
+            "https://public",
+            true,
+        )];
         assert!(usable_endpoints(&endpoints, StreamClass::Record).is_empty());
         assert_eq!(usable_endpoints(&endpoints, StreamClass::Preview).len(), 1);
     }
@@ -612,7 +612,12 @@ mod tests {
             .collect();
         assert_eq!(
             ordered,
-            vec!["http://lan", "http://ts", "https://direct", "https://public"]
+            vec![
+                "http://lan",
+                "http://ts",
+                "https://direct",
+                "https://public"
+            ]
         );
     }
 
@@ -620,7 +625,10 @@ mod tests {
     fn user_priority_breaks_ties_within_a_kind() {
         let mut high = endpoint(EndpointKind::Tailscale, "http://preferred", true);
         high.user_priority = 10;
-        let endpoints = vec![endpoint(EndpointKind::Tailscale, "http://other", true), high];
+        let endpoints = vec![
+            endpoint(EndpointKind::Tailscale, "http://other", true),
+            high,
+        ];
         let ordered = usable_endpoints(&endpoints, StreamClass::View);
         assert_eq!(ordered[0].address, "http://preferred");
     }

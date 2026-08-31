@@ -26,8 +26,10 @@ impl QualityScorer {
         let current = db.get_driver_quality_stats(bon_driver_id)?;
 
         let total_packets = current.as_ref().map(|s| s.total_packets).unwrap_or(0) + packets as i64;
-        let dropped_packets = current.as_ref().map(|s| s.dropped_packets).unwrap_or(0) + dropped as i64;
-        let scrambled_packets = current.as_ref().map(|s| s.scrambled_packets).unwrap_or(0) + scrambled as i64;
+        let dropped_packets =
+            current.as_ref().map(|s| s.dropped_packets).unwrap_or(0) + dropped as i64;
+        let scrambled_packets =
+            current.as_ref().map(|s| s.scrambled_packets).unwrap_or(0) + scrambled as i64;
         let error_packets = current.as_ref().map(|s| s.error_packets).unwrap_or(0) + errors as i64;
         let total_sessions = current.as_ref().map(|s| s.total_sessions).unwrap_or(0) + 1;
 
@@ -83,10 +85,14 @@ impl QualityScorer {
     ) -> Result<()> {
         let current = db.get_driver_quality_stats(bon_driver_id)?;
 
-        let total_packets = current.as_ref().map(|s| s.total_packets).unwrap_or(0) + delta_packets as i64;
-        let dropped_packets = current.as_ref().map(|s| s.dropped_packets).unwrap_or(0) + delta_dropped as i64;
-        let scrambled_packets = current.as_ref().map(|s| s.scrambled_packets).unwrap_or(0) + delta_scrambled as i64;
-        let error_packets = current.as_ref().map(|s| s.error_packets).unwrap_or(0) + delta_errors as i64;
+        let total_packets =
+            current.as_ref().map(|s| s.total_packets).unwrap_or(0) + delta_packets as i64;
+        let dropped_packets =
+            current.as_ref().map(|s| s.dropped_packets).unwrap_or(0) + delta_dropped as i64;
+        let scrambled_packets =
+            current.as_ref().map(|s| s.scrambled_packets).unwrap_or(0) + delta_scrambled as i64;
+        let error_packets =
+            current.as_ref().map(|s| s.error_packets).unwrap_or(0) + delta_errors as i64;
         let total_sessions = current.as_ref().map(|s| s.total_sessions).unwrap_or(0)
             + if increment_sessions { 1 } else { 0 };
 

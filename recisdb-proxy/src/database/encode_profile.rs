@@ -14,12 +14,8 @@ use rusqlite::{params, OptionalExtension};
 /// Kept here (not in `preview_setup`) because
 /// [`preview_4k_extra_args_is_auto_generated`] has to recognize every
 /// template this codebase can generate, and that includes one per decoder.
-pub(crate) const KNOWN_HEVC_HW_DECODERS: &[&str] = &[
-    "hevc_qsv",
-    "hevc_cuvid",
-    "hevc_vaapi",
-    "hevc_videotoolbox",
-];
+pub(crate) const KNOWN_HEVC_HW_DECODERS: &[&str] =
+    &["hevc_qsv", "hevc_cuvid", "hevc_vaapi", "hevc_videotoolbox"];
 
 const KNOWN_PREVIEW_ENCODERS: &[&str] = &[
     "libx264",
@@ -211,9 +207,13 @@ pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
 }
 
 pub fn preview_4k_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool {
-    let Some(args) = extra_args else { return true; };
+    let Some(args) = extra_args else {
+        return true;
+    };
     let args = args.trim();
-    if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS { return true; }
+    if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS {
+        return true;
+    }
     KNOWN_PREVIEW_ENCODERS.iter().any(|enc| {
         args == preview_4k_encode_args_ffmpeg(enc)
             || KNOWN_HEVC_HW_DECODERS
@@ -296,7 +296,9 @@ impl Database {
             name: row.get("name")?,
             purpose: row.get("purpose")?,
             codec: row.get("codec")?,
-            container: row.get::<_, Option<String>>("container")?.unwrap_or_else(|| "mpegts".to_string()),
+            container: row
+                .get::<_, Option<String>>("container")?
+                .unwrap_or_else(|| "mpegts".to_string()),
             target_bitrate: row.get("target_bitrate")?,
             extra_args: row.get("extra_args")?,
             is_enabled: row.get::<_, i64>("is_enabled")? != 0,
@@ -317,7 +319,9 @@ impl Database {
 
     /// Get a single encode profile by id.
     pub fn get_encode_profile(&self, id: i64) -> Result<Option<EncodeProfileRecord>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM encode_profiles WHERE id = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM encode_profiles WHERE id = ?1")?;
         Ok(stmt
             .query_row([id], Self::row_to_encode_profile_record)
             .optional()?)
@@ -329,7 +333,10 @@ impl Database {
     ///
     /// Used by the HTTP preview streaming endpoint (STREAMING_DESIGN.md §6.3)
     /// to pick the encode profile for `?profile=preview`.
-    pub fn get_encode_profile_by_purpose(&self, purpose: &str) -> Result<Option<EncodeProfileRecord>> {
+    pub fn get_encode_profile_by_purpose(
+        &self,
+        purpose: &str,
+    ) -> Result<Option<EncodeProfileRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM encode_profiles WHERE purpose = ?1 AND is_enabled = 1 ORDER BY id ASC LIMIT 1",
         )?;
@@ -419,7 +426,10 @@ impl Database {
         }
 
         values.push(Box::new(id));
-        let sql = format!("UPDATE encode_profiles SET {} WHERE id = ?", updates.join(", "));
+        let sql = format!(
+            "UPDATE encode_profiles SET {} WHERE id = ?",
+            updates.join(", ")
+        );
         let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
@@ -427,7 +437,8 @@ impl Database {
 
     /// Delete an encode profile.
     pub fn delete_encode_profile(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM encode_profiles WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM encode_profiles WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -457,7 +468,9 @@ impl Database {
                 Some(DEFAULT_PREVIEW_ENCODE_ARGS),
                 true,
             )?;
-            log::info!("Seeded default encode profile 'preview-h264' (H.264, ~2Mbps, purpose=preview)");
+            log::info!(
+                "Seeded default encode profile 'preview-h264' (H.264, ~2Mbps, purpose=preview)"
+            );
         } else {
             // One-time carry-over for rows still holding the pre-two-stage
             // tsreplace-wrapped template verbatim: that shape is broken now
@@ -533,9 +546,7 @@ impl Database {
                     "UPDATE encode_profiles SET extra_args = ?1 WHERE name = 'preview-4k'",
                     params![replacement],
                 )?;
-                log::info!(
-                    "Migrated encode profile 'preview-4k' to the current ffmpeg template"
-                );
+                log::info!("Migrated encode profile 'preview-4k' to the current ffmpeg template");
             }
         }
         Ok(())
@@ -559,9 +570,15 @@ mod tests {
         assert!(profile.is_enabled);
         // The recommendation is a direct QSVEncC invocation (two-stage design:
         // service selection lives in the tsreadex preprocessor arguments).
-        assert_eq!(profile.extra_args.as_deref(), Some(super::DEFAULT_PREVIEW_ENCODE_ARGS));
+        assert_eq!(
+            profile.extra_args.as_deref(),
+            Some(super::DEFAULT_PREVIEW_ENCODE_ARGS)
+        );
         assert!(
-            !profile.extra_args.unwrap().contains("--preserve-other-services"),
+            !profile
+                .extra_args
+                .unwrap()
+                .contains("--preserve-other-services"),
             "seed must not be tsreplace-shaped anymore"
         );
     }
@@ -579,14 +596,32 @@ mod tests {
             )
             .unwrap();
         db.seed_default_encode_profiles().unwrap();
-        let profile = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
-        assert_eq!(profile.extra_args.as_deref(), Some(super::DEFAULT_PREVIEW_ENCODE_ARGS));
+        let profile = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.extra_args.as_deref(),
+            Some(super::DEFAULT_PREVIEW_ENCODE_ARGS)
+        );
 
         // An admin-edited value must survive re-seeding untouched.
-        db.update_encode_profile(profile.id, None, None, None, None, None, Some(Some("--custom")), None)
-            .unwrap();
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--custom")),
+            None,
+        )
+        .unwrap();
         db.seed_default_encode_profiles().unwrap();
-        let profile = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
         assert_eq!(profile.extra_args.as_deref(), Some("--custom"));
     }
 
@@ -626,7 +661,10 @@ mod tests {
         // The throttles are decoder options: they only take effect before -i.
         let input_at = args.find("-i pipe:0").expect("input");
         assert!(args.find("-skip_frame:v").unwrap() < input_at, "{args}");
-        assert!(args.find("-skip_loop_filter:v").unwrap() < input_at, "{args}");
+        assert!(
+            args.find("-skip_loop_filter:v").unwrap() < input_at,
+            "{args}"
+        );
     }
 
     /// Every earlier ffmpeg 4K template (0.27x, then 0.88x sustained) was
@@ -636,12 +674,27 @@ mod tests {
     fn seed_upgrades_every_superseded_ffmpeg_four_k_template() {
         for slow in super::legacy_preview_4k_encode_args_ffmpeg("libx264") {
             let db = Database::open_in_memory().unwrap();
-            let profile = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
-            db.update_encode_profile(profile.id, None, None, None, None, None,
-                Some(Some(&slow)), None).unwrap();
+            let profile = db
+                .get_encode_profile_by_purpose("preview4k")
+                .unwrap()
+                .unwrap();
+            db.update_encode_profile(
+                profile.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&slow)),
+                None,
+            )
+            .unwrap();
             assert!(super::preview_4k_extra_args_is_auto_generated(Some(&slow)));
             db.seed_default_encode_profiles().unwrap();
-            let migrated = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
+            let migrated = db
+                .get_encode_profile_by_purpose("preview4k")
+                .unwrap()
+                .unwrap();
             let args = migrated.extra_args.as_deref().unwrap();
             assert!(args.contains("-skip_frame:v noref"), "{args}");
             assert!(args.contains("scale=1280:720"), "{args}");
@@ -651,38 +704,99 @@ mod tests {
     #[test]
     fn seed_migrates_only_untouched_broken_four_k_template() {
         let db = Database::open_in_memory().unwrap();
-        let ordinary = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        let ordinary = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
         let ordinary_args = super::preview_encode_args_ffmpeg("h264_qsv");
-        db.update_encode_profile(ordinary.id, None, None, None, None, None,
-            Some(Some(&ordinary_args)), None).unwrap();
-        let profile = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
-        db.update_encode_profile(profile.id, None, None, None, None, None,
-            Some(Some(super::DEFAULT_PREVIEW_4K_ENCODE_ARGS)), None).unwrap();
+        db.update_encode_profile(
+            ordinary.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&ordinary_args)),
+            None,
+        )
+        .unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(super::DEFAULT_PREVIEW_4K_ENCODE_ARGS)),
+            None,
+        )
+        .unwrap();
         db.seed_default_encode_profiles().unwrap();
-        let migrated = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
-        assert_eq!(migrated.extra_args.as_deref(),
-            Some(super::preview_4k_encode_args_ffmpeg("h264_qsv").as_str()));
+        let migrated = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            migrated.extra_args.as_deref(),
+            Some(super::preview_4k_encode_args_ffmpeg("h264_qsv").as_str())
+        );
 
-        db.update_encode_profile(migrated.id, None, None, None, None, None,
-            Some(Some("--avhw --administrator-customized")), None).unwrap();
+        db.update_encode_profile(
+            migrated.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--avhw --administrator-customized")),
+            None,
+        )
+        .unwrap();
         db.seed_default_encode_profiles().unwrap();
-        let preserved = db.get_encode_profile_by_purpose("preview4k").unwrap().unwrap();
-        assert_eq!(preserved.extra_args.as_deref(), Some("--avhw --administrator-customized"));
+        let preserved = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved.extra_args.as_deref(),
+            Some("--avhw --administrator-customized")
+        );
     }
 
     #[test]
     fn crud_roundtrip() {
         let db = Database::open_in_memory().unwrap();
         let id = db
-            .insert_encode_profile("record-hevc", "record", "hevc", "mpegts", Some(8_000_000), Some("--foo"), true)
+            .insert_encode_profile(
+                "record-hevc",
+                "record",
+                "hevc",
+                "mpegts",
+                Some(8_000_000),
+                Some("--foo"),
+                true,
+            )
             .unwrap();
 
         let fetched = db.get_encode_profile(id).unwrap().expect("just inserted");
         assert_eq!(fetched.name, "record-hevc");
         assert_eq!(fetched.target_bitrate, Some(8_000_000));
 
-        db.update_encode_profile(id, Some("record-hevc-v2"), None, None, None, Some(Some(10_000_000)), None, Some(false))
-            .unwrap();
+        db.update_encode_profile(
+            id,
+            Some("record-hevc-v2"),
+            None,
+            None,
+            None,
+            Some(Some(10_000_000)),
+            None,
+            Some(false),
+        )
+        .unwrap();
         let updated = db.get_encode_profile(id).unwrap().unwrap();
         assert_eq!(updated.name, "record-hevc-v2");
         assert_eq!(updated.target_bitrate, Some(10_000_000));
@@ -697,10 +811,15 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Disable the seeded default and insert a second, disabled-by-default
         // candidate — get_by_purpose must return None, not the disabled row.
-        let seeded = db.get_encode_profile_by_purpose("preview").unwrap().unwrap();
+        let seeded = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
         db.update_encode_profile(seeded.id, None, None, None, None, None, None, Some(false))
             .unwrap();
-        assert!(db.get_encode_profile_by_purpose("preview").unwrap().is_none());
+        assert!(db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .is_none());
     }
 }
-

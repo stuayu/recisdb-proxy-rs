@@ -183,7 +183,9 @@ pub(crate) struct OpenFailureBackoff {
 
 impl OpenFailureBackoff {
     pub(crate) fn new() -> Self {
-        Self { state: Mutex::new(HashMap::new()) }
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
     }
 
     /// ロックを取る。毒(poisoning)は無視して中身をそのまま使う: ここに入って
@@ -272,7 +274,9 @@ impl OpenFailureBackoff {
 
     pub(crate) fn record_failure_at(&self, tuner_path: &str, now: Instant) -> FailureReport {
         let mut state = self.lock_state();
-        let entry = state.entry(tuner_path.to_string()).or_insert_with(DriverFailures::new);
+        let entry = state
+            .entry(tuner_path.to_string())
+            .or_insert_with(DriverFailures::new);
 
         entry.consecutive += 1;
         // A failing open is not a slow one; the slow streak restarts.
@@ -288,7 +292,11 @@ impl OpenFailureBackoff {
         } else {
             Duration::ZERO
         };
-        entry.cooldown_until = if cooldown.is_zero() { None } else { Some(now + cooldown) };
+        entry.cooldown_until = if cooldown.is_zero() {
+            None
+        } else {
+            Some(now + cooldown)
+        };
 
         let should_log = match entry.last_logged {
             None => true,
@@ -304,7 +312,12 @@ impl OpenFailureBackoff {
             entry.suppressed
         };
 
-        FailureReport { consecutive: entry.consecutive, cooldown, should_log, suppressed }
+        FailureReport {
+            consecutive: entry.consecutive,
+            cooldown,
+            should_log,
+            suppressed,
+        }
     }
 
     /// Clear all failure state for `tuner_path` — a successful open means
@@ -346,7 +359,10 @@ impl OpenFailureBackoff {
     /// [`Self::cooldown_remaining`]) and need the count for diagnostics —
     /// e.g. [`crate::tuner::acquire::AcquireError::OpenCooldown`].
     pub(crate) fn consecutive_failures(&self, tuner_path: &str) -> u32 {
-        self.lock_state().get(tuner_path).map(|e| e.consecutive).unwrap_or(0)
+        self.lock_state()
+            .get(tuner_path)
+            .map(|e| e.consecutive)
+            .unwrap_or(0)
     }
 }
 
@@ -575,7 +591,10 @@ mod tests {
         assert_eq!(remaining, Some(Duration::from_secs(1)));
 
         let mid = t0 + Duration::from_millis(500);
-        assert_eq!(backoff.cooldown_remaining_at(PATH, mid), Some(Duration::from_millis(500)));
+        assert_eq!(
+            backoff.cooldown_remaining_at(PATH, mid),
+            Some(Duration::from_millis(500))
+        );
 
         let after = t0 + Duration::from_secs(2);
         assert_eq!(backoff.cooldown_remaining_at(PATH, after), None);

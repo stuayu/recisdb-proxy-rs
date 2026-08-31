@@ -6,9 +6,9 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::Once;
 use std::time::Duration;
@@ -127,8 +127,14 @@ fn init_process_once() {
     PROCESS_INIT.get_or_init(|| {
         let log_level = crate::config::load_log_level();
         crate::logging::set_file_log_level(log_level);
-        let _ = env_logger::Builder::new().filter_level(log_level).try_init();
-        file_log!(info, "init_process_once: logging initialized (log_level={:?})", log_level);
+        let _ = env_logger::Builder::new()
+            .filter_level(log_level)
+            .try_init();
+        file_log!(
+            info,
+            "init_process_once: logging initialized (log_level={:?})",
+            log_level
+        );
     });
 }
 
@@ -146,7 +152,11 @@ pub fn create_instance() -> *mut IBonDriver {
 /// INI/environment says.
 fn create_instance_with_config(config: ConnectionConfig) -> *mut IBonDriver {
     info!("BonDriver_NetworkProxy instance created");
-    file_log!(info, "create_instance: server address: {}", config.server_addr);
+    file_log!(
+        info,
+        "create_instance: server address: {}",
+        config.server_addr
+    );
     debug!("Server: {}", config.server_addr);
 
     let instance = Box::new(BonDriverInstance {
@@ -168,7 +178,11 @@ unsafe fn instance_of<'a>(this: *mut c_void) -> Option<&'a BonDriverInstance> {
         return None;
     }
     if !live_instances().read().contains(&(this as usize)) {
-        file_log!(error, "FFI call on released/unknown instance {:p}; ignoring", this);
+        file_log!(
+            error,
+            "FFI call on released/unknown instance {:p}; ignoring",
+            this
+        );
         return None;
     }
     Some(&*(this as *const BonDriverInstance))
@@ -188,7 +202,9 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
     file_log!(info, "OpenTuner called");
     debug!("OpenTuner called");
 
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
 
     // Take the connection out from under the lock and release it before any
     // network round-trip. Holding the instance lock across an RPC blocks every
@@ -236,7 +252,9 @@ pub unsafe extern "system" fn open_tuner(this: *mut c_void) -> BOOL {
 pub unsafe extern "system" fn close_tuner(this: *mut c_void) {
     file_log!(info, "CloseTuner called");
     debug!("CloseTuner called");
-    let Some(instance) = instance_of(this) else { return };
+    let Some(instance) = instance_of(this) else {
+        return;
+    };
     let connection = {
         let state = instance.state.lock();
         state.connection.clone()
@@ -249,7 +267,9 @@ pub unsafe extern "system" fn close_tuner(this: *mut c_void) {
 /// Set channel (IBonDriver v1).
 pub unsafe extern "system" fn set_channel(this: *mut c_void, channel: BYTE) -> BOOL {
     debug!("SetChannel called: channel={}", channel);
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
     let connection = {
         let state = instance.state.lock();
         state.connection.clone()
@@ -269,7 +289,9 @@ pub unsafe extern "system" fn set_channel(this: *mut c_void, channel: BYTE) -> B
 /// Get signal level.
 pub unsafe extern "system" fn get_signal_level(this: *mut c_void) -> f32 {
     trace!("GetSignalLevel called");
-    let Some(instance) = instance_of(this) else { return 0.0 };
+    let Some(instance) = instance_of(this) else {
+        return 0.0;
+    };
     let connection = {
         let state = instance.state.lock();
         state.connection.clone()
@@ -285,7 +307,9 @@ pub unsafe extern "system" fn get_signal_level(this: *mut c_void) -> f32 {
 pub unsafe extern "system" fn wait_ts_stream(this: *mut c_void, timeout_ms: DWORD) -> DWORD {
     file_log!(debug, "WaitTsStream called: timeout={}ms", timeout_ms);
 
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
 
     // ロックは短く、connection を clone して使う
     let connection = {
@@ -321,7 +345,9 @@ pub unsafe extern "system" fn wait_ts_stream(this: *mut c_void, timeout_ms: DWOR
 
 /// Get the number of ready TS packets.
 pub unsafe extern "system" fn get_ready_count(this: *mut c_void) -> DWORD {
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
 
     // connection を clone してロックを短くする
     let connection = {
@@ -381,8 +407,7 @@ pub unsafe extern "system" fn get_ts_stream(
     };
 
     // ログ間引き用カウンタ
-    static LOG_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static LOG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // IN/OUT：呼び出し側が *size に「dst バッファ容量」を入れて渡す前提で扱う
@@ -500,7 +525,6 @@ pub unsafe extern "system" fn get_ts_stream(
     TRUE
 }
 
-
 /// Get TS stream data - pointer version (second overload).
 /// Returns a pointer to internal buffer instead of copying.
 pub unsafe extern "system" fn get_ts_stream_ptr(
@@ -514,7 +538,10 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
 
     // ===== 引数チェック =====
     if dst.is_null() || size.is_null() || remain.is_null() {
-        crate::file_log!(error, "GetTsStream(ptr): invalid args dst/size/remain is null");
+        crate::file_log!(
+            error,
+            "GetTsStream(ptr): invalid args dst/size/remain is null"
+        );
         return FALSE;
     }
 
@@ -531,8 +558,7 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
     let max_len = DEFAULT_CHUNK.min(MAX_TS_BUFFER_SIZE);
 
     // ===== ログ間引き用カウンタ =====
-    static LOG_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static LOG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Single lock for the entire function.
@@ -643,7 +669,9 @@ pub unsafe extern "system" fn get_ts_stream_ptr(
 /// Purge the TS stream buffer.
 pub unsafe extern "system" fn purge_ts_stream(this: *mut c_void) {
     debug!("PurgeTsStream called");
-    let Some(instance) = instance_of(this) else { return };
+    let Some(instance) = instance_of(this) else {
+        return;
+    };
     let connection = {
         let state = instance.state.lock();
         state.connection.clone()
@@ -666,7 +694,11 @@ pub unsafe extern "system" fn release(this: *mut c_void) {
         return;
     }
     if !live_instances().write().remove(&(this as usize)) {
-        file_log!(error, "Release on released/unknown instance {:p}; ignoring", this);
+        file_log!(
+            error,
+            "Release on released/unknown instance {:p}; ignoring",
+            this
+        );
         return;
     }
 
@@ -697,7 +729,9 @@ pub unsafe extern "system" fn get_tuner_name(_this: *mut c_void) -> LPCTSTR {
 /// Check if the tuner is open.
 pub unsafe extern "system" fn is_tuner_opening(this: *mut c_void) -> BOOL {
     trace!("IsTunerOpening called");
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
     let state = instance.state.lock();
     match state.connection.state() {
         ConnectionState::TunerOpen | ConnectionState::Streaming => 1,
@@ -718,19 +752,33 @@ pub unsafe extern "system" fn enum_tuning_space(this: *mut c_void, space: DWORD)
 
     // Bounds check to prevent excessive memory allocation
     if space as usize >= MAX_SPACES {
-        file_log!(debug, "EnumTuningSpace: space {} exceeds maximum {}", space, MAX_SPACES);
-        debug!("EnumTuningSpace: space {} exceeds maximum {}", space, MAX_SPACES);
+        file_log!(
+            debug,
+            "EnumTuningSpace: space {} exceeds maximum {}",
+            space,
+            MAX_SPACES
+        );
+        debug!(
+            "EnumTuningSpace: space {} exceeds maximum {}",
+            space, MAX_SPACES
+        );
         return std::ptr::null();
     }
 
-    let Some(instance) = instance_of(this) else { return std::ptr::null() };
+    let Some(instance) = instance_of(this) else {
+        return std::ptr::null();
+    };
 
     // Check cache first
     let connection = {
         let state = instance.state.lock();
         if (space as usize) < state.space_names.len() {
             if let Some(name) = state.space_names[space as usize] {
-                file_log!(debug, "EnumTuningSpace: returning cached value for space {}", space);
+                file_log!(
+                    debug,
+                    "EnumTuningSpace: returning cached value for space {}",
+                    space
+                );
                 return name.as_ptr();
             }
         }
@@ -739,10 +787,19 @@ pub unsafe extern "system" fn enum_tuning_space(this: *mut c_void, space: DWORD)
 
     // Query server with the instance lock released (see `open_tuner`). A racing
     // caller may query the same space twice; interning makes that harmless.
-    file_log!(debug, "EnumTuningSpace: querying server for space {}", space);
+    file_log!(
+        debug,
+        "EnumTuningSpace: querying server for space {}",
+        space
+    );
     match connection.enum_tuning_space(space) {
         Some(name) => {
-            file_log!(debug, "EnumTuningSpace: got name '{}' for space {}", name, space);
+            file_log!(
+                debug,
+                "EnumTuningSpace: got name '{}' for space {}",
+                name,
+                space
+            );
             let wide = intern_wide(&name);
             let mut state = instance.state.lock();
             // Extend cache if needed
@@ -765,19 +822,30 @@ pub unsafe extern "system" fn enum_channel_name(
     space: DWORD,
     channel: DWORD,
 ) -> LPCTSTR {
-    debug!("EnumChannelName called: space={}, channel={}", space, channel);
+    debug!(
+        "EnumChannelName called: space={}, channel={}",
+        space, channel
+    );
 
     // Bounds check to prevent excessive memory allocation
     if space as usize >= MAX_SPACES {
-        debug!("EnumChannelName: space {} exceeds maximum {}", space, MAX_SPACES);
+        debug!(
+            "EnumChannelName: space {} exceeds maximum {}",
+            space, MAX_SPACES
+        );
         return std::ptr::null();
     }
     if channel as usize >= MAX_CHANNELS_PER_SPACE {
-        debug!("EnumChannelName: channel {} exceeds maximum {}", channel, MAX_CHANNELS_PER_SPACE);
+        debug!(
+            "EnumChannelName: channel {} exceeds maximum {}",
+            channel, MAX_CHANNELS_PER_SPACE
+        );
         return std::ptr::null();
     }
 
-    let Some(instance) = instance_of(this) else { return std::ptr::null() };
+    let Some(instance) = instance_of(this) else {
+        return std::ptr::null();
+    };
 
     // Check cache first
     let connection = {
@@ -817,9 +885,16 @@ pub unsafe extern "system" fn set_channel2(
     space: DWORD,
     channel: DWORD,
 ) -> BOOL {
-    file_log!(info, "SetChannel2 called: space={}, channel={}", space, channel);
+    file_log!(
+        info,
+        "SetChannel2 called: space={}, channel={}",
+        space,
+        channel
+    );
     debug!("SetChannel2 called: space={}, channel={}", space, channel);
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
 
     // Tuning is up to three sequential round-trips (SetChannelSpace, then
     // PurgeStream and StartStream). Doing them under the instance lock froze
@@ -829,13 +904,25 @@ pub unsafe extern "system" fn set_channel2(
         state.connection.clone()
     };
 
-    file_log!(info, "SetChannel2: connection state before tuning={:?}", connection.state());
+    file_log!(
+        info,
+        "SetChannel2: connection state before tuning={:?}",
+        connection.state()
+    );
 
-    file_log!(debug, "SetChannel2: Calling connection.set_channel_space...");
+    file_log!(
+        debug,
+        "SetChannel2: Calling connection.set_channel_space..."
+    );
 
     let priority = connection.default_priority();
     let exclusive = connection.default_exclusive();
-    file_log!(debug, "SetChannel2: priority={}, exclusive={}", priority, exclusive);
+    file_log!(
+        debug,
+        "SetChannel2: priority={}, exclusive={}",
+        priority,
+        exclusive
+    );
 
     if connection.set_channel_space(space, channel, priority, exclusive) {
         {
@@ -853,7 +940,11 @@ pub unsafe extern "system" fn set_channel2(
             file_log!(error, "SetChannel2: StartStream failed after SetChannelSpace (space={}, channel={}, state={:?})", space, channel, connection.state());
         }
 
-        file_log!(info, "SetChannel2: SetChannelSpace succeeded; StartStream={}", started);
+        file_log!(
+            info,
+            "SetChannel2: SetChannelSpace succeeded; StartStream={}",
+            started
+        );
         1
     } else {
         file_log!(error, "SetChannel2: Failed");
@@ -864,7 +955,9 @@ pub unsafe extern "system" fn set_channel2(
 /// Get current tuning space.
 pub unsafe extern "system" fn get_cur_space(this: *mut c_void) -> DWORD {
     trace!("GetCurSpace called");
-    let Some(instance) = instance_of(this) else { return 0xFFFFFFFF };
+    let Some(instance) = instance_of(this) else {
+        return 0xFFFFFFFF;
+    };
     let state = instance.state.lock();
     state.cur_space
 }
@@ -872,7 +965,9 @@ pub unsafe extern "system" fn get_cur_space(this: *mut c_void) -> DWORD {
 /// Get current channel.
 pub unsafe extern "system" fn get_cur_channel(this: *mut c_void) -> DWORD {
     trace!("GetCurChannel called");
-    let Some(instance) = instance_of(this) else { return 0xFFFFFFFF };
+    let Some(instance) = instance_of(this) else {
+        return 0xFFFFFFFF;
+    };
     let state = instance.state.lock();
     state.cur_channel
 }
@@ -891,7 +986,9 @@ pub unsafe extern "system" fn get_total_device_num(_this: *mut c_void) -> DWORD 
 /// Get active device count.
 pub unsafe extern "system" fn get_active_device_num(this: *mut c_void) -> DWORD {
     debug!("GetActiveDeviceNum called");
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
     let state = instance.state.lock();
     match state.connection.state() {
         ConnectionState::TunerOpen | ConnectionState::Streaming => 1,
@@ -902,7 +999,9 @@ pub unsafe extern "system" fn get_active_device_num(this: *mut c_void) -> DWORD 
 /// Set LNB power.
 pub unsafe extern "system" fn set_lnb_power(this: *mut c_void, enable: BOOL) -> BOOL {
     debug!("SetLnbPower called: enable={}", enable);
-    let Some(instance) = instance_of(this) else { return 0 };
+    let Some(instance) = instance_of(this) else {
+        return 0;
+    };
     let connection = {
         let state = instance.state.lock();
         state.connection.clone()
@@ -967,7 +1066,7 @@ fn make_type_name(name: &[u8]) -> [u8; 32] {
 #[cfg(windows)]
 const PMD_SIMPLE: PMD = PMD {
     mdisp: 0,
-    pdisp: -1,  // -1 means no vbtable
+    pdisp: -1, // -1 means no vbtable
     vdisp: 0,
 };
 
@@ -980,74 +1079,71 @@ static mut RTTI_DATA: IBonDriver3RTTI = IBonDriver3RTTI {
         p_vftable: std::ptr::null(),
         spare: std::ptr::null_mut(),
         name: [
-            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n',
-            b'D', b'r', b'i', b'v', b'e', b'r', b'@', b'@',
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n', b'D', b'r', b'i', b'v', b'e', b'r',
+            b'@', b'@', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ],
     },
     type_desc_ibondriver2: RTTITypeDescriptor {
         p_vftable: std::ptr::null(),
         spare: std::ptr::null_mut(),
         name: [
-            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n',
-            b'D', b'r', b'i', b'v', b'e', b'r', b'2', b'@',
-            b'@', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n', b'D', b'r', b'i', b'v', b'e', b'r',
+            b'2', b'@', b'@', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ],
     },
     type_desc_ibondriver3: RTTITypeDescriptor {
         p_vftable: std::ptr::null(),
         spare: std::ptr::null_mut(),
         name: [
-            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n',
-            b'D', b'r', b'i', b'v', b'e', b'r', b'3', b'@',
-            b'@', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'.', b'?', b'A', b'V', b'I', b'B', b'o', b'n', b'D', b'r', b'i', b'v', b'e', b'r',
+            b'3', b'@', b'@', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ],
     },
 
     // Base class descriptors (RVAs will be fixed up)
     base_class_desc_ibondriver: RTTIBaseClassDescriptor {
-        p_type_descriptor: 0,  // Will be fixed up
+        p_type_descriptor: 0, // Will be fixed up
         num_contained_bases: 0,
         where_: PMD_SIMPLE,
         attributes: 0,
-        p_class_hierarchy_descriptor: 0,  // Will be fixed up
+        p_class_hierarchy_descriptor: 0, // Will be fixed up
     },
     base_class_desc_ibondriver2: RTTIBaseClassDescriptor {
-        p_type_descriptor: 0,  // Will be fixed up
-        num_contained_bases: 1,  // IBonDriver2 has 1 base (IBonDriver)
+        p_type_descriptor: 0,   // Will be fixed up
+        num_contained_bases: 1, // IBonDriver2 has 1 base (IBonDriver)
         where_: PMD_SIMPLE,
         attributes: 0,
-        p_class_hierarchy_descriptor: 0,  // Will be fixed up
+        p_class_hierarchy_descriptor: 0, // Will be fixed up
     },
     base_class_desc_ibondriver3: RTTIBaseClassDescriptor {
-        p_type_descriptor: 0,  // Will be fixed up
-        num_contained_bases: 2,  // IBonDriver3 has 2 bases (IBonDriver2, IBonDriver)
+        p_type_descriptor: 0,   // Will be fixed up
+        num_contained_bases: 2, // IBonDriver3 has 2 bases (IBonDriver2, IBonDriver)
         where_: PMD_SIMPLE,
         attributes: 0,
-        p_class_hierarchy_descriptor: 0,  // Will be fixed up
+        p_class_hierarchy_descriptor: 0, // Will be fixed up
     },
 
     // Base class array (RVAs will be fixed up)
     base_class_array: RTTIBaseClassArray3 {
-        entries: [0, 0, 0],  // Will be fixed up
+        entries: [0, 0, 0], // Will be fixed up
     },
 
     // Class hierarchy descriptor
     class_hierarchy_ibondriver3: RTTIClassHierarchyDescriptor {
-        signature: 1,  // x64
-        attributes: 0,  // Single inheritance, no virtual bases
-        num_base_classes: 3,  // IBonDriver3, IBonDriver2, IBonDriver
-        p_base_class_array: 0,  // Will be fixed up
+        signature: 1,          // x64
+        attributes: 0,         // Single inheritance, no virtual bases
+        num_base_classes: 3,   // IBonDriver3, IBonDriver2, IBonDriver
+        p_base_class_array: 0, // Will be fixed up
     },
 
     // Complete object locator
     complete_object_locator: RTTICompleteObjectLocator {
-        signature: 1,  // x64
+        signature: 1, // x64
         offset: 0,
         cd_offset: 0,
-        p_type_descriptor: 0,  // Will be fixed up
-        p_class_hierarchy_descriptor: 0,  // Will be fixed up
-        p_self: 0,  // Will be fixed up
+        p_type_descriptor: 0,            // Will be fixed up
+        p_class_hierarchy_descriptor: 0, // Will be fixed up
+        p_self: 0,                       // Will be fixed up
     },
 };
 
@@ -1188,8 +1284,8 @@ fn get_module_base() -> usize {
     const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
     const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
     let mut handle = std::ptr::null_mut();
-    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let flags =
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
     let ok = unsafe {
         GetModuleHandleExW(
             flags,
@@ -1202,7 +1298,10 @@ fn get_module_base() -> usize {
         // This should only be possible if Windows rejects the address.  Do
         // not fall back to GetModuleHandleW(NULL): that returns the EXE base,
         // which would turn every RTTI RVA into an invalid pointer.
-        file_log!(error, "get_module_base: GetModuleHandleExW(FROM_ADDRESS) failed");
+        file_log!(
+            error,
+            "get_module_base: GetModuleHandleExW(FROM_ADDRESS) failed"
+        );
         0
     } else {
         handle as usize
@@ -1220,7 +1319,7 @@ pub fn get_rtti_locator_ptr() -> *const RTTICompleteObjectLocator {
 /// Initialized with null RTTI pointer, fixed up in init_rtti().
 #[cfg(windows)]
 static mut IBONDRIVER3_VTBL_WITH_RTTI: IBonDriver3VtblWithRTTI = IBonDriver3VtblWithRTTI {
-    rtti_locator_ptr: std::ptr::null(),  // Will be fixed up at runtime
+    rtti_locator_ptr: std::ptr::null(), // Will be fixed up at runtime
     vtable: IBonDriver3Vtbl {
         base: IBonDriver2Vtbl {
             base: IBonDriverVtbl {
@@ -1260,16 +1359,18 @@ pub fn get_vtable_ptr() -> *const IBonDriver3Vtbl {
     init_rtti();
 
     // Fix up the vtable's RTTI pointer
-    VTABLE_RTTI_INIT.call_once(|| {
-        unsafe {
-            let rtti_ptr = &RTTI_DATA.complete_object_locator as *const RTTICompleteObjectLocator;
-            file_log!(info, "get_vtable_ptr: Fixing up RTTI locator pointer to {:p}", rtti_ptr);
+    VTABLE_RTTI_INIT.call_once(|| unsafe {
+        let rtti_ptr = &RTTI_DATA.complete_object_locator as *const RTTICompleteObjectLocator;
+        file_log!(
+            info,
+            "get_vtable_ptr: Fixing up RTTI locator pointer to {:p}",
+            rtti_ptr
+        );
 
-            let vtbl_ptr = &mut IBONDRIVER3_VTBL_WITH_RTTI as *mut IBonDriver3VtblWithRTTI;
-            (*vtbl_ptr).rtti_locator_ptr = rtti_ptr;
+        let vtbl_ptr = &mut IBONDRIVER3_VTBL_WITH_RTTI as *mut IBonDriver3VtblWithRTTI;
+        (*vtbl_ptr).rtti_locator_ptr = rtti_ptr;
 
-            file_log!(info, "get_vtable_ptr: RTTI locator pointer fixed up");
-        }
+        file_log!(info, "get_vtable_ptr: RTTI locator pointer fixed up");
     });
 
     unsafe { &IBONDRIVER3_VTBL_WITH_RTTI.vtable }
@@ -1312,7 +1413,11 @@ mod tests {
             assert_eq!(get_cur_space(a), 3);
             assert_eq!(get_cur_channel(a), 11);
             assert_eq!(get_cur_space(b), 0xFFFFFFFF, "instance B must be untouched");
-            assert_eq!(get_cur_channel(b), 0xFFFFFFFF, "instance B must be untouched");
+            assert_eq!(
+                get_cur_channel(b),
+                0xFFFFFFFF,
+                "instance B must be untouched"
+            );
 
             release(a);
             release(b);
@@ -1339,14 +1444,15 @@ mod tests {
             // Nobody answers the request, so SetChannel2 blocks in the RPC.
             let _req_rx = {
                 let state = instance_of(inst).unwrap().state.lock();
-                state.connection.buffer().write(&vec![0x47u8; TS_PACKET_SIZE * 4]);
+                state
+                    .connection
+                    .buffer()
+                    .write(&vec![0x47u8; TS_PACKET_SIZE * 4]);
                 state.connection.stub_unanswered_rpc()
             };
 
             let addr = inst as usize;
-            let tuning = std::thread::spawn(move || {
-                set_channel2(addr as *mut c_void, 0, 0)
-            });
+            let tuning = std::thread::spawn(move || set_channel2(addr as *mut c_void, 0, 0));
 
             // Give the tuning thread time to enter the RPC and block.
             std::thread::sleep(Duration::from_millis(100));
@@ -1382,7 +1488,10 @@ mod tests {
             // limited by availability.
             {
                 let state = instance_of(inst).unwrap().state.lock();
-                state.connection.buffer().write(&vec![0x47u8; TS_PACKET_SIZE * 8]);
+                state
+                    .connection
+                    .buffer()
+                    .write(&vec![0x47u8; TS_PACKET_SIZE * 8]);
             }
 
             // A generous destination with a canary past the packet boundary, and
@@ -1419,9 +1528,7 @@ mod tests {
         unsafe {
             assert!(enum_tuning_space(inst, MAX_SPACES as DWORD).is_null());
             assert!(enum_channel_name(inst, MAX_SPACES as DWORD, 0).is_null());
-            assert!(
-                enum_channel_name(inst, 0, MAX_CHANNELS_PER_SPACE as DWORD).is_null()
-            );
+            assert!(enum_channel_name(inst, 0, MAX_CHANNELS_PER_SPACE as DWORD).is_null());
             release(inst);
         }
     }

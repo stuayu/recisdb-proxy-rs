@@ -21,31 +21,31 @@
 //! }
 //! ```
 
-mod packet;
-mod psi;
-mod pat;
-mod pmt;
-mod nit;
-mod sdt;
 mod analyzer;
 mod descriptors;
+mod nit;
+mod packet;
+mod pat;
+mod pmt;
+mod psi;
+mod sdt;
 
 #[allow(unused_imports)]
-pub use packet::{TsPacket, TsHeader, AdaptationField, TS_PACKET_SIZE, SYNC_BYTE};
+pub use analyzer::{AnalyzerConfig, AnalyzerResult, TsAnalyzer};
 #[allow(unused_imports)]
-pub use psi::{PsiSection, PsiHeader};
-#[allow(unused_imports)]
-pub use pat::{PatTable, PatEntry};
-#[allow(unused_imports)]
-pub use pmt::{PmtTable, PmtStream};
+pub use descriptors::{ServiceDescriptor, TerrestrialDeliveryDescriptor};
 #[allow(unused_imports)]
 pub use nit::{NitTable, NitTransportStream};
 #[allow(unused_imports)]
-pub use sdt::{SdtTable, SdtService};
+pub use packet::{AdaptationField, TsHeader, TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
 #[allow(unused_imports)]
-pub use analyzer::{TsAnalyzer, AnalyzerConfig, AnalyzerResult};
+pub use pat::{PatEntry, PatTable};
 #[allow(unused_imports)]
-pub use descriptors::{ServiceDescriptor, TerrestrialDeliveryDescriptor};
+pub use pmt::{PmtStream, PmtTable};
+#[allow(unused_imports)]
+pub use psi::{PsiHeader, PsiSection};
+#[allow(unused_imports)]
+pub use sdt::{SdtService, SdtTable};
 
 /// Well-known PIDs in MPEG-TS.
 pub mod pid {

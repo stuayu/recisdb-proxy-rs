@@ -50,10 +50,10 @@ const FLUSH_INTERVAL_SECS: u64 = 2;
 /// Set the file log level.
 pub fn set_file_log_level(level: log::LevelFilter) {
     let n = match level {
-        log::LevelFilter::Off   => 0,
+        log::LevelFilter::Off => 0,
         log::LevelFilter::Error => 1,
-        log::LevelFilter::Warn  => 2,
-        log::LevelFilter::Info  => 3,
+        log::LevelFilter::Warn => 2,
+        log::LevelFilter::Info => 3,
         log::LevelFilter::Debug => 4,
         log::LevelFilter::Trace => 5,
     };
@@ -63,7 +63,9 @@ pub fn set_file_log_level(level: log::LevelFilter) {
 /// Returns true if the given level should be written to the log file.
 pub fn file_level_enabled(level: log::Level) -> bool {
     let filter = FILE_LOG_LEVEL.load(Ordering::Relaxed);
-    if filter == 0 { return false; }
+    if filter == 0 {
+        return false;
+    }
     (level as u8) <= filter
 }
 
@@ -75,7 +77,11 @@ fn get_dll_path() -> Option<PathBuf> {
 
     // HMODULE for our DLL
     extern "system" {
-        fn GetModuleFileNameW(hModule: *mut std::ffi::c_void, lpFilename: *mut u16, nSize: u32) -> u32;
+        fn GetModuleFileNameW(
+            hModule: *mut std::ffi::c_void,
+            lpFilename: *mut u16,
+            nSize: u32,
+        ) -> u32;
     }
 
     // Get handle to our DLL by using a known symbol address
@@ -142,11 +148,7 @@ pub fn init_file_logger() -> bool {
     // Change extension to .log
     let log_path = dll_path.with_extension("log");
 
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(file) => {
             let written = file.metadata().map(|m| m.len()).unwrap_or(0);
             let state = LoggerState {
@@ -266,7 +268,11 @@ mod tests {
     }
 
     fn open_state(path: &PathBuf) -> LoggerState {
-        let file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         LoggerState {
             writer: Some(BufWriter::new(file)),
             last_flush: Instant::now(),
@@ -306,7 +312,11 @@ mod tests {
             );
         }
         assert!(
-            !dir.join(format!("BonDriver_NetworkProxy.log.{}", MAX_LOG_GENERATIONS + 1)).exists(),
+            !dir.join(format!(
+                "BonDriver_NetworkProxy.log.{}",
+                MAX_LOG_GENERATIONS + 1
+            ))
+            .exists(),
             "generations beyond the cap must be discarded"
         );
 
@@ -321,9 +331,19 @@ mod tests {
         let path = dir.join("app.log");
         let mut state = open_state(&path);
 
-        state.writer.as_mut().unwrap().write_all(b"older\n").unwrap();
+        state
+            .writer
+            .as_mut()
+            .unwrap()
+            .write_all(b"older\n")
+            .unwrap();
         rotate(&mut state);
-        state.writer.as_mut().unwrap().write_all(b"newer\n").unwrap();
+        state
+            .writer
+            .as_mut()
+            .unwrap()
+            .write_all(b"newer\n")
+            .unwrap();
         rotate(&mut state);
 
         let gen1 = std::fs::read_to_string(dir.join("app.log.1")).unwrap();
@@ -372,7 +392,10 @@ macro_rules! file_log {
 
 /// Convenience function for logging errors with context.
 pub fn log_error(context: &str, error: &dyn std::fmt::Display) {
-    log_with_level(&format!("[ERROR] {}: {}", context, error), log::Level::Error);
+    log_with_level(
+        &format!("[ERROR] {}: {}", context, error),
+        log::Level::Error,
+    );
 }
 
 /// Log a panic to the file.
@@ -380,9 +403,14 @@ pub fn log_error(context: &str, error: &dyn std::fmt::Display) {
 pub fn log_panic(info: &std::panic::PanicInfo) {
     log_with_level(&format!("[PANIC] {}", info), log::Level::Error);
     if let Some(location) = info.location() {
-        log_with_level(&format!("[PANIC] at {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()), log::Level::Error);
+        log_with_level(
+            &format!(
+                "[PANIC] at {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            ),
+            log::Level::Error,
+        );
     }
 }

@@ -145,7 +145,8 @@ impl BlockingGate {
     /// from the fake reader's blocking thread; marks `entered` on the way
     /// in so a test's `wait_until_entered` can observe it.
     fn block_until_released(&self) {
-        self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -164,7 +165,8 @@ impl BlockingGate {
 
     /// Let a blocked `get_ts_stream` call return.
     pub(crate) fn release(&self) {
-        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -243,7 +245,10 @@ impl TsSource for FakeTsSource {
             panic!("FakeTsSource: configured to panic on set_channel");
         }
         match self.set_channel_error {
-            Some(kind) => Err(io::Error::new(kind, "FakeTsSource: configured set_channel error")),
+            Some(kind) => Err(io::Error::new(
+                kind,
+                "FakeTsSource: configured set_channel error",
+            )),
             None => Ok(()),
         }
     }

@@ -137,8 +137,14 @@ fn install_fonts(ctx: &egui::Context) -> FontSetup {
                 "C:\\Windows\\Fonts\\YuGothM.ttc",
                 "C:\\Windows\\Fonts\\YuGothB.ttc",
             ),
-            ("C:\\Windows\\Fonts\\meiryo.ttc", "C:\\Windows\\Fonts\\meiryob.ttc"),
-            ("C:\\Windows\\Fonts\\msgothic.ttc", "C:\\Windows\\Fonts\\msgothic.ttc"),
+            (
+                "C:\\Windows\\Fonts\\meiryo.ttc",
+                "C:\\Windows\\Fonts\\meiryob.ttc",
+            ),
+            (
+                "C:\\Windows\\Fonts\\msgothic.ttc",
+                "C:\\Windows\\Fonts\\msgothic.ttc",
+            ),
         ]
     } else if cfg!(target_os = "macos") {
         &[
@@ -235,9 +241,18 @@ fn apply_theme(ctx: &egui::Context, fonts: &FontSetup) {
     style.text_styles = [
         (TextStyle::Heading, FontId::new(27.0, heading_family(fonts))),
         (TextStyle::Body, FontId::new(17.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(17.0, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(14.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(17.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(15.0, FontFamily::Monospace),
+        ),
     ]
     .into();
 
@@ -351,11 +366,7 @@ fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// 補足説明。本文より一段弱い色で、読み飛ばしても支障ない情報だと示す。
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(15.0)
-            .color(palette::MUTED),
-    );
+    ui.label(egui::RichText::new(text).size(15.0).color(palette::MUTED));
 }
 
 /// エラー表示。赤の帯で囲み、見落とされないようにする。
@@ -783,7 +794,8 @@ impl SetupApp {
         // recisdb-proxy 本体をインストール先に配置/更新する。既にインストール
         // 済みで内容が同一なら何もしない(設定ファイル・DBには触れない)。
         match setup_exe_dir() {
-            Some(source_dir) => match setup_helpers::sync_program_binary(&source_dir, &install_dir) {
+            Some(source_dir) => match setup_helpers::sync_program_binary(&source_dir, &install_dir)
+            {
                 Ok(setup_helpers::BinarySyncAction::FreshInstall) => self.log_lines.push(format!(
                     "recisdb-proxy をインストールしました: {}",
                     install_dir.display()
@@ -834,8 +846,9 @@ impl SetupApp {
                 self.setup_error = Some(format!("データベースのバックアップに失敗しました: {e}"));
                 return;
             }
-            self.log_lines
-                .push(format!("既存のデータベースをバックアップしました: {backup_path}"));
+            self.log_lines.push(format!(
+                "既存のデータベースをバックアップしました: {backup_path}"
+            ));
         }
 
         let db = match Database::open(&db_file_path) {
@@ -845,8 +858,10 @@ impl SetupApp {
                 return;
             }
         };
-        self.log_lines
-            .push(format!("データベースを初期化しました: {}", db_file_path.display()));
+        self.log_lines.push(format!(
+            "データベースを初期化しました: {}",
+            db_file_path.display()
+        ));
 
         let selected_indices: Vec<usize> = self
             .selected
@@ -859,24 +874,28 @@ impl SetupApp {
             let results = register_tuners_to_db(&db, &self.detected, &selected_indices);
             for r in results {
                 match r.outcome {
-                    Ok(id) => self
-                        .log_lines
-                        .push(format!("チューナーを登録しました: {} (ID: {id})", r.device_path)),
-                    Err(e) => self
-                        .log_lines
-                        .push(format!("チューナーの登録に失敗しました: {} ({e})", r.device_path)),
+                    Ok(id) => self.log_lines.push(format!(
+                        "チューナーを登録しました: {} (ID: {id})",
+                        r.device_path
+                    )),
+                    Err(e) => self.log_lines.push(format!(
+                        "チューナーの登録に失敗しました: {} ({e})",
+                        r.device_path
+                    )),
                 }
             }
         }
 
         for entry in &self.manual_entries {
             match register_manual_tuner(&db, &entry.path, &entry.group, entry.max_instances) {
-                Ok(id) => self
-                    .log_lines
-                    .push(format!("チューナーを登録しました: {} (ID: {id})", entry.path)),
-                Err(e) => self
-                    .log_lines
-                    .push(format!("チューナーの登録に失敗しました: {} ({e})", entry.path)),
+                Ok(id) => self.log_lines.push(format!(
+                    "チューナーを登録しました: {} (ID: {id})",
+                    entry.path
+                )),
+                Err(e) => self.log_lines.push(format!(
+                    "チューナーの登録に失敗しました: {} ({e})",
+                    entry.path
+                )),
             }
         }
 
@@ -932,19 +951,30 @@ impl SetupApp {
     /// **失敗してもセットアップ全体は続行する** — プレビューが無くても
     /// TVTest からの視聴という主目的には影響しないため。理由はログに残し、
     /// あとからダッシュボードの「プレビューを使えるようにする」で再試行できる。
-    fn setup_browser_preview(&mut self, db: &recisdb_proxy::database::Database, install_dir: &Path) {
+    fn setup_browser_preview(
+        &mut self,
+        db: &recisdb_proxy::database::Database,
+        install_dir: &Path,
+    ) {
         let config_path = install_dir.join("recisdb-proxy.toml");
-        self.log_lines
-            .push("ブラウザプレビューの準備中... (ダウンロードを伴うため時間がかかります)".to_string());
-        match recisdb_proxy::preview_setup::ensure_preview_ready(db, install_dir, Some(&config_path)) {
+        self.log_lines.push(
+            "ブラウザプレビューの準備中... (ダウンロードを伴うため時間がかかります)".to_string(),
+        );
+        match recisdb_proxy::preview_setup::ensure_preview_ready(
+            db,
+            install_dir,
+            Some(&config_path),
+        ) {
             Ok(report) => {
                 self.log_lines.push(format!(
                     "ブラウザプレビューを有効にしました (エンコーダ: {} / 映像: {})",
                     report.encoder_path, report.video_encoder
                 ));
                 if report.preprocessor_path.is_empty() {
-                    self.log_lines
-                        .push("前段処理 (tsreadex) は未設定です。字幕が表示されない場合があります。".to_string());
+                    self.log_lines.push(
+                        "前段処理 (tsreadex) は未設定です。字幕が表示されない場合があります。"
+                            .to_string(),
+                    );
                 }
                 self.log_lines.extend(report.warnings);
             }
@@ -975,7 +1005,11 @@ impl SetupApp {
             ServiceScope::System
         };
 
-        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_name = if cfg!(windows) {
+            "recisdb-proxy.exe"
+        } else {
+            "recisdb-proxy"
+        };
         let exe_path = install_dir.join(exe_name);
         let config_file_path = self.config_file_path();
         let spec = service::default_spec(
@@ -1016,7 +1050,11 @@ impl SetupApp {
 
     fn launch_server_and_open_dashboard(&mut self) {
         let install_dir = self.install_dir();
-        let exe_name = if cfg!(windows) { "recisdb-proxy.exe" } else { "recisdb-proxy" };
+        let exe_name = if cfg!(windows) {
+            "recisdb-proxy.exe"
+        } else {
+            "recisdb-proxy"
+        };
         let exe = install_dir.join(exe_name);
 
         if !exe.exists() {
@@ -1049,7 +1087,10 @@ impl SetupApp {
 /// インストール先へコピーしてくる際のコピー元として使う(ダウンロードした
 /// リリースzipの展開先を想定)。
 fn setup_exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 /// OS既定のブラウザでURLを開く。失敗しても致命的ではないので握りつぶす。
@@ -1234,11 +1275,7 @@ impl SetupApp {
                     .corner_radius(6)
                     .inner_margin(egui::Margin::symmetric(8, 3))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(badge)
-                                .size(14.0)
-                                .color(palette::ACCENT),
-                        );
+                        ui.label(egui::RichText::new(badge).size(14.0).color(palette::ACCENT));
                     });
             });
             ui.add_space(6.0);
@@ -1386,13 +1423,13 @@ impl SetupApp {
             ui.label(egui::RichText::new("インストール先フォルダ").size(19.0));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.install_location).desired_width(480.0),
-                );
+                ui.add(egui::TextEdit::singleline(&mut self.install_location).desired_width(480.0));
                 #[cfg(windows)]
                 if ui.button("参照…").clicked() {
                     let start_dir = self.install_dir();
-                    if let Some(dir) = rfd::FileDialog::new().set_directory(&start_dir).pick_folder()
+                    if let Some(dir) = rfd::FileDialog::new()
+                        .set_directory(&start_dir)
+                        .pick_folder()
                     {
                         self.install_location = dir.to_string_lossy().to_string();
                     }
@@ -1470,7 +1507,9 @@ impl SetupApp {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.add_space(6.0);
-                ui.label("接続されているチューナーを自動で検出しています。しばらくお待ちください。");
+                ui.label(
+                    "接続されているチューナーを自動で検出しています。しばらくお待ちください。",
+                );
             });
         });
     }
@@ -1576,7 +1615,10 @@ impl SetupApp {
                 // pnputil等の詳細ログは複数行になりうるので、選択・コピーできる
                 // スクロール可能なテキストボックスで表示する(単一行ラベルだと
                 // 折り返しやコピーができず読みづらいため)。
-                ui.colored_label(palette::DANGER, "ドライバのインストールでエラーが発生しました:");
+                ui.colored_label(
+                    palette::DANGER,
+                    "ドライバのインストールでエラーが発生しました:",
+                );
                 let mut err_text = err.clone();
                 egui::ScrollArea::vertical()
                     .max_height(180.0)
@@ -1614,8 +1656,7 @@ impl SetupApp {
                     });
 
                 ui.add_space(6.0);
-                if ui.button("この内容で追加").clicked()
-                    && !self.manual_form.path.trim().is_empty()
+                if ui.button("この内容で追加").clicked() && !self.manual_form.path.trim().is_empty()
                 {
                     let max_instances = self.manual_form.max_instances.trim().parse().unwrap_or(1);
                     self.manual_entries.push(ManualEntry {
@@ -1857,8 +1898,7 @@ impl SetupApp {
                 ui.horizontal(|ui| {
                     ui.label("更新先フォルダ:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.bulk_update_dir)
-                            .desired_width(420.0),
+                        egui::TextEdit::singleline(&mut self.bulk_update_dir).desired_width(420.0),
                     );
                 });
                 hint(
@@ -1935,10 +1975,8 @@ mod tests {
     fn run_bulk_dll_update_reports_error_when_source_dll_missing() {
         // インストールを実行していない(セットアップ未完了)状況では
         // クライアント配布用DLLがまだ存在しないため、エラーとして扱われる。
-        let base = std::env::temp_dir().join(format!(
-            "run_bulk_dll_update_test_{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("run_bulk_dll_update_test_{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let target_dir = base.join("target");
         std::fs::create_dir_all(&target_dir).unwrap();

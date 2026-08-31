@@ -4,8 +4,8 @@
 use axum::{
     extract::{Path, Query, State},
     response::{
-        IntoResponse,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse,
     },
     Json,
 };
@@ -54,9 +54,7 @@ pub struct ClientControlOverrideRequest {
 }
 
 /// Get all connected clients.
-pub async fn get_clients(
-    State(web_state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+pub async fn get_clients(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
     let sessions = web_state.session_registry.get_all().await;
 
     let clients: Vec<serde_json::Value> = sessions
@@ -104,9 +102,7 @@ pub async fn get_clients(
 }
 
 /// Get server statistics.
-pub async fn get_stats(
-    State(web_state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+pub async fn get_stats(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
     let active_sessions = web_state.session_registry.count().await;
     let tuner_keys = web_state.tuner_pool.keys().await;
     let total_tuners = tuner_keys.len();
@@ -202,8 +198,16 @@ pub async fn get_client_quality(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let sessions = web_state.session_registry.get_all().await;
     if let Some(session) = sessions.into_iter().find(|s| s.id == id) {
-        let bitrate: Vec<(i64, f64)> = session.metrics_history.bitrate_history.into_iter().collect();
-        let packet_loss: Vec<(i64, f64)> = session.metrics_history.packet_loss_history.into_iter().collect();
+        let bitrate: Vec<(i64, f64)> = session
+            .metrics_history
+            .bitrate_history
+            .into_iter()
+            .collect();
+        let packet_loss: Vec<(i64, f64)> = session
+            .metrics_history
+            .packet_loss_history
+            .into_iter()
+            .collect();
 
         return Ok(Json(json!({
             "success": true,
@@ -227,9 +231,18 @@ pub async fn get_client_metrics_history(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let sessions = web_state.session_registry.get_all().await;
     if let Some(session) = sessions.into_iter().find(|s| s.id == id) {
-        let bitrate: Vec<(i64, f64)> = session.metrics_history.bitrate_history.into_iter().collect();
-        let packet_loss: Vec<(i64, f64)> = session.metrics_history.packet_loss_history.into_iter().collect();
-        let signal_level: Vec<(i64, f32)> = session.metrics_history.signal_history.into_iter().collect();
+        let bitrate: Vec<(i64, f64)> = session
+            .metrics_history
+            .bitrate_history
+            .into_iter()
+            .collect();
+        let packet_loss: Vec<(i64, f64)> = session
+            .metrics_history
+            .packet_loss_history
+            .into_iter()
+            .collect();
+        let signal_level: Vec<(i64, f32)> =
+            session.metrics_history.signal_history.into_iter().collect();
 
         return Ok(Json(json!({
             "success": true,

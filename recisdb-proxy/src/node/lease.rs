@@ -195,7 +195,10 @@ impl RemoteLeaseManager {
             self.policy.ttl(stream_class),
             self.policy.replay_budget,
         ));
-        self.leases.write().await.insert(lease.id.clone(), Arc::clone(&lease));
+        self.leases
+            .write()
+            .await
+            .insert(lease.id.clone(), Arc::clone(&lease));
         lease
     }
 
@@ -244,8 +247,8 @@ impl RemoteLeaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::node::{FrameFlags, NodeTsFrame};
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn lease_lifetime_is_not_bound_to_transport_connection() {
@@ -272,7 +275,13 @@ mod tests {
         let resumed = manager.get(&lease.id).await.unwrap();
         assert_eq!(resumed.id, lease.id);
         assert_eq!(resumed.claim, EffectiveClaim::new(2, false));
-        assert!(resumed.replay.lock().await.replay_from(1, 0).unwrap().is_empty());
+        assert!(resumed
+            .replay
+            .lock()
+            .await
+            .replay_from(1, 0)
+            .unwrap()
+            .is_empty());
     }
 
     /// A consumer that crashes never sends its release. The lease TTL is the
@@ -308,12 +317,21 @@ mod tests {
         tokio::time::sleep(ttl / 2).await;
         assert!(manager.renew(&lease.id).await);
         tokio::time::sleep(ttl / 2).await;
-        assert!(manager.get(&lease.id).await.is_some(), "a renewed lease must survive");
+        assert!(
+            manager.get(&lease.id).await.is_some(),
+            "a renewed lease must survive"
+        );
 
         // The consumer dies: no more renewals.
         tokio::time::sleep(ttl * 2).await;
-        assert!(manager.get(&lease.id).await.is_none(), "an unrenewed lease must expire");
-        assert!(!manager.renew(&lease.id).await, "an expired lease cannot be renewed back to life");
+        assert!(
+            manager.get(&lease.id).await.is_none(),
+            "an unrenewed lease must expire"
+        );
+        assert!(
+            !manager.renew(&lease.id).await,
+            "an expired lease cannot be renewed back to life"
+        );
     }
 
     /// The janitor is the backstop for a lease whose pump is no longer
@@ -342,7 +360,10 @@ mod tests {
         let view = make(StreamClass::View).await;
         let record = make(StreamClass::Record).await;
 
-        assert!(manager.reap_expired().await.is_empty(), "nothing is expired yet");
+        assert!(
+            manager.reap_expired().await.is_empty(),
+            "nothing is expired yet"
+        );
         tokio::time::sleep(view_ttl * 2).await;
 
         let reaped = manager.reap_expired().await;
@@ -352,7 +373,10 @@ mod tests {
             manager.get(&record.id).await.is_some(),
             "a RECORD lease well inside its (much longer) TTL must not be reaped"
         );
-        assert!(manager.reap_expired().await.is_empty(), "reaping twice must not double-release");
+        assert!(
+            manager.reap_expired().await.is_empty(),
+            "reaping twice must not double-release"
+        );
     }
 
     #[tokio::test]
@@ -381,6 +405,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(live.recv().await.unwrap().sequence, 100);
-        assert_eq!(lease.replay.lock().await.replay_from(7, 100).unwrap()[0].sequence, 100);
+        assert_eq!(
+            lease.replay.lock().await.replay_from(7, 100).unwrap()[0].sequence,
+            100
+        );
     }
 }

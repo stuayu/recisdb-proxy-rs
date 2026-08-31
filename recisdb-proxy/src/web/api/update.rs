@@ -40,7 +40,8 @@ use super::error::ApiError;
 /// dashboard tabs polling this endpoint must not burn through that budget.
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-const RELEASES_URL: &str = "https://api.github.com/repos/stuayu/recisdb-proxy-rs/releases?per_page=15";
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/stuayu/recisdb-proxy-rs/releases?per_page=15";
 
 // ============================================================================
 // GitHub API response shape (only the fields this module needs)
@@ -82,7 +83,11 @@ pub struct ReleaseInfo {
 
 impl From<&GithubRelease> for ReleaseInfo {
     fn from(r: &GithubRelease) -> Self {
-        ReleaseInfo { tag: r.tag_name.clone(), url: r.html_url.clone(), published_at: r.published_at.clone() }
+        ReleaseInfo {
+            tag: r.tag_name.clone(),
+            url: r.html_url.clone(),
+            published_at: r.published_at.clone(),
+        }
     }
 }
 
@@ -164,7 +169,11 @@ fn prerelease_key(tag: &str) -> (String, u64) {
 /// so `alpha.11 < alpha.12`.
 fn version_key(tag: &str) -> Option<(u64, u64, u64, bool, String, u64)> {
     let (major, minor, patch, has_suffix) = parse_version(tag)?;
-    let (label, ordinal) = if has_suffix { prerelease_key(tag) } else { (String::new(), 0) };
+    let (label, ordinal) = if has_suffix {
+        prerelease_key(tag)
+    } else {
+        (String::new(), 0)
+    };
     Some((major, minor, patch, !has_suffix, label, ordinal))
 }
 
@@ -183,7 +192,10 @@ fn version_key(tag: &str) -> Option<(u64, u64, u64, bool, String, u64)> {
 /// - Releases whose tag doesn't parse as a version are ignored rather than
 ///   treated as errors, so one malformed tag can't take down the whole
 ///   check.
-pub fn select_updates(current_version: &str, releases: &[GithubRelease]) -> (Option<ReleaseInfo>, Option<ReleaseInfo>) {
+pub fn select_updates(
+    current_version: &str,
+    releases: &[GithubRelease],
+) -> (Option<ReleaseInfo>, Option<ReleaseInfo>) {
     // An unparsable "current" version (should not happen for our own crate
     // version, but keep this total) is treated as the lowest possible
     // version so every valid release counts as an update.
@@ -441,7 +453,10 @@ pub struct CheckQuery {
 }
 
 /// `GET /api/update/check` — see module docs.
-pub async fn check_update(State(web_state): State<Arc<WebState>>, Query(query): Query<CheckQuery>) -> Json<serde_json::Value> {
+pub async fn check_update(
+    State(web_state): State<Arc<WebState>>,
+    Query(query): Query<CheckQuery>,
+) -> Json<serde_json::Value> {
     let current_version = crate::VERSION;
 
     let releases = fetch_releases_cached(&web_state, query.force).await;
@@ -486,7 +501,10 @@ async fn fetch_releases_cached(web_state: &WebState, force: bool) -> Vec<GithubR
     match fetch_releases_from_github().await {
         Ok(releases) => {
             *web_state.update_check_cache.write().await =
-                Some(crate::web::state::UpdateCheckCache { fetched_at: Instant::now(), releases: releases.clone() });
+                Some(crate::web::state::UpdateCheckCache {
+                    fetched_at: Instant::now(),
+                    releases: releases.clone(),
+                });
             releases
         }
         Err(e) => {
@@ -513,7 +531,9 @@ async fn fetch_releases_from_github() -> Result<Vec<GithubRelease>, String> {
         return Err(format!("GitHub API returned HTTP {}", resp.status()));
     }
 
-    resp.json::<Vec<GithubRelease>>().await.map_err(|e| e.to_string())
+    resp.json::<Vec<GithubRelease>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -651,7 +671,10 @@ async fn run_self_update_inner(
     let kind = source.kind;
     let os = std::env::consts::OS;
     let exe_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let exe_dir = exe_path.parent().ok_or("current executable has no parent directory")?.to_path_buf();
+    let exe_dir = exe_path
+        .parent()
+        .ok_or("current executable has no parent directory")?
+        .to_path_buf();
     let pid = std::process::id();
     let archive_path = exe_dir.join(format!(".recisdb-proxy-update-{pid}.download"));
     let stage_dir = exe_dir.join(format!(".recisdb-proxy-update-{pid}.stage"));
@@ -660,12 +683,16 @@ async fn run_self_update_inner(
     // --- Download (streamed to disk; the archive is never fully buffered
     // in memory) -------------------------------------------------------
     set_status(web_state, UpdateStatus::Downloading).await;
-    download_to_file(&source.download_url, &archive_path, source.auth_token.as_deref())
-        .await
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&archive_path);
-            format!("download failed: {e}")
-        })?;
+    download_to_file(
+        &source.download_url,
+        &archive_path,
+        source.auth_token.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&archive_path);
+        format!("download failed: {e}")
+    })?;
 
     // --- Extract (blocking file/archive I/O off the async runtime) -----
     set_status(web_state, UpdateStatus::Extracting).await;
@@ -719,7 +746,11 @@ async fn run_self_update_inner(
 
     // recisdb is invoked independently by Mirakurun, so prove that it starts
     // on this machine before installing any part of the bundle.
-    let recisdb_name = if os == "windows" { "recisdb.exe" } else { "recisdb" };
+    let recisdb_name = if os == "windows" {
+        "recisdb.exe"
+    } else {
+        "recisdb"
+    };
     let recisdb_path = stage_dir.join(recisdb_name);
     if let Err(e) = smoke_test_binary(&recisdb_path).await {
         let _ = tokio::fs::remove_dir_all(&stage_dir).await;
@@ -744,10 +775,14 @@ async fn run_self_update_inner(
         // smoke test above has already established the new binary runs.
         tracing::warn!("self-update: could not keep a backup of the running binary: {e}");
     } else {
-        tracing::info!("self-update: previous binary kept at {}", backup_path.display());
+        tracing::info!(
+            "self-update: previous binary kept at {}",
+            backup_path.display()
+        );
     }
 
-    let installed_companions = match install_bundle_companions(&stage_dir, &exe_dir, &exe_path, os) {
+    let installed_companions = match install_bundle_companions(&stage_dir, &exe_dir, &exe_path, os)
+    {
         Ok(installed) => installed,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage_dir);
@@ -807,7 +842,9 @@ async fn download_to_file(url: &str, dest: &Path, auth_token: Option<&str>) -> R
     }
 
     use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| e.to_string())?;
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
     }
@@ -990,13 +1027,20 @@ async fn smoke_test_binary(path: &Path) -> Result<(), String> {
 async fn validate_extracted_binary(path: &Path, os: &str) -> Result<(), String> {
     let meta = tokio::fs::metadata(path).await.map_err(|e| e.to_string())?;
     if meta.len() <= MIN_BINARY_SIZE {
-        return Err(format!("downloaded binary is implausibly small ({} bytes)", meta.len()));
+        return Err(format!(
+            "downloaded binary is implausibly small ({} bytes)",
+            meta.len()
+        ));
     }
 
     use tokio::io::AsyncReadExt;
     let mut magic = [0u8; 4];
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| e.to_string())?;
-    file.read_exact(&mut magic).await.map_err(|e| format!("failed to read header: {e}"))?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.read_exact(&mut magic)
+        .await
+        .map_err(|e| format!("failed to read header: {e}"))?;
 
     if !has_valid_magic(&magic, os) {
         return Err("downloaded binary failed the magic-byte signature check".to_string());
@@ -1213,7 +1257,10 @@ pub struct ArtifactsResponse {
 /// Expired artifacts are skipped: GitHub keeps the metadata after the retention
 /// window but the download 404s, so offering one would only produce a confusing
 /// failure part-way through an update.
-pub fn select_dev_artifact<'a>(artifacts: &'a [Artifact], wanted_name: &str) -> Option<&'a Artifact> {
+pub fn select_dev_artifact<'a>(
+    artifacts: &'a [Artifact],
+    wanted_name: &str,
+) -> Option<&'a Artifact> {
     artifacts
         .iter()
         .find(|a| a.name == wanted_name && !a.expired)
@@ -1328,7 +1375,9 @@ pub struct SetGithubTokenRequest {
 ///
 /// Never returns the token itself: it is a credential, and the dashboard only
 /// needs to know whether to prompt for one.
-pub async fn get_github_token_status(State(web_state): State<Arc<WebState>>) -> Json<serde_json::Value> {
+pub async fn get_github_token_status(
+    State(web_state): State<Arc<WebState>>,
+) -> Json<serde_json::Value> {
     let configured = {
         let db = web_state.database.lock().await;
         db.get_github_token().ok().flatten().is_some()
@@ -1393,7 +1442,10 @@ pub async fn apply_dev_build(
         let status = web_state.update_status.lock().await;
         if matches!(
             *status,
-            UpdateStatus::Downloading | UpdateStatus::Extracting | UpdateStatus::Replacing | UpdateStatus::Restarting
+            UpdateStatus::Downloading
+                | UpdateStatus::Extracting
+                | UpdateStatus::Replacing
+                | UpdateStatus::Restarting
         ) {
             return Json(json!({ "success": false, "error": "an update is already in progress" }));
         }
@@ -1469,7 +1521,10 @@ mod tests {
             .filter(|file| file.required)
             .map(|file| file.name)
             .collect();
-        assert_eq!(required, vec!["recisdb-proxy", "recisdb", "recisdb-proxy-setup"]);
+        assert_eq!(
+            required,
+            vec!["recisdb-proxy", "recisdb", "recisdb-proxy-setup"]
+        );
         assert_eq!(
             bundle_file_for_entry("recisdb-proxy-v1-linux-amd64/recisdb", "linux").map(|f| f.name),
             Some("recisdb")
@@ -1577,7 +1632,9 @@ mod tests {
         let ok = dir.join("ok");
         std::fs::write(&ok, b"#!/bin/sh\necho 'recisdb-proxy 0.0.1'\n").unwrap();
 
-        smoke_test_binary(&ok).await.expect("a runnable binary must pass");
+        smoke_test_binary(&ok)
+            .await
+            .expect("a runnable binary must pass");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1597,13 +1654,31 @@ mod tests {
     /// upload naming, or the update silently finds nothing to install.
     #[test]
     fn dev_artifact_names_match_the_workflow_labels() {
-        assert_eq!(dev_artifact_name("windows", "x86_64"), Some("recisdb-win-x64"));
+        assert_eq!(
+            dev_artifact_name("windows", "x86_64"),
+            Some("recisdb-win-x64")
+        );
         assert_eq!(dev_artifact_name("windows", "x86"), Some("recisdb-win-x86"));
-        assert_eq!(dev_artifact_name("windows", "aarch64"), Some("recisdb-win-arm64"));
-        assert_eq!(dev_artifact_name("linux", "x86_64"), Some("recisdb-linux-amd64"));
-        assert_eq!(dev_artifact_name("linux", "aarch64"), Some("recisdb-linux-arm64"));
-        assert_eq!(dev_artifact_name("macos", "x86_64"), Some("recisdb-macos-amd64"));
-        assert_eq!(dev_artifact_name("macos", "aarch64"), Some("recisdb-macos-arm64"));
+        assert_eq!(
+            dev_artifact_name("windows", "aarch64"),
+            Some("recisdb-win-arm64")
+        );
+        assert_eq!(
+            dev_artifact_name("linux", "x86_64"),
+            Some("recisdb-linux-amd64")
+        );
+        assert_eq!(
+            dev_artifact_name("linux", "aarch64"),
+            Some("recisdb-linux-arm64")
+        );
+        assert_eq!(
+            dev_artifact_name("macos", "x86_64"),
+            Some("recisdb-macos-amd64")
+        );
+        assert_eq!(
+            dev_artifact_name("macos", "aarch64"),
+            Some("recisdb-macos-arm64")
+        );
 
         // Platforms the workflow does not build must say so rather than
         // offering an artifact that cannot exist.
@@ -1612,7 +1687,12 @@ mod tests {
     }
 
     fn artifact(id: u64, name: &str, expired: bool) -> Artifact {
-        Artifact { id, name: name.to_string(), expired, size_in_bytes: 1234 }
+        Artifact {
+            id,
+            name: name.to_string(),
+            expired,
+            size_in_bytes: 1234,
+        }
     }
 
     #[test]
@@ -1621,7 +1701,10 @@ mod tests {
             artifact(1, "recisdb-linux-amd64", false),
             artifact(2, "recisdb-win-x64", false),
         ];
-        assert_eq!(select_dev_artifact(&artifacts, "recisdb-win-x64").map(|a| a.id), Some(2));
+        assert_eq!(
+            select_dev_artifact(&artifacts, "recisdb-win-x64").map(|a| a.id),
+            Some(2)
+        );
         assert!(select_dev_artifact(&artifacts, "recisdb-macos-arm64").is_none());
 
         // GitHub keeps the metadata after retention but the download 404s, so
@@ -1716,8 +1799,14 @@ mod tests {
         // leading `v` already stripped by build.rs). Only the numeric
         // portion before the *first* '-' is significant, so this parses
         // exactly like the tag it's built on top of.
-        assert_eq!(parse_version("0.0.1-alpha.6-1-g05a127c"), Some((0, 0, 1, true)));
-        assert_eq!(parse_version("v0.0.1-alpha.6-1-g05a127c-dirty"), Some((0, 0, 1, true)));
+        assert_eq!(
+            parse_version("0.0.1-alpha.6-1-g05a127c"),
+            Some((0, 0, 1, true))
+        );
+        assert_eq!(
+            parse_version("v0.0.1-alpha.6-1-g05a127c-dirty"),
+            Some((0, 0, 1, true))
+        );
     }
 
     #[test]
@@ -1731,7 +1820,10 @@ mod tests {
     fn version_key_ranks_stable_above_prerelease_at_same_numeric_version() {
         let stable = version_key("1.2.3").unwrap();
         let pre = version_key("1.2.3-beta.1").unwrap();
-        assert!(stable > pre, "stable {stable:?} should outrank prerelease {pre:?}");
+        assert!(
+            stable > pre,
+            "stable {stable:?} should outrank prerelease {pre:?}"
+        );
     }
 
     #[test]
@@ -1740,7 +1832,10 @@ mod tests {
         assert_eq!(prerelease_key("0.0.1-beta.2"), ("beta".to_string(), 2));
         // git describe on a commit past a prerelease tag: the tag's own
         // ordinal must win over the commit distance.
-        assert_eq!(prerelease_key("0.0.1-alpha.6-1-g05a127c"), ("alpha".to_string(), 6));
+        assert_eq!(
+            prerelease_key("0.0.1-alpha.6-1-g05a127c"),
+            ("alpha".to_string(), 6)
+        );
         // git describe past a *stable* tag has no label, just a distance.
         assert_eq!(prerelease_key("0.0.1-1-g05a127c"), (String::new(), 1));
         assert_eq!(prerelease_key("0.0.1-dirty"), ("dirty".to_string(), 0));
@@ -1756,7 +1851,10 @@ mod tests {
         let a12 = version_key("v0.0.1-alpha.12").unwrap();
         let a9 = version_key("v0.0.1-alpha.9").unwrap();
         assert!(a12 > a11, "alpha.12 {a12:?} must outrank alpha.11 {a11:?}");
-        assert!(a11 > a9, "alpha.11 {a11:?} must outrank alpha.9 {a9:?} (numeric, not lexical)");
+        assert!(
+            a11 > a9,
+            "alpha.11 {a11:?} must outrank alpha.9 {a9:?} (numeric, not lexical)"
+        );
     }
 
     // -- select_updates ------------------------------------------------------
@@ -1775,7 +1873,10 @@ mod tests {
 
     #[test]
     fn select_updates_reports_no_update_when_running_the_newest_alpha() {
-        let releases = vec![release("v0.0.1-alpha.11", true, false), release("v0.0.1-alpha.12", true, false)];
+        let releases = vec![
+            release("v0.0.1-alpha.11", true, false),
+            release("v0.0.1-alpha.12", true, false),
+        ];
         let (stable, prerelease) = select_updates("v0.0.1-alpha.12", &releases);
         assert!(stable.is_none());
         assert!(prerelease.is_none());
@@ -1792,7 +1893,10 @@ mod tests {
 
     #[test]
     fn select_updates_finds_newer_stable() {
-        let releases = vec![release("v0.1.0", false, false), release("v0.2.0", false, false)];
+        let releases = vec![
+            release("v0.1.0", false, false),
+            release("v0.2.0", false, false),
+        ];
         let (stable, prerelease) = select_updates("0.1.0", &releases);
         assert_eq!(stable.unwrap().tag, "v0.2.0");
         assert!(prerelease.is_none());
@@ -1800,7 +1904,10 @@ mod tests {
 
     #[test]
     fn select_updates_returns_none_when_current_is_latest() {
-        let releases = vec![release("v0.1.0", false, false), release("v0.2.0", false, false)];
+        let releases = vec![
+            release("v0.1.0", false, false),
+            release("v0.2.0", false, false),
+        ];
         let (stable, prerelease) = select_updates("0.2.0", &releases);
         assert!(stable.is_none());
         assert!(prerelease.is_none());
@@ -1826,16 +1933,25 @@ mod tests {
     fn select_updates_hides_prerelease_superseded_by_stable() {
         // A 0.2.0-beta.1 prerelease exists, but 0.2.0 stable has since
         // shipped — the prerelease must not be surfaced anymore.
-        let releases = vec![release("v0.2.0-beta.1", true, false), release("v0.2.0", false, false)];
+        let releases = vec![
+            release("v0.2.0-beta.1", true, false),
+            release("v0.2.0", false, false),
+        ];
         let (stable, prerelease) = select_updates("0.1.0", &releases);
         assert_eq!(stable.unwrap().tag, "v0.2.0");
-        assert!(prerelease.is_none(), "prerelease behind stable must not be surfaced");
+        assert!(
+            prerelease.is_none(),
+            "prerelease behind stable must not be surfaced"
+        );
     }
 
     #[test]
     fn select_updates_surfaces_prerelease_newer_than_stable() {
         // Stable 0.2.0 shipped, but there's already a newer 0.3.0-beta.1.
-        let releases = vec![release("v0.2.0", false, false), release("v0.3.0-beta.1", true, false)];
+        let releases = vec![
+            release("v0.2.0", false, false),
+            release("v0.3.0-beta.1", true, false),
+        ];
         let (stable, prerelease) = select_updates("0.1.0", &releases);
         assert_eq!(stable.unwrap().tag, "v0.2.0");
         assert_eq!(prerelease.unwrap().tag, "v0.3.0-beta.1");
@@ -1843,24 +1959,41 @@ mod tests {
 
     #[test]
     fn select_updates_excludes_drafts() {
-        let releases = vec![release("v0.9.0", false, true) /* draft */, release("v0.2.0", false, false)];
+        let releases = vec![
+            release("v0.9.0", false, true), /* draft */
+            release("v0.2.0", false, false),
+        ];
         let (stable, _) = select_updates("0.1.0", &releases);
-        assert_eq!(stable.unwrap().tag, "v0.2.0", "draft must never be selected");
+        assert_eq!(
+            stable.unwrap().tag,
+            "v0.2.0",
+            "draft must never be selected"
+        );
     }
 
     #[test]
     fn select_updates_ignores_unparsable_tags_without_erroring() {
-        let releases = vec![release("not-a-version", false, false), release("v0.2.0", false, false)];
+        let releases = vec![
+            release("not-a-version", false, false),
+            release("v0.2.0", false, false),
+        ];
         let (stable, _) = select_updates("0.1.0", &releases);
         assert_eq!(stable.unwrap().tag, "v0.2.0");
     }
 
     #[test]
     fn select_updates_picks_max_across_multiple_newer_releases() {
-        let releases =
-            vec![release("v0.2.0", false, false), release("v0.4.0", false, false), release("v0.3.0", false, false)];
+        let releases = vec![
+            release("v0.2.0", false, false),
+            release("v0.4.0", false, false),
+            release("v0.3.0", false, false),
+        ];
         let (stable, _) = select_updates("0.1.0", &releases);
-        assert_eq!(stable.unwrap().tag, "v0.4.0", "must pick the highest, not the first newer one");
+        assert_eq!(
+            stable.unwrap().tag,
+            "v0.4.0",
+            "must pick the highest, not the first newer one"
+        );
     }
 
     #[test]
@@ -1881,7 +2014,10 @@ mod tests {
     fn select_updates_dev_build_between_tags_still_finds_newer_stable() {
         // Built from a commit 1 past v0.1.0; v0.2.0 has since shipped and
         // must still be surfaced as an update.
-        let releases = vec![release("v0.1.0", false, false), release("v0.2.0", false, false)];
+        let releases = vec![
+            release("v0.1.0", false, false),
+            release("v0.2.0", false, false),
+        ];
         let (stable, prerelease) = select_updates("0.1.0-1-g05a127c", &releases);
         assert_eq!(stable.unwrap().tag, "v0.2.0");
         assert!(prerelease.is_none());
@@ -1926,7 +2062,10 @@ mod tests {
         // hash, which `parse_version` rejects. `select_updates` must not
         // panic, and falls back to "every valid release counts as an
         // update" (see its doc comment) rather than silently hiding them.
-        let releases = vec![release("v0.1.0", false, false), release("v0.2.0-beta.1", true, false)];
+        let releases = vec![
+            release("v0.1.0", false, false),
+            release("v0.2.0-beta.1", true, false),
+        ];
         let (stable, prerelease) = select_updates("05a127c", &releases);
         assert_eq!(stable.unwrap().tag, "v0.1.0");
         assert_eq!(prerelease.unwrap().tag, "v0.2.0-beta.1");
@@ -1949,26 +2088,68 @@ mod tests {
 
     #[test]
     fn asset_filename_matches_release_ci_naming() {
-        assert_eq!(asset_filename("v1.2.3", "linux", "x86_64").as_deref(), Some("recisdb-proxy-v1.2.3-linux-amd64.tar.gz"));
-        assert_eq!(asset_filename("v1.2.3", "linux", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-linux-arm64.tar.gz"));
-        assert_eq!(asset_filename("v1.2.3", "windows", "x86_64").as_deref(), Some("recisdb-v1.2.3-win-x64.zip"));
-        assert_eq!(asset_filename("v1.2.3", "windows", "x86").as_deref(), Some("recisdb-v1.2.3-win-x86.zip"));
-        assert_eq!(asset_filename("v1.2.3", "windows", "aarch64").as_deref(), Some("recisdb-v1.2.3-win-arm64.zip"));
-        assert_eq!(asset_filename("v1.2.3", "macos", "x86_64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-amd64.tar.gz"));
-        assert_eq!(asset_filename("v1.2.3", "macos", "aarch64").as_deref(), Some("recisdb-proxy-v1.2.3-macos-arm64.tar.gz"));
+        assert_eq!(
+            asset_filename("v1.2.3", "linux", "x86_64").as_deref(),
+            Some("recisdb-proxy-v1.2.3-linux-amd64.tar.gz")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "linux", "aarch64").as_deref(),
+            Some("recisdb-proxy-v1.2.3-linux-arm64.tar.gz")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "windows", "x86_64").as_deref(),
+            Some("recisdb-v1.2.3-win-x64.zip")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "windows", "x86").as_deref(),
+            Some("recisdb-v1.2.3-win-x86.zip")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "windows", "aarch64").as_deref(),
+            Some("recisdb-v1.2.3-win-arm64.zip")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "macos", "x86_64").as_deref(),
+            Some("recisdb-proxy-v1.2.3-macos-amd64.tar.gz")
+        );
+        assert_eq!(
+            asset_filename("v1.2.3", "macos", "aarch64").as_deref(),
+            Some("recisdb-proxy-v1.2.3-macos-arm64.tar.gz")
+        );
         assert_eq!(asset_filename("v1.2.3", "freebsd", "x86_64"), None);
     }
 
     #[test]
     fn is_target_binary_entry_matches_tail_component_only() {
-        assert!(is_target_binary_entry("recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy", "linux"));
-        assert!(!is_target_binary_entry("recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy.exe", "linux"));
-        assert!(!is_target_binary_entry("recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy-setup", "linux"));
-        assert!(is_target_binary_entry("recisdb-v1.2.3-win-x64\\recisdb-proxy.exe", "windows"));
-        assert!(!is_target_binary_entry("recisdb-v1.2.3-win-x64\\recisdb.exe", "windows"));
+        assert!(is_target_binary_entry(
+            "recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy",
+            "linux"
+        ));
+        assert!(!is_target_binary_entry(
+            "recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy.exe",
+            "linux"
+        ));
+        assert!(!is_target_binary_entry(
+            "recisdb-proxy-v1.2.3-linux-amd64/recisdb-proxy-setup",
+            "linux"
+        ));
+        assert!(is_target_binary_entry(
+            "recisdb-v1.2.3-win-x64\\recisdb-proxy.exe",
+            "windows"
+        ));
+        assert!(!is_target_binary_entry(
+            "recisdb-v1.2.3-win-x64\\recisdb.exe",
+            "windows"
+        ));
         // macOS ships the same tarball layout as Linux.
-        assert!(is_target_binary_entry("recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy", "macos"));
-        assert!(!is_target_binary_entry("recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy-setup", "macos"));
+        assert!(is_target_binary_entry(
+            "recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy",
+            "macos"
+        ));
+        assert!(!is_target_binary_entry(
+            "recisdb-proxy-v1.2.3-macos-arm64/recisdb-proxy-setup",
+            "macos"
+        ));
     }
 
     #[test]
@@ -1977,7 +2158,10 @@ mod tests {
         assert!(!has_valid_magic(b"MZ\x00\x00", "linux"));
         assert!(has_valid_magic(b"MZ\x90\x00", "windows"));
         assert!(!has_valid_magic(b"\x7fELF", "windows"));
-        assert!(!has_valid_magic(b"<htm", "linux"), "an HTML error page must never pass validation");
+        assert!(
+            !has_valid_magic(b"<htm", "linux"),
+            "an HTML error page must never pass validation"
+        );
 
         // Mach-O 64-bit (both endiannesses) and the universal wrapper.
         assert!(has_valid_magic(&[0xcf, 0xfa, 0xed, 0xfe], "macos"));
@@ -1995,8 +2179,14 @@ mod tests {
 
     #[test]
     fn status_json_shape() {
-        assert_eq!(status_json(&UpdateStatus::Idle), json!({"state": "idle", "message": null}));
-        assert_eq!(status_json(&UpdateStatus::Downloading), json!({"state": "downloading", "message": null}));
+        assert_eq!(
+            status_json(&UpdateStatus::Idle),
+            json!({"state": "idle", "message": null})
+        );
+        assert_eq!(
+            status_json(&UpdateStatus::Downloading),
+            json!({"state": "downloading", "message": null})
+        );
         assert_eq!(
             status_json(&UpdateStatus::Error("boom".to_string())),
             json!({"state": "error", "message": "boom"})

@@ -175,22 +175,14 @@ mod tests {
         // Create a mock SDT section
         let data = [
             // Original network ID = 0x7FE0
-            0x7F, 0xE0,
-            // Reserved byte
-            0xFF,
-            // Service entry: service_id=0x0101
-            0x01, 0x01,
-            // flags (EIT schedule=0, EIT p/f=1)
-            0x01,
-            // running_status=4 (running), free_ca=0, descriptors_length=12
-            0x80, 0x0C,
-            // Service descriptor: tag=0x48, length=10
-            0x48, 0x0A,
-            // service_type=0x01
-            0x01,
-            // provider_name_length=3, "ABC"
-            0x03, b'A', b'B', b'C',
-            // service_name_length=4, "CH01"
+            0x7F, 0xE0, // Reserved byte
+            0xFF, // Service entry: service_id=0x0101
+            0x01, 0x01, // flags (EIT schedule=0, EIT p/f=1)
+            0x01, // running_status=4 (running), free_ca=0, descriptors_length=12
+            0x80, 0x0C, // Service descriptor: tag=0x48, length=10
+            0x48, 0x0A, // service_type=0x01
+            0x01, // provider_name_length=3, "ABC"
+            0x03, b'A', b'B', b'C', // service_name_length=4, "CH01"
             0x04, b'C', b'H', b'0', b'1',
         ];
 

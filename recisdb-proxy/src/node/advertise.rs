@@ -221,22 +221,37 @@ mod tests {
         // NID 0x0004 is BS. Even when the row was scanned on a CATV tuner the
         // logical family must not become "CATV original" — that is what makes
         // a client's BS request resolvable through a CATV feed.
-        let bs = LogicalMuxId { nid: 0x0004, tsid: 0x4010 };
+        let bs = LogicalMuxId {
+            nid: 0x0004,
+            tsid: 0x4010,
+        };
         assert_eq!(
             logical_broadcast_for(bs, Some(BandType::BS as u8)),
             LogicalBroadcastType::Bs
         );
         // ... while the delivery it arrived by is recorded separately.
-        assert_eq!(delivery_for(Some(BandType::CATV as u8)), DeliveryType::CatvPassThrough);
-        assert_eq!(delivery_for(Some(BandType::BS as u8)), DeliveryType::IsdbSDirect);
+        assert_eq!(
+            delivery_for(Some(BandType::CATV as u8)),
+            DeliveryType::CatvPassThrough
+        );
+        assert_eq!(
+            delivery_for(Some(BandType::BS as u8)),
+            DeliveryType::IsdbSDirect
+        );
     }
 
     #[test]
     fn four_k_is_classified_by_nid_not_only_by_band() {
         // A 4K mux scanned before band classification existed still has to be
         // reported as 4K: nothing downstream may run B25 over it.
-        let four_k = LogicalMuxId { nid: 0x000B, tsid: 0x0001 };
-        assert_eq!(logical_broadcast_for(four_k, None), LogicalBroadcastType::Bs4k);
+        let four_k = LogicalMuxId {
+            nid: 0x000B,
+            tsid: 0x0001,
+        };
+        assert_eq!(
+            logical_broadcast_for(four_k, None),
+            LogicalBroadcastType::Bs4k
+        );
         assert_eq!(
             logical_broadcast_for(four_k, Some(BandType::BS as u8)),
             LogicalBroadcastType::Bs4k

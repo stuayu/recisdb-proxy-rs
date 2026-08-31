@@ -95,7 +95,8 @@ impl Database {
         let mut stmt = self.connection().prepare(&sql)?;
         let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(bound.as_slice(), Self::row_to_program_record)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.into())
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
     }
 
     /// Delete programs that ended more than 24h before `now`. Intended to
@@ -217,7 +218,10 @@ mod tests {
         db.upsert_programs(&[a, b]).unwrap();
         let rows = db.get_programs(0, 10_000, Some(1), Some(100)).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows.iter().map(|r| r.tsid).collect::<Vec<_>>(), vec![10, 20]);
+        assert_eq!(
+            rows.iter().map(|r| r.tsid).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
     }
 
     #[test]

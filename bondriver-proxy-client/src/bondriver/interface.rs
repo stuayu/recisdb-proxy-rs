@@ -173,9 +173,12 @@ pub struct IBonDriverVtbl {
     pub wait_ts_stream: Option<unsafe extern "system" fn(*mut c_void, DWORD) -> DWORD>,
     pub get_ready_count: Option<unsafe extern "system" fn(*mut c_void) -> DWORD>,
     /// GetTsStream - return pointer to internal buffer (second overload)
-    pub get_ts_stream_ptr: Option<unsafe extern "system" fn(*mut c_void, *mut *mut BYTE, *mut DWORD, *mut DWORD) -> BOOL>,
+    pub get_ts_stream_ptr: Option<
+        unsafe extern "system" fn(*mut c_void, *mut *mut BYTE, *mut DWORD, *mut DWORD) -> BOOL,
+    >,
     /// GetTsStream - copy data to caller's buffer
-    pub get_ts_stream: Option<unsafe extern "system" fn(*mut c_void, *mut BYTE, *mut DWORD, *mut DWORD) -> BOOL>,
+    pub get_ts_stream:
+        Option<unsafe extern "system" fn(*mut c_void, *mut BYTE, *mut DWORD, *mut DWORD) -> BOOL>,
     pub purge_ts_stream: Option<unsafe extern "system" fn(*mut c_void)>,
     pub release: Option<unsafe extern "system" fn(*mut c_void)>,
 }

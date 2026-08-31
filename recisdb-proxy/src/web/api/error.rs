@@ -23,35 +23,53 @@ pub struct ApiError {
 impl ApiError {
     /// 404 — the requested resource does not exist.
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_FOUND, message: message.into() }
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
     }
 
     /// 400 — the request itself was invalid (missing/malformed fields).
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
     }
 
     /// 500 — something went wrong on the server (DB error, I/O error, etc).
     pub fn internal(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
     }
 
     /// 409 — the request conflicts with an in-progress operation (e.g. a
     /// self-update already running, `web/api/update.rs`).
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::CONFLICT, message: message.into() }
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
     }
 
     /// 502 — an upstream this server had to talk to failed (e.g. the remote
     /// node's pairing endpoint, `web/api/nodes.rs`).
     pub fn bad_gateway(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_GATEWAY, message: message.into() }
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
     }
 
     /// 501 — the server (or this platform's build) does not implement the
     /// requested capability (e.g. self-update on macOS, `web/api/update.rs`).
     pub fn not_implemented(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_IMPLEMENTED, message: message.into() }
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+        }
     }
 }
 
@@ -72,4 +90,8 @@ impl From<crate::database::DatabaseError> for ApiError {
     fn from(e: crate::database::DatabaseError) -> Self {
         ApiError::internal(e.to_string())
     }
+}
+
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self { ApiError::internal(e.to_string()) }
 }

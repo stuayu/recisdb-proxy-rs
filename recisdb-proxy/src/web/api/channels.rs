@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, header::CONTENT_TYPE},
+    http::{header::CONTENT_TYPE, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -69,7 +69,9 @@ pub async fn get_channels(
     let enabled_only = query.enabled_only.unwrap_or(false);
 
     // Get channels based on query
-    let channel_infos: Result<Vec<ChannelInfoApi>, String> = if let Some(bondriver_id) = query.bondriver_id {
+    let channel_infos: Result<Vec<ChannelInfoApi>, String> = if let Some(bondriver_id) =
+        query.bondriver_id
+    {
         // Get channels for specific BonDriver
         db.get_channels_by_bon_driver(bondriver_id)
             .map(|channels| {
@@ -112,7 +114,8 @@ pub async fn get_channels(
         // Get all channels grouped by logical identity (NID-SID-TSID)
         db.get_all_bon_drivers()
             .map(|all_drivers| {
-                let mut channel_map: std::collections::HashMap<(u16, u16, u16), ChannelInfoApi> = std::collections::HashMap::new();
+                let mut channel_map: std::collections::HashMap<(u16, u16, u16), ChannelInfoApi> =
+                    std::collections::HashMap::new();
 
                 for driver in &all_drivers {
                     if let Ok(channels) = db.get_channels_by_bon_driver(driver.id) {
@@ -121,14 +124,16 @@ pub async fn get_channels(
                                 continue;
                             }
                             let key = (c.nid, c.sid, c.tsid);
-                            let driver_name = driver.driver_name.clone()
-                                .unwrap_or_else(|| std::path::Path::new(&driver.dll_path)
+                            let driver_name = driver.driver_name.clone().unwrap_or_else(|| {
+                                std::path::Path::new(&driver.dll_path)
                                     .file_stem()
                                     .and_then(|s| s.to_str())
                                     .unwrap_or("Unknown")
-                                    .to_string());
+                                    .to_string()
+                            });
 
-                            channel_map.entry(key)
+                            channel_map
+                                .entry(key)
                                 .and_modify(|existing| {
                                     if let Some(ref mut count) = existing.tuner_count {
                                         *count += 1;
@@ -146,7 +151,9 @@ pub async fn get_channels(
                                     if c.updated_at > existing.updated_at {
                                         existing.updated_at = c.updated_at;
                                     }
-                                    if existing.created_at == 0 || (c.created_at != 0 && c.created_at < existing.created_at) {
+                                    if existing.created_at == 0
+                                        || (c.created_at != 0 && c.created_at < existing.created_at)
+                                    {
                                         existing.created_at = c.created_at;
                                     }
                                 })
@@ -185,7 +192,8 @@ pub async fn get_channels(
 
                 let mut channels: Vec<ChannelInfoApi> = channel_map.into_values().collect();
                 channels.sort_by(|a, b| {
-                    a.nid.cmp(&b.nid)
+                    a.nid
+                        .cmp(&b.nid)
                         .then_with(|| a.tsid.cmp(&b.tsid))
                         .then_with(|| a.sid.cmp(&b.sid))
                 });
@@ -308,7 +316,9 @@ pub async fn update_channel(
         payload.bon_space,
         payload.bon_channel,
     )?;
-    Ok(Json(json!({ "success": true, "message": "Channel updated successfully" })))
+    Ok(Json(
+        json!({ "success": true, "message": "Channel updated successfully" }),
+    ))
 }
 
 /// Enable/disable channel.
@@ -319,7 +329,10 @@ pub async fn toggle_channel(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let result = if enabled {
         db.enable_channel(id)
@@ -402,13 +415,20 @@ fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
             }
             // セパレータ or 行末
             match chars.peek() {
-                Some(&',') => { chars.next(); }
+                Some(&',') => {
+                    chars.next();
+                }
                 Some(&'\r') => {
                     chars.next();
-                    if chars.peek() == Some(&'\n') { chars.next(); }
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
                     break;
                 }
-                Some(&'\n') => { chars.next(); break; }
+                Some(&'\n') => {
+                    chars.next();
+                    break;
+                }
                 None => break,
                 _ => break,
             }
@@ -417,15 +437,15 @@ fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
             break;
         }
         rows.push(row);
-        if chars.peek().is_none() { break; }
+        if chars.peek().is_none() {
+            break;
+        }
     }
     rows
 }
 
 /// Export channels as CSV.
-pub async fn export_channels(
-    State(web_state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+pub async fn export_channels(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
     let db = web_state.database.lock().await;
 
     let rows = match db.get_all_channels_for_export() {
@@ -435,7 +455,8 @@ pub async fn export_channels(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(CONTENT_TYPE, "text/plain")],
                 format!("error: {}", e),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -462,11 +483,17 @@ pub async fn export_channels(
         csv.push_str(&line);
     }
 
-    use axum::http::header::{CONTENT_DISPOSITION, HeaderValue};
+    use axum::http::header::{HeaderValue, CONTENT_DISPOSITION};
     let mut resp = axum::response::Response::new(axum::body::Body::from(csv));
     *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
-    resp.headers_mut().insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"channels.csv\""));
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    resp.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"channels.csv\""),
+    );
     resp.into_response()
 }
 
@@ -500,19 +527,22 @@ pub async fn import_channels(
     }
 
     // ヘッダー行からカラムインデックスを取得
-    let headers: Vec<String> = all_rows[0].iter().map(|s| s.trim().to_lowercase()).collect();
+    let headers: Vec<String> = all_rows[0]
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .collect();
     let col = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
 
-    let col_id            = col("id");
+    let col_id = col("id");
     let col_bon_driver_id = col("bon_driver_id");
-    let col_nid           = col("nid");
-    let col_sid           = col("sid");
-    let col_tsid          = col("tsid");
-    let col_channel_name  = col("channel_name");
-    let col_bon_space     = col("bon_space");
-    let col_bon_channel   = col("bon_channel");
-    let col_priority      = col("priority");
-    let col_is_enabled    = col("is_enabled");
+    let col_nid = col("nid");
+    let col_sid = col("sid");
+    let col_tsid = col("tsid");
+    let col_channel_name = col("channel_name");
+    let col_bon_space = col("bon_space");
+    let col_bon_channel = col("bon_channel");
+    let col_priority = col("priority");
+    let col_is_enabled = col("is_enabled");
 
     // nid/sid/tsid は必須
     let (col_nid, col_sid, col_tsid) = match (col_nid, col_sid, col_tsid) {
@@ -523,11 +553,13 @@ pub async fn import_channels(
     let db = web_state.database.lock().await;
 
     let mut inserted = 0usize;
-    let mut updated  = 0usize;
+    let mut updated = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
     let get_field = |row: &Vec<String>, idx: Option<usize>| -> Option<String> {
-        idx.and_then(|i| row.get(i)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        idx.and_then(|i| row.get(i))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     };
 
     for (line_no, row) in all_rows.iter().skip(1).enumerate() {
@@ -536,25 +568,36 @@ pub async fn import_channels(
         // nid / sid / tsid をパース
         let nid = match get_field(row, Some(col_nid)).and_then(|s| s.parse::<u16>().ok()) {
             Some(v) => v,
-            None => { errors.push(format!("行{}: nidが不正", line_no)); continue; }
+            None => {
+                errors.push(format!("行{}: nidが不正", line_no));
+                continue;
+            }
         };
         let sid = match get_field(row, Some(col_sid)).and_then(|s| s.parse::<u16>().ok()) {
             Some(v) => v,
-            None => { errors.push(format!("行{}: sidが不正", line_no)); continue; }
+            None => {
+                errors.push(format!("行{}: sidが不正", line_no));
+                continue;
+            }
         };
         let tsid = match get_field(row, Some(col_tsid)).and_then(|s| s.parse::<u16>().ok()) {
             Some(v) => v,
-            None => { errors.push(format!("行{}: tsidが不正", line_no)); continue; }
+            None => {
+                errors.push(format!("行{}: tsidが不正", line_no));
+                continue;
+            }
         };
 
         let channel_name = get_field(row, col_channel_name);
         let bon_driver_id = get_field(row, col_bon_driver_id).and_then(|s| s.parse::<i64>().ok());
-        let bon_space    = get_field(row, col_bon_space).and_then(|s| s.parse::<u32>().ok());
-        let bon_channel  = get_field(row, col_bon_channel).and_then(|s| s.parse::<u32>().ok());
+        let bon_space = get_field(row, col_bon_space).and_then(|s| s.parse::<u32>().ok());
+        let bon_channel = get_field(row, col_bon_channel).and_then(|s| s.parse::<u32>().ok());
         let bon_space_update = col_bon_space.map(|_| bon_space);
         let bon_channel_update = col_bon_channel.map(|_| bon_channel);
-        let priority     = get_field(row, col_priority).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-        let is_enabled   = get_field(row, col_is_enabled)
+        let priority = get_field(row, col_priority)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        let is_enabled = get_field(row, col_is_enabled)
             .map(|s| s == "true" || s == "1")
             .unwrap_or(true);
 
@@ -567,16 +610,26 @@ pub async fn import_channels(
                     Ok(None) => {
                         // IDが指定されているが存在しない → 自然キーで再検索
                         if let Some(bd_id) = bon_driver_id {
-                            db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
-                        } else { None }
+                            db.get_channel_by_key(bd_id, nid, sid, tsid, None)
+                                .ok()
+                                .flatten()
+                                .map(|c| c.id)
+                        } else {
+                            None
+                        }
                     }
                     Err(_) => None,
                 }
             } else {
                 // id 未指定 → 自然キーで検索
                 if let Some(bd_id) = bon_driver_id {
-                    db.get_channel_by_key(bd_id, nid, sid, tsid, None).ok().flatten().map(|c| c.id)
-                } else { None }
+                    db.get_channel_by_key(bd_id, nid, sid, tsid, None)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.id)
+                } else {
+                    None
+                }
             }
         };
 
@@ -603,12 +656,17 @@ pub async fn import_channels(
             let bon_drv = match bon_driver_id {
                 Some(v) => v,
                 None => {
-                    errors.push(format!("行{}: 新規登録にはbon_driver_idが必要です", line_no));
+                    errors.push(format!(
+                        "行{}: 新規登録にはbon_driver_idが必要です",
+                        line_no
+                    ));
                     continue;
                 }
             };
             let info = ChannelInfo {
-                nid, sid, tsid,
+                nid,
+                sid,
+                tsid,
                 manual_sheet: None,
                 raw_name: None,
                 channel_name: channel_name.clone(),
@@ -623,7 +681,8 @@ pub async fn import_channels(
             };
             match db.insert_channel(bon_drv, &info) {
                 Ok(new_id) => {
-                    let _ = db.update_channel_fields(new_id, None, Some(priority), Some(is_enabled));
+                    let _ =
+                        db.update_channel_fields(new_id, None, Some(priority), Some(is_enabled));
                     inserted += 1;
                 }
                 Err(e) => errors.push(format!("行{}: 挿入失敗 ({})", line_no, e)),

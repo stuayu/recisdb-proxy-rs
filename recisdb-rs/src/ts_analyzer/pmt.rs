@@ -131,7 +131,8 @@ impl PmtTable {
         while offset + 5 <= data.len() {
             let stream_type = data[offset];
             let elementary_pid = ((data[offset + 1] as u16 & 0x1F) << 8) | data[offset + 2] as u16;
-            let es_info_length = ((data[offset + 3] as usize & 0x0F) << 8) | data[offset + 4] as usize;
+            let es_info_length =
+                ((data[offset + 3] as usize & 0x0F) << 8) | data[offset + 4] as usize;
 
             offset += 5;
 
@@ -186,10 +187,8 @@ mod tests {
         // Create a mock PSI section with PMT data
         let data = [
             // PCR PID = 0x0100 (with reserved bits)
-            0xE1, 0x00,
-            // Program info length = 0
-            0xF0, 0x00,
-            // Stream 1: Video H.264, PID=0x0100, ES info length=0
+            0xE1, 0x00, // Program info length = 0
+            0xF0, 0x00, // Stream 1: Video H.264, PID=0x0100, ES info length=0
             0x1B, 0xE1, 0x00, 0xF0, 0x00,
             // Stream 2: AAC Audio, PID=0x0110, ES info length=0
             0x0F, 0xE1, 0x10, 0xF0, 0x00,

@@ -235,11 +235,8 @@ impl LeasePump {
                 break "released";
             }
 
-            let received = tokio::time::timeout(
-                Duration::from_secs(1),
-                self.subscription.recv(),
-            )
-            .await;
+            let received =
+                tokio::time::timeout(Duration::from_secs(1), self.subscription.recv()).await;
 
             let data = match received {
                 // Timeout is not an error: it is the periodic chance to
@@ -353,7 +350,11 @@ mod tests {
         let mut carry = vec![0u8; TS_PACKET_SIZE * 2 + 30];
         let chunk = take_aligned_chunk(&mut carry).unwrap();
         assert_eq!(chunk.len(), TS_PACKET_SIZE * 2);
-        assert_eq!(carry.len(), 30, "the partial packet must stay for next time");
+        assert_eq!(
+            carry.len(),
+            30,
+            "the partial packet must stay for next time"
+        );
         assert!(take_aligned_chunk(&mut carry).is_none());
     }
 

@@ -38,7 +38,9 @@ use tokio::sync::mpsc;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::ts_analyzer::{pid, table_id, NitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
+use crate::ts_analyzer::{
+    pid, table_id, NitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE,
+};
 use recisdb_protocol::BandType;
 
 /// One terrestrial transport stream as described by a received NIT.
@@ -64,7 +66,9 @@ pub struct NitObservation {
 impl NitObservation {
     /// Whether this observation carries anything worth storing.
     fn is_useful(&self) -> bool {
-        self.remote_control_key.is_some() || self.physical_ch.is_some() || self.network_name.is_some()
+        self.remote_control_key.is_some()
+            || self.physical_ch.is_some()
+            || self.network_name.is_some()
     }
 }
 
@@ -98,7 +102,10 @@ pub struct NitCollector {
 
 impl NitCollector {
     pub fn new() -> Self {
-        Self { collector: SectionCollector::new(), seen: HashSet::new() }
+        Self {
+            collector: SectionCollector::new(),
+            seen: HashSet::new(),
+        }
     }
 
     /// Feed a raw chunk of TS packets (as read from the tuner). Best-effort:
@@ -124,7 +131,10 @@ impl NitCollector {
         if packet.header.pid != NIT_PID {
             return;
         }
-        if packet.header.transport_error || packet.header.is_scrambled() || !packet.header.has_payload() {
+        if packet.header.transport_error
+            || packet.header.is_scrambled()
+            || !packet.header.has_payload()
+        {
             return;
         }
 
@@ -166,7 +176,9 @@ impl NitCollector {
                 return;
             };
             if tx.send(observation).is_err() {
-                debug!("[NitCollector] writer task gone, dropping remaining entries for this section");
+                debug!(
+                    "[NitCollector] writer task gone, dropping remaining entries for this section"
+                );
                 return;
             }
         }
@@ -267,7 +279,13 @@ mod tests {
     #[test]
     fn satellite_entries_are_dropped() {
         // BS (NID 4) / CS (NID 7) はスキャン側が TSID から導出するので触らない。
-        let table = nit(0x0004, vec![ts(0x0004, 0x4031, Some(1), None), ts(0x0007, 0x6020, None, None)]);
+        let table = nit(
+            0x0004,
+            vec![
+                ts(0x0004, 0x4031, Some(1), None),
+                ts(0x0007, 0x6020, None, None),
+            ],
+        );
         assert!(observations_from_nit(&table).is_empty());
     }
 

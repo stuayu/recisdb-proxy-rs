@@ -267,16 +267,8 @@ pub(crate) fn process_command(
             format,
             detail,
         } => {
-            let exit_code = database::cmd_query(
-                database,
-                name,
-                sid,
-                nid,
-                tsid,
-                remote_key,
-                format,
-                detail,
-            );
+            let exit_code =
+                database::cmd_query(database, name, sid, nid, tsid, remote_key, format, detail);
             std::process::exit(exit_code)
         }
 
@@ -284,15 +276,20 @@ pub(crate) fn process_command(
         Commands::Driver { action } => {
             use crate::context::DriverAction;
             let exit_code = match action {
-                DriverAction::Add { path, name, database: db } => {
-                    database::cmd_driver_add(path, name, db)
-                }
-                DriverAction::List { database: db, format } => {
-                    database::cmd_driver_list(db, format)
-                }
-                DriverAction::Remove { id_or_path, database: db, yes } => {
-                    database::cmd_driver_remove(id_or_path, db, yes)
-                }
+                DriverAction::Add {
+                    path,
+                    name,
+                    database: db,
+                } => database::cmd_driver_add(path, name, db),
+                DriverAction::List {
+                    database: db,
+                    format,
+                } => database::cmd_driver_list(db, format),
+                DriverAction::Remove {
+                    id_or_path,
+                    database: db,
+                    yes,
+                } => database::cmd_driver_remove(id_or_path, db, yes),
             };
             std::process::exit(exit_code)
         }

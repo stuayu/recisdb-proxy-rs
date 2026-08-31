@@ -36,7 +36,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::database::ProgramUpsert;
-use crate::ts_analyzer::{pid, table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE};
+use crate::ts_analyzer::{
+    pid, table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE,
+};
 
 const MAX_PENDING_TS: usize = TS_PACKET_SIZE * 3;
 
@@ -55,7 +57,10 @@ fn global_sender() -> Option<&'static mpsc::UnboundedSender<ProgramUpsert>> {
 }
 
 fn is_eit_pid(value: u16) -> bool {
-    matches!(value, pid::EIT | pid::EIT_MOBILE | pid::EIT_PARTIAL_RECEPTION)
+    matches!(
+        value,
+        pid::EIT | pid::EIT_MOBILE | pid::EIT_PARTIAL_RECEPTION
+    )
 }
 
 fn accepts_table_id(pid: u16, table_id: u8) -> bool {
@@ -152,7 +157,10 @@ impl EpgCollector {
         if !is_eit_pid(packet.header.pid) {
             return;
         }
-        if packet.header.transport_error || packet.header.is_scrambled() || !packet.header.has_payload() {
+        if packet.header.transport_error
+            || packet.header.is_scrambled()
+            || !packet.header.has_payload()
+        {
             return;
         }
 
@@ -162,7 +170,7 @@ impl EpgCollector {
             packet.header.payload_unit_start,
         );
         for section_data in &sections {
-                    self.process_section(packet.header.pid, section_data);
+            self.process_section(packet.header.pid, section_data);
         }
     }
 
@@ -234,7 +242,9 @@ impl EpgCollector {
                 updated_at: now,
             };
             if tx.send(record).is_err() {
-                debug!("[EpgCollector] writer task gone, dropping remaining events for this section");
+                debug!(
+                    "[EpgCollector] writer task gone, dropping remaining events for this section"
+                );
                 break;
             }
         }
@@ -403,7 +413,10 @@ mod tests {
     #[test]
     fn test_m_and_l_eit_only_use_present_following_table_id() {
         assert!(accepts_table_id(pid::EIT_MOBILE, table_id::EIT_PF_ACTUAL));
-        assert!(accepts_table_id(pid::EIT_PARTIAL_RECEPTION, table_id::EIT_PF_ACTUAL));
+        assert!(accepts_table_id(
+            pid::EIT_PARTIAL_RECEPTION,
+            table_id::EIT_PF_ACTUAL
+        ));
         assert!(!accepts_table_id(pid::EIT_MOBILE, 0x50));
         assert!(!accepts_table_id(pid::EIT_PARTIAL_RECEPTION, 0x60));
     }

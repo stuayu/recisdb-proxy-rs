@@ -95,15 +95,14 @@ mod tests {
         // Create a mock PSI section with PAT data
         let data = [
             // Program 1: number=0x0101, PID=0x0100
-            0x01, 0x01, 0xE1, 0x00,
-            // Program 2: number=0x0102, PID=0x0200
+            0x01, 0x01, 0xE1, 0x00, // Program 2: number=0x0102, PID=0x0200
             0x01, 0x02, 0xE2, 0x00,
         ];
 
         let header = PsiHeader {
             table_id: table_id::PAT,
             section_syntax_indicator: true,
-            section_length: 17, // header(5) + data(8) + crc(4)
+            section_length: 17,         // header(5) + data(8) + crc(4)
             table_id_extension: 0x1234, // TSID
             version_number: 1,
             current_next_indicator: true,
@@ -133,8 +132,7 @@ mod tests {
         // PAT with NIT entry (program_number = 0)
         let data = [
             // NIT: number=0x0000, PID=0x0010
-            0x00, 0x00, 0xE0, 0x10,
-            // Program 1: number=0x0101, PID=0x0100
+            0x00, 0x00, 0xE0, 0x10, // Program 1: number=0x0101, PID=0x0100
             0x01, 0x01, 0xE1, 0x00,
         ];
 

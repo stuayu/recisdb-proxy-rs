@@ -97,7 +97,9 @@ pub fn sort_candidate_drivers(
             .then_with(|| {
                 let score_a = score_map.get(&a.0).copied().unwrap_or(1.0);
                 let score_b = score_map.get(&b.0).copied().unwrap_or(1.0);
-                score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
 }
@@ -323,7 +325,6 @@ impl TunerSnapshot {
             .map(|e| (e.key.tuner_path.clone(), e.key.channel.clone()))
             .collect()
     }
-
 }
 
 /// A single logical channel request, expressed as a caller-priority-ordered
@@ -461,7 +462,8 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
         None
     };
 
-    let mut candidate_tuples: Vec<DriverCandidate> = req.candidates.iter().map(candidate_tuple).collect();
+    let mut candidate_tuples: Vec<DriverCandidate> =
+        req.candidates.iter().map(candidate_tuple).collect();
     let exclusive_map = build_exclusive_map(snapshot);
     let score_map = build_score_map(snapshot);
     let max_instances_map = build_max_instances_map(snapshot);
@@ -726,7 +728,8 @@ fn find_fallback_with_capacity(
         }
         let running = snapshot.running_count_excluding(path, exclude_own);
         let max = max_instances_map.get(path).copied().unwrap_or(1);
-        has_capacity(running, max).then(|| ChannelKey::space_channel(path.clone(), *space, *channel))
+        has_capacity(running, max)
+            .then(|| ChannelKey::space_channel(path.clone(), *space, *channel))
     })
 }
 
@@ -970,7 +973,9 @@ mod tests {
         let req = base_request(vec![]);
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::NoCandidates }
+            Decision::Reject {
+                reason: RejectReason::NoCandidates
+            }
         );
     }
 
@@ -996,7 +1001,9 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reuse { key: ChannelKey::space_channel("A.dll", 0, 5) }
+            Decision::Reuse {
+                key: ChannelKey::space_channel("A.dll", 0, 5)
+            }
         );
     }
 
@@ -1011,7 +1018,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("A.dll", 0, 5), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("A.dll", 0, 5),
+                evict: vec![]
+            }
         );
     }
 
@@ -1062,7 +1072,7 @@ mod tests {
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 2)],
             entries: vec![
-                entry("A.dll", 0, 1, true, 0, 5), // idle, priority 5 (lowest)
+                entry("A.dll", 0, 1, true, 0, 5),  // idle, priority 5 (lowest)
                 entry("A.dll", 0, 2, true, 1, 10), // has a subscriber
             ],
         };
@@ -1271,7 +1281,11 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
+            Decision::Reject {
+                reason: RejectReason::AtCapacity {
+                    lowest_idle_priority: None
+                }
+            }
         );
     }
 
@@ -1294,7 +1308,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1317,7 +1334,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1340,7 +1360,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1404,7 +1427,11 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: None } }
+            Decision::Reject {
+                reason: RejectReason::AtCapacity {
+                    lowest_idle_priority: None
+                }
+            }
         );
     }
 
@@ -1473,7 +1500,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] },
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![]
+            },
             "the second requester must move to the free driver, not pile onto the one mid-open"
         );
     }
@@ -1495,7 +1525,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("B.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("B.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1517,7 +1550,9 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reuse { key: ChannelKey::space_channel("A.dll", 0, 9) }
+            Decision::Reuse {
+                key: ChannelKey::space_channel("A.dll", 0, 9)
+            }
         );
     }
 
@@ -1541,7 +1576,11 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Reject { reason: RejectReason::AtCapacity { lowest_idle_priority: Some(0) } },
+            Decision::Reject {
+                reason: RejectReason::AtCapacity {
+                    lowest_idle_priority: Some(0)
+                }
+            },
             "a reader whose subscriber has not attached yet must survive"
         );
     }
@@ -1573,7 +1612,10 @@ mod tests {
         // with it, the driver has room and no eviction is needed.
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("A.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("A.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1631,7 +1673,10 @@ mod tests {
 
         assert_eq!(
             decide(&snapshot, &req),
-            Decision::Create { key: ChannelKey::space_channel("Idle.dll", 0, 9), evict: vec![] }
+            Decision::Create {
+                key: ChannelKey::space_channel("Idle.dll", 0, 9),
+                evict: vec![]
+            }
         );
     }
 
@@ -1693,5 +1738,4 @@ mod tests {
         };
         assert_eq!(decide(&snapshot, &req), Decision::Reuse { key });
     }
-
 }

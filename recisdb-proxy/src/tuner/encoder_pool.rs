@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use log::{debug, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot, RwLock, Semaphore};
 
@@ -123,7 +123,11 @@ impl EncoderRuntimeConfig {
     /// The preprocessor command, if one is configured (non-blank path).
     pub fn preprocessor(&self) -> Option<&str> {
         let trimmed = self.preprocessor_path.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 }
 
@@ -212,7 +216,10 @@ enum SpawnPlan {
     Single { enc_args: Vec<String> },
     /// Two processes connected by an OS pipe:
     /// `stdin -> preprocessor_path(pre_args) -> command_path(enc_args) -> stdout`.
-    TwoStage { pre_args: Vec<String>, enc_args: Vec<String> },
+    TwoStage {
+        pre_args: Vec<String>,
+        enc_args: Vec<String>,
+    },
     /// Legacy tsreplace multi-SID chain (`spawn_chain`), one `command_path`
     /// process per SID with `--service` auto-injection. Never used together
     /// with a preprocessor or `{SID}` placeholder.
@@ -386,12 +393,13 @@ fn spawn_single(
     args: &[String],
     label: &str,
 ) -> std::io::Result<(ChildStdin, ChildStdout, Vec<Child>)> {
-    let mut child = spawn_process(command_path, args, Stdio::piped(), Stdio::piped()).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to spawn '{}': {}", command_path, e),
-        )
-    })?;
+    let mut child =
+        spawn_process(command_path, args, Stdio::piped(), Stdio::piped()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn '{}': {}", command_path, e),
+            )
+        })?;
 
     let stdin = child
         .stdin
@@ -430,10 +438,16 @@ fn spawn_two_stage(
         })?;
 
     let stdin = pre_child.stdin.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "preprocessor stdin not available")
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "preprocessor stdin not available",
+        )
     })?;
     let pre_stdout = pre_child.stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "preprocessor stdout not available")
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "preprocessor stdout not available",
+        )
     })?;
     if let Some(stderr) = pre_child.stderr.take() {
         spawn_stderr_logger(format!("{} stage1", label), None, stderr);
@@ -446,12 +460,13 @@ fn spawn_two_stage(
         )
     })?;
 
-    let mut enc_child = spawn_process(enc_path, enc_args, pre_stdio, Stdio::piped()).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to spawn encoder '{}': {}", enc_path, e),
-        )
-    })?;
+    let mut enc_child =
+        spawn_process(enc_path, enc_args, pre_stdio, Stdio::piped()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn encoder '{}': {}", enc_path, e),
+            )
+        })?;
 
     let stdout = enc_child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "encoder stdout not available")
@@ -478,8 +493,8 @@ fn spawn_chain(
     let mut children: Vec<Child> = Vec::with_capacity(sids.len());
 
     let args_first = build_tsreplace_args(base_arguments, sids[0]);
-    let mut first_child =
-        spawn_process(command_path, &args_first, Stdio::piped(), Stdio::piped()).map_err(|e| {
+    let mut first_child = spawn_process(command_path, &args_first, Stdio::piped(), Stdio::piped())
+        .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("failed to spawn encoder for SID {}: {}", sids[0], e),
@@ -487,7 +502,10 @@ fn spawn_chain(
         })?;
 
     let pipeline_stdin = first_child.stdin.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "encoder chain: stdin not available")
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "encoder chain: stdin not available",
+        )
     })?;
     if let Some(stderr) = first_child.stderr.take() {
         spawn_stderr_logger(label.to_string(), Some(sids[0]), stderr);
@@ -500,7 +518,10 @@ fn spawn_chain(
         let prev_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("encoder chain: stdout not available for previous stage (SID {})", sid),
+                format!(
+                    "encoder chain: stdout not available for previous stage (SID {})",
+                    sid
+                ),
             )
         })?;
 
@@ -511,12 +532,13 @@ fn spawn_chain(
             )
         })?;
 
-        let mut child = spawn_process(command_path, &args, prev_stdio, Stdio::piped()).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to spawn encoder for SID {}: {}", sid, e),
-            )
-        })?;
+        let mut child =
+            spawn_process(command_path, &args, prev_stdio, Stdio::piped()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to spawn encoder for SID {}: {}", sid, e),
+                )
+            })?;
 
         if let Some(stderr) = child.stderr.take() {
             spawn_stderr_logger(label.to_string(), Some(sid), stderr);
@@ -525,7 +547,10 @@ fn spawn_chain(
     }
 
     let final_stdout = children.last_mut().unwrap().stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "encoder chain: final stdout not available")
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "encoder chain: final stdout not available",
+        )
     })?;
 
     Ok((pipeline_stdin, final_stdout, children))
@@ -579,7 +604,8 @@ impl SharedEncoder {
         let (stdin, stdout, children) = match plan_spawn(&cfg, &key.sids)? {
             SpawnPlan::Single { enc_args } => spawn_single(&cfg.command_path, &enc_args, &label)?,
             SpawnPlan::TwoStage { pre_args, enc_args } => spawn_two_stage(
-                cfg.preprocessor().expect("TwoStage plan implies a preprocessor"),
+                cfg.preprocessor()
+                    .expect("TwoStage plan implies a preprocessor"),
                 &pre_args,
                 &cfg.command_path,
                 &enc_args,
@@ -637,14 +663,21 @@ impl SharedEncoder {
         Ok(shared)
     }
 
-    async fn run_feeder(shared: Arc<Self>, mut tuner_rx: UntrackedSubscription, mut stdin: ChildStdin) {
+    async fn run_feeder(
+        shared: Arc<Self>,
+        mut tuner_rx: UntrackedSubscription,
+        mut stdin: ChildStdin,
+    ) {
         let mut last_lag_warning = None;
         loop {
             match tuner_rx.recv().await {
                 Ok(data) => {
                     *shared.last_input_at.lock().unwrap() = Instant::now();
                     if let Err(e) = stdin.write_all(&data).await {
-                        debug!("[SharedEncoder {:?}] stdin write failed: {}", shared.key.channel_key, e);
+                        debug!(
+                            "[SharedEncoder {:?}] stdin write failed: {}",
+                            shared.key.channel_key, e
+                        );
                         break;
                     }
                 }
@@ -657,9 +690,9 @@ impl SharedEncoder {
                         .unwrap_or_else(|total| total);
                     let total = previous.saturating_add(n);
                     let now = Instant::now();
-                    if last_lag_warning
-                        .map_or(true, |last| now.duration_since(last) >= INPUT_LAG_WARN_INTERVAL)
-                    {
+                    if last_lag_warning.map_or(true, |last| {
+                        now.duration_since(last) >= INPUT_LAG_WARN_INTERVAL
+                    }) {
                         warn!(
                             "[SharedEncoder {:?}] input lagged, skipped {} chunks (total={})",
                             shared.key.channel_key, n, total
@@ -668,7 +701,10 @@ impl SharedEncoder {
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    debug!("[SharedEncoder {:?}] source tuner broadcast closed", shared.key.channel_key);
+                    debug!(
+                        "[SharedEncoder {:?}] source tuner broadcast closed",
+                        shared.key.channel_key
+                    );
                     break;
                 }
             }
@@ -693,7 +729,10 @@ impl SharedEncoder {
                     }
                 }
                 Err(e) => {
-                    warn!("[SharedEncoder {:?}] output read failed: {}", shared.key.channel_key, e);
+                    warn!(
+                        "[SharedEncoder {:?}] output read failed: {}",
+                        shared.key.channel_key, e
+                    );
                     break;
                 }
             }
@@ -771,13 +810,19 @@ impl SharedEncoder {
                     }
                     Ok(None) => false,
                     Err(e) => {
-                        debug!("[SharedEncoder {:?}] try_wait failed: {}", self.key.channel_key, e);
+                        debug!(
+                            "[SharedEncoder {:?}] try_wait failed: {}",
+                            self.key.channel_key, e
+                        );
                         false
                     }
                 };
                 if !already_exited {
                     if let Err(e) = child.start_kill() {
-                        debug!("[SharedEncoder {:?}] kill skipped: {}", self.key.channel_key, e);
+                        debug!(
+                            "[SharedEncoder {:?}] kill skipped: {}",
+                            self.key.channel_key, e
+                        );
                     }
                 }
                 let _ = child.wait().await;
@@ -972,7 +1017,10 @@ impl EncoderPool {
                 self.cancel_idle_close(&key).await;
                 return Ok(enc);
             }
-            warn!("[EncoderPool] evicting stale (stopped) encoder for {:?}", key);
+            warn!(
+                "[EncoderPool] evicting stale (stopped) encoder for {:?}",
+                key
+            );
             encoders.remove(&key);
         }
 
@@ -1004,13 +1052,18 @@ impl EncoderPool {
     pub async fn release(self: &Arc<Self>, key: &EncodeKey, encoder: &Arc<SharedEncoder>) {
         encoder.unsubscribe();
         if !encoder.has_subscribers() {
-            self.schedule_idle_close(key.clone(), Arc::clone(encoder)).await;
+            self.schedule_idle_close(key.clone(), Arc::clone(encoder))
+                .await;
         }
     }
 
     /// Schedule a delayed stop for `encoder` if it remains subscriber-less
     /// for `idle_grace`.
-    pub async fn schedule_idle_close(self: &Arc<Self>, key: EncodeKey, encoder: Arc<SharedEncoder>) {
+    pub async fn schedule_idle_close(
+        self: &Arc<Self>,
+        key: EncodeKey,
+        encoder: Arc<SharedEncoder>,
+    ) {
         {
             let idle_tasks = self.idle_tasks.lock().await;
             if idle_tasks.contains_key(&key) {
@@ -1133,7 +1186,12 @@ mod tests {
         // Preprocessor settings must also bump the generation.
         let g4 = config_generation(&runtime_config("tsreplace", "-a -b", "tsreadex", ""));
         assert_ne!(g1, g4);
-        let g5 = config_generation(&runtime_config("tsreplace", "-a -b", "tsreadex", "-n {SID} -"));
+        let g5 = config_generation(&runtime_config(
+            "tsreplace",
+            "-a -b",
+            "tsreadex",
+            "-n {SID} -",
+        ));
         assert_ne!(g4, g5);
     }
 
@@ -1141,7 +1199,10 @@ mod tests {
 
     #[test]
     fn substitute_sid_replaces_every_occurrence() {
-        assert_eq!(substitute_sid("-n {SID} --tag {SID} -", 1032), "-n 1032 --tag 1032 -");
+        assert_eq!(
+            substitute_sid("-n {SID} --tag {SID} -", 1032),
+            "-n 1032 --tag 1032 -"
+        );
         assert_eq!(substitute_sid("no placeholder", 1), "no placeholder");
     }
 
@@ -1151,8 +1212,14 @@ mod tests {
         let plan = plan_spawn(&cfg, &[1032]).unwrap();
         match plan {
             SpawnPlan::Single { enc_args } => {
-                assert_eq!(enc_args, vec!["-i", "-", "--service-hint", "1032", "-o", "-"]);
-                assert!(!enc_args.iter().any(|a| a == "--service"), "no auto-injection with {{SID}}");
+                assert_eq!(
+                    enc_args,
+                    vec!["-i", "-", "--service-hint", "1032", "-o", "-"]
+                );
+                assert!(
+                    !enc_args.iter().any(|a| a == "--service"),
+                    "no auto-injection with {{SID}}"
+                );
             }
             other => panic!("expected Single, got {:?}", other),
         }
@@ -1229,7 +1296,10 @@ mod tests {
     #[test]
     fn plan_blank_preprocessor_path_means_single_stage() {
         let cfg = runtime_config("enc", "-i - -o -", "   ", "-ignored");
-        assert!(matches!(plan_spawn(&cfg, &[]).unwrap(), SpawnPlan::Single { .. }));
+        assert!(matches!(
+            plan_spawn(&cfg, &[]).unwrap(),
+            SpawnPlan::Single { .. }
+        ));
     }
 
     // ---- EncoderPool (real `cat` subprocess: pure stdin->stdout passthrough) ----
@@ -1269,7 +1339,10 @@ mod tests {
             .await
             .expect("second get_or_create should join, not fail");
 
-        assert!(Arc::ptr_eq(&enc_a, &enc_b), "expected the same shared encoder instance");
+        assert!(
+            Arc::ptr_eq(&enc_a, &enc_b),
+            "expected the same shared encoder instance"
+        );
         assert_eq!(pool.count().await, 1);
         assert_eq!(pool.saturated_count(), 0);
 
@@ -1421,7 +1494,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn idle_release_stops_encoder_after_grace_period() {
-        let pool = Arc::new(EncoderPool::new_with_idle_grace(2, Duration::from_millis(50)));
+        let pool = Arc::new(EncoderPool::new_with_idle_grace(
+            2,
+            Duration::from_millis(50),
+        ));
         let tuner = test_tuner(1);
         let key = EncodeKey::new(tuner.key.clone(), vec![], 1);
 
@@ -1439,14 +1515,24 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        assert!(!encoder.is_running(), "encoder should have been stopped after the idle grace period");
-        assert_eq!(pool.count().await, 0, "stale entry should have been evicted from the pool");
+        assert!(
+            !encoder.is_running(),
+            "encoder should have been stopped after the idle grace period"
+        );
+        assert_eq!(
+            pool.count().await,
+            0,
+            "stale entry should have been evicted from the pool"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn idle_release_cancelled_by_rejoin() {
-        let pool = Arc::new(EncoderPool::new_with_idle_grace(2, Duration::from_millis(100)));
+        let pool = Arc::new(EncoderPool::new_with_idle_grace(
+            2,
+            Duration::from_millis(100),
+        ));
         let tuner = test_tuner(1);
         let key = EncodeKey::new(tuner.key.clone(), vec![], 1);
 
@@ -1467,7 +1553,10 @@ mod tests {
         let _sub2 = enc2.subscribe();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(encoder.is_running(), "encoder should still be running: idle-close was cancelled by the rejoin");
+        assert!(
+            encoder.is_running(),
+            "encoder should still be running: idle-close was cancelled by the rejoin"
+        );
 
         encoder.finish("test cleanup").await;
     }
@@ -1504,7 +1593,10 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(3), out_rx.recv()).await;
         match closed {
             Ok(Err(broadcast::error::RecvError::Closed)) => {}
-            other => panic!("expected watchdog to close the broadcast channel, got {:?}", other),
+            other => panic!(
+                "expected watchdog to close the broadcast channel, got {:?}",
+                other
+            ),
         }
         assert!(!encoder.is_running());
     }
@@ -1527,7 +1619,10 @@ mod stderr_classification_tests {
             "tsreadex: Error: not enough arguments.",
             "/opt/homebrew/bin/ffmpeg: No such file or directory",
         ] {
-            assert!(stderr_line_looks_like_an_error(line), "見逃している: {line}");
+            assert!(
+                stderr_line_looks_like_an_error(line),
+                "見逃している: {line}"
+            );
         }
     }
 

@@ -62,8 +62,7 @@ pub fn restart_self() -> Result<(), ServiceError> {
         RestartMethod::ServiceControlManager => {
             #[cfg(windows)]
             {
-                let name = super::current_service_name()
-                    .ok_or(ServiceError::NotSupported)?;
+                let name = super::current_service_name().ok_or(ServiceError::NotSupported)?;
                 super::windows_scm::spawn_detached_restart(&name)
             }
             #[cfg(not(windows))]

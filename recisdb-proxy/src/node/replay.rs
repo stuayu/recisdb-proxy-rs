@@ -42,7 +42,10 @@ pub struct ReplayBuffer {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ReplayError {
     #[error("requested generation {requested} is no longer available (current {current:?})")]
-    GenerationMismatch { requested: u32, current: Option<u32> },
+    GenerationMismatch {
+        requested: u32,
+        current: Option<u32>,
+    },
     #[error("requested sequence {requested} has already expired; oldest retained is {oldest:?}")]
     TooOld { requested: u64, oldest: Option<u64> },
     #[error("sequence gap in source frames: expected {expected}, got {actual}")]
@@ -222,12 +225,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         replay.push(frame(1, 4)).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        assert!(replay.replay_from(1, 5).unwrap().is_empty(), "a caught-up consumer is fine");
+        assert!(
+            replay.replay_from(1, 5).unwrap().is_empty(),
+            "a caught-up consumer is fine"
+        );
         assert_eq!(replay.oldest_sequence(), None, "the window really is empty");
 
         assert_eq!(
             replay.replay_from(1, 2).unwrap_err(),
-            ReplayError::TooOld { requested: 2, oldest: None },
+            ReplayError::TooOld {
+                requested: 2,
+                oldest: None
+            },
             "a stale resume point must fail, not be answered 'you missed nothing'"
         );
     }
@@ -239,7 +248,10 @@ mod tests {
             replay.push(frame(1, seq)).unwrap();
         }
         let resumed = replay.replay_from(1, 13).unwrap();
-        assert_eq!(resumed.iter().map(|f| f.sequence).collect::<Vec<_>>(), vec![13, 14]);
+        assert_eq!(
+            resumed.iter().map(|f| f.sequence).collect::<Vec<_>>(),
+            vec![13, 14]
+        );
     }
 
     #[test]

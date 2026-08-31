@@ -102,11 +102,11 @@ impl TsQueueShared {
     pub fn release(&self, len: usize) {
         // `fetch_update` rather than `fetch_sub` so an accounting slip can
         // never wrap the counter around to a huge value and wedge the queue.
-        let _ = self.queued_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |queued| Some(queued.saturating_sub(len)),
-        );
+        let _ = self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                Some(queued.saturating_sub(len))
+            });
         self.drained.notify_waiters();
     }
 
@@ -147,9 +147,7 @@ impl TsWriteQueue {
     /// Create the queue, returning the producer handle, the receiver for the
     /// writer task, and the shared accounting the writer needs to release
     /// bytes as it drains.
-    pub fn new(
-        initial_budget_bytes: usize,
-    ) -> (Self, mpsc::Receiver<Bytes>, Arc<TsQueueShared>) {
+    pub fn new(initial_budget_bytes: usize) -> (Self, mpsc::Receiver<Bytes>, Arc<TsQueueShared>) {
         let (tx, rx) = mpsc::channel::<Bytes>(TS_WRITE_SLOTS);
         let shared = Arc::new(TsQueueShared::new(initial_budget_bytes));
         (
@@ -250,7 +248,10 @@ mod tests {
         // Otherwise a chunk larger than the configured window would wedge the
         // stream forever.
         let shared = TsQueueShared::new(1000);
-        assert!(shared.try_reserve(5000), "empty queue must accept any frame");
+        assert!(
+            shared.try_reserve(5000),
+            "empty queue must accept any frame"
+        );
         assert!(!shared.try_reserve(1), "but it is now over budget");
         shared.release(5000);
         assert_eq!(shared.queued(), 0);
@@ -272,7 +273,10 @@ mod tests {
         assert!(!shared.try_reserve(500));
 
         shared.set_budget(2000);
-        assert!(shared.try_reserve(500), "resize must take effect immediately");
+        assert!(
+            shared.try_reserve(500),
+            "resize must take effect immediately"
+        );
     }
 
     #[tokio::test]

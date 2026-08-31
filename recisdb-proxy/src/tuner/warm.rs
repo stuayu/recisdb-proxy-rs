@@ -69,7 +69,12 @@ impl WarmTunerHandle {
                         tuner
                     }
                     Err(e) => {
-                        error!("[WarmTuner] Failed to open BonDriver {}: {} (kind: {:?})", thread_path, e, e.kind());
+                        error!(
+                            "[WarmTuner] Failed to open BonDriver {}: {} (kind: {:?})",
+                            thread_path,
+                            e,
+                            e.kind()
+                        );
                         let _ = ready_tx.send(Err(format!("BonDriver error: {}", e)));
                         return;
                     }
@@ -78,13 +83,22 @@ impl WarmTunerHandle {
                 let _ = ready_tx.send(Ok(()));
 
                 let cmd = if timeout_secs > 0 {
-                    cmd_rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)).ok()
+                    cmd_rx
+                        .recv_timeout(std::time::Duration::from_secs(timeout_secs))
+                        .ok()
                 } else {
                     cmd_rx.recv().ok()
                 };
 
                 match cmd {
-                    Some(WarmCommand::Start { shared, tuner_path, space, channel, startup_config, ready_tx }) => {
+                    Some(WarmCommand::Start {
+                        shared,
+                        tuner_path,
+                        space,
+                        channel,
+                        startup_config,
+                        ready_tx,
+                    }) => {
                         started_shared = Some(Arc::clone(&shared));
                         SharedTuner::run_bondriver_reader_with_tuner(
                             shared,
@@ -317,10 +331,15 @@ mod tests {
         let pool = TunerPool::new(4);
         let path = "/nonexistent/BonDriver_Test.dll";
 
-        let warm_permit = pool.acquire_slot(path, 1).await.expect("first slot is free");
+        let warm_permit = pool
+            .acquire_slot(path, 1)
+            .await
+            .expect("first slot is free");
         let mut warm = WarmTunerHandle::spawn(path.to_string(), 1, warm_permit);
 
-        let target_permit = warm.take_permit().expect("warm handle holds the permit until activation");
+        let target_permit = warm
+            .take_permit()
+            .expect("warm handle holds the permit until activation");
         let shared = SharedTuner::new(ChannelKey::space_channel(path, 0, 13), 2);
         shared.set_slot_permit(target_permit);
         shared.set_state(ReaderState::Starting);

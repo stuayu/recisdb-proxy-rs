@@ -1,4 +1,3 @@
-
 //! Build script for recisdb-proxy
 //!
 //! Compiles C++ wrapper code for BonDriver interface on Windows.
@@ -128,10 +127,9 @@ fn build_bondriver_wrapper() {
         .cpp(true)
         .warnings(false)
         .flag_if_supported("/utf-8") // 文字コード警告(C4819)の抑止に有効
-        .flag_if_supported("/EHa")   // SEH例外もcatch(...)で捕捉可能にする
+        .flag_if_supported("/EHa") // SEH例外もcatch(...)で捕捉可能にする
         .compile("BonDriver_dynamic_cast_ffi");
 }
-
 
 fn build_aribb24_wrapper(target_os: &str) {
     use std::env;
@@ -145,11 +143,26 @@ fn build_aribb24_wrapper(target_os: &str) {
 
     // 変更検知
     println!("cargo:rerun-if-changed={}", wrap_c.display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("aribb24.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("decoder.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("parser.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("drcs.c").display());
-    println!("cargo:rerun-if-changed={}", aribb24_src.join("md5.c").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        aribb24_src.join("aribb24.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        aribb24_src.join("decoder.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        aribb24_src.join("parser.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        aribb24_src.join("drcs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        aribb24_src.join("md5.c").display()
+    );
 
     let mut b = cc::Build::new();
     b.warnings(false);
@@ -161,7 +174,10 @@ fn build_aribb24_wrapper(target_os: &str) {
         b.flag_if_supported("/utf-8");
         b.define("__USE_MINGW_ANSI_STDIO", Some("1"));
         // Windows では asprintf/vasprintf が標準ではないため互換実装を使う
-        println!("cargo:rerun-if-changed={}", aribb24_src.join("win_compat_asprintf.c").display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            aribb24_src.join("win_compat_asprintf.c").display()
+        );
         b.file(aribb24_src.join("win_compat_asprintf.c"));
     } else {
         // Linux/macOS では asprintf が POSIX 標準で利用可能

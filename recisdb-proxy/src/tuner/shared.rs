@@ -2442,13 +2442,11 @@ mod tests {
         let mut received = 0usize;
         let mut actual = Vec::with_capacity(expected.len());
         while received < 4 * 1024 * 1024 {
-            let chunk = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                subscription.recv(),
-            )
-            .await
-            .expect("large chunk drain timed out")
-            .expect("reader stopped before draining the chunk");
+            let chunk =
+                tokio::time::timeout(std::time::Duration::from_secs(2), subscription.recv())
+                    .await
+                    .expect("large chunk drain timed out")
+                    .expect("reader stopped before draining the chunk");
             received += chunk.len();
             actual.extend_from_slice(&chunk);
         }

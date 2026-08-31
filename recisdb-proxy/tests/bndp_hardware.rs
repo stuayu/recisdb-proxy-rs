@@ -45,8 +45,12 @@ struct Client {
 impl Client {
     fn connect() -> Self {
         let sock = TcpStream::connect(addr()).expect("connect to the proxy");
-        sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        Self { sock, buf: Vec::new() }
+        sock.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        Self {
+            sock,
+            buf: Vec::new(),
+        }
     }
 
     fn send(&mut self, msg: ClientMessage) {
@@ -62,7 +66,10 @@ impl Client {
             if let Some(msg) = self.try_take(ts_bytes) {
                 return msg;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for a control message");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a control message"
+            );
             let mut tmp = [0u8; 65536];
             let n = self.sock.read(&mut tmp).expect("read");
             assert!(n > 0, "server closed the connection");
@@ -85,7 +92,9 @@ impl Client {
     fn drain_ts_until(&mut self, min_bytes: usize, max_wait: Duration) -> usize {
         let mut ts = 0usize;
         let deadline = Instant::now() + max_wait;
-        self.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        self.sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let mut reads = 0usize;
         let mut errs: Vec<String> = Vec::new();
         let mut eof = false;
@@ -115,7 +124,9 @@ impl Client {
             );
         }
         while self.try_take(&mut ts).is_some() {}
-        self.sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        self.sock
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
         ts
     }
 
@@ -125,7 +136,9 @@ impl Client {
     /// one — only the EOF can.
     fn is_closed(&mut self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
-        self.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        self.sock
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
         let mut sink = 0usize;
         while Instant::now() < deadline {
             while self.try_take(&mut sink).is_some() {}
@@ -152,10 +165,9 @@ impl Client {
                 return None;
             }
             let frame: Vec<u8> = self.buf.drain(..HEADER_SIZE + len).collect();
-            let msg_type = MessageType::try_from(u16::from_le_bytes(
-                frame[8..10].try_into().unwrap(),
-            ))
-            .expect("unknown message type");
+            let msg_type =
+                MessageType::try_from(u16::from_le_bytes(frame[8..10].try_into().unwrap()))
+                    .expect("unknown message type");
             let payload = Bytes::copy_from_slice(&frame[HEADER_SIZE..]);
             match decode_server_message(msg_type, payload) {
                 Ok(ServerMessage::TsData { data }) => {
@@ -183,13 +195,18 @@ fn open_tuned_session_with_priority(
     let mut ts = 0usize;
     let mut c = Client::connect();
 
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::HelloAck { success: true, .. } => {}
         other => return Err(format!("Hello: {other:?}")),
     }
 
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::OpenTunerAck { success: true, .. } => {}
         ServerMessage::OpenTunerAck { error_code, .. } => {
@@ -198,7 +215,12 @@ fn open_tuned_session_with_priority(
         other => return Err(format!("OpenTuner: {other:?}")),
     }
 
-    c.send(ClientMessage::SetChannelSpace { space, channel, priority, exclusive: false });
+    c.send(ClientMessage::SetChannelSpace {
+        space,
+        channel,
+        priority,
+        exclusive: false,
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
         ServerMessage::SetChannelSpaceAck { error_code, .. } => {
@@ -234,14 +256,18 @@ fn open_tuned_session_with_priority(
 #[test]
 #[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
 fn matrix_concurrent_sessions() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let plan: Vec<u32> = std::env::var("BNDP_MATRIX")
         .unwrap_or_else(|_| "0,1,2,3,4".to_string())
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
         .collect();
-    let expect_ok: Option<usize> =
-        std::env::var("BNDP_MATRIX_EXPECT_OK").ok().and_then(|v| v.parse().ok());
+    let expect_ok: Option<usize> = std::env::var("BNDP_MATRIX_EXPECT_OK")
+        .ok()
+        .and_then(|v| v.parse().ok());
 
     // Start every session at once by default: staggering hides races in the
     // selection path, which is exactly what a matrix run is for.
@@ -309,7 +335,10 @@ fn matrix_concurrent_sessions() {
         );
     }
     if let Some(expect) = expect_ok {
-        assert_eq!(ok, expect, "expected exactly {expect} sessions to be admitted");
+        assert_eq!(
+            ok, expect,
+            "expected exactly {expect} sessions to be admitted"
+        );
     }
 }
 
@@ -324,15 +353,23 @@ fn matrix_concurrent_sessions() {
 #[test]
 #[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
 fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let fill: Vec<u32> = std::env::var("BNDP_PRIO_FILL")
         .unwrap_or_else(|_| "0,1,2,3,4".to_string())
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
         .collect();
-    let target: u32 =
-        std::env::var("BNDP_PRIO_CHANNEL").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    let priority: i32 = std::env::var("BNDP_PRIO").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let target: u32 = std::env::var("BNDP_PRIO_CHANNEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let priority: i32 = std::env::var("BNDP_PRIO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
 
     // Fill every receiver with ordinary viewers, staggered so they settle on
     // distinct tuners rather than racing.
@@ -342,7 +379,10 @@ fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
             Ok(mut c) => {
                 let got = c.drain_ts(Duration::from_secs(20));
                 println!("viewer on channel {ch}: {got} bytes");
-                assert!(got > 188 * 200, "filler viewer on channel {ch} never streamed");
+                assert!(
+                    got > 188 * 200,
+                    "filler viewer on channel {ch} never streamed"
+                );
                 viewers.push(c);
             }
             Err(e) => panic!("could not fill the group: channel {ch}: {e}"),
@@ -355,7 +395,10 @@ fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
         .unwrap_or_else(|e| panic!("priority {priority} request was refused: {e}"));
     let got = rec.drain_ts(Duration::from_secs(20));
     println!("priority {priority} request on channel {target}: {got} bytes");
-    assert!(got > 188 * 200, "the displacing request was admitted but never streamed");
+    assert!(
+        got > 188 * 200,
+        "the displacing request was admitted but never streamed"
+    );
 
     // One of the viewers must have lost its tuner. The server drops such a
     // session as soon as the reader stops (P4), so its socket reports EOF.
@@ -379,33 +422,61 @@ fn a_higher_priority_request_displaces_a_viewer_when_every_receiver_is_busy() {
 #[test]
 #[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
 fn an_exclusive_request_wins_a_tie_when_every_receiver_is_busy() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let fill: Vec<u32> = vec![0, 1, 2, 3, 4];
 
     let mut viewers = Vec::new();
     for &ch in &fill {
         let mut c = open_tuned_session(space, ch).unwrap_or_else(|e| panic!("fill {ch}: {e}"));
-        assert!(c.drain_ts(Duration::from_secs(20)) > 188 * 200, "filler {ch} never streamed");
+        assert!(
+            c.drain_ts(Duration::from_secs(20)) > 188 * 200,
+            "filler {ch} never streamed"
+        );
         viewers.push(c);
     }
 
     // Same priority as the incumbents (0); only `exclusive` distinguishes it.
     let mut c = Client::connect();
     let mut ts = 0usize;
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
-    c.send(ClientMessage::SetChannelSpace { space, channel: 5, priority: 0, exclusive: true });
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::HelloAck { success: true, .. }
+    ));
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::OpenTunerAck { success: true, .. }
+    ));
+    c.send(ClientMessage::SetChannelSpace {
+        space,
+        channel: 5,
+        priority: 0,
+        exclusive: true,
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
         other => panic!("exclusive request refused: {other:?}"),
     }
     c.send(ClientMessage::StartStream);
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::StartStreamAck { success: true, .. }
+    ));
     let got = c.drain_ts(Duration::from_secs(20));
     println!("exclusive request: {got} bytes");
-    assert!(got > 188 * 200, "the exclusive request was admitted but never streamed");
+    assert!(
+        got > 188 * 200,
+        "the exclusive request was admitted but never streamed"
+    );
 
     let mut displaced = 0usize;
     for v in viewers.iter_mut() {
@@ -414,7 +485,10 @@ fn an_exclusive_request_wins_a_tie_when_every_receiver_is_busy() {
         }
     }
     println!("displaced viewers: {displaced}");
-    assert!(displaced >= 1, "exclusive must take a receiver from someone");
+    assert!(
+        displaced >= 1,
+        "exclusive must take a receiver from someone"
+    );
 }
 
 /// The `SelectLogicalChannel` path (tune by NID/TSID rather than by a
@@ -435,24 +509,53 @@ fn select_logical_channel_tunes_and_streams() {
 
     let mut ts = 0usize;
     let mut c = Client::connect();
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::HelloAck { success: true, .. }
+    ));
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::OpenTunerAck { success: true, .. }
+    ));
 
-    c.send(ClientMessage::SelectLogicalChannel { nid, tsid, sid: None });
+    c.send(ClientMessage::SelectLogicalChannel {
+        nid,
+        tsid,
+        sid: None,
+    });
     match c.recv_control(&mut ts) {
-        ServerMessage::SelectLogicalChannelAck { success: true, tuner_id, space, channel, .. } => {
-            println!("SelectLogicalChannel → tuner={tuner_id:?} space={space:?} channel={channel:?}");
+        ServerMessage::SelectLogicalChannelAck {
+            success: true,
+            tuner_id,
+            space,
+            channel,
+            ..
+        } => {
+            println!(
+                "SelectLogicalChannel → tuner={tuner_id:?} space={space:?} channel={channel:?}"
+            );
         }
         other => panic!("SelectLogicalChannel failed: {other:?}"),
     }
 
     c.send(ClientMessage::StartStream);
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::StartStreamAck { success: true, .. }
+    ));
     let got = c.drain_ts(Duration::from_secs(20));
     println!("logical selection: {got} bytes");
-    assert!(got > 188 * 200, "logical channel selection streamed only {got} bytes");
+    assert!(
+        got > 188 * 200,
+        "logical channel selection streamed only {got} bytes"
+    );
 }
 
 /// A viewer that disconnects leaves its reader in the keep-alive window; the
@@ -460,10 +563,16 @@ fn select_logical_channel_tunes_and_streams() {
 #[test]
 #[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
 fn a_reconnecting_viewer_joins_the_kept_alive_reader() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut first = open_tuned_session(space, 0).expect("first viewer");
-    assert!(first.drain_ts(Duration::from_secs(20)) > 188 * 200, "first viewer never streamed");
+    assert!(
+        first.drain_ts(Duration::from_secs(20)) > 188 * 200,
+        "first viewer never streamed"
+    );
     drop(first); // disconnect; the reader stays warm
 
     std::thread::sleep(Duration::from_secs(2));
@@ -471,7 +580,10 @@ fn a_reconnecting_viewer_joins_the_kept_alive_reader() {
     let mut second = open_tuned_session(space, 0).expect("second viewer");
     let got = second.drain_ts(Duration::from_secs(20));
     println!("viewer after reconnect: {got} bytes");
-    assert!(got > 188 * 200, "the reconnecting viewer got only {got} bytes");
+    assert!(
+        got > 188 * 200,
+        "the reconnecting viewer got only {got} bytes"
+    );
 }
 
 /// After `prewarm_timeout_secs` the warm tuner's thread has exited, and the
@@ -485,7 +597,10 @@ fn a_reconnecting_viewer_joins_the_kept_alive_reader() {
 #[test]
 #[ignore = "requires a running proxy with real tuner hardware; takes ~40s by design"]
 fn selection_after_prewarm_expiry_falls_back_to_a_cold_open() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let wait_s: u64 = std::env::var("BNDP_PREWARM_WAIT_S")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -493,22 +608,43 @@ fn selection_after_prewarm_expiry_falls_back_to_a_cold_open() {
 
     let mut ts = 0usize;
     let mut c = Client::connect();
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::HelloAck { success: true, .. }
+    ));
 
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::OpenTunerAck { success: true, .. }
+    ));
 
     println!("waiting {wait_s}s for the warm tuner to expire...");
     std::thread::sleep(Duration::from_secs(wait_s));
 
-    c.send(ClientMessage::SetChannelSpace { space, channel: 0, priority: 0, exclusive: false });
+    c.send(ClientMessage::SetChannelSpace {
+        space,
+        channel: 0,
+        priority: 0,
+        exclusive: false,
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
-        other => panic!("selection after prewarm expiry failed ({other:?}) — the cold fallback is gone"),
+        other => {
+            panic!("selection after prewarm expiry failed ({other:?}) — the cold fallback is gone")
+        }
     }
     c.send(ClientMessage::StartStream);
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::StartStreamAck { success: true, .. }));
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::StartStreamAck { success: true, .. }
+    ));
 
     let got = c.drain_ts(Duration::from_secs(25));
     println!("after prewarm expiry: {got} bytes");
@@ -540,14 +676,30 @@ fn a_session_switches_between_terrestrial_and_satellite() {
 
     let mut ts = 0usize;
     let mut c = Client::connect();
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::HelloAck { success: true, .. }));
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
-    assert!(matches!(c.recv_control(&mut ts), ServerMessage::OpenTunerAck { success: true, .. }));
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::HelloAck { success: true, .. }
+    ));
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
+    assert!(matches!(
+        c.recv_control(&mut ts),
+        ServerMessage::OpenTunerAck { success: true, .. }
+    ));
 
     let mut started = false;
     for (round, &(space, channel)) in plan.iter().enumerate() {
-        c.send(ClientMessage::SetChannelSpace { space, channel, priority: 0, exclusive: false });
+        c.send(ClientMessage::SetChannelSpace {
+            space,
+            channel,
+            priority: 0,
+            exclusive: false,
+        });
         let mut sink = 0usize;
         match c.recv_control(&mut sink) {
             ServerMessage::SetChannelSpaceAck { success: true, .. } => {}
@@ -582,7 +734,10 @@ fn active_tuners(web: &str) -> u32 {
     let body = String::from_utf8_lossy(&out.stdout);
     body.split("\"active_tuners\":")
         .nth(1)
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty()))
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|t| !t.is_empty())
+        })
         .and_then(|n| n.parse().ok())
         .unwrap_or(0)
 }
@@ -602,8 +757,11 @@ fn last_scan_of(web: &str, driver_id: &str) -> i64 {
             || chunk.contains(&format!("\"id\":{driver_id}"))
         {
             if let Some(rest) = chunk.split("\"last_scan\":").nth(1) {
-                let digits: String =
-                    rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                let digits: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 return digits.parse().unwrap_or(0);
             }
         }
@@ -634,11 +792,16 @@ fn last_scan_of(web: &str, driver_id: &str) -> i64 {
 #[test]
 #[ignore = "requires a running proxy with real hardware; drives a real channel scan (~3 min)"]
 fn a_running_scan_neither_displaces_nor_blocks_viewers() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let scan_driver = std::env::var("BNDP_SCAN_DRIVER").unwrap_or_else(|_| "5".to_string());
     let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
-    let window_s: u64 =
-        std::env::var("BNDP_SCAN_WINDOW_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    let window_s: u64 = std::env::var("BNDP_SCAN_WINDOW_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
 
     let mut before = open_tuned_session(space, 0).expect("viewer before the scan");
     assert!(
@@ -649,12 +812,22 @@ fn a_running_scan_neither_displaces_nor_blocks_viewers() {
     let last_scan_before = last_scan_of(&web, &scan_driver);
     let status = std::process::Command::new("curl")
         .args([
-            "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-X",
+            "POST",
             &format!("{web}/api/bondriver/{scan_driver}/scan"),
         ])
         .output()
         .expect("trigger the scan");
-    assert_eq!(String::from_utf8_lossy(&status.stdout), "200", "scan trigger failed");
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "200",
+        "scan trigger failed"
+    );
     println!("scan requested on driver {scan_driver} (last_scan was {last_scan_before})");
 
     // Hold the assertions across the whole window the scan can occur in.
@@ -670,7 +843,10 @@ fn a_running_scan_neither_displaces_nor_blocks_viewers() {
         let mut during = open_tuned_session(space, 1)
             .unwrap_or_else(|e| panic!("a viewer could not be admitted while scanning: {e}"));
         let got = during.drain_ts(Duration::from_secs(20));
-        assert!(got > 188 * 200, "a viewer admitted during the scan got only {got} bytes");
+        assert!(
+            got > 188 * 200,
+            "a viewer admitted during the scan got only {got} bytes"
+        );
         joins += 1;
         drop(during);
 
@@ -702,11 +878,17 @@ fn a_running_scan_neither_displaces_nor_blocks_viewers() {
 #[test]
 #[ignore = "requires a running proxy with real hardware"]
 fn a_scan_yields_to_a_viewer_already_on_that_driver() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
 
     let mut viewer = open_tuned_session(space, 0).expect("viewer");
-    assert!(viewer.drain_ts(Duration::from_secs(20)) > 188 * 200, "viewer never streamed");
+    assert!(
+        viewer.drain_ts(Duration::from_secs(20)) > 188 * 200,
+        "viewer never streamed"
+    );
 
     // Whichever driver it landed on, ask for a scan of exactly that one.
     let out = std::process::Command::new("curl")
@@ -732,7 +914,10 @@ fn a_scan_yields_to_a_viewer_already_on_that_driver() {
         .find(|chunk| chunk.contains(&driver_path))
         .and_then(|chunk| chunk.split("\"id\":").nth(1))
         .map(|rest| {
-            rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+            rest.trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
         })
         .filter(|s| !s.is_empty())
         .expect("driver id for the viewer's path");
@@ -740,7 +925,13 @@ fn a_scan_yields_to_a_viewer_already_on_that_driver() {
 
     let status = std::process::Command::new("curl")
         .args([
-            "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-X",
+            "POST",
             &format!("{web}/api/bondriver/{driver_id}/scan"),
         ])
         .output()
@@ -752,7 +943,10 @@ fn a_scan_yields_to_a_viewer_already_on_that_driver() {
     let deadline = Instant::now() + Duration::from_secs(150);
     while Instant::now() < deadline {
         let got = viewer.drain_ts_until(188 * 200, Duration::from_secs(10));
-        assert!(got > 188 * 200, "the scan took the tuner from a viewer ({got} bytes)");
+        assert!(
+            got > 188 * 200,
+            "the scan took the tuner from a viewer ({got} bytes)"
+        );
 
         let stats = std::process::Command::new("curl")
             .args(["-s", &format!("{web}/api/stats")])
@@ -781,16 +975,27 @@ fn a_scan_yields_to_a_viewer_already_on_that_driver() {
 #[test]
 #[ignore = "requires a running proxy with real hardware; waits out the keep-alive window"]
 fn an_abandoned_session_releases_its_tuner() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let web = std::env::var("BNDP_WEB").unwrap_or_else(|_| "http://127.0.0.1:40080".to_string());
     // Must exceed the server's `keep_alive_secs` (default 60).
-    let wait_s: u64 =
-        std::env::var("BNDP_KEEPALIVE_WAIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+    let wait_s: u64 = std::env::var("BNDP_KEEPALIVE_WAIT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
 
     let before = active_tuners(&web);
     let mut viewer = open_tuned_session(space, 0).expect("viewer");
-    assert!(viewer.drain_ts(Duration::from_secs(20)) > 188 * 200, "viewer never streamed");
-    assert!(active_tuners(&web) > before, "the viewer should have opened a tuner");
+    assert!(
+        viewer.drain_ts(Duration::from_secs(20)) > 188 * 200,
+        "viewer never streamed"
+    );
+    assert!(
+        active_tuners(&web) > before,
+        "the viewer should have opened a tuner"
+    );
 
     // Vanish without StopStream or CloseTuner, the way a killed client does.
     drop(viewer);
@@ -819,26 +1024,41 @@ fn an_abandoned_session_releases_its_tuner() {
 #[test]
 #[ignore = "requires a running proxy with a scanned channel DB and real tuner hardware"]
 fn session_switches_channels_on_a_single_instance_driver() {
-    let space: u32 = std::env::var("BNDP_SPACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let space: u32 = std::env::var("BNDP_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let channels: Vec<u32> = std::env::var("BNDP_CHANNELS")
         .unwrap_or_else(|_| "0,1".to_string())
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
         .collect();
-    assert!(channels.len() >= 2, "need at least two channel indices to test a switch");
+    assert!(
+        channels.len() >= 2,
+        "need at least two channel indices to test a switch"
+    );
 
     let mut ts = 0usize;
     let mut c = Client::connect();
 
-    c.send(ClientMessage::Hello { version: 2, stream_class: StreamClass::View });
+    c.send(ClientMessage::Hello {
+        version: 2,
+        stream_class: StreamClass::View,
+    });
     match c.recv_control(&mut ts) {
         ServerMessage::HelloAck { success, .. } => assert!(success, "Hello rejected"),
         other => panic!("expected HelloAck, got {other:?}"),
     }
 
-    c.send(ClientMessage::OpenTunerWithGroup { group_name: group() });
+    c.send(ClientMessage::OpenTunerWithGroup {
+        group_name: group(),
+    });
     match c.recv_control(&mut ts) {
-        ServerMessage::OpenTunerAck { success, error_code, .. } => {
+        ServerMessage::OpenTunerAck {
+            success,
+            error_code,
+            ..
+        } => {
             assert!(success, "OpenTuner failed (error_code={error_code})")
         }
         other => panic!("expected OpenTunerAck, got {other:?}"),
@@ -851,15 +1071,24 @@ fn session_switches_channels_on_a_single_instance_driver() {
         exclusive: false,
     });
     match c.recv_control(&mut ts) {
-        ServerMessage::SetChannelSpaceAck { success, error_code } => {
-            assert!(success, "initial SetChannelSpace failed (error_code={error_code})")
+        ServerMessage::SetChannelSpaceAck {
+            success,
+            error_code,
+        } => {
+            assert!(
+                success,
+                "initial SetChannelSpace failed (error_code={error_code})"
+            )
         }
         other => panic!("expected SetChannelSpaceAck, got {other:?}"),
     }
 
     c.send(ClientMessage::StartStream);
     match c.recv_control(&mut ts) {
-        ServerMessage::StartStreamAck { success, error_code } => {
+        ServerMessage::StartStreamAck {
+            success,
+            error_code,
+        } => {
             assert!(success, "StartStream failed (error_code={error_code})")
         }
         other => panic!("expected StartStreamAck, got {other:?}"),
@@ -867,15 +1096,26 @@ fn session_switches_channels_on_a_single_instance_driver() {
 
     let first = c.drain_ts(Duration::from_secs(20));
     println!("channel {} → {} bytes", channels[0], first);
-    assert!(first > 188 * 500, "no TS on the first channel ({first} bytes)");
+    assert!(
+        first > 188 * 500,
+        "no TS on the first channel ({first} bytes)"
+    );
 
     // The switch under test: same driver, different physical channel, while
     // streaming.
     for &ch in &channels[1..] {
-        c.send(ClientMessage::SetChannelSpace { space, channel: ch, priority: 0, exclusive: false });
+        c.send(ClientMessage::SetChannelSpace {
+            space,
+            channel: ch,
+            priority: 0,
+            exclusive: false,
+        });
         let mut sink = 0usize;
         match c.recv_control(&mut sink) {
-            ServerMessage::SetChannelSpaceAck { success, error_code } => assert!(
+            ServerMessage::SetChannelSpaceAck {
+                success,
+                error_code,
+            } => assert!(
                 success,
                 "switching to channel {ch} failed (error_code={error_code}) — \
                  the session's slot permit was not carried over"
@@ -885,7 +1125,10 @@ fn session_switches_channels_on_a_single_instance_driver() {
 
         let got = c.drain_ts(Duration::from_secs(20));
         println!("channel {ch} → {got} bytes");
-        assert!(got > 188 * 500, "no TS after switching to channel {ch} ({got} bytes)");
+        assert!(
+            got > 188 * 500,
+            "no TS after switching to channel {ch} ({got} bytes)"
+        );
     }
 
     c.send(ClientMessage::StopStream);

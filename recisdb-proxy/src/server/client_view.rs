@@ -243,13 +243,15 @@ pub fn build_channels_by_region<F: Fn(&str) -> bool>(
         .map(|(region, channels)| {
             let list = channels
                 .into_iter()
-                .map(|((nid, tsid), (bon_space, bon_channel, name))| ChannelEntry {
-                    bon_space,
-                    bon_channel,
-                    name,
-                    nid,
-                    tsid,
-                })
+                .map(
+                    |((nid, tsid), (bon_space, bon_channel, name))| ChannelEntry {
+                        bon_space,
+                        bon_channel,
+                        name,
+                        nid,
+                        tsid,
+                    },
+                )
                 .collect();
             (region, list)
         })
@@ -388,7 +390,11 @@ mod tests {
             row(&d, 0x0006, 0x6020, 100, Some("CS100"), 2, 0, true),  // CS
         ];
         let result = build_space_list(&rows, |p| p == "BonDriver_A.dll");
-        let names: Vec<_> = result.spaces.iter().map(|s| s.region_key.as_str()).collect();
+        let names: Vec<_> = result
+            .spaces
+            .iter()
+            .map(|s| s.region_key.as_str())
+            .collect();
         assert_eq!(names, vec!["関東", "BS", "CS"]);
         assert_eq!(result.spaces[0].display_name, "地デジ (関東)");
     }
@@ -523,16 +529,36 @@ mod tests {
         let rows = vec![
             // Two services on the same TS (out of SID order), one duplicated
             // on a second driver, plus a disabled service.
-            row(&d1, 0x7FE8, 0x7FE8, 1025, Some("NHK総合・サブ"), 0, 27, true),
+            row(
+                &d1,
+                0x7FE8,
+                0x7FE8,
+                1025,
+                Some("NHK総合・サブ"),
+                0,
+                27,
+                true,
+            ),
             row(&d1, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 27, true),
             row(&d2, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 5, true),
-            row(&d1, 0x7FE8, 0x7FE8, 1026, Some("無効サービス"), 0, 27, false),
+            row(
+                &d1,
+                0x7FE8,
+                0x7FE8,
+                1026,
+                Some("無効サービス"),
+                0,
+                27,
+                false,
+            ),
             row(&d1, 0x0004, 0x4010, 101, Some("BS朝日"), 1, 0, true),
         ];
         let by_ts = build_services_by_ts(&rows, |_| true);
         let terr = &by_ts[&(0x7FE8, 0x7FE8)];
         assert_eq!(
-            terr.iter().map(|s| (s.sid, s.name.as_str())).collect::<Vec<_>>(),
+            terr.iter()
+                .map(|s| (s.sid, s.name.as_str()))
+                .collect::<Vec<_>>(),
             vec![(1024, "NHK総合"), (1025, "NHK総合・サブ")]
         );
         assert_eq!(by_ts[&(0x0004, 0x4010)].len(), 1);

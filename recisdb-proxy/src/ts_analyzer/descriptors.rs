@@ -44,7 +44,6 @@ impl ServiceDescriptor {
             &data[service_name_offset + 1..service_name_offset + 1 + service_name_length],
         );
 
-
         Ok(ServiceDescriptor {
             service_type,
             provider_name,
@@ -254,7 +253,6 @@ pub fn find_descriptor(data: &[u8], tag: u8) -> Option<Vec<u8>> {
         .map(|(_, d)| d)
 }
 
-
 /// Convert BCD bytes to u32.
 fn bcd_to_u32(data: &[u8]) -> u32 {
     let mut result = 0u32;
@@ -327,10 +325,7 @@ mod tests {
 
     #[test]
     fn test_find_descriptor() {
-        let data = [
-            0x48, 0x02, 0xAA, 0xBB,
-            0x40, 0x03, 0xCC, 0xDD, 0xEE,
-        ];
+        let data = [0x48, 0x02, 0xAA, 0xBB, 0x40, 0x03, 0xCC, 0xDD, 0xEE];
 
         let found = find_descriptor(&data, 0x40);
         assert_eq!(found, Some(vec![0xCC, 0xDD, 0xEE]));

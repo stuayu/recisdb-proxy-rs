@@ -14,18 +14,18 @@
 //! `--verbose` > `"info"`), via a `tracing_subscriber::reload` layer that lets
 //! the level change at runtime without restarting the process.
 
+use chrono::Local;
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
-use chrono::Local;
-use std::fs;
 
 mod buffer;
 pub use buffer::{
-    LogBuffer, LogBufferLayer, LogCategory, LogEntry, LogQuery, LogQueryResult,
-    ACCESS_LOG_TARGET, LOG_BUFFER_CAPACITY,
+    LogBuffer, LogBufferLayer, LogCategory, LogEntry, LogQuery, LogQueryResult, ACCESS_LOG_TARGET,
+    LOG_BUFFER_CAPACITY,
 };
 
 /// Log levels accepted by [`LogLevelHandle::set_level`] and the `/api/log-config`
@@ -54,7 +54,10 @@ impl LogLevelHandle {
     /// true — the raw `RUST_LOG` directive string, which may name modules
     /// individually and so need not be one of the five canonical levels.
     pub fn current(&self) -> String {
-        self.current.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether `RUST_LOG` was present (and non-empty) in the environment at
@@ -157,10 +160,12 @@ pub fn init_logging(
     // Priority: RUST_LOG env > --verbose flag > default "info". The DB-backed
     // level (`log_config` table) is applied afterward by `main.rs` via the
     // returned `LogLevelHandle`, once the database is open.
-    let rust_log = std::env::var("RUST_LOG").ok().filter(|v| !v.trim().is_empty());
+    let rust_log = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let default_level = if verbose { "debug" } else { "info" };
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     // `current()` reports what is actually in effect, so when RUST_LOG is set
     // it holds that directive string verbatim (which may be per-module, e.g.
     // `recisdb_proxy::tuner=debug,info`) rather than one of the five
@@ -169,7 +174,11 @@ pub fn init_logging(
     let (env_filter, reload_handle) = reload::Layer::new(env_filter);
     let log_level_handle = Arc::new(LogLevelHandle {
         handle: reload_handle,
-        current: Mutex::new(rust_log.clone().unwrap_or_else(|| default_level.to_string())),
+        current: Mutex::new(
+            rust_log
+                .clone()
+                .unwrap_or_else(|| default_level.to_string()),
+        ),
         env_override: rust_log.is_some(),
     });
 
@@ -192,7 +201,7 @@ pub fn init_logging(
                 .with_thread_ids(false)
                 .with_file(false)
                 .with_line_number(false)
-                .with_timer(LocalTimeTimer)
+                .with_timer(LocalTimeTimer),
         )
         .with(
             fmt::layer()
@@ -203,15 +212,14 @@ pub fn init_logging(
                 .with_file(true)
                 .with_line_number(true)
                 .with_ansi(false)
-                .with_timer(LocalTimeTimer)
+                .with_timer(LocalTimeTimer),
         )
         .with(buffer::LogBufferLayer::new(Arc::clone(&log_buffer)));
 
     // Initialize tracing-log FIRST so `log::` macro records are bridged to
     // tracing from the very first event; this is also the order recommended
     // by tracing-log (set the LogTracer before the global subscriber).
-    tracing_log::LogTracer::init()
-        .map_err(|e| format!("Failed to initialize LogTracer: {}", e))?;
+    tracing_log::LogTracer::init().map_err(|e| format!("Failed to initialize LogTracer: {}", e))?;
 
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| format!("Failed to set default subscriber: {}", e))?;
@@ -243,7 +251,10 @@ fn clean_old_logs(log_dir: &Path, retention_days: u64) -> io::Result<()> {
                                 let modified_datetime: chrono::DateTime<Local> = modified.into();
                                 if modified_datetime < cutoff {
                                     if let Err(e) = fs::remove_file(&path) {
-                                        eprintln!("Failed to remove old log file {:?}: {}", path, e);
+                                        eprintln!(
+                                            "Failed to remove old log file {:?}: {}",
+                                            path, e
+                                        );
                                     }
                                 }
                             }

@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::web::state::WebState;
 use crate::tuner::TunerPoolConfig;
+use crate::web::state::WebState;
 
 use super::error::ApiError;
 
@@ -21,9 +21,7 @@ use super::error::ApiError;
 // ============================================================================
 
 /// Legacy: Get server configuration.
-pub async fn get_config(
-    State(web_state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+pub async fn get_config(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
     super::bondrivers::get_bondrivers(State(web_state)).await
 }
 
@@ -50,12 +48,22 @@ pub async fn update_config(
 
     for driver_config in payload.bon_drivers {
         db.update_bon_driver_max_instances(driver_config.id, driver_config.max_instances)
-            .map_err(|e| ApiError::internal(format!("Failed to update {}: {}", driver_config.dll_path, e)))?;
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to update {}: {}",
+                    driver_config.dll_path, e
+                ))
+            })?;
 
         // Update group_name if provided
         if let Some(group) = driver_config.group_name {
             db.set_group_name(driver_config.id, Some(&group))
-                .map_err(|e| ApiError::internal(format!("Failed to update group_name for {}: {}", driver_config.dll_path, e)))?;
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to update group_name for {}: {}",
+                        driver_config.dll_path, e
+                    ))
+                })?;
         }
     }
 
@@ -89,7 +97,8 @@ pub async fn get_tuner_config(
         jitter_safety_factor,
     ) = db.get_tuner_config()?;
     let (ts_queue_view_ms, ts_queue_preview_ms, ts_queue_record_ms) = db.get_ts_queue_config()?;
-    let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) = db.get_tuner_livelock_config()?;
+    let (min_hold_secs, reject_cooldown_ms, no_data_timeout_secs) =
+        db.get_tuner_livelock_config()?;
 
     Ok(Json(json!({
         "success": true,
@@ -178,11 +187,12 @@ pub async fn update_tuner_config(
             mut prefill_preview_ms,
             mut prefill_record_ms,
             mut jitter_safety_factor,
-        ) =
-            match db.get_tuner_config() {
-                Ok(config) => config,
-                Err(_) => (60, true, 30, 500, 10_000, 500, 10_000, 1000, 2000, 6000, 1.5),
-            };
+        ) = match db.get_tuner_config() {
+            Ok(config) => config,
+            Err(_) => (
+                60, true, 30, 500, 10_000, 500, 10_000, 1000, 2000, 6000, 1.5,
+            ),
+        };
 
         if let Some(val) = payload.keep_alive_secs {
             if val > 0 {
@@ -218,9 +228,21 @@ pub async fn update_tuner_config(
                 signal_wait_timeout_ms = val;
             }
         }
-        if let Some(val) = payload.min_hold_secs { if val > 0 { min_hold_secs = val; } }
-        if let Some(val) = payload.reject_cooldown_ms { if val > 0 { reject_cooldown_ms = val; } }
-        if let Some(val) = payload.no_data_timeout_secs { if val > 0 { no_data_timeout_secs = val; } }
+        if let Some(val) = payload.min_hold_secs {
+            if val > 0 {
+                min_hold_secs = val;
+            }
+        }
+        if let Some(val) = payload.reject_cooldown_ms {
+            if val > 0 {
+                reject_cooldown_ms = val;
+            }
+        }
+        if let Some(val) = payload.no_data_timeout_secs {
+            if val > 0 {
+                no_data_timeout_secs = val;
+            }
+        }
         if let Some(val) = payload.prefill_view_ms {
             prefill_view_ms = val;
         }
@@ -243,13 +265,19 @@ pub async fn update_tuner_config(
             // make every frame collide with the budget and turn a VIEW session
             // into a drop machine.
             if let Some(val) = payload.ts_queue_view_ms {
-                if val > 0 { view_ms = val; }
+                if val > 0 {
+                    view_ms = val;
+                }
             }
             if let Some(val) = payload.ts_queue_preview_ms {
-                if val > 0 { preview_ms = val; }
+                if val > 0 {
+                    preview_ms = val;
+                }
             }
             if let Some(val) = payload.ts_queue_record_ms {
-                if val > 0 { record_ms = val; }
+                if val > 0 {
+                    record_ms = val;
+                }
             }
             db.update_ts_queue_config(view_ms, preview_ms, record_ms)
                 .map_err(|e| ApiError::internal(format!("Failed to save configuration: {}", e)))?;
@@ -270,7 +298,9 @@ pub async fn update_tuner_config(
         )
         .map_err(|e| ApiError::internal(format!("Failed to save configuration: {}", e)))?;
         db.update_tuner_livelock_config(min_hold_secs, reject_cooldown_ms, no_data_timeout_secs)
-            .map_err(|e| ApiError::internal(format!("Failed to save livelock configuration: {}", e)))?;
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to save livelock configuration: {}", e))
+            })?;
 
         (
             keep_alive,
@@ -362,8 +392,16 @@ pub async fn get_tsreplace_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments) =
-        db.get_tsreplace_config()?;
+    let (
+        enabled,
+        command_path,
+        arguments,
+        read_timeout_ms,
+        passthrough_on_error,
+        max_concurrent_encoders,
+        preprocessor_path,
+        preprocessor_arguments,
+    ) = db.get_tsreplace_config()?;
     Ok(Json(json!({
         "success": true,
         "config": {
@@ -416,11 +454,28 @@ pub async fn update_tsreplace_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, command_path, mut arguments, mut read_timeout_ms, mut passthrough_on_error, mut max_concurrent_encoders, preprocessor_path, mut preprocessor_arguments) =
-        match db.get_tsreplace_config() {
-            Ok(config) => config,
-            Err(_) => (false, "tsreplace".to_string(), "".to_string(), 10_000, true, 2, "".to_string(), "".to_string()),
-        };
+    let (
+        mut enabled,
+        command_path,
+        mut arguments,
+        mut read_timeout_ms,
+        mut passthrough_on_error,
+        mut max_concurrent_encoders,
+        preprocessor_path,
+        mut preprocessor_arguments,
+    ) = match db.get_tsreplace_config() {
+        Ok(config) => config,
+        Err(_) => (
+            false,
+            "tsreplace".to_string(),
+            "".to_string(),
+            10_000,
+            true,
+            2,
+            "".to_string(),
+            "".to_string(),
+        ),
+    };
 
     if let Some(val) = payload.enabled {
         enabled = val;
@@ -483,7 +538,9 @@ pub async fn update_tsreplace_config(
 // ============================================================================
 
 /// Get browser-preview encoder configuration (`GET /api/preview-config`).
-pub async fn get_preview_config(State(web_state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn get_preview_config(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
     let (enabled, command_path, preprocessor_path, preprocessor_arguments, read_timeout_ms) =
@@ -529,8 +586,13 @@ pub async fn update_preview_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
 
-    let (mut enabled, command_path, preprocessor_path, mut preprocessor_arguments, mut read_timeout_ms) =
-        db.get_preview_encoder_config()?;
+    let (
+        mut enabled,
+        command_path,
+        preprocessor_path,
+        mut preprocessor_arguments,
+        mut read_timeout_ms,
+    ) = db.get_preview_encoder_config()?;
 
     if let Some(val) = payload.enabled {
         enabled = val;
@@ -571,7 +633,9 @@ pub async fn update_preview_config(
 // ============================================================================
 
 /// Get all encode profiles.
-pub async fn get_encode_profiles(State(web_state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn get_encode_profiles(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
     let profiles = db.get_all_encode_profiles()?;
     Ok(Json(json!({
@@ -598,8 +662,13 @@ pub async fn create_encode_profile(
     State(web_state): State<Arc<WebState>>,
     Json(payload): Json<CreateEncodeProfileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if payload.name.trim().is_empty() || payload.purpose.trim().is_empty() || payload.codec.trim().is_empty() {
-        return Err(ApiError::bad_request("name, purpose, and codec are required"));
+    if payload.name.trim().is_empty()
+        || payload.purpose.trim().is_empty()
+        || payload.codec.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "name, purpose, and codec are required",
+        ));
     }
 
     let db = web_state.database.lock().await;
@@ -658,7 +727,9 @@ pub async fn update_encode_profile(
         payload.extra_args.as_ref().map(|v| v.as_deref()),
         payload.is_enabled,
     )?;
-    Ok(Json(json!({ "success": true, "message": "Encode profile updated successfully" })))
+    Ok(Json(
+        json!({ "success": true, "message": "Encode profile updated successfully" }),
+    ))
 }
 
 /// Delete an encode profile.
@@ -668,7 +739,9 @@ pub async fn delete_encode_profile(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
     db.delete_encode_profile(id)?;
-    Ok(Json(json!({ "success": true, "message": "Encode profile deleted" })))
+    Ok(Json(
+        json!({ "success": true, "message": "Encode profile deleted" }),
+    ))
 }
 
 /// Get scan scheduler configuration.
@@ -709,11 +782,16 @@ pub async fn update_scan_config(
     // Get current config from database
     let db = web_state.database.lock().await;
 
-    let (mut interval, mut concurrent, mut timeout, mut signal_lock_wait_ms, mut ts_read_timeout_ms) =
-        match db.get_scan_scheduler_config() {
-            Ok(config) => config,
-            Err(_) => (60, 1, 900, 500, 300000),
-        };
+    let (
+        mut interval,
+        mut concurrent,
+        mut timeout,
+        mut signal_lock_wait_ms,
+        mut ts_read_timeout_ms,
+    ) = match db.get_scan_scheduler_config() {
+        Ok(config) => config,
+        Err(_) => (60, 1, 900, 500, 300000),
+    };
 
     // Update with provided values
     if let Some(val) = payload.check_interval_secs {

@@ -56,7 +56,8 @@ impl AlertManager {
                 };
 
                 let triggered = evaluate_condition(&rule.condition, value, rule.threshold);
-                let active = db.get_active_alert_for_rule_session(rule.id, Some(session.id as i64))?;
+                let active =
+                    db.get_active_alert_for_rule_session(rule.id, Some(session.id as i64))?;
 
                 if triggered && active.is_none() {
                     let message = format!(
@@ -71,12 +72,19 @@ impl AlertManager {
                         Some(&message),
                     )?;
 
-                    info!("Alert triggered: rule={} session={} id={}", rule.name, session.id, alert_id);
+                    info!(
+                        "Alert triggered: rule={} session={} id={}",
+                        rule.name, session.id, alert_id
+                    );
 
                     #[cfg(feature = "webhook")]
                     if let Some(url) = rule.webhook_url.as_deref() {
                         let format = rule.webhook_format.as_deref().unwrap_or("generic");
-                        if let Err(e) = self.webhook_sender.send_alert(url, format, &rule, session.id, value, &message).await {
+                        if let Err(e) = self
+                            .webhook_sender
+                            .send_alert(url, format, &rule, session.id, value, &message)
+                            .await
+                        {
                             warn!("Webhook send failed: {}", e);
                         }
                     }
@@ -96,7 +104,10 @@ impl AlertManager {
 fn metric_value(rule: &AlertRuleRecord, session: &crate::web::SessionInfo) -> Option<f64> {
     match rule.metric.as_str() {
         "drop_rate" => Some(rate_percent(session.packets_dropped, session.packets_sent)),
-        "scramble_rate" => Some(rate_percent(session.packets_scrambled, session.packets_sent)),
+        "scramble_rate" => Some(rate_percent(
+            session.packets_scrambled,
+            session.packets_sent,
+        )),
         "error_rate" => Some(rate_percent(session.packets_error, session.packets_sent)),
         "signal_level" => Some(session.signal_level as f64),
         "bitrate" => Some(session.current_bitrate_mbps),
@@ -130,7 +141,9 @@ struct WebhookSender {
 #[cfg(feature = "webhook")]
 impl WebhookSender {
     fn new() -> Self {
-        Self { client: Client::new() }
+        Self {
+            client: Client::new(),
+        }
     }
 
     pub async fn send_alert(
@@ -149,9 +162,14 @@ impl WebhookSender {
             _ => self.format_generic_payload(rule, session_id, metric_value, message),
         };
 
-        self.client.post(url).json(&payload).send().await.map_err(|e| {
-            crate::database::DatabaseError::MigrationFailed(format!("Webhook error: {}", e))
-        })?;
+        self.client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::database::DatabaseError::MigrationFailed(format!("Webhook error: {}", e))
+            })?;
         Ok(())
     }
 

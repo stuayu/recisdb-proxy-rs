@@ -1,8 +1,8 @@
 //! Client session handling.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
@@ -11,21 +11,24 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc};
 
 use recisdb_protocol::{
-    broadcast_region::classify_nid,
-    decode_client_message, decode_header, encode_server_message, BandType, ClientChannelInfo,
-    ClientMessage, ErrorCode, ServerMessage, StreamClass, HEADER_SIZE, PROTOCOL_VERSION,
+    broadcast_region::classify_nid, decode_client_message, decode_header, encode_server_message,
+    BandType, ClientChannelInfo, ClientMessage, ErrorCode, ServerMessage, StreamClass, HEADER_SIZE,
+    PROTOCOL_VERSION,
 };
 
 use crate::server::listener::DatabaseHandle;
 use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
-use crate::tuner::shared::{ReaderState, StopReason};
-use crate::tuner::{ChannelKey, SharedTuner, SlotPermit, TunerPool, TunerSubscription, WarmTunerHandle, ts_analyzer::TsPacketAnalyzer};
+use crate::ts_analyzer::service_filter::TsServiceFilter;
+use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::encoder_pool::{
     self, EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
 };
 use crate::tuner::quality_scorer::QualityScorer;
-use crate::tuner::channel_key::ChannelKeySpec;
-use crate::ts_analyzer::service_filter::TsServiceFilter;
+use crate::tuner::shared::{ReaderState, StopReason};
+use crate::tuner::{
+    ts_analyzer::TsPacketAnalyzer, ChannelKey, SharedTuner, SlotPermit, TunerPool,
+    TunerSubscription, WarmTunerHandle,
+};
 use crate::web::SessionRegistry;
 
 /// Session state machine.
@@ -44,9 +47,11 @@ enum SessionState {
 }
 
 use crate::server::client_view::ChannelEntry;
+use crate::server::session_capacity::{cleanup_unused_tuner_after_switch, driver_max_instances};
+use crate::server::session_channel_candidates::collect_group_channel_candidates;
 use crate::server::session_runtime::{
-    load_prefill_runtime_config, load_tsreplace_runtime_config, resolve_encode_sids,
-    PrefillRuntimeConfig, TsreplaceRuntimeConfig, load_ts_queue_runtime_config,
+    load_prefill_runtime_config, load_ts_queue_runtime_config, load_tsreplace_runtime_config,
+    resolve_encode_sids, PrefillRuntimeConfig, TsreplaceRuntimeConfig,
 };
 use crate::server::session_space_cache::{
     clear_caches as clear_session_caches, current_or_default_tuner_path,
@@ -55,11 +60,8 @@ use crate::server::session_space_cache::{
     get_space_list_with_names as get_space_list_with_names_cached,
     map_space_idx_to_actual_with_region as map_space_idx_to_actual_with_region_cached,
 };
-use crate::server::session_capacity::{cleanup_unused_tuner_after_switch, driver_max_instances};
-use crate::server::session_channel_candidates::collect_group_channel_candidates;
-use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::server::session_tuner_handoff::handoff_current_tuner;
-
+use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 
 /// Weight of a new sample in the measured-bitrate EWMA.
 ///
@@ -114,11 +116,11 @@ fn no_ts_source_deadline_passed(
 /// are exempt: keeping a tuner open without streaming is legitimate.
 const IDLE_NO_TUNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-use crate::server::ts_queue::{budget_bytes, TsWriteQueue};
 use crate::server::session_backpressure::{
-    send_ts_frame, should_auto_promote_to_record, TsFrameSendOutcome,
-    RECORD_OVERFLOW_TIMEOUT, RECORD_PRIORITY_THRESHOLD,
+    send_ts_frame, should_auto_promote_to_record, TsFrameSendOutcome, RECORD_OVERFLOW_TIMEOUT,
+    RECORD_PRIORITY_THRESHOLD,
 };
+use crate::server::ts_queue::{budget_bytes, TsWriteQueue};
 
 /// A client session.
 pub struct Session {
@@ -436,9 +438,8 @@ impl Session {
     /// `current_nid` is classified via `BandType::from_nid`; an unresolved NID
     /// (legacy v1 `SetChannel` clients) falls back to the "unknown" default.
     fn sizing_bitrate_bps(&self) -> u64 {
-        self.measured_bitrate_bps.unwrap_or_else(|| {
-            default_bitrate_bps(self.current_nid.map(BandType::from_nid))
-        })
+        self.measured_bitrate_bps
+            .unwrap_or_else(|| default_bitrate_bps(self.current_nid.map(BandType::from_nid)))
     }
 
     /// Re-size the TS write queue's byte budget from the configured per-class
@@ -643,7 +644,8 @@ impl Session {
     async fn refresh_current_bon_driver_id(&mut self) {
         if let Some(path) = &self.current_tuner_path {
             let db = self.database.lock().await;
-            self.current_bon_driver_id = db.get_bon_driver_by_path(path).ok().flatten().map(|d| d.id);
+            self.current_bon_driver_id =
+                db.get_bon_driver_by_path(path).ok().flatten().map(|d| d.id);
         } else {
             self.current_bon_driver_id = None;
         }
@@ -699,8 +701,10 @@ impl Session {
             found
         };
         if already_running {
-            debug!("[Session {}] Skipping warm tuner for {} – driver already has a running reader",
-                   self.id, tuner_path);
+            debug!(
+                "[Session {}] Skipping warm tuner for {} – driver already has a running reader",
+                self.id, tuner_path
+            );
             return;
         }
 
@@ -713,7 +717,11 @@ impl Session {
         // spare slot; a failed prewarm is just a missed optimization, not a
         // user-visible error, so there is no fallback path to design here.
         let max_instances = driver_max_instances(&self.database, tuner_path).await;
-        let Some(permit) = self.tuner_pool.acquire_slot(tuner_path, max_instances).await else {
+        let Some(permit) = self
+            .tuner_pool
+            .acquire_slot(tuner_path, max_instances)
+            .await
+        else {
             debug!(
                 "[Session {}] Skipping warm tuner for {} – driver at capacity ({} instance(s))",
                 self.id, tuner_path, max_instances
@@ -723,7 +731,8 @@ impl Session {
 
         self.stop_warm_tuner().await;
 
-        let warm = WarmTunerHandle::spawn(tuner_path.to_string(), config.prewarm_timeout_secs, permit);
+        let warm =
+            WarmTunerHandle::spawn(tuner_path.to_string(), config.prewarm_timeout_secs, permit);
         self.warm_tuner_path = Some(tuner_path.to_string());
         self.warm_tuner = Some(warm);
     }
@@ -744,9 +753,12 @@ impl Session {
         if streaming && self.ts_receiver.is_none() && self.current_encoder.is_none() {
             // Start the clock here rather than on the next idle tick, so the
             // grace period is measured from the failure itself.
-            self.no_ts_source_since.get_or_insert_with(std::time::Instant::now);
+            self.no_ts_source_since
+                .get_or_insert_with(std::time::Instant::now);
         }
-        let Some(ref old_key) = old_tuner_key else { return };
+        let Some(ref old_key) = old_tuner_key else {
+            return;
+        };
         let Some(old_tuner) = self.tuner_pool.get(old_key).await else {
             warn!("[Session {}] Channel switch failed but old tuner {:?} is no longer in pool; cannot restore",
                   self.id, old_key);
@@ -757,27 +769,31 @@ impl Session {
                   self.id, old_key);
             return;
         }
-        info!("[Session {}] Channel switch failed — restoring previous channel {:?}", self.id, old_key);
+        info!(
+            "[Session {}] Channel switch failed — restoring previous channel {:?}",
+            self.id, old_key
+        );
         // Cancel any pending idle-close so the tuner stays alive.
         self.tuner_pool.cancel_idle_close(old_key).await;
         self.current_tuner = Some(old_tuner.clone());
         // If we were (or are still) streaming, re-subscribe so TS data flows again.
         if self.state == SessionState::Streaming && self.ts_receiver.is_none() {
             self.ts_receiver = Some(
-                old_tuner.subscribe_with_claim(
-                    self.tuner_claim_priority,
-                    self.tuner_claim_exclusive,
-                ),
+                old_tuner
+                    .subscribe_with_claim(self.tuner_claim_priority, self.tuner_claim_exclusive),
             );
         }
     }
-
 
     /// Get channel map for a specific space and region (for virtual space filtering).
     /// Cached per region_key: TVTest calls EnumChannelName once per channel,
     /// so without the cache every call would re-scan the whole channels table
     /// under the DB mutex. Cleared by `clear_caches` (every OpenTuner).
-    async fn ensure_channel_map_with_region(&mut self, _space: u32, region_name: &str) -> Vec<ChannelEntry> {
+    async fn ensure_channel_map_with_region(
+        &mut self,
+        _space: u32,
+        region_name: &str,
+    ) -> Vec<ChannelEntry> {
         ensure_channel_map_with_region_cached(
             &self.database,
             self.id,
@@ -813,7 +829,10 @@ impl Session {
     /// Map virtual space index to (actual_space, region_key) for filtering.
     /// Returns the region_key (e.g., "宮城", "BS", "CS") used for channel matching,
     /// NOT the display name (which may differ, e.g., "地デジ").
-    async fn map_space_idx_to_actual_with_region(&mut self, space_idx: u32) -> Option<(u32, String)> {
+    async fn map_space_idx_to_actual_with_region(
+        &mut self,
+        space_idx: u32,
+    ) -> Option<(u32, String)> {
         map_space_idx_to_actual_with_region_cached(
             &self.group_driver_paths,
             self.current_group_name.as_deref(),
@@ -866,7 +885,10 @@ impl Session {
         ) {
             self.session_history_id = Some(db);
         } else {
-            warn!("[Session {}] Failed to insert session history start", self.id);
+            warn!(
+                "[Session {}] Failed to insert session history start",
+                self.id
+            );
         }
 
         // Detects a tuner reader that stops out from under us: displaced to
@@ -1181,10 +1203,8 @@ impl Session {
                     let _ = self.read_buf.split_to(HEADER_SIZE);
                     let payload = self.read_buf.split_to(header.payload_len as usize);
 
-                    match decode_client_message(
-                        header.message_type,
-                        Bytes::from(payload.to_vec()),
-                    ) {
+                    match decode_client_message(header.message_type, Bytes::from(payload.to_vec()))
+                    {
                         Ok(msg) => {
                             debug!("[Session {}] Decoded message: {:?}", self.id, msg);
                             Ok(Some(msg))
@@ -1201,7 +1221,10 @@ impl Session {
             Ok(None) => Ok(None), // Need more data
             Err(e) => {
                 error!("[Session {}] Protocol error: {}", self.id, e);
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
             }
         }
     }
@@ -1232,7 +1255,10 @@ impl Session {
                                     return Ok(Some(msg));
                                 }
                                 Err(e) => {
-                                    error!("[Session {}] Failed to decode message: {}", session_id, e);
+                                    error!(
+                                        "[Session {}] Failed to decode message: {}",
+                                        session_id, e
+                                    );
                                     continue;
                                 }
                             }
@@ -1261,7 +1287,10 @@ impl Session {
     /// Handle a client message. Returns false to close the session.
     async fn handle_message(&mut self, msg: ClientMessage) -> std::io::Result<bool> {
         match msg {
-            ClientMessage::Hello { version, stream_class } => {
+            ClientMessage::Hello {
+                version,
+                stream_class,
+            } => {
                 self.handle_hello(version, stream_class).await?;
             }
             ClientMessage::Ping => {
@@ -1277,19 +1306,37 @@ impl Session {
             ClientMessage::CloseTuner => {
                 self.handle_close_tuner().await?;
             }
-            ClientMessage::SetChannel { channel, priority, exclusive } => {
-                self.handle_set_channel(channel, priority, exclusive).await?;
+            ClientMessage::SetChannel {
+                channel,
+                priority,
+                exclusive,
+            } => {
+                self.handle_set_channel(channel, priority, exclusive)
+                    .await?;
             }
-            ClientMessage::SetChannelSpace { space, channel, priority, exclusive } => {
-                self.handle_set_channel_space(space, channel, priority, exclusive).await?;
+            ClientMessage::SetChannelSpace {
+                space,
+                channel,
+                priority,
+                exclusive,
+            } => {
+                self.handle_set_channel_space(space, channel, priority, exclusive)
+                    .await?;
             }
-            ClientMessage::SetChannelSpaceInGroup { group_name, space_idx, channel, priority, exclusive } => {
+            ClientMessage::SetChannelSpaceInGroup {
+                group_name,
+                space_idx,
+                channel,
+                priority,
+                exclusive,
+            } => {
                 // Group mode is handled by `handle_set_channel_space` via current group context.
                 // Keep the explicit group open path for compatibility.
                 if self.current_group_name.as_deref() != Some(group_name.as_str()) {
                     self.handle_open_tuner(group_name).await?;
                 }
-                self.handle_set_channel_space(space_idx, channel, priority, exclusive).await?;
+                self.handle_set_channel_space(space_idx, channel, priority, exclusive)
+                    .await?;
             }
             ClientMessage::GetSignalLevel => {
                 self.handle_get_signal_level().await?;
@@ -1332,7 +1379,11 @@ impl Session {
     /// added `stream_class`; older (v1) clients simply never send it (the
     /// codec defaults them to `StreamClass::View`), so a v1 client is still
     /// accepted here — only truly unknown/future versions are rejected.
-    async fn handle_hello(&mut self, version: u16, stream_class: StreamClass) -> std::io::Result<()> {
+    async fn handle_hello(
+        &mut self,
+        version: u16,
+        stream_class: StreamClass,
+    ) -> std::io::Result<()> {
         info!(
             "[Session {}] Client hello, version {}, stream_class {:?}",
             self.id, version, stream_class
@@ -1383,25 +1434,36 @@ impl Session {
 
             match db.resolve_tuner_target(&path) {
                 Ok(Some((driver_paths, true))) => {
-                    debug!("[Session {}] Tuner '{}' matched as group_name (drivers: {})",
-                        self.id, path, driver_paths.len());
+                    debug!(
+                        "[Session {}] Tuner '{}' matched as group_name (drivers: {})",
+                        self.id,
+                        path,
+                        driver_paths.len()
+                    );
                     (path.clone(), true)
                 }
                 Ok(Some((driver_paths, false))) => {
-                    debug!("[Session {}] Tuner '{}' resolved to DLL: {}",
-                        self.id, path, driver_paths[0]);
+                    debug!(
+                        "[Session {}] Tuner '{}' resolved to DLL: {}",
+                        self.id, path, driver_paths[0]
+                    );
                     (driver_paths.into_iter().next().unwrap(), false)
                 }
                 Ok(None) => {
                     // 4. Use first available driver
-                    warn!("[Session {}] Tuner '{}' not found, trying first available driver", self.id, path);
+                    warn!(
+                        "[Session {}] Tuner '{}' not found, trying first available driver",
+                        self.id, path
+                    );
                     match db.get_all_bon_drivers() {
                         Ok(drivers) => match drivers.first() {
                             Some(driver) => {
-                                warn!("[Session {}] Using driver: {} (path: {})",
+                                warn!(
+                                    "[Session {}] Using driver: {} (path: {})",
                                     self.id,
                                     driver.driver_name.as_ref().unwrap_or(&driver.dll_path),
-                                    driver.dll_path);
+                                    driver.dll_path
+                                );
                                 (driver.dll_path.clone(), false)
                             }
                             None => {
@@ -1418,14 +1480,20 @@ impl Session {
                     }
                 }
                 Err(e) => {
-                    error!("[Session {}] Database error resolving tuner: {}", self.id, e);
+                    error!(
+                        "[Session {}] Database error resolving tuner: {}",
+                        self.id, e
+                    );
                     drop(db);
                     return self.fail_open_tuner(ErrorCode::TunerOpenFailed).await;
                 }
             }
         }; // db is dropped here
 
-        info!("[Session {}] Opening tuner: {} (group: {})", self.id, path, is_group);
+        info!(
+            "[Session {}] Opening tuner: {} (group: {})",
+            self.id, path, is_group
+        );
 
         // If group, load all drivers in the group
         if is_group {
@@ -1434,9 +1502,14 @@ impl Session {
                 Ok(drivers) => {
                     self.group_driver_paths = drivers.iter().map(|d| d.dll_path.clone()).collect();
                     self.current_group_name = Some(path.clone());
-                    info!("[Session {}] Loaded group '{}' with {} drivers: {:?}", 
-                        self.id, path, self.group_driver_paths.len(), self.group_driver_paths);
-                },
+                    info!(
+                        "[Session {}] Loaded group '{}' with {} drivers: {:?}",
+                        self.id,
+                        path,
+                        self.group_driver_paths.len(),
+                        self.group_driver_paths
+                    );
+                }
                 Err(e) => {
                     error!("[Session {}] Failed to load group drivers: {}", self.id, e);
                     drop(db);
@@ -1455,14 +1528,16 @@ impl Session {
         }
 
         self.clear_caches();
-        
+
         // ★ Initialize space list cache (for proper virtual space handling)
         self.ensure_space_list().await;
-        
+
         self.state = SessionState::TunerOpen;
 
         // Update session registry
-        self.session_registry.update_tuner(self.id, Some(path)).await;
+        self.session_registry
+            .update_tuner(self.id, Some(path))
+            .await;
 
         self.send_message(ServerMessage::OpenTunerAck {
             success: true,
@@ -1485,7 +1560,12 @@ impl Session {
     }
 
     /// Handle SetChannel message (IBonDriver v1 style).
-    async fn handle_set_channel(&mut self, channel: u8, priority: i32, exclusive: bool) -> std::io::Result<()> {
+    async fn handle_set_channel(
+        &mut self,
+        channel: u8,
+        priority: i32,
+        exclusive: bool,
+    ) -> std::io::Result<()> {
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
             return self
                 .send_error(ErrorCode::InvalidState, "Tuner not open")
@@ -1535,7 +1615,8 @@ impl Session {
         };
         self.tuner_claim_priority = channel_priority_for_class;
         self.tuner_claim_exclusive = effective_exclusive;
-        self.maybe_promote_stream_class(channel_priority_for_class).await;
+        self.maybe_promote_stream_class(channel_priority_for_class)
+            .await;
 
         let key = ChannelKey::simple(&tuner_path, channel);
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
@@ -1551,7 +1632,11 @@ impl Session {
             let sub_count = old.subscriber_count();
             let will_free = (sub_count == 1 && self.ts_receiver.is_some())
                 || (sub_count == 0 && self.ts_receiver.is_none());
-            if will_free { old.take_slot_permit() } else { None }
+            if will_free {
+                old.take_slot_permit()
+            } else {
+                None
+            }
         });
 
         // Rejoining the reader we are already on? Then it must not be torn
@@ -1596,9 +1681,15 @@ impl Session {
                     e,
                     AcquireError::OpenCooldown { .. } | AcquireError::Warming { .. }
                 ) {
-                    debug!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                    debug!(
+                        "[Session {}] SetChannel: failed to acquire a tuner: {}",
+                        self.id, e
+                    );
                 } else {
-                    error!("[Session {}] SetChannel: failed to acquire a tuner: {}", self.id, e);
+                    error!(
+                        "[Session {}] SetChannel: failed to acquire a tuner: {}",
+                        self.id, e
+                    );
                 }
                 return self.fail_set_channel(&old_tuner_key).await;
             }
@@ -1620,7 +1711,8 @@ impl Session {
             self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SetChannel:",
-        ).await;
+        )
+        .await;
         if let Some(old) = cleanup_old {
             cleanup_unused_tuner_after_switch(
                 &self.database,
@@ -1630,7 +1722,8 @@ impl Session {
                 Some(outcome.key.tuner_path.as_str()),
                 false,
                 "SetChannel cleanup:",
-            ).await;
+            )
+            .await;
         }
 
         self.finish_set_channel_success(&outcome.tuner).await
@@ -1665,7 +1758,8 @@ impl Session {
                     Some(cleanup_path),
                     false,
                     log_prefix,
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -1757,7 +1851,6 @@ impl Session {
         .await
     }
 
-
     async fn finish_logical_channel_selection_success(
         &mut self,
         tuner: &Arc<SharedTuner>,
@@ -1795,7 +1888,12 @@ impl Session {
     /// control of its own reply/return so the surrounding control flow stays
     /// explicit. Extracted to kill five near-identical copies (see
     /// docs/SYSTEM_REVIEW_2026-07.md H2).
-    async fn apply_channel_metadata(&mut self, path: &str, actual_space: u32, actual_bon_channel: u32) {
+    async fn apply_channel_metadata(
+        &mut self,
+        path: &str,
+        actual_space: u32,
+        actual_bon_channel: u32,
+    ) {
         // A successful channel change means an entirely new stream/lineup: the
         // old PIDs and their CC baselines are gone. Fully reset the analyzer so
         // the first packets of the new lineup re-baseline instead of each
@@ -1805,7 +1903,9 @@ impl Session {
         self.ts_quality_analyzer.reset();
 
         let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
-        self.session_registry.update_channel(self.id, Some(channel_info.clone())).await;
+        self.session_registry
+            .update_channel(self.id, Some(channel_info.clone()))
+            .await;
         self.current_channel_info = Some(channel_info);
 
         let (channel_name, ch_nid, ch_tsid, ch_sid) = {
@@ -1820,14 +1920,25 @@ impl Session {
                 _ => (None, None, None, None),
             }
         };
-        self.session_registry.update_channel_name(self.id, channel_name.clone()).await;
-        self.session_registry.update_channel_ids(self.id, ch_nid, ch_sid).await;
-        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid).await;
+        self.session_registry
+            .update_channel_name(self.id, channel_name.clone())
+            .await;
+        self.session_registry
+            .update_channel_ids(self.id, ch_nid, ch_sid)
+            .await;
+        self.update_service_filter_for_sid(ch_nid, ch_tsid, ch_sid)
+            .await;
         self.current_channel_name = channel_name;
     }
 
     /// Handle SetChannelSpace message (IBonDriver v2 style).
-    async fn handle_set_channel_space(&mut self, space: u32, channel: u32, priority: i32, exclusive: bool) -> std::io::Result<()> {
+    async fn handle_set_channel_space(
+        &mut self,
+        space: u32,
+        channel: u32,
+        priority: i32,
+        exclusive: bool,
+    ) -> std::io::Result<()> {
         info!("[Session {}] HandleSetChannelSpace called: space={}, channel={}, priority={}, exclusive={}", 
               self.id, space, channel, priority, exclusive);
 
@@ -1847,33 +1958,49 @@ impl Session {
         let requested_exclusive = effective_exclusive;
         self.tuner_claim_priority = requested_priority;
         self.tuner_claim_exclusive = requested_exclusive;
-        
+
         if self.state != SessionState::TunerOpen && self.state != SessionState::Streaming {
-            error!("[Session {}] SetChannelSpace: Tuner not open (state: {:?})", self.id, self.state);
-            return self.send_error(ErrorCode::InvalidState, "Tuner not open").await;
+            error!(
+                "[Session {}] SetChannelSpace: Tuner not open (state: {:?})",
+                self.id, self.state
+            );
+            return self
+                .send_error(ErrorCode::InvalidState, "Tuner not open")
+                .await;
         }
 
         // ★space は「仮想 space_idx」なので、実 space に変換する
-        let Some((actual_space, region_name)) = self.map_space_idx_to_actual_with_region(space).await else {
-            error!("[Session {}] SetChannelSpace: Failed to map space_idx {} to actual space", self.id, space);
-            return self.send_message(ServerMessage::SetChannelSpaceAck {
-                success: false,
-                error_code: ErrorCode::InvalidParameter.into(),
-            }).await;
+        let Some((actual_space, region_name)) =
+            self.map_space_idx_to_actual_with_region(space).await
+        else {
+            error!(
+                "[Session {}] SetChannelSpace: Failed to map space_idx {} to actual space",
+                self.id, space
+            );
+            return self
+                .send_message(ServerMessage::SetChannelSpaceAck {
+                    success: false,
+                    error_code: ErrorCode::InvalidParameter.into(),
+                })
+                .await;
         };
 
         // Get region-filtered channel map
-        let map = self.ensure_channel_map_with_region(actual_space, &region_name).await;
+        let map = self
+            .ensure_channel_map_with_region(actual_space, &region_name)
+            .await;
         debug!("[Session {}] SetChannelSpace: Checking channel map for space {} (region: {}): {} channels total", 
                self.id, actual_space, region_name, map.len());
-        
+
         let Some(entry) = map.get(channel as usize) else {
             error!("[Session {}] SetChannelSpace: Channel index {} not found in space {} region {} (map size: {})", 
                    self.id, channel, actual_space, region_name, map.len());
-            return self.send_message(ServerMessage::SetChannelSpaceAck {
-                success: false,
-                error_code: ErrorCode::InvalidParameter.into(),
-            }).await;
+            return self
+                .send_message(ServerMessage::SetChannelSpaceAck {
+                    success: false,
+                    error_code: ErrorCode::InvalidParameter.into(),
+                })
+                .await;
         };
 
         // ★ In group mode, find which driver has this channel (matching by NID+TSID)
@@ -1893,22 +2020,27 @@ impl Session {
                 &self.group_driver_paths,
                 entry.nid,
                 entry.tsid,
-            ).await
+            )
+            .await
         };
 
         // ★ Capture the current session's tuner key BEFORE driver selection.
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
 
-        let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty() {
-            let Some((path, driver_space, driver_bon_channel)) = group_candidates.first().cloned() else {
+        let (tuner_path, actual_space, actual_bon_channel) = if !self.group_driver_paths.is_empty()
+        {
+            let Some((path, driver_space, driver_bon_channel)) = group_candidates.first().cloned()
+            else {
                 error!(
                     "[Session {}] SetChannelSpace: Channel NID=0x{:04X} TSID=0x{:04X} not found in any group driver",
                     self.id, entry.nid, entry.tsid
                 );
-                return self.send_message(ServerMessage::SetChannelSpaceAck {
-                    success: false,
-                    error_code: ErrorCode::InvalidParameter.into(),
-                }).await;
+                return self
+                    .send_message(ServerMessage::SetChannelSpaceAck {
+                        success: false,
+                        error_code: ErrorCode::InvalidParameter.into(),
+                    })
+                    .await;
             };
             // This is only a representative used for DB-default priority and
             // same-DLL permit handoff. The actual winner is chosen once, by
@@ -1918,11 +2050,16 @@ impl Session {
             match &self.current_tuner_path {
                 Some(p) => (p.clone(), entry.bon_space, entry.bon_channel),
                 None => {
-                    error!("[Session {}] SetChannelSpace: current_tuner_path is None", self.id);
-                    return self.send_message(ServerMessage::SetChannelSpaceAck {
-                        success: false,
-                        error_code: ErrorCode::InvalidState.into(),
-                    }).await;
+                    error!(
+                        "[Session {}] SetChannelSpace: current_tuner_path is None",
+                        self.id
+                    );
+                    return self
+                        .send_message(ServerMessage::SetChannelSpaceAck {
+                            success: false,
+                            error_code: ErrorCode::InvalidState.into(),
+                        })
+                        .await;
                 }
             }
         };
@@ -2053,9 +2190,15 @@ impl Session {
                     e,
                     AcquireError::OpenCooldown { .. } | AcquireError::Warming { .. }
                 ) {
-                    debug!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
+                    debug!(
+                        "[Session {}] SetChannelSpace: failed to acquire a tuner: {}",
+                        self.id, e
+                    );
                 } else {
-                    error!("[Session {}] SetChannelSpace: failed to acquire a tuner: {}", self.id, e);
+                    error!(
+                        "[Session {}] SetChannelSpace: failed to acquire a tuner: {}",
+                        self.id, e
+                    );
                 }
                 return self.fail_set_channel_space(&old_tuner_key).await;
             }
@@ -2073,7 +2216,8 @@ impl Session {
         let chosen_path = outcome.key.tuner_path.clone();
 
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
-        self.set_selected_tuner_path_and_registry(&chosen_path).await;
+        self.set_selected_tuner_path_and_registry(&chosen_path)
+            .await;
 
         let cleanup_old = handoff_current_tuner(
             self.id,
@@ -2084,7 +2228,8 @@ impl Session {
             self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SetChannelSpace:",
-        ).await;
+        )
+        .await;
         if let Some(old) = cleanup_old {
             // `force_stop_same_dll = false`: a multi-instance DLL may keep the
             // old reader warm for a zapping-back client (DESIGN.md §4.3),
@@ -2097,7 +2242,8 @@ impl Session {
                 Some(chosen_path.as_str()),
                 false,
                 "SetChannelSpace cleanup:",
-            ).await;
+            )
+            .await;
         }
 
         self.finish_set_channel_space_success(
@@ -2105,12 +2251,17 @@ impl Session {
             &chosen_path,
             chosen_space,
             chosen_channel,
-        ).await
+        )
+        .await
     }
 
     /// Put back the warm handle `acquire` did not consume, and forget the
     /// stored path when it did.
-    fn absorb_acquire_leftovers(&mut self, _had_permit: bool, unused_warm: Option<WarmTunerHandle>) {
+    fn absorb_acquire_leftovers(
+        &mut self,
+        _had_permit: bool,
+        unused_warm: Option<WarmTunerHandle>,
+    ) {
         match unused_warm {
             Some(warm) => {
                 self.warm_tuner_path = Some(warm.path().to_string());
@@ -2148,9 +2299,9 @@ impl Session {
             .map(|t| t.signal_level())
             .unwrap_or(0.0);
 
-        self.send_message(ServerMessage::GetSignalLevelAck { signal_level }).await
+        self.send_message(ServerMessage::GetSignalLevelAck { signal_level })
+            .await
     }
-
 
     /// Handle EnumTuningSpace message.
     async fn handle_enum_tuning_space(&mut self, space: u32) -> std::io::Result<()> {
@@ -2158,36 +2309,52 @@ impl Session {
 
         // Get space list with names
         let space_list = self.get_space_list_with_names().await;
-        
+
         if space >= space_list.len() as u32 {
             // No more spaces, end enumeration
-            return self.send_message(ServerMessage::EnumTuningSpaceAck { name: None }).await;
+            return self
+                .send_message(ServerMessage::EnumTuningSpaceAck { name: None })
+                .await;
         }
 
         let (actual_space, name, _region_key) = &space_list[space as usize];
 
-        debug!("[Session {}] EnumTuningSpace: space_idx={} actual_space={} name={:?}",
-            self.id, space, actual_space, name);
+        debug!(
+            "[Session {}] EnumTuningSpace: space_idx={} actual_space={} name={:?}",
+            self.id, space, actual_space, name
+        );
 
-        self.send_message(ServerMessage::EnumTuningSpaceAck { name: Some(name.clone()) })
-            .await
+        self.send_message(ServerMessage::EnumTuningSpaceAck {
+            name: Some(name.clone()),
+        })
+        .await
     }
 
     /// Handle EnumChannelName message.
     async fn handle_enum_channel_name(&mut self, space: u32, channel: u32) -> std::io::Result<()> {
-        debug!("[Session {}] EnumChannelName: space={}, channel={}", self.id, space, channel);
+        debug!(
+            "[Session {}] EnumChannelName: space={}, channel={}",
+            self.id, space, channel
+        );
 
-        let Some((actual_space, region_name)) = self.map_space_idx_to_actual_with_region(space).await else {
-            return self.send_message(ServerMessage::EnumChannelNameAck { name: None }).await;
+        let Some((actual_space, region_name)) =
+            self.map_space_idx_to_actual_with_region(space).await
+        else {
+            return self
+                .send_message(ServerMessage::EnumChannelNameAck { name: None })
+                .await;
         };
 
-        let map = self.ensure_channel_map_with_region(actual_space, &region_name).await;
+        let map = self
+            .ensure_channel_map_with_region(actual_space, &region_name)
+            .await;
         let name = map.get(channel as usize).map(|e| e.name.clone());
 
         debug!("[Session {}] EnumChannelName: space_idx={} actual_space={} region={} channel={} name={:?}",
             self.id, space, actual_space, region_name, channel, name);
 
-        self.send_message(ServerMessage::EnumChannelNameAck { name }).await
+        self.send_message(ServerMessage::EnumChannelNameAck { name })
+            .await
     }
 
     /// Handle StartStream message.
@@ -2220,16 +2387,16 @@ impl Session {
         self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
         // Subscribe to the tuner's broadcast channel
-        let rx = tuner.subscribe_with_claim(
-            self.tuner_claim_priority,
-            self.tuner_claim_exclusive,
-        );
+        let rx = tuner.subscribe_with_claim(self.tuner_claim_priority, self.tuner_claim_exclusive);
         self.ts_receiver = Some(rx);
         self.state = SessionState::Streaming;
 
         if let Err(e) = self.start_tsreplace_pipeline().await {
             if self.tsreplace_passthrough_on_error {
-                warn!("[Session {}] tsreplace unavailable, fallback to raw TS: {}", self.id, e);
+                warn!(
+                    "[Session {}] tsreplace unavailable, fallback to raw TS: {}",
+                    self.id, e
+                );
                 self.stop_tsreplace_pipeline().await;
             } else {
                 self.ts_receiver = None;
@@ -2353,7 +2520,12 @@ impl Session {
     /// prefill/jitter buffer for the new channel's band-based bitrate
     /// default (no-op if not currently `Streaming` — `StartStream` performs
     /// its own reset when the stream actually begins).
-    async fn update_service_filter_for_sid(&mut self, nid: Option<u16>, tsid: Option<u16>, sid: Option<u16>) {
+    async fn update_service_filter_for_sid(
+        &mut self,
+        nid: Option<u16>,
+        tsid: Option<u16>,
+        sid: Option<u16>,
+    ) {
         // Always update NID/TSID/SID tracking (used by tsreplace pipeline)
         self.current_nid = nid;
         self.current_tsid = tsid;
@@ -2460,10 +2632,7 @@ impl Session {
         // its canonical claim is the configured DB priority of the logical
         // channel and non-exclusive. This same claim is used by arbitration
         // and by the subscription installed after handoff.
-        let logical_priority = channels
-            .first()
-            .map(|c| c.channel.priority)
-            .unwrap_or(0);
+        let logical_priority = channels.first().map(|c| c.channel.priority).unwrap_or(0);
         self.tuner_claim_priority = logical_priority;
         self.tuner_claim_exclusive = false;
         self.maybe_promote_stream_class(logical_priority).await;
@@ -2472,10 +2641,13 @@ impl Session {
         let old_tuner_for_permit = self.current_tuner.clone();
         let carried_permit: Option<SlotPermit> = old_tuner_for_permit.as_ref().and_then(|old| {
             let sub_count = old.subscriber_count();
-            let will_free =
-                (sub_count == 1 && self.ts_receiver.is_some()) ||
-                (sub_count == 0 && self.ts_receiver.is_none());
-            if will_free { old.take_slot_permit() } else { None }
+            let will_free = (sub_count == 1 && self.ts_receiver.is_some())
+                || (sub_count == 0 && self.ts_receiver.is_none());
+            if will_free {
+                old.take_slot_permit()
+            } else {
+                None
+            }
         });
         let own_key_will_free_slot = carried_permit.is_some();
         let warm = self.warm_tuner.take();
@@ -2501,7 +2673,10 @@ impl Session {
                         self.id, old.key, e
                     );
                 } else {
-                    debug!("[Session {}] SelectLogicalChannel: acquire failed: {}", self.id, e);
+                    debug!(
+                        "[Session {}] SelectLogicalChannel: acquire failed: {}",
+                        self.id, e
+                    );
                 }
                 self.try_restore_previous_channel(&old_tuner_key).await;
                 return self.fail_logical_channel_selection().await;
@@ -2537,7 +2712,8 @@ impl Session {
             self.tuner_claim_exclusive,
             self.state == SessionState::Streaming,
             "SelectLogicalChannel:",
-        ).await;
+        )
+        .await;
         if let Some(old) = cleanup_old {
             cleanup_unused_tuner_after_switch(
                 &self.database,
@@ -2547,7 +2723,8 @@ impl Session {
                 Some(chosen_path.as_str()),
                 true,
                 "SelectLogicalChannel cleanup:",
-            ).await;
+            )
+            .await;
         }
 
         self.finish_logical_channel_selection_success(
@@ -2556,7 +2733,8 @@ impl Session {
             &chosen_path,
             chosen_space,
             chosen_channel,
-        ).await
+        )
+        .await
     }
 
     /// Handle GetChannelList message.
@@ -2680,8 +2858,10 @@ impl Session {
                     continue;
                 }
 
-                let ok_188 = i + 188 < self.ts_send_carry.len() && self.ts_send_carry[i + 188] == 0x47;
-                let ok_376 = i + 376 < self.ts_send_carry.len() && self.ts_send_carry[i + 376] == 0x47;
+                let ok_188 =
+                    i + 188 < self.ts_send_carry.len() && self.ts_send_carry[i + 188] == 0x47;
+                let ok_376 =
+                    i + 376 < self.ts_send_carry.len() && self.ts_send_carry[i + 376] == 0x47;
                 if ok_188 || ok_376 {
                     sync_pos = Some(i);
                     break;
@@ -2747,8 +2927,10 @@ impl Session {
                     continue;
                 }
 
-                let ok_188 = i + 188 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 188] == 0x47;
-                let ok_376 = i + 376 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 376] == 0x47;
+                let ok_188 =
+                    i + 188 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 188] == 0x47;
+                let ok_376 =
+                    i + 376 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 376] == 0x47;
                 if ok_188 || ok_376 {
                     sync_pos = Some(i);
                     break;
@@ -2776,7 +2958,9 @@ impl Session {
         let mut delta = crate::tuner::ts_analyzer::TsStreamQualityDelta::default();
         let full_len = self.ts_quality_carry.len() - (self.ts_quality_carry.len() % 188);
         if full_len >= 188 {
-            delta = self.ts_quality_analyzer.analyze(&self.ts_quality_carry[..full_len]);
+            delta = self
+                .ts_quality_analyzer
+                .analyze(&self.ts_quality_carry[..full_len]);
             self.ts_quality_carry.drain(0..full_len);
         }
 
@@ -2806,26 +2990,29 @@ impl Session {
 
                 let bitrate_mbps = (self.bytes_since_last as f64 * 8.0) / 1_000_000.0 / elapsed;
                 let packet_loss_rate = if self.interval_packets_total > 0 {
-                    (self.interval_packets_dropped as f64 / self.interval_packets_total as f64) * 100.0
+                    (self.interval_packets_dropped as f64 / self.interval_packets_total as f64)
+                        * 100.0
                 } else {
                     0.0
                 };
 
                 let top_loss_pids = self.ts_quality_analyzer.top_loss_pids(10);
 
-                self.session_registry.update_stats(
-                    self.id,
-                    signal_level,
-                    packets_sent,
-                    self.packets_dropped,
-                    self.packets_scrambled,
-                    self.packets_error,
-                    bitrate_mbps,
-                    self.loss_broadcast_lag_chunks,
-                    self.loss_ts_queue_chunks,
-                    self.loss_encoder_stall_events,
-                    top_loss_pids,
-                ).await;
+                self.session_registry
+                    .update_stats(
+                        self.id,
+                        signal_level,
+                        packets_sent,
+                        self.packets_dropped,
+                        self.packets_scrambled,
+                        self.packets_error,
+                        bitrate_mbps,
+                        self.loss_broadcast_lag_chunks,
+                        self.loss_ts_queue_chunks,
+                        self.loss_encoder_stall_events,
+                        top_loss_pids,
+                    )
+                    .await;
 
                 // STREAMING_DESIGN.md §4 P3: surface prefill/jitter buffer
                 // status on the same 1-second cadence as the other stats.
@@ -2834,13 +3021,15 @@ impl Session {
                     .await;
 
                 let timestamp_ms = chrono::Utc::now().timestamp_millis();
-                self.session_registry.push_metrics_sample(
-                    self.id,
-                    timestamp_ms,
-                    bitrate_mbps,
-                    packet_loss_rate,
-                    signal_level,
-                ).await;
+                self.session_registry
+                    .push_metrics_sample(
+                        self.id,
+                        timestamp_ms,
+                        bitrate_mbps,
+                        packet_loss_rate,
+                        signal_level,
+                    )
+                    .await;
 
                 self.signal_samples += 1;
                 self.signal_level_sum += signal_level as f64;
@@ -2918,7 +3107,14 @@ impl Session {
         for frame in frames {
             let data_len = frame.len();
 
-            match send_ts_frame(&self.ts_write_queue, frame, self.stream_class, RECORD_OVERFLOW_TIMEOUT).await {
+            match send_ts_frame(
+                &self.ts_write_queue,
+                frame,
+                self.stream_class,
+                RECORD_OVERFLOW_TIMEOUT,
+            )
+            .await
+            {
                 TsFrameSendOutcome::Sent => {}
                 TsFrameSendOutcome::DroppedFull => {
                     // The write buffer is full — the writer task can't keep up
@@ -2938,7 +3134,8 @@ impl Session {
                     self.loss_ts_queue_chunks += 1;
 
                     // Log once per second to avoid flooding.
-                    static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static LAST_WARN: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -2979,7 +3176,6 @@ impl Session {
         Ok(false)
     }
 
-
     /// Send a server message to the client via the writer task.
     ///
     /// Control messages are sent on a separate priority channel so they
@@ -2987,13 +3183,13 @@ impl Session {
     async fn send_message(&mut self, msg: ServerMessage) -> std::io::Result<()> {
         trace!("[Session {}] Sending: {:?}", self.id, msg);
 
-        let encoded = encode_server_message(&msg).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let encoded = encode_server_message(&msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-        self.ctrl_write_tx.send(encoded).await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer task closed")
-        })
+        self.ctrl_write_tx
+            .send(encoded)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer task closed"))
     }
 
     /// Send an error message to the client.
@@ -3038,7 +3234,10 @@ impl Session {
                 self.current_channel_info.as_deref(),
                 self.current_channel_name.as_deref(),
             ) {
-                warn!("[Session {}] Failed to flush session progress to DB: {}", self.id, e);
+                warn!(
+                    "[Session {}] Failed to flush session progress to DB: {}",
+                    self.id, e
+                );
             }
         }
 
@@ -3062,7 +3261,10 @@ impl Session {
                 self.packets_error,
                 false,
             ) {
-                warn!("[Session {}] Failed to flush driver quality stats to DB: {}", self.id, e);
+                warn!(
+                    "[Session {}] Failed to flush driver quality stats to DB: {}",
+                    self.id, e
+                );
             }
 
             // Update flushed counters
@@ -3072,8 +3274,14 @@ impl Session {
             self.flushed_error = self.packets_error;
         }
 
-        debug!("[Session {}] Flushed metrics to DB (duration={}s, dropped={}, scrambled={}, error={})",
-            self.id, duration_secs, self.packets_dropped, self.packets_scrambled, self.packets_error);
+        debug!(
+            "[Session {}] Flushed metrics to DB (duration={}s, dropped={}, scrambled={}, error={})",
+            self.id,
+            duration_secs,
+            self.packets_dropped,
+            self.packets_scrambled,
+            self.packets_error
+        );
     }
 
     /// Clean up session resources.
@@ -3082,14 +3290,17 @@ impl Session {
         // to drain remaining data and exit.  We then wait for it to finish so
         // that the client receives any final control messages (e.g. error).
         // Use a bounded clone so we can explicitly drop and await.
-        drop(std::mem::replace(&mut self.ts_write_queue, TsWriteQueue::new(1).0));
-        drop(std::mem::replace(&mut self.ctrl_write_tx, mpsc::channel(1).0));
+        drop(std::mem::replace(
+            &mut self.ts_write_queue,
+            TsWriteQueue::new(1).0,
+        ));
+        drop(std::mem::replace(
+            &mut self.ctrl_write_tx,
+            mpsc::channel(1).0,
+        ));
         if let Some(handle) = self.writer_handle.take() {
             // Give the writer a few seconds to flush remaining data.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                handle,
-            ).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
         }
 
         self.stop_warm_tuner().await;
@@ -3110,7 +3321,10 @@ impl Session {
             // (the subscription was already released above, but tuner may
             // still have no subscribers)
             if tuner.subscriber_count() == 0 {
-                info!("[Session {}] No more subscribers, scheduling keep-alive close for {:?}", self.id, tuner.key);
+                info!(
+                    "[Session {}] No more subscribers, scheduling keep-alive close for {:?}",
+                    self.id, tuner.key
+                );
                 self.tuner_pool
                     .schedule_idle_close(tuner.key.clone(), Arc::clone(&tuner))
                     .await;
@@ -3174,7 +3388,10 @@ impl Session {
                 Some(&loss_summary),
                 Some(self.stream_class.as_str()),
             ) {
-                warn!("[Session {}] Failed to update session history: {}", self.id, e);
+                warn!(
+                    "[Session {}] Failed to update session history: {}",
+                    self.id, e
+                );
             }
         }
 
@@ -3198,7 +3415,10 @@ impl Session {
                 self.packets_error,
                 true, // increment session count at session end
             ) {
-                warn!("[Session {}] Failed to update driver quality stats: {}", self.id, e);
+                warn!(
+                    "[Session {}] Failed to update driver quality stats: {}",
+                    self.id, e
+                );
             }
         }
 
@@ -3345,11 +3565,23 @@ mod tests {
     async fn view_class_drops_frame_when_write_budget_is_exhausted() {
         let (queue, mut rx) = tiny_queue();
         assert_eq!(
-            send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(
+                &queue,
+                Bytes::from_static(b"first"),
+                StreamClass::View,
+                TEST_RECORD_TIMEOUT
+            )
+            .await,
             TsFrameSendOutcome::Sent
         );
 
-        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::View, TEST_RECORD_TIMEOUT).await;
+        let outcome = send_ts_frame(
+            &queue,
+            Bytes::from_static(b"second"),
+            StreamClass::View,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
         assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
 
         // Only the original frame is queued; the second was dropped, not enqueued.
@@ -3360,9 +3592,21 @@ mod tests {
     #[tokio::test]
     async fn preview_class_drops_frame_when_write_budget_is_exhausted() {
         let (queue, mut rx) = tiny_queue();
-        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
+        send_ts_frame(
+            &queue,
+            Bytes::from_static(b"first"),
+            StreamClass::Preview,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
 
-        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::Preview, TEST_RECORD_TIMEOUT).await;
+        let outcome = send_ts_frame(
+            &queue,
+            Bytes::from_static(b"second"),
+            StreamClass::Preview,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
         assert_eq!(outcome, TsFrameSendOutcome::DroppedFull);
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
         assert!(rx.try_recv().is_err());
@@ -3371,19 +3615,37 @@ mod tests {
     #[tokio::test]
     async fn record_class_times_out_when_the_queue_never_drains() {
         let (queue, _rx) = tiny_queue();
-        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        send_ts_frame(
+            &queue,
+            Bytes::from_static(b"first"),
+            StreamClass::Record,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
 
         // RECORD must never drop — it blocks up to the timeout, then
         // reports the overflow instead of silently losing data
         // (STREAMING_DESIGN.md §12-1).
-        let outcome = send_ts_frame(&queue, Bytes::from_static(b"second"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        let outcome = send_ts_frame(
+            &queue,
+            Bytes::from_static(b"second"),
+            StreamClass::Record,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
         assert_eq!(outcome, TsFrameSendOutcome::RecordOverflowTimeout);
     }
 
     #[tokio::test]
     async fn record_class_sends_once_the_queue_drains() {
         let (queue, mut rx) = tiny_queue();
-        send_ts_frame(&queue, Bytes::from_static(b"first"), StreamClass::Record, TEST_RECORD_TIMEOUT).await;
+        send_ts_frame(
+            &queue,
+            Bytes::from_static(b"first"),
+            StreamClass::Record,
+            TEST_RECORD_TIMEOUT,
+        )
+        .await;
 
         // Simulate the writer task draining the first frame while the sender
         // waits: the RECORD send must resume and deliver, not time out.
@@ -3410,11 +3672,23 @@ mod tests {
         let (queue, rx, _shared) = TsWriteQueue::new(1024);
         drop(rx);
         assert_eq!(
-            send_ts_frame(&queue, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(
+                &queue,
+                Bytes::from_static(b"x"),
+                StreamClass::View,
+                TEST_RECORD_TIMEOUT
+            )
+            .await,
             TsFrameSendOutcome::WriterClosed
         );
         assert_eq!(
-            send_ts_frame(&queue, Bytes::from_static(b"y"), StreamClass::Record, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(
+                &queue,
+                Bytes::from_static(b"y"),
+                StreamClass::Record,
+                TEST_RECORD_TIMEOUT
+            )
+            .await,
             TsFrameSendOutcome::WriterClosed
         );
     }
@@ -3426,10 +3700,20 @@ mod tests {
         let (queue, rx, shared) = TsWriteQueue::new(1024);
         drop(rx);
         assert_eq!(
-            send_ts_frame(&queue, Bytes::from_static(b"x"), StreamClass::View, TEST_RECORD_TIMEOUT).await,
+            send_ts_frame(
+                &queue,
+                Bytes::from_static(b"x"),
+                StreamClass::View,
+                TEST_RECORD_TIMEOUT
+            )
+            .await,
             TsFrameSendOutcome::WriterClosed
         );
-        assert_eq!(shared.queued(), 0, "reservation must be released on failure");
+        assert_eq!(
+            shared.queued(),
+            0,
+            "reservation must be released on failure"
+        );
     }
 
     /// The point of the seconds-based budget: the same setting must mean the

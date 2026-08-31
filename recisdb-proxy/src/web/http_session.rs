@@ -148,7 +148,9 @@ impl HttpStreamSession {
         info: HttpStreamSessionInfo,
     ) -> (Self, mpsc::Receiver<()>) {
         let id = registry.allocate_id();
-        let addr = info.addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let addr = info
+            .addr
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         let shutdown_rx = registry.register(id, addr, info.protocol).await;
 
         let started_at = chrono::Utc::now().timestamp();
@@ -162,7 +164,10 @@ impl HttpStreamSession {
         ) {
             Ok(row) => Some(row),
             Err(e) => {
-                warn!("[Session {}] Failed to insert HTTP session history start: {}", id, e);
+                warn!(
+                    "[Session {}] Failed to insert HTTP session history start: {}",
+                    id, e
+                );
                 None
             }
         };
@@ -296,7 +301,10 @@ impl Drop for HttpStreamSession {
                     None,
                     Some(stream_class.as_str()),
                 ) {
-                    warn!("[Session {}] Failed to update HTTP session history: {}", id, e);
+                    warn!(
+                        "[Session {}] Failed to update HTTP session history: {}",
+                        id, e
+                    );
                 }
             }
             match reason {
@@ -350,7 +358,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
         assert_eq!(sessions[0].protocol, SessionProtocol::Mirakurun);
-        assert_eq!(sessions[0].channel_name.as_deref(), Some("ＴＯＫＹＯ　ＭＸ１"));
+        assert_eq!(
+            sessions[0].channel_name.as_deref(),
+            Some("ＴＯＫＹＯ　ＭＸ１")
+        );
         assert_eq!(sessions[0].channel_nid, Some(32391));
         assert_eq!(sessions[0].tuner_path.as_deref(), Some("Test.dll"));
         assert!(sessions[0].is_streaming);
@@ -370,7 +381,9 @@ mod tests {
     async fn ids_do_not_collide_between_transports() {
         let registry = Arc::new(SessionRegistry::new());
         let bndp_id = registry.allocate_id();
-        let _bndp = registry.register(bndp_id, addr(), SessionProtocol::Bndp).await;
+        let _bndp = registry
+            .register(bndp_id, addr(), SessionProtocol::Bndp)
+            .await;
 
         let (http, _rx) = HttpStreamSession::register(
             Arc::clone(&registry),

@@ -106,11 +106,9 @@ impl Database {
 
     /// Get total session count from database.
     pub fn get_total_session_count(&self) -> Result<u64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM session_history",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM session_history", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 

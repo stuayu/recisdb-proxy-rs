@@ -106,7 +106,8 @@ fn patch_multi2_simd_for_windows_arm64(dst: &Path) {
         .replace("\r\n", "\n");
     let mut header_patched = header_original.clone();
 
-    let union_variant = "typedef union {\n\t__m256i key256[8];\n\t__m128i key[8];\n} MULTI2_SIMD_WORK_KEY;";
+    let union_variant =
+        "typedef union {\n\t__m256i key256[8];\n\t__m128i key[8];\n} MULTI2_SIMD_WORK_KEY;";
     let union_replacement = "typedef union {\n#if defined(_M_ARM64) || defined(__aarch64__)\n\tuint8_t key256[8][32];\n\tuint8_t key[8][16];\n#else\n\t__m256i key256[8];\n\t__m128i key[8];\n#endif\n} MULTI2_SIMD_WORK_KEY;";
     assert!(
         header_patched.contains(union_variant),

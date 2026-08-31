@@ -20,8 +20,7 @@ use crate::server::ts_queue::{TsSendError, TsWriteQueue};
 pub(super) const RECORD_PRIORITY_THRESHOLD: i32 = 200;
 
 /// Maximum time a RECORD stream may wait for its client write queue.
-pub(super) const RECORD_OVERFLOW_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
+pub(super) const RECORD_OVERFLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) fn should_auto_promote_to_record(effective_priority: i32) -> bool {
     effective_priority >= RECORD_PRIORITY_THRESHOLD
@@ -77,11 +76,8 @@ pub(super) async fn send_ts_frame(
                 queue.shared().wait_drained(deadline - now).await;
             }
 
-            match tokio::time::timeout(
-                record_overflow_timeout,
-                queue.send_reserved_blocking(frame),
-            )
-            .await
+            match tokio::time::timeout(record_overflow_timeout, queue.send_reserved_blocking(frame))
+                .await
             {
                 Ok(Ok(())) => TsFrameSendOutcome::Sent,
                 Ok(Err(_)) => TsFrameSendOutcome::WriterClosed,

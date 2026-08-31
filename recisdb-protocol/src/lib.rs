@@ -69,10 +69,23 @@ pub use codec::{
 };
 pub use error::{ClientError, ErrorCode, ProtocolError, ServerError};
 pub use types::{
-    // Existing types
-    ChannelSpec, ClientMessage, MessageType, ServerMessage, StreamClass, MAGIC, MAX_FRAME_SIZE,
-    MAX_TS_CHUNK_SIZE, PROTOCOL_VERSION, BandType,
+    BandType,
     // New channel management types
-    BroadcastType, ChannelFilter, ChannelInfo, ChannelKey, ChannelListMessage, ChannelSelector,
+    BroadcastType,
+    ChannelFilter,
+    ChannelInfo,
+    ChannelKey,
+    ChannelListMessage,
+    ChannelSelector,
+    // Existing types
+    ChannelSpec,
     ClientChannelInfo,
+    ClientMessage,
+    MessageType,
+    ServerMessage,
+    StreamClass,
+    MAGIC,
+    MAX_FRAME_SIZE,
+    MAX_TS_CHUNK_SIZE,
+    PROTOCOL_VERSION,
 };

@@ -30,9 +30,7 @@ use bondriver::interface::IBonDriver;
 pub extern "system" fn CreateBonDriver() -> *mut IBonDriver {
     // **IMPROVEMENT**: Wrap the entire function body in catch_unwind to ensure
     // panics don't propagate into C++ code
-    let result = std::panic::catch_unwind(|| {
-        create_bondriver_impl()
-    });
+    let result = std::panic::catch_unwind(|| create_bondriver_impl());
 
     match result {
         Ok(ptr) => ptr,
@@ -77,18 +75,42 @@ fn create_bondriver_impl() -> *mut IBonDriver {
         VTABLE_DUMP.call_once(|| unsafe {
             use bondriver::exports::get_vtable_ptr;
             let vtbl_head = get_vtable_ptr();
-            file_log!(info, "sizeof(IBonDriver3Vtbl): {} bytes", std::mem::size_of::<bondriver::interface::IBonDriver3Vtbl>());
-            file_log!(info, "sizeof(IBonDriver3VtblWithRTTI): {} bytes", std::mem::size_of::<bondriver::interface::IBonDriver3VtblWithRTTI>());
+            file_log!(
+                info,
+                "sizeof(IBonDriver3Vtbl): {} bytes",
+                std::mem::size_of::<bondriver::interface::IBonDriver3Vtbl>()
+            );
+            file_log!(
+                info,
+                "sizeof(IBonDriver3VtblWithRTTI): {} bytes",
+                std::mem::size_of::<bondriver::interface::IBonDriver3VtblWithRTTI>()
+            );
             file_log!(info, "get_vtable_ptr(): {:p}", vtbl_head);
 
             // vtable[-1] must point to the RTTI Complete Object Locator.
             let vtbl_ptr_raw = vtbl_head as *const usize;
-            file_log!(info, "vtbl[-1] (RTTI locator ptr): 0x{:016x}", *vtbl_ptr_raw.offset(-1));
+            file_log!(
+                info,
+                "vtbl[-1] (RTTI locator ptr): 0x{:016x}",
+                *vtbl_ptr_raw.offset(-1)
+            );
 
             let vtbl = &*vtbl_head;
-            file_log!(info, "vtbl.base.base.open_tuner: {:?}", vtbl.base.base.open_tuner.map(|f| f as *const ()));
-            file_log!(info, "vtbl.base.base.release: {:?}", vtbl.base.base.release.map(|f| f as *const ()));
-            file_log!(info, "vtbl.base.get_tuner_name: {:?}", vtbl.base.get_tuner_name.map(|f| f as *const ()));
+            file_log!(
+                info,
+                "vtbl.base.base.open_tuner: {:?}",
+                vtbl.base.base.open_tuner.map(|f| f as *const ())
+            );
+            file_log!(
+                info,
+                "vtbl.base.base.release: {:?}",
+                vtbl.base.base.release.map(|f| f as *const ())
+            );
+            file_log!(
+                info,
+                "vtbl.base.get_tuner_name: {:?}",
+                vtbl.base.get_tuner_name.map(|f| f as *const ())
+            );
 
             let vtbl_bytes = vtbl_head as *const u8;
             file_log!(info, "Raw vtable dump:");

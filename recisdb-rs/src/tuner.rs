@@ -2,17 +2,17 @@ use crate::channels::Channel;
 
 #[cfg(target_os = "linux")]
 pub use self::linux::{Tuner, UnTunedTuner};
-#[cfg(target_os = "windows")]
-pub use self::windows::{Tuner, UnTunedTuner};
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use self::unsupported::{Tuner, UnTunedTuner};
+#[cfg(target_os = "windows")]
+pub use self::windows::{Tuner, UnTunedTuner};
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod unsupported;
+#[cfg(target_os = "windows")]
+mod windows;
 
 mod error;
 

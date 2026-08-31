@@ -78,7 +78,10 @@ pub struct QualificationDecision {
     pub reasons: Vec<String>,
 }
 
-pub fn qualify(observation: &ReceptionObservation, policy: QualificationPolicy) -> QualificationDecision {
+pub fn qualify(
+    observation: &ReceptionObservation,
+    policy: QualificationPolicy,
+) -> QualificationDecision {
     let mut reasons = Vec::new();
     let structural_ok = observation.pat_ok
         && observation.sdt_ok
@@ -122,7 +125,9 @@ pub fn qualify(observation: &ReceptionObservation, policy: QualificationPolicy) 
         || observation.cc_error_rate > policy.max_cc_error_rate * 5.0
         || observation.sync_error_rate > policy.max_sync_error_rate * 5.0;
 
-    let slow_tune = observation.tune_ms.is_some_and(|ms| ms > policy.soft_tune_ms);
+    let slow_tune = observation
+        .tune_ms
+        .is_some_and(|ms| ms > policy.soft_tune_ms);
     let slow_first = observation
         .first_ts_ms
         .is_some_and(|ms| ms > policy.soft_first_ts_ms);
@@ -139,7 +144,8 @@ pub fn qualify(observation: &ReceptionObservation, policy: QualificationPolicy) 
         + observation.scramble_rate * 0.5;
     let latency_penalty = if slow_tune { 0.08 } else { 0.0 } + if slow_first { 0.08 } else { 0.0 };
     let signal = observation.signal_normalized.unwrap_or(0.8).clamp(0.0, 1.0);
-    let quality_score = (signal * 0.35 + (1.0 - integrity_penalty).clamp(0.0, 1.0) * 0.65 - latency_penalty)
+    let quality_score = (signal * 0.35 + (1.0 - integrity_penalty).clamp(0.0, 1.0) * 0.65
+        - latency_penalty)
         .clamp(0.0, 1.0);
 
     let result = if hard_bad {
@@ -188,7 +194,10 @@ impl RouteQualifier {
                     self.state = ReceptionRouteState::Usable;
                 } else if self.state == ReceptionRouteState::Discovered {
                     self.state = ReceptionRouteState::Validated;
-                } else if matches!(self.state, ReceptionRouteState::Quarantined | ReceptionRouteState::Degraded) {
+                } else if matches!(
+                    self.state,
+                    ReceptionRouteState::Quarantined | ReceptionRouteState::Degraded
+                ) {
                     // Stay conservative until the promotion threshold is met.
                 }
             }
@@ -216,7 +225,11 @@ impl RouteQualifier {
 /// Decide whether a challenger reception route is sufficiently better than
 /// the current preferred route to avoid RF flapping. The ratio is a recisdb
 /// policy parameter, not an ARIB-defined threshold.
-pub fn challenger_beats_current(current_quality: f64, challenger_quality: f64, required_ratio: f64) -> bool {
+pub fn challenger_beats_current(
+    current_quality: f64,
+    challenger_quality: f64,
+    required_ratio: f64,
+) -> bool {
     if current_quality <= 0.0 {
         return challenger_quality > current_quality;
     }

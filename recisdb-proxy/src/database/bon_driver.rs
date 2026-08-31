@@ -60,7 +60,10 @@ impl Database {
     }
 
     /// Get BonDriver by display name.
-    pub fn get_bon_driver_by_display_name(&self, display_name: &str) -> Result<Option<BonDriverRecord>> {
+    pub fn get_bon_driver_by_display_name(
+        &self,
+        display_name: &str,
+    ) -> Result<Option<BonDriverRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, dll_path, driver_name, version, group_name, auto_scan_enabled, scan_interval_hours,
                     scan_priority, last_scan, next_scan_at, passive_scan_enabled,
@@ -131,9 +134,9 @@ impl Database {
 
     /// Get max instances for a BonDriver by path.
     pub fn get_max_instances_for_path(&self, dll_path: &str) -> Result<i32> {
-        let mut stmt = self.conn.prepare(
-            "SELECT max_instances FROM bon_drivers WHERE dll_path = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT max_instances FROM bon_drivers WHERE dll_path = ?1")?;
 
         let result = stmt.query_row([dll_path], |row| row.get(0));
 
@@ -259,10 +262,7 @@ impl Database {
         }
 
         values.push(Box::new(id));
-        let sql = format!(
-            "UPDATE bon_drivers SET {} WHERE id = ?",
-            updates.join(", ")
-        );
+        let sql = format!("UPDATE bon_drivers SET {} WHERE id = ?", updates.join(", "));
 
         let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, params.as_slice())?;
@@ -385,7 +385,10 @@ impl Database {
         }
         let group = self.get_group_drivers(name)?;
         if !group.is_empty() {
-            return Ok(Some((group.into_iter().map(|d| d.dll_path).collect(), true)));
+            return Ok(Some((
+                group.into_iter().map(|d| d.dll_path).collect(),
+                true,
+            )));
         }
         if let Some(driver) = self.get_bon_driver_by_display_name(name)? {
             return Ok(Some((vec![driver.dll_path], false)));
@@ -487,7 +490,9 @@ mod tests {
     #[test]
     fn periodic_rescan_is_opt_in_but_one_shot_scan_still_fires() {
         let db = Database::open_in_memory().unwrap();
-        let id = db.insert_bon_driver(&NewBonDriver::new("Driver.dll")).unwrap();
+        let id = db
+            .insert_bon_driver(&NewBonDriver::new("Driver.dll"))
+            .unwrap();
 
         // Fresh driver: auto scan OFF, nothing scheduled → not due.
         assert!(db.get_due_bon_drivers().unwrap().is_empty());
@@ -507,7 +512,8 @@ mod tests {
 
         // User explicitly enables periodic rescan → due (nothing scheduled
         // yet), and after scheduling a future scan it stops being due.
-        db.update_scan_config(id, Some(true), Some(24), None, None).unwrap();
+        db.update_scan_config(id, Some(true), Some(24), None, None)
+            .unwrap();
         db.update_next_scan(id, None).unwrap();
         assert_eq!(db.get_due_bon_drivers().unwrap().len(), 1);
         let future = chrono::Utc::now().timestamp() + 24 * 3600;

@@ -1,8 +1,8 @@
 //! Lock-free ring buffer for TS data.
 
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::ptr;
 use std::time::Duration;
 
 /// TS packet size.
@@ -317,7 +317,6 @@ impl TsRingBuffer {
             return (0, available); // ← ここ重要
         }
 
-
         // Copy data, handling wrap-around
         let first_chunk = to_read.min(RING_BUFFER_SIZE - read);
         dest[..first_chunk].copy_from_slice(&self.buffer[read..read + first_chunk]);
@@ -385,11 +384,18 @@ mod tests {
     #[test]
     fn ring_buffer_depth_is_what_the_docs_claim() {
         assert_eq!(RING_BUFFER_SIZE, 19_251_200);
-        assert_eq!(RING_BUFFER_SIZE % TS_PACKET_SIZE, 0, "must hold whole packets");
+        assert_eq!(
+            RING_BUFFER_SIZE % TS_PACKET_SIZE,
+            0,
+            "must hold whole packets"
+        );
 
         // ~9.6 s at 16 Mbps.
         let seconds_at_16mbps = RING_BUFFER_SIZE as f64 / (16_000_000.0 / 8.0);
-        assert!((9.0..10.0).contains(&seconds_at_16mbps), "{seconds_at_16mbps}");
+        assert!(
+            (9.0..10.0).contains(&seconds_at_16mbps),
+            "{seconds_at_16mbps}"
+        );
     }
 
     #[test]
@@ -478,7 +484,11 @@ mod tests {
             read_before,
             "producer must not move the consumer's read_pos on overflow"
         );
-        assert_eq!(buffer.dropped_bytes(), extra, "dropped bytes must be counted");
+        assert_eq!(
+            buffer.dropped_bytes(),
+            extra,
+            "dropped bytes must be counted"
+        );
         assert_eq!(buffer.available(), accepted_bytes);
 
         // Drain via read(), which triggers the consumer-side resync (drop
@@ -500,10 +510,21 @@ mod tests {
         assert!(buffer.is_empty());
         // Survivors are the tail of `accepted`, strictly increasing, in order.
         assert!(!survivors.is_empty());
-        assert!(survivors.windows(2).all(|w| w[1] == w[0] + 1), "in-order, contiguous");
-        assert_eq!(*survivors.last().unwrap(), *accepted.last().unwrap(), "keeps freshest");
+        assert!(
+            survivors.windows(2).all(|w| w[1] == w[0] + 1),
+            "in-order, contiguous"
+        );
+        assert_eq!(
+            *survivors.last().unwrap(),
+            *accepted.last().unwrap(),
+            "keeps freshest"
+        );
         let start = survivors[0];
-        assert_eq!(&survivors[..], &accepted[(start as usize)..], "suffix of accepted");
+        assert_eq!(
+            &survivors[..],
+            &accepted[(start as usize)..],
+            "suffix of accepted"
+        );
     }
 
     #[test]
@@ -521,7 +542,10 @@ mod tests {
         let accept_expected = (free / TS_PACKET_SIZE) * TS_PACKET_SIZE;
         let chunk = vec![0x47u8; 5 * TS_PACKET_SIZE];
         let written = buffer.write(&chunk);
-        assert_eq!(written, accept_expected, "accepted amount must be packet-aligned and fit");
+        assert_eq!(
+            written, accept_expected,
+            "accepted amount must be packet-aligned and fit"
+        );
         assert_eq!(written % TS_PACKET_SIZE, 0, "never write a partial packet");
         assert_eq!(buffer.dropped_bytes(), chunk.len() - written);
     }
@@ -536,7 +560,10 @@ mod tests {
         while buffer.free_space() >= TS_PACKET_SIZE {
             buffer.write(&vec![0x47u8; TS_PACKET_SIZE]);
         }
-        assert!(buffer.free_space() < TS_PACKET_SIZE, "buffer should be full");
+        assert!(
+            buffer.free_space() < TS_PACKET_SIZE,
+            "buffer should be full"
+        );
         let before = buffer.available();
 
         // A read triggers the consumer-side resync.
@@ -576,7 +603,10 @@ mod tests {
         for frame in stream.chunks(500) {
             buffer.write(frame);
         }
-        assert!(buffer.free_space() < TS_PACKET_SIZE, "buffer should be full");
+        assert!(
+            buffer.free_space() < TS_PACKET_SIZE,
+            "buffer should be full"
+        );
 
         // Draining triggers the resync. Every packet handed back must be a
         // whole, uncorrupted packet, and they must stay contiguous.
@@ -590,7 +620,10 @@ mod tests {
             }
             read_any = true;
             buffer.consume(n);
-            assert_eq!(dest[0], SYNC_BYTE_FOR_TEST, "read window lost packet alignment");
+            assert_eq!(
+                dest[0], SYNC_BYTE_FOR_TEST,
+                "read window lost packet alignment"
+            );
             let seq = u32::from_le_bytes(dest[1..5].try_into().unwrap());
             assert_eq!(dest, make_packet(seq), "packet {seq} corrupted");
             if let Some(p) = prev {
@@ -629,7 +662,11 @@ mod tests {
         let mut dest = vec![0u8; TS_PACKET_SIZE];
         let (n, _) = buffer.read_into(&mut dest);
         assert_eq!(n, TS_PACKET_SIZE);
-        assert_eq!(dest, make_packet(9999), "consumer must not see pre-purge data");
+        assert_eq!(
+            dest,
+            make_packet(9999),
+            "consumer must not see pre-purge data"
+        );
         buffer.consume(n);
         assert!(buffer.is_empty());
     }

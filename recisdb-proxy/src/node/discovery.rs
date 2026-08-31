@@ -127,7 +127,11 @@ pub async fn probe_endpoint(
     let mut successful_pings = 0usize;
     for i in 0..config.ping_samples.max(1) {
         let started = Instant::now();
-        if client.ping(&endpoint.address, &format!("probe-{i}")).await.is_ok() {
+        if client
+            .ping(&endpoint.address, &format!("probe-{i}"))
+            .await
+            .is_ok()
+        {
             successful_pings += 1;
             rtts.push(started.elapsed().as_secs_f64() * 1000.0);
         }
@@ -136,7 +140,10 @@ pub async fn probe_endpoint(
 
     let mut throughputs = Vec::new();
     for _ in 0..config.download_samples {
-        if let Ok((bytes, elapsed)) = client.probe_download(&endpoint.address, config.download_bytes).await {
+        if let Ok((bytes, elapsed)) = client
+            .probe_download(&endpoint.address, config.download_bytes)
+            .await
+        {
             let seconds = elapsed.as_secs_f64().max(0.000_001);
             throughputs.push((bytes as f64 * 8.0 / seconds) as u64);
         }
