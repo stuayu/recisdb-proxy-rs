@@ -67,8 +67,9 @@ try {
   const topology = await readFile(resolve(process.cwd(), 'src/components/nodes/NodeTopologyPreview.vue'), 'utf8')
   if (!/@media\s*\(max-width:\s*700px\)/.test(css)) throw error
   if (!topology.includes('.mobile-svg') || !topology.includes('width: 100%')) throw error
-  console.log('Playwright unavailable; static responsive checks passed for 390px, 768px, and 1280px.')
-  process.exit(0)
+  console.error('Playwright unavailable; responsive checks were not run in a real browser.')
+  process.exitCode = 1
+  process.exit()
 }
 const tabs = [
   'overview',

@@ -313,6 +313,7 @@ impl NodeTransportState {
 pub fn router(state: Arc<NodeTransportState>) -> Router {
     Router::new()
         .route("/node/v3/pair", post(pair))
+        .route("/node/v3/peer", delete(unpair_peer))
         .route("/node/v3/hello", get(hello))
         .route("/node/v3/routes", get(routes))
         .route("/node/v3/probe/ping", get(probe_ping))
@@ -322,6 +323,31 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/lease/:id", delete(release_lease))
         .route("/node/v3/stream/:id", get(stream_lease))
         .with_state(state)
+}
+
+/// Remove the authenticated caller from this node's persisted peer list.
+/// Pairing rollback and normal node deletion use this to clean up both sides.
+async fn unpair_peer(State(state): State<Arc<NodeTransportState>>, headers: HeaderMap) -> Response {
+    let Ok(node_id) = state.authorize(&headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(database) = state.database.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = {
+        let db = database.lock().await;
+        NodeStore::new(&db).and_then(|store| store.delete_node(&node_id))
+    };
+    match result {
+        Ok(()) => {
+            state.peers.write().await.remove(&node_id);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(error) => {
+            log::error!("Node unpair failed for {node_id}: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Serve the node router on a dedicated TCP listener. Hyper/axum accepts the
@@ -825,6 +851,18 @@ impl NodeTransportClient {
         )
         .send()
         .await?;
+        Ok(())
+    }
+
+    /// Remove this node from the peer's persisted pairing records.
+    pub async fn unpair_peer(&self, base: &str) -> Result<(), reqwest::Error> {
+        self.request(
+            reqwest::Method::DELETE,
+            format!("{}/node/v3/peer", base.trim_end_matches('/')),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import QRCode from 'qrcode'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../../api'
 import type { IssuedPairing, ProbeResponse } from './types'
 import { nodeError } from './errors'
-import { parsePairingConnection } from './pairing'
+import { isPairingExpired, pairingConnectionText, parsePairingConnection } from './pairing'
 const emit = defineEmits<{ close: []; complete: [] }>()
 const step = ref(1)
 const purpose = ref('both')
@@ -14,8 +15,16 @@ const issued = ref<IssuedPairing | null>(null)
 const error = ref('')
 const diagnostic = ref<ProbeResponse | null>(null)
 const rolledBack = ref(false)
+const reciprocalWarning = ref('')
 const rollbackNodeId = ref<string | null>(null)
 const dialog = ref<HTMLElement | null>(null)
+const qrCanvas = ref<HTMLCanvasElement | null>(null)
+const now = ref(Date.now())
+const expired = computed(() => !!issued.value && isPairingExpired(issued.value.expires_at_unix_ms, now.value))
+const pairingText = computed(() =>
+  issued.value ? pairingConnectionText(issued.value.node_listen_addr || '', issued.value.code) : '',
+)
+let clock: ReturnType<typeof setInterval> | undefined
 function keydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
     emit('close')
@@ -37,8 +46,20 @@ function keydown(event: KeyboardEvent) {
 onMounted(() => {
   document.addEventListener('keydown', keydown)
   void nextTick(() => dialog.value?.focus())
+  clock = setInterval(() => { now.value = Date.now() }, 1000)
 })
-onBeforeUnmount(() => document.removeEventListener('keydown', keydown))
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', keydown)
+  if (clock) clearInterval(clock)
+})
+watch([issued, step], () => {
+  if (!qrCanvas.value || !pairingText.value || expired.value) return
+  void QRCode.toCanvas(qrCanvas.value, pairingText.value, {
+    errorCorrectionLevel: 'M',
+    margin: 2,
+    width: 240,
+  })
+})
 async function issue() {
   issuing.value = true
   error.value = ''
@@ -96,8 +117,12 @@ async function redeem() {
 async function rollback() {
   if (!rollbackNodeId.value) return
   try {
-    await api(`/nodes/${encodeURIComponent(rollbackNodeId.value)}`, { method: 'DELETE' })
+    const result = await api<{ reciprocal_removed?: boolean; warning?: string }>(
+      `/nodes/${encodeURIComponent(rollbackNodeId.value)}`,
+      { method: 'DELETE' },
+    )
     rolledBack.value = true
+    if (!result.reciprocal_removed) reciprocalWarning.value = result.warning || '相手側の設定が残っている可能性があります。相手PCの分散ノード一覧から、このPCの接続設定を削除してください。'
   } catch (cause) {
     error.value = `診断失敗。自動取消にも失敗しました: ${nodeError(cause)}`
   } finally {
@@ -111,12 +136,11 @@ function retry() {
   diagnostic.value = null
   rolledBack.value = false
   error.value = ''
+  reciprocalWarning.value = ''
 }
 async function copyPairing() {
   if (!issued.value) return
-  const endpoint = issued.value.node_listen_addr || ''
-  const text = `recisdb://pair?endpoint=${encodeURIComponent(endpoint)}&code=${encodeURIComponent(issued.value.code)}`
-  await navigator.clipboard?.writeText(text)
+  await navigator.clipboard?.writeText(pairingText.value)
 }
 </script>
 <template>
@@ -142,9 +166,20 @@ async function copyPairing() {
         <h3>相手PCの接続情報</h3>
         <p>相手PCで発行した接続情報を貼り付け。</p>
         <div v-if="issued" class="pair-code">
-          <code>{{ issued.code }}</code
-          ><button class="button secondary" @click="copyPairing">接続情報をコピー</button
-          ><small>コードは一度だけ表示。</small>
+          <code>{{ issued.code }}</code>
+          <p v-if="expired" class="notice error" role="alert">
+            接続情報の有効期限が切れています。再発行してください。
+          </p>
+          <div v-else class="qr-box">
+            <canvas ref="qrCanvas" role="img" aria-label="ペアリング接続情報のQRコード" />
+            <span>QRを読み取って接続できます。</span>
+          </div>
+          <code class="pairing-text">{{ pairingText }}</code>
+          <button class="button secondary" :disabled="expired" @click="copyPairing">
+            接続情報をコピー
+          </button>
+          <small>コードは一度だけ表示。文字列でも接続できます。</small>
+          <button v-if="expired" class="button" @click="issue">接続情報を再発行</button>
         </div>
         <label
           >接続情報<input
@@ -204,6 +239,7 @@ async function copyPairing() {
         <p v-if="rolledBack" class="notice warning" role="status">
           登録前診断に失敗したため、仮登録を自動で取り消しました。ユーザー操作は不要です。
         </p>
+        <p v-if="reciprocalWarning" class="notice warning" role="alert">{{ reciprocalWarning }}</p>
         <button v-if="!rolledBack && diagnostic?.selected.view" class="button" @click="emit('complete')">
           この設定で開始
         </button>
@@ -270,6 +306,23 @@ async function copyPairing() {
 
 .pair-code code {
   font-size: 1.2rem;
+  overflow-wrap: anywhere;
+}
+
+.qr-box {
+  display: grid;
+  justify-items: center;
+  gap: 0.4rem;
+}
+
+.qr-box canvas {
+  width: min(240px, 100%);
+  height: auto;
+  image-rendering: pixelated;
+}
+
+.pairing-text {
+  font-size: 0.8rem !important;
   overflow-wrap: anywhere;
 }
 

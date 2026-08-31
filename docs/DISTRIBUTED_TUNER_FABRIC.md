@@ -33,9 +33,17 @@ Probe results are cached in process memory for topology display. A path without
 a cached result is reported as `unmeasured`, not healthy. Continuous passive
 measurement and persistent path-health storage remain future work.
 
-The dashboard has no bundled QR encoder yet. The offline-safe
-`recisdb://pair?...` text and one-click copy flow remain complete; QR can be
-added later without changing the connection format.
+The dashboard bundles the browser entry of `qrcode` and displays the same
+offline-safe `recisdb://pair?...` value as a QR and copyable text. Expired codes
+are rejected in the UI and can be reissued without changing the connection
+format.
+
+When deleting a paired node, the dashboard API first calls the authenticated
+`DELETE /node/v3/peer` endpoint on the remote node. If every endpoint is
+unreachable, local deletion still completes but the response and UI tell the
+operator to remove the reciprocal entry on the other node. This fallback is
+necessary because the remote peer cannot be deleted without a live authenticated
+transport connection.
 
 Automatic transport selection must not be described as continuously optimal.
 Current normal routing is still the static preference order LAN, Tailscale,

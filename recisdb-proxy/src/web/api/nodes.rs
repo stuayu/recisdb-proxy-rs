@@ -274,7 +274,7 @@ pub async fn delete_node(
     Path(node_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let node_id = NodeId::new(node_id).map_err(ApiError::bad_request)?;
-    {
+    let (local, credential, endpoints) = {
         let db = web_state.database.lock().await;
         let store = NodeStore::new(&db)?;
         if !store
@@ -284,12 +284,36 @@ pub async fn delete_node(
         {
             return Err(ApiError::not_found(format!("node {node_id} not found")));
         }
-        store.delete_node(&node_id)?;
+        (
+            store.local_identity()?,
+            store.credential_for(&node_id)?,
+            store.endpoints(&node_id)?,
+        )
+    };
+    let mut reciprocal_removed = false;
+    if let Some(credential) = credential {
+        if let Ok(client) = NodeTransportClient::new(local.node_id, credential) {
+            for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
+                if client.unpair_peer(&endpoint.address).await.is_ok() {
+                    reciprocal_removed = true;
+                    break;
+                }
+            }
+        }
+    }
+    {
+        let db = web_state.database.lock().await;
+        NodeStore::new(&db)?.delete_node(&node_id)?;
     }
     if let Some(state) = web_state.node_transport.as_ref() {
         state.peers.write().await.remove(&node_id);
     }
-    Ok(Json(json!({ "success": true, "node_id": node_id })))
+    Ok(Json(json!({
+        "success": true,
+        "node_id": node_id,
+        "reciprocal_removed": reciprocal_removed,
+        "warning": if reciprocal_removed { serde_json::Value::Null } else { json!("相手側の設定を確認してください") },
+    })))
 }
 
 /// Issue a one-time pairing code for another node to redeem.

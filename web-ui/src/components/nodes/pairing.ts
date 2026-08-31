@@ -1,5 +1,13 @@
 export type PairingConnection = { base_url: string; code: string }
 
+export function pairingConnectionText(endpoint: string, code: string): string {
+  return `recisdb://pair?endpoint=${encodeURIComponent(endpoint)}&code=${encodeURIComponent(code)}`
+}
+
+export function isPairingExpired(expiresAtUnixMs: number, currentUnixMs = Date.now()): boolean {
+  return expiresAtUnixMs <= currentUnixMs
+}
+
 export function parsePairingConnection(value: string): PairingConnection {
   const raw = value.trim()
   if (!raw) throw new Error('接続情報を入力してください。')
