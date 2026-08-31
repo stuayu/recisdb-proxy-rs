@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use log::debug;
 
+use crate::tuner::shared::TunerUsage;
 use crate::tuner::{EffectiveClaim, SharedTuner, TunerSubscription};
 
 /// Backwards-compatible adapter for existing session call sites. New code
@@ -21,6 +22,7 @@ pub(super) async fn handoff_current_tuner(
     next_tuner: Arc<SharedTuner>,
     claim_priority: i32,
     claim_exclusive: bool,
+    usage: TunerUsage,
     is_streaming: bool,
     log_prefix: &str,
 ) -> Option<Arc<SharedTuner>> {
@@ -30,6 +32,7 @@ pub(super) async fn handoff_current_tuner(
         current_tuner,
         next_tuner,
         EffectiveClaim::new(claim_priority, claim_exclusive),
+        usage,
         is_streaming,
         log_prefix,
     )
@@ -52,6 +55,7 @@ pub(super) async fn handoff_current_tuner_with_claim(
     current_tuner: &mut Option<Arc<SharedTuner>>,
     next_tuner: Arc<SharedTuner>,
     claim: EffectiveClaim,
+    usage: TunerUsage,
     is_streaming: bool,
     log_prefix: &str,
 ) -> Option<Arc<SharedTuner>> {
@@ -68,7 +72,8 @@ pub(super) async fn handoff_current_tuner_with_claim(
                 // right-hand side of an assignment (the subscribe call)
                 // before dropping the place's previous value, so there is
                 // never a transient subscriber_count==0 on an active tuner.
-                let new_sub = next_tuner.subscribe_with_claim(claim.priority, claim.exclusive);
+                let new_sub =
+                    next_tuner.subscribe_with_claim_class(claim.priority, claim.exclusive, usage);
                 *ts_receiver = Some(new_sub);
             }
             *current_tuner = Some(next_tuner);
@@ -85,7 +90,8 @@ pub(super) async fn handoff_current_tuner_with_claim(
 
         let needs_cleanup = old.subscriber_count() == 0;
         if is_streaming {
-            *ts_receiver = Some(next_tuner.subscribe_with_claim(claim.priority, claim.exclusive));
+            *ts_receiver =
+                Some(next_tuner.subscribe_with_claim_class(claim.priority, claim.exclusive, usage));
         }
         *current_tuner = Some(next_tuner);
 
@@ -96,7 +102,8 @@ pub(super) async fn handoff_current_tuner_with_claim(
     }
 
     if is_streaming {
-        *ts_receiver = Some(next_tuner.subscribe_with_claim(claim.priority, claim.exclusive));
+        *ts_receiver =
+            Some(next_tuner.subscribe_with_claim_class(claim.priority, claim.exclusive, usage));
     }
     *current_tuner = Some(next_tuner);
     None
@@ -125,6 +132,7 @@ mod tests {
             &mut current_tuner,
             Arc::clone(&tuner),
             EffectiveClaim::new(42, true),
+            TunerUsage::View,
             true,
             "test:",
         )
@@ -144,7 +152,8 @@ mod tests {
             tuner.incumbent_claim(),
             Some(crate::tuner::shared::Claim {
                 priority: 42,
-                exclusive: true
+                exclusive: true,
+                usage: crate::tuner::shared::TunerUsage::View,
             })
         );
     }
@@ -163,6 +172,7 @@ mod tests {
             &mut current_tuner,
             Arc::clone(&tuner),
             claim,
+            TunerUsage::View,
             true,
             "claim-test:",
         )
@@ -192,6 +202,7 @@ mod tests {
             Arc::clone(&new_tuner),
             0,
             false,
+            TunerUsage::View,
             true,
             "test:",
         )
@@ -225,6 +236,7 @@ mod tests {
             Arc::clone(&new_tuner),
             0,
             false,
+            TunerUsage::View,
             true,
             "test:",
         )

@@ -778,10 +778,11 @@ impl Session {
         self.current_tuner = Some(old_tuner.clone());
         // If we were (or are still) streaming, re-subscribe so TS data flows again.
         if self.state == SessionState::Streaming && self.ts_receiver.is_none() {
-            self.ts_receiver = Some(
-                old_tuner
-                    .subscribe_with_claim(self.tuner_claim_priority, self.tuner_claim_exclusive),
-            );
+            self.ts_receiver = Some(old_tuner.subscribe_with_claim_class(
+                self.tuner_claim_priority,
+                self.tuner_claim_exclusive,
+                crate::tuner::shared::TunerUsage::from(self.stream_class),
+            ));
         }
     }
 
@@ -1709,6 +1710,7 @@ impl Session {
             outcome.tuner.clone(),
             self.tuner_claim_priority,
             self.tuner_claim_exclusive,
+            crate::tuner::shared::TunerUsage::from(self.stream_class),
             self.state == SessionState::Streaming,
             "SetChannel:",
         )
@@ -2226,6 +2228,7 @@ impl Session {
             outcome.tuner.clone(),
             self.tuner_claim_priority,
             self.tuner_claim_exclusive,
+            crate::tuner::shared::TunerUsage::from(self.stream_class),
             self.state == SessionState::Streaming,
             "SetChannelSpace:",
         )
@@ -2387,7 +2390,11 @@ impl Session {
         self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
         // Subscribe to the tuner's broadcast channel
-        let rx = tuner.subscribe_with_claim(self.tuner_claim_priority, self.tuner_claim_exclusive);
+        let rx = tuner.subscribe_with_claim_class(
+            self.tuner_claim_priority,
+            self.tuner_claim_exclusive,
+            crate::tuner::shared::TunerUsage::from(self.stream_class),
+        );
         self.ts_receiver = Some(rx);
         self.state = SessionState::Streaming;
 
@@ -2710,6 +2717,7 @@ impl Session {
             outcome.tuner.clone(),
             self.tuner_claim_priority,
             self.tuner_claim_exclusive,
+            crate::tuner::shared::TunerUsage::from(self.stream_class),
             self.state == SessionState::Streaming,
             "SelectLogicalChannel:",
         )

@@ -25,6 +25,7 @@ use recisdb_protocol::StreamClass;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::tuner::channel_key::ChannelKeySpec;
+use crate::tuner::shared::TunerUsage;
 use crate::tuner::{ChannelKey, TunerPool};
 
 use super::frame::{FrameFlags, NodeTsFrame, MAX_NODE_TS_PAYLOAD};
@@ -174,9 +175,16 @@ impl LocalMuxServer {
         // `open_lease` returns. Otherwise the reader looks idle in the window
         // between acquire and the task being scheduled, and the idle-close /
         // reclaim paths could take it away from the peer that just asked.
-        let subscription = outcome
-            .tuner
-            .subscribe_with_claim(context.claim.priority, context.claim.exclusive);
+        let usage = match context.stream_class {
+            StreamClass::Record => TunerUsage::Record,
+            StreamClass::Preview => TunerUsage::Preview,
+            StreamClass::View => TunerUsage::View,
+        };
+        let subscription = outcome.tuner.subscribe_with_claim_class(
+            context.claim.priority,
+            context.claim.exclusive,
+            usage,
+        );
 
         let pump = LeasePump {
             lease: Arc::clone(&lease),

@@ -157,7 +157,8 @@ effective値を作り、API/UIはeffective値とsourceを表示する。現在�
 subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、idle timeout、CPU limit、
 同時数を適用し、開始/完了/失敗をstate/historyへ記録する。EpgWriterのflush後とscheduler
 判定前にprogramsからcoverage_until/last_eit_received_atを再集計する。remote node側metadata
-実行とnode leaseによる同一(NID,TSID)重複排除は未接続で、remote利用は延期対象。
+実行とnode leaseによる同一(NID,TSID)重複排除は未接続で、remote利用は延期対象。現行の
+`/node/v3/lease` はTSフレーム用で、EPG metadata専用RPCは提供していない。
 
 スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
 スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を

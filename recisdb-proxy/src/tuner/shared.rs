@@ -621,12 +621,22 @@ impl SharedTuner {
         priority: i32,
         exclusive: bool,
     ) -> TunerSubscription {
+        self.subscribe_with_claim_class(priority, exclusive, TunerUsage::View)
+    }
+
+    pub fn subscribe_with_claim_class(
+        self: &Arc<Self>,
+        priority: i32,
+        exclusive: bool,
+        usage: TunerUsage,
+    ) -> TunerSubscription {
         let id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
         self.claims.lock().unwrap().insert(
             id,
             Claim {
                 priority,
                 exclusive,
+                usage,
             },
         );
         self.subscriber_count.fetch_add(1, Ordering::SeqCst);
@@ -2187,6 +2197,26 @@ impl Drop for TunerSubscription {
 pub struct Claim {
     pub priority: i32,
     pub exclusive: bool,
+    pub usage: TunerUsage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunerUsage {
+    Record,
+    View,
+    Preview,
+    EpgActiveScan,
+    BackgroundScan,
+}
+
+impl From<recisdb_protocol::StreamClass> for TunerUsage {
+    fn from(value: recisdb_protocol::StreamClass) -> Self {
+        match value {
+            recisdb_protocol::StreamClass::Record => Self::Record,
+            recisdb_protocol::StreamClass::Preview => Self::Preview,
+            recisdb_protocol::StreamClass::View => Self::View,
+        }
+    }
 }
 
 fn monotonic_millis() -> u64 {
@@ -2279,6 +2309,17 @@ fn test_startup_config() -> ReaderStartupConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_claim_preserves_competing_usage() {
+        let tuner = SharedTuner::new(ChannelKey::simple("/dev/test", 1), 1);
+        let _record = tuner.subscribe_with_claim_class(100, true, TunerUsage::Record);
+
+        assert_eq!(
+            tuner.incumbent_claim().map(|claim| claim.usage),
+            Some(TunerUsage::Record)
+        );
+    }
 
     /// 通常のストリーミング(空振りが単発で終わる)では1行も出さない。
     /// 旧実装(`streak % 50 == 1`)はここで毎回 true を返していた。

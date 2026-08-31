@@ -52,7 +52,7 @@ use crate::server::listener::DatabaseHandle;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
 use crate::tuner::pool::TunerPoolError;
-use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason};
+use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason, TunerUsage};
 #[cfg(unix)]
 use crate::tuner::timing;
 use crate::tuner::{
@@ -140,6 +140,14 @@ pub(crate) struct AcquireOutcome {
     pub unused_warm: Option<WarmTunerHandle>,
 }
 
+/// The incumbent that prevented a request from acquiring a slot. Kept typed
+/// so callers such as the EPG scheduler do not have to parse log text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcquireConflict {
+    pub usage: TunerUsage,
+    pub tuner: ChannelKey,
+}
+
 /// Failure modes of [`acquire`]. Callers with their own error type
 /// (`server::channel_resolve::ChannelResolveError`) convert via `#[from]` or
 /// an explicit `match`.
@@ -152,7 +160,10 @@ pub(crate) enum AcquireError {
     /// `decide` rejected the request as over capacity with no acceptable
     /// eviction — mirrors [`policy::RejectReason::AtCapacity`].
     #[error("all tuner slot(s) on the requested driver are in use (lowest idle priority observed: {lowest_idle_priority:?})")]
-    AtCapacity { lowest_idle_priority: Option<i32> },
+    AtCapacity {
+        lowest_idle_priority: Option<i32>,
+        conflict: Option<AcquireConflict>,
+    },
     #[error("all tuner slots are still warming; retry after {}ms", retry_after.as_millis())]
     Warming { retry_after: std::time::Duration },
     /// Every snapshot→decide→act round lost a race
@@ -188,6 +199,7 @@ impl From<RejectReason> for AcquireError {
                 lowest_idle_priority,
             } => AcquireError::AtCapacity {
                 lowest_idle_priority,
+                conflict: None,
             },
             RejectReason::Warming { retry_after } => AcquireError::Warming { retry_after },
         }
@@ -208,6 +220,22 @@ fn max_attempts(candidates: usize) -> usize {
     // candidate may consume (see `is_ealready`), plus slack for a stale
     // snapshot round.
     candidates * 2 + 2
+}
+
+async fn find_conflict(pool: &TunerPool, candidates: &[ChannelKey]) -> Option<AcquireConflict> {
+    for key in candidates {
+        let Some(tuner) = pool.get(key).await else {
+            continue;
+        };
+        let Some(claim) = tuner.incumbent_claim() else {
+            continue;
+        };
+        return Some(AcquireConflict {
+            usage: claim.usage,
+            tuner: key.clone(),
+        });
+    }
+    None
 }
 
 /// Write one runtime-health observation for `tuner_path`, if the driver is
@@ -647,6 +675,7 @@ pub(crate) async fn acquire(
             );
             return Err(last_start_failure.unwrap_or(AcquireError::AtCapacity {
                 lowest_idle_priority: None,
+                conflict: None,
             }));
         }
 
@@ -1013,7 +1042,18 @@ pub(crate) async fn acquire(
                         Instant::now(),
                     );
                 }
-                return Err(AcquireError::from(reason));
+                match AcquireError::from(reason) {
+                    AcquireError::AtCapacity {
+                        lowest_idle_priority,
+                        ..
+                    } => {
+                        return Err(AcquireError::AtCapacity {
+                            lowest_idle_priority,
+                            conflict: find_conflict(pool, &request.candidates).await,
+                        })
+                    }
+                    error => return Err(error),
+                }
             }
         }
     }

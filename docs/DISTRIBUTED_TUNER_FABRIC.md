@@ -3,8 +3,11 @@
 ## EPG remote execution
 
 `remote_prefer_metadata_execution` 有効時はremote node側のEIT解析を優先し、
-`remote_allow_ts_transport` 無効時は放送TSをWAN転送しない。remote scanの同一
-`(network_id, tsid)`重複排除は既存lease経路へ接続するまで延期扱い。
+`remote_allow_ts_transport` 無効時は放送TSをWAN転送しない。現行の`/node/v3/lease`は
+TSフレーム用で、番組情報を返すmetadata RPCとEPG専用mux leaseは未提供。remote scanを
+実装するには、認証済みpeerへ`(network_id, tsid)`を渡し、remote側で解析した
+`ProgramUpsert`相当の結果を返すRPC、およびその間だけ保持するmux leaseが必要。
+そのため現状はremote scanを延期し、無認証TS転送を行わない。
 
 ## Dashboard setup flow
 

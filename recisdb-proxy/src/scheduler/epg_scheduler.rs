@@ -8,10 +8,20 @@ use crate::{
     database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState},
     server::listener::DatabaseHandle,
     tuner::{
-        acquire::{self, AcquireRequest},
+        acquire::{self, AcquireError, AcquireRequest},
         ChannelKey, TunerPool,
     },
 };
+
+#[derive(Debug, thiserror::Error)]
+enum EpgScanError {
+    #[error("CPU hard limit reached")]
+    CpuHardLimit,
+    #[error("no TS data during EPG dwell")]
+    NoTsData,
+    #[error(transparent)]
+    Acquire(#[from] AcquireError),
+}
 use recisdb_protocol::{broadcast_region::classify_nid, BroadcastType};
 use std::{
     sync::{
@@ -247,12 +257,27 @@ impl EpgScanScheduler {
                 let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
             }
             Err(e) => {
+                let (code, conflict) =
+                    match &e {
+                        EpgScanError::CpuHardLimit => (EpgReasonCode::CpuHardLimit, None),
+                        EpgScanError::Acquire(AcquireError::AtCapacity { conflict, .. }) => {
+                            let code = conflict.as_ref().map_or(
+                                EpgReasonCode::NoTunerAvailable,
+                                |conflict| match conflict.usage {
+                                    crate::tuner::shared::TunerUsage::Record => {
+                                        EpgReasonCode::PreemptedByRecord
+                                    }
+                                    crate::tuner::shared::TunerUsage::View => {
+                                        EpgReasonCode::PreemptedByView
+                                    }
+                                    _ => EpgReasonCode::NoTunerAvailable,
+                                },
+                            );
+                            (code, conflict.as_ref().map(|conflict| &conflict.tuner))
+                        }
+                        _ => (EpgReasonCode::ScanFailed, None),
+                    };
                 let message = e.to_string();
-                let code = if message == "EPG scan interrupted: CPU hard limit reached" {
-                    EpgReasonCode::CpuHardLimit
-                } else {
-                    EpgReasonCode::ScanFailed
-                };
                 let reason = epg_reason(
                     code,
                     serde_json::json!({
@@ -260,6 +285,7 @@ impl EpgScanScheduler {
                         "tsid": channel.tsid,
                         "message": message,
                         "cpu_percent": cpu_percent(),
+                        "conflict_tuner": conflict.map(|tuner| format!("{tuner:?}")),
                     }),
                 );
                 let _ = db.epg_scan_finished(
@@ -279,7 +305,7 @@ impl EpgScanScheduler {
         config: &EpgGlobalSettings,
         key: ChannelKey,
         channel_id: i64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), EpgScanError> {
         let outcome = acquire::acquire(
             &self.pool,
             &self.database,
@@ -296,12 +322,16 @@ impl EpgScanScheduler {
             },
         )
         .await?;
-        let mut subscription = outcome.tuner.subscribe();
+        let mut subscription = outcome.tuner.subscribe_with_claim_class(
+            -1000,
+            false,
+            crate::tuner::shared::TunerUsage::EpgActiveScan,
+        );
         let started = tokio::time::Instant::now();
         let mut useful = false;
         loop {
             if cpu_percent() as i64 >= config.cpu_hard_limit_percent {
-                return Err("EPG scan interrupted: CPU hard limit reached".into());
+                return Err(EpgScanError::CpuHardLimit);
             }
             let elapsed = started.elapsed();
             if elapsed >= Duration::from_secs(config.max_dwell_secs as u64) {
@@ -324,7 +354,7 @@ impl EpgScanScheduler {
             }
         }
         if !useful {
-            return Err("no TS data during EPG dwell".into());
+            return Err(EpgScanError::NoTsData);
         }
         let _ = channel_id;
         Ok(())
@@ -401,6 +431,31 @@ fn target_needs_scan(target: &EpgTarget, now: i64, config: &EpgGlobalSettings) -
     }
 }
 
+fn cpu_percent_from_ticks(
+    idle: u64,
+    kernel: u64,
+    user: u64,
+    previous: Option<(u64, u64, u64)>,
+) -> (u32, (u64, u64, u64)) {
+    let current = (idle, kernel, user);
+    let Some((previous_idle, previous_kernel, previous_user)) = previous else {
+        return (0, current);
+    };
+    let total = kernel
+        .saturating_sub(previous_kernel)
+        .saturating_add(user.saturating_sub(previous_user));
+    let idle = idle.saturating_sub(previous_idle);
+    let busy = total.saturating_sub(idle);
+    let percent = if total == 0 {
+        0
+    } else {
+        ((busy as f64 / total as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u32
+    };
+    (percent, current)
+}
+
 #[cfg(target_os = "linux")]
 fn cpu_percent() -> u32 {
     let load = std::fs::read_to_string("/proc/loadavg")
@@ -428,7 +483,53 @@ fn cpu_percent() -> u32 {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cpu_percent() -> u32 {
-    0
+    #[cfg(windows)]
+    {
+        use std::sync::{Mutex, OnceLock};
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        unsafe extern "system" {
+            fn GetSystemTimes(
+                idle: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        fn value(time: FileTime) -> u64 {
+            (u64::from(time.high) << 32) | u64::from(time.low)
+        }
+        let mut idle = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+            // The limit cannot be enforced without a reading. Record it so
+            // `cpu_limit_source` reports "unavailable" instead of letting a
+            // hard-coded 0% look like an idle machine.
+            windows_cpu_probe_failed().store(true, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        windows_cpu_probe_failed().store(false, std::sync::atomic::Ordering::Relaxed);
+        let current = (value(idle), value(kernel), value(user));
+        static PREVIOUS: OnceLock<Mutex<Option<(u64, u64, u64)>>> = OnceLock::new();
+        let previous = PREVIOUS.get_or_init(|| Mutex::new(None));
+        let mut previous = previous.lock().unwrap_or_else(|error| error.into_inner());
+        let (percent, current) = cpu_percent_from_ticks(current.0, current.1, current.2, *previous);
+        *previous = Some(current);
+        return percent;
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn windows_cpu_probe_failed() -> &'static std::sync::atomic::AtomicBool {
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FAILED
 }
 
 pub fn cpu_limit_source() -> &'static str {
@@ -442,7 +543,18 @@ pub fn cpu_limit_source() -> &'static str {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        "unavailable:cpu limit disabled"
+        #[cfg(windows)]
+        {
+            if windows_cpu_probe_failed().load(std::sync::atomic::Ordering::Relaxed) {
+                "unavailable:GetSystemTimes failed"
+            } else {
+                "windows:GetSystemTimes"
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            "unavailable:cpu limit disabled"
+        }
     }
 }
 
@@ -481,6 +593,14 @@ mod tests {
             decide(&config(), 0, 70, 10, None, None, None),
             EpgScanDecision::SoftCpuLimit
         )
+    }
+
+    #[test]
+    fn cpu_ticks_convert_to_busy_percentage() {
+        let (percent, previous) = cpu_percent_from_ticks(10, 100, 100, None);
+        assert_eq!(percent, 0);
+        let (percent, _) = cpu_percent_from_ticks(20, 150, 150, Some(previous));
+        assert_eq!(percent, 90);
     }
 
     #[test]
