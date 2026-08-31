@@ -4,7 +4,7 @@
 //! arbitration still belongs to `tuner::acquire::acquire`, which owns the
 //! `SlotPermit` and all policy/preemption side effects.
 
-use crate::node::{MuxLeaseGuard, MuxLeaseManager};
+use crate::node::{MuxLeaseGuard, MuxLeaseManager, NodeTransportState};
 use crate::{
     database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState},
     server::listener::DatabaseHandle,
@@ -44,6 +44,33 @@ pub enum EpgScanDecision {
     AtCapacity,
     Backoff,
     NotDue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpgExecutionPath {
+    Local,
+    RemoteMetadata,
+    RemoteTs,
+}
+
+/// Select transport without inspecting names, files, or live state.
+pub fn choose_execution_path(
+    config: &EpgGlobalSettings,
+    local_available: bool,
+    remote_available: bool,
+) -> EpgExecutionPath {
+    if config.prefer_local && local_available {
+        return EpgExecutionPath::Local;
+    }
+    if config.allow_remote && remote_available {
+        if config.remote_prefer_metadata_execution {
+            return EpgExecutionPath::RemoteMetadata;
+        }
+        if config.remote_allow_ts_transport {
+            return EpgExecutionPath::RemoteTs;
+        }
+    }
+    EpgExecutionPath::Local
 }
 
 impl EpgScanDecision {
@@ -127,6 +154,7 @@ pub struct EpgScanScheduler {
     active: Arc<AtomicUsize>,
     stopped: Arc<Mutex<bool>>,
     mux_leases: Arc<MuxLeaseManager>,
+    remote_state: Arc<tokio::sync::RwLock<Option<Arc<NodeTransportState>>>>,
 }
 
 impl EpgScanScheduler {
@@ -141,7 +169,12 @@ impl EpgScanScheduler {
             active: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(Mutex::new(false)),
             mux_leases,
+            remote_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    pub async fn set_remote_state(&self, state: Arc<NodeTransportState>) {
+        *self.remote_state.write().await = Some(state);
     }
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move { self.run().await })
@@ -249,6 +282,58 @@ impl EpgScanScheduler {
             }
             return Ok(());
         }
+        let remote_available = if config.allow_remote {
+            let db = self.database.lock().await;
+            let store = crate::node::NodeStore::new(&db)?;
+            store
+                .remote_routes_for(crate::node::LogicalMuxId {
+                    nid: channel.nid,
+                    tsid: channel.tsid,
+                })
+                .map(|routes| !routes.is_empty())?
+        } else {
+            false
+        };
+        let execution_path = choose_execution_path(
+            &config,
+            channel.bon_space.zip(channel.bon_channel).is_some(),
+            remote_available,
+        );
+        let history = {
+            let db = self.database.lock().await;
+            db.epg_scan_started(
+                driver.id,
+                channel.nid,
+                channel.tsid,
+                &epg_reason(EpgReasonCode::Scheduled, serde_json::json!({})),
+            )?
+        };
+        if execution_path == EpgExecutionPath::RemoteMetadata {
+            if let Err(error) = self.try_remote_metadata(channel.nid, channel.tsid).await {
+                let reason = epg_reason(
+                    EpgReasonCode::RemoteMetadataFailed,
+                    serde_json::json!({
+                        "network_id": channel.nid,
+                        "tsid": channel.tsid,
+                        "error": error.to_string(),
+                    }),
+                );
+                let db = self.database.lock().await;
+                let _ = db.epg_scan_finished(
+                    history,
+                    "failed",
+                    channel.nid,
+                    channel.tsid,
+                    Some(&reason),
+                );
+                let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
+            } else {
+                let db = self.database.lock().await;
+                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
+                let _ = db.refresh_epg_coverage();
+                return Ok(());
+            }
+        }
         let Some((space, number)) = channel.bon_space.zip(channel.bon_channel) else {
             let reason = epg_reason(
                 EpgReasonCode::NoCompatibleTuner,
@@ -259,15 +344,6 @@ impl EpgScanScheduler {
             return Ok(());
         };
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
-        let history = {
-            let db = self.database.lock().await;
-            db.epg_scan_started(
-                driver.id,
-                channel.nid,
-                channel.tsid,
-                &epg_reason(EpgReasonCode::Scheduled, serde_json::json!({})),
-            )?
-        };
         self.active.fetch_add(1, Ordering::SeqCst);
         let result = self.scan_one(&config, key, channel.id).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
@@ -319,6 +395,71 @@ impl EpgScanScheduler {
         }
         let _ = db.refresh_epg_coverage();
         Ok(())
+    }
+
+    async fn try_remote_metadata(
+        &self,
+        network_id: u16,
+        tsid: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(state) = self.remote_state.read().await.clone() else {
+            return Err("node transport is not ready".into());
+        };
+        let (local, routes) = {
+            let db = self.database.lock().await;
+            let store = crate::node::NodeStore::new(&db)?;
+            let mux = crate::node::LogicalMuxId {
+                nid: network_id,
+                tsid,
+            };
+            (store.local_identity()?, store.remote_routes_for(mux)?)
+        };
+        for route in routes {
+            let credential = {
+                let db = self.database.lock().await;
+                crate::node::NodeStore::new(&db)?.credential_for(&route.node_id)?
+            };
+            let Some(credential) = credential else {
+                continue;
+            };
+            let endpoints = {
+                let db = self.database.lock().await;
+                crate::node::NodeStore::new(&db)?.endpoints(&route.node_id)?
+            };
+            let client = crate::node::NodeTransportClient::new(local.node_id.clone(), credential)?;
+            for endpoint in endpoints.into_iter().filter(|endpoint| endpoint.enabled) {
+                let request = crate::node::RemoteEpgMetadataRequest {
+                    context: crate::node::RequestContext {
+                        request_id: format!("epg-{network_id:04x}-{tsid:04x}"),
+                        trace_id: format!(
+                            "epg-{}",
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                        ),
+                        stream_class: recisdb_protocol::StreamClass::View,
+                        claim: crate::tuner::EffectiveClaim::new(-1000, false),
+                        remaining_ms: 300_000,
+                        origin_node: local.node_id.clone(),
+                        visited_nodes: vec![local.node_id.clone()],
+                        hop_count: 0,
+                        max_hops: 3,
+                    },
+                    mux: route.mux,
+                    sid: None,
+                    dwell_secs: 30,
+                    spent_ms: 0,
+                };
+                if let Ok(reply) = client
+                    .collect_epg_metadata(&endpoint.address, &request)
+                    .await
+                {
+                    let records = reply.programs.into_iter().map(Into::into);
+                    crate::tuner::epg_collector::submit_metadata_records(records);
+                    return Ok(());
+                }
+            }
+        }
+        let _ = state;
+        Err("no authenticated remote metadata route responded".into())
     }
     async fn scan_one(
         &self,
@@ -621,6 +762,40 @@ mod tests {
         assert_eq!(percent, 0);
         let (percent, _) = cpu_percent_from_ticks(20, 150, 150, Some(previous));
         assert_eq!(percent, 90);
+    }
+
+    #[test]
+    fn execution_path_honors_local_and_remote_settings() {
+        let mut c = config();
+        c.allow_remote = false;
+        c.prefer_local = false;
+        c.remote_prefer_metadata_execution = true;
+        assert_eq!(
+            choose_execution_path(&c, false, true),
+            EpgExecutionPath::Local
+        );
+
+        c.allow_remote = true;
+        assert_eq!(
+            choose_execution_path(&c, false, true),
+            EpgExecutionPath::RemoteMetadata
+        );
+        c.remote_prefer_metadata_execution = false;
+        c.remote_allow_ts_transport = false;
+        assert_eq!(
+            choose_execution_path(&c, false, true),
+            EpgExecutionPath::Local
+        );
+        c.remote_allow_ts_transport = true;
+        assert_eq!(
+            choose_execution_path(&c, false, true),
+            EpgExecutionPath::RemoteTs
+        );
+        c.prefer_local = true;
+        assert_eq!(
+            choose_execution_path(&c, true, true),
+            EpgExecutionPath::Local
+        );
     }
 
     #[test]

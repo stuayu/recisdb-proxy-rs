@@ -160,6 +160,7 @@ pub enum EpgReasonCode {
     ScanFailed,
     NoCompatibleTuner,
     MuxLeaseUnavailable,
+    RemoteMetadataFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

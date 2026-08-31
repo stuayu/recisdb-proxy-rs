@@ -162,6 +162,15 @@ broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報
 `LocalMuxServer` は別系統の `MuxLeaseManager` を共有し、TTLまたはguard dropで同一
 (NID,TSID)の重複を防ぐ。
 
+経路の選択は純関数 `choose_execution_path()` が行い、`allow_remote` / `prefer_local` /
+`remote_prefer_metadata_execution` / `remote_allow_ts_transport` の4設定だけで決まる。
+`allow_remote=false` なら remote を選ばない。remote を選んだ場合、
+`remote_prefer_metadata_execution=true` なら TS を引かずに metadata RPC を使い、
+`remote_allow_ts_transport=false` のときは TS 転送経路を選ばない。remote 実行が失敗した
+ときは `RemoteMetadataFailed` を記録してローカル収集へフォールバックする。
+なお remote から TS を引く経路自体はまだ結線しておらず、現状の remote 実行は
+metadata のみである。
+
 スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
 スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を
 `coverage_until`へ反映する。状態APIの全体coverageは系統ごとの最小値であり、1系統だけ

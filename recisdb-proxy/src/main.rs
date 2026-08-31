@@ -849,6 +849,9 @@ async fn run_server(
             None => (None, None),
         }
     };
+    if let Some(node_state) = node_transport_for_web.clone() {
+        epg_scheduler.set_remote_state(node_state).await;
+    }
     tokio::spawn(async move {
         match web::start_web_server(
             web_listen_addr,
