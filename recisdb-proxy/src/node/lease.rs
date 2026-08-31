@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use recisdb_protocol::StreamClass;
@@ -17,6 +18,73 @@ use crate::tuner::EffectiveClaim;
 use super::frame::NodeTsFrame;
 use super::replay::{ReplayBudget, ReplayBuffer, ReplayError};
 use super::types::{LogicalMuxId, NodeId};
+
+/// A short-lived, connection-independent lock for one logical multiplex.
+/// This is deliberately separate from `RemoteLeaseManager`: stream leases
+/// own a tuner stream, while this lock serializes EPG work for one mux.
+pub struct MuxLeaseManager {
+    leases: StdMutex<HashMap<LogicalMuxId, (u64, Instant)>>,
+    ttl: Duration,
+    next_token: StdMutex<u64>,
+}
+
+pub struct MuxLeaseGuard {
+    manager: Arc<MuxLeaseManager>,
+    mux: LogicalMuxId,
+    token: u64,
+}
+
+impl MuxLeaseManager {
+    pub fn new(ttl: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            leases: StdMutex::new(HashMap::new()),
+            ttl,
+            next_token: StdMutex::new(0),
+        })
+    }
+
+    pub fn try_acquire(self: &Arc<Self>, mux: LogicalMuxId) -> Option<MuxLeaseGuard> {
+        let now = Instant::now();
+        let mut leases = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        leases.retain(|_, (_, expires)| *expires > now);
+        if leases.contains_key(&mux) {
+            return None;
+        }
+        let mut next = self.next_token.lock().unwrap_or_else(|e| e.into_inner());
+        *next = next.wrapping_add(1);
+        let token = *next;
+        leases.insert(mux, (token, now + self.ttl));
+        Some(MuxLeaseGuard {
+            manager: Arc::clone(self),
+            mux,
+            token,
+        })
+    }
+
+    pub fn reap_expired(&self) {
+        let now = Instant::now();
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (_, expires)| *expires > now);
+    }
+}
+
+impl Drop for MuxLeaseGuard {
+    fn drop(&mut self) {
+        let mut leases = self
+            .manager
+            .leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if leases
+            .get(&self.mux)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            leases.remove(&self.mux);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteLeaseId(String);
@@ -46,7 +114,6 @@ impl RemoteLeaseId {
     }
 }
 
-#[derive(Clone)]
 pub struct RemoteMuxLease {
     pub id: RemoteLeaseId,
     pub owner_node: NodeId,
@@ -59,6 +126,7 @@ pub struct RemoteMuxLease {
     pub replay: Arc<Mutex<ReplayBuffer>>,
     live_tx: broadcast::Sender<NodeTsFrame>,
     state: Arc<Mutex<LeaseTimes>>,
+    _mux_lease: Option<MuxLeaseGuard>,
 }
 
 struct LeaseTimes {
@@ -78,6 +146,7 @@ impl RemoteMuxLease {
         generation: u32,
         ttl: Duration,
         replay_budget: ReplayBudget,
+        mux_lease: Option<MuxLeaseGuard>,
     ) -> Self {
         let now = Instant::now();
         let (live_tx, _) = broadcast::channel(256);
@@ -100,6 +169,7 @@ impl RemoteMuxLease {
                 renewed_at: now,
                 expires_at: now + ttl,
             })),
+            _mux_lease: mux_lease,
         }
     }
 
@@ -184,6 +254,30 @@ impl RemoteLeaseManager {
         claim: EffectiveClaim,
         generation: u32,
     ) -> Arc<RemoteMuxLease> {
+        self.create_with_mux_lease(
+            owner_node,
+            route_id,
+            mux,
+            sid,
+            stream_class,
+            claim,
+            generation,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_with_mux_lease(
+        &self,
+        owner_node: NodeId,
+        route_id: String,
+        mux: LogicalMuxId,
+        sid: Option<u16>,
+        stream_class: StreamClass,
+        claim: EffectiveClaim,
+        generation: u32,
+        mux_lease: Option<MuxLeaseGuard>,
+    ) -> Arc<RemoteMuxLease> {
         let lease = Arc::new(RemoteMuxLease::new(
             owner_node,
             route_id,
@@ -194,6 +288,7 @@ impl RemoteLeaseManager {
             generation,
             self.policy.ttl(stream_class),
             self.policy.replay_budget,
+            mux_lease,
         ));
         self.leases
             .write()
@@ -249,6 +344,24 @@ mod tests {
     use super::*;
     use crate::node::{FrameFlags, NodeTsFrame};
     use bytes::Bytes;
+
+    #[test]
+    fn mux_lease_is_exclusive_and_releases() {
+        let manager = MuxLeaseManager::new(Duration::from_secs(60));
+        let mux = LogicalMuxId { nid: 1, tsid: 2 };
+        let lease = manager.try_acquire(mux).expect("first lease");
+        assert!(manager.try_acquire(mux).is_none());
+        drop(lease);
+        assert!(manager.try_acquire(mux).is_some());
+    }
+
+    #[test]
+    fn expired_mux_lease_can_be_reclaimed() {
+        let manager = MuxLeaseManager::new(Duration::ZERO);
+        let mux = LogicalMuxId { nid: 3, tsid: 4 };
+        let _first = manager.try_acquire(mux).expect("first lease");
+        assert!(manager.try_acquire(mux).is_some());
+    }
 
     #[tokio::test]
     async fn lease_lifetime_is_not_bound_to_transport_connection() {

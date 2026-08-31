@@ -4,6 +4,7 @@
 //! arbitration still belongs to `tuner::acquire::acquire`, which owns the
 //! `SlotPermit` and all policy/preemption side effects.
 
+use crate::node::{MuxLeaseGuard, MuxLeaseManager};
 use crate::{
     database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState},
     server::listener::DatabaseHandle,
@@ -125,15 +126,21 @@ pub struct EpgScanScheduler {
     pool: Arc<TunerPool>,
     active: Arc<AtomicUsize>,
     stopped: Arc<Mutex<bool>>,
+    mux_leases: Arc<MuxLeaseManager>,
 }
 
 impl EpgScanScheduler {
-    pub fn new(database: DatabaseHandle, pool: Arc<TunerPool>) -> Self {
+    pub fn new(
+        database: DatabaseHandle,
+        pool: Arc<TunerPool>,
+        mux_leases: Arc<MuxLeaseManager>,
+    ) -> Self {
         Self {
             database,
             pool,
             active: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(Mutex::new(false)),
+            mux_leases,
         }
     }
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -193,6 +200,19 @@ impl EpgScanScheduler {
             })
         };
         let Some((driver, channel)) = candidate else {
+            return Ok(());
+        };
+        let mux = crate::node::LogicalMuxId {
+            nid: channel.nid,
+            tsid: channel.tsid,
+        };
+        let Some(_mux_lease): Option<MuxLeaseGuard> = self.mux_leases.try_acquire(mux) else {
+            let db = self.database.lock().await;
+            let reason = epg_reason(
+                EpgReasonCode::MuxLeaseUnavailable,
+                serde_json::json!({"network_id": channel.nid, "tsid": channel.tsid}),
+            );
+            db.record_epg_deferred(channel.nid, channel.tsid, &reason, true)?;
             return Ok(());
         };
         let state = states

@@ -52,6 +52,18 @@ pub fn set_global_sender(tx: mpsc::UnboundedSender<ProgramUpsert>) -> bool {
     EPG_SENDER.set(tx).is_ok()
 }
 
+/// Forward rows returned by an authenticated remote metadata scan through the
+/// same batching writer as locally parsed EIT.
+pub fn submit_metadata_records(records: impl IntoIterator<Item = ProgramUpsert>) -> usize {
+    let Some(tx) = global_sender() else {
+        return 0;
+    };
+    records
+        .into_iter()
+        .filter(|record| tx.send(record.clone()).is_ok())
+        .count()
+}
+
 fn global_sender() -> Option<&'static mpsc::UnboundedSender<ProgramUpsert>> {
     EPG_SENDER.get()
 }
@@ -82,6 +94,8 @@ pub struct EpgCollector {
     /// TS bytes carried across calls. Reader chunks are not required to end
     /// on a 188-byte packet boundary.
     pending_ts: Vec<u8>,
+    metadata_only: bool,
+    metadata_records: Vec<ProgramUpsert>,
     #[cfg(test)]
     parsed_events: Vec<u16>,
 }
@@ -92,9 +106,24 @@ impl EpgCollector {
             collector: SectionCollector::new(),
             versions: HashMap::new(),
             pending_ts: Vec::new(),
+            metadata_only: false,
+            metadata_records: Vec::new(),
             #[cfg(test)]
             parsed_events: Vec::new(),
         }
+    }
+
+    /// Collector for the authenticated remote-metadata RPC. It returns parsed
+    /// rows to the caller and never forwards them through this node's writer.
+    pub fn new_metadata() -> Self {
+        Self {
+            metadata_only: true,
+            ..Self::new()
+        }
+    }
+
+    pub fn drain_metadata_records(&mut self) -> Vec<ProgramUpsert> {
+        std::mem::take(&mut self.metadata_records)
     }
 
     /// Feed a raw chunk of TS packets (as read from the tuner). Best-effort:
@@ -216,14 +245,8 @@ impl EpgCollector {
         self.parsed_events
             .extend(eit.events.iter().map(|event| event.event_id));
 
-        let Some(tx) = global_sender() else {
-            trace!(
-                "[EpgCollector] no writer installed, dropping {} event(s) for sid={}",
-                eit.events.len(),
-                eit.service_id
-            );
-            return;
-        };
+        let tx = global_sender();
+        let event_count = eit.events.len();
 
         let now = chrono::Utc::now().timestamp();
         for event in eit.events {
@@ -240,6 +263,18 @@ impl EpgCollector {
                 extended: non_empty(event.extended),
                 genre: event.genre.map(|g| g as i64),
                 updated_at: now,
+            };
+            if self.metadata_only {
+                self.metadata_records.push(record);
+                continue;
+            }
+            let Some(tx) = tx else {
+                trace!(
+                    "[EpgCollector] no writer installed, dropping {} event(s) for sid={}",
+                    event_count,
+                    eit.service_id
+                );
+                break;
             };
             if tx.send(record).is_err() {
                 debug!(

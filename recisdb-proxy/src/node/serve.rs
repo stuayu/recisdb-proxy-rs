@@ -21,16 +21,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use recisdb_protocol::StreamClass;
+use serde::{Deserialize, Serialize};
 
+use crate::database::ProgramUpsert;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::tuner::channel_key::ChannelKeySpec;
+use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::shared::TunerUsage;
 use crate::tuner::{ChannelKey, TunerPool};
 
 use super::frame::{FrameFlags, NodeTsFrame, MAX_NODE_TS_PAYLOAD};
 use super::identity::NodeIdentity;
-use super::lease::{RemoteLeaseManager, RemoteMuxLease};
+use super::lease::{MuxLeaseManager, RemoteLeaseManager, RemoteMuxLease};
 use super::types::{HopError, LogicalMuxId, RequestContext};
 
 /// TS packets per node frame. 188 * 1000 ≈ 188 KB, comfortably under
@@ -49,6 +52,8 @@ pub enum ServeError {
     Hop(#[from] HopError),
     #[error("no local reception route for NID=0x{:04X} TSID=0x{:04X}", .0.nid, .0.tsid)]
     NoRoute(LogicalMuxId),
+    #[error("EPG mux is already leased: NID=0x{:04X} TSID=0x{:04X}", .0.nid, .0.tsid)]
+    MuxLeaseUnavailable(LogicalMuxId),
     /// Rendered rather than wrapped: `AcquireError` is crate-private, and a
     /// peer only needs to know that no local tuner could be given.
     #[error("local tuner unavailable: {0}")]
@@ -57,12 +62,72 @@ pub enum ServeError {
     Database(String),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteEpgMetadataReply {
+    pub programs: Vec<ProgramUpsertWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramUpsertWire {
+    pub nid: u16,
+    pub sid: u16,
+    pub tsid: u16,
+    pub event_id: u16,
+    pub start_at: i64,
+    pub duration_secs: i64,
+    pub free_ca_mode: bool,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub extended: Option<String>,
+    pub genre: Option<i64>,
+    pub updated_at: i64,
+}
+
+impl From<ProgramUpsert> for ProgramUpsertWire {
+    fn from(value: ProgramUpsert) -> Self {
+        Self {
+            nid: value.nid,
+            sid: value.sid,
+            tsid: value.tsid,
+            event_id: value.event_id,
+            start_at: value.start_at,
+            duration_secs: value.duration_secs,
+            free_ca_mode: value.free_ca_mode,
+            name: value.name,
+            description: value.description,
+            extended: value.extended,
+            genre: value.genre,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<ProgramUpsertWire> for ProgramUpsert {
+    fn from(value: ProgramUpsertWire) -> Self {
+        Self {
+            nid: value.nid,
+            sid: value.sid,
+            tsid: value.tsid,
+            event_id: value.event_id,
+            start_at: value.start_at,
+            duration_secs: value.duration_secs,
+            free_ca_mode: value.free_ca_mode,
+            name: value.name,
+            description: value.description,
+            extended: value.extended,
+            genre: value.genre,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
 /// Turns peer lease requests into local tuner acquisitions.
 pub struct LocalMuxServer {
     identity: NodeIdentity,
     tuner_pool: Arc<TunerPool>,
     database: DatabaseHandle,
     leases: Arc<RemoteLeaseManager>,
+    mux_leases: Arc<MuxLeaseManager>,
 }
 
 impl LocalMuxServer {
@@ -71,12 +136,14 @@ impl LocalMuxServer {
         tuner_pool: Arc<TunerPool>,
         database: DatabaseHandle,
         leases: Arc<RemoteLeaseManager>,
+        mux_leases: Arc<MuxLeaseManager>,
     ) -> Self {
         Self {
             identity,
             tuner_pool,
             database,
             leases,
+            mux_leases,
         }
     }
 
@@ -129,6 +196,10 @@ impl LocalMuxServer {
     ) -> Result<Arc<RemoteMuxLease>, ServeError> {
         context.enter_node(&self.identity.node_id, spent_ms)?;
 
+        let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
+            return Err(ServeError::MuxLeaseUnavailable(mux));
+        };
+
         let candidates = self.local_candidates(mux, sid).await?;
         if candidates.is_empty() {
             return Err(ServeError::NoRoute(mux));
@@ -159,7 +230,7 @@ impl LocalMuxServer {
 
         let lease = self
             .leases
-            .create(
+            .create_with_mux_lease(
                 self.identity.node_id.clone(),
                 route_id_for(&outcome.key),
                 mux,
@@ -167,6 +238,7 @@ impl LocalMuxServer {
                 context.stream_class,
                 context.claim,
                 INITIAL_GENERATION,
+                Some(_mux_lease),
             )
             .await;
 
@@ -204,6 +276,63 @@ impl LocalMuxServer {
             outcome.key
         );
         Ok(lease)
+    }
+
+    /// Parse EIT on this node and return only program rows. TS never crosses
+    /// the node boundary on this endpoint.
+    pub async fn collect_epg_metadata(
+        &self,
+        context: &mut RequestContext,
+        mux: LogicalMuxId,
+        sid: Option<u16>,
+        spent_ms: u64,
+        dwell_secs: u64,
+    ) -> Result<Vec<ProgramUpsert>, ServeError> {
+        context.enter_node(&self.identity.node_id, spent_ms)?;
+        let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
+            return Err(ServeError::MuxLeaseUnavailable(mux));
+        };
+        let candidates = self.local_candidates(mux, sid).await?;
+        if candidates.is_empty() {
+            return Err(ServeError::NoRoute(mux));
+        }
+        let outcome = acquire(
+            &self.tuner_pool,
+            &self.database,
+            AcquireRequest {
+                candidates,
+                priority: context.claim.priority,
+                exclusive: context.claim.exclusive,
+                bondriver_version: 2,
+                carried_permit: None,
+                warm: None,
+                own_key: None,
+                own_key_will_free_slot: false,
+                client_host: format!("node-epg:{}", context.origin_node),
+            },
+        )
+        .await
+        .map_err(|e: AcquireError| ServeError::Unavailable(e.to_string()))?;
+        let mut subscription = outcome.tuner.subscribe_with_claim_class(
+            context.claim.priority,
+            context.claim.exclusive,
+            TunerUsage::EpgActiveScan,
+        );
+        let mut collector = EpgCollector::new_metadata();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(dwell_secs.clamp(1, 300));
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), subscription.recv())
+                .await
+            {
+                Ok(Ok(chunk)) => collector.process_ts_chunk(&chunk),
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        Ok(collector.drain_metadata_records())
     }
 }
 

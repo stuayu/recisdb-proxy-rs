@@ -681,9 +681,12 @@ async fn run_server(
     // Active EPG collection reads runtime settings from DB on every
     // evaluation. It is intentionally independent from the channel scan
     // scheduler and starts even when channel scanning is disabled.
+    let epg_mux_leases =
+        recisdb_proxy::node::MuxLeaseManager::new(std::time::Duration::from_secs(60));
     let epg_scheduler = Arc::new(EpgScanScheduler::new(
         db.clone(),
         Arc::clone(server.tuner_pool()),
+        Arc::clone(&epg_mux_leases),
     ));
     let _epg_scheduler_handle = Arc::clone(&epg_scheduler).start();
 
@@ -792,6 +795,7 @@ async fn run_server(
                     Arc::clone(server.tuner_pool()),
                     db.clone(),
                     Arc::clone(&leases),
+                    Arc::clone(&epg_mux_leases),
                 ));
                 // Expired leases are normally noticed by their own pump
                 // (it re-checks the lease every second and stops when it

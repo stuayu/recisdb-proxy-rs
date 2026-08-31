@@ -157,8 +157,10 @@ effective値を作り、API/UIはeffective値とsourceを表示する。現在�
 subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、idle timeout、CPU limit、
 同時数を適用し、開始/完了/失敗をstate/historyへ記録する。EpgWriterのflush後とscheduler
 判定前にprogramsからcoverage_until/last_eit_received_atを再集計する。remote node側metadata
-実行とnode leaseによる同一(NID,TSID)重複排除は未接続で、remote利用は延期対象。現行の
-`/node/v3/lease` はTSフレーム用で、EPG metadata専用RPCは提供していない。
+実行は認証済み `POST /node/v3/epg/metadata` を使う。remote側は通常の `acquire()` と
+broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報だけ返す。schedulerと
+`LocalMuxServer` は別系統の `MuxLeaseManager` を共有し、TTLまたはguard dropで同一
+(NID,TSID)の重複を防ぐ。
 
 スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
 スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を

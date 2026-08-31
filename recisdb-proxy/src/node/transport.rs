@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use super::frame::{FrameFlags, NodeTsFrame};
 use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 use super::lease::{RemoteLeaseId, RemoteLeaseManager};
-use super::serve::{LocalMuxServer, ServeError};
+use super::serve::{LocalMuxServer, ProgramUpsertWire, RemoteEpgMetadataReply, ServeError};
 use super::store::{NodeStore, StoredNode};
 use super::types::{
     LogicalMuxId, NodeEndpoint, NodeId, ReceptionRouteAdvertisement, RequestContext,
@@ -136,6 +136,22 @@ pub struct OpenLeaseReply {
     /// The context as this node saw it after `enter_node`, so the caller can
     /// see the remaining budget and hop count actually charged.
     pub context: RequestContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteEpgMetadataRequest {
+    pub context: RequestContext,
+    pub mux: LogicalMuxId,
+    #[serde(default)]
+    pub sid: Option<u16>,
+    #[serde(default = "default_epg_dwell_secs")]
+    pub dwell_secs: u64,
+    #[serde(default)]
+    pub spent_ms: u64,
+}
+
+fn default_epg_dwell_secs() -> u64 {
+    30
 }
 
 /// What the redeeming node sends to `/node/v3/pair`.
@@ -322,6 +338,7 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/lease/:id/renew", post(renew_lease))
         .route("/node/v3/lease/:id", delete(release_lease))
         .route("/node/v3/stream/:id", get(stream_lease))
+        .route("/node/v3/epg/metadata", post(epg_metadata))
         .with_state(state)
 }
 
@@ -552,6 +569,9 @@ async fn open_lease(
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
         Err(e @ ServeError::NoRoute(_)) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e @ ServeError::MuxLeaseUnavailable(_)) => {
+            (StatusCode::CONFLICT, e.to_string()).into_response()
+        }
         Err(e @ ServeError::Unavailable(_)) => {
             log::info!("[node] lease request from {peer} could not be served: {e}");
             (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
@@ -559,6 +579,45 @@ async fn open_lease(
         Err(e @ ServeError::Database(_)) => {
             log::error!("[node] lease request from {peer} failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn epg_metadata(
+    State(state): State<Arc<NodeTransportState>>,
+    headers: HeaderMap,
+    Json(payload): Json<RemoteEpgMetadataRequest>,
+) -> Response {
+    let Ok(peer) = state.authorize(&headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(server) = state.mux_server.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut context = payload.context;
+    match server
+        .collect_epg_metadata(
+            &mut context,
+            payload.mux,
+            payload.sid,
+            payload.spent_ms,
+            payload.dwell_secs,
+        )
+        .await
+    {
+        Ok(programs) => Json(RemoteEpgMetadataReply {
+            programs: programs.into_iter().map(ProgramUpsertWire::from).collect(),
+        })
+        .into_response(),
+        Err(e @ ServeError::MuxLeaseUnavailable(_)) => {
+            log::info!("[node] EPG metadata request from {peer} deferred: {e}");
+            (StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        Err(e @ ServeError::NoRoute(_)) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e @ ServeError::Hop(_)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            log::warn!("[node] EPG metadata request from {peer} failed: {e}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
@@ -817,6 +876,25 @@ impl NodeTransportClient {
         self.request(
             reqwest::Method::POST,
             format!("{}/node/v3/lease", base.trim_end_matches('/')),
+        )
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+    }
+
+    /// Ask a paired node to parse EIT locally. Only metadata rows are returned;
+    /// no TS endpoint is involved.
+    pub async fn collect_epg_metadata(
+        &self,
+        base: &str,
+        request: &RemoteEpgMetadataRequest,
+    ) -> Result<RemoteEpgMetadataReply, reqwest::Error> {
+        self.request(
+            reqwest::Method::POST,
+            format!("{}/node/v3/epg/metadata", base.trim_end_matches('/')),
         )
         .json(request)
         .send()

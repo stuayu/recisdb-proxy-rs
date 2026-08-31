@@ -159,6 +159,7 @@ pub enum EpgReasonCode {
     NotDue,
     ScanFailed,
     NoCompatibleTuner,
+    MuxLeaseUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

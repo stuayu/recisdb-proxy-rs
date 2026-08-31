@@ -2,12 +2,12 @@
 
 ## EPG remote execution
 
-`remote_prefer_metadata_execution` 有効時はremote node側のEIT解析を優先し、
-`remote_allow_ts_transport` 無効時は放送TSをWAN転送しない。現行の`/node/v3/lease`は
-TSフレーム用で、番組情報を返すmetadata RPCとEPG専用mux leaseは未提供。remote scanを
-実装するには、認証済みpeerへ`(network_id, tsid)`を渡し、remote側で解析した
-`ProgramUpsert`相当の結果を返すRPC、およびその間だけ保持するmux leaseが必要。
-そのため現状はremote scanを延期し、無認証TS転送を行わない。
+`remote_prefer_metadata_execution` 有効時は認証済み
+`POST /node/v3/epg/metadata` でremote node側のEIT解析を使う。remote側は通常の
+`acquire()` とbroadcast購読側の `EpgCollector::new_metadata()` を使い、放送TSではなく
+`ProgramUpsert`相当の結果だけを返す。scheduler と `LocalMuxServer` はストリーム用とは
+別の `MuxLeaseManager` で `(network_id, tsid)` を排他し、TTLまたはguard dropで解放する。
+`remote_allow_ts_transport` が無効でも、このmetadata経路はTS転送を行わない。
 
 ## Dashboard setup flow
 

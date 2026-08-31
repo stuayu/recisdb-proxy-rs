@@ -32,7 +32,9 @@ pub use discovery::{
 };
 pub use frame::{FrameFlags, NodeTsFrame};
 pub use identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
-pub use lease::{LeasePolicy, RemoteLeaseId, RemoteLeaseManager, RemoteMuxLease};
+pub use lease::{
+    LeasePolicy, MuxLeaseGuard, MuxLeaseManager, RemoteLeaseId, RemoteLeaseManager, RemoteMuxLease,
+};
 pub use path::{
     score_path, select_best_path, PathHealth, PathPolicy, PathScore, PathState, TransportPath,
 };
@@ -47,6 +49,7 @@ pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteR
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};
 pub use transport::{
     serve_h2c, LeaseStreamError, NodeCapabilities, NodeHello, NodeTransportClient,
-    NodeTransportState, OpenLeaseReply, OpenLeaseRequest, PAIRING_CODE_TTL,
+    NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgMetadataRequest,
+    PAIRING_CODE_TTL,
 };
 pub use types::*;
