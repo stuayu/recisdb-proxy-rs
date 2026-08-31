@@ -147,7 +147,8 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 自動取得のRuntime設定は `epg_global_settings`、`epg_scan_presets`、
 `physical_tuner_epg_settings` を正とする。設定ファイルには置かない。Migration 027が
 singleton global、system preset、scan state/history/retentionの初期行を冪等に作る。Migration
-028はglobalのpreset選択、029はcoverage集計用indexを追加する。
+028はglobalのpreset選択、029はcoverage集計用index、030はスキャン状態を
+(network_id, tsid)単位へ移行する。旧singletonの状態行だけは破棄し、番組・設定データは保持する。
 `database/epg_settings.rs` のresolverが global → preset → physical tuner override の順で
 effective値を作り、API/UIはeffective値とsourceを表示する。現在の永続チューナーidentityは
 既存 `bon_drivers.id`（`/api/tuners/:id`）であり、tuner instance用の新identityは追加しない。
@@ -157,6 +158,13 @@ subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、id
 同時数を適用し、開始/完了/失敗をstate/historyへ記録する。EpgWriterのflush後とscheduler
 判定前にprogramsからcoverage_until/last_eit_received_atを再集計する。remote node側metadata
 実行とnode leaseによる同一(NID,TSID)重複排除は未接続で、remote利用は延期対象。
+
+スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
+スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を
+`coverage_until`へ反映する。状態APIの全体coverageは系統ごとの最小値であり、1系統だけ
+埋まった状態を全体正常とは扱わない。スケジューラは全BonDriverの有効チャンネルを重複排除し、
+coverage不足・stale・failure/backoffを使って次のTSを選ぶ。対象選択は純粋関数で、固定の
+先頭チャンネルには依存しない。
 
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。

@@ -264,6 +264,10 @@ impl Database {
             "029_epg_coverage_index",
             Database::migration_029_epg_coverage_index,
         ),
+        (
+            "030_epg_scan_states_by_multiplex",
+            Database::migration_030_epg_scan_states_by_multiplex,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -283,6 +287,27 @@ impl Database {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_programs_epg_coverage
              ON programs(nid, tsid, start_at, duration_secs)",
+        )?;
+        Ok(())
+    }
+
+    fn migration_030_epg_scan_states_by_multiplex(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS epg_scan_states;
+             CREATE TABLE epg_scan_states (
+                 network_id INTEGER NOT NULL,
+                 tsid INTEGER NOT NULL,
+                 last_scan_started_at INTEGER,
+                 last_scan_completed_at INTEGER,
+                 last_eit_received_at INTEGER,
+                 coverage_until INTEGER,
+                 next_eligible_at INTEGER,
+                 last_tuner_id INTEGER,
+                 last_node_id TEXT,
+                 failure_count INTEGER NOT NULL DEFAULT 0,
+                 last_failure_reason TEXT,
+                 PRIMARY KEY(network_id, tsid)
+             );",
         )?;
         Ok(())
     }

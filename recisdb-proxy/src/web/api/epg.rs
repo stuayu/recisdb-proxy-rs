@@ -151,21 +151,21 @@ pub async fn get_epg_status(
     State(s): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = s.database.lock().await;
-    let state: serde_json::Value = db.connection().query_row(
-        "SELECT last_scan_started_at,last_scan_completed_at,last_eit_received_at,coverage_until,next_eligible_at,last_tuner_id,last_node_id,failure_count,last_failure_reason FROM epg_scan_states WHERE id=1", [],
-        |r| Ok(json!({"lastScanStartedAt":r.get::<_,Option<i64>>(0)?,"lastScanCompletedAt":r.get::<_,Option<i64>>(1)?,"lastEitReceivedAt":r.get::<_,Option<i64>>(2)?,"coverageUntil":r.get::<_,Option<i64>>(3)?,"nextEligibleAt":r.get::<_,Option<i64>>(4)?,"lastTunerId":r.get::<_,Option<i64>>(5)?,"lastNodeId":r.get::<_,Option<String>>(6)?,"failureCount":r.get::<_,i64>(7)?,"lastFailureReason":r.get::<_,Option<String>>(8)?})),
-    )?;
+    let states = db.get_epg_scan_states()?;
+    let minimum_coverage = states.iter().filter_map(|state| state.coverage_until).min();
     let active: bool = db.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM epg_scan_history WHERE status='running')",
         [],
         |r| r.get::<_, i64>(0),
     )? != 0;
-    let reason = state
-        .get("lastFailureReason")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let reason = states
+        .iter()
+        .find_map(|state| state.last_failure_reason.clone());
+    let states_json =
+        serde_json::to_value(states).map_err(|e| ApiError::internal(e.to_string()))?;
+    let cpu_source = crate::scheduler::epg_scheduler::cpu_limit_source();
     Ok(Json(
-        json!({"success":true,"state":state,"active":active,"reason":reason}),
+        json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source}}),
     ))
 }
 

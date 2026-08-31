@@ -42,9 +42,11 @@ CREATE TABLE IF NOT EXISTS physical_tuner_epg_settings (
  updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')), FOREIGN KEY(preset_id) REFERENCES epg_scan_presets(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS epg_scan_states (
- id INTEGER PRIMARY KEY CHECK(id=1), last_scan_started_at INTEGER, last_scan_completed_at INTEGER,
+ network_id INTEGER NOT NULL, tsid INTEGER NOT NULL,
+ last_scan_started_at INTEGER, last_scan_completed_at INTEGER,
  last_eit_received_at INTEGER, coverage_until INTEGER, next_eligible_at INTEGER, last_tuner_id INTEGER,
- last_node_id TEXT, failure_count INTEGER NOT NULL DEFAULT 0, last_failure_reason TEXT
+ last_node_id TEXT, failure_count INTEGER NOT NULL DEFAULT 0, last_failure_reason TEXT,
+ PRIMARY KEY(network_id, tsid)
 );
 CREATE TABLE IF NOT EXISTS epg_scan_history (
  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, finished_at INTEGER,
@@ -124,6 +126,22 @@ pub struct PhysicalTunerEpgSettings {
     pub reserve_for_recording_override: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpgScanState {
+    pub network_id: u16,
+    pub tsid: u16,
+    pub last_scan_started_at: Option<i64>,
+    pub last_scan_completed_at: Option<i64>,
+    pub last_eit_received_at: Option<i64>,
+    pub coverage_until: Option<i64>,
+    pub next_eligible_at: Option<i64>,
+    pub last_tuner_id: Option<i64>,
+    pub last_node_id: Option<String>,
+    pub failure_count: i64,
+    pub last_failure_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveEpgScanConfig {
     pub effective: EpgGlobalSettings,
@@ -145,7 +163,6 @@ pub(crate) fn seed_defaults(c: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO epg_global_settings(id) VALUES(1)",
         [],
     )?;
-    c.execute("INSERT OR IGNORE INTO epg_scan_states(id) VALUES(1)", [])?;
     c.execute("INSERT OR IGNORE INTO epg_scan_retention(id) VALUES(1)", [])?;
     for (name, desc) in [
         ("標準", "録画・視聴を優先しながら自動更新"),
@@ -165,17 +182,24 @@ pub(crate) fn seed_defaults(c: &Connection) -> Result<()> {
 }
 
 impl Database {
-    pub fn epg_scan_started(&self, tuner_id: i64, reason: &str) -> Result<i64> {
+    pub fn epg_scan_started(
+        &self,
+        tuner_id: i64,
+        network_id: u16,
+        tsid: u16,
+        reason: &str,
+    ) -> Result<i64> {
         let now = chrono::Utc::now().timestamp();
-        self.connection().execute("UPDATE epg_scan_states SET last_scan_started_at=?1,last_tuner_id=?2,last_failure_reason=NULL WHERE id=1", params![now,tuner_id])?;
-        self.connection().execute("INSERT INTO epg_scan_history(started_at,status,reason,physical_tuner_id) VALUES(?1,'running',?2,?3)", params![now,reason,tuner_id])?;
+        self.connection().execute("INSERT INTO epg_scan_states(network_id,tsid,last_scan_started_at,last_tuner_id,last_failure_reason) VALUES(?1,?2,?3,?4,NULL) ON CONFLICT(network_id,tsid) DO UPDATE SET last_scan_started_at=?3,last_tuner_id=?4,last_failure_reason=NULL", params![network_id,tsid,now,tuner_id])?;
+        self.connection().execute("INSERT INTO epg_scan_history(started_at,status,reason,physical_tuner_id,network_id,tsid) VALUES(?1,'running',?2,?3,?4,?5)", params![now,reason,tuner_id,network_id,tsid])?;
         Ok(self.connection().last_insert_rowid())
     }
     pub fn epg_scan_finished(
         &self,
         history_id: i64,
         status: &str,
-        tuner_id: i64,
+        network_id: u16,
+        tsid: u16,
         error: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
@@ -184,9 +208,8 @@ impl Database {
             params![now, status, error, history_id],
         )?;
         let failure = if status == "completed" { 0 } else { 1 };
-        self.connection().execute("UPDATE epg_scan_states SET last_scan_completed_at=?1,failure_count=CASE WHEN ?2=0 THEN 0 ELSE failure_count+1 END,last_failure_reason=?3,next_eligible_at=?1+60 WHERE id=1",params![now,failure,error])?;
+        self.connection().execute("UPDATE epg_scan_states SET last_scan_completed_at=?1,failure_count=CASE WHEN ?2=0 THEN 0 ELSE failure_count+1 END,last_failure_reason=?3,next_eligible_at=?1+60 WHERE network_id=?4 AND tsid=?5",params![now,failure,error,network_id,tsid])?;
         self.connection().execute("DELETE FROM epg_scan_history WHERE id NOT IN (SELECT id FROM epg_scan_history ORDER BY started_at DESC LIMIT (SELECT max_rows FROM epg_scan_retention WHERE id=1)) OR started_at < ?1-(SELECT max_age_days FROM epg_scan_retention WHERE id=1)*86400",[now])?;
-        let _ = tuner_id;
         Ok(())
     }
     pub fn epg_last_event_time(&self) -> Result<Option<i64>> {
@@ -198,23 +221,49 @@ impl Database {
     /// Reconcile state with rows actually retained in `programs`.
     /// Called after writer flushes, never from the reader loop.
     pub fn refresh_epg_coverage(&self) -> Result<Option<i64>> {
-        let (coverage, last_event): (Option<i64>, Option<i64>) = self.connection().query_row(
-            "SELECT MAX(start_at + duration_secs), MAX(updated_at) FROM programs",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        self.connection().execute(
-            "UPDATE epg_scan_states SET coverage_until=?1,last_eit_received_at=?2 WHERE id=1",
-            params![coverage, last_event],
-        )?;
-        Ok(coverage)
-    }
-    pub fn epg_next_eligible(&self) -> Result<Option<i64>> {
-        Ok(self.connection().query_row(
-            "SELECT next_eligible_at FROM epg_scan_states WHERE id=1",
+        let coverage: Option<i64> = self.connection().query_row(
+            "SELECT MAX(start_at + duration_secs) FROM programs",
             [],
             |r| r.get(0),
-        )?)
+        )?;
+        let configured: Vec<(i64, i64)> = self
+            .connection()
+            .prepare("SELECT DISTINCT nid,tsid FROM channels")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (nid, tsid) in configured {
+            self.connection().execute(
+                "INSERT INTO epg_scan_states(network_id,tsid) VALUES(?1,?2) ON CONFLICT(network_id,tsid) DO NOTHING",
+                params![nid, tsid],
+            )?;
+        }
+        let grouped: Vec<_> = self.connection().prepare("SELECT nid,tsid,MAX(start_at + duration_secs),MAX(updated_at) FROM programs GROUP BY nid,tsid")?.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<i64>>(2)?, r.get::<_,Option<i64>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (nid, tsid, until, updated) in grouped {
+            self.connection().execute("INSERT INTO epg_scan_states(network_id,tsid,coverage_until,last_eit_received_at) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,tsid) DO UPDATE SET coverage_until=?3,last_eit_received_at=?4", params![nid,tsid,until,updated])?;
+        }
+        self.connection().execute("UPDATE epg_scan_states SET coverage_until=NULL,last_eit_received_at=NULL WHERE NOT EXISTS (SELECT 1 FROM programs p WHERE p.nid=epg_scan_states.network_id AND p.tsid=epg_scan_states.tsid)", [])?;
+        Ok(coverage)
+    }
+    pub fn get_epg_scan_states(&self) -> Result<Vec<EpgScanState>> {
+        let mut stmt = self.connection().prepare("SELECT network_id,tsid,last_scan_started_at,last_scan_completed_at,last_eit_received_at,coverage_until,next_eligible_at,last_tuner_id,last_node_id,failure_count,last_failure_reason FROM epg_scan_states ORDER BY network_id,tsid")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(EpgScanState {
+                    network_id: r.get::<_, i64>(0)? as u16,
+                    tsid: r.get::<_, i64>(1)? as u16,
+                    last_scan_started_at: r.get(2)?,
+                    last_scan_completed_at: r.get(3)?,
+                    last_eit_received_at: r.get(4)?,
+                    coverage_until: r.get(5)?,
+                    next_eligible_at: r.get(6)?,
+                    last_tuner_id: r.get(7)?,
+                    last_node_id: r.get(8)?,
+                    failure_count: r.get(9)?,
+                    last_failure_reason: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
     pub fn get_epg_global_settings(&self) -> Result<EpgGlobalSettings> {
         self.connection().query_row("SELECT enabled,scheduler_interval_secs,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,startup_delay_secs,startup_jitter_secs,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,max_concurrent_scans,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport,selected_preset_id FROM epg_global_settings WHERE id=1",[],|r|Ok(EpgGlobalSettings{enabled:r.get::<_,i64>(0)?!=0,scheduler_interval_secs:r.get(1)?,target_refresh_secs:r.get(2)?,max_stale_secs:r.get(3)?,min_future_coverage_hours:r.get(4)?,target_future_coverage_hours:r.get(5)?,startup_delay_secs:r.get(6)?,startup_jitter_secs:r.get(7)?,min_dwell_secs:r.get(8)?,normal_dwell_secs:r.get(9)?,max_dwell_secs:r.get(10)?,idle_section_timeout_secs:r.get(11)?,max_concurrent_scans:r.get(12)?,reserve_tuners:r.get::<_,i64>(13)?!=0,prefer_local:r.get::<_,i64>(14)?!=0,allow_remote:r.get::<_,i64>(15)?!=0,preemptible:r.get::<_,i64>(16)?!=0,cpu_soft_limit_percent:r.get(17)?,cpu_hard_limit_percent:r.get(18)?,remote_prefer_metadata_execution:r.get::<_,i64>(19)?!=0,remote_allow_ts_transport:r.get::<_,i64>(20)?!=0,selected_preset_id:r.get(21)?})).map_err(Into::into)
@@ -387,7 +436,7 @@ mod tests {
         assert_eq!(
             db.connection()
                 .query_row(
-                    "SELECT coverage_until FROM epg_scan_states WHERE id=1",
+                    "SELECT coverage_until FROM epg_scan_states WHERE network_id=1 AND tsid=3",
                     [],
                     |r| { r.get::<_, Option<i64>>(0) }
                 )

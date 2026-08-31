@@ -5,7 +5,7 @@
 //! `SlotPermit` and all policy/preemption side effects.
 
 use crate::{
-    database::{BonDriverRecord, ChannelRecord, EpgGlobalSettings},
+    database::{EpgGlobalSettings, EpgScanState},
     server::listener::DatabaseHandle,
     tuner::{
         acquire::{self, AcquireRequest},
@@ -54,7 +54,7 @@ pub fn decide(
     let target_covered =
         coverage_until.is_some_and(|at| at >= now + config.target_future_coverage_hours * 3600);
     let fresh = last_eit_received_at.is_some_and(|at| at + config.max_stale_secs > now);
-    if target_covered && fresh || next.is_some_and(|at| at > now) {
+    if (target_covered && fresh) || next.is_some_and(|at| at > now) {
         return EpgScanDecision::NotDue;
     }
     EpgScanDecision::Start
@@ -98,44 +98,65 @@ impl EpgScanScheduler {
         }
     }
     async fn evaluate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (config, next, coverage, last_event) = {
+        let (config, states) = {
             let db = self.database.lock().await;
-            let coverage = db.refresh_epg_coverage()?;
-            let last_event = db.epg_last_event_time()?;
-            (
-                db.get_epg_global_settings()?,
-                db.epg_next_eligible()?,
-                coverage,
-                last_event,
-            )
+            db.refresh_epg_coverage()?;
+            (db.get_epg_global_settings()?, db.get_epg_scan_states()?)
         };
-        let decision = decide(
-            &config,
-            self.active.load(Ordering::SeqCst),
-            cpu_percent(),
-            chrono::Utc::now().timestamp(),
-            next,
-            coverage,
-            last_event,
-        );
-        if decision != EpgScanDecision::Start {
-            return Ok(());
-        }
+        let now = chrono::Utc::now().timestamp();
         let candidate = {
             let db = self.database.lock().await;
             let drivers = db.get_all_bon_drivers()?;
-            first_candidate(&db, &drivers)
+            let mut targets = Vec::new();
+            for driver in &drivers {
+                for channel in db.get_enabled_channels_by_bon_driver(driver.id)? {
+                    if targets.iter().any(|target: &EpgTarget| {
+                        target.network_id == channel.nid && target.tsid == channel.tsid
+                    }) {
+                        continue;
+                    }
+                    let state = states.iter().find(|state| {
+                        state.network_id == channel.nid && state.tsid == channel.tsid
+                    });
+                    targets.push(EpgTarget::from_state(channel.nid, channel.tsid, state));
+                }
+            }
+            let Some(target) = select_next_target(&targets, now, &config) else {
+                return Ok(());
+            };
+            drivers.iter().find_map(|driver| {
+                db.get_enabled_channels_by_bon_driver(driver.id)
+                    .ok()?
+                    .into_iter()
+                    .find(|channel| channel.nid == target.network_id && channel.tsid == target.tsid)
+                    .map(|channel| (driver.clone(), channel))
+            })
         };
         let Some((driver, channel)) = candidate else {
             return Ok(());
         };
+        let state = states
+            .iter()
+            .find(|state| state.network_id == channel.nid && state.tsid == channel.tsid);
+        let decision = decide(
+            &config,
+            self.active.load(Ordering::SeqCst),
+            cpu_percent(),
+            now,
+            state.and_then(|s| s.next_eligible_at),
+            state.and_then(|s| s.coverage_until),
+            state.and_then(|s| s.last_eit_received_at),
+        );
+        if decision != EpgScanDecision::Start {
+            return Ok(());
+        }
         let Some((space, number)) = channel.bon_space.zip(channel.bon_channel) else {
             return Ok(());
         };
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
         let history = {
             let db = self.database.lock().await;
-            db.epg_scan_started(driver.id, "scheduled")?
+            db.epg_scan_started(driver.id, channel.nid, channel.tsid, "scheduled")?
         };
         self.active.fetch_add(1, Ordering::SeqCst);
         let result = self.scan_one(&config, key, channel.id).await;
@@ -143,10 +164,16 @@ impl EpgScanScheduler {
         let db = self.database.lock().await;
         match result {
             Ok(()) => {
-                let _ = db.epg_scan_finished(history, "completed", driver.id, None);
+                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
             }
             Err(e) => {
-                let _ = db.epg_scan_finished(history, "failed", driver.id, Some(&e.to_string()));
+                let _ = db.epg_scan_finished(
+                    history,
+                    "failed",
+                    channel.nid,
+                    channel.tsid,
+                    Some(&e.to_string()),
+                );
             }
         }
         let _ = db.refresh_epg_coverage();
@@ -209,21 +236,55 @@ impl EpgScanScheduler {
     }
 }
 
-fn first_candidate(
-    db: &crate::database::Database,
-    drivers: &[BonDriverRecord],
-) -> Option<(BonDriverRecord, ChannelRecord)> {
-    drivers
-        .iter()
-        .filter_map(|d| {
-            db.get_enabled_channels_by_bon_driver(d.id)
-                .ok()
-                .and_then(|mut c| c.drain(..).next().map(|ch| (d.clone(), ch)))
-        })
-        .next()
+#[derive(Debug, Clone, Copy)]
+struct EpgTarget {
+    network_id: u16,
+    tsid: u16,
+    coverage_until: Option<i64>,
+    last_eit_received_at: Option<i64>,
+    next_eligible_at: Option<i64>,
+    failure_count: i64,
 }
 
-#[cfg(unix)]
+impl EpgTarget {
+    fn from_state(network_id: u16, tsid: u16, state: Option<&EpgScanState>) -> Self {
+        Self {
+            network_id,
+            tsid,
+            coverage_until: state.and_then(|s| s.coverage_until),
+            last_eit_received_at: state.and_then(|s| s.last_eit_received_at),
+            next_eligible_at: state.and_then(|s| s.next_eligible_at),
+            failure_count: state.map_or(0, |s| s.failure_count),
+        }
+    }
+}
+
+fn select_next_target(
+    targets: &[EpgTarget],
+    now: i64,
+    config: &EpgGlobalSettings,
+) -> Option<EpgTarget> {
+    targets
+        .iter()
+        .copied()
+        .filter(|target| target.next_eligible_at.is_none_or(|at| at <= now))
+        .min_by_key(|target| {
+            let coverage_missing = !target
+                .coverage_until
+                .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
+            let stale = !target
+                .last_eit_received_at
+                .is_some_and(|at| at + config.max_stale_secs > now);
+            (
+                !coverage_missing,
+                !stale,
+                target.failure_count,
+                target.coverage_until.unwrap_or(i64::MIN),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
 fn cpu_percent() -> u32 {
     let load = std::fs::read_to_string("/proc/loadavg")
         .ok()
@@ -235,9 +296,37 @@ fn cpu_percent() -> u32 {
     ((load / cores) * 100.0).round().clamp(0.0, 100.0) as u32
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "macos")]
+fn cpu_percent() -> u32 {
+    let mut loads = [0.0_f64; 1];
+    let count = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    if count != 1 {
+        return 0;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
+    ((loads[0] / cores) * 100.0).round().clamp(0.0, 100.0) as u32
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cpu_percent() -> u32 {
     0
+}
+
+pub fn cpu_limit_source() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "linux:/proc/loadavg"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos:getloadavg"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "unavailable:cpu limit disabled"
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +371,37 @@ mod tests {
             decide(&config(), 0, 0, 10, None, None, None),
             EpgScanDecision::Start
         )
+    }
+
+    #[test]
+    fn target_selection_prefers_missing_coverage_and_skips_backoff() {
+        let targets = [
+            EpgTarget {
+                network_id: 1,
+                tsid: 1,
+                coverage_until: Some(10 + 168 * 3600),
+                last_eit_received_at: Some(10),
+                next_eligible_at: None,
+                failure_count: 0,
+            },
+            EpgTarget {
+                network_id: 2,
+                tsid: 2,
+                coverage_until: None,
+                last_eit_received_at: None,
+                next_eligible_at: None,
+                failure_count: 0,
+            },
+            EpgTarget {
+                network_id: 3,
+                tsid: 3,
+                coverage_until: None,
+                last_eit_received_at: None,
+                next_eligible_at: Some(100),
+                failure_count: 0,
+            },
+        ];
+        let selected = select_next_target(&targets, 10, &config()).unwrap();
+        assert_eq!((selected.network_id, selected.tsid), (2, 2));
     }
 }
