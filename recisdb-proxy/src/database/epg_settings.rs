@@ -229,9 +229,10 @@ impl Database {
             .query_row(
                 "SELECT last_failure_reason FROM epg_scan_states WHERE network_id=? AND tsid=?",
                 params![network_id, tsid],
-                |r| r.get(0),
+                |r| r.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         self.connection().execute(
             "INSERT INTO epg_scan_states(network_id,tsid,last_failure_reason) VALUES(?1,?2,?3) ON CONFLICT(network_id,tsid) DO UPDATE SET last_failure_reason=?3",
             params![network_id, tsid, reason],
@@ -533,5 +534,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn deferred_reason_handles_null_after_scan_started() {
+        let db = Database::open_in_memory().unwrap();
+        let started_reason = epg_reason(EpgReasonCode::Scheduled, serde_json::json!({}));
+        db.epg_scan_started(1, 1, 2, &started_reason).unwrap();
+        let deferred_reason = epg_reason(
+            EpgReasonCode::NoTunerAvailable,
+            serde_json::json!({"tuner_id": 1}),
+        );
+
+        db.record_epg_deferred(1, 2, &deferred_reason, true)
+            .unwrap();
+
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM epg_scan_history WHERE network_id=1 AND tsid=2 AND status='deferred'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            db.get_epg_scan_states().unwrap()[0]
+                .last_failure_reason
+                .as_deref(),
+            Some(deferred_reason.as_str())
+        );
     }
 }
