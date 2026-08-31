@@ -1,5 +1,26 @@
 # Distributed Tuner Fabric
 
+## Dashboard setup flow
+
+The Vue dashboard presents distributed nodes as local/remote PC and reception
+area concepts. Normal setup uses a four-step wizard: purpose, one-time pairing
+connection information, automatic transport confirmation, and final review.
+Node IDs, credentials, endpoint kinds, weights, and raw path measurements are
+available only under Expert Mode. The existing pairing API remains unchanged;
+the browser receives the credential only through the one-time pairing flow and
+`GET /api/nodes` continues to expose only `paired`.
+
+The dashboard translates probe values into human-readable speed, stability,
+viewing, and recording states. Cloudflare Public paths are explicitly shown as
+view-only when `record_allowed` is false. The topology preview is rendered in
+Vue/SVG-compatible markup and changes to a vertical layout on narrow screens.
+
+Automatic transport selection must not be described as continuously optimal.
+Current normal routing is still the static preference order LAN, Tailscale,
+Cloudflare private, Static, direct Internet, and Cloudflare public. `score_path`
+is used by explicit probing and admission decisions; continuous PathHealth
+storage and dynamic failover remain future work.
+
 Status: implementation design for `feat/distributed-tuner-fabric`.
 
 The goal is not merely remote BonDriver access. The fabric must keep viewing
