@@ -260,6 +260,10 @@ impl Database {
             "028_epg_selected_preset",
             Database::migration_028_epg_selected_preset,
         ),
+        (
+            "029_epg_coverage_index",
+            Database::migration_029_epg_coverage_index,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -273,6 +277,14 @@ impl Database {
 
     fn migration_028_epg_selected_preset(&self) -> Result<()> {
         self.add_column_if_not_exists("epg_global_settings", "selected_preset_id", "INTEGER")
+    }
+
+    fn migration_029_epg_coverage_index(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_programs_epg_coverage
+             ON programs(nid, tsid, start_at, duration_secs)",
+        )?;
+        Ok(())
     }
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,

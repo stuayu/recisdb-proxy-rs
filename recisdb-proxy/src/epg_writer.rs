@@ -146,6 +146,9 @@ impl EpgWriter {
         match db.upsert_programs(&records) {
             Ok(_) => {
                 debug!("[EpgWriter] flushed {} program row(s)", count);
+                if let Err(e) = db.refresh_epg_coverage() {
+                    warn!("[EpgWriter] failed to refresh coverage: {}", e);
+                }
                 // Fan out to `/mirakurun/api/events/stream` subscribers only
                 // *after* the UPSERT actually succeeded — a subscriber must
                 // never observe an event for a row that failed to persist.
@@ -181,6 +184,9 @@ impl EpgWriter {
                 Ok(n) if n > 0 => debug!("[EpgWriter] pruned {} stale program row(s)", n),
                 Ok(_) => {}
                 Err(e) => error!("[EpgWriter] failed to prune old programs: {}", e),
+            }
+            if let Err(e) = db.refresh_epg_coverage() {
+                warn!("[EpgWriter] failed to refresh coverage after prune: {}", e);
             }
         }
     }

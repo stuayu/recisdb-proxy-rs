@@ -108,6 +108,7 @@ pub struct EpgPreset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PhysicalTunerEpgSettings {
     pub physical_tuner_id: i64,
     pub enabled_override: Option<bool>,
@@ -192,6 +193,21 @@ impl Database {
         Ok(self
             .connection()
             .query_row("SELECT MAX(updated_at) FROM programs", [], |r| r.get(0))?)
+    }
+
+    /// Reconcile state with rows actually retained in `programs`.
+    /// Called after writer flushes, never from the reader loop.
+    pub fn refresh_epg_coverage(&self) -> Result<Option<i64>> {
+        let (coverage, last_event): (Option<i64>, Option<i64>) = self.connection().query_row(
+            "SELECT MAX(start_at + duration_secs), MAX(updated_at) FROM programs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        self.connection().execute(
+            "UPDATE epg_scan_states SET coverage_until=?1,last_eit_received_at=?2 WHERE id=1",
+            params![coverage, last_event],
+        )?;
+        Ok(coverage)
     }
     pub fn epg_next_eligible(&self) -> Result<Option<i64>> {
         Ok(self.connection().query_row(
@@ -330,6 +346,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::ProgramUpsert;
 
     #[test]
     fn epg_defaults_are_bootstrapped_in_db() {
@@ -346,5 +363,36 @@ mod tests {
         let mut global = db.get_epg_global_settings().unwrap();
         global.normal_dwell_secs = 10;
         assert!(db.update_epg_global_settings(&global).is_err());
+    }
+
+    #[test]
+    fn coverage_is_reconciled_from_program_rows() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[ProgramUpsert {
+            nid: 1,
+            sid: 2,
+            tsid: 3,
+            event_id: 4,
+            start_at: 10_000,
+            duration_secs: 600,
+            free_ca_mode: false,
+            name: Some("test".into()),
+            description: None,
+            extended: None,
+            genre: None,
+            updated_at: 9_000,
+        }])
+        .unwrap();
+        assert_eq!(db.refresh_epg_coverage().unwrap(), Some(10_600));
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT coverage_until FROM epg_scan_states WHERE id=1",
+                    [],
+                    |r| { r.get::<_, Option<i64>>(0) }
+                )
+                .unwrap(),
+            Some(10_600)
+        );
     }
 }

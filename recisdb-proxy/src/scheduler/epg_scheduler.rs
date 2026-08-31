@@ -39,6 +39,8 @@ pub fn decide(
     cpu_percent: u32,
     now: i64,
     next: Option<i64>,
+    coverage_until: Option<i64>,
+    last_eit_received_at: Option<i64>,
 ) -> EpgScanDecision {
     if !config.enabled {
         return EpgScanDecision::Disabled;
@@ -49,7 +51,10 @@ pub fn decide(
     if active >= config.max_concurrent_scans.max(1) as usize {
         return EpgScanDecision::AtCapacity;
     }
-    if next.is_some_and(|at| at > now) {
+    let target_covered =
+        coverage_until.is_some_and(|at| at >= now + config.target_future_coverage_hours * 3600);
+    let fresh = last_eit_received_at.is_some_and(|at| at + config.max_stale_secs > now);
+    if target_covered && fresh || next.is_some_and(|at| at > now) {
         return EpgScanDecision::NotDue;
     }
     EpgScanDecision::Start
@@ -93,9 +98,16 @@ impl EpgScanScheduler {
         }
     }
     async fn evaluate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (config, next) = {
+        let (config, next, coverage, last_event) = {
             let db = self.database.lock().await;
-            (db.get_epg_global_settings()?, db.epg_next_eligible()?)
+            let coverage = db.refresh_epg_coverage()?;
+            let last_event = db.epg_last_event_time()?;
+            (
+                db.get_epg_global_settings()?,
+                db.epg_next_eligible()?,
+                coverage,
+                last_event,
+            )
         };
         let decision = decide(
             &config,
@@ -103,6 +115,8 @@ impl EpgScanScheduler {
             cpu_percent(),
             chrono::Utc::now().timestamp(),
             next,
+            coverage,
+            last_event,
         );
         if decision != EpgScanDecision::Start {
             return Ok(());
@@ -135,6 +149,7 @@ impl EpgScanScheduler {
                 let _ = db.epg_scan_finished(history, "failed", driver.id, Some(&e.to_string()));
             }
         }
+        let _ = db.refresh_epg_coverage();
         Ok(())
     }
     async fn scan_one(
@@ -257,12 +272,15 @@ mod tests {
     #[test]
     fn policy_blocks_soft_cpu() {
         assert_eq!(
-            decide(&config(), 0, 70, 10, None),
+            decide(&config(), 0, 70, 10, None, None, None),
             EpgScanDecision::SoftCpuLimit
         )
     }
     #[test]
     fn policy_starts_when_due() {
-        assert_eq!(decide(&config(), 0, 0, 10, None), EpgScanDecision::Start)
+        assert_eq!(
+            decide(&config(), 0, 0, 10, None, None, None),
+            EpgScanDecision::Start
+        )
     }
 }

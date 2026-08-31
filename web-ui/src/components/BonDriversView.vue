@@ -3,6 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
 import { useColumnVisibility, type ColumnDef } from '../columns'
 import ColumnPicker from './ColumnPicker.vue'
+import PhysicalTunerEpgSettings from './PhysicalTunerEpgSettings.vue'
 const rankingColumns: ColumnDef[] = [
   { key: 'driver', label: 'BonDriver' },
   { key: 'quality_score', label: '品質スコア' },
@@ -319,5 +320,6 @@ onMounted(load)
         ><button class="button" type="submit">保存</button>
       </form>
     </div>
+    <PhysicalTunerEpgSettings v-if="editing" :tuner-id="editing" :tuner-name="String(form.driver_name || form.dll_path)" />
   </section>
 </template>
