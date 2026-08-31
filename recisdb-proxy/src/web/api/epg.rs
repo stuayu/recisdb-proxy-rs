@@ -2,7 +2,7 @@
 
 use super::error::ApiError;
 use crate::{
-    database::{epg_reason, EpgGlobalSettings, EpgReasonCode},
+    database::{epg_reason, Database, EpgGlobalSettings, EpgReasonCode},
     web::state::WebState,
 };
 use axum::{
@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 fn reason_value(reason: Option<String>) -> serde_json::Value {
@@ -26,8 +27,32 @@ fn reason_value(reason: Option<String>) -> serde_json::Value {
     })
 }
 
-fn reason_values(states: &[crate::database::EpgScanState]) -> Vec<serde_json::Value> {
-    let mut values = Vec::new();
+fn reason_values(
+    db: &Database,
+    states: &[crate::database::EpgScanState],
+) -> Result<Vec<serde_json::Value>, crate::database::DatabaseError> {
+    let mut labels = HashMap::new();
+    for state in states {
+        if labels.contains_key(&(state.network_id, state.tsid)) {
+            continue;
+        }
+        let label = db
+            .get_channels_by_nid_tsid(state.network_id, state.tsid)?
+            .into_iter()
+            .next()
+            .and_then(|(channel, _)| channel.service_name);
+        labels.insert((state.network_id, state.tsid), label);
+    }
+
+    Ok(reason_values_with_labels(states, &labels))
+}
+
+fn reason_values_with_labels(
+    states: &[crate::database::EpgScanState],
+    labels: &HashMap<(u16, u16), Option<String>>,
+) -> Vec<serde_json::Value> {
+    let mut entries = HashMap::new();
+    let mut code_systems: HashMap<String, HashSet<(u16, u16)>> = HashMap::new();
     for state in states {
         let Some(value) = state
             .last_failure_reason
@@ -36,22 +61,92 @@ fn reason_values(states: &[crate::database::EpgScanState]) -> Vec<serde_json::Va
         else {
             continue;
         };
-        if !values.contains(&value) {
-            values.push(value.clone());
+
+        let mut codes = Vec::new();
+        if let Some(code) = value
+            .get("code")
+            .and_then(|v| serde_json::from_value::<EpgReasonCode>(v.clone()).ok())
+        {
+            codes.push((
+                code,
+                value.get("details").cloned().unwrap_or_else(|| json!({})),
+            ));
         }
-        if let Some(codes) = value
+        if let Some(additional) = value
             .get("details")
             .and_then(|details| details.get("additional_codes"))
             .and_then(serde_json::Value::as_array)
         {
-            for code in codes {
-                let extra = json!({"code": code, "details": {}});
-                if !values.contains(&extra) {
-                    values.push(extra);
-                }
+            codes.extend(additional.iter().filter_map(|code| {
+                serde_json::from_value::<EpgReasonCode>(code.clone())
+                    .ok()
+                    .map(|code| (code, json!({})))
+            }));
+        }
+
+        let mut seen_codes = HashSet::new();
+        for (code, details) in codes {
+            let code_name = serde_json::to_string(&code).expect("EpgReasonCode serializes");
+            if !seen_codes.insert(code_name.clone()) {
+                continue;
             }
+            code_systems
+                .entry(code_name.clone())
+                .or_default()
+                .insert((state.network_id, state.tsid));
+            entries
+                .entry((code_name, state.network_id, state.tsid))
+                .or_insert((
+                    code,
+                    details,
+                    state.last_tuner_id,
+                    state.last_node_id.clone(),
+                ));
         }
     }
+
+    let mut values: Vec<_> = entries
+        .into_iter()
+        .map(
+            |((code, network_id, tsid), (code_enum, details, tuner_id, node_id))| {
+                let count = code_systems.get(&code).map_or(0, HashSet::len);
+                json!({
+                    "code": code_enum,
+                    "details": details,
+                    "networkId": network_id,
+                    "tsid": tsid,
+                    "label": labels.get(&(network_id, tsid)).cloned().flatten(),
+                    "tunerId": tuner_id,
+                    "nodeId": node_id,
+                    "count": count,
+                })
+            },
+        )
+        .collect();
+    values.sort_by(|a, b| {
+        let count = |v: &serde_json::Value| v.get("count").and_then(|n| n.as_u64()).unwrap_or(0);
+        let number = |v: &serde_json::Value, key: &str| {
+            v.get(key).and_then(|n| n.as_u64()).unwrap_or(u64::MAX)
+        };
+        count(b)
+            .cmp(&count(a))
+            .then_with(|| number(a, "networkId").cmp(&number(b, "networkId")))
+            .then_with(|| number(a, "tsid").cmp(&number(b, "tsid")))
+    });
+    let mut per_code = HashMap::<String, usize>::new();
+    values.retain(|value| {
+        let code = value
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let shown = per_code.entry(code.to_owned()).or_default();
+        if *shown < 3 {
+            *shown += 1;
+            true
+        } else {
+            false
+        }
+    });
     values
 }
 
@@ -281,8 +376,16 @@ pub async fn get_epg_status(
         [],
         |r| r.get::<_, i64>(0),
     )? != 0;
-    let reasons = reason_values(&states);
-    let reason = reasons.first().cloned().unwrap_or(serde_json::Value::Null);
+    let reasons = reason_values(&db, &states)?;
+    let reason = states
+        .iter()
+        .find_map(|state| {
+            state
+                .last_failure_reason
+                .clone()
+                .map(|value| reason_value(Some(value)))
+        })
+        .unwrap_or(serde_json::Value::Null);
     let states_json =
         serde_json::to_value(states).map_err(|e| ApiError::internal(e.to_string()))?;
     let cpu_source = crate::scheduler::epg_scheduler::cpu_limit_source();
@@ -298,4 +401,81 @@ pub async fn get_epg_scan_history(
     let mut st = db.connection().prepare("SELECT id,started_at,finished_at,status,reason,physical_tuner_id,node_id,network_id,tsid,coverage_before,coverage_after,error FROM epg_scan_history ORDER BY started_at DESC LIMIT 100")?;
     let rows = st.query_map([], |r| Ok(json!({"id":r.get::<_,i64>(0)?,"startedAt":r.get::<_,i64>(1)?,"finishedAt":r.get::<_,Option<i64>>(2)?,"status":r.get::<_,String>(3)?,"reason":reason_value(r.get::<_,Option<String>>(4)?),"physicalTunerId":r.get::<_,Option<i64>>(5)?,"nodeId":r.get::<_,Option<String>>(6)?,"networkId":r.get::<_,Option<i64>>(7)?,"tsid":r.get::<_,Option<i64>>(8)?,"coverageBefore":r.get::<_,Option<i64>>(9)?,"coverageAfter":r.get::<_,Option<i64>>(10)?,"error":r.get::<_,Option<String>>(11)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(json!({"success":true,"scans":rows})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::EpgScanState;
+
+    fn state(network_id: u16, tsid: u16, reason: EpgReasonCode) -> EpgScanState {
+        EpgScanState {
+            network_id,
+            tsid,
+            last_scan_started_at: None,
+            last_scan_completed_at: None,
+            last_eit_received_at: None,
+            coverage_until: None,
+            next_eligible_at: None,
+            last_tuner_id: None,
+            last_node_id: None,
+            failure_count: 1,
+            last_failure_reason: Some(epg_reason(reason, json!({}))),
+        }
+    }
+
+    #[test]
+    fn reason_values_group_by_code_and_multiplex_with_metadata() {
+        let mut first = state(20, 2, EpgReasonCode::NoTunerAvailable);
+        first.last_tuner_id = Some(12);
+        first.last_node_id = Some("sendai".to_owned());
+        first.last_failure_reason = Some(epg_reason(
+            EpgReasonCode::NoTunerAvailable,
+            json!({"additional_codes": [EpgReasonCode::Backoff]}),
+        ));
+        let states = vec![
+            first,
+            state(10, 1, EpgReasonCode::NoTunerAvailable),
+            state(30, 3, EpgReasonCode::Backoff),
+        ];
+        let labels = HashMap::from([
+            ((20, 2), Some("二つ目".to_owned())),
+            ((10, 1), Some("一つ目".to_owned())),
+        ]);
+
+        let values = reason_values_with_labels(&states, &labels);
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[0]["code"], "no_tuner_available");
+        assert_eq!(values[0]["networkId"], 10);
+        assert_eq!(values[0]["count"], 2);
+        let tuner_reason = values
+            .iter()
+            .find(|value| value["code"] == "no_tuner_available" && value["networkId"] == 20)
+            .unwrap();
+        assert_eq!(tuner_reason["label"], "二つ目");
+        assert_eq!(tuner_reason["tunerId"], 12);
+        assert_eq!(tuner_reason["nodeId"], "sendai");
+        let backoff_reason = values
+            .iter()
+            .find(|value| value["code"] == "backoff")
+            .unwrap();
+        assert_eq!(backoff_reason["count"], 2);
+        assert_eq!(
+            values
+                .iter()
+                .find(|value| value["networkId"] == 30)
+                .unwrap()["label"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn reason_values_limits_each_code_to_three_systems() {
+        let states = (1..=4)
+            .map(|nid| state(nid, nid, EpgReasonCode::ScanFailed))
+            .collect::<Vec<_>>();
+        let values = reason_values_with_labels(&states, &HashMap::new());
+        assert_eq!(values.len(), 3);
+        assert!(values.iter().all(|value| value["count"] == 4));
+    }
 }

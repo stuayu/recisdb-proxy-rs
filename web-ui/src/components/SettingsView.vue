@@ -18,7 +18,6 @@ const label = computed(() => endpoints.find((item) => item[1] === selected.value
 const isEpg = computed(() => selected.value === '/settings/epg')
 const epgPresets = ref<JsonRecord[]>([])
 const selectedEpgPreset = ref<number | null>(null)
-const featuredEpgPresets = computed(() => epgPresets.value.filter((preset) => preset.is_system).slice(0, 3))
 const epgStatus = ref<JsonRecord | null>(null)
 const editingPreset = ref<JsonRecord | null>(null)
 const creatingPreset = ref(false)
@@ -37,6 +36,7 @@ const presetLabels: Record<string, string> = {
   remote_prefer_metadata_execution: 'リモート解析優先', remote_allow_ts_transport: 'TS転送許可',
   min_dwell_secs: '最小滞在(秒)', normal_dwell_secs: '通常滞在(秒)', max_dwell_secs: '最大滞在(秒)', idle_section_timeout_secs: '無受信タイムアウト(秒)',
 }
+const presetSettingKeys = presetGroups.flatMap((group) => [...group.keys])
 const epgReasonLabels: Record<string, string> = {
   scheduled: '取得を開始しました', scan_failed: 'EPG取得に失敗しました',
   disabled: 'EPG自動取得が無効です', not_due: '更新時刻にはまだ達していません',
@@ -45,16 +45,41 @@ const epgReasonLabels: Record<string, string> = {
   preempted_by_record: '録画を優先して取得を延期しました', preempted_by_view: '視聴を優先して取得を延期しました',
   no_compatible_tuner: '対応する受信帯域のチューナーがありません',
 }
-function epgReasonText(value: unknown): string {
+function epgReasonLabel(value: unknown): string {
   if (value && typeof value === 'object') {
-    const code = String((value as JsonRecord).code ?? '')
+    const reason = value as JsonRecord
+    const code = String(reason.code ?? '')
     return epgReasonLabels[code] ?? '取得理由を確認できません（未知の理由コード）'
   }
-  return '取得理由を確認できません（不正な理由データ）'
+  return value == null ? '—' : '取得理由を確認できません（不正な理由データ）'
+}
+function epgReasonNetworkText(value: unknown): string {
+  if (!value || typeof value !== 'object') return '系統を確認できません'
+  const reason = value as JsonRecord
+  const networkId = Number(reason.networkId)
+  const tsid = Number(reason.tsid)
+  const label = typeof reason.label === 'string' && reason.label.length > 0
+    ? reason.label
+    : `NID ${networkId} / TSID ${tsid}`
+  const tuner = reason.tunerId !== null && reason.tunerId !== undefined ? `チューナー#${reason.tunerId}` : ''
+  const node = typeof reason.nodeId === 'string' && reason.nodeId ? reason.nodeId : ''
+  const source = [tuner, node].filter(Boolean).join(' / ')
+  return `${label} (${networkId}/${tsid})${source ? ` ${source}` : ''}`
 }
 const epgReasonList = computed(() => {
   const values = epgStatus.value?.reasons
   return Array.isArray(values) ? values : epgStatus.value?.reason ? [epgStatus.value.reason] : []
+})
+const epgReasonGroups = computed(() => {
+  const groups = new Map<string, { code: string; count: number; reasons: unknown[] }>()
+  for (const reason of epgReasonList.value) {
+    const code = reason && typeof reason === 'object' ? String((reason as JsonRecord).code ?? '') : ''
+    const group = groups.get(code) ?? { code, count: 0, reasons: [] }
+    group.count = Math.max(group.count, Number((reason as JsonRecord)?.count) || 0)
+    group.reasons.push(reason)
+    groups.set(code, group)
+  }
+  return [...groups.values()]
 })
 function formatEpoch(value: unknown): string {
   return typeof value === 'number'
@@ -146,7 +171,12 @@ async function save() {
 }
 async function duplicateEpgPreset(preset: JsonRecord) {
   try {
-    await api('/epg-presets', { method: 'POST', body: JSON.stringify({ name: `${String(preset.name)}（コピー）`, description: preset.description ?? '' }) })
+    const copy = Object.fromEntries(presetSettingKeys.map((key) => [key, preset[key] ?? null]))
+    await api('/epg-presets', { method: 'POST', body: JSON.stringify({
+      name: `${String(preset.name)}（コピー）`,
+      description: preset.description ?? '',
+      ...copy,
+    }) })
     await load()
     message.value = 'プリセットを複製しました。'
   } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
@@ -157,13 +187,43 @@ function editEpgPreset(preset: JsonRecord) {
 }
 function startCreateEpgPreset() {
   creatingPreset.value = true
-  editingPreset.value = { name: '', description: '', enabled: true }
+  editingPreset.value = {
+    name: '', description: '', enabled: true,
+    ...Object.fromEntries(presetSettingKeys.filter((key) => key !== 'enabled').map((key) => [key, null])),
+  }
 }
 function clearPresetValue(key: string) {
   if (editingPreset.value) editingPreset.value[key] = null
 }
 function updatePresetText(key: string, event: Event) {
   if (editingPreset.value) editingPreset.value[key] = (event.target as HTMLTextAreaElement).value
+}
+function updatePresetNumber(key: string, event: Event) {
+  if (!editingPreset.value) return
+  const value = (event.target as HTMLInputElement).value.trim()
+  editingPreset.value[key] = value === '' ? null : Number(value)
+}
+function presetValue(value: unknown, unit: 'seconds' | 'hours' | 'percent' | 'boolean'): string {
+  if (value === null || value === undefined) return '全体設定'
+  if (unit === 'boolean') return value ? 'はい' : 'いいえ'
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  if (unit === 'percent') return `${number}%`
+  if (unit === 'hours') {
+    if (number % 24 === 0) return `${number / 24}日`
+    return `${number}時間`
+  }
+  if (number >= 86400 && number % 86400 === 0) return `約${number / 86400}日`
+  if (number >= 3600 && number % 3600 === 0) return `約${number / 3600}時間`
+  if (number >= 60 && number % 60 === 0) return `約${number / 60}分`
+  return `約${number}秒`
+}
+function presetPlaceholder(key: string): string {
+  const examples: Record<string, string> = {
+    target_refresh_secs: '全体設定の値(例: 21600)',
+    target_future_coverage_hours: '全体設定の値(例: 168)',
+  }
+  return examples[key] ?? '全体設定の値'
 }
 async function saveEpgPreset() {
   if (!editingPreset.value) return
@@ -719,35 +779,47 @@ onMounted(() => {
       <template v-if="isEpg">
         <section class="panel epg-status" aria-labelledby="epg-status-title">
           <h4 id="epg-status-title">EPG状態 <span>{{ epgStatus?.active ? '取得中' : '待機中' }}</span></h4>
-          <div v-if="epgReasonList.length" class="muted" role="status"><p>取得を延期・終了した理由</p><ul><li v-for="(reason, index) in epgReasonList" :key="index" v-text="epgReasonText(reason)" /></ul></div>
-          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd><dt>延期理由</dt><dd>{{ epgReasonText(epgStateValue('lastFailureReason')) }}</dd></dl>
+          <div v-if="epgReasonGroups.length" class="muted" role="status"><p>取得を延期・終了した理由</p><ul><li v-for="group in epgReasonGroups" :key="group.code"><span class="epg-reason-main">{{ epgReasonLabel(group.reasons[0]) }}</span><span class="epg-reason-networks"><span v-for="(reason, index) in group.reasons" :key="index">{{ epgReasonNetworkText(reason) }}</span><span v-if="group.count > group.reasons.length">ほか{{ group.count - group.reasons.length }}系統</span></span></li></ul></div>
+          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd></dl>
         </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
         <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
         <fieldset>
-          <legend>更新方針</legend>
-          <label v-for="preset in featuredEpgPresets" :key="String(preset.id)" class="preset-choice">
-            <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="Number(preset.id)" />
-            <span><strong v-text="String(preset.name)" /> — <span v-text="String(preset.description ?? '')" /></span>
-          </label>
-          <label class="preset-choice"><input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="null" /><span><strong>カスタム</strong> — 詳細設定を自分で決める</span></label>
-          <p class="muted">プリセットのチューナー割り当ては、個別チューナー設定画面から行います。</p>
-        </fieldset>
-        <section class="epg-presets" aria-labelledby="epg-presets-title">
-          <h4 id="epg-presets-title">プリセット管理</h4>
-          <button class="button secondary" type="button" @click="startCreateEpgPreset">新規作成</button>
+          <legend>更新方針とプリセット</legend>
+          <p class="muted">組み込み初期値 → 全体設定 → プリセット → 物理チューナー個別設定の順に上書きされます。プリセットで空欄の項目は全体設定の値が使われます。</p>
           <div class="epg-preset-cards">
-            <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card">
-              <h5>{{ String(preset.name) }} <span v-if="preset.is_system" class="badge">おすすめ</span></h5>
-              <p>{{ String(preset.description ?? '') }}</p>
-              <div class="actions"><button v-if="!preset.is_system" class="button secondary" type="button" @click="editEpgPreset(preset)">編集</button><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></div>
+            <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card" :class="{ 'is-selected': selectedEpgPreset === Number(preset.id) }">
+              <label class="preset-choice">
+                <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="Number(preset.id)" />
+                <span class="epg-preset-content">
+                <span class="epg-preset-heading"><strong v-text="String(preset.name)" /><span v-if="preset.is_system" class="badge">おすすめ</span><span v-if="selectedEpgPreset === Number(preset.id)" class="badge">使用中</span></span>
+                <span class="muted" v-text="String(preset.description ?? '')" />
+                <span class="epg-preset-summary"><span>更新頻度: {{ presetValue(preset.target_refresh_secs, 'seconds') }}</span><span>維持日数: {{ presetValue(preset.target_future_coverage_hours, 'hours') }}</span><span>CPU延期上限: {{ presetValue(preset.cpu_soft_limit_percent, 'percent') }}</span><span>録画・視聴で中断: {{ presetValue(preset.preemptible, 'boolean') }}</span></span>
+                </span>
+              </label>
+              <span class="actions epg-preset-actions">
+                <button class="button secondary" type="button" :disabled="Boolean(preset.is_system)" @click="editEpgPreset(preset)">{{ preset.is_system ? 'システム設定（複製して編集）' : '編集' }}</button>
+                <button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button>
+                <button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button>
+              </span>
+            </article>
+            <article class="panel epg-preset-card" :class="{ 'is-selected': selectedEpgPreset === null }">
+              <label class="preset-choice">
+                <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="null" />
+                <span class="epg-preset-content"><span class="epg-preset-heading"><strong>カスタム</strong><span v-if="selectedEpgPreset === null" class="badge">使用中</span></span><span class="muted">詳細設定を自分で決める</span><span class="epg-preset-summary"><span>全項目を個別に設定</span></span></span>
+              </label>
             </article>
           </div>
+          <div class="actions"><button class="button secondary" type="button" @click="startCreateEpgPreset">新規作成</button><a class="button secondary" href="#bondrivers">チューナー個別設定を開く</a></div>
+          <p class="muted">プリセットを物理チューナーへ割り当てる場合は、<a href="#bondrivers">BonDriver（チューナー個別設定）</a>から設定します。</p>
+        </fieldset>
+        <section class="epg-presets" aria-labelledby="epg-presets-title">
+          <h4 id="epg-presets-title">プリセットを編集</h4>
           <div v-if="editingPreset" class="panel preset-editor">
             <h5>{{ creatingPreset ? '新しいプリセット' : `プリセット編集: ${String(editingPreset.name)}` }}</h5>
             <label class="field"><span>名前</span><input v-model="editingPreset.name" type="text" /></label>
             <label class="field"><span>説明</span><textarea :value="String(editingPreset.description ?? '')" rows="2" @input="updatePresetText('description', $event)" /></label>
-            <fieldset v-for="group in presetGroups" :key="group.label"><legend>{{ group.label }}</legend><div class="epg-friendly-grid"><label v-for="key in group.keys" :key="key" class="field"><span>{{ presetLabels[key] }} <small v-if="editingPreset[key] === null">（全体設定を使用）</small></span><input v-if="typeof editingPreset[key] === 'boolean'" v-model="editingPreset[key]" type="checkbox" /><input v-else v-model.number="editingPreset[key]" type="number" min="0" /><button v-if="editingPreset[key] !== null && key !== 'enabled'" class="button secondary" type="button" @click="clearPresetValue(key)">全体設定に戻す</button></label></div></fieldset>
+            <fieldset v-for="group in presetGroups" :key="group.label"><legend>{{ group.label }}</legend><div class="epg-friendly-grid"><label v-for="key in group.keys" :key="key" class="field"><span>{{ presetLabels[key] }} <small v-if="editingPreset[key] === null">（全体設定を使用）</small></span><input v-if="typeof editingPreset[key] === 'boolean'" v-model="editingPreset[key]" type="checkbox" /><input v-else :value="editingPreset[key] ?? ''" :placeholder="editingPreset[key] === null ? presetPlaceholder(key) : undefined" type="number" min="0" @input="updatePresetNumber(key, $event)" /><button v-if="editingPreset[key] !== null && key !== 'enabled'" class="button secondary" type="button" @click="clearPresetValue(key)">全体設定に戻す</button></label></div></fieldset>
             <div class="actions"><button class="button" type="button" @click="saveEpgPreset">保存</button><button class="button secondary" type="button" @click="editingPreset = null; creatingPreset = false">キャンセル</button></div>
           </div>
         </section>
@@ -764,7 +836,7 @@ onMounted(() => {
         </details>
         <p class="muted">この設定では、録画と視聴を優先し、最大{{ config.max_concurrent_scans }}台の取得チューナーを使います。</p>
       </template>
-      <template v-else v-for="[key, value] in entries" :key="key">
+      <template v-for="[key, value] in entries" v-else :key="key">
         <label v-if="typeof value === 'boolean'" class="check"
           ><input v-model="config[key]" type="checkbox" :disabled="protectedKeys.has(key)" /><span
             v-text="displayName(key)"
@@ -814,6 +886,33 @@ onMounted(() => {
 
 .service-status dd {
   margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.epg-status li,
+.epg-reason-networks,
+.epg-reason-networks span {
+  overflow-wrap: anywhere;
+}
+
+.epg-status li {
+  display: grid;
+  gap: 3px;
+}
+
+.epg-reason-main {
+  color: var(--text-color, inherit);
+}
+
+.epg-reason-networks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  font-size: 0.9em;
+}
+
+.epg-reason-networks span:not(:last-child)::after {
+  content: ',';
 }
 
 .epg-preset-cards {
@@ -827,8 +926,47 @@ onMounted(() => {
   padding: 12px;
 }
 
-.epg-preset-card h5 {
-  margin: 0;
+.epg-preset-card.is-selected {
+  border-color: var(--accent-color, currentColor);
+}
+
+.preset-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.epg-preset-actions {
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.preset-choice > input {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+
+.epg-preset-content {
+  display: grid;
+  flex: 1;
+  gap: 8px;
+  min-width: 0;
+}
+
+.epg-preset-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.epg-preset-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+  font-size: 0.9rem;
 }
 
 .epg-preset-card p {
@@ -840,8 +978,17 @@ onMounted(() => {
     grid-template-columns: 1fr;
     gap: 2px;
   }
+
   .service-status dd {
     margin-bottom: 6px;
+  }
+
+  .epg-preset-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .epg-preset-summary {
+    grid-template-columns: 1fr;
   }
 }
 </style>
