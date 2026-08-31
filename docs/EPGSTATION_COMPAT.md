@@ -231,6 +231,10 @@ DB 挿入用データへ変換するループを 1 つ回すが、このルー�
 `api.d.ts:68-` の `Program`。EPGStation が参照する主なもの:
 
 - `id` / `eventId` / `serviceId` / `networkId` / `startAt` (ミリ秒) / `duration` (ミリ秒) / `isFree`
+- `isFree` は EIT の `free_CA_mode` を反映する。proxy は `eit.rs` で抽出し、
+  `database/program.rs` の `programs.free_ca_mode` へ保存してから
+  `web/mirakurun.rs::build_mirakurun_program` で `!free_ca_mode` として返す
+  (Migration 026, 2026-08-31)。
 - `name` / `description` / `extended` / `genres`
 - `video` / `audio` (または `audios`) — 録画時のメタデータに入る
 - `relatedItems` — **イベントリレー処理で参照する** (`EPGUpdateManageModel.ts:145-171`)
@@ -239,39 +243,78 @@ DB 挿入用データへ変換するループを 1 つ回すが、このルー�
 EPGStation はこれを特別扱いし、暫定の終了時刻 (3 時間) を与えたうえで番組表 API で次番組の開始時刻まで切り詰める (`src/util/ProgramDuration.ts`)。
 実際の長さや 0 を返すとこの処理が働かず、番組表と予約が壊れる。
 
-### `ChannelType` に `BS4K` は無い — 4K は `BS` として出す (2026-08-10 追記)
+### 4K は `BS4K` / `CS4K` として出す (2026-08-31 改訂)
 
-BS4K 対応 (`docs/FOURK_SETUP.md`) を入れるにあたり、4K サービスをどの
-`type` で出すべきかを EPGStation 側の実コードで確認した。
+**2026-08-10 の判断「`ChannelType` に `BS4K` は無いので `BS` として出す」は失効した。**
+当時 EPGStation が同梱していた `api.d.ts` の `ChannelType` は
+`"GR" | "BS" | "CS" | "SKY" | "NW1"〜"NW40"` までで 4K 用の型がなく、
+`BS4K` を出すと `getChannelTypeId` の `default` に落ちて「その他」枠に
+丸められた。現在の 4.3.0-stuayu では 4K の型が正式に追加されている。
 
-**根拠 (EPGStation 同梱物・実コード):**
+**根拠 (EPGStation 同梱物・実コード、2026-08-31 時点):**
 
-- `node_modules/mirakurun/api.d.ts:48-52`
-  ```
+- `node_modules/mirakurun/api.d.ts:53`
+  ```ts
   export type ChannelType = "GR" | "BS" | "CS" | "SKY" |
-      "NW1" | ... | "NW40";
+      "NW1" | ... | "NW40" | // NWを追加
+      "BS4K" | "CS4K"; // 新4K8K衛星放送 (MMT/TLV を MPEG-2 TS へ変換して受信する)
   ```
-  **`BS4K` は宣言に存在しない。** stuayu フォークが足したのは `NW1`〜`NW40`
-  であって 4K 用の型ではない。
-- `src/model/db/ChannelDB.ts:169` `getChannelTypeId(type)` は
-  `GR`→0 / `BS`→1 / `CS`→2 / `SKY`→3 / `NW1`〜`NW40`→4〜43 の switch で、
-  **`default: return 44`**。未知の型でも例外にはならず、単一のその他枠に
-  落ちる。
+- `src/model/db/ChannelDB.ts:258-260` — `getChannelTypeId` に
+  `case 'BS4K': return 44;` / `case 'CS4K': return 45;` があり、
+  `default` は 46 へ後退した。**4K は専用のチャンネル種別枠を持つ。**
+- 4K は型宣言と ChannelDB だけの対応ではない。検索・予約・配信の各層に
+  行き渡っている:
+  - `src/model/db/RuleDB.ts:282-283, 427-428` — ルール検索条件に `BS4K` / `CS4K`
+  - `src/model/db/ProgramDB.ts:917-921` — 検索対象 `channelTypes` へ追加
+  - `src/model/api/schedule/ScheduleApiModel.ts:197-201`,
+    `src/model/service/api/schedules.ts:60-61` — 番組表 API のクエリパラメータ
+  - `src/model/api/iptv/IPTVApiModel.ts:127-128` — IPTV プレイリストの種別順
+  - `src/util/EncodePresets.ts:137` — 4K 向けエンコードプリセット
+- `EPGStation/package.json:61` — `"mirakurun": "git+https://github.com/stuayu/Mirakurun.git#4.3.0-stuayu"`
 
-つまり `BS4K` を出しても EPGStation は落ちないが、型宣言の外であり、
-チャンネル種別が「その他」に丸められる。
+**判断: 出力を `BS4K` / `CS4K` に変更する** (`web/mirakurun.rs`)。
+`BS` に丸めたままだと、EPGStation の番組表タブ・ルール検索の 4K 絞り込み・
+IPTV の種別分けがすべて BS と混ざったままになる。
 
-**判断: 出力は `BS` のままにする。** 4K は実運用上ほぼ BS 配信であり、
-`BS` なら EPGStation の GUI でも BS グループに正しく並ぶ。
+**`BS4K` / `CS4K` の振り分けは NID で行う。**
+`recisdb_protocol` の `BandType` は 4K を単一の `FourK` に分類する
+(`broadcast_region.rs`: `0x000B | 0x000C => FourK`)。チューナー側は両者を
+区別する理由がないため。Mirakurun の契約は区別するので、行が持つ `nid` から
+復元する: `0x000C` (高度広帯域CS) → `CS4K`、それ以外の 4K
+(`0x000B` = 高度BS) → `BS4K` (`four_k_type_for_nid`)。
 
-**入力としては `BS4K` を受け付ける** (`web/mirakurun.rs`)。
-4K 対応フォークの [MMirakurun](https://github.com/otya128/MMirakurun) は
-`BS4K` を実在の ChannelType として定義しているため、それに合わせて書かれた
-クライアントが `type=BS4K` で問い合わせたときに空を返さないようにする。
-追加分岐なので既存の挙動は変わらない。
+規格根拠: ARIB TR-B39 Part 1 Vol.3 §5.5 表5.5-1 (PDF pp.43-44)。
+`network_id=0x000B`、ネットワーク内で一意な `tlv_stream_id`、サービス固有の
+`service_id`、サービス内で一意な `event_id` を定義する。MMT/TLV の表・PID と
+TS への写像は `docs/FOURK_SETUP.md` の根拠を参照。
+
+4K 番組の識別は、proxy 内部では `nid=0x000B`、`sid=service_id`、
+`tsid=tlv_stream_id` (dantto4k が変換後 TS の transport_stream_id へ設定)、
+`event_id` で行う。MH-EIT 自体は API へ直接出さず、dantto4k が TS EIT へ
+変換した後に通常の EPG 収集・programs UPSERT を通る。
+
+**入力としては `BS` も `BS4K` / `CS4K` も受け付ける。**
+`type=BS` の候補バンドに `FourK` を残してあるので、この変更より前に発行された
+`.ch2` エクスポート・EPGStation の行・ブックマークが持つ `type=BS` の 4K
+チャンネルも解決できる。行は `(type, channel)` の組で照合されるため、
+実在の BS multiplex を横取りすることはない。
+
+**⚠️ EPGStation 側での影響**: 4K チャンネルの `channelTypeId` が
+`1` (BS) から `44`/`45` へ変わる。EPGStation は `(type, channel)` を
+チャンネルの同一性に使うため、**4K チャンネルは別チャンネルとして
+登録し直される**。既存の 4K の予約・ルールは貼り直しが要る。
+地デジ・BS・CS には影響しない。
+
+**`/mirakurun/api/version` と `/status` の `version` は `4.3.0-stuayu` を返す**
+(`MIRAKURUN_COMPAT_VERSION`)。このエンドポイントは「どの Mirakurun と
+話しているか」として読まれるので、互換ターゲットのバージョンを返す
+(このクレート自身のバージョンはプロジェクト固有の `/api/*` 側が返す)。
+EPGStation はこの値を機能判定には使っておらず、画面右上の表示に使うだけ
+(`src/model/update/UpdateManageModel.ts:453` 周辺)。
 
 **未確認**: EPGStation が 4K サービス (H.265 / 2160p) を録画・再生時に
 どう扱うか。型の問題とは別に、エンコード設定側での対応が要る可能性がある。
+`EncodePresets.ts:137` に 4K 向けプリセットの記述はある。
 
 ## 5. ストリームのセマンティクス
 

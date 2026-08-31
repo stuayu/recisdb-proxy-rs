@@ -28,9 +28,8 @@
 //!   out of scope per STREAMING_DESIGN.md §7.1's original P6 note ("まずは
 //!   視聴系のみのサブセットで良い"), but EPG storage/collection was added
 //!   later. `/schedules` and other EPG-adjacent endpoints (recording rules,
-//!   etc.) remain unimplemented. `isFree` is always reported `true` — the
-//!   `programs` table does not store `free_CA_mode` (see `web/mirakurun.rs`
-//!   `get_programs` doc comment for why).
+//!   etc.) remain unimplemented. `isFree` reflects persisted EIT
+//!   `free_CA_mode`.
 //! - `GET /docs` ([`crate::web::mirakurun_docs`]) IS implemented: the
 //!   `mirakurun` npm client used by EPGStation resolves every API call
 //!   through this OpenAPI (Swagger 2.0) document (operationId → method/path/
@@ -82,19 +81,24 @@
 //!   ([`mirakurun_service_id`] / [`split_mirakurun_service_id`]) are unit
 //!   tested for round-tripping.
 //! - **`BandType` → Mirakurun channel `type`** ([`band_type_to_mirakurun`]):
-//!   `Terrestrial → "GR"`, `BS → "BS"`, `CS → "CS"`, `SKY → "SKY"`. This
-//!   crate's `BandType` (`recisdb_protocol::types`) has two more variants
-//!   than Mirakurun's `type` enum, bucketed as a documented simplification:
-//!   - `FourK → "BS"`: advanced-BS/CS4K has no distinct Mirakurun type in
-//!     this subset (real Mirakurun forks disagree on whether a `"BS4K"` type
-//!     even exists); 4K services are overwhelmingly BS-delivered in practice
-//!     so `"BS"` is the closer bucket than `"CS"`.
-//!   - `CATV → "GR"`, `Other → "SKY"`: neither has a faithful Mirakurun
-//!     equivalent; these are best-effort buckets purely so the row is not
-//!     silently dropped.
+//!   `Terrestrial → "GR"`, `BS → "BS"`, `CS → "CS"`, `SKY → "SKY"`,
+//!   `FourK → "BS4K"`/`"CS4K"`. The compatibility target is the 4K-capable
+//!   fork the clients we care about build against (Mirakurun
+//!   `4.3.0-stuayu`), whose `ChannelType` union does include `"BS4K"` and
+//!   `"CS4K"` (`api.d.ts:53`); EPGStation gives each its own bucket
+//!   (`src/model/db/ChannelDB.ts:258-260`). `BandType::FourK` does not by
+//!   itself say which of the two, so the split is made on the network id:
+//!   `0x000C` (高度広帯域CS) → `"CS4K"`, everything else 4K (`0x000B`,
+//!   高度BS) → `"BS4K"` — see [`four_k_type_for_nid`].
+//!   This crate's `BandType` has two variants with no faithful Mirakurun
+//!   equivalent, bucketed as a documented simplification:
+//!   - `CATV → "GR"`, `Other → "SKY"`: best-effort buckets purely so the row
+//!     is not silently dropped.
 //!   The reverse mapping used by `GET /channels/:type/:channel/stream`
 //!   ([`mirakurun_type_to_band_candidates`]) is therefore one-to-many (e.g.
-//!   `type=BS` matches both `BandType::BS` and `BandType::FourK` rows).
+//!   `type=GR` matches both `BandType::Terrestrial` and `BandType::CATV`
+//!   rows). `type=BS` no longer matches 4K rows, but is still accepted for
+//!   them so links handed out before this change keep resolving.
 //! - **`channel` string**: `physical_ch` for terrestrial rows when present,
 //!   else `bon_channel`, rendered as a decimal string — then **disambiguated
 //!   so that `(type, channel)` identifies exactly one multiplex**
@@ -196,12 +200,30 @@ fn band_type_from_db(v: Option<u8>) -> BandType {
     }
 }
 
+/// Which of the two 4K `ChannelType`s a network id belongs to.
+///
+/// `recisdb_protocol` classifies both advanced-satellite network ids as the
+/// single `BandType::FourK` (`broadcast_region.rs`: `0x000B | 0x000C =>
+/// FourK`), because the tuner side has no reason to tell them apart. The
+/// Mirakurun contract does, so recover the distinction from the nid the row
+/// already carries.
+fn four_k_type_for_nid(nid: u16) -> &'static str {
+    match nid {
+        // 0x000C = 高度広帯域CS (advanced wide-band CS).
+        0x000C => "CS4K",
+        // 0x000B = 高度BS, plus any future advanced-BS nid.
+        _ => "BS4K",
+    }
+}
+
 /// `BandType` → Mirakurun `type` string. See the module doc comment for the
-/// documented, lossy `FourK`/`CATV`/`Other` bucketing.
-fn band_type_to_mirakurun(bt: BandType) -> &'static str {
+/// documented, lossy `CATV`/`Other` bucketing. `nid` only matters for
+/// `FourK`, where it selects `"BS4K"` vs `"CS4K"`.
+fn band_type_to_mirakurun(bt: BandType, nid: u16) -> &'static str {
     match bt {
         BandType::Terrestrial => "GR",
-        BandType::BS | BandType::FourK => "BS",
+        BandType::BS => "BS",
+        BandType::FourK => four_k_type_for_nid(nid),
         BandType::CS => "CS",
         BandType::CATV => "GR",
         BandType::SKY | BandType::Other => "SKY",
@@ -281,7 +303,7 @@ fn mirakurun_type_of(c: &ChannelRecord, terrestrial_types: &HashMap<u8, String>)
             return ty.clone();
         }
     }
-    band_type_to_mirakurun(bt).to_string()
+    band_type_to_mirakurun(bt, c.nid).to_string()
 }
 
 /// Mirakurun `type` string → candidate `BandType`s to search when resolving
@@ -291,25 +313,19 @@ fn mirakurun_type_of(c: &ChannelRecord, terrestrial_types: &HashMap<u8, String>)
 fn mirakurun_type_to_band_candidates(t: &str) -> Option<&'static [BandType]> {
     match t {
         "GR" => Some(&[BandType::Terrestrial, BandType::CATV]),
+        // `BandType::FourK` stays in the `BS` candidates even though we no
+        // longer *emit* `BS` for it: `.ch2`/bookmarks/EPGStation rows handed
+        // out before the switch to `BS4K` still say `type=BS`, and resolving
+        // them costs nothing. Rows are matched on the `(type, channel)` pair
+        // the caller asks for, so this cannot steal a real BS multiplex.
         "BS" => Some(&[BandType::BS, BandType::FourK]),
         "CS" => Some(&[BandType::CS]),
         "SKY" => Some(&[BandType::SKY, BandType::Other]),
-        // Accepted on input only, never produced by `band_type_to_mirakurun`.
-        //
-        // MMirakurun (otya128), the 4K-capable fork, does define `BS4K` as a
-        // real ChannelType, so a client written against it would otherwise get
-        // an empty list from us. Answering it costs nothing and is purely
-        // additive.
-        //
-        // We still advertise 4K as `BS`: the `api.d.ts` that EPGStation
-        // actually compiles against declares
-        // `"GR" | "BS" | "CS" | "SKY" | "NW1".."NW40"` with no `BS4K`
-        // (`node_modules/mirakurun/api.d.ts:48-52`), and its
-        // `ChannelDB.getChannelTypeId` funnels anything unrecognised into a
-        // single catch-all bucket (`src/model/db/ChannelDB.ts:169`, `default:
-        // return 44`). Emitting a type outside the union would be off-contract
-        // for the client we care about.
-        "BS4K" => Some(&[BandType::FourK]),
+        // The 4K types, as emitted by `band_type_to_mirakurun`. Both resolve
+        // to the same `BandType`; which of the two a row is depends on its
+        // nid ([`four_k_type_for_nid`]), and the `(type, channel)` match the
+        // caller performs afterwards keeps them apart.
+        "BS4K" | "CS4K" => Some(&[BandType::FourK]),
         // Out-of-area terrestrial ([`terrestrial_type_map`]). Which region a
         // given `NWn` refers to depends on what has been scanned, so the
         // candidate bands are simply the terrestrial ones and the caller
@@ -330,14 +346,16 @@ fn is_nw_type(t: &str) -> bool {
 
 /// Mirakurun `types` per `bon_drivers.id`, derived from the bands that
 /// driver's scanned channels fall into. Ordered `GR`, `BS`, `CS`, `SKY` (the
-/// order real Mirakurun's `tuners.yml` conventionally lists them in) rather
-/// than by discovery, so the response is stable across restarts.
+/// order real Mirakurun's `tuners.yml` conventionally lists them in) with the
+/// 4K types last — the same 地デジ→BS→CS→BS4K ordering the rest of the
+/// project keeps — rather than by discovery, so the response is stable
+/// across restarts.
 fn channel_types_by_driver(channels: &[ChannelRecord]) -> HashMap<i64, Vec<&'static str>> {
-    const TYPE_ORDER: [&str; 4] = ["GR", "BS", "CS", "SKY"];
+    const TYPE_ORDER: [&str; 6] = ["GR", "BS", "CS", "SKY", "BS4K", "CS4K"];
 
     let mut seen: HashMap<i64, HashSet<&'static str>> = HashMap::new();
     for c in channels {
-        let ty = band_type_to_mirakurun(band_type_from_db(c.band_type));
+        let ty = band_type_to_mirakurun(band_type_from_db(c.band_type), c.nid);
         seen.entry(c.bon_driver_id).or_default().insert(ty);
     }
 
@@ -476,7 +494,7 @@ pub struct MirakurunProgram {
     /// Milliseconds.
     pub duration: i64,
     /// Always `true` — see [`get_programs`] doc comment: the `programs`
-    /// table does not carry `free_CA_mode`.
+    /// table stores EIT `free_CA_mode`.
     pub is_free: bool,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -531,6 +549,7 @@ fn build_mirakurun_program(
     name: Option<String>,
     description: Option<String>,
     genre: Option<i64>,
+    free_ca_mode: bool,
 ) -> MirakurunProgram {
     let genres = genre
         .map(|g| {
@@ -547,7 +566,7 @@ fn build_mirakurun_program(
         transport_stream_id: tsid,
         start_at: start_at * 1000,
         duration: duration_secs * 1000,
-        is_free: true,
+        is_free: !free_ca_mode,
         name,
         description,
         genres,
@@ -565,6 +584,7 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
         r.name,
         r.description,
         r.genre,
+        r.free_ca_mode,
     )
 }
 
@@ -583,6 +603,7 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
         u.name.clone(),
         u.description.clone(),
         u.genre,
+        u.free_ca_mode,
     )
 }
 
@@ -590,14 +611,24 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
 // Handlers
 // ============================================================================
 
-/// `GET /mirakurun/api/version`.
+/// The Mirakurun release this compatibility layer targets.
 ///
-/// Intentionally `CARGO_PKG_VERSION` (not `crate::VERSION`/git describe):
-/// Mirakurun-compatible clients (EPGStation etc.) may expect a strict
-/// semver-ish string here, not a `-N-g<hash>` dev-build suffix.
+/// Deliberately *not* this crate's own version: `/mirakurun/api/version` is
+/// read as "which Mirakurun am I talking to", and clients decide what the
+/// server can do from it. `4.3.0-stuayu` is the 4K-capable fork EPGStation
+/// pins (`EPGStation/package.json:61`) and whose `ChannelType` union is the
+/// one we now emit against — it is what declares `"BS4K"`/`"CS4K"`
+/// (`api.d.ts:53`). Bump this together with the contract it describes, not
+/// with our own releases; this crate's version is still reported by the
+/// project's own `/api/*` endpoints.
+const MIRAKURUN_COMPAT_VERSION: &str = "4.3.0-stuayu";
+
+/// `GET /mirakurun/api/version`.
 pub async fn get_version() -> impl IntoResponse {
-    let v = env!("CARGO_PKG_VERSION");
-    Json(json!({ "current": v, "latest": v }))
+    Json(json!({
+        "current": MIRAKURUN_COMPAT_VERSION,
+        "latest": MIRAKURUN_COMPAT_VERSION,
+    }))
 }
 
 /// `GET /mirakurun/api/status`.
@@ -634,8 +665,8 @@ pub async fn get_status(State(web_state): State<Arc<WebState>>) -> impl IntoResp
     };
 
     Json(json!({
-        // Intentionally CARGO_PKG_VERSION, see get_version() above.
-        "version": env!("CARGO_PKG_VERSION"),
+        // The Mirakurun contract version, see `get_version()` above.
+        "version": MIRAKURUN_COMPAT_VERSION,
         "tunerCount": tuner_count,
         "runningTunerCount": running_tuner_count,
     }))
@@ -917,13 +948,8 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
 ///
 /// Real Mirakurun accepts `?networkId=&serviceId=` filters; this reads the
 /// full `programs` table unfiltered (EPGStation/KonomiTV typically fetch
-/// everything and filter client-side for this subset's scale). `isFree` is
-/// always reported `true`: the `programs` table (Migration 015) does not
-/// store `free_CA_mode` — the collector (`tuner/epg_collector.rs`) parses it
-/// per-event but the design's schema (see `database/program.rs`) omits the
-/// column, so it is not persisted. This is a known simplification, not a
-/// bug: EPGStation/KonomiTV use `isFree` only to badge scrambled programs in
-/// the UI, which does not block program-guide population.
+/// everything and filter client-side for this subset's scale). `isFree`
+/// reflects the persisted EIT `free_CA_mode` value.
 pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
     let programs = {
         let db = web_state.database.lock().await;
@@ -1533,13 +1559,25 @@ mod tests {
 
     #[test]
     fn band_type_maps_to_expected_mirakurun_type() {
-        assert_eq!(band_type_to_mirakurun(BandType::Terrestrial), "GR");
-        assert_eq!(band_type_to_mirakurun(BandType::BS), "BS");
-        assert_eq!(band_type_to_mirakurun(BandType::CS), "CS");
-        assert_eq!(band_type_to_mirakurun(BandType::FourK), "BS");
-        assert_eq!(band_type_to_mirakurun(BandType::CATV), "GR");
-        assert_eq!(band_type_to_mirakurun(BandType::SKY), "SKY");
-        assert_eq!(band_type_to_mirakurun(BandType::Other), "SKY");
+        // nid is only consulted for `FourK`; 0x0004 (BS) stands in for
+        // "some non-4K network" for the others.
+        assert_eq!(band_type_to_mirakurun(BandType::Terrestrial, 0x7FE0), "GR");
+        assert_eq!(band_type_to_mirakurun(BandType::BS, 0x0004), "BS");
+        assert_eq!(band_type_to_mirakurun(BandType::CS, 0x0006), "CS");
+        assert_eq!(band_type_to_mirakurun(BandType::CATV, 0x7FE0), "GR");
+        assert_eq!(band_type_to_mirakurun(BandType::SKY, 0x0001), "SKY");
+        assert_eq!(band_type_to_mirakurun(BandType::Other, 0x0001), "SKY");
+    }
+
+    /// `BandType::FourK` covers both advanced-satellite networks, so the
+    /// `BS4K`/`CS4K` split has to come from the nid
+    /// (`broadcast_region.rs`: `0x000B | 0x000C => FourK`).
+    #[test]
+    fn four_k_splits_into_bs4k_and_cs4k_by_network_id() {
+        assert_eq!(band_type_to_mirakurun(BandType::FourK, 0x000B), "BS4K");
+        assert_eq!(band_type_to_mirakurun(BandType::FourK, 0x000C), "CS4K");
+        // An unclassified 4K row must not silently become `CS4K`.
+        assert_eq!(band_type_to_mirakurun(BandType::FourK, 0x0000), "BS4K");
     }
 
     #[test]
@@ -1556,9 +1594,12 @@ mod tests {
             BandType::SKY,
             BandType::Other,
         ] {
-            let ty = band_type_to_mirakurun(bt);
+            // Both 4K nids, so `FourK` is checked for `BS4K` and `CS4K`.
+            for nid in [0x000B_u16, 0x000C] {
+            let ty = band_type_to_mirakurun(bt, nid);
             let candidates = mirakurun_type_to_band_candidates(ty).unwrap();
             assert!(candidates.contains(&bt), "{:?} -> {} not in reverse candidates", bt, ty);
+            }
         }
     }
 
@@ -1569,28 +1610,40 @@ mod tests {
         assert!(mirakurun_type_to_band_candidates("bs4k").is_none(), "types are case-sensitive");
     }
 
-    /// `BS4K` is accepted on input because MMirakurun defines it, but must not
-    /// be produced: the `api.d.ts` EPGStation compiles against has no such
-    /// member, and its ChannelDB drops unknown types into a catch-all bucket.
+    /// `type=BS` must keep resolving 4K rows even now that they advertise
+    /// themselves as `BS4K`/`CS4K`: links generated before the switch (`.ch2`
+    /// exports, EPGStation rows, bookmarks) still carry the old type.
     #[test]
-    fn bs4k_is_accepted_on_input_but_never_advertised() {
+    fn legacy_bs_type_still_resolves_four_k_rows() {
+        let candidates = mirakurun_type_to_band_candidates("BS").unwrap();
+        assert!(candidates.contains(&BandType::FourK));
+        assert!(candidates.contains(&BandType::BS));
+    }
+
+    #[test]
+    fn four_k_types_resolve_to_the_four_k_band() {
         assert_eq!(
             mirakurun_type_to_band_candidates("BS4K"),
             Some(&[BandType::FourK][..])
         );
-        assert_eq!(band_type_to_mirakurun(BandType::FourK), "BS");
-
-        // Nothing may advertise itself as BS4K.
+        assert_eq!(
+            mirakurun_type_to_band_candidates("CS4K"),
+            Some(&[BandType::FourK][..])
+        );
+        // Only 4K rows advertise the 4K types.
         for bt in [
             BandType::Terrestrial,
             BandType::BS,
             BandType::CS,
-            BandType::FourK,
             BandType::CATV,
             BandType::SKY,
             BandType::Other,
         ] {
-            assert_ne!(band_type_to_mirakurun(bt), "BS4K");
+            for nid in [0x000B_u16, 0x000C, 0x0004] {
+                let ty = band_type_to_mirakurun(bt, nid);
+                assert_ne!(ty, "BS4K");
+                assert_ne!(ty, "CS4K");
+            }
         }
     }
 

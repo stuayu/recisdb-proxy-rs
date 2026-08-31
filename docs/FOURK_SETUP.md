@@ -331,10 +331,27 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
 | 0x0000 | PAT | 選局・サービス解決 |
 | 0x0010 | NIT | スキャン (physical_ch / remote_control_key) |
 | 0x0011 | SDT | スキャン (サービス名・service_type) |
-| 0x0012 | H-EIT | **番組表 (EPG) が動く** |
+| 0x0012 | EIT (MH-EIT変換後) | **番組表 (EPG) が動く** |
 | 0x0014 | TOT | 時刻 |
 | 0x0024 | BIT | — |
 | 0x0029 | CDT | **ロゴ収集が動く** |
+
+### MH-EIT と変換後TS
+
+高度BSのMH-EITは、MMTP Packet ID `0x8000` のM2 section messageに載る。
+table_idは p/f `0x8B`、schedule `0x8C..0x9B`。dantto4kの
+`RemuxerHandler::onMhEit` はこれを MPEG-2 TS の PID `0x0012`へ再多重し、
+table_idをそれぞれ `0x4E`、`0x50..0x5F`へ写す。よって `epg_collector.rs` は
+変換後の通常EITとして処理できる。前回追加のPID `0x0026/0x0027`は4K用ではない。
+
+規格根拠: ARIB STD-B60 §4.3 表4-11/4-12 (PDF pp.22-23)、§7.3.3.9 表7-18
+(PDF pp.66-68)。運用は ARIB TR-B39 Part 1 Vol.4 §5.1/5.2 表5.1-3/5.2-4
+(PDF pp.37-40)、§14.1 (PDF pp.83-87)。
+
+`tlv_stream_id`は4Kでの多重ストリーム識別子。dantto4kはTSの
+`transport_stream_id`欄へ同値を設定する。proxyは変換後EITの
+`original_network_id`/`service_id`/TSID/`event_id`を保存するため、4Kも
+`(nid, sid, tsid, event_id)`で衝突しない。
 
 ### プレビュー用エンコードプロファイル (2026-08-22 対応)
 
@@ -496,9 +513,12 @@ UPDATE bon_drivers SET disable_b25 = 1 WHERE dll_path = '...BonDriver_dantto4k.d
   (映像 794484 パケット中 57)。変換器が PSI を再生成する際に連続性カウンタが
   飛んでいる可能性がある。ダッシュボードの品質表示に常時 Drop が出るなら、
   4K では計上の仕方を見直す必要がある
-- **Mirakurun 互換 API**: 出力は `FourK → "BS"`、入力は `BS4K` も受け付ける
-  (`web/mirakurun.rs`)。EPGStation 同梱の `api.d.ts` に `BS4K` が無いことを
-  実コードで確認済み — 根拠と判断は `docs/EPGSTATION_COMPAT.md` §4 に記載。
+- **Mirakurun 互換 API**: 出力は `FourK → "BS4K"` / `"CS4K"` (NID `0x000C` は
+  `CS4K`、それ以外の 4K は `BS4K`)。入力は `BS` も `BS4K`/`CS4K` も受け付ける
+  (`web/mirakurun.rs`)。互換ターゲットは Mirakurun `4.3.0-stuayu` で、その
+  `ChannelType` に 4K の型があることを EPGStation の実コードで確認済み —
+  根拠と判断、および EPGStation 側でチャンネルが再登録される影響は
+  `docs/EPGSTATION_COMPAT.md` §4 に記載。
   EPGStation が 4K サービス (H.265 / 2160p) を録画・再生でどう扱うかは未検証。
   dantto4k の README には PT4K + Mirakurun 運用時のタイムアウト問題への言及が
   あり、本プロジェクトの Mirakurun 互換 API でも該当する可能性がある
