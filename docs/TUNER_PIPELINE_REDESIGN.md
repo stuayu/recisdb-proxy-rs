@@ -3,6 +3,11 @@
 対象: `recisdb-proxy` のクリティカルパス — チューナー選択ロジック、TS配信機構、
 チャンネル切り替え処理。
 
+EPG active scanはpriority `-1000` の低優先要求として
+`tuner/acquire.rs::acquire`へ渡す。scan schedulerがSlotPermitなしにBonDriverを開くことを
+禁止し、録画・視聴が先なら容量判定でEPGを延期する。readerの読み取りループへEPG専用処理を
+追加せず、subscription側で既存EpgCollectorへ接続する。
+
 位置づけ: `docs/SYSTEM_REVIEW_2026-07.md` のリファクタリング・ロードマップ
 Phase 2 項目 **17 (SetChannel ポリシーエンジン抽出)** と **18 (Session 状態機械の
 型による強制)** の実施計画。本書が設計の正本であり、完了後は `DESIGN.md` §4.3〜4.5

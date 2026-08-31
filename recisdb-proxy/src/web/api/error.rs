@@ -93,5 +93,7 @@ impl From<crate::database::DatabaseError> for ApiError {
 }
 
 impl From<rusqlite::Error> for ApiError {
-    fn from(e: rusqlite::Error) -> Self { ApiError::internal(e.to_string()) }
+    fn from(e: rusqlite::Error) -> Self {
+        ApiError::internal(e.to_string())
+    }
 }

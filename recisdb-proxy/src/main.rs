@@ -20,7 +20,7 @@ use recisdb_proxy::server;
 use recisdb_proxy::tuner;
 use recisdb_proxy::web;
 
-use scheduler::{scan_scheduler::ScanSchedulerConfig, ScanScheduler};
+use scheduler::{scan_scheduler::ScanSchedulerConfig, EpgScanScheduler, ScanScheduler};
 
 use server::{Server, ServerConfig};
 use tuner::TunerPoolConfig;
@@ -677,6 +677,15 @@ async fn run_server(
 
     // Create server
     let server = Server::new(config, Arc::clone(&session_registry));
+
+    // Active EPG collection reads runtime settings from DB on every
+    // evaluation. It is intentionally independent from the channel scan
+    // scheduler and starts even when channel scanning is disabled.
+    let epg_scheduler = Arc::new(EpgScanScheduler::new(
+        db.clone(),
+        Arc::clone(server.tuner_pool()),
+    ));
+    let _epg_scheduler_handle = Arc::clone(&epg_scheduler).start();
 
     // Prepare scan configuration to share with web server
     let scan_config_for_web = if args.enable_scan {

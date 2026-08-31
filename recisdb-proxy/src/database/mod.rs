@@ -256,6 +256,10 @@ impl Database {
             "027_epg_runtime_settings",
             Database::migration_027_epg_runtime_settings,
         ),
+        (
+            "028_epg_selected_preset",
+            Database::migration_028_epg_selected_preset,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -265,6 +269,10 @@ impl Database {
         self.conn.execute_batch(epg_settings::EPG_SCHEMA_SQL)?;
         epg_settings::seed_defaults(&self.conn)?;
         Ok(())
+    }
+
+    fn migration_028_epg_selected_preset(&self) -> Result<()> {
+        self.add_column_if_not_exists("epg_global_settings", "selected_preset_id", "INTEGER")
     }
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,

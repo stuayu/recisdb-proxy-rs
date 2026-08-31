@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { api, downloadApi, unwrapArray, type JsonRecord } from '../api'
+import EntityLookup, { type LookupEntity } from './EntityLookup.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 type Column = {
@@ -37,6 +38,7 @@ const columns: Column[] = [
 
 const defaultKeys = columns.slice(0, 12).map((column) => column.key)
 const rows = ref<JsonRecord[]>([])
+const drivers = ref<LookupEntity[]>([])
 const query = ref('')
 const error = ref('')
 const message = ref('')
@@ -160,6 +162,8 @@ async function load() {
   loading.value = true
   try {
     rows.value = unwrapArray(await api('/channels'), ['channels'])
+    const driverRows = unwrapArray(await api('/bondrivers'), ['bondrivers', 'tuners'])
+    drivers.value = driverRows.map((driver) => ({ id: Number(driver.id), name: String(driver.display_name ?? driver.driver_name ?? driver.dll_path ?? `Driver ${driver.id}`), description: String(driver.dll_path ?? ''), secondary: 'ローカル' }))
     selected.value = selected.value.filter((id) => rows.value.some((row) => Number(row.id) === id))
     error.value = ''
   } catch (cause) {
@@ -609,10 +613,7 @@ onUnmounted(() => {
 
       <form v-if="editMode" id="channel-form" class="panel" @submit.prevent="save">
         <h3>editing ? 'チャンネル編集' : 'チャンネル登録'</h3>
-        <label class="field">
-          <span>BonDriver ID</span>
-          <input v-model.number="form.bon_driver_id" type="number" min="1" required />
-        </label>
+        <EntityLookup v-model="form.bon_driver_id" :entities="drivers" label="チューナー" placeholder="名前・パスで検索" />
         <div class="form-grid">
           <label class="field"
             ><span>NID</span

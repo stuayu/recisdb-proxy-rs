@@ -17,6 +17,18 @@ const error = ref('')
 const label = computed(() => endpoints.find((item) => item[1] === selected.value)?.[0] ?? '設定')
 const isEpg = computed(() => selected.value === '/settings/epg')
 const epgPresets = ref<JsonRecord[]>([])
+const selectedEpgPreset = ref<number | null>(null)
+const featuredEpgPresets = computed(() => epgPresets.value.filter((preset) => preset.is_system).slice(0, 3))
+const epgStatus = ref<JsonRecord | null>(null)
+function formatEpoch(value: unknown): string {
+  return typeof value === 'number'
+    ? new Date(value * 1000).toLocaleString('ja-JP', { dateStyle: 'short', timeStyle: 'short' })
+    : '—'
+}
+function epgStateValue(key: string): unknown {
+  const state = epgStatus.value?.state
+  return state && typeof state === 'object' ? (state as JsonRecord)[key] : null
+}
 const entries = computed(() => Object.entries(config.value))
 const protectedKeys = new Set([
   'command_path',
@@ -72,6 +84,8 @@ async function load() {
     if (isEpg.value) {
       const presets = await api<JsonRecord>('/epg-presets')
       epgPresets.value = Array.isArray(presets.presets) ? (presets.presets as JsonRecord[]) : []
+      selectedEpgPreset.value = typeof config.value.selected_preset_id === 'number' ? Number(config.value.selected_preset_id) : null
+      epgStatus.value = await api<JsonRecord>('/epg/status')
     }
     message.value = ''
     error.value = ''
@@ -81,6 +95,7 @@ async function load() {
 }
 async function save() {
   try {
+    if (isEpg.value) config.value.selected_preset_id = selectedEpgPreset.value
     const payload = Object.fromEntries(entries.value.filter(([key]) => !protectedKeys.has(key)))
     await api(selected.value, {
       method: isEpg.value ? 'PUT' : 'POST',
@@ -92,6 +107,21 @@ async function save() {
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
+}
+async function duplicateEpgPreset(preset: JsonRecord) {
+  try {
+    await api('/epg-presets', { method: 'POST', body: JSON.stringify({ name: `${String(preset.name)}（コピー）`, description: preset.description ?? '' }) })
+    await load()
+    message.value = 'プリセットを複製しました。'
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+async function deleteEpgPreset(preset: JsonRecord) {
+  if (preset.is_system || !window.confirm(`「${String(preset.name)}」を削除しますか？`)) return
+  try {
+    await api(`/epg-presets/${String(preset.id)}`, { method: 'DELETE' })
+    await load()
+    message.value = 'プリセットを削除しました。'
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
 }
 // --- サーバー(OSサービス)状態と再起動 -------------------------------
 type ServiceStatus = {
@@ -625,16 +655,32 @@ onMounted(() => {
     <form class="panel settings-form" @submit.prevent="save">
       <h3 v-text="label" />
       <template v-if="isEpg">
+        <section class="panel epg-status" aria-labelledby="epg-status-title">
+          <h4 id="epg-status-title">EPG状態 <span>{{ epgStatus?.active ? '取得中' : '待機中' }}</span></h4>
+          <p v-if="epgStatus?.reason" class="muted" v-text="String(epgStatus.reason)" />
+          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd><dt>延期理由</dt><dd>{{ epgStateValue('lastFailureReason') ?? 'なし' }}</dd></dl>
+        </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
         <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
         <fieldset>
           <legend>更新方針</legend>
-          <label v-for="preset in epgPresets" :key="String(preset.id)" class="preset-choice">
-            <input type="radio" name="epg-preset" :value="preset.id" :checked="preset.name === '標準'" disabled />
+          <label v-for="preset in featuredEpgPresets" :key="String(preset.id)" class="preset-choice">
+            <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="Number(preset.id)" />
             <span><strong v-text="String(preset.name)" /> — <span v-text="String(preset.description ?? '')" /></span>
           </label>
+          <label class="preset-choice"><input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="null" /><span><strong>カスタム</strong> — 詳細設定を自分で決める</span></label>
           <p class="muted">プリセットのチューナー割り当ては、個別チューナー設定画面から行います。</p>
         </fieldset>
+        <section class="epg-presets" aria-labelledby="epg-presets-title">
+          <h4 id="epg-presets-title">プリセット管理</h4>
+          <div class="epg-preset-cards">
+            <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card">
+              <h5>{{ String(preset.name) }} <span v-if="preset.is_system" class="badge">おすすめ</span></h5>
+              <p>{{ String(preset.description ?? '') }}</p>
+              <div class="actions"><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></div>
+            </article>
+          </div>
+        </section>
         <div class="epg-friendly-grid">
           <label class="field"><span>更新頻度</span><select v-model.number="config.target_refresh_secs"><option :value="3600">約1時間</option><option :value="21600">約6時間</option><option :value="43200">約12時間</option></select></label>
           <label class="field"><span>何日先まで維持</span><select v-model.number="config.target_future_coverage_hours"><option :value="72">3日</option><option :value="168">7日</option><option :value="336">14日</option></select></label>
@@ -698,5 +744,34 @@ onMounted(() => {
 
 .service-status dd {
   margin: 0;
+}
+
+.epg-preset-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 12px;
+}
+
+.epg-preset-card {
+  margin: 0;
+  padding: 12px;
+}
+
+.epg-preset-card h5 {
+  margin: 0;
+}
+
+.epg-preset-card p {
+  min-height: 2.5em;
+}
+
+@media (max-width: 700px) {
+  .service-status {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .service-status dd {
+    margin-bottom: 6px;
+  }
 }
 </style>

@@ -79,6 +79,7 @@ pub struct EpgGlobalSettings {
     pub cpu_hard_limit_percent: i64,
     pub remote_prefer_metadata_execution: bool,
     pub remote_allow_ts_transport: bool,
+    pub selected_preset_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,8 +164,44 @@ pub(crate) fn seed_defaults(c: &Connection) -> Result<()> {
 }
 
 impl Database {
+    pub fn epg_scan_started(&self, tuner_id: i64, reason: &str) -> Result<i64> {
+        let now = chrono::Utc::now().timestamp();
+        self.connection().execute("UPDATE epg_scan_states SET last_scan_started_at=?1,last_tuner_id=?2,last_failure_reason=NULL WHERE id=1", params![now,tuner_id])?;
+        self.connection().execute("INSERT INTO epg_scan_history(started_at,status,reason,physical_tuner_id) VALUES(?1,'running',?2,?3)", params![now,reason,tuner_id])?;
+        Ok(self.connection().last_insert_rowid())
+    }
+    pub fn epg_scan_finished(
+        &self,
+        history_id: i64,
+        status: &str,
+        tuner_id: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.connection().execute(
+            "UPDATE epg_scan_history SET finished_at=?1,status=?2,error=?3 WHERE id=?4",
+            params![now, status, error, history_id],
+        )?;
+        let failure = if status == "completed" { 0 } else { 1 };
+        self.connection().execute("UPDATE epg_scan_states SET last_scan_completed_at=?1,failure_count=CASE WHEN ?2=0 THEN 0 ELSE failure_count+1 END,last_failure_reason=?3,next_eligible_at=?1+60 WHERE id=1",params![now,failure,error])?;
+        self.connection().execute("DELETE FROM epg_scan_history WHERE id NOT IN (SELECT id FROM epg_scan_history ORDER BY started_at DESC LIMIT (SELECT max_rows FROM epg_scan_retention WHERE id=1)) OR started_at < ?1-(SELECT max_age_days FROM epg_scan_retention WHERE id=1)*86400",[now])?;
+        let _ = tuner_id;
+        Ok(())
+    }
+    pub fn epg_last_event_time(&self) -> Result<Option<i64>> {
+        Ok(self
+            .connection()
+            .query_row("SELECT MAX(updated_at) FROM programs", [], |r| r.get(0))?)
+    }
+    pub fn epg_next_eligible(&self) -> Result<Option<i64>> {
+        Ok(self.connection().query_row(
+            "SELECT next_eligible_at FROM epg_scan_states WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
     pub fn get_epg_global_settings(&self) -> Result<EpgGlobalSettings> {
-        self.connection().query_row("SELECT enabled,scheduler_interval_secs,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,startup_delay_secs,startup_jitter_secs,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,max_concurrent_scans,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport FROM epg_global_settings WHERE id=1",[],|r|Ok(EpgGlobalSettings{enabled:r.get::<_,i64>(0)?!=0,scheduler_interval_secs:r.get(1)?,target_refresh_secs:r.get(2)?,max_stale_secs:r.get(3)?,min_future_coverage_hours:r.get(4)?,target_future_coverage_hours:r.get(5)?,startup_delay_secs:r.get(6)?,startup_jitter_secs:r.get(7)?,min_dwell_secs:r.get(8)?,normal_dwell_secs:r.get(9)?,max_dwell_secs:r.get(10)?,idle_section_timeout_secs:r.get(11)?,max_concurrent_scans:r.get(12)?,reserve_tuners:r.get::<_,i64>(13)?!=0,prefer_local:r.get::<_,i64>(14)?!=0,allow_remote:r.get::<_,i64>(15)?!=0,preemptible:r.get::<_,i64>(16)?!=0,cpu_soft_limit_percent:r.get(17)?,cpu_hard_limit_percent:r.get(18)?,remote_prefer_metadata_execution:r.get::<_,i64>(19)?!=0,remote_allow_ts_transport:r.get::<_,i64>(20)?!=0})).map_err(Into::into)
+        self.connection().query_row("SELECT enabled,scheduler_interval_secs,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,startup_delay_secs,startup_jitter_secs,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,max_concurrent_scans,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport,selected_preset_id FROM epg_global_settings WHERE id=1",[],|r|Ok(EpgGlobalSettings{enabled:r.get::<_,i64>(0)?!=0,scheduler_interval_secs:r.get(1)?,target_refresh_secs:r.get(2)?,max_stale_secs:r.get(3)?,min_future_coverage_hours:r.get(4)?,target_future_coverage_hours:r.get(5)?,startup_delay_secs:r.get(6)?,startup_jitter_secs:r.get(7)?,min_dwell_secs:r.get(8)?,normal_dwell_secs:r.get(9)?,max_dwell_secs:r.get(10)?,idle_section_timeout_secs:r.get(11)?,max_concurrent_scans:r.get(12)?,reserve_tuners:r.get::<_,i64>(13)?!=0,prefer_local:r.get::<_,i64>(14)?!=0,allow_remote:r.get::<_,i64>(15)?!=0,preemptible:r.get::<_,i64>(16)?!=0,cpu_soft_limit_percent:r.get(17)?,cpu_hard_limit_percent:r.get(18)?,remote_prefer_metadata_execution:r.get::<_,i64>(19)?!=0,remote_allow_ts_transport:r.get::<_,i64>(20)?!=0,selected_preset_id:r.get(21)?})).map_err(Into::into)
     }
     pub fn update_epg_global_settings(&self, c: &EpgGlobalSettings) -> Result<()> {
         if !valid(c) {
@@ -172,7 +209,7 @@ impl Database {
                 "invalid EPG settings ordering or CPU limits".into(),
             ));
         }
-        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,scheduler_interval_secs=?2,target_refresh_secs=?3,max_stale_secs=?4,min_future_coverage_hours=?5,target_future_coverage_hours=?6,startup_delay_secs=?7,startup_jitter_secs=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,max_concurrent_scans=?13,reserve_tuners=?14,prefer_local=?15,allow_remote=?16,preemptible=?17,cpu_soft_limit_percent=?18,cpu_hard_limit_percent=?19,remote_prefer_metadata_execution=?20,remote_allow_ts_transport=?21,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,c.max_concurrent_scans,b(c.reserve_tuners),b(c.prefer_local),b(c.allow_remote),b(c.preemptible),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport)])?;
+        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,scheduler_interval_secs=?2,target_refresh_secs=?3,max_stale_secs=?4,min_future_coverage_hours=?5,target_future_coverage_hours=?6,startup_delay_secs=?7,startup_jitter_secs=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,max_concurrent_scans=?13,reserve_tuners=?14,prefer_local=?15,allow_remote=?16,preemptible=?17,cpu_soft_limit_percent=?18,cpu_hard_limit_percent=?19,remote_prefer_metadata_execution=?20,remote_allow_ts_transport=?21,selected_preset_id=?22,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,b(c.reserve_tuners),b(c.prefer_local),b(c.allow_remote),b(c.preemptible),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport),c.selected_preset_id])?;
         Ok(())
     }
     pub fn list_epg_presets(&self) -> Result<Vec<EpgPreset>> {
@@ -216,7 +253,7 @@ impl Database {
     pub fn get_epg_effective(&self, tuner_id: Option<i64>) -> Result<EffectiveEpgScanConfig> {
         let g = self.get_epg_global_settings()?;
         let physical = tuner_id.and_then(|id| self.get_physical_tuner_epg_settings(id).ok());
-        let p=tuner_id.and_then(|id|self.connection().query_row("SELECT preset_id FROM physical_tuner_epg_settings WHERE physical_tuner_id=?",[id],|r|r.get::<_,Option<i64>>(0)).optional().ok().flatten()).flatten();
+        let p=tuner_id.and_then(|id|self.connection().query_row("SELECT preset_id FROM physical_tuner_epg_settings WHERE physical_tuner_id=?",[id],|r|r.get::<_,Option<i64>>(0)).optional().ok().flatten()).flatten().or(g.selected_preset_id);
         let preset = p.and_then(|id| {
             self.list_epg_presets()
                 .ok()?

@@ -1,5 +1,11 @@
 # Distributed Tuner Fabric
 
+## EPG remote execution
+
+`remote_prefer_metadata_execution` 有効時はremote node側のEIT解析を優先し、
+`remote_allow_ts_transport` 無効時は放送TSをWAN転送しない。remote scanの同一
+`(network_id, tsid)`重複排除は既存lease経路へ接続するまで延期扱い。
+
 Status: implementation design for `feat/distributed-tuner-fabric`.
 
 The goal is not merely remote BonDriver access. The fabric must keep viewing

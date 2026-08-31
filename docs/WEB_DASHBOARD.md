@@ -31,6 +31,9 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 削除不可。effective値の表示・physical tuner override・状態/history画面はAPI基盤追加後に
 段階実装する。
 
+Active scan状態は「取得中」「延期理由」「最終更新」「次回判定」をstatus APIから表示する。
+延期理由はbackendの構造化statusをUIで日本語化し、CPU負荷・録画/視聴による占有を区別する。
+
 ### 1. リアルタイム監視
 
 **チューナー状況**

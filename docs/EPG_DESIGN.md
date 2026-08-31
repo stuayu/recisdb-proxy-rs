@@ -151,9 +151,10 @@ singleton global、system preset、scan state/history/retentionの初期行を�
 effective値を作り、API/UIはeffective値とsourceを表示する。現在の永続チューナーidentityは
 既存 `bon_drivers.id`（`/api/tuners/:id`）であり、tuner instance用の新identityは追加しない。
 
-設定更新はDBへ直ちに保存され、schedulerは次回評価で再読込する設計。active scanの専用巡回、
-scan state/historyの実行時更新、physical override CRUDは後続実装であり、現行の受動収集を
-自動取得済みとは扱わない。
+設定更新はDBへ直ちに保存され、schedulerは次回評価で再読込する。Active scanは既存readerの
+subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、idle timeout、CPU limit、
+同時数を適用し、開始/完了/失敗をstate/historyへ記録する。remote node側metadata実行と
+node leaseによる同一(NID,TSID)重複排除は未接続で、remote利用は延期対象。
 
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。
