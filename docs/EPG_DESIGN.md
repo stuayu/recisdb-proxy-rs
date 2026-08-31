@@ -174,6 +174,12 @@ B25やMMT処理は行わない。
 
 延期・失敗理由は `EpgReasonCode` enumから生成する `{code, details}`形式で保存・配信する。
 CPU値、対象TS、次回時刻などの付加情報はdetailsに入れ、画面側はコード対応表だけを持つ。
+スケジューラの延期判定は毎回 `epg_scan_states.last_failure_reason` を更新するが、
+`epg_scan_history` への deferred 行は同じ理由が継続する間は追加しない(edge-triggered)。
+`not_due` は正常な待機状態なのでstateだけに残し、履歴を増やさない。CPU soft/hard上限、
+チューナー不足、backoff、無効化、互換チューナーなし、取得失敗はそれぞれ対応する
+reason codeと対象TS・CPU値・次回時刻などを記録する。複数条件はdetailsの
+`additional_codes`で同時に返す。
 
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。

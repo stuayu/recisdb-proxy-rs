@@ -31,6 +31,7 @@ pub enum EpgScanDecision {
     Disabled,
     SoftCpuLimit,
     AtCapacity,
+    Backoff,
     NotDue,
 }
 
@@ -40,10 +41,43 @@ impl EpgScanDecision {
             Self::Disabled => Some(EpgReasonCode::Disabled),
             Self::SoftCpuLimit => Some(EpgReasonCode::CpuSoftLimit),
             Self::AtCapacity => Some(EpgReasonCode::NoTunerAvailable),
+            Self::Backoff => Some(EpgReasonCode::Backoff),
             Self::NotDue => Some(EpgReasonCode::NotDue),
             Self::Start => None,
         }
     }
+}
+
+fn decision_details(
+    decision: EpgScanDecision,
+    config: &EpgGlobalSettings,
+    active: usize,
+    cpu: u32,
+    now: i64,
+    next: Option<i64>,
+    network_id: u16,
+    tsid: u16,
+) -> serde_json::Value {
+    let mut additional_codes = Vec::new();
+    if cpu as i64 >= config.cpu_soft_limit_percent && decision != EpgScanDecision::SoftCpuLimit {
+        additional_codes.push(EpgReasonCode::CpuSoftLimit);
+    }
+    if active >= config.max_concurrent_scans.max(1) as usize
+        && decision != EpgScanDecision::AtCapacity
+    {
+        additional_codes.push(EpgReasonCode::NoTunerAvailable);
+    }
+    if next.is_some_and(|at| at > now) && decision != EpgScanDecision::Backoff {
+        additional_codes.push(EpgReasonCode::Backoff);
+    }
+    serde_json::json!({
+        "network_id": network_id,
+        "tsid": tsid,
+        "cpu_percent": cpu,
+        "next_eligible_at": next,
+        "active_scans": active,
+        "additional_codes": additional_codes,
+    })
 }
 
 pub fn decide(
@@ -63,6 +97,9 @@ pub fn decide(
     }
     if active >= config.max_concurrent_scans.max(1) as usize {
         return EpgScanDecision::AtCapacity;
+    }
+    if next.is_some_and(|at| at > now) {
+        return EpgScanDecision::Backoff;
     }
     let target_covered =
         coverage_until.is_some_and(|at| at >= now + config.target_future_coverage_hours * 3600);
@@ -151,19 +188,44 @@ impl EpgScanScheduler {
         let state = states
             .iter()
             .find(|state| state.network_id == channel.nid && state.tsid == channel.tsid);
+        let cpu = cpu_percent();
         let decision = decide(
             &config,
             self.active.load(Ordering::SeqCst),
-            cpu_percent(),
+            cpu,
             now,
             state.and_then(|s| s.next_eligible_at),
             state.and_then(|s| s.coverage_until),
             state.and_then(|s| s.last_eit_received_at),
         );
         if decision != EpgScanDecision::Start {
+            if let Some(code) = decision.reason_code() {
+                let record_history = !matches!(decision, EpgScanDecision::NotDue);
+                let reason = epg_reason(
+                    code,
+                    decision_details(
+                        decision,
+                        &config,
+                        self.active.load(Ordering::SeqCst),
+                        cpu,
+                        now,
+                        state.and_then(|s| s.next_eligible_at),
+                        channel.nid,
+                        channel.tsid,
+                    ),
+                );
+                let db = self.database.lock().await;
+                db.record_epg_deferred(channel.nid, channel.tsid, &reason, record_history)?;
+            }
             return Ok(());
         }
         let Some((space, number)) = channel.bon_space.zip(channel.bon_channel) else {
+            let reason = epg_reason(
+                EpgReasonCode::NoCompatibleTuner,
+                serde_json::json!({"network_id": channel.nid, "tsid": channel.tsid}),
+            );
+            let db = self.database.lock().await;
+            db.record_epg_deferred(channel.nid, channel.tsid, &reason, true)?;
             return Ok(());
         };
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
@@ -185,9 +247,20 @@ impl EpgScanScheduler {
                 let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
             }
             Err(e) => {
+                let message = e.to_string();
+                let code = if message == "EPG scan interrupted: CPU hard limit reached" {
+                    EpgReasonCode::CpuHardLimit
+                } else {
+                    EpgReasonCode::ScanFailed
+                };
                 let reason = epg_reason(
-                    EpgReasonCode::ScanFailed,
-                    serde_json::json!({"message": e.to_string()}),
+                    code,
+                    serde_json::json!({
+                        "network_id": channel.nid,
+                        "tsid": channel.tsid,
+                        "message": message,
+                        "cpu_percent": cpu_percent(),
+                    }),
                 );
                 let _ = db.epg_scan_finished(
                     history,
@@ -291,10 +364,7 @@ fn select_next_target(
     targets
         .iter()
         .copied()
-        .filter(|target| {
-            target.next_eligible_at.is_none_or(|at| at <= now)
-                && target_needs_scan(target, now, config)
-        })
+        .filter(|target| target_needs_scan(target, now, config))
         .min_by_key(|target| {
             let coverage_missing = !target
                 .coverage_until
@@ -412,6 +482,28 @@ mod tests {
             EpgScanDecision::SoftCpuLimit
         )
     }
+
+    #[test]
+    fn policy_reason_codes_cover_deferred_branches() {
+        let mut disabled = config();
+        disabled.enabled = false;
+        assert_eq!(
+            decide(&disabled, 0, 0, 10, None, None, None).reason_code(),
+            Some(EpgReasonCode::Disabled)
+        );
+        assert_eq!(
+            decide(&config(), 0, 70, 10, None, None, None).reason_code(),
+            Some(EpgReasonCode::CpuSoftLimit)
+        );
+        assert_eq!(
+            decide(&config(), 1, 0, 10, None, None, None).reason_code(),
+            Some(EpgReasonCode::NoTunerAvailable)
+        );
+        assert_eq!(
+            decide(&config(), 0, 0, 10, Some(100), None, None).reason_code(),
+            Some(EpgReasonCode::Backoff)
+        );
+    }
     #[test]
     fn policy_starts_when_due() {
         assert_eq!(
@@ -427,6 +519,7 @@ mod tests {
             EpgScanDecision::Disabled,
             EpgScanDecision::SoftCpuLimit,
             EpgScanDecision::AtCapacity,
+            EpgScanDecision::Backoff,
             EpgScanDecision::NotDue,
         ] {
             if let Some(code) = decision.reason_code() {

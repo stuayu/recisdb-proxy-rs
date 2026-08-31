@@ -150,7 +150,9 @@ pub enum EpgReasonCode {
     NoTunerAvailable,
     CpuSoftLimit,
     CpuHardLimit,
+    /// Reserved until `acquire` exposes the incumbent stream class.
     PreemptedByRecord,
+    /// Reserved until `acquire` exposes the incumbent stream class.
     PreemptedByView,
     Backoff,
     Disabled,
@@ -209,6 +211,37 @@ pub(crate) fn seed_defaults(c: &Connection) -> Result<()> {
 }
 
 impl Database {
+    /// Persist a scheduler decision. State is always current; history is
+    /// edge-triggered so a five-second evaluation loop cannot create rows.
+    pub fn record_epg_deferred(
+        &self,
+        network_id: u16,
+        tsid: u16,
+        reason: &str,
+        record_history: bool,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let previous: Option<String> = self
+            .connection()
+            .query_row(
+                "SELECT last_failure_reason FROM epg_scan_states WHERE network_id=? AND tsid=?",
+                params![network_id, tsid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        self.connection().execute(
+            "INSERT INTO epg_scan_states(network_id,tsid,last_failure_reason) VALUES(?1,?2,?3) ON CONFLICT(network_id,tsid) DO UPDATE SET last_failure_reason=?3",
+            params![network_id, tsid, reason],
+        )?;
+        if record_history && previous.as_deref() != Some(reason) {
+            self.connection().execute(
+                "INSERT INTO epg_scan_history(started_at,finished_at,status,reason,network_id,tsid) VALUES(?1,?1,'deferred',?2,?3,?4)",
+                params![now, reason, network_id, tsid],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn epg_scan_started(
         &self,
         tuner_id: i64,
@@ -231,7 +264,7 @@ impl Database {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.connection().execute(
-            "UPDATE epg_scan_history SET finished_at=?1,status=?2,error=?3 WHERE id=?4",
+            "UPDATE epg_scan_history SET finished_at=?1,status=?2,reason=COALESCE(?3,reason),error=?3 WHERE id=?4",
             params![now, status, error, history_id],
         )?;
         let failure = if status == "completed" { 0 } else { 1 };
@@ -470,5 +503,32 @@ mod tests {
                 .unwrap(),
             Some(10_600)
         );
+    }
+
+    #[test]
+    fn deferred_reason_updates_state_and_records_only_edges() {
+        let db = Database::open_in_memory().unwrap();
+        let reason = epg_reason(
+            EpgReasonCode::CpuSoftLimit,
+            serde_json::json!({"cpu_percent": 80}),
+        );
+        db.record_epg_deferred(1, 2, &reason, true).unwrap();
+        db.record_epg_deferred(1, 2, &reason, true).unwrap();
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| (state.network_id, state.tsid) == (1, 2))
+            .unwrap();
+        assert_eq!(state.last_failure_reason.as_deref(), Some(reason.as_str()));
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM epg_scan_history WHERE network_id=1 AND tsid=2 AND status='deferred'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

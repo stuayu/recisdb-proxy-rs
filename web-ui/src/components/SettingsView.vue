@@ -48,10 +48,14 @@ const epgReasonLabels: Record<string, string> = {
 function epgReasonText(value: unknown): string {
   if (value && typeof value === 'object') {
     const code = String((value as JsonRecord).code ?? '')
-    return epgReasonLabels[code] ?? code
+    return epgReasonLabels[code] ?? '取得理由を確認できません（未知の理由コード）'
   }
-  return typeof value === 'string' ? value : 'なし'
+  return '取得理由を確認できません（不正な理由データ）'
 }
+const epgReasonList = computed(() => {
+  const values = epgStatus.value?.reasons
+  return Array.isArray(values) ? values : epgStatus.value?.reason ? [epgStatus.value.reason] : []
+})
 function formatEpoch(value: unknown): string {
   return typeof value === 'number'
     ? new Date(value * 1000).toLocaleString('ja-JP', { dateStyle: 'short', timeStyle: 'short' })
@@ -715,7 +719,7 @@ onMounted(() => {
       <template v-if="isEpg">
         <section class="panel epg-status" aria-labelledby="epg-status-title">
           <h4 id="epg-status-title">EPG状態 <span>{{ epgStatus?.active ? '取得中' : '待機中' }}</span></h4>
-          <p v-if="epgStatus?.reason" class="muted" v-text="epgReasonText(epgStatus.reason)" />
+          <div v-if="epgReasonList.length" class="muted" role="status"><p>取得を延期・終了した理由</p><ul><li v-for="(reason, index) in epgReasonList" :key="index" v-text="epgReasonText(reason)" /></ul></div>
           <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd><dt>延期理由</dt><dd>{{ epgReasonText(epgStateValue('lastFailureReason')) }}</dd></dl>
         </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>

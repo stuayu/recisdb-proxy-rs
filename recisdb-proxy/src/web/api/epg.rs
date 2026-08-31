@@ -26,6 +26,35 @@ fn reason_value(reason: Option<String>) -> serde_json::Value {
     })
 }
 
+fn reason_values(states: &[crate::database::EpgScanState]) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
+    for state in states {
+        let Some(value) = state
+            .last_failure_reason
+            .clone()
+            .map(|reason| reason_value(Some(reason)))
+        else {
+            continue;
+        };
+        if !values.contains(&value) {
+            values.push(value.clone());
+        }
+        if let Some(codes) = value
+            .get("details")
+            .and_then(|details| details.get("additional_codes"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for code in codes {
+                let extra = json!({"code": code, "details": {}});
+                if !values.contains(&extra) {
+                    values.push(extra);
+                }
+            }
+        }
+    }
+    values
+}
+
 pub async fn get_epg_settings(
     State(s): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -252,16 +281,13 @@ pub async fn get_epg_status(
         [],
         |r| r.get::<_, i64>(0),
     )? != 0;
-    let reason = states
-        .iter()
-        .find_map(|state| state.last_failure_reason.clone())
-        .map(|value| reason_value(Some(value)))
-        .unwrap_or(serde_json::Value::Null);
+    let reasons = reason_values(&states);
+    let reason = reasons.first().cloned().unwrap_or(serde_json::Value::Null);
     let states_json =
         serde_json::to_value(states).map_err(|e| ApiError::internal(e.to_string()))?;
     let cpu_source = crate::scheduler::epg_scheduler::cpu_limit_source();
     Ok(Json(
-        json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"reasons":if reason.is_null(){vec![]}else{vec![reason.clone()]},"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source}}),
+        json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"reasons":reasons,"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source}}),
     ))
 }
 
