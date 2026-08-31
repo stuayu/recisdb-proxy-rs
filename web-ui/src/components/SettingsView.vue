@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { api, type JsonRecord } from '../api'
 
 const endpoints = [
+  ['EPG自動取得', '/settings/epg'],
   ['スキャンスケジューラー', '/scan-config'],
   ['チューナー最適化', '/tuner-config'],
   ['BNDP外部エンコード（tsreplace）', '/tsreplace-config'],
@@ -14,6 +15,8 @@ const config = ref<JsonRecord>({})
 const message = ref('')
 const error = ref('')
 const label = computed(() => endpoints.find((item) => item[1] === selected.value)?.[0] ?? '設定')
+const isEpg = computed(() => selected.value === '/settings/epg')
+const epgPresets = ref<JsonRecord[]>([])
 const entries = computed(() => Object.entries(config.value))
 const protectedKeys = new Set([
   'command_path',
@@ -66,6 +69,10 @@ async function load() {
       value && typeof value === 'object' && !Array.isArray(value)
         ? { ...(value as JsonRecord) }
         : { ...response }
+    if (isEpg.value) {
+      const presets = await api<JsonRecord>('/epg-presets')
+      epgPresets.value = Array.isArray(presets.presets) ? (presets.presets as JsonRecord[]) : []
+    }
     message.value = ''
     error.value = ''
   } catch (cause) {
@@ -75,7 +82,10 @@ async function load() {
 async function save() {
   try {
     const payload = Object.fromEntries(entries.value.filter(([key]) => !protectedKeys.has(key)))
-    await api(selected.value, { method: 'POST', body: JSON.stringify(payload) })
+    await api(selected.value, {
+      method: isEpg.value ? 'PUT' : 'POST',
+      body: JSON.stringify(isEpg.value ? config.value : payload),
+    })
     message.value = `${label.value}を保存しました。`
     error.value = ''
     await load()
@@ -614,7 +624,31 @@ onMounted(() => {
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <form class="panel settings-form" @submit.prevent="save">
       <h3 v-text="label" />
-      <template v-for="[key, value] in entries" :key="key">
+      <template v-if="isEpg">
+        <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
+        <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
+        <fieldset>
+          <legend>更新方針</legend>
+          <label v-for="preset in epgPresets" :key="String(preset.id)" class="preset-choice">
+            <input type="radio" name="epg-preset" :value="preset.id" :checked="preset.name === '標準'" disabled />
+            <span><strong v-text="String(preset.name)" /> — <span v-text="String(preset.description ?? '')" /></span>
+          </label>
+          <p class="muted">プリセットのチューナー割り当ては、個別チューナー設定画面から行います。</p>
+        </fieldset>
+        <div class="epg-friendly-grid">
+          <label class="field"><span>更新頻度</span><select v-model.number="config.target_refresh_secs"><option :value="3600">約1時間</option><option :value="21600">約6時間</option><option :value="43200">約12時間</option></select></label>
+          <label class="field"><span>何日先まで維持</span><select v-model.number="config.target_future_coverage_hours"><option :value="72">3日</option><option :value="168">7日</option><option :value="336">14日</option></select></label>
+        </div>
+        <label class="check"><input v-model="config.reserve_tuners" type="checkbox" /><span>空いているチューナーを確保して取得</span></label>
+        <label class="check"><input v-model="config.preemptible" type="checkbox" /><span>録画・視聴が始まったら取得を中断</span></label>
+        <label class="check"><input v-model="config.prefer_local" type="checkbox" /><span>ローカルチューナーを優先</span></label>
+        <details><summary>エキスパート設定</summary>
+          <p class="muted">秒単位の値。推奨: 最小30秒 / 通常90秒 / 最大180秒。</p>
+          <div class="epg-friendly-grid"><label class="field"><span>最小滞在(秒)</span><input v-model.number="config.min_dwell_secs" type="number" min="1" /></label><label class="field"><span>通常滞在(秒)</span><input v-model.number="config.normal_dwell_secs" type="number" min="1" /></label><label class="field"><span>最大滞在(秒)</span><input v-model.number="config.max_dwell_secs" type="number" min="1" /></label><label class="field"><span>CPU上限(%)</span><input v-model.number="config.cpu_hard_limit_percent" type="number" min="1" max="100" /></label></div>
+        </details>
+        <p class="muted">この設定では、録画と視聴を優先し、最大{{ config.max_concurrent_scans }}台の取得チューナーを使います。</p>
+      </template>
+      <template v-else v-for="[key, value] in entries" :key="key">
         <label v-if="typeof value === 'boolean'" class="check"
           ><input v-model="config[key]" type="checkbox" :disabled="protectedKeys.has(key)" /><span
             v-text="displayName(key)"

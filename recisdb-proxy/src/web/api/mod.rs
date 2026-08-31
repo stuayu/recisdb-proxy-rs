@@ -6,32 +6,34 @@
 //! `web/mod.rs`'s routes (`api::get_tuners`, etc.) and any other caller
 //! keep working unchanged.
 
-mod error;
-mod statics;
-mod tuners;
+mod alerts;
 mod bondrivers;
 mod channels;
-mod clients;
-mod alerts;
-mod configs;
 mod client_view;
-mod programs;
-mod update;
+mod clients;
+mod configs;
+mod epg;
+mod error;
 mod logs;
-mod service;
 mod nodes;
+mod programs;
+mod service;
+mod statics;
+mod tuners;
+mod update;
 
-pub use error::*;
-pub use statics::*;
-pub use tuners::*;
+pub use alerts::*;
 pub use bondrivers::*;
 pub use channels::*;
-pub use clients::*;
-pub use alerts::*;
-pub use configs::*;
 pub use client_view::*;
-pub use programs::*;
-pub use update::*;
+pub use clients::*;
+pub use configs::*;
+pub use epg::*;
+pub use error::*;
 pub use logs::*;
-pub use service::*;
 pub use nodes::*;
+pub use programs::*;
+pub use service::*;
+pub use statics::*;
+pub use tuners::*;
+pub use update::*;

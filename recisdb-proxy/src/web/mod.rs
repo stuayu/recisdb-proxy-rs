@@ -15,7 +15,7 @@ use axum::{
     extract::{ConnectInfo, Request},
     middleware::Next,
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::net::SocketAddr;
@@ -127,6 +127,26 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Scan scheduler configuration API
         .route("/scan-config", get(api::get_scan_config))
         .route("/scan-config", post(api::update_scan_config))
+        // EPG runtime settings are DB-only; no TOML counterpart.
+        .route("/settings/epg", get(api::get_epg_settings))
+        .route("/settings/epg", put(api::update_epg_settings))
+        .route("/epg-presets", get(api::get_epg_presets))
+        .route("/epg-presets", post(api::create_epg_preset))
+        .route("/epg-presets/:id", get(api::get_epg_preset))
+        .route("/epg-presets/:id", put(api::update_epg_preset))
+        .route("/epg-presets/:id", delete(api::delete_epg_preset))
+        .route("/tuners/:id/epg-settings", get(api::get_tuner_epg_settings))
+        .route(
+            "/tuners/:id/epg-settings",
+            put(api::update_tuner_epg_settings),
+        )
+        .route(
+            "/tuners/:id/epg-settings/effective",
+            get(api::get_epg_effective),
+        )
+        .route("/epg/status", get(api::get_epg_status))
+        .route("/epg/scans", get(api::get_epg_scan_history))
+        .route("/epg/scans/history", get(api::get_epg_scan_history))
         // Tuner optimization configuration API
         .route("/tuner-config", get(api::get_tuner_config))
         .route("/tuner-config", post(api::update_tuner_config))

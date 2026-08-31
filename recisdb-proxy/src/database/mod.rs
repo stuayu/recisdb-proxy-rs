@@ -5,22 +5,24 @@
 //! - Channel information (NID/SID/TSID-based identification)
 //! - Scan history and statistics
 
+mod alert;
 mod bon_driver;
 mod channel;
 mod driver_quality;
-mod alert;
 mod encode_profile;
-mod session_history;
-mod program;
+mod epg_settings;
 mod models;
+mod program;
 mod schema;
+mod session_history;
 
-pub use models::*;
 pub use encode_profile::{
     preview_4k_encode_args_ffmpeg, preview_4k_encode_args_ffmpeg_hwdec,
     preview_4k_extra_args_is_auto_generated, preview_encode_args_ffmpeg,
     preview_extra_args_is_auto_generated, video_encoder_tuning,
 };
+pub use epg_settings::*;
+pub use models::*;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
@@ -119,21 +121,21 @@ impl Database {
     }
 
     /// Add a column to a table if it doesn't exist.
-    fn add_column_if_not_exists(
-        &self,
-        table: &str,
-        column: &str,
-        column_type: &str,
-    ) -> Result<()> {
+    fn add_column_if_not_exists(&self, table: &str, column: &str, column_type: &str) -> Result<()> {
         // Check if column exists using PRAGMA table_info
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({})", table))?;
         let column_exists = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(|r| r.ok())
             .any(|name| name == column);
 
         if !column_exists {
-            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, column_type);
+            let sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table, column, column_type
+            );
             self.conn.execute(&sql, [])?;
             log::info!("Migration: Added column {} to table {}", column, table);
         }
@@ -155,18 +157,54 @@ impl Database {
     /// this list replays from index 0 and must be a harmless no-op wherever
     /// the work was already done.
     const MIGRATIONS: &'static [(&'static str, MigrationFn)] = &[
-        ("001_channels_band_region_columns", Database::migration_001_channels_band_region_columns),
-        ("002_alert_rules_webhook_columns", Database::migration_002_alert_rules_webhook_columns),
-        ("003_scan_scheduler_timing_columns", Database::migration_003_scan_scheduler_timing_columns),
-        ("004_tuner_startup_timing_columns", Database::migration_004_tuner_startup_timing_columns),
-        ("005_session_history_loss_summary", Database::migration_005_session_history_loss_summary),
-        ("006_tsreplace_max_concurrent_encoders", Database::migration_006_tsreplace_max_concurrent_encoders),
-        ("007_tsreplace_preprocessor_columns", Database::migration_007_tsreplace_preprocessor_columns),
-        ("008_tsreplace_preview_enabled_legacy", Database::migration_008_tsreplace_preview_enabled_legacy),
-        ("009_preview_encoder_config_seed", Database::migration_009_preview_encoder_config_seed),
-        ("010_session_history_stream_class", Database::migration_010_session_history_stream_class),
-        ("011_tuner_prefill_jitter_columns", Database::migration_011_tuner_prefill_jitter_columns),
-        ("012_encode_profiles_noop", Database::migration_012_encode_profiles_noop),
+        (
+            "001_channels_band_region_columns",
+            Database::migration_001_channels_band_region_columns,
+        ),
+        (
+            "002_alert_rules_webhook_columns",
+            Database::migration_002_alert_rules_webhook_columns,
+        ),
+        (
+            "003_scan_scheduler_timing_columns",
+            Database::migration_003_scan_scheduler_timing_columns,
+        ),
+        (
+            "004_tuner_startup_timing_columns",
+            Database::migration_004_tuner_startup_timing_columns,
+        ),
+        (
+            "005_session_history_loss_summary",
+            Database::migration_005_session_history_loss_summary,
+        ),
+        (
+            "006_tsreplace_max_concurrent_encoders",
+            Database::migration_006_tsreplace_max_concurrent_encoders,
+        ),
+        (
+            "007_tsreplace_preprocessor_columns",
+            Database::migration_007_tsreplace_preprocessor_columns,
+        ),
+        (
+            "008_tsreplace_preview_enabled_legacy",
+            Database::migration_008_tsreplace_preview_enabled_legacy,
+        ),
+        (
+            "009_preview_encoder_config_seed",
+            Database::migration_009_preview_encoder_config_seed,
+        ),
+        (
+            "010_session_history_stream_class",
+            Database::migration_010_session_history_stream_class,
+        ),
+        (
+            "011_tuner_prefill_jitter_columns",
+            Database::migration_011_tuner_prefill_jitter_columns,
+        ),
+        (
+            "012_encode_profiles_noop",
+            Database::migration_012_encode_profiles_noop,
+        ),
         (
             "013_backfill_channels_band_terrestrial_region",
             Database::migration_013_backfill_channels_band_terrestrial_region,
@@ -180,20 +218,54 @@ impl Database {
             "016_reclassify_band_region_from_nid",
             Database::migration_016_reclassify_band_region_from_nid,
         ),
-        ("017_card_reader_name", Database::migration_017_card_reader_name),
-        ("018_ts_queue_duration_columns", Database::migration_018_ts_queue_duration_columns),
-        ("019_bon_driver_disable_b25", Database::migration_019_bon_driver_disable_b25),
-        ("020_bon_driver_stream_format", Database::migration_020_bon_driver_stream_format),
+        (
+            "017_card_reader_name",
+            Database::migration_017_card_reader_name,
+        ),
+        (
+            "018_ts_queue_duration_columns",
+            Database::migration_018_ts_queue_duration_columns,
+        ),
+        (
+            "019_bon_driver_disable_b25",
+            Database::migration_019_bon_driver_disable_b25,
+        ),
+        (
+            "020_bon_driver_stream_format",
+            Database::migration_020_bon_driver_stream_format,
+        ),
         ("021_github_token", Database::migration_021_github_token),
         ("022_log_config", Database::migration_022_log_config),
-        ("023_tuner_livelock_config", Database::migration_023_tuner_livelock_config),
+        (
+            "023_tuner_livelock_config",
+            Database::migration_023_tuner_livelock_config,
+        ),
         (
             "024_driver_runtime_health",
             Database::migration_024_driver_runtime_health,
         ),
-        ("025_programs_tsid_unique_key", Database::migration_025_programs_tsid_unique_key),
-        ("026_programs_free_ca_mode", Database::migration_026_programs_free_ca_mode),
+        (
+            "025_programs_tsid_unique_key",
+            Database::migration_025_programs_tsid_unique_key,
+        ),
+        (
+            "026_programs_free_ca_mode",
+            Database::migration_026_programs_free_ca_mode,
+        ),
+        (
+            "027_epg_runtime_settings",
+            Database::migration_027_epg_runtime_settings,
+        ),
     ];
+
+    /// EPG automatic collection is runtime state. Keep it in SQLite so a
+    /// dashboard update is visible to the next scheduler evaluation without
+    /// restarting the process or consulting TOML.
+    fn migration_027_epg_runtime_settings(&self) -> Result<()> {
+        self.conn.execute_batch(epg_settings::EPG_SCHEMA_SQL)?;
+        epg_settings::seed_defaults(&self.conn)?;
+        Ok(())
+    }
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,
     /// failures). Previously created lazily on first access, which worked but
@@ -226,11 +298,7 @@ impl Database {
     /// §5.2.7. Rebuilding is harmless if an old pre-ledger database replays
     /// this migration, and the temporary table is explicitly removed first.
     fn migration_025_programs_tsid_unique_key(&self) -> Result<()> {
-        self.add_column_if_not_exists(
-            "programs",
-            "free_ca_mode",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
+        self.add_column_if_not_exists("programs", "free_ca_mode", "INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS programs_new;
              CREATE TABLE programs_new (
@@ -265,11 +333,7 @@ impl Database {
 
     /// Migration 026: retain EIT free_CA_mode through storage and delivery.
     fn migration_026_programs_free_ca_mode(&self) -> Result<()> {
-        self.add_column_if_not_exists(
-            "programs",
-            "free_ca_mode",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
+        self.add_column_if_not_exists("programs", "free_ca_mode", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -293,9 +357,21 @@ impl Database {
     /// Livelock protection settings. Kept as one idempotent migration so old
     /// databases receive all three controls together.
     fn migration_023_tuner_livelock_config(&self) -> Result<()> {
-        self.add_column_if_not_exists("tuner_config", "min_hold_secs", "INTEGER NOT NULL DEFAULT 10")?;
-        self.add_column_if_not_exists("tuner_config", "reject_cooldown_ms", "INTEGER NOT NULL DEFAULT 2000")?;
-        self.add_column_if_not_exists("tuner_config", "no_data_timeout_secs", "INTEGER NOT NULL DEFAULT 30")?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "min_hold_secs",
+            "INTEGER NOT NULL DEFAULT 10",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "reject_cooldown_ms",
+            "INTEGER NOT NULL DEFAULT 2000",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "no_data_timeout_secs",
+            "INTEGER NOT NULL DEFAULT 30",
+        )?;
         Ok(())
     }
 
@@ -360,7 +436,11 @@ impl Database {
     /// Store (or, with an empty string, clear) the GitHub token.
     pub fn set_github_token(&self, token: &str) -> Result<()> {
         let trimmed = token.trim();
-        let value = if trimmed.is_empty() { None } else { Some(trimmed) };
+        let value = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
         self.conn.execute(
             "INSERT INTO web_auth_config (id, github_token, updated_at)
              VALUES (1, ?1, strftime('%s','now'))
@@ -488,8 +568,16 @@ impl Database {
     /// the class that must not drop.
     fn migration_018_ts_queue_duration_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tuner_config", "ts_queue_view_ms", "INTEGER DEFAULT 8000")?;
-        self.add_column_if_not_exists("tuner_config", "ts_queue_preview_ms", "INTEGER DEFAULT 12000")?;
-        self.add_column_if_not_exists("tuner_config", "ts_queue_record_ms", "INTEGER DEFAULT 15000")?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "ts_queue_preview_ms",
+            "INTEGER DEFAULT 12000",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "ts_queue_record_ms",
+            "INTEGER DEFAULT 15000",
+        )?;
         Ok(())
     }
 
@@ -562,9 +650,7 @@ impl Database {
             let mut stmt = self
                 .conn
                 .prepare("SELECT id, nid, band_type FROM channels")?;
-            let mapped = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+            let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
             mapped.collect::<std::result::Result<Vec<_>, _>>()?
         };
 
@@ -682,17 +768,41 @@ impl Database {
 
     // Migration 003 (was 004): Add global scan timing config columns if they don't exist.
     fn migration_003_scan_scheduler_timing_columns(&self) -> Result<()> {
-        self.add_column_if_not_exists("scan_scheduler_config", "signal_lock_wait_ms", "INTEGER DEFAULT 500")?;
-        self.add_column_if_not_exists("scan_scheduler_config", "ts_read_timeout_ms", "INTEGER DEFAULT 300000")?;
+        self.add_column_if_not_exists(
+            "scan_scheduler_config",
+            "signal_lock_wait_ms",
+            "INTEGER DEFAULT 500",
+        )?;
+        self.add_column_if_not_exists(
+            "scan_scheduler_config",
+            "ts_read_timeout_ms",
+            "INTEGER DEFAULT 300000",
+        )?;
         Ok(())
     }
 
     // Migration 004 (was 005): Add tuner startup timing config columns if they don't exist.
     fn migration_004_tuner_startup_timing_columns(&self) -> Result<()> {
-        self.add_column_if_not_exists("tuner_config", "set_channel_retry_interval_ms", "INTEGER DEFAULT 500")?;
-        self.add_column_if_not_exists("tuner_config", "set_channel_retry_timeout_ms", "INTEGER DEFAULT 10000")?;
-        self.add_column_if_not_exists("tuner_config", "signal_poll_interval_ms", "INTEGER DEFAULT 500")?;
-        self.add_column_if_not_exists("tuner_config", "signal_wait_timeout_ms", "INTEGER DEFAULT 10000")?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "set_channel_retry_interval_ms",
+            "INTEGER DEFAULT 500",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "set_channel_retry_timeout_ms",
+            "INTEGER DEFAULT 10000",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "signal_poll_interval_ms",
+            "INTEGER DEFAULT 500",
+        )?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "signal_wait_timeout_ms",
+            "INTEGER DEFAULT 10000",
+        )?;
         Ok(())
     }
 
@@ -708,7 +818,11 @@ impl Database {
     // tsreplace_config if it doesn't exist (STREAMING_DESIGN.md §5/§9 P4:
     // shared encoder pool).
     fn migration_006_tsreplace_max_concurrent_encoders(&self) -> Result<()> {
-        self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "max_concurrent_encoders",
+            "INTEGER DEFAULT 2",
+        )?;
         Ok(())
     }
 
@@ -720,7 +834,11 @@ impl Database {
     // like `arguments`.
     fn migration_007_tsreplace_preprocessor_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "preprocessor_arguments",
+            "TEXT DEFAULT ''",
+        )?;
         Ok(())
     }
 
@@ -755,7 +873,11 @@ impl Database {
     // fixed-duration prefill/jitter buffer, sized per stream class).
     fn migration_011_tuner_prefill_jitter_columns(&self) -> Result<()> {
         self.add_column_if_not_exists("tuner_config", "prefill_view_ms", "INTEGER DEFAULT 1000")?;
-        self.add_column_if_not_exists("tuner_config", "prefill_preview_ms", "INTEGER DEFAULT 2000")?;
+        self.add_column_if_not_exists(
+            "tuner_config",
+            "prefill_preview_ms",
+            "INTEGER DEFAULT 2000",
+        )?;
         self.add_column_if_not_exists("tuner_config", "prefill_record_ms", "INTEGER DEFAULT 6000")?;
         self.add_column_if_not_exists("tuner_config", "jitter_safety_factor", "REAL DEFAULT 1.5")?;
         Ok(())
@@ -849,7 +971,7 @@ impl Database {
                 ELSE '不明'
             END
             WHERE band_type = 0 AND terrestrial_region IS NULL;
-            "#
+            "#,
         )?;
 
         Ok(())
@@ -886,7 +1008,12 @@ impl Database {
         }).map_err(DatabaseError::Sqlite)
     }
 
-    pub fn update_tuner_livelock_config(&self, min_hold_secs: u64, reject_cooldown_ms: u64, no_data_timeout_secs: u64) -> Result<()> {
+    pub fn update_tuner_livelock_config(
+        &self,
+        min_hold_secs: u64,
+        reject_cooldown_ms: u64,
+        no_data_timeout_secs: u64,
+    ) -> Result<()> {
         self.conn.execute("UPDATE tuner_config SET min_hold_secs=?1, reject_cooldown_ms=?2, no_data_timeout_secs=?3, updated_at=strftime('%s','now') WHERE id=1", rusqlite::params![min_hold_secs, reject_cooldown_ms, no_data_timeout_secs])?;
         Ok(())
     }
@@ -908,9 +1035,13 @@ impl Database {
         });
 
         match result {
-            Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms)) => {
-                Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms))
-            }
+            Ok((interval, concurrent, timeout, signal_lock_wait_ms, ts_read_timeout_ms)) => Ok((
+                interval,
+                concurrent,
+                timeout,
+                signal_lock_wait_ms,
+                ts_read_timeout_ms,
+            )),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Initialize with defaults if not exists
                 self.conn.execute(
@@ -956,14 +1087,16 @@ impl Database {
     /// settings (STREAMING_DESIGN.md §4/§9 P3): `prefill_view_ms`,
     /// `prefill_preview_ms`, `prefill_record_ms`, `jitter_safety_factor`.
     #[allow(clippy::type_complexity)]
-    pub fn get_tuner_config(&self) -> Result<(u64, bool, u64, u64, u64, u64, u64, u64, u64, u64, f64)> {
+    pub fn get_tuner_config(
+        &self,
+    ) -> Result<(u64, bool, u64, u64, u64, u64, u64, u64, u64, u64, f64)> {
         let mut stmt = self.conn.prepare(
             "SELECT keep_alive_secs, prewarm_enabled, prewarm_timeout_secs,
                     set_channel_retry_interval_ms, set_channel_retry_timeout_ms,
                     signal_poll_interval_ms, signal_wait_timeout_ms,
                     prefill_view_ms, prefill_preview_ms, prefill_record_ms,
                     jitter_safety_factor
-             FROM tuner_config WHERE id = 1"
+             FROM tuner_config WHERE id = 1",
         )?;
 
         let result = stmt.query_row([], |row| {
@@ -1054,13 +1187,33 @@ impl Database {
     // guards individual columns added by later migrations, plus seeding.
     fn ensure_tsreplace_config_compat(&self) -> Result<()> {
         self.add_column_if_not_exists("tsreplace_config", "enabled", "INTEGER DEFAULT 0")?;
-        self.add_column_if_not_exists("tsreplace_config", "command_path", "TEXT DEFAULT 'tsreplace'")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "command_path",
+            "TEXT DEFAULT 'tsreplace'",
+        )?;
         self.add_column_if_not_exists("tsreplace_config", "arguments", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("tsreplace_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
-        self.add_column_if_not_exists("tsreplace_config", "passthrough_on_error", "INTEGER DEFAULT 1")?;
-        self.add_column_if_not_exists("tsreplace_config", "max_concurrent_encoders", "INTEGER DEFAULT 2")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "read_timeout_ms",
+            "INTEGER DEFAULT 10000",
+        )?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "passthrough_on_error",
+            "INTEGER DEFAULT 1",
+        )?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "max_concurrent_encoders",
+            "INTEGER DEFAULT 2",
+        )?;
         self.add_column_if_not_exists("tsreplace_config", "preprocessor_path", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("tsreplace_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
+        self.add_column_if_not_exists(
+            "tsreplace_config",
+            "preprocessor_arguments",
+            "TEXT DEFAULT ''",
+        )?;
         self.add_column_if_not_exists("tsreplace_config", "preview_enabled", "INTEGER DEFAULT 0")?;
         self.add_column_if_not_exists(
             "tsreplace_config",
@@ -1130,7 +1283,9 @@ impl Database {
     /// [`Self::get_preview_encoder_config`]. (The legacy `preview_enabled`
     /// column still physically exists but is deliberately not returned.)
     #[allow(clippy::type_complexity)]
-    pub fn get_tsreplace_config(&self) -> Result<(bool, String, String, u64, bool, i64, String, String)> {
+    pub fn get_tsreplace_config(
+        &self,
+    ) -> Result<(bool, String, String, u64, bool, i64, String, String)> {
         self.ensure_tsreplace_config_compat()?;
 
         let mut stmt = self.conn.prepare(
@@ -1280,9 +1435,21 @@ impl Database {
 
         self.add_column_if_not_exists("preview_encoder_config", "enabled", "INTEGER DEFAULT 0")?;
         self.add_column_if_not_exists("preview_encoder_config", "command_path", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("preview_encoder_config", "preprocessor_path", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("preview_encoder_config", "preprocessor_arguments", "TEXT DEFAULT ''")?;
-        self.add_column_if_not_exists("preview_encoder_config", "read_timeout_ms", "INTEGER DEFAULT 10000")?;
+        self.add_column_if_not_exists(
+            "preview_encoder_config",
+            "preprocessor_path",
+            "TEXT DEFAULT ''",
+        )?;
+        self.add_column_if_not_exists(
+            "preview_encoder_config",
+            "preprocessor_arguments",
+            "TEXT DEFAULT ''",
+        )?;
+        self.add_column_if_not_exists(
+            "preview_encoder_config",
+            "read_timeout_ms",
+            "INTEGER DEFAULT 10000",
+        )?;
         self.add_column_if_not_exists(
             "preview_encoder_config",
             "updated_at",
@@ -1362,7 +1529,11 @@ impl Database {
              SET enabled = ?1, preprocessor_arguments = ?2, read_timeout_ms = ?3,
                  updated_at = strftime('%s', 'now')
              WHERE id = 1",
-            rusqlite::params![if enabled { 1 } else { 0 }, preprocessor_arguments, read_timeout_ms],
+            rusqlite::params![
+                if enabled { 1 } else { 0 },
+                preprocessor_arguments,
+                read_timeout_ms
+            ],
         )?;
         Ok(())
     }
@@ -1509,7 +1680,10 @@ mod tests {
         assert_eq!(db.get_github_token().unwrap(), None);
 
         db.set_github_token("ghp_example").unwrap();
-        assert_eq!(db.get_github_token().unwrap(), Some("ghp_example".to_string()));
+        assert_eq!(
+            db.get_github_token().unwrap(),
+            Some("ghp_example".to_string())
+        );
 
         // Whitespace-only is the same as unset, so a cleared field does not
         // turn into an Authorization header of spaces.
@@ -1519,8 +1693,14 @@ mod tests {
         // Storing does not disturb the Web API token in the same row.
         db.set_web_auth_token("web-token").unwrap();
         db.set_github_token("ghp_second").unwrap();
-        assert_eq!(db.get_web_auth_token().unwrap(), Some("web-token".to_string()));
-        assert_eq!(db.get_github_token().unwrap(), Some("ghp_second".to_string()));
+        assert_eq!(
+            db.get_web_auth_token().unwrap(),
+            Some("web-token".to_string())
+        );
+        assert_eq!(
+            db.get_github_token().unwrap(),
+            Some("ghp_second".to_string())
+        );
     }
 
     /// `get_log_config` on a freshly-opened DB must seed and return the
@@ -1563,7 +1743,8 @@ mod tests {
         db.get_or_create_bon_driver(path).unwrap();
         assert_eq!(db.driver_stream_format(path), StreamFormat::Ts);
 
-        db.set_driver_stream_format(path, StreamFormat::MmtTlv).unwrap();
+        db.set_driver_stream_format(path, StreamFormat::MmtTlv)
+            .unwrap();
         assert_eq!(db.driver_stream_format(path), StreamFormat::MmtTlv);
         assert!(db.driver_stream_format(path).is_mmt_tlv());
 
@@ -1588,7 +1769,10 @@ mod tests {
         assert_eq!(StreamFormat::from_db_value("ts"), StreamFormat::Ts);
         assert_eq!(StreamFormat::from_db_value("mmttlv"), StreamFormat::MmtTlv);
         assert_eq!(StreamFormat::from_db_value("MMTTLV"), StreamFormat::MmtTlv);
-        assert_eq!(StreamFormat::from_db_value(" mmt/tlv "), StreamFormat::MmtTlv);
+        assert_eq!(
+            StreamFormat::from_db_value(" mmt/tlv "),
+            StreamFormat::MmtTlv
+        );
         assert_eq!(StreamFormat::from_db_value("mmt"), StreamFormat::Ts);
         assert_eq!(StreamFormat::from_db_value(""), StreamFormat::Ts);
     }
@@ -1644,7 +1828,10 @@ mod tests {
         );
         // Not scanned yet.
         assert_eq!(db.band_type_for_bon_channel(path, 9, 9), None);
-        assert_eq!(db.band_type_for_bon_channel("BonDriver_Other.dll", 3, 0), None);
+        assert_eq!(
+            db.band_type_for_bon_channel("BonDriver_Other.dll", 3, 0),
+            None
+        );
     }
 
     /// Migration 018 must be idempotent (the whole ledger replays from
@@ -1715,7 +1902,11 @@ mod tests {
         db.migration_016_reclassify_band_region_from_nid().unwrap();
         let band2: i64 = db
             .connection()
-            .query_row("SELECT band_type FROM channels WHERE nid = 0x7880", [], |row| row.get(0))
+            .query_row(
+                "SELECT band_type FROM channels WHERE nid = 0x7880",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(band2, 0);
     }
@@ -1736,13 +1927,24 @@ mod tests {
     #[test]
     fn set_tsreplace_command_path_only_changes_command_path() {
         let db = Database::open_in_memory().unwrap();
-        db.update_tsreplace_config(true, "old-path", "--foo", 5000, false, 3, "pre-path", "--pre")
+        db.update_tsreplace_config(
+            true, "old-path", "--foo", 5000, false, 3, "pre-path", "--pre",
+        )
+        .unwrap();
+
+        db.set_tsreplace_command_path("/usr/local/bin/tsreplace")
             .unwrap();
 
-        db.set_tsreplace_command_path("/usr/local/bin/tsreplace").unwrap();
-
-        let (enabled, command_path, arguments, read_timeout_ms, passthrough_on_error, max_concurrent_encoders, preprocessor_path, preprocessor_arguments) =
-            db.get_tsreplace_config().unwrap();
+        let (
+            enabled,
+            command_path,
+            arguments,
+            read_timeout_ms,
+            passthrough_on_error,
+            max_concurrent_encoders,
+            preprocessor_path,
+            preprocessor_arguments,
+        ) = db.get_tsreplace_config().unwrap();
         assert_eq!(command_path, "/usr/local/bin/tsreplace");
         // Everything else must be preserved.
         assert!(enabled);
@@ -1764,7 +1966,8 @@ mod tests {
         assert_eq!(pre_args, "");
 
         // TOML-only setter changes only the path.
-        db.set_tsreplace_preprocessor_path("C:/DTV/tsreadex/tsreadex.exe").unwrap();
+        db.set_tsreplace_preprocessor_path("C:/DTV/tsreadex/tsreadex.exe")
+            .unwrap();
         let (_, _, _, _, _, _, pre_path, pre_args) = db.get_tsreplace_config().unwrap();
         assert_eq!(pre_path, "C:/DTV/tsreadex/tsreadex.exe");
         assert_eq!(pre_args, "");
@@ -1801,9 +2004,11 @@ mod tests {
 
         // TOML-only setters change only their own column.
         db.set_preview_command_path("C:/enc/QSVEncC64.exe").unwrap();
-        db.set_preview_preprocessor_path("C:/pre/tsreadex.exe").unwrap();
+        db.set_preview_preprocessor_path("C:/pre/tsreadex.exe")
+            .unwrap();
         // API-editable trio roundtrips.
-        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 20_000).unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 20_000)
+            .unwrap();
 
         let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
         assert!(enabled);
@@ -1820,13 +2025,17 @@ mod tests {
         // A row left empty (pre-backfill-era DB, or cleared via the API) is
         // refilled with the recommended tsreadex template on the next read...
         db.conn
-            .execute("UPDATE preview_encoder_config SET preprocessor_arguments = '' WHERE id = 1", [])
+            .execute(
+                "UPDATE preview_encoder_config SET preprocessor_arguments = '' WHERE id = 1",
+                [],
+            )
             .unwrap();
         let (_, _, _, pre_args, _) = db.get_preview_encoder_config().unwrap();
         assert_eq!(pre_args, DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS);
 
         // ...while a deliberately customized value is left alone.
-        db.update_preview_encoder_config(false, "-n {SID} -", 10_000).unwrap();
+        db.update_preview_encoder_config(false, "-n {SID} -", 10_000)
+            .unwrap();
         let (_, _, _, pre_args, _) = db.get_preview_encoder_config().unwrap();
         assert_eq!(pre_args, "-n {SID} -");
     }
@@ -1836,8 +2045,17 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         // Scribble all over the BNDP-side config...
-        db.update_tsreplace_config(true, "garbage-cmd", "--garbage", 1, false, 1, "garbage-pre", "--garbage-pre")
-            .unwrap();
+        db.update_tsreplace_config(
+            true,
+            "garbage-cmd",
+            "--garbage",
+            1,
+            false,
+            1,
+            "garbage-pre",
+            "--garbage-pre",
+        )
+        .unwrap();
         // ...and the preview side must be completely unaffected (it keeps its
         // own seeded defaults, not the BNDP-side garbage).
         let (enabled, cmd, pre_path, pre_args, timeout) = db.get_preview_encoder_config().unwrap();
@@ -1849,7 +2067,8 @@ mod tests {
 
         // And the reverse: preview updates never leak into tsreplace_config.
         db.set_preview_command_path("C:/enc/QSVEncC64.exe").unwrap();
-        db.update_preview_encoder_config(true, "-n {SID} -", 5_000).unwrap();
+        db.update_preview_encoder_config(true, "-n {SID} -", 5_000)
+            .unwrap();
         let (enabled, command_path, arguments, ..) = db.get_tsreplace_config().unwrap();
         assert!(enabled);
         assert_eq!(command_path, "garbage-cmd");
@@ -1863,12 +2082,20 @@ mod tests {
         // Simulate a DB from the short-lived Migration-012 era: legacy flag
         // set to 1 and no preview_encoder_config row yet.
         db.conn
-            .execute("UPDATE tsreplace_config SET preview_enabled = 1 WHERE id = 1", [])
+            .execute(
+                "UPDATE tsreplace_config SET preview_enabled = 1 WHERE id = 1",
+                [],
+            )
             .unwrap();
-        db.conn.execute("DELETE FROM preview_encoder_config", []).unwrap();
+        db.conn
+            .execute("DELETE FROM preview_encoder_config", [])
+            .unwrap();
 
         let (enabled, ..) = db.get_preview_encoder_config().unwrap();
-        assert!(enabled, "legacy tsreplace_config.preview_enabled=1 must carry over");
+        assert!(
+            enabled,
+            "legacy tsreplace_config.preview_enabled=1 must carry over"
+        );
     }
 
     /// M6 (docs/SYSTEM_REVIEW_2026-07.md Phase 14): a fresh DB ends up with
@@ -1891,7 +2118,9 @@ mod tests {
         // Force user_version back to 0, as a real pre-ledger production DB
         // would have (it was migrated ad-hoc, so every column/table already
         // exists despite the ledger position being 0).
-        db.connection().execute_batch("PRAGMA user_version = 0;").unwrap();
+        db.connection()
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
 
         db.apply_migrations().unwrap();
 
@@ -1915,8 +2144,12 @@ mod card_reader_tests {
         // 存在しないリーダーを名指ししてしまう。
         assert_eq!(db.get_card_reader_name().unwrap(), "");
 
-        db.set_card_reader_name("SCM Microsystems Inc. SCR3310").unwrap();
-        assert_eq!(db.get_card_reader_name().unwrap(), "SCM Microsystems Inc. SCR3310");
+        db.set_card_reader_name("SCM Microsystems Inc. SCR3310")
+            .unwrap();
+        assert_eq!(
+            db.get_card_reader_name().unwrap(),
+            "SCM Microsystems Inc. SCR3310"
+        );
 
         // 空文字列で「自動」に戻せること。
         db.set_card_reader_name("").unwrap();

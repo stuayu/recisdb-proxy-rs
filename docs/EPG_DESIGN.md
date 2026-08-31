@@ -142,6 +142,19 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 
 ## 既知の制約
 
+### 自動取得設定のDB管理
+
+自動取得のRuntime設定は `epg_global_settings`、`epg_scan_presets`、
+`physical_tuner_epg_settings` を正とする。設定ファイルには置かない。Migration 027が
+singleton global、system preset、scan state/history/retentionの初期行を冪等に作る。
+`database/epg_settings.rs` のresolverが global → preset → physical tuner override の順で
+effective値を作り、API/UIはeffective値とsourceを表示する。現在の永続チューナーidentityは
+既存 `bon_drivers.id`（`/api/tuners/:id`）であり、tuner instance用の新identityは追加しない。
+
+設定更新はDBへ直ちに保存され、schedulerは次回評価で再読込する設計。active scanの専用巡回、
+scan state/historyの実行時更新、physical override CRUDは後続実装であり、現行の受動収集を
+自動取得済みとは扱わない。
+
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。
 - **schedule EIT の送出周期は遠い日付ほど長い**(地上波で数分オーダー)。選局直後は
