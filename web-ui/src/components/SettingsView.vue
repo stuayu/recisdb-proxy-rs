@@ -21,6 +21,7 @@ const selectedEpgPreset = ref<number | null>(null)
 const featuredEpgPresets = computed(() => epgPresets.value.filter((preset) => preset.is_system).slice(0, 3))
 const epgStatus = ref<JsonRecord | null>(null)
 const editingPreset = ref<JsonRecord | null>(null)
+const creatingPreset = ref(false)
 const presetGroups = [
   { label: '基本', keys: ['enabled', 'target_refresh_secs', 'max_stale_secs', 'min_future_coverage_hours', 'target_future_coverage_hours'] },
   { label: 'チューナー', keys: ['reserve_tuners', 'prefer_local', 'preemptible'] },
@@ -38,9 +39,11 @@ const presetLabels: Record<string, string> = {
 }
 const epgReasonLabels: Record<string, string> = {
   scheduled: '取得を開始しました', scan_failed: 'EPG取得に失敗しました',
+  disabled: 'EPG自動取得が無効です', not_due: '更新時刻にはまだ達していません',
   no_tuner_available: '利用可能なチューナーがありません', cpu_soft_limit: 'CPU負荷が設定値を超過しました',
   cpu_hard_limit: 'CPU負荷が高いため取得を中断しました', backoff: '前回の失敗後の待機中です',
   preempted_by_record: '録画を優先して取得を延期しました', preempted_by_view: '視聴を優先して取得を延期しました',
+  no_compatible_tuner: '対応する受信帯域のチューナーがありません',
 }
 function epgReasonText(value: unknown): string {
   if (value && typeof value === 'object') {
@@ -148,6 +151,10 @@ function editEpgPreset(preset: JsonRecord) {
   if (preset.is_system) return
   editingPreset.value = { ...preset }
 }
+function startCreateEpgPreset() {
+  creatingPreset.value = true
+  editingPreset.value = { name: '', description: '', enabled: true }
+}
 function clearPresetValue(key: string) {
   if (editingPreset.value) editingPreset.value[key] = null
 }
@@ -157,7 +164,10 @@ function updatePresetText(key: string, event: Event) {
 async function saveEpgPreset() {
   if (!editingPreset.value) return
   try {
-    await api(`/epg-presets/${String(editingPreset.value.id)}`, { method: 'PUT', body: JSON.stringify(editingPreset.value) })
+    const isNew = creatingPreset.value
+    if (!String(editingPreset.value.name ?? '').trim()) { error.value = 'プリセット名を入力してください'; return }
+    await api(isNew ? '/epg-presets' : `/epg-presets/${String(editingPreset.value.id)}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(editingPreset.value) })
+    creatingPreset.value = false
     editingPreset.value = null
     await load()
     message.value = 'プリセットを保存しました。'
@@ -721,6 +731,7 @@ onMounted(() => {
         </fieldset>
         <section class="epg-presets" aria-labelledby="epg-presets-title">
           <h4 id="epg-presets-title">プリセット管理</h4>
+          <button class="button secondary" type="button" @click="startCreateEpgPreset">新規作成</button>
           <div class="epg-preset-cards">
             <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card">
               <h5>{{ String(preset.name) }} <span v-if="preset.is_system" class="badge">おすすめ</span></h5>
@@ -729,11 +740,11 @@ onMounted(() => {
             </article>
           </div>
           <div v-if="editingPreset" class="panel preset-editor">
-            <h5>プリセット編集: {{ String(editingPreset.name) }}</h5>
+            <h5>{{ creatingPreset ? '新しいプリセット' : `プリセット編集: ${String(editingPreset.name)}` }}</h5>
             <label class="field"><span>名前</span><input v-model="editingPreset.name" type="text" /></label>
             <label class="field"><span>説明</span><textarea :value="String(editingPreset.description ?? '')" rows="2" @input="updatePresetText('description', $event)" /></label>
             <fieldset v-for="group in presetGroups" :key="group.label"><legend>{{ group.label }}</legend><div class="epg-friendly-grid"><label v-for="key in group.keys" :key="key" class="field"><span>{{ presetLabels[key] }} <small v-if="editingPreset[key] === null">（全体設定を使用）</small></span><input v-if="typeof editingPreset[key] === 'boolean'" v-model="editingPreset[key]" type="checkbox" /><input v-else v-model.number="editingPreset[key]" type="number" min="0" /><button v-if="editingPreset[key] !== null && key !== 'enabled'" class="button secondary" type="button" @click="clearPresetValue(key)">全体設定に戻す</button></label></div></fieldset>
-            <div class="actions"><button class="button" type="button" @click="saveEpgPreset">保存</button><button class="button secondary" type="button" @click="editingPreset = null">キャンセル</button></div>
+            <div class="actions"><button class="button" type="button" @click="saveEpgPreset">保存</button><button class="button secondary" type="button" @click="editingPreset = null; creatingPreset = false">キャンセル</button></div>
           </div>
         </section>
         <div class="epg-friendly-grid">

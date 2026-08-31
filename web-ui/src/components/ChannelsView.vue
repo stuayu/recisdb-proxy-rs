@@ -192,13 +192,19 @@ function reset() {
   })
 }
 
-function edit(row: JsonRecord) {
+async function edit(row: JsonRecord) {
   editing.value = Number(row.id)
   editMode.value = true
   for (const key of Object.keys(form)) {
     const value = row[key]
     if (value !== undefined) (form as Record<string, unknown>)[key] = value
   }
+  try {
+    const response = await api<JsonRecord>(`/channels/${String(row.id)}/candidate-tuners`)
+    const candidates = unwrapArray(response, ['tuners'])
+    drivers.value = candidates.map((driver) => ({ id: Number(driver.id), name: String(driver.name ?? `Tuner ${driver.id}`), description: String(driver.description ?? ''), secondary: String(driver.secondary ?? '') }))
+    if (!drivers.value.length && response.reason) error.value = '対応する受信帯域のチューナーがありません'
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
   requestAnimationFrame(() =>
     document.getElementById('channel-form')?.scrollIntoView({ behavior: 'smooth' }),
   )

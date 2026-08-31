@@ -107,6 +107,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/client-view", get(api::get_client_view))
         .route("/client-view/files/:kind", get(api::get_client_view_file))
         .route("/channels", get(api::get_channels))
+        .route(
+            "/channels/:id/candidate-tuners",
+            get(api::get_candidate_tuners),
+        )
         .route("/channels/export", get(api::export_channels))
         .route("/channels/import", post(api::import_channels))
         .route("/channels/batch", post(api::batch_update_channels))

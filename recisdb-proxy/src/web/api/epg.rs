@@ -1,7 +1,10 @@
 //! DB-backed EPG automatic collection settings.
 
 use super::error::ApiError;
-use crate::{database::EpgGlobalSettings, web::state::WebState};
+use crate::{
+    database::{epg_reason, EpgGlobalSettings, EpgReasonCode},
+    web::state::WebState,
+};
 use axum::{
     extract::{Path, State},
     Json,
@@ -14,8 +17,13 @@ fn reason_value(reason: Option<String>) -> serde_json::Value {
     let Some(reason) = reason else {
         return serde_json::Value::Null;
     };
-    serde_json::from_str(&reason)
-        .unwrap_or_else(|_| json!({"code":"scan_failed","details":{"message":reason}}))
+    serde_json::from_str(&reason).unwrap_or_else(|_| {
+        serde_json::from_str(&epg_reason(
+            EpgReasonCode::ScanFailed,
+            json!({"message":reason}),
+        ))
+        .unwrap_or(serde_json::Value::Null)
+    })
 }
 
 pub async fn get_epg_settings(

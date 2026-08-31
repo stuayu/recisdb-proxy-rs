@@ -266,6 +266,36 @@ pub async fn get_channels(
     })))
 }
 
+/// Return only tuners whose backend-reported channel capability matches the
+/// selected channel band. The frontend never infers compatibility from names.
+pub async fn get_candidate_tuners(
+    State(web_state): State<Arc<WebState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = web_state.database.lock().await;
+    let band: Option<i64> = db
+        .connection()
+        .query_row("SELECT band_type FROM channels WHERE id=?", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|_| ApiError::not_found("Channel not found"))?;
+    let Some(band) = band else {
+        return Ok(Json(
+            json!({"success":true,"tuners":[],"reason":{"code":"no_compatible_tuner","details":{"message":"対応する受信帯域のチューナーがありません"}}}),
+        ));
+    };
+    let mut stmt = db.connection().prepare("SELECT DISTINCT d.id,d.display_name,d.dll_path FROM bon_drivers d JOIN channels c ON c.bon_driver_id=d.id WHERE c.band_type=? AND c.is_enabled=1 ORDER BY d.id")?;
+    let tuners = stmt.query_map([band], |r| Ok(json!({"id":r.get::<_,i64>(0)?,"name":r.get::<_,Option<String>>(1)?.unwrap_or_else(|| format!("Tuner {}", r.get::<_,i64>(0).unwrap_or(0))),"description":r.get::<_,String>(2)?,"secondary":"ローカル","capability":{"bandType":band}})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let reason = if tuners.is_empty() {
+        Some(json!({"code":"no_compatible_tuner","details":{"bandType":band}}))
+    } else {
+        None
+    };
+    Ok(Json(
+        json!({"success":true,"tuners":tuners,"reason":reason}),
+    ))
+}
+
 /// Update channel request.
 #[derive(Debug, Deserialize)]
 pub struct UpdateChannelRequest {

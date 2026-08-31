@@ -172,6 +172,9 @@ BS/CSではEIT parserが返す `original_network_id` と `transport_stream_id` �
 MMT/TLVからdantto4kが変換したTSだけを既存collectorへ渡すため、EPG scheduler側で独自に
 B25やMMT処理は行わない。
 
+延期・失敗理由は `EpgReasonCode` enumから生成する `{code, details}`形式で保存・配信する。
+CPU値、対象TS、次回時刻などの付加情報はdetailsに入れ、画面側はコード対応表だけを持つ。
+
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。
 - **schedule EIT の送出周期は遠い日付ほど長い**(地上波で数分オーダー)。選局直後は

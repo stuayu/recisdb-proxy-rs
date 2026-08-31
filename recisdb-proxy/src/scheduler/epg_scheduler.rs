@@ -5,7 +5,7 @@
 //! `SlotPermit` and all policy/preemption side effects.
 
 use crate::{
-    database::{EpgGlobalSettings, EpgScanState},
+    database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState},
     server::listener::DatabaseHandle,
     tuner::{
         acquire::{self, AcquireRequest},
@@ -32,6 +32,18 @@ pub enum EpgScanDecision {
     SoftCpuLimit,
     AtCapacity,
     NotDue,
+}
+
+impl EpgScanDecision {
+    pub fn reason_code(self) -> Option<EpgReasonCode> {
+        match self {
+            Self::Disabled => Some(EpgReasonCode::Disabled),
+            Self::SoftCpuLimit => Some(EpgReasonCode::CpuSoftLimit),
+            Self::AtCapacity => Some(EpgReasonCode::NoTunerAvailable),
+            Self::NotDue => Some(EpgReasonCode::NotDue),
+            Self::Start => None,
+        }
+    }
 }
 
 pub fn decide(
@@ -161,7 +173,7 @@ impl EpgScanScheduler {
                 driver.id,
                 channel.nid,
                 channel.tsid,
-                r#"{"code":"scheduled","details":{}}"#,
+                &epg_reason(EpgReasonCode::Scheduled, serde_json::json!({})),
             )?
         };
         self.active.fetch_add(1, Ordering::SeqCst);
@@ -173,11 +185,10 @@ impl EpgScanScheduler {
                 let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
             }
             Err(e) => {
-                let reason = serde_json::json!({
-                    "code": "scan_failed",
-                    "details": {"message": e.to_string()}
-                })
-                .to_string();
+                let reason = epg_reason(
+                    EpgReasonCode::ScanFailed,
+                    serde_json::json!({"message": e.to_string()}),
+                );
                 let _ = db.epg_scan_finished(
                     history,
                     "failed",
@@ -407,6 +418,26 @@ mod tests {
             decide(&config(), 0, 0, 10, None, None, None),
             EpgScanDecision::Start
         )
+    }
+
+    #[test]
+    fn every_decision_reason_is_serializable() {
+        for decision in [
+            EpgScanDecision::Start,
+            EpgScanDecision::Disabled,
+            EpgScanDecision::SoftCpuLimit,
+            EpgScanDecision::AtCapacity,
+            EpgScanDecision::NotDue,
+        ] {
+            if let Some(code) = decision.reason_code() {
+                let value = serde_json::to_value(crate::database::EpgReason {
+                    code,
+                    details: serde_json::json!({}),
+                })
+                .unwrap();
+                assert!(value.get("code").is_some());
+            }
+        }
     }
 
     #[test]

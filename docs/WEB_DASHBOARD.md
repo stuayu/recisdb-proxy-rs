@@ -461,6 +461,9 @@ EPG状態APIは全体サマリに加えて、`network_id`/`tsid`ごとのcoverag
 失敗状態を返す。全体の番組情報表示は最もcoverageが薄い系統を基準にする。CPU負荷の
 取得元と、取得不能時に制限を無効化していることもAPIで判別できる。
 
+チャンネル編集のチューナー候補は `GET /api/channels/:id/candidate-tuners` で取得する。
+Backendがchannelの帯域と有効な受信実績から候補を判定し、候補なしの場合は理由コードを返す。
+
 以下はすべて実装済みです:
 
 - クライアント毎の Drop/Scramble/Error 統計表示 (概要タブのクライアント一覧)

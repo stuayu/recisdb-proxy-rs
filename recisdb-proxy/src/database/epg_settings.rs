@@ -7,6 +7,7 @@
 use crate::database::{Database, DatabaseError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const EPG_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS epg_global_settings (
@@ -140,6 +141,32 @@ pub struct EpgScanState {
     pub last_node_id: Option<String>,
     pub failure_count: i64,
     pub last_failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EpgReasonCode {
+    Scheduled,
+    NoTunerAvailable,
+    CpuSoftLimit,
+    CpuHardLimit,
+    PreemptedByRecord,
+    PreemptedByView,
+    Backoff,
+    Disabled,
+    NotDue,
+    ScanFailed,
+    NoCompatibleTuner,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EpgReason {
+    pub code: EpgReasonCode,
+    pub details: Value,
+}
+
+pub fn epg_reason(code: EpgReasonCode, details: Value) -> String {
+    serde_json::to_string(&EpgReason { code, details }).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
