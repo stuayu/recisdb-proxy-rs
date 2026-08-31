@@ -17,41 +17,74 @@ use serde_json::json;
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
 impl ApiError {
     /// 404 — the requested resource does not exist.
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_FOUND, message: message.into() }
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+        }
     }
 
     /// 400 — the request itself was invalid (missing/malformed fields).
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
+            message: message.into(),
+        }
     }
 
     /// 500 — something went wrong on the server (DB error, I/O error, etc).
     pub fn internal(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+        }
     }
 
     /// 409 — the request conflicts with an in-progress operation (e.g. a
     /// self-update already running, `web/api/update.rs`).
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::CONFLICT, message: message.into() }
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.into(),
+        }
     }
 
     /// 502 — an upstream this server had to talk to failed (e.g. the remote
     /// node's pairing endpoint, `web/api/nodes.rs`).
     pub fn bad_gateway(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_GATEWAY, message: message.into() }
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "upstream_error",
+            message: message.into(),
+        }
     }
 
     /// 501 — the server (or this platform's build) does not implement the
     /// requested capability (e.g. self-update on macOS, `web/api/update.rs`).
     pub fn not_implemented(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_IMPLEMENTED, message: message.into() }
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "not_implemented",
+            message: message.into(),
+        }
+    }
+
+    pub fn coded_conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -61,6 +94,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(json!({
                 "success": false,
+                "error_code": self.code,
                 "error": self.message,
             })),
         )

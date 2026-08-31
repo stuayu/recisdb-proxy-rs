@@ -27,12 +27,36 @@ export type NodeEntry = {
   routable_routes: number
   total_routes: number
 }
-export type RouteGroup = { id: number; name: string }
+export type RouteGroup = {
+  id: number
+  name: string
+  members?: Array<{ node_id: string; weight: number }>
+}
+export type SetupStatus = {
+  id: string
+  label: string
+  state: 'done' | 'warn' | 'todo'
+  action: string | null
+}
+export type Topology = {
+  local: { node_id: string; display_name: string }
+  nodes: StoredNode[]
+  paths: Array<{
+    from: string
+    to: string
+    kind: EndpointKind
+    status: 'online' | 'unavailable'
+    role: string
+    record_allowed: boolean
+  }>
+}
 export type NodesResponse = {
   success: boolean
   local: { node_id: string; display_name: string }
   nodes: NodeEntry[]
   route_groups: RouteGroup[]
+  setup_status: SetupStatus[]
+  topology: Topology
   pending_pairings: Array<{ expires_at_unix_ms: number; label: string | null }>
 }
 export type IssuedPairing = {

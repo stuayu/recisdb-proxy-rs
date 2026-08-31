@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 import { api } from '../../api'
-import type { IssuedPairing } from './types'
+import type { IssuedPairing, ProbeResponse } from './types'
+import { nodeError } from './errors'
+import { parsePairingConnection } from './pairing'
 const emit = defineEmits<{ close: []; complete: [] }>()
 const step = ref(1)
 const purpose = ref('both')
@@ -10,18 +12,7 @@ const issuing = ref(false)
 const redeeming = ref(false)
 const issued = ref<IssuedPairing | null>(null)
 const error = ref('')
-const parsed = computed(() => {
-  try {
-    const url = new URL(connection.value.trim())
-    if (url.protocol !== 'recisdb:') return null
-    return {
-      base_url: url.searchParams.get('endpoint') || '',
-      code: url.searchParams.get('code') || '',
-    }
-  } catch {
-    return null
-  }
-})
+const diagnostic = ref<ProbeResponse | null>(null)
 async function issue() {
   issuing.value = true
   error.value = ''
@@ -32,18 +23,19 @@ async function issue() {
     })
     step.value = 2
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    error.value = nodeError(cause)
   } finally {
     issuing.value = false
   }
 }
 async function redeem() {
-  const pair =
-    parsed.value ||
-    (() => {
-      const [base_url, code] = connection.value.split(/\s+/)
-      return { base_url, code }
-    })()
+  let pair
+  try {
+    pair = parsePairingConnection(connection.value)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+    return
+  }
   if (!pair.base_url || !pair.code) {
     error.value = '接続情報を確認してください。'
     return
@@ -51,13 +43,20 @@ async function redeem() {
   redeeming.value = true
   error.value = ''
   try {
-    await api('/nodes/pairing/redeem', {
+    const result = await api<{ node: { node_id: string } }>('/nodes/pairing/redeem', {
       method: 'POST',
       body: JSON.stringify({ base_url: pair.base_url, code: pair.code, endpoints: [] }),
     })
+    diagnostic.value = await api<ProbeResponse>(
+      `/nodes/${encodeURIComponent(result.node.node_id)}/probe`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ bitrate_bps: 20_000_000, download_bytes: 1_048_576 }),
+      },
+    )
     step.value = 4
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    error.value = nodeError(cause)
   } finally {
     redeeming.value = false
   }
@@ -130,7 +129,27 @@ async function copyPairing() {
                 : 'チューナー共有'
           }}
         </p>
-        <p class="good">✓ 相手PCへ接続可能 / ✓ 認証成功 / ✓ 録画利用可</p>
+        <div class="diagnostic">
+          <p>診断</p>
+          <p class="good">✓ 相手PCへ接続可能 / ✓ 認証成功</p>
+          <p :class="diagnostic?.selected.view ? 'good' : 'bad'">
+            {{
+              diagnostic?.selected.view
+                ? '✓ 通信速度十分 / ✓ ライブ視聴 快適'
+                : '⚠ ライブ視聴に利用できる経路なし'
+            }}
+          </p>
+          <p :class="diagnostic?.selected.record ? 'good' : 'warn'">
+            {{
+              diagnostic?.selected.record
+                ? '✓ 録画利用可能 / 録画 推奨'
+                : '⚠ 録画利用可能な経路なし'
+            }}
+          </p>
+        </div>
+        <p v-if="!diagnostic?.selected.view" class="notice error" role="alert">
+          問題があります。再試行するか、詳細設定の手動接続を確認してください。
+        </p>
         <button class="button" @click="emit('complete')">この設定で開始</button>
       </div>
       <p v-if="error" class="notice error" role="alert">

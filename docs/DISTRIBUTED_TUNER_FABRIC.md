@@ -15,6 +15,14 @@ viewing, and recording states. Cloudflare Public paths are explicitly shown as
 view-only when `record_allowed` is false. The topology preview is rendered in
 Vue/SVG-compatible markup and changes to a vertical layout on narrow screens.
 
+`GET /api/nodes` also returns backend-owned `setup_status` items, topology data,
+and route-area members. Route areas can be renamed, deleted, and updated through
+the dashboard without changing the route selection algorithm. Manual node
+updates use the existing `POST /api/nodes` upsert; an omitted credential
+preserves the stored credential, so credentials are never read back to the
+browser. API failures include a stable `error_code` alongside the raw detail
+for UI translation.
+
 Automatic transport selection must not be described as continuously optimal.
 Current normal routing is still the static preference order LAN, Tailscale,
 Cloudflare private, Static, direct Internet, and Cloudflare public. `score_path`

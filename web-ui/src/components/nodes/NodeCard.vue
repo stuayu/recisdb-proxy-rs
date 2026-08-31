@@ -2,13 +2,14 @@
 import NodeHealthSummary from './NodeHealthSummary.vue'
 import NodeAdvancedSettings from './NodeAdvancedSettings.vue'
 import type { NodeEntry, ProbeResponse } from './types'
+import { ref } from 'vue'
 defineProps<{
   entry: NodeEntry
   probe?: ProbeResponse
-  local: { display_name: string }
   probing: boolean
 }>()
-const emit = defineEmits<{ probe: []; edit: []; toggle: []; remove: []; topology: [] }>()
+const emit = defineEmits<{ probe: []; edit: []; toggle: []; remove: []; topology: []; saved: [] }>()
+const advancedOpen = ref(false)
 function selectedEndpoint(probe: ProbeResponse | undefined) {
   return (
     probe?.paths.find((path) => path.id === probe.selected.view)?.endpoint.kind ||
@@ -70,18 +71,12 @@ function selectedEndpoint(probe: ProbeResponse | undefined) {
         >
       </div>
     </details>
-    <NodeAdvancedSettings
-      :node-id="entry.node.node_id"
-      :endpoint="entry.endpoints[0]"
-      :record-allowed="entry.endpoints[0]?.record_allowed ?? false"
-      credential=""
-      :weight="100"
-    />
+    <NodeAdvancedSettings :entry="entry" :open="advancedOpen" @saved="emit('saved')" />
     <div class="actions">
       <button class="button" :disabled="probing || !entry.paired" @click="emit('probe')">
         {{ probing ? 'テスト中…' : '通信テスト' }}</button
       ><button class="button secondary" @click="emit('topology')">構成図</button
-      ><button class="button secondary" @click="emit('edit')">設定</button
+      ><button class="button secondary" @click="advancedOpen = true">設定</button
       ><button class="button secondary" @click="emit('toggle')">
         {{ entry.node.enabled ? '停止' : '有効化' }}</button
       ><button class="button secondary" @click="emit('remove')">削除</button>

@@ -5,7 +5,7 @@ import { chromium } from '@playwright/test'
 
 const root = resolve(process.cwd(), '../recisdb-proxy/static/vue')
 const output = resolve(process.cwd(), 'test-results/responsive')
-const port = 4176
+let port = 0
 
 const mockJson = {
   '/api/stats': { active_tuners: 2, active_sessions: 1, total_sessions: 12, total_channels: 3 },
@@ -48,6 +48,15 @@ const mockJson = {
   '/api/tuner-config': {},
   '/api/preview-config': {},
   '/api/tsreplace-config': {},
+  '/api/nodes': {
+    success: true,
+    local: { node_id: 'home', display_name: '自宅' },
+    nodes: [],
+    route_groups: [],
+    setup_status: [],
+    topology: { local: { node_id: 'home', display_name: '自宅' }, nodes: [], paths: [] },
+    pending_pairings: [],
+  },
 }
 
 const contentTypes = {
@@ -100,7 +109,13 @@ const server = createServer(async (request, response) => {
 })
 
 await mkdir(output, { recursive: true })
-await new Promise((resolveReady) => server.listen(port, '127.0.0.1', resolveReady))
+await new Promise((resolveReady, reject) => {
+  server.once('error', reject)
+  server.listen(0, '127.0.0.1', resolveReady)
+})
+const address = server.address()
+if (!address || typeof address === 'string') throw new Error('responsive test server did not expose a TCP port')
+port = address.port
 const browser = await chromium.launch({ headless: true })
 const tabs = [
   'overview',
@@ -110,6 +125,7 @@ const tabs = [
   'scan-history',
   'session-history',
   'alerts',
+  'nodes',
   'settings',
 ]
 const viewports = [

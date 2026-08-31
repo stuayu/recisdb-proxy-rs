@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 import { api } from '../api'
 import type { NodeEntry, NodesResponse, ProbeResponse } from '../components/nodes/types'
+import { nodeError } from '../components/nodes/errors'
 
 export function useNodes() {
   const data = ref<NodesResponse | null>(null)
@@ -16,7 +17,7 @@ export function useNodes() {
       data.value = await api<NodesResponse>('/nodes')
       error.value = ''
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
+      error.value = nodeError(cause)
     } finally {
       loading.value = false
     }
@@ -33,7 +34,7 @@ export function useNodes() {
       )
       error.value = ''
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
+      error.value = nodeError(cause)
     } finally {
       probing.value = null
     }

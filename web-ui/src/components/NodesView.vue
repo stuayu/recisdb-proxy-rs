@@ -5,6 +5,8 @@ import NodeCard from './nodes/NodeCard.vue'
 import NodeHelpDrawer from './nodes/NodeHelpDrawer.vue'
 import NodeSetupWizard from './nodes/NodeSetupWizard.vue'
 import NodeTopologyPreview from './nodes/NodeTopologyPreview.vue'
+import NodeAdvancedSettings from './nodes/NodeAdvancedSettings.vue'
+import RouteAreaEditor from './nodes/RouteAreaEditor.vue'
 import { useNodes } from '../composables/useNodes'
 import type { NodeEntry } from './nodes/types'
 const { data, loading, error, message, probes, probing, load, probe } = useNodes()
@@ -14,6 +16,11 @@ const topology = ref<NodeEntry | null>(null)
 const localName = ref('')
 const savingLocal = ref(false)
 const nodes = computed(() => data.value?.nodes ?? [])
+function setupAction(action: string | null) {
+  if (action === 'wizard' || action === 'probe') wizard.value = true
+  if (action === 'area') document.querySelector('.area-editor')?.scrollIntoView({ behavior: 'smooth' })
+  if (action === 'settings') document.querySelector('details.advanced')?.setAttribute('open', '')
+}
 async function saveLocal() {
   if (!localName.value.trim()) return
   savingLocal.value = true
@@ -41,10 +48,6 @@ async function remove(entry: NodeEntry) {
 }
 function edit() {
   help.value = true
-}
-function topologyPath(entry: NodeEntry) {
-  const selected = probes.value[entry.node.node_id]?.selected.view
-  return probes.value[entry.node.node_id]?.paths.find((path) => path.id === selected)?.endpoint.kind
 }
 function finishWizard() {
   wizard.value = false
@@ -82,24 +85,23 @@ onMounted(async () => {
     </section>
     <section class="card setup">
       <h3>セットアップ状況</h3>
-      <p>✓ このPCの設定</p>
-      <p v-if="nodes.length" class="good">✓ {{ nodes[0].node.display_name }}と接続</p>
-      <p v-else>○ 別のPCを接続</p>
-      <p v-if="nodes.some((node) => !node.paired)" class="warn">! 通信経路を確認してください</p>
-      <p v-if="nodes.length">○ 録画利用の確認（通信テストで確認）</p>
-    </section>
-    <section v-if="data?.route_groups.length" class="card">
-      <h3>受信エリア</h3>
-      <p v-for="group in data.route_groups" :key="group.id">
-        {{ group.name }} — このエリア内から状態の良い受信機を自動的に選択します。
+      <p
+        v-for="item in data?.setup_status"
+        :key="item.id"
+        :class="item.state === 'done' ? 'good' : item.state === 'warn' ? 'warn' : ''"
+      >
+        {{ item.state === 'done' ? '✓' : item.state === 'warn' ? '!' : '○' }} {{ item.label }}
+        <button v-if="item.action" class="link" @click="setupAction(item.action)">確認</button>
       </p>
     </section>
+    <RouteAreaEditor v-if="data" :groups="data.route_groups" :nodes="nodes" @changed="load" />
     <section v-if="!loading && !nodes.length" class="empty card">
       <h3>まだ別のPCは接続されていません</h3>
       <p>
         東京のPCから地方局を視聴、別PCの空いているチューナー利用、故障時の別拠点切り替えができます。
       </p>
       <button class="button" @click="wizard = true">＋ 最初のPCを追加</button>
+      <NodeAdvancedSettings @saved="load" />
     </section>
     <section v-else class="node-list">
       <div class="list-heading">
@@ -111,22 +113,18 @@ onMounted(async () => {
         :key="entry.node.node_id"
         :entry="entry"
         :probe="probes[entry.node.node_id]"
-        :local="data!.local"
         :probing="probing === entry.node.node_id"
         @probe="probe(entry)"
         @edit="edit"
         @toggle="toggle(entry)"
         @remove="remove(entry)"
         @topology="topology = entry"
+        @saved="load"
       />
     </section>
     <div v-if="topology && data" class="topology-dialog" role="dialog" aria-modal="true">
       <button class="button secondary" @click="topology = null">閉じる</button
-      ><NodeTopologyPreview
-        :local="data.local"
-        :node="topology.node"
-        :path="topologyPath(topology)"
-      />
+      ><NodeTopologyPreview :topology="data.topology" :focus-node-id="topology.node.node_id" />
     </div>
     <NodeSetupWizard
       v-if="wizard"

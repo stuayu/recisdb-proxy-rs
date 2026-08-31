@@ -4,6 +4,7 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    public code: string | null = null,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -31,7 +32,10 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, { ...init, headers })
   if (!response.ok) {
     const body = await response.text()
-    throw new ApiError(response.status, body || `${response.status} ${response.statusText}`)
+    let message = body || `${response.status} ${response.statusText}`
+    let code: string | null = null
+    try { const parsed = JSON.parse(body) as { error?: string; error_code?: string }; message = parsed.error || message; code = parsed.error_code || null } catch { /* preserve non-JSON upstream errors */ }
+    throw new ApiError(response.status, message, code)
   }
 
   const type = response.headers.get('content-type') || ''
@@ -44,7 +48,10 @@ export async function downloadApi(path: string, fallbackName: string): Promise<v
   })
   if (!response.ok) {
     const body = await response.text()
-    throw new ApiError(response.status, body || `${response.status} ${response.statusText}`)
+    let message = body || `${response.status} ${response.statusText}`
+    let code: string | null = null
+    try { const parsed = JSON.parse(body) as { error?: string; error_code?: string }; message = parsed.error || message; code = parsed.error_code || null } catch { /* preserve non-JSON upstream errors */ }
+    throw new ApiError(response.status, message, code)
   }
 
   const disposition = response.headers.get('content-disposition') || ''
