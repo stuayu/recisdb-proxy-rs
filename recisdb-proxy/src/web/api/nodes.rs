@@ -578,9 +578,25 @@ pub async fn update_route_group(
     }
     let db = web_state.database.lock().await;
     let store = NodeStore::new(&db)?;
+    // `route_groups.name` is UNIQUE. Resolve the collision here so the user
+    // gets a readable 409 instead of the raw SQLite constraint error as a 500.
+    let existing = store.route_group_id_by_name(name)?;
     let id = match payload.id {
-        Some(id) => id,
-        None => store.ensure_route_group(name)?,
+        Some(id) => {
+            if !store.route_group_exists(id)? {
+                return Err(ApiError::not_found(format!(
+                    "route area {id} not found"
+                )));
+            }
+            if matches!(existing, Some(other) if other != id) {
+                return Err(ApiError::coded_conflict(
+                    "route_group_name_taken",
+                    format!("受信エリア「{name}」はすでにあります。別の名前を入力してください。"),
+                ));
+            }
+            id
+        }
+        None => existing.unwrap_or(store.ensure_route_group(name)?),
     };
     store.rename_route_group(id, name)?;
     Ok(Json(json!({ "success": true, "id": id, "name": name })))

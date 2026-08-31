@@ -144,8 +144,8 @@ async function copyPairing() {
 }
 </script>
 <template>
-  <div ref="dialog" class="overlay" role="dialog" aria-modal="true" aria-labelledby="wizard-title" tabindex="-1">
-    <section class="wizard">
+  <div ref="dialog" class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="wizard-title" tabindex="-1">
+    <section class="dialog wizard">
       <button class="close" aria-label="ウィザードを閉じる" @click="emit('close')">×</button>
       <p class="step">STEP {{ step }} / 4</p>
       <h2 id="wizard-title">別のPC・拠点を追加</h2>
@@ -158,9 +158,12 @@ async function copyPairing() {
             { v: 'both', t: '両方（おすすめ）' },
           ]"
           :key="item.v"
-          class="choice"
-          ><input v-model="purpose" type="radio" :value="item.v" />{{ item.t }}</label
-        ><button class="button" @click="issue">{{ issuing ? '準備中…' : '次へ' }}</button>
+          class="choice check"
+          ><input v-model="purpose" type="radio" :value="item.v" /><span>{{ item.t }}</span></label
+        >
+        <div class="actions">
+          <button class="button" @click="issue">{{ issuing ? '準備中…' : '次へ' }}</button>
+        </div>
       </div>
       <div v-else-if="step === 2">
         <h3>相手PCの接続情報</h3>
@@ -175,23 +178,30 @@ async function copyPairing() {
             <span>QRを読み取って接続できます。</span>
           </div>
           <code class="pairing-text">{{ pairingText }}</code>
-          <button class="button secondary" :disabled="expired" @click="copyPairing">
-            接続情報をコピー
-          </button>
+          <div class="actions">
+            <button class="button secondary" :disabled="expired" @click="copyPairing">
+              接続情報をコピー
+            </button>
+          </div>
           <small>コードは一度だけ表示。文字列でも接続できます。</small>
-          <button v-if="expired" class="button" @click="issue">接続情報を再発行</button>
+          <div v-if="expired" class="actions">
+            <button class="button" @click="issue">接続情報を再発行</button>
+          </div>
         </div>
-        <label
-          >接続情報<input
-            v-model="connection"
-            placeholder="recisdb://pair?..."
-            autocomplete="off" /></label
-        ><button class="button" @click="step = 3">次へ</button
-        ><button class="button secondary" @click="step = 1">戻る</button>
+        <label class="field"
+          ><span>接続情報</span
+          ><input v-model="connection" placeholder="recisdb://pair?..." autocomplete="off"
+        /></label>
+        <div class="actions">
+          <button class="button" @click="step = 3">次へ</button
+          ><button class="button secondary" @click="step = 1">戻る</button>
+        </div>
       </div>
       <div v-else-if="step === 3">
         <h3>通信方法</h3>
-        <label class="choice"><input checked type="radio" />自動（おすすめ）</label>
+        <label class="choice check"
+          ><input checked type="radio" /><span>自動（おすすめ）</span></label
+        >
         <p class="muted">
           利用可能な通信方法を自動確認し、推奨経路を選択します。経路選択は現在、静的な優先順が基本です。
         </p>
@@ -199,9 +209,11 @@ async function copyPairing() {
           <summary>通信方法を手動指定</summary>
           <p>LAN → Tailscale → Cloudflare Private → Static → Direct HTTPS → Cloudflare Public</p>
         </details>
-        <button class="button" :disabled="redeeming" @click="redeem">
-          {{ redeeming ? '診断中…' : '接続確認へ' }}</button
-        ><button class="button secondary" @click="step = 2">戻る</button>
+        <div class="actions">
+          <button class="button" :disabled="redeeming" @click="redeem">
+            {{ redeeming ? '診断中…' : '接続確認へ' }}</button
+          ><button class="button secondary" @click="step = 2">戻る</button>
+        </div>
       </div>
       <div v-else>
         <h3>設定内容を確認</h3>
@@ -240,10 +252,16 @@ async function copyPairing() {
           登録前診断に失敗したため、仮登録を自動で取り消しました。ユーザー操作は不要です。
         </p>
         <p v-if="reciprocalWarning" class="notice warning" role="alert">{{ reciprocalWarning }}</p>
-        <button v-if="!rolledBack && diagnostic?.selected.view" class="button" @click="emit('complete')">
-          この設定で開始
-        </button>
-        <button v-else class="button secondary" @click="retry">再試行</button>
+        <div class="actions">
+          <button
+            v-if="!rolledBack && diagnostic?.selected.view"
+            class="button"
+            @click="emit('complete')"
+          >
+            この設定で開始
+          </button>
+          <button v-else class="button secondary" @click="retry">再試行</button>
+        </div>
       </div>
       <p v-if="error" class="notice error" role="alert">
         接続設定を完了できません。詳細: {{ error }}
@@ -252,56 +270,50 @@ async function copyPairing() {
   </div>
 </template>
 <style scoped>
-.overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-  background: #0008;
-}
-
 .wizard {
   position: relative;
   width: min(34rem, 100%);
+  max-height: 90dvh;
+  overflow: auto;
   display: grid;
-  gap: 1rem;
-  padding: 1.5rem;
-  background: var(--surface, #fff);
-  border-radius: 14px;
-  box-sizing: border-box;
+  gap: 16px;
+}
+
+.wizard > div {
+  display: grid;
+  gap: 12px;
 }
 
 .close {
   position: absolute;
-  right: 1rem;
-  top: 1rem;
+  right: 12px;
+  top: 12px;
+  min-width: 44px;
+  min-height: 44px;
   border: 0;
   background: none;
+  color: var(--text);
   font-size: 1.5rem;
   cursor: pointer;
 }
 
 .step {
   margin: 0;
-  color: var(--text-muted, #6b7280);
+  color: var(--muted);
 }
 
 .choice {
-  display: flex;
-  gap: 0.6rem;
-  align-items: center;
-  padding: 0.8rem;
-  border: 1px solid var(--border, #d9dee7);
+  padding: 8px 14px;
+  border: 1px solid var(--border);
   border-radius: 8px;
 }
 
 .pair-code {
   display: grid;
-  gap: 0.5rem;
-  padding: 0.8rem;
-  background: rgb(127 127 127 / 8%);
+  gap: 8px;
+  padding: 12px;
+  background: var(--soft);
+  border-radius: 8px;
 }
 
 .pair-code code {
@@ -312,7 +324,7 @@ async function copyPairing() {
 .qr-box {
   display: grid;
   justify-items: center;
-  gap: 0.4rem;
+  gap: 6px;
 }
 
 .qr-box canvas {
@@ -326,20 +338,20 @@ async function copyPairing() {
   overflow-wrap: anywhere;
 }
 
-.wizard label:not(.choice) {
+/* .field's stacked-form margin would fight the dialog's grid gap. */
+.wizard .field {
+  margin: 0;
+}
+
+.diagnostic {
   display: grid;
-  gap: 0.3rem;
+  gap: 4px;
+  padding: 12px;
+  background: var(--soft);
+  border-radius: 8px;
 }
 
-.wizard input:not([type='radio']) {
-  padding: 0.6rem;
-}
-
-.good {
-  color: #15803d;
-}
-
-.notice.error {
-  color: #b91c1c;
+.diagnostic p {
+  margin: 0;
 }
 </style>

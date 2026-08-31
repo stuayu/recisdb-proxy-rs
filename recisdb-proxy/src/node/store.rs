@@ -394,15 +394,25 @@ impl<'a> NodeStore<'a> {
             .transpose()
     }
 
+    /// Atomically replace one node's endpoint list.
+    ///
+    /// The list is de-duplicated first: `node_endpoints` has
+    /// `UNIQUE(node_id, endpoint_json)`, and a UI that sends the same endpoint
+    /// twice is asking for the same end state, not for an error. Letting the
+    /// constraint fire here would surface as a raw SQLite 500 on save.
     pub fn replace_endpoints(&self, node_id: &NodeId, endpoints: &[NodeEndpoint]) -> Result<()> {
         let conn = self.db.connection();
         conn.execute(
             "DELETE FROM node_endpoints WHERE node_id = ?1",
             params![node_id.as_str()],
         )?;
+        let mut seen = std::collections::HashSet::new();
         for endpoint in endpoints {
             let json = serde_json::to_string(endpoint)
                 .map_err(|e| DatabaseError::MigrationFailed(e.to_string()))?;
+            if !seen.insert(json.clone()) {
+                continue;
+            }
             conn.execute(
                 "INSERT INTO node_endpoints (node_id, endpoint_json) VALUES (?1, ?2)",
                 params![node_id.as_str(), json],
@@ -696,6 +706,36 @@ impl<'a> NodeStore<'a> {
         .collect()
     }
 
+    /// Look up a route group by its (unique) name.
+    ///
+    /// Callers use this to turn "the name is taken" into a 409 with a human
+    /// message instead of letting the UNIQUE constraint surface as a raw
+    /// `SQLite error: UNIQUE constraint failed: route_groups.name` 500.
+    pub fn route_group_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        self.db
+            .connection()
+            .query_row(
+                "SELECT id FROM route_groups WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn route_group_exists(&self, group_id: i64) -> Result<bool> {
+        self.db
+            .connection()
+            .query_row(
+                "SELECT 1 FROM route_groups WHERE id = ?1",
+                params![group_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(DatabaseError::from)
+    }
+
     pub fn rename_route_group(&self, group_id: i64, name: &str) -> Result<()> {
         self.db.connection().execute(
             "UPDATE route_groups SET name = ?2 WHERE id = ?1",
@@ -780,6 +820,42 @@ mod tests {
         // A replay of the same code must not pair a second node.
         assert!(!store.consume_pending_pairing(&code).unwrap());
         assert!(store.pending_pairings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_endpoints_collapse_instead_of_violating_the_unique_index() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let node = paired_node(&store, "tokyo");
+        let endpoint = NodeEndpoint {
+            kind: EndpointKind::Lan,
+            address: "http://192.0.2.10:20773".into(),
+            enabled: true,
+            record_allowed: true,
+            metered: false,
+            user_priority: 0,
+        };
+        // The dashboard can submit the same endpoint twice; that asks for one
+        // endpoint, not for a UNIQUE constraint failure surfaced as a 500.
+        store
+            .replace_endpoints(&node, &[endpoint.clone(), endpoint])
+            .unwrap();
+        assert_eq!(store.endpoints(&node).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn route_group_lookup_reports_the_name_owner() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let kanto = store.ensure_route_group("関東").unwrap();
+        let tohoku = store.ensure_route_group("東北").unwrap();
+
+        assert_eq!(store.route_group_id_by_name("関東").unwrap(), Some(kanto));
+        assert_eq!(store.route_group_id_by_name("近畿").unwrap(), None);
+        assert!(store.route_group_exists(tohoku).unwrap());
+        assert!(!store.route_group_exists(tohoku + 1000).unwrap());
+        // ensure_route_group is idempotent: the same name keeps its id.
+        assert_eq!(store.ensure_route_group("関東").unwrap(), kanto);
     }
 
     #[test]

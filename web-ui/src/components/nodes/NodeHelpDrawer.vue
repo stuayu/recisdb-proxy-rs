@@ -52,22 +52,29 @@ watch(() => props.open, (open) => {
 <style scoped>
 .drawer {
   position: fixed;
-  z-index: 10;
+
+  /* Above the nav (z:10) but below dialogs (z:200), matching styles.css. */
+  z-index: 150;
   right: 0;
   top: 0;
   width: min(24rem, 100vw);
-  height: 100vh;
-  box-sizing: border-box;
-  padding: 1.5rem;
-  background: var(--surface, #fff);
+  height: 100dvh;
+  overflow: auto;
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text);
+  border-left: 1px solid var(--border);
   box-shadow: -4px 0 18px #0003;
 }
 
 .close {
   float: right;
-  font-size: 1.5rem;
+  min-width: 44px;
+  min-height: 44px;
   border: 0;
   background: none;
+  color: var(--text);
+  font-size: 1.5rem;
   cursor: pointer;
 }
 </style>

@@ -59,31 +59,33 @@ onMounted(async () => {
 })
 </script>
 <template>
-  <section class="nodes-view">
-    <header class="heading">
+  <section class="view nodes-view">
+    <div class="view-heading">
       <div>
         <h2>分散ノード</h2>
         <p>別のPC・拠点にあるチューナーを利用できます。</p>
       </div>
-      <div class="heading-actions">
+      <div class="actions">
         <button class="button secondary" aria-label="設定ガイドを開く" @click="help = true">
           ？ 設定ガイド</button
         ><button class="button secondary" :disabled="loading" @click="load">再読み込み</button>
       </div>
-    </header>
+    </div>
     <p v-if="error" class="notice error" role="alert">
       接続設定を確認できません。詳細: {{ error }}
     </p>
     <p v-if="message" class="notice" aria-live="polite">{{ message }}</p>
-    <section class="local card">
-      <div>
+    <section class="panel local">
+      <div class="local-title">
         <h3>このPC</h3>
         <span class="good">● 正常</span>
       </div>
-      <label>表示名<input v-model="localName" autocomplete="off" /></label
-      ><button class="button secondary" :disabled="savingLocal" @click="saveLocal">保存</button>
+      <label class="field"><span>表示名</span><input v-model="localName" autocomplete="off" /></label>
+      <div class="actions">
+        <button class="button secondary" :disabled="savingLocal" @click="saveLocal">保存</button>
+      </div>
     </section>
-    <section class="card setup">
+    <section class="panel setup">
       <h3>セットアップ状況</h3>
       <p
         v-for="item in data?.setup_status"
@@ -91,11 +93,13 @@ onMounted(async () => {
         :class="item.state === 'done' ? 'good' : item.state === 'warn' ? 'warn' : ''"
       >
         {{ item.state === 'done' ? '✓' : item.state === 'warn' ? '!' : '○' }} {{ item.label }}
-        <button v-if="item.action" class="link" @click="setupAction(item.action)">確認</button>
+        <button v-if="item.action" class="link" type="button" @click="setupAction(item.action)">
+          確認
+        </button>
       </p>
     </section>
     <RouteAreaEditor v-if="data" :groups="data.route_groups" :nodes="nodes" @changed="load" />
-    <section v-if="!loading && !nodes.length" class="empty card">
+    <section v-if="!loading && !nodes.length" class="panel empty">
       <h3>まだ別のPCは接続されていません</h3>
       <p>
         東京のPCから地方局を視聴、別PCの空いているチューナー利用、故障時の別拠点切り替えができます。
@@ -122,9 +126,17 @@ onMounted(async () => {
         @saved="load"
       />
     </section>
-    <div v-if="topology && data" class="topology-dialog" role="dialog" aria-modal="true">
-      <button class="button secondary" @click="topology = null">閉じる</button
-      ><NodeTopologyPreview :topology="data.topology" :focus-node-id="topology.node.node_id" @probe="probe(topology)" />
+    <div v-if="topology && data" class="dialog-backdrop" role="dialog" aria-modal="true">
+      <div class="dialog topology-dialog">
+        <NodeTopologyPreview
+          :topology="data.topology"
+          :focus-node-id="topology.node.node_id"
+          @probe="probe(topology)"
+        />
+        <div class="actions">
+          <button class="button secondary" @click="topology = null">閉じる</button>
+        </div>
+      </div>
     </div>
     <NodeSetupWizard
       v-if="wizard"
@@ -136,105 +148,66 @@ onMounted(async () => {
 <style scoped>
 .nodes-view {
   display: grid;
-  gap: 1rem;
+  gap: 16px;
 }
 
-.heading,
-.heading-actions,
-.list-heading,
-.local {
+.local-title {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  align-items: baseline;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
-.heading h2,
-.card h3,
+.list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.panel h3,
 .list-heading h3 {
   margin: 0;
 }
 
-.heading p {
-  margin: 0.3rem 0;
-  color: var(--text-muted, #6b7280);
-}
-
-.card {
-  padding: 1rem;
-  border: 1px solid var(--border, #d9dee7);
-  border-radius: 12px;
-  background: var(--surface, rgb(255 255 255 / 4%));
-}
-
-.local label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-weight: 600;
-}
-
-.local input {
-  padding: 0.5rem;
+/* The name field is the only control in this panel: keep it from stretching
+   to the full dashboard width on desktop while still filling narrow screens. */
+.local .field {
+  max-width: 420px;
 }
 
 .setup p {
-  margin: 0.4rem 0;
-}
-
-.good {
-  color: #15803d;
-}
-
-.warn {
-  color: #a16207;
+  margin: 6px 0;
 }
 
 .empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
   text-align: center;
-  padding: 2rem;
 }
 
 .node-list {
   display: grid;
-  gap: 0.8rem;
+  gap: 12px;
 }
 
 .topology-dialog {
-  position: fixed;
-  inset: 0;
-  z-index: 15;
-  display: grid;
-  place-content: center;
-  gap: 1rem;
-  padding: 1rem;
-  background: #0008;
-}
-
-.topology-dialog > * {
-  max-width: min(40rem, 90vw);
-  background: var(--surface, #fff);
+  width: min(680px, 100%);
+  max-height: 90dvh;
+  overflow: auto;
 }
 
 @media (max-width: 700px) {
-  .heading-actions,
+  .view-heading .actions,
   .list-heading {
     width: 100%;
   }
 
-  .heading-actions .button,
-  .list-heading .button {
+  .list-heading .button,
+  .view-heading .actions .button {
     flex: 1;
-  }
-
-  .local label {
-    width: 100%;
-  }
-
-  .local input {
-    flex: 1;
-    min-width: 0;
   }
 }
 </style>

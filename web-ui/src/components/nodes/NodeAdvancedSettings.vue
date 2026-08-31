@@ -76,16 +76,19 @@ async function save() {
   <details class="advanced" :open="open">
     <summary>詳細設定（Expert Mode）</summary>
     <p class="muted">通常は変更不要。接続先や認証情報を手動管理する場合だけ使用。</p>
-    <label
-      >Node ID<input
-        v-model="nodeId"
-        :disabled="!!entry"
-        autocomplete="off"
-        placeholder="tokyo" /></label
-    ><label>表示名<input v-model="displayName" autocomplete="off" placeholder="東京" /></label
-    ><label>受信拠点<input v-model="siteName" autocomplete="off" placeholder="東京都" /></label
-    ><label
-      >EndpointKind<select v-model="kind">
+    <label class="field"
+      ><span>Node ID</span
+      ><input v-model="nodeId" :disabled="!!entry" autocomplete="off" placeholder="tokyo"
+    /></label>
+    <label class="field"
+      ><span>表示名</span><input v-model="displayName" autocomplete="off" placeholder="東京"
+    /></label>
+    <label class="field"
+      ><span>受信拠点</span><input v-model="siteName" autocomplete="off" placeholder="東京都"
+    /></label>
+    <label class="field"
+      ><span>EndpointKind</span
+      ><select v-model="kind">
         <option value="lan">LAN</option>
         <option value="tailscale">Tailscale</option>
         <option value="cloudflare_private">Cloudflare Private</option>
@@ -93,53 +96,54 @@ async function save() {
         <option value="cloudflare_public">Cloudflare Public</option>
         <option value="static">Static</option>
       </select></label
-    ><label
-      >Endpoint URL<input
-        v-model="address"
-        autocomplete="off"
-        placeholder="http://100.x.y.z:20773" /></label
-    ><label class="check"
-      ><input v-model="recordAllowed" type="checkbox" />録画経路として使用可</label
-    ><label class="check"><input v-model="autoConnect" type="checkbox" />自動接続</label
-    ><label
-      >共有credential<input
+    >
+    <label class="field"
+      ><span>Endpoint URL</span
+      ><input v-model="address" autocomplete="off" placeholder="http://100.x.y.z:20773"
+    /></label>
+    <label class="check"
+      ><input v-model="recordAllowed" type="checkbox" /><span>録画経路として使用可</span></label
+    ><label class="check"><input v-model="autoConnect" type="checkbox" /><span>自動接続</span></label>
+    <label class="field"
+      ><span>共有credential</span
+      ><input
         v-model="credential"
         type="password"
         autocomplete="off"
         placeholder="未入力なら既存値を保持"
     /></label>
-    <button class="button" :disabled="saving" @click.prevent="save">
-      {{ saving ? '保存中…' : '詳細設定を保存' }}
-    </button>
-    <p v-if="saved" class="success" role="status">設定を保存しました。</p>
+    <div class="actions">
+      <button class="button" :disabled="saving" @click.prevent="save">
+        {{ saving ? '保存中…' : '詳細設定を保存' }}
+      </button>
+    </div>
+    <p v-if="saved" class="notice success" role="status">設定を保存しました。</p>
     <p v-if="error" class="notice error" role="alert">{{ error }}</p>
   </details>
 </template>
 <style scoped>
 .advanced {
   display: grid;
-  gap: 0.6rem;
+  gap: 10px;
+
+  /* The empty-state panel centers its text; the form must stay left-aligned. */
+  text-align: left;
 }
 
-.advanced label {
-  display: grid;
-  gap: 0.3rem;
-  font-weight: 600;
+/* No display override: that would drop the native disclosure triangle, and
+   the triangle is the only cue that the section opens. */
+.advanced summary {
+  padding: 10px 0;
+  font-weight: 700;
+  cursor: pointer;
 }
 
-.advanced input,
-.advanced select {
-  box-sizing: border-box;
-  width: 100%;
-  padding: 0.5rem;
+.advanced p {
+  margin: 0;
 }
 
-.check {
-  display: flex !important;
-  align-items: center;
-}
-
-.success {
-  color: #15803d;
+/* The panel already spaces its rows; .field's own margin would double it. */
+.advanced .field {
+  margin: 0;
 }
 </style>

@@ -18,7 +18,7 @@ function selectedEndpoint(probe: ProbeResponse | undefined) {
 }
 </script>
 <template>
-  <article class="node-card">
+  <article class="node-card panel">
     <div class="head">
       <div>
         <h3>
@@ -86,28 +86,24 @@ function selectedEndpoint(probe: ProbeResponse | undefined) {
 <style scoped>
 .node-card {
   display: grid;
-  gap: 0.8rem;
-  padding: 1rem;
-  border: 1px solid var(--border, #d9dee7);
-  border-radius: 12px;
-  background: var(--surface, rgb(255 255 255 / 4%));
+  gap: 12px;
 }
 
 .head {
   display: flex;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 16px;
   align-items: start;
   flex-wrap: wrap;
 }
 
 .head h3 {
-  margin: 0 0 0.3rem;
+  margin: 0 0 4px;
 }
 
 .head small {
   font-weight: 400;
-  opacity: 0.7;
+  color: var(--muted);
 }
 
 .state,
@@ -115,31 +111,25 @@ function selectedEndpoint(probe: ProbeResponse | undefined) {
   font-size: 0.9rem;
 }
 
-.good {
-  color: #15803d;
+.node-card .notice.warning {
+  margin: 0;
 }
 
-.warn {
-  color: #a16207;
+.paths {
+  display: grid;
+  gap: 6px;
 }
 
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.link {
-  border: 0;
-  background: none;
-  color: inherit;
-  text-decoration: underline;
+.paths summary {
+  padding: 10px 0;
   cursor: pointer;
 }
 
-.notice.warning {
-  margin: 0;
-  padding: 0.6rem;
-  background: rgb(245 158 11 / 12%);
+.path {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  background: var(--soft);
+  border-radius: 8px;
 }
 </style>

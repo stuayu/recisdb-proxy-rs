@@ -141,7 +141,18 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 | POST | `/api/nodes/:id/probe` | 全エンドポイントを実測し、VIEW/PREVIEW/RECORD ごとの最良経路を返す |
 | POST | `/api/nodes/pairing` | ワンタイムのペアリングコードを発行する |
 | POST | `/api/nodes/pairing/redeem` | 相手ノードのURLとコードを指定してペアリングする |
+| POST | `/api/node-route-groups` | 受信エリア（ルートグループ）を作成、または `id` 指定で改名する |
+| DELETE | `/api/node-route-groups/:id` | 受信エリアを削除する（所属ノードの割り当ても消える） |
 | POST | `/api/node-route-groups/member` | ルートグループを作成し、ノードを重み付きで追加・更新する |
+| DELETE | `/api/node-route-groups/member` | ノードを受信エリアから外す |
+
+`route_groups.name` は UNIQUE。`POST /api/node-route-groups` に既存の名前を渡した場合の挙動は
+`id` の有無で分かれる。**`id` なし**は同名の既存エリアをそのまま返す（作成は冪等）。
+**`id` あり**で他のエリアが既にその名前を使っていれば `409 route_group_name_taken` を返す
+（SQLiteのUNIQUE違反を500として素通しにしない）。存在しない `id` は `404 not_found`。
+
+`POST /api/nodes` の `endpoints` は丸ごと置換で、**同一エンドポイントの重複は保存前に畳む**
+（`node_endpoints` の `UNIQUE(node_id, endpoint_json)` を踏ませない）。
 
 **クレデンシャルはレスポンスに出さない。** `GET /api/nodes` が返すのは `paired: true/false` だけ。
 `POST /api/nodes/pairing` が返す平文コードは**その1回だけ**で、サーバーにはSHA-256しか保存しない

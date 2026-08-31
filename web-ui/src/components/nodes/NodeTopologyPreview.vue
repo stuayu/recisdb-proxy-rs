@@ -28,7 +28,7 @@ function pathFor(nodeId: string) {
 }
 </script>
 <template>
-  <div class="topology-wrap">
+  <div class="topology-wrap panel">
     <svg
       class="topology-svg desktop-svg"
       viewBox="0 0 720 260"
@@ -124,11 +124,7 @@ function pathFor(nodeId: string) {
 <style scoped>
 .topology-wrap {
   display: grid;
-  gap: 0.7rem;
-  padding: 1rem;
-  border: 1px solid var(--border, #d9dee7);
-  border-radius: 10px;
-  background: var(--surface, #fff);
+  gap: 12px;
 }
 
 .topology-svg {
@@ -137,13 +133,13 @@ function pathFor(nodeId: string) {
 }
 
 .node-box {
-  fill: var(--surface, #fff);
-  stroke: var(--border, #9ca3af);
+  fill: var(--surface);
+  stroke: var(--border);
   stroke-width: 2;
 }
 
 .local-box {
-  stroke: #2563eb;
+  stroke: var(--accent);
 }
 
 .node-name {
@@ -154,38 +150,30 @@ function pathFor(nodeId: string) {
 
 .node-sub,
 .path-label {
-  fill: var(--text-muted, #6b7280);
+  fill: var(--muted);
   font-size: 11px;
 }
 
 .healthy {
-  stroke: #16a34a;
+  stroke: var(--success);
   stroke-width: 3;
 }
 
 .unavailable {
-  stroke: #dc2626;
+  stroke: var(--danger);
   stroke-width: 2;
   stroke-dasharray: 5 4;
 }
 
 .unmeasured {
-  stroke: #6b7280;
+  stroke: var(--muted);
   stroke-width: 2;
   stroke-dasharray: 3 4;
 }
 
-.link {
-  border: 0;
-  background: none;
-  color: inherit;
-  text-decoration: underline;
-  cursor: pointer;
-}
-
 .accessible-paths {
   display: grid;
-  gap: 0.3rem;
+  gap: 6px;
   font-size: 0.9rem;
 }
 

@@ -21,6 +21,7 @@
   --muted: #66758a;
   --danger: #b42318;
   --success: #19704a;
+  --warning: #8a5a00;
 }
 
 * {
@@ -59,6 +60,12 @@ textarea {
   --muted: #b6c0cd;
   --nav: #122a4a;
   --nav2: #0d2039;
+
+  /* Dark canvas needs lighter status hues: the light-theme values are chosen
+     for contrast against white and go unreadable on #191d24. */
+  --danger: #ff9b90;
+  --success: #6fd3a4;
+  --warning: #e8b25a;
 }
 
 .topbar {
@@ -286,6 +293,57 @@ h3 {
 .notice.success {
   color: var(--success);
   background: #e8f1ec;
+}
+
+.notice.warning {
+  color: var(--warning);
+  background: #fdf3e2;
+}
+
+.app.dark .notice.error {
+  background: #3a1d1a;
+}
+
+.app.dark .notice.success {
+  background: #16302a;
+}
+
+.app.dark .notice.warning {
+  background: #362b16;
+}
+
+/* Text-level status colors. Shared so "正常/注意/利用不可" reads the same
+   everywhere instead of each view hardcoding its own green/amber/red. */
+.good {
+  color: var(--success);
+}
+
+.warn {
+  color: var(--warning);
+}
+
+.bad {
+  color: var(--danger);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* Inline text button (looks like a link, behaves like a button). */
+.link {
+  min-height: auto;
+
+  /* Vertical padding (cancelled by the negative margin) makes the tap target
+     finger-sized on phones without changing the inline text flow. */
+  padding: 8px 4px;
+  margin: -8px 0;
+  background: none;
+  border: 0;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .field,
@@ -623,7 +681,11 @@ textarea:focus-visible,
     grid-template-columns: 1fr;
   }
 
-  .panel {
+  /* Only the side-by-side layout reorders: in `.split` the edit form is the
+     second column and should come first once it stacks. Unscoped, this pulled
+     every `.panel` on a page above its non-panel siblings (the Nodes view's
+     heading, the Settings category picker). */
+  .split > .panel {
     order: -1;
   }
 }

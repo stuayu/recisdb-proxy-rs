@@ -69,7 +69,7 @@ function reset() {
 }
 </script>
 <template>
-  <section class="area-editor card">
+  <section class="area-editor panel">
     <div class="area-heading">
       <div>
         <h3>受信エリア</h3>
@@ -88,21 +88,28 @@ function reset() {
         {{ group.name }}</button
       ><span v-if="!props.groups.length" class="muted">まだ設定されていません。</span>
     </div>
-    <label>エリア名<input v-model="name" placeholder="関東" /></label>
-    <label
-      >所属する拠点<select v-model="nodeId">
+    <label class="field"><span>エリア名</span><input v-model="name" placeholder="関東" /></label>
+    <label class="field"
+      ><span>所属する拠点</span
+      ><select v-model="nodeId">
         <option value="">選択しない</option>
         <option v-for="entry in props.nodes" :key="entry.node.node_id" :value="entry.node.node_id">
           {{ entry.node.display_name }}
         </option>
       </select></label
     >
-    <fieldset>
+    <fieldset class="route-preference">
       <legend>経路選択</legend>
-      <label><input v-model="preference" type="radio" value="auto" />● 自動（おすすめ）</label
-      ><label><input v-model="preference" type="radio" value="priority" />○ この拠点を優先</label
-      ><label
-        ><input v-model="preference" type="radio" value="backup" />○ この拠点を予備として使用</label
+      <label class="check"
+        ><input v-model="preference" type="radio" value="auto" /><span>自動（おすすめ）</span></label
+      ><label class="check"
+        ><input v-model="preference" type="radio" value="priority" /><span
+          >この拠点を優先</span
+        ></label
+      ><label class="check"
+        ><input v-model="preference" type="radio" value="backup" /><span
+          >この拠点を予備として使用</span
+        ></label
       >
     </fieldset>
     <ul v-if="selectedGroup()?.members?.length" class="members">
@@ -110,7 +117,7 @@ function reset() {
         {{
           props.nodes.find((entry) => entry.node.node_id === member.node_id)?.node.display_name ||
           member.node_id
-        }}<button class="link" @click="removeMember(member)">所属から外す</button>
+        }}<button class="link" type="button" @click="removeMember(member)">所属から外す</button>
       </li>
     </ul>
     <div class="actions">
@@ -124,14 +131,12 @@ function reset() {
 <style scoped>
 .area-editor {
   display: grid;
-  gap: 0.8rem;
+  gap: 12px;
 }
 
-.area-heading,
-.area-list,
-.actions {
+.area-heading {
   display: flex;
-  gap: 0.6rem;
+  gap: 12px;
   align-items: center;
   flex-wrap: wrap;
   justify-content: space-between;
@@ -142,43 +147,64 @@ function reset() {
 }
 
 .area-heading p {
-  margin: 0.3rem 0;
+  margin: 4px 0 0;
+}
+
+/* Chips are a horizontal list, not a spread-apart row: without an explicit
+   flex-start they inherit the heading's space-between and drift to the edges. */
+.area-list {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-start;
 }
 
 .area-chip {
-  padding: 0.45rem 0.7rem;
-  border: 1px solid var(--border, #d9dee7);
+  min-height: 36px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
   border-radius: 999px;
-  background: none;
-  color: inherit;
+  background: var(--surface);
+  color: var(--text);
   cursor: pointer;
 }
 
 .area-chip.selected {
-  background: rgb(59 130 246 / 14%);
+  background: var(--soft);
+  border-color: var(--accent);
+  font-weight: 700;
 }
 
-.area-editor > label {
+/* .field carries a vertical margin for stacked forms; this panel already
+   spaces its children with grid gap. */
+.area-editor .field {
+  margin: 0;
+}
+
+.route-preference {
+  margin: 0;
+  padding: 8px 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.route-preference legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+
+.members {
+  margin: 0;
+  padding-left: 20px;
   display: grid;
-  gap: 0.3rem;
-  font-weight: 600;
+  gap: 6px;
 }
 
-.area-editor input:not([type='radio']),
-.area-editor select {
-  box-sizing: border-box;
-  width: 100%;
-  padding: 0.6rem;
-}
-
-.area-editor fieldset {
-  display: grid;
-  gap: 0.4rem;
-  border: 1px solid var(--border, #d9dee7);
-}
-
-.area-editor fieldset label {
+.members li {
   display: flex;
-  gap: 0.4rem;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 </style>

@@ -45,24 +45,12 @@ function pathFor(probe: ProbeResponse | undefined, kind: string | null) {
 .health-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-  gap: 0.5rem;
+  gap: 8px;
 }
 
 .health-summary span {
-  padding: 0.6rem;
-  background: rgb(127 127 127 / 8%);
+  padding: 10px;
+  background: var(--soft);
   border-radius: 8px;
-}
-
-.good {
-  color: #15803d;
-}
-
-.warn {
-  color: #a16207;
-}
-
-.bad {
-  color: #b91c1c;
 }
 </style>
