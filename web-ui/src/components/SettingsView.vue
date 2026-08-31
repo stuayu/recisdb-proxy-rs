@@ -20,6 +20,35 @@ const epgPresets = ref<JsonRecord[]>([])
 const selectedEpgPreset = ref<number | null>(null)
 const featuredEpgPresets = computed(() => epgPresets.value.filter((preset) => preset.is_system).slice(0, 3))
 const epgStatus = ref<JsonRecord | null>(null)
+const editingPreset = ref<JsonRecord | null>(null)
+const presetGroups = [
+  { label: '基本', keys: ['enabled', 'target_refresh_secs', 'max_stale_secs', 'min_future_coverage_hours', 'target_future_coverage_hours'] },
+  { label: 'チューナー', keys: ['reserve_tuners', 'prefer_local', 'preemptible'] },
+  { label: '負荷', keys: ['cpu_soft_limit_percent', 'cpu_hard_limit_percent'] },
+  { label: 'リモート', keys: ['allow_remote', 'remote_prefer_metadata_execution', 'remote_allow_ts_transport'] },
+  { label: '詳細', keys: ['min_dwell_secs', 'normal_dwell_secs', 'max_dwell_secs', 'idle_section_timeout_secs'] },
+] as const
+const presetLabels: Record<string, string> = {
+  enabled: '有効', target_refresh_secs: '更新間隔(秒)', max_stale_secs: '最大古さ(秒)',
+  min_future_coverage_hours: '最低coverage(時間)', target_future_coverage_hours: '目標coverage(時間)',
+  reserve_tuners: 'チューナー確保', prefer_local: 'ローカル優先', preemptible: '録画・視聴で中断',
+  cpu_soft_limit_percent: 'CPU延期上限(%)', cpu_hard_limit_percent: 'CPU中断上限(%)', allow_remote: 'リモート許可',
+  remote_prefer_metadata_execution: 'リモート解析優先', remote_allow_ts_transport: 'TS転送許可',
+  min_dwell_secs: '最小滞在(秒)', normal_dwell_secs: '通常滞在(秒)', max_dwell_secs: '最大滞在(秒)', idle_section_timeout_secs: '無受信タイムアウト(秒)',
+}
+const epgReasonLabels: Record<string, string> = {
+  scheduled: '取得を開始しました', scan_failed: 'EPG取得に失敗しました',
+  no_tuner_available: '利用可能なチューナーがありません', cpu_soft_limit: 'CPU負荷が設定値を超過しました',
+  cpu_hard_limit: 'CPU負荷が高いため取得を中断しました', backoff: '前回の失敗後の待機中です',
+  preempted_by_record: '録画を優先して取得を延期しました', preempted_by_view: '視聴を優先して取得を延期しました',
+}
+function epgReasonText(value: unknown): string {
+  if (value && typeof value === 'object') {
+    const code = String((value as JsonRecord).code ?? '')
+    return epgReasonLabels[code] ?? code
+  }
+  return typeof value === 'string' ? value : 'なし'
+}
 function formatEpoch(value: unknown): string {
   return typeof value === 'number'
     ? new Date(value * 1000).toLocaleString('ja-JP', { dateStyle: 'short', timeStyle: 'short' })
@@ -113,6 +142,25 @@ async function duplicateEpgPreset(preset: JsonRecord) {
     await api('/epg-presets', { method: 'POST', body: JSON.stringify({ name: `${String(preset.name)}（コピー）`, description: preset.description ?? '' }) })
     await load()
     message.value = 'プリセットを複製しました。'
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+function editEpgPreset(preset: JsonRecord) {
+  if (preset.is_system) return
+  editingPreset.value = { ...preset }
+}
+function clearPresetValue(key: string) {
+  if (editingPreset.value) editingPreset.value[key] = null
+}
+function updatePresetText(key: string, event: Event) {
+  if (editingPreset.value) editingPreset.value[key] = (event.target as HTMLTextAreaElement).value
+}
+async function saveEpgPreset() {
+  if (!editingPreset.value) return
+  try {
+    await api(`/epg-presets/${String(editingPreset.value.id)}`, { method: 'PUT', body: JSON.stringify(editingPreset.value) })
+    editingPreset.value = null
+    await load()
+    message.value = 'プリセットを保存しました。'
   } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
 }
 async function deleteEpgPreset(preset: JsonRecord) {
@@ -657,8 +705,8 @@ onMounted(() => {
       <template v-if="isEpg">
         <section class="panel epg-status" aria-labelledby="epg-status-title">
           <h4 id="epg-status-title">EPG状態 <span>{{ epgStatus?.active ? '取得中' : '待機中' }}</span></h4>
-          <p v-if="epgStatus?.reason" class="muted" v-text="String(epgStatus.reason)" />
-          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd><dt>延期理由</dt><dd>{{ epgStateValue('lastFailureReason') ?? 'なし' }}</dd></dl>
+          <p v-if="epgStatus?.reason" class="muted" v-text="epgReasonText(epgStatus.reason)" />
+          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd><dt>延期理由</dt><dd>{{ epgReasonText(epgStateValue('lastFailureReason')) }}</dd></dl>
         </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
         <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
@@ -677,8 +725,15 @@ onMounted(() => {
             <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card">
               <h5>{{ String(preset.name) }} <span v-if="preset.is_system" class="badge">おすすめ</span></h5>
               <p>{{ String(preset.description ?? '') }}</p>
-              <div class="actions"><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></div>
+              <div class="actions"><button v-if="!preset.is_system" class="button secondary" type="button" @click="editEpgPreset(preset)">編集</button><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></div>
             </article>
+          </div>
+          <div v-if="editingPreset" class="panel preset-editor">
+            <h5>プリセット編集: {{ String(editingPreset.name) }}</h5>
+            <label class="field"><span>名前</span><input v-model="editingPreset.name" type="text" /></label>
+            <label class="field"><span>説明</span><textarea :value="String(editingPreset.description ?? '')" rows="2" @input="updatePresetText('description', $event)" /></label>
+            <fieldset v-for="group in presetGroups" :key="group.label"><legend>{{ group.label }}</legend><div class="epg-friendly-grid"><label v-for="key in group.keys" :key="key" class="field"><span>{{ presetLabels[key] }} <small v-if="editingPreset[key] === null">（全体設定を使用）</small></span><input v-if="typeof editingPreset[key] === 'boolean'" v-model="editingPreset[key]" type="checkbox" /><input v-else v-model.number="editingPreset[key]" type="number" min="0" /><button v-if="editingPreset[key] !== null && key !== 'enabled'" class="button secondary" type="button" @click="clearPresetValue(key)">全体設定に戻す</button></label></div></fieldset>
+            <div class="actions"><button class="button" type="button" @click="saveEpgPreset">保存</button><button class="button secondary" type="button" @click="editingPreset = null">キャンセル</button></div>
           </div>
         </section>
         <div class="epg-friendly-grid">

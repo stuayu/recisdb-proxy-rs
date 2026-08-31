@@ -12,6 +12,7 @@ use crate::{
         ChannelKey, TunerPool,
     },
 };
+use recisdb_protocol::{broadcast_region::classify_nid, BroadcastType};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -156,7 +157,12 @@ impl EpgScanScheduler {
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
         let history = {
             let db = self.database.lock().await;
-            db.epg_scan_started(driver.id, channel.nid, channel.tsid, "scheduled")?
+            db.epg_scan_started(
+                driver.id,
+                channel.nid,
+                channel.tsid,
+                r#"{"code":"scheduled","details":{}}"#,
+            )?
         };
         self.active.fetch_add(1, Ordering::SeqCst);
         let result = self.scan_one(&config, key, channel.id).await;
@@ -167,12 +173,17 @@ impl EpgScanScheduler {
                 let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
             }
             Err(e) => {
+                let reason = serde_json::json!({
+                    "code": "scan_failed",
+                    "details": {"message": e.to_string()}
+                })
+                .to_string();
                 let _ = db.epg_scan_finished(
                     history,
                     "failed",
                     channel.nid,
                     channel.tsid,
-                    Some(&e.to_string()),
+                    Some(&reason),
                 );
             }
         }
@@ -240,6 +251,7 @@ impl EpgScanScheduler {
 struct EpgTarget {
     network_id: u16,
     tsid: u16,
+    broadcast_type: BroadcastType,
     coverage_until: Option<i64>,
     last_eit_received_at: Option<i64>,
     next_eligible_at: Option<i64>,
@@ -251,6 +263,7 @@ impl EpgTarget {
         Self {
             network_id,
             tsid,
+            broadcast_type: classify_nid(network_id).0,
             coverage_until: state.and_then(|s| s.coverage_until),
             last_eit_received_at: state.and_then(|s| s.last_eit_received_at),
             next_eligible_at: state.and_then(|s| s.next_eligible_at),
@@ -267,7 +280,10 @@ fn select_next_target(
     targets
         .iter()
         .copied()
-        .filter(|target| target.next_eligible_at.is_none_or(|at| at <= now))
+        .filter(|target| {
+            target.next_eligible_at.is_none_or(|at| at <= now)
+                && target_needs_scan(target, now, config)
+        })
         .min_by_key(|target| {
             let coverage_missing = !target
                 .coverage_until
@@ -282,6 +298,26 @@ fn select_next_target(
                 target.coverage_until.unwrap_or(i64::MIN),
             )
         })
+}
+
+/// Satellite EIT may populate another multiplex's `(NID, TSID)` directly.
+/// Therefore a satellite target with sufficient retained coverage is skipped;
+/// terrestrial targets remain independently eligible per physical TS.
+fn target_needs_scan(target: &EpgTarget, now: i64, config: &EpgGlobalSettings) -> bool {
+    let covered = target
+        .coverage_until
+        .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
+    match target.broadcast_type {
+        BroadcastType::Terrestrial => {
+            let fresh = target
+                .last_eit_received_at
+                .is_some_and(|at| at + config.max_stale_secs > now);
+            !(covered && fresh)
+        }
+        // For satellite multiplexes, Other-TS EIT may have supplied this
+        // target without a direct tune. Retained coverage is sufficient.
+        BroadcastType::BS | BroadcastType::CS | BroadcastType::FourK => !covered,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -379,6 +415,7 @@ mod tests {
             EpgTarget {
                 network_id: 1,
                 tsid: 1,
+                broadcast_type: BroadcastType::Terrestrial,
                 coverage_until: Some(10 + 168 * 3600),
                 last_eit_received_at: Some(10),
                 next_eligible_at: None,
@@ -387,6 +424,7 @@ mod tests {
             EpgTarget {
                 network_id: 2,
                 tsid: 2,
+                broadcast_type: BroadcastType::Terrestrial,
                 coverage_until: None,
                 last_eit_received_at: None,
                 next_eligible_at: None,
@@ -395,6 +433,7 @@ mod tests {
             EpgTarget {
                 network_id: 3,
                 tsid: 3,
+                broadcast_type: BroadcastType::Terrestrial,
                 coverage_until: None,
                 last_eit_received_at: None,
                 next_eligible_at: Some(100),
@@ -403,5 +442,59 @@ mod tests {
         ];
         let selected = select_next_target(&targets, 10, &config()).unwrap();
         assert_eq!((selected.network_id, selected.tsid), (2, 2));
+    }
+
+    #[test]
+    fn target_selection_keeps_terrestrial_transport_streams_independent() {
+        let targets = [
+            EpgTarget {
+                network_id: 0x7fe8,
+                tsid: 1,
+                broadcast_type: BroadcastType::Terrestrial,
+                coverage_until: Some(10 + 168 * 3600),
+                last_eit_received_at: Some(10),
+                next_eligible_at: None,
+                failure_count: 0,
+            },
+            EpgTarget {
+                network_id: 0x7fe8,
+                tsid: 2,
+                broadcast_type: BroadcastType::Terrestrial,
+                coverage_until: None,
+                last_eit_received_at: None,
+                next_eligible_at: None,
+                failure_count: 0,
+            },
+        ];
+        assert_eq!(select_next_target(&targets, 10, &config()).unwrap().tsid, 2);
+    }
+
+    #[test]
+    fn target_selection_skips_covered_bs_other_ts() {
+        let target = EpgTarget {
+            network_id: 4,
+            tsid: 1,
+            broadcast_type: BroadcastType::BS,
+            coverage_until: Some(10 + 168 * 3600),
+            last_eit_received_at: Some(10),
+            next_eligible_at: None,
+            failure_count: 0,
+        };
+        assert!(!target_needs_scan(&target, 10, &config()));
+        assert!(select_next_target(&[target], 10, &config()).is_none());
+    }
+
+    #[test]
+    fn target_selection_keeps_uncovered_bs_other_ts_eligible() {
+        let target = EpgTarget {
+            network_id: 4,
+            tsid: 2,
+            broadcast_type: BroadcastType::BS,
+            coverage_until: None,
+            last_eit_received_at: None,
+            next_eligible_at: None,
+            failure_count: 0,
+        };
+        assert!(select_next_target(&[target], 10, &config()).is_some());
     }
 }

@@ -34,6 +34,10 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 Active scan状態は「取得中」「延期理由」「最終更新」「次回判定」をstatus APIから表示する。
 延期理由はbackendの構造化statusをUIで日本語化し、CPU負荷・録画/視聴による占有を区別する。
 
+プリセット編集は基本・チューナー・負荷・リモート・詳細へ分割し、個別値を「全体設定に戻す」
+操作で継承へ戻せる。system presetは複製のみ可能。EPG status/historyの理由は`code`と
+`details`を持つJSONで返し、画面側はコード対応表だけを管理する。
+
 ### 1. リアルタイム監視
 
 **チューナー状況**

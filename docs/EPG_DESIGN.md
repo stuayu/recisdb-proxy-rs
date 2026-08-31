@@ -166,6 +166,12 @@ subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、id
 coverage不足・stale・failure/backoffを使って次のTSを選ぶ。対象選択は純粋関数で、固定の
 先頭チャンネルには依存しない。
 
+BS/CSではEIT parserが返す `original_network_id` と `transport_stream_id` をcollectorが
+そのまま `ProgramUpsert.nid/tsid` に設定する。Other-TS EITで供給された系統も同じcoverage
+集計へ入るため、目標coverageを満たす系統は直接選局しない。4KはNID分類を維持するが、
+MMT/TLVからdantto4kが変換したTSだけを既存collectorへ渡すため、EPG scheduler側で独自に
+B25やMMT処理は行わない。
+
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。
 - **schedule EIT の送出周期は遠い日付ほど長い**(地上波で数分オーダー)。選局直後は
