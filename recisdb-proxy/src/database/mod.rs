@@ -191,6 +191,8 @@ impl Database {
             "024_driver_runtime_health",
             Database::migration_024_driver_runtime_health,
         ),
+        ("025_programs_tsid_unique_key", Database::migration_025_programs_tsid_unique_key),
+        ("026_programs_free_ca_mode", Database::migration_026_programs_free_ca_mode),
     ];
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,
@@ -215,6 +217,58 @@ impl Database {
                 last_updated INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 FOREIGN KEY(bon_driver_id) REFERENCES bon_drivers(id) ON DELETE CASCADE
             );",
+        )?;
+        Ok(())
+    }
+
+    /// Migration 025: service_id/event_id are only unique within a TS. Keep
+    /// transport_stream_id in the EIT event identity as required by B10
+    /// §5.2.7. Rebuilding is harmless if an old pre-ledger database replays
+    /// this migration, and the temporary table is explicitly removed first.
+    fn migration_025_programs_tsid_unique_key(&self) -> Result<()> {
+        self.add_column_if_not_exists(
+            "programs",
+            "free_ca_mode",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS programs_new;
+             CREATE TABLE programs_new (
+                 id INTEGER PRIMARY KEY,
+                 nid INTEGER NOT NULL,
+                 sid INTEGER NOT NULL,
+                 tsid INTEGER NOT NULL,
+                 event_id INTEGER NOT NULL,
+                 start_at INTEGER NOT NULL,
+                 duration_secs INTEGER NOT NULL,
+                 name TEXT,
+                 description TEXT,
+                 extended TEXT,
+                 genre INTEGER,
+                 free_ca_mode INTEGER NOT NULL DEFAULT 0,
+                 updated_at INTEGER NOT NULL,
+                 UNIQUE(nid, sid, tsid, event_id)
+             );
+             INSERT OR REPLACE INTO programs_new
+                 (id, nid, sid, tsid, event_id, start_at, duration_secs,
+                  name, description, extended, genre, free_ca_mode, updated_at)
+                 SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
+                        name, description, extended, genre, free_ca_mode, updated_at
+                   FROM programs;
+             DROP TABLE programs;
+             ALTER TABLE programs_new RENAME TO programs;
+             CREATE INDEX IF NOT EXISTS idx_programs_sid_start_at ON programs(sid, start_at);
+             CREATE INDEX IF NOT EXISTS idx_programs_start_at ON programs(start_at);",
+        )?;
+        Ok(())
+    }
+
+    /// Migration 026: retain EIT free_CA_mode through storage and delivery.
+    fn migration_026_programs_free_ca_mode(&self) -> Result<()> {
+        self.add_column_if_not_exists(
+            "programs",
+            "free_ca_mode",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -559,6 +613,7 @@ impl Database {
                 description TEXT,
                 extended TEXT,
                 genre INTEGER,
+                free_ca_mode INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(nid, sid, event_id)
             );

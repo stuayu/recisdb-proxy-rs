@@ -183,11 +183,13 @@ impl SectionCollector {
         let mut sections = Vec::new();
 
         // Check continuity
+        let mut continuity_broken = false;
         if let Some(last) = self.last_cc {
             let expected_cc = (last + 1) & 0x0F;
-            if cc != expected_cc && !payload_unit_start {
+            if cc != expected_cc {
                 // Discontinuity - clear and start over
                 self.clear();
+                continuity_broken = true;
             }
         }
         self.last_cc = Some(cc);
@@ -215,7 +217,7 @@ impl SectionCollector {
             let (before, after) = rest.split_at(pointer);
 
             // Finish the section that was in progress before this packet.
-            if !before.is_empty() {
+            if !continuity_broken && !before.is_empty() {
                 self.buffer.extend_from_slice(before);
             }
             self.drain_sections(&mut sections);
@@ -449,6 +451,20 @@ mod tests {
 
         let sections = collector.add_data(&payload, 0, true);
         assert_eq!(sections, vec![section1, section2]);
+    }
+
+    #[test]
+    fn test_accepts_maximum_4096_byte_section() {
+        // section_length=4093 means 3-byte header + 4093 bytes = 4096,
+        // the EIT/private-section maximum from B10 §5.2.7.
+        let section = make_section(0x50, true, &vec![0x00; 4089]);
+        assert_eq!(section.len(), 4096);
+        let mut collector = SectionCollector::new();
+        let first = pusi_payload(0, &section[..100]);
+        let mut sections = collector.add_data(&first, 0, true);
+        sections.extend(collector.add_data(&section[100..], 1, false));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].len(), 4096);
     }
 
     /// Defect 3: the 3-byte section header itself straddles a packet

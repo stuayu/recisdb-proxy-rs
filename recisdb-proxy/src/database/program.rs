@@ -11,8 +11,8 @@ use rusqlite::params;
 impl Database {
     /// Batch UPSERT program rows in a single transaction.
     ///
-    /// Dedupe key is `(nid, sid, event_id)` (the table's UNIQUE constraint,
-    /// matching Migration 015's schema). On conflict, the existing row is
+    /// Dedupe key is `(nid, sid, tsid, event_id)` (the table's UNIQUE
+    /// constraint, matching Migration 025's schema). On conflict, the existing row is
     /// only overwritten when the incoming `updated_at` is not older than
     /// what's already stored — the "keep the newest" rule from the design:
     /// a batch is flushed periodically, and a slightly stale duplicate must
@@ -27,9 +27,9 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO programs (
                     nid, sid, tsid, event_id, start_at, duration_secs,
-                    name, description, extended, genre, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(nid, sid, event_id) DO UPDATE SET
+                    name, description, extended, genre, free_ca_mode, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(nid, sid, tsid, event_id) DO UPDATE SET
                     tsid = excluded.tsid,
                     start_at = excluded.start_at,
                     duration_secs = excluded.duration_secs,
@@ -37,6 +37,7 @@ impl Database {
                     description = excluded.description,
                     extended = excluded.extended,
                     genre = excluded.genre,
+                    free_ca_mode = excluded.free_ca_mode,
                     updated_at = excluded.updated_at
                  WHERE excluded.updated_at >= programs.updated_at",
             )?;
@@ -53,6 +54,7 @@ impl Database {
                     p.description,
                     p.extended,
                     p.genre,
+                    p.free_ca_mode,
                     p.updated_at,
                 ])?;
             }
@@ -74,7 +76,7 @@ impl Database {
     ) -> Result<Vec<ProgramRecord>> {
         let mut sql = String::from(
             "SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
-                    name, description, extended, genre, updated_at
+                    name, description, extended, genre, free_ca_mode, updated_at
              FROM programs
              WHERE start_at < ? AND (start_at + duration_secs) > ?",
         );
@@ -121,6 +123,7 @@ impl Database {
             description: row.get("description")?,
             extended: row.get("extended")?,
             genre: row.get("genre")?,
+            free_ca_mode: row.get::<_, i32>("free_ca_mode")? != 0,
             updated_at: row.get("updated_at")?,
         })
     }
@@ -142,6 +145,7 @@ mod tests {
             description: Some("desc".to_string()),
             extended: None,
             genre: Some(0x21),
+            free_ca_mode: false,
             updated_at,
         }
     }
@@ -201,6 +205,19 @@ mod tests {
         assert_eq!(rows[0].updated_at, 10);
         assert_eq!(rows[0].start_at, 2_000);
         assert_eq!(rows[0].name, Some("Fresh".to_string()));
+    }
+
+    #[test]
+    fn test_same_service_event_on_distinct_transport_streams_is_distinct() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut a = sample(1, 100, 1, 1_000, 1);
+        let mut b = sample(1, 100, 1, 1_000, 1);
+        a.tsid = 10;
+        b.tsid = 20;
+        db.upsert_programs(&[a, b]).unwrap();
+        let rows = db.get_programs(0, 10_000, Some(1), Some(100)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().map(|r| r.tsid).collect::<Vec<_>>(), vec![10, 20]);
     }
 
     #[test]

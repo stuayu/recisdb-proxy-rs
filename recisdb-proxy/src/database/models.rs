@@ -253,6 +253,7 @@ pub struct ProgramUpsert {
     /// Event start time, epoch seconds (UTC).
     pub start_at: i64,
     pub duration_secs: i64,
+    pub free_ca_mode: bool,
     pub name: Option<String>,
     pub description: Option<String>,
     pub extended: Option<String>,
@@ -273,6 +274,7 @@ pub struct ProgramRecord {
     pub event_id: u16,
     pub start_at: i64,
     pub duration_secs: i64,
+    pub free_ca_mode: bool,
     pub name: Option<String>,
     pub description: Option<String>,
     pub extended: Option<String>,

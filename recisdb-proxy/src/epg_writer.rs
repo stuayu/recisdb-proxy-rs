@@ -10,7 +10,7 @@
 //! Shaped like `alert::AlertManager` (owns the shared `DatabaseHandle`,
 //! `run(self)` loop spawned once from `main.rs`), but driven by the mpsc
 //! channel instead of a fixed timer alone: events are buffered in memory
-//! (deduped by `(nid, sid, event_id)`, keeping the newest `updated_at`) and
+//! (deduped by `(nid, sid, tsid, event_id)`, keeping the newest `updated_at`) and
 //! flushed either when [`FLUSH_INTERVAL`] elapses or [`FLUSH_BATCH_SIZE`]
 //! records have queued up, whichever comes first — "毎チャンク書くのでは
 //! なく、一定間隔(例: 10秒)か一定件数でフラッシュ" from the design.
@@ -81,11 +81,11 @@ impl EpgWriter {
     /// (same convention as `alert::AlertManager::run`); intended to be
     /// `tokio::spawn`ed once from `main.rs`.
     pub async fn run(mut self) {
-        // Keyed by (nid, sid, event_id) — the table's UNIQUE constraint —
+        // Keyed by (nid, sid, tsid, event_id) — the table's UNIQUE constraint —
         // so a burst of duplicate present/following + schedule sections for
         // the same event within one flush window collapses into a single
         // UPSERT, keeping only the newest `updated_at`.
-        let mut batch: HashMap<(u16, u16, u16), ProgramUpsert> = HashMap::new();
+        let mut batch: HashMap<(u16, u16, u16, u16), ProgramUpsert> = HashMap::new();
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut flush_count: u32 = 0;
@@ -95,7 +95,7 @@ impl EpgWriter {
                 maybe_event = self.rx.recv() => {
                     match maybe_event {
                         Some(record) => {
-                            let key = (record.nid, record.sid, record.event_id);
+                            let key = (record.nid, record.sid, record.tsid, record.event_id);
                             match batch.entry(key) {
                                 Entry::Occupied(mut e) => {
                                     if record.updated_at >= e.get().updated_at {
@@ -127,7 +127,7 @@ impl EpgWriter {
         }
     }
 
-    async fn flush(&self, batch: &mut HashMap<(u16, u16, u16), ProgramUpsert>, flush_count: &mut u32) {
+    async fn flush(&self, batch: &mut HashMap<(u16, u16, u16, u16), ProgramUpsert>, flush_count: &mut u32) {
         if batch.is_empty() {
             return;
         }

@@ -1,11 +1,10 @@
 //! EIT (Event Information Table) parsing (ARIB STD-B10 §5.2.4 / ETSI EN 300 468).
 //!
-//! Covers every EIT table_id: present/following (0x4E/0x4F, actual/other TS)
-//! and schedule (0x50-0x5F actual TS, 0x60-0x6F other TS) — see
-//! `super::table_id::is_eit_table_id`. BS multiplexes commonly carry
-//! schedule-other sections for services on *other* transport streams, so
-//! tuning to a single BS channel can populate the EPG for the whole BS
-//! multiplex group without visiting every channel individually.
+//! Covers the common MPEG-TS EIT table IDs. Terrestrial reception must use
+//! `super::table_id::is_terrestrial_eit_table_id`: TR-B14 Vol. 4 §13.1
+//! (printed p. 64) says other-TS EIT is not transmitted. The generic parser
+//! still accepts other-TS IDs because the same crate also handles satellite
+//! multiplexes, where they are valid.
 
 use super::descriptor_tag;
 use super::descriptors::{find_descriptor, parse_descriptor_loop};
@@ -70,6 +69,9 @@ impl EitTable {
     pub fn parse(section: &PsiSection) -> Result<Self, &'static str> {
         if !super::table_id::is_eit_table_id(section.header.table_id) {
             return Err("Not an EIT section");
+        }
+        if !section.header.section_syntax_indicator {
+            return Err("EIT section_syntax_indicator must be 1");
         }
 
         let data = section.data;
@@ -159,8 +161,13 @@ fn mjd_to_ymd(mjd: u32) -> (i32, u32, u32) {
 }
 
 /// Decode a 2-digit BCD byte (e.g. hour/minute/second) to its integer value.
-fn bcd_byte_to_u32(b: u8) -> u32 {
-    (((b >> 4) & 0x0F) as u32) * 10 + (b & 0x0F) as u32
+fn bcd_byte_to_u32(b: u8) -> Option<u32> {
+    let high = b >> 4;
+    let low = b & 0x0F;
+    if high > 9 || low > 9 {
+        return None;
+    }
+    Some((high as u32) * 10 + low as u32)
 }
 
 /// Parse the 5-byte MJD+BCD `start_time` field. Returns `None` when the
@@ -172,9 +179,9 @@ fn parse_start_time(b: &[u8]) -> Option<i64> {
     }
     let mjd = ((b[0] as u32) << 8) | b[1] as u32;
     let (year, month, day) = mjd_to_ymd(mjd);
-    let hour = bcd_byte_to_u32(b[2]);
-    let minute = bcd_byte_to_u32(b[3]);
-    let second = bcd_byte_to_u32(b[4]);
+    let hour = bcd_byte_to_u32(b[2])?;
+    let minute = bcd_byte_to_u32(b[3])?;
+    let second = bcd_byte_to_u32(b[4])?;
 
     let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
     let time = chrono::NaiveTime::from_hms_opt(hour, minute, second)?;
@@ -187,9 +194,15 @@ fn parse_start_time(b: &[u8]) -> Option<i64> {
 
 /// Parse the 3-byte BCD `duration` field into total seconds.
 fn parse_duration(b: &[u8]) -> u32 {
-    let h = bcd_byte_to_u32(b[0]);
-    let m = bcd_byte_to_u32(b[1]);
-    let s = bcd_byte_to_u32(b[2]);
+    if b == [0xFF, 0xFF, 0xFF] {
+        return 0;
+    }
+    let Some(h) = bcd_byte_to_u32(b[0]) else { return 0 };
+    let Some(m) = bcd_byte_to_u32(b[1]) else { return 0 };
+    let Some(s) = bcd_byte_to_u32(b[2]) else { return 0 };
+    if m >= 60 || s >= 60 {
+        return 0;
+    }
     h * 3600 + m * 60 + s
 }
 
@@ -242,7 +255,11 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
         }
         let items = &data[5..5 + items_length];
 
-        let mut buf = String::new();
+        // Decode all item descriptions/values and trailing text as one
+        // 8-bit-code stream. An ESC designation may legally occur only in
+        // the first item; decoding each field independently would reset
+        // GL/GR and corrupt the following fields.
+        let mut fields: Vec<(bool, Vec<u8>)> = Vec::new();
         let mut off = 0usize;
         while off < items.len() {
             let item_desc_len = items[off] as usize;
@@ -250,7 +267,9 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
             if off + item_desc_len > items.len() {
                 break;
             }
-            let item_desc = decode_arib_string(&items[off..off + item_desc_len]);
+            if item_desc_len != 0 {
+                fields.push((true, items[off..off + item_desc_len].to_vec()));
+            }
             off += item_desc_len;
 
             if off >= items.len() {
@@ -261,27 +280,48 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
             if off + item_len > items.len() {
                 break;
             }
-            let item = decode_arib_string(&items[off..off + item_len]);
-            off += item_len;
-
-            if !item_desc.is_empty() {
-                buf.push_str(&item_desc);
-                buf.push_str(": ");
+            if item_len != 0 {
+                fields.push((false, items[off..off + item_len].to_vec()));
             }
-            buf.push_str(&item);
-            buf.push('\n');
+            off += item_len;
         }
 
         let text_offset = 5 + items_length;
         if text_offset < data.len() {
             let text_len = data[text_offset] as usize;
             if data.len() >= text_offset + 1 + text_len {
-                let text =
-                    decode_arib_string(&data[text_offset + 1..text_offset + 1 + text_len]);
-                buf.push_str(&text);
+                if text_len != 0 {
+                    fields.push((false, data[text_offset + 1..text_offset + 1 + text_len].to_vec()));
+                }
             }
         }
 
+        let mut encoded = Vec::new();
+        for (index, (_, field)) in fields.iter().enumerate() {
+            if index != 0 {
+                encoded.push(0x0D);
+            }
+            encoded.extend_from_slice(field);
+        }
+        let decoded = decode_arib_string(&encoded);
+        let mut buf = String::new();
+        let mut rendered = decoded.split('\n');
+        let mut pending_description: Option<&str> = None;
+        for (is_description, _) in &fields {
+            let value = rendered.next().unwrap_or("");
+            if *is_description {
+                pending_description = Some(value);
+            } else {
+                if let Some(description) = pending_description.take() {
+                    if !description.is_empty() {
+                        buf.push_str(description);
+                        buf.push_str(": ");
+                    }
+                }
+                buf.push_str(value);
+                buf.push('\n');
+            }
+        }
         parts.push((descriptor_number, buf));
     }
 
@@ -318,10 +358,10 @@ mod tests {
 
     #[test]
     fn test_bcd_byte_to_u32() {
-        assert_eq!(bcd_byte_to_u32(0x00), 0);
-        assert_eq!(bcd_byte_to_u32(0x09), 9);
-        assert_eq!(bcd_byte_to_u32(0x23), 23);
-        assert_eq!(bcd_byte_to_u32(0x59), 59);
+        assert_eq!(bcd_byte_to_u32(0x00), Some(0));
+        assert_eq!(bcd_byte_to_u32(0x09), Some(9));
+        assert_eq!(bcd_byte_to_u32(0x23), Some(23));
+        assert_eq!(bcd_byte_to_u32(0x59), Some(59));
     }
 
     #[test]
@@ -350,6 +390,8 @@ mod tests {
         // 1h23m45s
         assert_eq!(parse_duration(&[0x01, 0x23, 0x45]), 3600 + 23 * 60 + 45);
         assert_eq!(parse_duration(&[0x00, 0x00, 0x00]), 0);
+        assert_eq!(parse_duration(&[0xFF, 0xFF, 0xFF]), 0);
+        assert_eq!(parse_duration(&[0x00, 0x60, 0x00]), 0);
     }
 
     fn arib(s: &[u8]) -> Vec<u8> {
@@ -384,6 +426,26 @@ mod tests {
 
         assert_eq!(parse_genre(&descriptors), Some(0x21));
         assert_eq!(parse_genre(&[]), None);
+    }
+
+    #[test]
+    fn extended_event_keeps_code_set_across_item_fields() {
+        // The second item has no repeated ESC designation. It must still be
+        // decoded as alphanumeric because the 8-bit-code state is continuous
+        // across the descriptor's item loop (STD-B24 Vol. 1 Part 3 §7.1.1).
+        let first = arib(b"A");
+        let second = b"B";
+        let mut data = vec![0x00, 0x00, 0x00, 0x00, 0x07]; // number + "jpn" + items length
+        data.extend_from_slice(&[0x00, first.len() as u8]);
+        data.extend_from_slice(&first);
+        data.push(0x00);
+        data.push(second.len() as u8);
+        data.extend_from_slice(second);
+        data.push(0x00); // empty trailing text
+
+        let mut descriptors = vec![descriptor_tag::EXTENDED_EVENT, data.len() as u8];
+        descriptors.extend_from_slice(&data);
+        assert_eq!(parse_extended_event(&descriptors), "Ａ\nＢ\n");
     }
 
     #[test]

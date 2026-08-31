@@ -56,6 +56,12 @@ pub mod pid {
     pub const SDT: u16 = 0x0011;
     /// Event Information Table PID.
     pub const EIT: u16 = 0x0012;
+    /// M-EIT PID (mobile-receiver EPG, ARIB TR-B14 Vol. 4 Table 13-7,
+    /// printed p. 83). This is not a terrestrial/satellite distinction.
+    pub const EIT_MOBILE: u16 = 0x0026;
+    /// L-EIT PID (partial-reception/portable-receiver EPG, ARIB TR-B14
+    /// Vol. 4 Table 13-7, printed p. 83).
+    pub const EIT_PARTIAL_RECEPTION: u16 = 0x0027;
     /// Time and Date Table PID.
     pub const TDT: u16 = 0x0014;
     /// Null packet PID (stuffing).
@@ -95,6 +101,16 @@ pub mod table_id {
     pub fn is_eit_table_id(id: u8) -> bool {
         (EIT_PF_ACTUAL..=EIT_SCHEDULE_OTHER_END).contains(&id)
     }
+
+    /// EIT table IDs used by TR-B14's terrestrial transmission.
+    ///
+    /// Terrestrial broadcasting carries actual-TS EIT only (Vol. 4 §13.1,
+    /// printed p. 64): H-EIT[p/f] is 0x4E, H-EIT[schedule basic] is
+    /// 0x50..=0x57, and H-EIT[schedule extended] is 0x58..=0x5F. M-EIT and
+    /// L-EIT use 0x4E (Table 13-8, printed p. 83).
+    pub fn is_terrestrial_eit_table_id(id: u8) -> bool {
+        id == EIT_PF_ACTUAL || (EIT_SCHEDULE_ACTUAL_START..=0x5F).contains(&id)
+    }
 }
 
 /// Descriptor tags used in PSI/SI tables.
@@ -125,4 +141,19 @@ pub mod descriptor_tag {
     pub const EXTENDED_EVENT: u8 = 0x4E;
     /// Content descriptor (0x54).
     pub const CONTENT: u8 = 0x54;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table_id;
+
+    #[test]
+    fn terrestrial_eit_table_ids_exclude_other_ts() {
+        assert!(table_id::is_terrestrial_eit_table_id(0x4E));
+        assert!(table_id::is_terrestrial_eit_table_id(0x50));
+        assert!(table_id::is_terrestrial_eit_table_id(0x5F));
+        assert!(!table_id::is_terrestrial_eit_table_id(0x4F));
+        assert!(!table_id::is_terrestrial_eit_table_id(0x60));
+        assert!(!table_id::is_terrestrial_eit_table_id(0x6F));
+    }
 }

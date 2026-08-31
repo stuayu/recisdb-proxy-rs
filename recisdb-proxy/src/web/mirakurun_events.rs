@@ -262,6 +262,7 @@ mod tests {
             description: Some("desc".to_string()),
             extended: None,
             genre: Some(0x71),
+            free_ca_mode: false,
             updated_at: 1_700_000_000,
         }
     }
