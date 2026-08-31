@@ -45,9 +45,11 @@ export type Topology = {
     from: string
     to: string
     kind: EndpointKind
-    status: 'online' | 'unavailable'
+    status: 'online' | 'degraded' | 'unmeasured' | 'unavailable'
     role: string
     record_allowed: boolean
+    measured: boolean
+    health?: { state: string; rtt_p95_ms?: number; throughput_down_p10_bps?: number }
   }>
 }
 export type NodesResponse = {

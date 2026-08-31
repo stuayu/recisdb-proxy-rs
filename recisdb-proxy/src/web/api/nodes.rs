@@ -5,7 +5,9 @@
 //! separate HTTP/2 listener/namespace (`node::transport`) and never shares the
 //! dashboard bearer token.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -24,6 +26,11 @@ use crate::node::{
 use crate::web::state::WebState;
 
 use super::error::ApiError;
+
+fn probe_cache() -> &'static Mutex<HashMap<String, Vec<serde_json::Value>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertNodeRequest {
@@ -143,6 +150,7 @@ pub async fn get_nodes(
         .iter()
         .flat_map(|entry| {
             let node = entry["node"]["node_id"].clone();
+            let node_key = node.as_str().unwrap_or_default().to_owned();
             let paired = entry["paired"] == true;
             entry["endpoints"]
                 .as_array()
@@ -151,14 +159,31 @@ pub async fn get_nodes(
                 .enumerate()
                 .map({
                     let from = local_node_id.clone();
+                    let measured_paths = probe_cache()
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.get(&node_key).cloned())
+                        .unwrap_or_default();
                     move |(index, endpoint)| {
+                        let measured = measured_paths.get(index).cloned();
+                        let status = measured
+                            .as_ref()
+                            .and_then(|path| path["health"]["state"].as_str())
+                            .map(|state| match state {
+                                "healthy" => "online",
+                                "degraded" => "degraded",
+                                _ => "unavailable",
+                            })
+                            .unwrap_or(if paired { "unmeasured" } else { "unavailable" });
                         json!({
                             "from": from.clone(),
                             "to": node.clone(),
                             "kind": endpoint["kind"],
-                            "status": if paired { "online" } else { "unavailable" },
+                            "status": status,
                             "role": if index == 0 { "primary" } else { "fallback" },
                             "record_allowed": endpoint["record_allowed"],
+                            "measured": measured.is_some(),
+                            "health": measured.map(|path| path["health"].clone()),
                         })
                     }
                 })
@@ -465,6 +490,17 @@ pub async fn probe_node(
         select_best_path(&paths, StreamClass::Preview, bitrate, policy).map(|p| p.id.clone());
     let selected_record =
         select_best_path(&paths, StreamClass::Record, bitrate, policy).map(|p| p.id.clone());
+
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.insert(
+            node_id.to_string(),
+            paths
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ApiError::internal(format!("failed to encode probe result: {e}")))?,
+        );
+    }
 
     Ok(Json(json!({
         "success": true,

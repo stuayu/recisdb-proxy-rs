@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../../api'
 import type { IssuedPairing, ProbeResponse } from './types'
 import { nodeError } from './errors'
@@ -13,6 +13,32 @@ const redeeming = ref(false)
 const issued = ref<IssuedPairing | null>(null)
 const error = ref('')
 const diagnostic = ref<ProbeResponse | null>(null)
+const rolledBack = ref(false)
+const rollbackNodeId = ref<string | null>(null)
+const dialog = ref<HTMLElement | null>(null)
+function keydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    emit('close')
+    return
+  }
+  if (event.key !== 'Tab' || !dialog.value) return
+  const focusable = [...dialog.value.querySelectorAll<HTMLElement>('button, input, select, [tabindex]:not([tabindex="-1"])')]
+  if (!focusable.length) return
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+onMounted(() => {
+  document.addEventListener('keydown', keydown)
+  void nextTick(() => dialog.value?.focus())
+})
+onBeforeUnmount(() => document.removeEventListener('keydown', keydown))
 async function issue() {
   issuing.value = true
   error.value = ''
@@ -47,6 +73,7 @@ async function redeem() {
       method: 'POST',
       body: JSON.stringify({ base_url: pair.base_url, code: pair.code, endpoints: [] }),
     })
+    rollbackNodeId.value = result.node.node_id
     diagnostic.value = await api<ProbeResponse>(
       `/nodes/${encodeURIComponent(result.node.node_id)}/probe`,
       {
@@ -54,12 +81,36 @@ async function redeem() {
         body: JSON.stringify({ bitrate_bps: 20_000_000, download_bytes: 1_048_576 }),
       },
     )
+    if (!diagnostic.value.selected.view) {
+      await rollback()
+      error.value = '通信経路を確認できなかったため、仮登録を取り消しました。'
+    }
     step.value = 4
   } catch (cause) {
+    await rollback()
     error.value = nodeError(cause)
   } finally {
     redeeming.value = false
   }
+}
+async function rollback() {
+  if (!rollbackNodeId.value) return
+  try {
+    await api(`/nodes/${encodeURIComponent(rollbackNodeId.value)}`, { method: 'DELETE' })
+    rolledBack.value = true
+  } catch (cause) {
+    error.value = `診断失敗。自動取消にも失敗しました: ${nodeError(cause)}`
+  } finally {
+    rollbackNodeId.value = null
+  }
+}
+function retry() {
+  step.value = 1
+  issued.value = null
+  connection.value = ''
+  diagnostic.value = null
+  rolledBack.value = false
+  error.value = ''
 }
 async function copyPairing() {
   if (!issued.value) return
@@ -69,7 +120,7 @@ async function copyPairing() {
 }
 </script>
 <template>
-  <div class="overlay" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+  <div ref="dialog" class="overlay" role="dialog" aria-modal="true" aria-labelledby="wizard-title" tabindex="-1">
     <section class="wizard">
       <button class="close" aria-label="ウィザードを閉じる" @click="emit('close')">×</button>
       <p class="step">STEP {{ step }} / 4</p>
@@ -129,7 +180,7 @@ async function copyPairing() {
                 : 'チューナー共有'
           }}
         </p>
-        <div class="diagnostic">
+        <div class="diagnostic" aria-live="polite">
           <p>診断</p>
           <p class="good">✓ 相手PCへ接続可能 / ✓ 認証成功</p>
           <p :class="diagnostic?.selected.view ? 'good' : 'bad'">
@@ -150,7 +201,13 @@ async function copyPairing() {
         <p v-if="!diagnostic?.selected.view" class="notice error" role="alert">
           問題があります。再試行するか、詳細設定の手動接続を確認してください。
         </p>
-        <button class="button" @click="emit('complete')">この設定で開始</button>
+        <p v-if="rolledBack" class="notice warning" role="status">
+          登録前診断に失敗したため、仮登録を自動で取り消しました。ユーザー操作は不要です。
+        </p>
+        <button v-if="!rolledBack && diagnostic?.selected.view" class="button" @click="emit('complete')">
+          この設定で開始
+        </button>
+        <button v-else class="button secondary" @click="retry">再試行</button>
       </div>
       <p v-if="error" class="notice error" role="alert">
         接続設定を完了できません。詳細: {{ error }}

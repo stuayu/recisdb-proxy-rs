@@ -23,6 +23,20 @@ preserves the stored credential, so credentials are never read back to the
 browser. API failures include a stable `error_code` alongside the raw detail
 for UI translation.
 
+The wizard performs the pairing handshake as a temporary registration, then
+runs the existing VIEW/PREVIEW/RECORD probe. If no VIEW path is admitted, the
+new local peer is deleted automatically and the UI reports the rollback. The
+remote node may retain its reciprocal peer entry because the pairing protocol
+persists both sides during the handshake.
+
+Probe results are cached in process memory for topology display. A path without
+a cached result is reported as `unmeasured`, not healthy. Continuous passive
+measurement and persistent path-health storage remain future work.
+
+The dashboard has no bundled QR encoder yet. The offline-safe
+`recisdb://pair?...` text and one-click copy flow remain complete; QR can be
+added later without changing the connection format.
+
 Automatic transport selection must not be described as continuously optimal.
 Current normal routing is still the static preference order LAN, Tailscale,
 Cloudflare private, Static, direct Internet, and Cloudflare public. `score_path`

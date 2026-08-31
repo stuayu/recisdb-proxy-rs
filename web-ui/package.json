@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "typecheck": "vue-tsc -b",
+    "test:nodes": "node --experimental-strip-types --test src/components/nodes/*.test.ts",
     "lint": "eslint . --max-warnings=0 && stylelint \"src/**/*.{css,vue}\"",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

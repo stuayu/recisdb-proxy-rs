@@ -1,10 +1,24 @@
 <script setup lang="ts">
 import type { Topology } from './types'
 const props = defineProps<{ topology: Topology; focusNodeId?: string }>()
+const emit = defineEmits<{ probe: [] }>()
 function label(path: Topology['paths'][number]) {
+  if (!path.measured) return '⚪ 未測定・通信テストが必要'
+  if (path.status === 'degraded') return '🟡 不安定・通信テストを再実行'
+  if (path.status === 'unavailable') return '🔴 利用不可・原因を確認'
   if (path.kind === 'cloudflare_public' || !path.record_allowed)
     return '🟡 視聴には使用できます / 🚫 録画には使用しません'
   return path.role === 'primary' ? '🟢 おすすめ・録画利用可' : '🟡 予備・録画利用可'
+}
+function metrics(path: Topology['paths'][number]) {
+  if (!path.measured || !path.health) return ''
+  const rtt = typeof path.health.rtt_p95_ms === 'number' && Number.isFinite(path.health.rtt_p95_ms)
+    ? ` / ${path.health.rtt_p95_ms.toFixed(1)} ms`
+    : ''
+  const bandwidth = path.health.throughput_down_p10_bps
+    ? ` / ${(path.health.throughput_down_p10_bps / 1_000_000).toFixed(1)} Mbps`
+    : ''
+  return `${rtt}${bandwidth}`
 }
 function x(index: number) {
   return 280 + (index % 2) * 220
@@ -36,7 +50,7 @@ function pathFor(nodeId: string) {
           y1="80"
           :x2="x(pathIndex)"
           y2="180"
-          :class="path.status === 'online' ? 'healthy' : 'unavailable'"
+          :class="path.status === 'online' ? 'healthy' : path.status === 'unmeasured' ? 'unmeasured' : 'unavailable'"
         />
         <text
           v-for="(path, pathIndex) in pathFor(node.node_id)"
@@ -45,7 +59,7 @@ function pathFor(nodeId: string) {
           :y="130 + pathIndex * 18"
           class="path-label"
         >
-          {{ path.kind }}: {{ label(path) }}
+          {{ path.kind }}: {{ label(path) }}{{ metrics(path) }}
         </text>
         <rect :x="x(index) - 80" y="170" width="160" height="55" rx="8" class="node-box" />
         <text :x="x(index)" y="195" text-anchor="middle" class="node-name">
@@ -86,7 +100,7 @@ function pathFor(nodeId: string) {
           :y="105 + index * 130 + pathIndex * 16"
           class="path-label"
         >
-          {{ path.kind }}: {{ label(path) }}
+          {{ path.kind }}: {{ label(path) }}{{ metrics(path) }}
         </text>
         <rect x="280" :y="125 + index * 130" width="160" height="55" rx="8" class="node-box" />
         <text x="360" :y="150 + index * 130" text-anchor="middle" class="node-name">
@@ -100,7 +114,8 @@ function pathFor(nodeId: string) {
         v-for="path in topology.paths.filter((item) => !focusNodeId || item.to === focusNodeId)"
         :key="`${path.to}-${path.kind}`"
       >
-        <strong>{{ path.kind }}</strong> {{ label(path) }}
+        <strong>{{ path.kind }}</strong> {{ label(path) }}{{ metrics(path) }}
+        <button v-if="!path.measured" class="link" type="button" @click="emit('probe')">通信テスト</button>
       </div>
       <p v-if="!topology.paths.length" class="muted">利用可能な経路なし</p>
     </div>
@@ -152,6 +167,20 @@ function pathFor(nodeId: string) {
   stroke: #dc2626;
   stroke-width: 2;
   stroke-dasharray: 5 4;
+}
+
+.unmeasured {
+  stroke: #6b7280;
+  stroke-width: 2;
+  stroke-dasharray: 3 4;
+}
+
+.link {
+  border: 0;
+  background: none;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .accessible-paths {

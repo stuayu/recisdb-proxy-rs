@@ -124,7 +124,7 @@ onMounted(async () => {
     </section>
     <div v-if="topology && data" class="topology-dialog" role="dialog" aria-modal="true">
       <button class="button secondary" @click="topology = null">閉じる</button
-      ><NodeTopologyPreview :topology="data.topology" :focus-node-id="topology.node.node_id" />
+      ><NodeTopologyPreview :topology="data.topology" :focus-node-id="topology.node.node_id" @probe="probe(topology)" />
     </div>
     <NodeSetupWizard
       v-if="wizard"

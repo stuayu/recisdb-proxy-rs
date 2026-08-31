@@ -1,12 +1,7 @@
 <script setup lang="ts">
-import type { ProbeResponse, ProbePath } from './types'
+import type { ProbeResponse } from './types'
+import { healthLabel } from './health'
 defineProps<{ probe?: ProbeResponse }>()
-function level(path: ProbePath | undefined) {
-  if (!path || path.health.state === 'unreachable') return ['bad', '利用不可']
-  if (path.health.state === 'degraded') return ['warn', '不安定']
-  if (path.health.rtt_p95_ms <= 30 && path.health.stall_rate < 0.02) return ['good', 'とても良好']
-  return ['good', '良好']
-}
 function pathFor(probe: ProbeResponse | undefined, kind: string | null) {
   return probe?.paths.find((path) => path.id === kind)
 }
@@ -15,8 +10,8 @@ function pathFor(probe: ProbeResponse | undefined, kind: string | null) {
   <div v-if="probe" class="health-summary" aria-live="polite">
     <span
       >応答速度
-      <b :class="level(pathFor(probe, probe.selected.view))[0]"
-        >● {{ level(pathFor(probe, probe.selected.view))[1] }}</b
+      <b :class="healthLabel(pathFor(probe, probe.selected.view))[0]"
+        >● {{ healthLabel(pathFor(probe, probe.selected.view))[1] }}</b
       ></span
     >
     <span
@@ -27,8 +22,8 @@ function pathFor(probe: ProbeResponse | undefined, kind: string | null) {
     >
     <span
       >安定性
-      <b :class="level(pathFor(probe, probe.selected.view))[0]"
-        >● {{ level(pathFor(probe, probe.selected.view))[1] }}</b
+      <b :class="healthLabel(pathFor(probe, probe.selected.view))[0]"
+        >● {{ healthLabel(pathFor(probe, probe.selected.view))[1] }}</b
       ></span
     >
     <span
