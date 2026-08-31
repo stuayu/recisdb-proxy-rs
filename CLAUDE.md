@@ -41,6 +41,23 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - スキーマ変更は `database/mod.rs` の `MIGRATIONS` 台帳(PRAGMA user_version)に追記する。**全マイグレーションは冪等**であること(pre-ledger DBは user_version=0 から全再生される)。
 - `bon_drivers.next_scan_at` のセマンティクス: `0` = 即時ワンショットスキャン要求 / `NULL` = 予約なし / それ以外 = 次回定期スキャン時刻。定期再スキャンは **opt-in**(`auto_scan_enabled=1` かつ `scan_interval_hours>0`)。初回スキャンは `request_immediate_scan`(next_scan_at=0)で走る。
 
+### EPG 自動取得
+- **EPGの実行時設定はDBが唯一の正。** `recisdb-proxy.toml` に `[epg.*]` の実行時設定を
+  置かない。既定値は migration/bootstrap でDBへ入れる。設定変更に再起動を要求しない。
+- 設定の解決順は **built-in default → global → preset → 物理チューナーoverride** の1本道で、
+  `Database::get_epg_effective()` が返す `EffectiveEpgScanConfig` だけを実行系が見る。
+  **フロントエンドで継承を解決しない**(effective APIの値をそのまま表示する)。
+- `epg_scan_states` は **`(network_id, tsid)` ごと**。coverageも `programs` を同じキーで
+  GROUP BYして集計する。全体coverageは**系統ごとの最小値**で、1系統だけ埋まった状態を
+  「全体正常」と表示しない。
+- 巡回対象の判定は帯域で分ける(`broadcast_region::classify_nid` を使い、NIDをベタ書きしない)。
+  地デジは物理TSごとに独立。**BS/CSはOther-TS EITで供給済みの系統を選局しない**
+  (全TS無条件巡回は禁止)。
+- 延期・失敗理由は `EpgReasonCode` のenumだけから生む。文字列リテラルをその場で書かない。
+  `not_due` は state にだけ残し履歴に積まない(毎ループ1行増やさない)。
+- スキャン前に `(network_id, tsid)` の **mux リース**を取る。リースは `Drop` で解放し、
+  握ったまま死んでもTTLで他ノードが取り直せること。ストリーム用リースとは別系統。
+
 ### チャンネル列挙とインデックス
 - クライアントに見せる space/channel は**仮想インデックス**(`server/client_view.rs`)。space=放送地域(地デジ広域圏→BS→CS)、channel=(NID,TSID)で重複排除し (NID,TSID) 昇順。
 - 関東広域(NHK等)と県域局(テレ玉等)は**同じ「関東」スペース**に入り、県域局のNIDの方が小さいので先頭側に並ぶ。
@@ -60,6 +77,11 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - 同一DLL上のチャンネル切り替えは permit を**移譲**する(解放→再取得は `max_instances=1` で破綻)。
 - `ReaderState` の `Reserved`(作られたが起動前)と `Starting`(起動実行中)を混同しない。
   混ぜると「起動すべきか」の判定が必ず誤る(起動をサボる/二重オープン)。
+- `acquire()` の失敗は **型で理由を返す**(`AcquireError::AtCapacity` の `AcquireConflict` が
+  競合した用途と相手のチューナーを持つ)。呼び出し側がログ文字列を解析して分岐しない。
+  競合相手の特定は `acquire()` 側で行い、**`decide()` にI/O・async・ログを持ち込まない**。
+- `SharedTuner` の claim は `TunerUsage` を持つ。`subscribe_with_claim` はView相当の
+  互換入口として残してあるので、用途を明示したいときは `subscribe_with_claim_class` を使う。
 - 詳細と設計判断: `docs/TUNER_PIPELINE_REDESIGN.md`。
 
 ### ストリーミング

@@ -161,6 +161,7 @@ pub enum EpgReasonCode {
     NoCompatibleTuner,
     MuxLeaseUnavailable,
     RemoteMetadataFailed,
+    RemoteTsFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

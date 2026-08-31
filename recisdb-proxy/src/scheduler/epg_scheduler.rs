@@ -334,6 +334,32 @@ impl EpgScanScheduler {
                 return Ok(());
             }
         }
+        if execution_path == EpgExecutionPath::RemoteTs {
+            if let Err(error) = self.try_remote_ts(&config, channel.nid, channel.tsid).await {
+                let reason = epg_reason(
+                    EpgReasonCode::RemoteTsFailed,
+                    serde_json::json!({
+                        "network_id": channel.nid,
+                        "tsid": channel.tsid,
+                        "error": error.to_string(),
+                    }),
+                );
+                let db = self.database.lock().await;
+                let _ = db.epg_scan_finished(
+                    history,
+                    "failed",
+                    channel.nid,
+                    channel.tsid,
+                    Some(&reason),
+                );
+                let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
+            } else {
+                let db = self.database.lock().await;
+                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
+                let _ = db.refresh_epg_coverage();
+                return Ok(());
+            }
+        }
         let Some((space, number)) = channel.bon_space.zip(channel.bon_channel) else {
             let reason = epg_reason(
                 EpgReasonCode::NoCompatibleTuner,
@@ -460,6 +486,102 @@ impl EpgScanScheduler {
         }
         let _ = state;
         Err("no authenticated remote metadata route responded".into())
+    }
+
+    async fn try_remote_ts(
+        &self,
+        config: &EpgGlobalSettings,
+        network_id: u16,
+        tsid: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(state) = self.remote_state.read().await.clone() else {
+            return Err("node transport is not ready".into());
+        };
+        let (local, routes) = {
+            let db = self.database.lock().await;
+            let store = crate::node::NodeStore::new(&db)?;
+            let mux = crate::node::LogicalMuxId {
+                nid: network_id,
+                tsid,
+            };
+            (store.local_identity()?, store.remote_routes_for(mux)?)
+        };
+        for route in routes {
+            let (Some(credential), endpoints) = ({
+                let db = self.database.lock().await;
+                let store = crate::node::NodeStore::new(&db)?;
+                (
+                    store.credential_for(&route.node_id)?,
+                    store.endpoints(&route.node_id)?,
+                )
+            }) else {
+                continue;
+            };
+            let client = Arc::new(crate::node::NodeTransportClient::new(
+                local.node_id.clone(),
+                credential,
+            )?);
+            for endpoint in endpoints.into_iter().filter(|endpoint| endpoint.enabled) {
+                let context = crate::node::RequestContext {
+                    request_id: format!("epg-ts-{network_id:04x}-{tsid:04x}"),
+                    trace_id: format!(
+                        "epg-ts-{}",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ),
+                    stream_class: recisdb_protocol::StreamClass::View,
+                    claim: crate::tuner::EffectiveClaim::new(-1000, false),
+                    remaining_ms: 300_000,
+                    origin_node: local.node_id.clone(),
+                    visited_nodes: vec![local.node_id.clone()],
+                    hop_count: 0,
+                    max_hops: 3,
+                };
+                let Ok(remote) = crate::node::RemoteMuxStream::open(
+                    client.clone(),
+                    endpoint.address,
+                    context,
+                    route.mux,
+                    None,
+                    0,
+                )
+                .await
+                else {
+                    continue;
+                };
+                let mut subscription = remote.subscribe();
+                let mut collector = crate::tuner::epg_collector::EpgCollector::new_metadata();
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(config.max_dwell_secs.clamp(1, 300) as u64);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match timeout(
+                        remaining.min(Duration::from_secs(
+                            config.idle_section_timeout_secs.max(1) as u64
+                        )),
+                        subscription.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(chunk)) => {
+                            collector.process_ts_chunk(&chunk);
+                        }
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
+                let records = collector.drain_metadata_records();
+                if !records.is_empty() {
+                    crate::tuner::epg_collector::submit_metadata_records(records);
+                    drop(remote);
+                    return Ok(());
+                }
+                drop(remote);
+            }
+        }
+        let _ = state;
+        Err("no authenticated remote TS route produced EIT".into())
     }
     async fn scan_one(
         &self,

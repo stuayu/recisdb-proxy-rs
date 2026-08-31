@@ -168,8 +168,9 @@ broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報
 `remote_prefer_metadata_execution=true` なら TS を引かずに metadata RPC を使い、
 `remote_allow_ts_transport=false` のときは TS 転送経路を選ばない。remote 実行が失敗した
 ときは `RemoteMetadataFailed` を記録してローカル収集へフォールバックする。
-なお remote から TS を引く経路自体はまだ結線しておらず、現状の remote 実行は
-metadata のみである。
+`remote_prefer_metadata_execution=false` かつ `remote_allow_ts_transport=true` の場合は、
+既存の `RemoteMuxStream` を broadcast 購読し、こちら側の `EpgCollector` で解析する。
+remote TS 収集も metadata 収集も同じ dwell・lease・失敗時local fallbackを使う。
 
 スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
 スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を
