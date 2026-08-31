@@ -679,6 +679,45 @@ impl<'a> NodeStore<'a> {
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+
+    pub fn route_group_members(&self, group_id: i64) -> Result<Vec<(NodeId, i32)>> {
+        let mut stmt = self.db.connection().prepare(
+            "SELECT node_id, weight FROM route_group_members WHERE group_id = ?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            let id: String = row.get(0)?;
+            Ok((id, row.get::<_, i32>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, weight) = row?;
+            let id = NodeId::new(id).map_err(|e| DatabaseError::MigrationFailed(e.into()))?;
+            Ok((id, weight))
+        })
+        .collect()
+    }
+
+    pub fn rename_route_group(&self, group_id: i64, name: &str) -> Result<()> {
+        self.db.connection().execute(
+            "UPDATE route_groups SET name = ?2 WHERE id = ?1",
+            params![group_id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_route_group(&self, group_id: i64) -> Result<()> {
+        self.db
+            .connection()
+            .execute("DELETE FROM route_groups WHERE id = ?1", params![group_id])?;
+        Ok(())
+    }
+
+    pub fn remove_group_member(&self, group_id: i64, node_id: &NodeId) -> Result<()> {
+        self.db.connection().execute(
+            "DELETE FROM route_group_members WHERE group_id = ?1 AND node_id = ?2",
+            params![group_id, node_id.as_str()],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +780,25 @@ mod tests {
         // A replay of the same code must not pair a second node.
         assert!(!store.consume_pending_pairing(&code).unwrap());
         assert!(store.pending_pairings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_group_members_can_be_renamed_removed_and_deleted() {
+        let db = Database::open_in_memory().unwrap();
+        let store = NodeStore::new(&db).unwrap();
+        let node = paired_node(&store, "tokyo");
+        let group = store.ensure_route_group("関東").unwrap();
+        store.set_group_member(group, &node, 200).unwrap();
+        assert_eq!(
+            store.route_group_members(group).unwrap(),
+            vec![(node.clone(), 200)]
+        );
+        store.rename_route_group(group, "東日本").unwrap();
+        assert_eq!(store.list_route_groups().unwrap()[0].name, "東日本");
+        store.remove_group_member(group, &node).unwrap();
+        assert!(store.route_group_members(group).unwrap().is_empty());
+        store.delete_route_group(group).unwrap();
+        assert!(store.list_route_groups().unwrap().is_empty());
     }
 
     #[test]

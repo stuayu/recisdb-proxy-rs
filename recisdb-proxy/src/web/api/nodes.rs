@@ -5,7 +5,9 @@
 //! separate HTTP/2 listener/namespace (`node::transport`) and never shares the
 //! dashboard bearer token.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -24,6 +26,11 @@ use crate::node::{
 use crate::web::state::WebState;
 
 use super::error::ApiError;
+
+fn probe_cache() -> &'static Mutex<HashMap<String, Vec<serde_json::Value>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertNodeRequest {
@@ -84,6 +91,18 @@ pub struct RouteGroupMemberRequest {
     pub weight: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RouteGroupRequest {
+    pub id: Option<i64>,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveRouteGroupMemberRequest {
+    pub group_id: i64,
+    pub node_id: String,
+}
+
 /// Full fabric snapshot used by the Nodes dashboard tab.
 pub async fn get_nodes(
     State(web_state): State<Arc<WebState>>,
@@ -93,7 +112,7 @@ pub async fn get_nodes(
     let local = store.local_identity()?;
     let nodes = store.list_nodes()?;
     let mut entries = Vec::with_capacity(nodes.len());
-    for node in nodes {
+    for node in nodes.iter().cloned() {
         let endpoints = store.endpoints(&node.node_id)?;
         // Both numbers: "12 routes, 0 usable" and "no routes at all" are
         // different problems and the operator has to tell them apart.
@@ -107,15 +126,80 @@ pub async fn get_nodes(
             "total_routes": total_routes,
         }));
     }
-    let route_groups = store.list_route_groups()?;
+    let route_groups = store
+        .list_route_groups()?
+        .into_iter()
+        .map(|group| {
+            let members = store
+                .route_group_members(group.id)?
+                .into_iter()
+                .map(|(node_id, weight)| json!({ "node_id": node_id, "weight": weight }))
+                .collect::<Vec<_>>();
+            Ok(json!({ "id": group.id, "name": group.name, "members": members }))
+        })
+        .collect::<Result<Vec<_>, crate::database::DatabaseError>>()?;
+    let setup_status = vec![
+        json!({ "id": "local", "label": "このPCの設定", "state": "done", "action": null }),
+        json!({ "id": "pairing", "label": "相手PCとの接続", "state": if entries.iter().all(|entry| entry["paired"] == true) && !entries.is_empty() { "done" } else { "todo" }, "action": "wizard" }),
+        json!({ "id": "probe", "label": "通信テスト", "state": "todo", "action": "probe" }),
+        json!({ "id": "record", "label": "録画利用設定", "state": if entries.iter().any(|entry| entry["paired"] == true) { "done" } else { "todo" }, "action": "settings" }),
+        json!({ "id": "area", "label": "受信エリア設定", "state": if route_groups.is_empty() { "todo" } else { "done" }, "action": "area" }),
+    ];
+    let local_node_id = local.node_id.clone();
+    let topology_paths = entries
+        .iter()
+        .flat_map(|entry| {
+            let node = entry["node"]["node_id"].clone();
+            let node_key = node.as_str().unwrap_or_default().to_owned();
+            let paired = entry["paired"] == true;
+            entry["endpoints"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map({
+                    let from = local_node_id.clone();
+                    let measured_paths = probe_cache()
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.get(&node_key).cloned())
+                        .unwrap_or_default();
+                    move |(index, endpoint)| {
+                        let measured = measured_paths.get(index).cloned();
+                        let status = measured
+                            .as_ref()
+                            .and_then(|path| path["health"]["state"].as_str())
+                            .map(|state| match state {
+                                "healthy" => "online",
+                                "degraded" => "degraded",
+                                _ => "unavailable",
+                            })
+                            .unwrap_or(if paired { "unmeasured" } else { "unavailable" });
+                        json!({
+                            "from": from.clone(),
+                            "to": node.clone(),
+                            "kind": endpoint["kind"],
+                            "status": status,
+                            "role": if index == 0 { "primary" } else { "fallback" },
+                            "record_allowed": endpoint["record_allowed"],
+                            "measured": measured.is_some(),
+                            "health": measured.map(|path| path["health"].clone()),
+                        })
+                    }
+                })
+        })
+        .collect::<Vec<_>>();
     // Only the expiry is knowable: the code itself was stored as a digest.
     let pending_pairings = store.pending_pairings()?;
 
+    let topology_local = local.clone();
     Ok(Json(json!({
         "success": true,
         "local": local,
         "nodes": entries,
         "route_groups": route_groups,
+        "setup_status": setup_status,
+        "topology": { "local": topology_local, "nodes": entries.iter().map(|entry| entry["node"].clone()).collect::<Vec<_>>(), "paths": topology_paths },
         "pending_pairings": pending_pairings,
     })))
 }
@@ -190,7 +274,7 @@ pub async fn delete_node(
     Path(node_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let node_id = NodeId::new(node_id).map_err(ApiError::bad_request)?;
-    {
+    let (local, credential, endpoints) = {
         let db = web_state.database.lock().await;
         let store = NodeStore::new(&db)?;
         if !store
@@ -200,12 +284,36 @@ pub async fn delete_node(
         {
             return Err(ApiError::not_found(format!("node {node_id} not found")));
         }
-        store.delete_node(&node_id)?;
+        (
+            store.local_identity()?,
+            store.credential_for(&node_id)?,
+            store.endpoints(&node_id)?,
+        )
+    };
+    let mut reciprocal_removed = false;
+    if let Some(credential) = credential {
+        if let Ok(client) = NodeTransportClient::new(local.node_id, credential) {
+            for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
+                if client.unpair_peer(&endpoint.address).await.is_ok() {
+                    reciprocal_removed = true;
+                    break;
+                }
+            }
+        }
+    }
+    {
+        let db = web_state.database.lock().await;
+        NodeStore::new(&db)?.delete_node(&node_id)?;
     }
     if let Some(state) = web_state.node_transport.as_ref() {
         state.peers.write().await.remove(&node_id);
     }
-    Ok(Json(json!({ "success": true, "node_id": node_id })))
+    Ok(Json(json!({
+        "success": true,
+        "node_id": node_id,
+        "reciprocal_removed": reciprocal_removed,
+        "warning": if reciprocal_removed { serde_json::Value::Null } else { json!("相手側の設定を確認してください") },
+    })))
 }
 
 /// Issue a one-time pairing code for another node to redeem.
@@ -375,7 +483,10 @@ pub async fn probe_node(
         }
         let local = store.local_identity()?;
         let credential = store.credential_for(&node_id)?.ok_or_else(|| {
-            ApiError::conflict("node is not paired; no application credential is stored")
+            ApiError::coded_conflict(
+                "node_not_paired",
+                "node is not paired; no application credential is stored",
+            )
         })?;
         let endpoints = store.endpoints(&node_id)?;
         (local, credential, endpoints)
@@ -403,6 +514,17 @@ pub async fn probe_node(
         select_best_path(&paths, StreamClass::Preview, bitrate, policy).map(|p| p.id.clone());
     let selected_record =
         select_best_path(&paths, StreamClass::Record, bitrate, policy).map(|p| p.id.clone());
+
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.insert(
+            node_id.to_string(),
+            paths
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ApiError::internal(format!("failed to encode probe result: {e}")))?,
+        );
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -444,4 +566,41 @@ pub async fn set_route_group_member(
         "node_id": node_id,
         "weight": weight,
     })))
+}
+
+pub async fn update_route_group(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<RouteGroupRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("route area name must not be empty"));
+    }
+    let db = web_state.database.lock().await;
+    let store = NodeStore::new(&db)?;
+    let id = match payload.id {
+        Some(id) => id,
+        None => store.ensure_route_group(name)?,
+    };
+    store.rename_route_group(id, name)?;
+    Ok(Json(json!({ "success": true, "id": id, "name": name })))
+}
+
+pub async fn delete_route_group(
+    State(web_state): State<Arc<WebState>>,
+    Path(group_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let db = web_state.database.lock().await;
+    NodeStore::new(&db)?.delete_route_group(group_id)?;
+    Ok(Json(json!({ "success": true, "id": group_id })))
+}
+
+pub async fn remove_route_group_member(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<RemoveRouteGroupMemberRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let node_id = NodeId::new(payload.node_id).map_err(ApiError::bad_request)?;
+    let db = web_state.database.lock().await;
+    NodeStore::new(&db)?.remove_group_member(payload.group_id, &node_id)?;
+    Ok(Json(json!({ "success": true })))
 }

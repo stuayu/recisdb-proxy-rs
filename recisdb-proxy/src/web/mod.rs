@@ -56,8 +56,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/nodes/pairing/redeem", post(api::redeem_pairing_code))
         .route(
             "/node-route-groups/member",
-            post(api::set_route_group_member),
+            post(api::set_route_group_member).delete(api::remove_route_group_member),
         )
+        .route("/node-route-groups", post(api::update_route_group))
+        .route("/node-route-groups/:id", delete(api::delete_route_group))
         // Update notification / self-update API (web/api/update.rs)
         .route("/update/check", get(api::check_update))
         .route("/update/apply", post(api::apply_update))

@@ -1,552 +1,240 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
-
-type EndpointKind =
-  | 'lan'
-  | 'internet_direct'
-  | 'tailscale'
-  | 'cloudflare_private'
-  | 'cloudflare_public'
-  | 'static'
-
-type NodeEndpoint = {
-  kind: EndpointKind
-  address: string
-  enabled: boolean
-  record_allowed: boolean
-  metered: boolean
-  user_priority: number
-}
-
-type StoredNode = {
-  node_id: string
-  display_name: string
-  site_name: string | null
-  enabled: boolean
-  allow_transit: boolean
-  auto_connect: boolean
-  last_seen_unix_ms: number | null
-}
-
-type NodeEntry = {
-  node: StoredNode
-  endpoints: NodeEndpoint[]
-  paired: boolean
-  /// Advertised routes this node can currently be asked for.
-  routable_routes: number
-  /// Everything it advertised, including quarantined/disabled routes that are
-  /// kept for re-probing.
-  total_routes: number
-}
-
-type RouteGroup = { id: number; name: string }
-
-type PendingPairing = {
-  label: string | null
-  expires_at_unix_ms: number
-  created_at_unix_ms: number
-}
-
-type NodesResponse = {
-  success: boolean
-  local: { node_id: string; display_name: string }
-  nodes: NodeEntry[]
-  route_groups: RouteGroup[]
-  pending_pairings: PendingPairing[]
-}
-
-type IssuedPairing = {
-  success: boolean
-  code: string
-  expires_at_unix_ms: number
-  ttl_secs: number
-  label: string | null
-  node_listen_addr: string | null
-}
-
-type ProbePath = {
-  id: string
-  endpoint: NodeEndpoint
-  health: {
-    state: string
-    connect_success_rate: number
-    rtt_p50_ms: number
-    rtt_p95_ms: number
-    throughput_down_p10_bps: number
-    throughput_down_ewma_bps: number
-    jitter_ms: number
-    stall_rate: number
-    reconnect_rate: number
-    confidence: number
-    tailscale_path: string | null
-  }
-}
-
-type ProbeResponse = {
-  success: boolean
-  bitrate_bps: number
-  paths: ProbePath[]
-  selected: { view: string | null; preview: string | null; record: string | null }
-}
-
-const data = ref<NodesResponse | null>(null)
-const loading = ref(false)
-const saving = ref(false)
-const error = ref('')
-const message = ref('')
-const probing = ref<string | null>(null)
-const probes = ref<Record<string, ProbeResponse>>({})
-
-const form = ref({
-  node_id: '',
-  display_name: '',
-  site_name: '',
-  kind: 'tailscale' as EndpointKind,
-  address: '',
-  record_allowed: true,
-  auto_connect: true,
-  credential: '',
-})
-
-const groupForm = ref({ name: '関東', node_id: '', weight: 100 })
-const pairIssueForm = ref({ label: '' })
-const pairRedeemForm = ref({ base_url: '', code: '' })
-// Shown once, in this browser tab only. The server keeps only the digest, so
-// there is no endpoint that can hand it back.
-const issuedCode = ref<IssuedPairing | null>(null)
-const pairing = ref(false)
+import NodeCard from './nodes/NodeCard.vue'
+import NodeHelpDrawer from './nodes/NodeHelpDrawer.vue'
+import NodeSetupWizard from './nodes/NodeSetupWizard.vue'
+import NodeTopologyPreview from './nodes/NodeTopologyPreview.vue'
+import NodeAdvancedSettings from './nodes/NodeAdvancedSettings.vue'
+import RouteAreaEditor from './nodes/RouteAreaEditor.vue'
+import { useNodes } from '../composables/useNodes'
+import type { NodeEntry } from './nodes/types'
+const { data, loading, error, message, probes, probing, load, probe } = useNodes()
+const wizard = ref(false)
+const help = ref(false)
+const topology = ref<NodeEntry | null>(null)
+const localName = ref('')
 const savingLocal = ref(false)
-const localDisplayName = ref('')
-const endpointKinds: Array<{ value: EndpointKind; label: string }> = [
-  { value: 'lan', label: 'LAN' },
-  { value: 'tailscale', label: 'Tailscale' },
-  { value: 'cloudflare_private', label: 'Cloudflare Private' },
-  { value: 'internet_direct', label: 'Direct HTTPS' },
-  { value: 'cloudflare_public', label: 'Cloudflare Public' },
-  { value: 'static', label: 'Static' },
-]
-
 const nodes = computed(() => data.value?.nodes ?? [])
-
-function formatMbps(bps: number) {
-  if (!Number.isFinite(bps) || bps <= 0) return '—'
-  return `${(bps / 1_000_000).toFixed(1)} Mbps`
+function setupAction(action: string | null) {
+  if (action === 'wizard' || action === 'probe') wizard.value = true
+  if (action === 'area') document.querySelector('.area-editor')?.scrollIntoView({ behavior: 'smooth' })
+  if (action === 'settings') document.querySelector('details.advanced')?.setAttribute('open', '')
 }
-function formatMs(ms: number) {
-  return Number.isFinite(ms) ? `${ms.toFixed(1)} ms` : '—'
-}
-function pathLabel(path: ProbePath) {
-  const via = path.health.tailscale_path ? ` / ${path.health.tailscale_path}` : ''
-  return `${path.endpoint.kind}${via}`
-}
-
-function nodeListenUrl(address: string | null) {
-  if (!address) return null
-  try {
-    const parsed = new URL(address.includes('://') ? address : `http://${address}`)
-    const parsedHost = parsed.hostname.replace(/^\[|\]$/g, '')
-    const host = parsedHost === '0.0.0.0' || parsedHost === '::'
-      ? window.location.hostname.replace(/^\[|\]$/g, '')
-      : parsedHost
-    const displayHost = host.includes(':') ? `[${host}]` : host
-    return `${parsed.protocol}//${displayHost}:${parsed.port}`
-  } catch {
-    return address
-  }
-}
-
-async function load() {
-  loading.value = true
-  try {
-    data.value = await api<NodesResponse>('/nodes')
-    localDisplayName.value = data.value.local.display_name
-    error.value = ''
-    if (!groupForm.value.node_id && nodes.value[0]) groupForm.value.node_id = nodes.value[0].node.node_id
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    loading.value = false
-  }
-}
-
-async function saveLocalNode() {
-  const displayName = localDisplayName.value.trim()
-  if (!displayName) {
-    error.value = '表示名を入力してください。'
-    return
-  }
+async function saveLocal() {
+  if (!localName.value.trim()) return
   savingLocal.value = true
   try {
     const result = await api<{ local: { node_id: string; display_name: string } }>('/nodes/local', {
       method: 'POST',
-      body: JSON.stringify({ display_name: displayName }),
+      body: JSON.stringify({ display_name: localName.value.trim() }),
     })
     if (data.value) data.value.local = result.local
-    localDisplayName.value = result.local.display_name
-    message.value = 'このノードの表示名を更新しました。'
-    error.value = ''
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
     savingLocal.value = false
   }
 }
-
-function edit(entry: NodeEntry) {
-  const endpoint = entry.endpoints[0]
-  form.value = {
-    node_id: entry.node.node_id,
-    display_name: entry.node.display_name,
-    site_name: entry.node.site_name ?? '',
-    kind: endpoint?.kind ?? 'tailscale',
-    address: endpoint?.address ?? '',
-    record_allowed: endpoint?.record_allowed ?? true,
-    auto_connect: entry.node.auto_connect,
-    credential: '',
-  }
-  window.scrollTo({ top: 0, behavior: 'smooth' })
+async function toggle(entry: NodeEntry) {
+  await api(`/nodes/${encodeURIComponent(entry.node.node_id)}/state`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled: !entry.node.enabled }),
+  })
+  await load()
 }
-
-function resetForm() {
-  form.value = {
-    node_id: '', display_name: '', site_name: '', kind: 'tailscale', address: '',
-    record_allowed: true, auto_connect: true, credential: '',
-  }
-}
-
-async function save() {
-  if (!form.value.node_id.trim() || !form.value.display_name.trim() || !form.value.address.trim()) {
-    error.value = 'ノードID・表示名・接続先を入力してください。'
-    return
-  }
-  saving.value = true
-  try {
-    await api('/nodes', {
-      method: 'POST',
-      body: JSON.stringify({
-        node_id: form.value.node_id.trim(),
-        display_name: form.value.display_name.trim(),
-        site_name: form.value.site_name.trim() || null,
-        enabled: true,
-        allow_transit: false,
-        auto_connect: form.value.auto_connect,
-        credential: form.value.credential.trim() || null,
-        endpoints: [{
-          kind: form.value.kind,
-          address: form.value.address.trim(),
-          enabled: true,
-          record_allowed: form.value.record_allowed,
-          metered: false,
-          user_priority: 0,
-        }],
-      }),
-    })
-    message.value = 'ノード設定を保存しました。'
-    error.value = ''
-    resetForm()
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    saving.value = false
-  }
-}
-
-async function probe(entry: NodeEntry) {
-  const id = entry.node.node_id
-  probing.value = id
-  try {
-    probes.value[id] = await api<ProbeResponse>(`/nodes/${encodeURIComponent(id)}/probe`, {
-      method: 'POST',
-      body: JSON.stringify({ bitrate_bps: 20_000_000, download_bytes: 1_048_576 }),
-    })
-    error.value = ''
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    probing.value = null
-  }
-}
-
-async function setNodeEnabled(entry: NodeEntry, enabled: boolean) {
-  try {
-    await api(`/nodes/${encodeURIComponent(entry.node.node_id)}/state`, {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
-    message.value = enabled ? `${entry.node.display_name} を有効化しました。` : `${entry.node.display_name} を停止しました。`
-    error.value = ''
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  }
-}
-
-async function removeNode(entry: NodeEntry) {
+async function remove(entry: NodeEntry) {
   if (!window.confirm(`${entry.node.display_name} を削除しますか？`)) return
-  try {
-    await api(`/nodes/${encodeURIComponent(entry.node.node_id)}`, { method: 'DELETE' })
-    message.value = `${entry.node.display_name} を削除しました。`
-    error.value = ''
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  }
+  await api(`/nodes/${encodeURIComponent(entry.node.node_id)}`, { method: 'DELETE' })
+  await load()
 }
-
-function formatExpiry(unixMs: number) {
-  const remainingMs = unixMs - Date.now()
-  if (remainingMs <= 0) return '期限切れ'
-  return `あと約 ${Math.max(1, Math.round(remainingMs / 60000))} 分`
+function edit() {
+  help.value = true
 }
-
-async function issuePairingCode() {
-  pairing.value = true
-  try {
-    issuedCode.value = await api<IssuedPairing>('/nodes/pairing', {
-      method: 'POST',
-      body: JSON.stringify({ label: pairIssueForm.value.label.trim() || null }),
-    })
-    error.value = ''
-    message.value = 'ペアリングコードを発行しました。この画面を離れると再表示できません。'
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    pairing.value = false
-  }
+function finishWizard() {
+  wizard.value = false
+  void load()
 }
-
-async function redeemPairingCode() {
-  if (!pairRedeemForm.value.base_url.trim() || !pairRedeemForm.value.code.trim()) {
-    error.value = '相手ノードのURLとペアリングコードを入力してください。'
-    return
-  }
-  pairing.value = true
-  try {
-    const result = await api<{ node: StoredNode }>('/nodes/pairing/redeem', {
-      method: 'POST',
-      body: JSON.stringify({
-        base_url: pairRedeemForm.value.base_url.trim(),
-        code: pairRedeemForm.value.code.trim(),
-        endpoints: [],
-      }),
-    })
-    message.value = `${result.node.display_name} とペアリングしました。`
-    error.value = ''
-    pairRedeemForm.value = { base_url: '', code: '' }
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    pairing.value = false
-  }
-}
-
-async function addGroupMember() {
-  try {
-    await api('/node-route-groups/member', {
-      method: 'POST',
-      body: JSON.stringify(groupForm.value),
-    })
-    message.value = `${groupForm.value.name} グループを更新しました。`
-    error.value = ''
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  }
-}
-
-onMounted(load)
+onMounted(async () => {
+  await load()
+  localName.value = data.value?.local.display_name || ''
+})
 </script>
-
 <template>
   <section class="nodes-view">
-    <div class="view-heading">
+    <header class="heading">
       <div>
         <h2>分散ノード</h2>
-        <p>複数拠点の受信経路をまとめ、視聴・録画ごとに安定した通信経路を自動選択します。</p>
+        <p>別のPC・拠点にあるチューナーを利用できます。</p>
       </div>
-      <button class="button secondary" :disabled="loading" @click="load">再読み込み</button>
-    </div>
-
-    <p v-if="error" class="notice error" role="alert" v-text="error" />
-    <p v-if="message" class="notice" v-text="message" />
-
-    <div v-if="data" class="local-node-card">
-      <strong>このノード</strong>
-      <label class="local-name">表示名<input v-model="localDisplayName" autocomplete="off" /></label>
-      <button class="button secondary" :disabled="savingLocal" @click="saveLocalNode">
-        {{ savingLocal ? '保存中…' : '表示名を保存' }}
-      </button>
-      <code v-text="data.local.node_id" />
-    </div>
-
-    <div class="node-grid">
-      <section class="node-panel">
-        <h3>ペアリング</h3>
-        <p class="muted">
-          片方でコードを発行し、もう片方でそのコードと相手のURLを入力すると、双方に共有クレデンシャルが保存されます。
-          VPN や Tailscale に繋がっているだけでは認証になりません。
-        </p>
-
-        <label>用途メモ（任意）<input v-model="pairIssueForm.label" autocomplete="off" placeholder="東京の受信機" /></label>
-        <button class="button" :disabled="pairing" @click="issuePairingCode">
-          {{ pairing ? '処理中…' : 'ペアリングコードを発行' }}
-        </button>
-
-        <div v-if="issuedCode" class="pairing-code">
-          <strong>この画面でしか表示されません</strong>
-          <code class="pairing-code-value" v-text="issuedCode.code" />
-          <span class="muted">
-            有効期限 {{ Math.round(issuedCode.ttl_secs / 60) }} 分・1回限り<template v-if="issuedCode.node_listen_addr">
-            / 相手が入力するURL: <code v-text="nodeListenUrl(issuedCode.node_listen_addr)" /></template>
-          </span>
-        </div>
-        <ul v-if="data?.pending_pairings?.length" class="pending-list">
-          <li v-for="(pending, idx) in data.pending_pairings" :key="idx">
-            発行済みコード<template v-if="pending.label">（{{ pending.label }}）</template>
-            — {{ formatExpiry(pending.expires_at_unix_ms) }}
-          </li>
-        </ul>
-
-        <hr />
-
-        <label>相手ノードのURL<input v-model="pairRedeemForm.base_url" autocomplete="off" placeholder="http://100.x.y.z:20773" /></label>
-        <label>ペアリングコード<input v-model="pairRedeemForm.code" autocomplete="off" placeholder="ABCD-EF01-2345-6789" /></label>
-        <button class="button" :disabled="pairing" @click="redeemPairingCode">
-          {{ pairing ? '処理中…' : 'このコードでペアリング' }}
-        </button>
-      </section>
-
-      <section class="node-panel">
-        <h3>{{ form.node_id ? 'ノードを編集' : 'ノードを追加' }}</h3>
-        <p class="muted">通常はペアリングを使ってください。ここは手動登録・編集用です。</p>
-        <label>ノードID<input v-model="form.node_id" autocomplete="off" placeholder="tokyo" /></label>
-        <label>表示名<input v-model="form.display_name" autocomplete="off" placeholder="東京" /></label>
-        <label>受信拠点<input v-model="form.site_name" autocomplete="off" placeholder="東京都" /></label>
-        <label>接続方式
-          <select v-model="form.kind">
-            <option v-for="kind in endpointKinds" :key="kind.value" :value="kind.value" v-text="kind.label" />
-          </select>
-        </label>
-        <label>接続先<input v-model="form.address" autocomplete="off" placeholder="http://100.x.y.z:4512" /></label>
-        <label class="check"><input v-model="form.auto_connect" type="checkbox" /> 自動接続</label>
-        <label class="check"><input v-model="form.record_allowed" type="checkbox" /> 録画経路として使用可</label>
-        <details>
-          <summary>詳細設定</summary>
-          <label>共有credential（64桁hex）<input v-model="form.credential" type="password" autocomplete="off" /></label>
-        </details>
-        <div class="actions">
-          <button v-if="form.node_id" class="button secondary" @click="resetForm">新規入力</button>
-          <button class="button" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
-        </div>
-      </section>
-
-      <section class="node-panel">
-        <h3>Route Group</h3>
-        <p class="muted">例: 群馬・栃木・茨城・東京を「関東」にまとめ、受信品質とネットワーク品質から自動分散します。</p>
-        <label>グループ名<input v-model="groupForm.name" autocomplete="off" /></label>
-        <label>ノード
-          <select v-model="groupForm.node_id">
-            <option v-for="entry in nodes" :key="entry.node.node_id" :value="entry.node.node_id" v-text="entry.node.display_name" />
-          </select>
-        </label>
-        <label>重み<input v-model.number="groupForm.weight" type="number" min="1" max="10000" /></label>
-        <button class="button" :disabled="!groupForm.node_id" @click="addGroupMember">グループへ追加</button>
-        <div v-if="data?.route_groups.length" class="chips">
-          <span v-for="group in data.route_groups" :key="group.id" class="chip" v-text="group.name" />
-        </div>
-      </section>
-    </div>
-
-    <section class="node-list">
-      <h3>登録ノード</h3>
-      <p v-if="!loading && !nodes.length" class="muted">登録されたリモートノードはありません。</p>
-      <article v-for="entry in nodes" :key="entry.node.node_id" class="node-card">
-        <div class="node-card-head">
-          <div>
-            <h4><span v-text="entry.node.display_name" /> <small v-if="entry.node.site_name" v-text="entry.node.site_name" /></h4>
-            <code v-text="entry.node.node_id" />
-          </div>
-          <div class="actions compact">
-            <span :class="['status-pill', entry.paired ? 'ok' : 'warn']">{{ entry.paired ? 'ペア済み' : '未ペア' }}</span>
-            <span :class="['status-pill', entry.node.enabled ? 'ok' : 'warn']">{{ entry.node.enabled ? '有効' : '停止' }}</span>
-            <span :class="['status-pill', entry.routable_routes > 0 ? 'ok' : 'warn']">
-              受信可 {{ entry.routable_routes }}/{{ entry.total_routes }}
-            </span>
-            <button class="button secondary" @click="edit(entry)">編集</button>
-            <button class="button" :disabled="probing === entry.node.node_id || !entry.paired" @click="probe(entry)">
-              {{ probing === entry.node.node_id ? 'テスト中…' : '通信テスト' }}
-            </button>
-            <button class="button secondary" @click="setNodeEnabled(entry, !entry.node.enabled)">
-              {{ entry.node.enabled ? '停止' : '有効化' }}
-            </button>
-            <button class="button secondary" @click="removeNode(entry)">削除</button>
-          </div>
-        </div>
-
-        <div class="endpoint-list">
-          <div v-for="endpoint in entry.endpoints" :key="`${endpoint.kind}:${endpoint.address}`" class="endpoint-row">
-            <strong v-text="endpoint.kind" /><code v-text="endpoint.address" />
-            <span v-if="endpoint.record_allowed">RECORD可</span>
-          </div>
-        </div>
-
-        <div v-if="probes[entry.node.node_id]" class="probe-result">
-          <div class="selection-row">
-            <span>VIEW <strong v-text="probes[entry.node.node_id].selected.view ?? '選択不可'" /></span>
-            <span>PREVIEW <strong v-text="probes[entry.node.node_id].selected.preview ?? '選択不可'" /></span>
-            <span>RECORD <strong v-text="probes[entry.node.node_id].selected.record ?? '選択不可'" /></span>
-          </div>
-          <div v-for="path in probes[entry.node.node_id].paths" :key="path.id" class="path-row">
-            <strong v-text="pathLabel(path)" />
-            <span>状態 {{ path.health.state }}</span>
-            <span>RTT p95 {{ formatMs(path.health.rtt_p95_ms) }}</span>
-            <span>帯域 p10 {{ formatMbps(path.health.throughput_down_p10_bps) }}</span>
-            <span>信頼度 {{ Math.round(path.health.confidence * 100) }}%</span>
-          </div>
-        </div>
-      </article>
+      <div class="heading-actions">
+        <button class="button secondary" aria-label="設定ガイドを開く" @click="help = true">
+          ？ 設定ガイド</button
+        ><button class="button secondary" :disabled="loading" @click="load">再読み込み</button>
+      </div>
+    </header>
+    <p v-if="error" class="notice error" role="alert">
+      接続設定を確認できません。詳細: {{ error }}
+    </p>
+    <p v-if="message" class="notice" aria-live="polite">{{ message }}</p>
+    <section class="local card">
+      <div>
+        <h3>このPC</h3>
+        <span class="good">● 正常</span>
+      </div>
+      <label>表示名<input v-model="localName" autocomplete="off" /></label
+      ><button class="button secondary" :disabled="savingLocal" @click="saveLocal">保存</button>
     </section>
+    <section class="card setup">
+      <h3>セットアップ状況</h3>
+      <p
+        v-for="item in data?.setup_status"
+        :key="item.id"
+        :class="item.state === 'done' ? 'good' : item.state === 'warn' ? 'warn' : ''"
+      >
+        {{ item.state === 'done' ? '✓' : item.state === 'warn' ? '!' : '○' }} {{ item.label }}
+        <button v-if="item.action" class="link" @click="setupAction(item.action)">確認</button>
+      </p>
+    </section>
+    <RouteAreaEditor v-if="data" :groups="data.route_groups" :nodes="nodes" @changed="load" />
+    <section v-if="!loading && !nodes.length" class="empty card">
+      <h3>まだ別のPCは接続されていません</h3>
+      <p>
+        東京のPCから地方局を視聴、別PCの空いているチューナー利用、故障時の別拠点切り替えができます。
+      </p>
+      <button class="button" @click="wizard = true">＋ 最初のPCを追加</button>
+      <NodeAdvancedSettings @saved="load" />
+    </section>
+    <section v-else class="node-list">
+      <div class="list-heading">
+        <h3>接続している拠点</h3>
+        <button class="button" @click="wizard = true">＋ 別のPC・拠点を追加</button>
+      </div>
+      <NodeCard
+        v-for="entry in nodes"
+        :key="entry.node.node_id"
+        :entry="entry"
+        :probe="probes[entry.node.node_id]"
+        :probing="probing === entry.node.node_id"
+        @probe="probe(entry)"
+        @edit="edit"
+        @toggle="toggle(entry)"
+        @remove="remove(entry)"
+        @topology="topology = entry"
+        @saved="load"
+      />
+    </section>
+    <div v-if="topology && data" class="topology-dialog" role="dialog" aria-modal="true">
+      <button class="button secondary" @click="topology = null">閉じる</button
+      ><NodeTopologyPreview :topology="data.topology" :focus-node-id="topology.node.node_id" @probe="probe(topology)" />
+    </div>
+    <NodeSetupWizard
+      v-if="wizard"
+      @close="wizard = false"
+      @complete="finishWizard"
+    /><NodeHelpDrawer :open="help" @close="help = false" />
   </section>
 </template>
-
 <style scoped>
-.nodes-view { display: grid; gap: 1.25rem; }
-.view-heading, .node-card-head, .selection-row, .endpoint-row, .path-row { display: flex; gap: .8rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-.view-heading h2, .node-panel h3, .node-list h3, .node-card h4 { margin: 0; }
-.view-heading p, .muted { color: var(--text-muted, #6b7280); }
-.local-node-card, .node-panel, .node-card { border: 1px solid var(--border, #d9dee7); border-radius: 12px; padding: 1rem; background: var(--surface, rgba(255,255,255,.04)); }
-.local-node-card { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
-.local-name { display: inline-flex; gap: .4rem; align-items: center; font-weight: 600; }
-.local-name input { min-width: 10rem; box-sizing: border-box; padding: .5rem .6rem; border: 1px solid var(--border, #cbd5e1); border-radius: 8px; background: inherit; color: inherit; }
-.node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
-.node-panel { display: grid; gap: .75rem; align-content: start; }
-.node-panel label { display: grid; gap: .35rem; font-weight: 600; }
-.node-panel input, .node-panel select { width: 100%; box-sizing: border-box; padding: .6rem .7rem; border: 1px solid var(--border, #cbd5e1); border-radius: 8px; background: inherit; color: inherit; }
-.node-panel .check { display: flex; align-items: center; gap: .5rem; }
-.node-panel .check input { width: auto; }
-.pairing-code { display: grid; gap: .4rem; padding: .75rem; border: 1px dashed var(--border, #cbd5e1); border-radius: 8px; }
-/* The code must stay readable on a phone: wrap instead of scrolling the page. */
-.pairing-code-value { font-size: 1.15rem; letter-spacing: .08em; font-weight: 700; overflow-wrap: anywhere; }
-.pending-list { margin: 0; padding-left: 1.1rem; font-size: .85rem; opacity: .8; }
-.node-panel hr { width: 100%; border: 0; border-top: 1px solid var(--border, #cbd5e1); margin: .25rem 0; }
-.node-list { display: grid; gap: .75rem; }
-.node-card { display: grid; gap: .9rem; }
-.node-card small { font-weight: 400; opacity: .7; }
-.actions { display: flex; gap: .5rem; justify-content: flex-end; flex-wrap: wrap; }
-.actions.compact { align-items: center; }
-.endpoint-list, .probe-result { display: grid; gap: .45rem; }
-.endpoint-row, .path-row, .selection-row { justify-content: flex-start; padding: .55rem .7rem; border-radius: 8px; background: rgba(127,127,127,.08); }
-.endpoint-row code { overflow-wrap: anywhere; }
-.path-row span { min-width: 8rem; }
-.status-pill, .chip { border-radius: 999px; padding: .2rem .55rem; font-size: .85rem; }
-.status-pill.ok { background: rgba(34,197,94,.16); }
-.status-pill.warn { background: rgba(245,158,11,.18); }
-.chips { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .4rem; }
-.chip { background: rgba(59,130,246,.14); }
-code { font-size: .86em; }
-@media (max-width: 720px) { .node-card-head { align-items: flex-start; } .actions.compact { justify-content: flex-start; } .local-name { width: 100%; } .local-name input { min-width: 0; flex: 1; } }
+.nodes-view {
+  display: grid;
+  gap: 1rem;
+}
+
+.heading,
+.heading-actions,
+.list-heading,
+.local {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.heading h2,
+.card h3,
+.list-heading h3 {
+  margin: 0;
+}
+
+.heading p {
+  margin: 0.3rem 0;
+  color: var(--text-muted, #6b7280);
+}
+
+.card {
+  padding: 1rem;
+  border: 1px solid var(--border, #d9dee7);
+  border-radius: 12px;
+  background: var(--surface, rgb(255 255 255 / 4%));
+}
+
+.local label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.local input {
+  padding: 0.5rem;
+}
+
+.setup p {
+  margin: 0.4rem 0;
+}
+
+.good {
+  color: #15803d;
+}
+
+.warn {
+  color: #a16207;
+}
+
+.empty {
+  text-align: center;
+  padding: 2rem;
+}
+
+.node-list {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.topology-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  display: grid;
+  place-content: center;
+  gap: 1rem;
+  padding: 1rem;
+  background: #0008;
+}
+
+.topology-dialog > * {
+  max-width: min(40rem, 90vw);
+  background: var(--surface, #fff);
+}
+
+@media (max-width: 700px) {
+  .heading-actions,
+  .list-heading {
+    width: 100%;
+  }
+
+  .heading-actions .button,
+  .list-heading .button {
+    flex: 1;
+  }
+
+  .local label {
+    width: 100%;
+  }
+
+  .local input {
+    flex: 1;
+    min-width: 0;
+  }
+}
 </style>

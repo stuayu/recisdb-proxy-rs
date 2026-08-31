@@ -1,11 +1,10 @@
-import { createServer } from 'node:http'
-import { mkdir, readFile, stat } from 'node:fs/promises'
-import { extname, join, normalize, resolve } from 'node:path'
+import { mkdir, readFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { chromium } from '@playwright/test'
 
 const root = resolve(process.cwd(), '../recisdb-proxy/static/vue')
 const output = resolve(process.cwd(), 'test-results/responsive')
-const port = 4176
 
 const mockJson = {
   '/api/stats': { active_tuners: 2, active_sessions: 1, total_sessions: 12, total_channels: 3 },
@@ -48,60 +47,30 @@ const mockJson = {
   '/api/tuner-config': {},
   '/api/preview-config': {},
   '/api/tsreplace-config': {},
+  '/api/nodes': {
+    success: true,
+    local: { node_id: 'home', display_name: '自宅' },
+    nodes: [],
+    route_groups: [],
+    setup_status: [],
+    topology: { local: { node_id: 'home', display_name: '自宅' }, nodes: [], paths: [] },
+    pending_pairings: [],
+  },
 }
-
-const contentTypes = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.woff2': 'font/woff2',
-}
-
-const server = createServer(async (request, response) => {
-  const url = new URL(request.url || '/', `http://127.0.0.1:${port}`)
-  if (url.pathname === '/api/events') {
-    response.writeHead(204)
-    response.end()
-    return
-  }
-  const apiBody = mockJson[url.pathname]
-  if (apiBody !== undefined) {
-    response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    response.end(JSON.stringify(apiBody))
-    return
-  }
-  if (url.pathname.startsWith('/api/')) {
-    response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    response.end('{}')
-    return
-  }
-
-  const requested = url.pathname === '/' ? 'index.html' : url.pathname.replace(/^\//, '')
-  const normalized = normalize(requested)
-  const file = join(root, normalized)
-  if (!file.startsWith(root)) {
-    response.writeHead(400)
-    response.end('bad path')
-    return
-  }
-  try {
-    const info = await stat(file)
-    const target = info.isDirectory() ? join(file, 'index.html') : file
-    response.writeHead(200, {
-      'Content-Type': contentTypes[extname(target)] || 'application/octet-stream',
-    })
-    response.end(await readFile(target))
-  } catch {
-    response.writeHead(404)
-    response.end('not found')
-  }
-})
 
 await mkdir(output, { recursive: true })
-await new Promise((resolveReady) => server.listen(port, '127.0.0.1', resolveReady))
-const browser = await chromium.launch({ headless: true })
+let browser
+try {
+  browser = await chromium.launch({ headless: true })
+} catch (error) {
+  const css = await readFile(join(root, 'assets/app.css'), 'utf8')
+  const topology = await readFile(resolve(process.cwd(), 'src/components/nodes/NodeTopologyPreview.vue'), 'utf8')
+  if (!/@media\s*\(max-width:\s*700px\)/.test(css)) throw error
+  if (!topology.includes('.mobile-svg') || !topology.includes('width: 100%')) throw error
+  console.error('Playwright unavailable; responsive checks were not run in a real browser.')
+  process.exitCode = 1
+  process.exit()
+}
 const tabs = [
   'overview',
   'bondrivers',
@@ -110,6 +79,7 @@ const tabs = [
   'scan-history',
   'session-history',
   'alerts',
+  'nodes',
   'settings',
 ]
 const viewports = [
@@ -122,7 +92,19 @@ const failures = []
 try {
   for (const viewport of viewports) {
     const page = await browser.newPage({ viewport })
-    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle' })
+    await page.addInitScript((responses) => {
+      const nativeFetch = window.fetch.bind(window)
+      window.fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, window.location.href)
+        if (!url.pathname.startsWith('/api/')) return nativeFetch(input, init)
+        if (url.pathname === '/api/events') return new Response(null, { status: 204 })
+        return new Response(JSON.stringify(responses[url.pathname] || {}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+    }, mockJson)
+    await page.goto(pathToFileURL(join(root, 'index.html')).href, { waitUntil: 'load' })
     for (const tab of tabs) {
       await page.evaluate((id) => {
         location.hash = id
@@ -142,7 +124,6 @@ try {
   }
 } finally {
   await browser.close()
-  await new Promise((resolveClosed) => server.close(resolveClosed))
 }
 
 if (failures.length) {

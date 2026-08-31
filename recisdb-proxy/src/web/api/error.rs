@@ -17,6 +17,7 @@ use serde_json::json;
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
@@ -25,6 +26,7 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            code: "not_found",
             message: message.into(),
         }
     }
@@ -33,6 +35,7 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
             message: message.into(),
         }
     }
@@ -41,6 +44,7 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
             message: message.into(),
         }
     }
@@ -50,6 +54,7 @@ impl ApiError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            code: "conflict",
             message: message.into(),
         }
     }
@@ -59,6 +64,7 @@ impl ApiError {
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
+            code: "upstream_error",
             message: message.into(),
         }
     }
@@ -68,6 +74,15 @@ impl ApiError {
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
+            code: "not_implemented",
+            message: message.into(),
+        }
+    }
+
+    pub fn coded_conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
             message: message.into(),
         }
     }
@@ -79,6 +94,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(json!({
                 "success": false,
+                "error_code": self.code,
                 "error": self.message,
             })),
         )
