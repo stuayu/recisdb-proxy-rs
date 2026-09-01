@@ -268,6 +268,10 @@ impl Database {
             "030_epg_scan_states_by_multiplex",
             Database::migration_030_epg_scan_states_by_multiplex,
         ),
+        (
+            "031_purge_bogus_program_durations",
+            Database::migration_031_purge_bogus_program_durations,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -309,6 +313,40 @@ impl Database {
                  PRIMARY KEY(network_id, tsid)
              );",
         )?;
+        Ok(())
+    }
+
+    /// Migration 031: drop program rows whose duration is out of range.
+    ///
+    /// A pre-`a6cf1ab` EIT decoder BCD-decoded the "undefined duration"
+    /// sentinel 0xFFFFFF byte-wise into 165:165:165 = 604065s. Those rows
+    /// survive as week-long blocks that cover an entire service column in the
+    /// guide, so the affected services (NHK 総合 in several regions) look like
+    /// they collect no EPG at all even though the real events are stored
+    /// alongside them. The decoder now maps the sentinel to 0 and
+    /// `upsert_programs` clamps out-of-range values, so this only has to clear
+    /// the rows already on disk. Idempotent: a re-run deletes nothing.
+    fn migration_031_purge_bogus_program_durations(&self) -> Result<()> {
+        // `programs` does not exist yet when a pre-ledger database replays
+        // from user_version = 0 up to migration 015, so guard the delete.
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='programs')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(());
+        }
+        let removed = self.conn.execute(
+            "DELETE FROM programs WHERE duration_secs < 0 OR duration_secs > ?1",
+            [program::MAX_EVENT_DURATION_SECS],
+        )?;
+        if removed > 0 {
+            log::info!(
+                "Migration 031: removed {} program row(s) with an out-of-range duration",
+                removed
+            );
+        }
         Ok(())
     }
 
@@ -1913,6 +1951,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.get_ts_queue_config().unwrap(), (3000, 4000, 30000));
+    }
+
+    /// Migration 031 must clear the week-long rows a pre-`a6cf1ab` decoder
+    /// produced from the 0xFFFFFF "undefined duration" sentinel, and leave
+    /// real events alone. Idempotent: a second run deletes nothing.
+    #[test]
+    fn migration_031_purges_only_out_of_range_durations() {
+        let db = Database::open_in_memory().unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO programs
+                    (nid, sid, tsid, event_id, start_at, duration_secs, free_ca_mode, updated_at)
+                 VALUES (1, 1, 1, 1, 0, 604065, 0, 0),
+                        (1, 1, 1, 2, 0, -1, 0, 0),
+                        (1, 1, 1, 3, 0, 1800, 0, 0),
+                        (1, 1, 1, 4, 0, 86400, 0, 0);",
+            )
+            .unwrap();
+
+        db.migration_031_purge_bogus_program_durations().unwrap();
+        let remaining: Vec<i64> = db
+            .connection()
+            .prepare("SELECT event_id FROM programs ORDER BY event_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(remaining, vec![3, 4]);
+
+        db.migration_031_purge_bogus_program_durations().unwrap();
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM programs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     /// Migration 016 must correct terrestrial rows that migration 013's

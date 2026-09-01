@@ -8,6 +8,28 @@
 use super::{Database, ProgramRecord, ProgramUpsert, Result};
 use rusqlite::params;
 
+/// Upper bound for a stored event duration, in seconds.
+///
+/// EIT carries `duration` as 3 BCD bytes, and the all-ones value 0xFFFFFF
+/// means "undefined" (ARIB STD-B10 / EN 300 468). A decoder that BCD-decodes
+/// that sentinel byte-wise yields 165:165:165 = 604065s, which renders as a
+/// week-long block that swallows every other event in the same service's
+/// column of the guide. `ts_analyzer::eit::parse_duration` maps the sentinel
+/// to 0; this bound is the second line of defence for rows arriving from any
+/// other path (node transport, an older peer). Real broadcast events never
+/// approach 24h.
+pub const MAX_EVENT_DURATION_SECS: i64 = 86_400;
+
+/// Normalize a duration to the stored range, mapping anything out of bounds
+/// to 0 ("length undefined") rather than dropping the event: the event's
+/// existence and title are still worth keeping.
+fn sanitize_duration(duration_secs: i64) -> i64 {
+    if !(0..=MAX_EVENT_DURATION_SECS).contains(&duration_secs) {
+        return 0;
+    }
+    duration_secs
+}
+
 impl Database {
     /// Batch UPSERT program rows in a single transaction.
     ///
@@ -49,7 +71,7 @@ impl Database {
                     p.tsid as i32,
                     p.event_id as i32,
                     p.start_at,
-                    p.duration_secs,
+                    sanitize_duration(p.duration_secs),
                     p.name,
                     p.description,
                     p.extended,
@@ -249,5 +271,33 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         assert_eq!(db.upsert_programs(&[]).unwrap(), 0);
         assert!(db.get_programs(0, i64::MAX, None, None).unwrap().is_empty());
+    }
+
+    /// A week-long duration is the signature of the pre-`a6cf1ab` decoder
+    /// BCD-decoding 0xFFFFFF ("undefined") into 165:165:165 = 604065s. Such a
+    /// row covers the whole guide column for its service, so it is stored as
+    /// "length undefined" (0) instead — the event itself is kept.
+    #[test]
+    fn test_upsert_clamps_out_of_range_duration() {
+        let mut db = Database::open_in_memory().unwrap();
+
+        let mut bogus = sample(1, 100, 1, 1_000, 1);
+        bogus.duration_secs = 604_065;
+        let mut negative = sample(1, 100, 2, 1_000, 1);
+        negative.duration_secs = -1;
+        let mut ok = sample(1, 100, 3, 1_000, 1);
+        ok.duration_secs = MAX_EVENT_DURATION_SECS;
+        db.upsert_programs(&[bogus, negative, ok]).unwrap();
+
+        let rows = db.get_programs(0, i64::MAX, None, None).unwrap();
+        let by_event = |id: u16| {
+            rows.iter()
+                .find(|r| r.event_id == id)
+                .unwrap()
+                .duration_secs
+        };
+        assert_eq!(by_event(1), 0);
+        assert_eq!(by_event(2), 0);
+        assert_eq!(by_event(3), MAX_EVENT_DURATION_SECS);
     }
 }

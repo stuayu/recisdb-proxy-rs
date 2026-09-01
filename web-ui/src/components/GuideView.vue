@@ -10,6 +10,14 @@ const PX_PER_MIN = 2
 const GRID_START_HOUR = 6
 const TOTAL_MINUTES = 24 * 60
 const TOTAL_HEIGHT = TOTAL_MINUTES * PX_PER_MIN
+/**
+ * Upper bound for a program's duration. Matches the server's
+ * `MAX_EVENT_DURATION_SECS`. A row longer than this is a decoding artifact
+ * (EIT's 0xFFFFFF "undefined duration" sentinel BCD-decoded byte-wise becomes
+ * 604065s); drawing it would blanket its service's whole column and hide every
+ * real program under it, so the guide drops it rather than trusting the value.
+ */
+const MAX_PROGRAM_DURATION_SECS = 24 * 60 * 60
 
 /** ARIB content_nibble level-1 category labels (major genre). */
 const GENRE_LABELS: Record<number, string> = {
@@ -389,6 +397,7 @@ const programsByService = computed(() => {
     const start_at = Number(row.start_at)
     const duration_secs = Number(row.duration_secs)
     if (![nid, sid, start_at, duration_secs].every(Number.isFinite)) continue
+    if (duration_secs < 0 || duration_secs > MAX_PROGRAM_DURATION_SECS) continue
     const key = `${nid}:${sid}`
     const program: Program = {
       id: Number(row.id),
