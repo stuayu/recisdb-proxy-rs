@@ -557,6 +557,118 @@ textarea:focus-visible,
   }
 }
 
+/* Guide grid: one multiplex column, with main/sub services split only while their programmes overlap. */
+.guide-view {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.guide-scroll {
+  width: 100%;
+  max-width: 100%;
+  overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
+}
+
+.guide-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: 64px repeat(var(--guide-columns), 220px);
+  grid-template-rows: 52px auto;
+  min-width: 100%;
+}
+
+.guide-corner {
+  grid-column: 1;
+  grid-row: 1;
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 5;
+}
+
+.guide-header-cell {
+  grid-row: 1;
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  min-width: 0;
+  height: 52px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.guide-header-cell small {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.68rem;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guide-timeaxis {
+  grid-column: 1;
+  grid-row: 2;
+  position: sticky;
+  left: 0;
+}
+
+.guide-col {
+  grid-row: 2;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.guide-channel-background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: color-mix(in srgb, var(--soft) 78%, var(--surface));
+  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 59px, var(--border) 59px, var(--border) 60px);
+}
+
+.guide-cell {
+  z-index: 1;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 2px;
+  right: auto;
+  padding: 3px 6px;
+}
+
+.guide-cell strong,
+.guide-untitled {
+  overflow: hidden;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guide-untitled {
+  color: var(--muted);
+  font-style: italic;
+}
+
+@media (max-width: 700px) {
+  .guide-grid {
+    grid-template-columns: 56px repeat(var(--guide-columns), 180px);
+  }
+
+  .guide-scroll {
+    max-width: 100vw;
+    min-height: 320px;
+  }
+
+  .guide-header-cell {
+    padding: 6px;
+  }
+}
+
 @media (max-width: 390px) {
   .stat-grid {
     grid-template-columns: 1fr;
@@ -1274,122 +1386,9 @@ textarea:focus-visible,
   min-width: 200px;
 }
 
-.guide-scroll {
-  /* Fill the viewport below the topbar/heading/toolbar chrome (~250px). */
-  height: calc(100dvh - 250px);
-  min-height: 400px;
-  overflow: auto;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-
-.guide-grid {
-  display: grid;
-  grid-auto-flow: row;
-  width: max-content;
-  min-width: 100%;
-}
-
-.guide-corner,
-.guide-header-cell {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  padding: 8px 10px;
-  background: var(--nav);
-  color: #fff;
-  border-bottom: 1px solid var(--nav2);
-  font-weight: 700;
-}
-
-.guide-corner {
-  left: 0;
-  z-index: 4;
-}
-
-.guide-header-cell {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.guide-timeaxis {
-  position: sticky;
-  left: 0;
-  z-index: 2;
-  background: var(--soft);
-  border-right: 1px solid var(--border);
-}
-
-.guide-hour-label {
-  position: absolute;
-  width: 100%;
-  padding: 2px 6px;
-  color: var(--muted);
-  font-size: 0.72rem;
-  border-top: 1px solid var(--border);
-}
-
-.guide-col {
-  position: relative;
-  border-left: 1px solid var(--border);
-
-  /* 30-minute gridlines; matches PX_PER_MIN (2px/min) in GuideView.vue */
-  background-image: repeating-linear-gradient(
-    to bottom,
-    transparent 0,
-    transparent 59px,
-    var(--border) 59px,
-    var(--border) 60px
-  );
-}
-
-.guide-cell {
-  position: absolute;
-  left: 2px;
-  right: 2px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 3px 6px;
-  overflow: hidden;
-  color: var(--text);
-  text-align: left;
-  cursor: pointer;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-left: 4px solid var(--muted);
-  border-radius: 4px;
-}
-
-.guide-cell strong {
-  overflow: hidden;
-  font-size: 0.8rem;
-  line-height: 1.2;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
 .guide-cell-time {
   color: var(--muted);
   font-size: 0.68rem;
-}
-
-/*
- * Multi-programme (sub-channel) merged cells: an extra grid item spanning every column of a
- * (nid, tsid) group, painted after (on top of) the per-column .guide-col items. It must stay
- * click-through except for its own .guide-cell buttons, since non-merged slots are still drawn
- * (and clickable) in the per-column layer underneath.
- */
-.guide-span-overlay {
-  pointer-events: none;
-  background-image: none;
-  border-left: none;
-}
-
-.guide-span-overlay .guide-cell {
-  pointer-events: auto;
 }
 
 .guide-now-line {
@@ -1479,10 +1478,6 @@ textarea:focus-visible,
     min-width: 0;
   }
 
-  .guide-scroll {
-    height: calc(100dvh - 210px);
-    min-height: 320px;
-  }
 }
 
 /* フォーム項目の補足説明。設定の意味が名前だけでは伝わらないもの

@@ -1,117 +1,47 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
 import PreviewPlayer from './PreviewPlayer.vue'
 
-// --- constants -------------------------------------------------------
-
-/** Pixels per minute of program duration. 24h grid == 1440 * PX_PER_MIN tall. */
 const PX_PER_MIN = 2
 const GRID_START_HOUR = 6
 const TOTAL_MINUTES = 24 * 60
 const TOTAL_HEIGHT = TOTAL_MINUTES * PX_PER_MIN
-/**
- * Upper bound for a program's duration. Matches the server's
- * `MAX_EVENT_DURATION_SECS`. A row longer than this is a decoding artifact
- * (EIT's 0xFFFFFF "undefined duration" sentinel BCD-decoded byte-wise becomes
- * 604065s); drawing it would blanket its service's whole column and hide every
- * real program under it, so the guide drops it rather than trusting the value.
- */
 const MAX_PROGRAM_DURATION_SECS = 24 * 60 * 60
-
-/** ARIB content_nibble level-1 category labels (major genre). */
+const VISIBLE_BUFFER_MINUTES = 180
 const GENRE_LABELS: Record<number, string> = {
-  0x0: 'ニュース/報道',
-  0x1: 'スポーツ',
-  0x2: '情報/ワイドショー',
-  0x3: 'ドラマ',
-  0x4: '音楽',
-  0x5: 'バラエティ',
-  0x6: '映画',
-  0x7: 'アニメ/特撮',
-  0x8: 'ドキュメンタリー/教養',
-  0x9: '劇場/公演',
-  0xa: '趣味/教育',
-  0xb: '福祉',
-  0xe: '拡張',
-  0xf: 'その他',
+  0: 'ニュース/報道',
+  1: 'スポーツ',
+  2: '情報/ワイドショー',
+  3: 'ドラマ',
+  4: '音楽',
+  5: 'バラエティ',
+  6: '映画',
+  7: 'アニメ/特撮',
+  8: 'ドキュメンタリー/教養',
+  9: '劇場/公演',
+  10: '趣味/教育',
+  11: '福祉',
+  14: '拡張',
+  15: 'その他',
 }
-
 const GENRE_COLORS: Record<number, string> = {
-  0x0: '#3b82f6',
-  0x1: '#22c55e',
-  0x2: '#f59e0b',
-  0x3: '#ec4899',
-  0x4: '#a855f7',
-  0x5: '#f97316',
-  0x6: '#ef4444',
-  0x7: '#06b6d4',
-  0x8: '#14b8a6',
-  0x9: '#eab308',
-  0xa: '#84cc16',
-  0xb: '#64748b',
-  0xe: '#6366f1',
-  0xf: '#9ca3af',
+  0: '#3b82f6',
+  1: '#22c55e',
+  2: '#f59e0b',
+  3: '#ec4899',
+  4: '#a855f7',
+  5: '#f97316',
+  6: '#ef4444',
+  7: '#06b6d4',
+  8: '#14b8a6',
+  9: '#eab308',
+  10: '#84cc16',
+  11: '#64748b',
+  14: '#6366f1',
+  15: '#9ca3af',
 }
-
 type BandCategory = '地上' | 'BS' | 'CS' | 'その他'
-
-const BAND_ORDER: Record<BandCategory, number> = { 地上: 0, BS: 1, CS: 2, その他: 3 }
-
-/**
- * Mirrors recisdb-proxy database/schema.rs BandType enum values.
- * Older scan rows can have `band_type = null`; fall back to deriving the
- * band from the NID range in that case (see docs/DESIGN.md NID ranges).
- */
-function bandCategory(bandType: unknown, nid: number): BandCategory {
-  if (bandType !== null && bandType !== undefined) {
-    const value = Number(bandType)
-    if (Number.isFinite(value)) {
-      switch (value) {
-        case 0: // Terrestrial
-        case 5: // CATV
-          return '地上'
-        case 1: // BS
-        case 3: // 4K (mirakurun maps this to BS too)
-          return 'BS'
-        case 2: // CS (110 degree)
-        case 6: // SKY
-          return 'CS'
-        default:
-          return 'その他'
-      }
-    }
-  }
-  if (nid === 4) return 'BS'
-  if (nid === 6 || nid === 7) return 'CS'
-  if (nid >= 0x7880 && nid <= 0x7fef) return '地上'
-  return 'その他'
-}
-
-/** service_type values worth showing in the guide: digital TV (1) and 4K (0xAD). Null is unknown/legacy, kept visible. */
-function isGuideServiceType(serviceType: unknown): boolean {
-  if (serviceType === null || serviceType === undefined) return true
-  const value = Number(serviceType)
-  return value === 1 || value === 0xad
-}
-
-function genreLevel1(genre: number | null | undefined): number | null {
-  if (genre === null || genre === undefined) return null
-  return (genre >> 4) & 0xf
-}
-
-function genreLabel(genre: number | null | undefined): string {
-  const level1 = genreLevel1(genre)
-  if (level1 === null) return '—'
-  return GENRE_LABELS[level1] ?? `不明(0x${level1.toString(16)})`
-}
-
-function genreColor(genre: number | null | undefined): string {
-  const level1 = genreLevel1(genre)
-  if (level1 === null) return 'transparent'
-  return GENRE_COLORS[level1] ?? 'var(--muted)'
-}
-
 type Service = {
   key: string
   nid: number
@@ -122,7 +52,6 @@ type Service = {
   remoteControlKey: number | null
   region: string | null
 }
-
 type Program = {
   id: number
   nid: number
@@ -135,110 +64,52 @@ type Program = {
   extended: string
   genre: number | null
 }
-
-/** One (nid, tsid) multiplex: a main service (lowest sid) plus its sub-channels (sid asc). */
 type ServiceGroup = {
   key: string
   main: Service
   subs: Service[]
-}
-
-/** A group as actually rendered: sub-channels whose EPG is identical to (or empty vs.) the main are dropped. */
-type RenderGroup = {
-  key: string
   band: BandCategory
-  columns: Service[]
-  startIndex: number
+}
+const BAND_ORDER: Record<BandCategory, number> = {
+  地上: 0,
+  BS: 1,
+  CS: 2,
+  その他: 3,
 }
 
-type DisplayColumn = {
-  service: Service
-  groupKey: string
-  /** ids of programs on this column that are already drawn once by a span overlay (see groupSpanInfo). */
-  consumedIds: Set<number>
-}
-
-/** One main-column program spanning >1 columns, ready to render as a single overlay cell. */
-type SpanItem = {
-  program: Program
-  width: number
-}
-
-type GroupSpanInfo = {
-  group: RenderGroup
-  items: SpanItem[]
-  /** consumedByColumn[i] = ids of programs in columns[i] already covered by a span item. */
-  consumedByColumn: Set<number>[]
-}
-
-/** Comparator for services within the same band: 地上 sorts by remote_control_key (nulls last), everything else by sid. */
-function compareServices(a: Service, b: Service): number {
-  if (a.band === '地上') {
-    const ra = a.remoteControlKey ?? Number.POSITIVE_INFINITY
-    const rb = b.remoteControlKey ?? Number.POSITIVE_INFINITY
-    if (ra !== rb) return ra - rb
+function bandCategory(value: unknown, nid: number): BandCategory {
+  if (value !== null && value !== undefined && Number.isFinite(Number(value))) {
+    if (Number(value) === 0 || Number(value) === 5) return '地上'
+    if (Number(value) === 1 || Number(value) === 3) return 'BS'
+    if (Number(value) === 2 || Number(value) === 6) return 'CS'
+    return 'その他'
   }
-  return a.sid - b.sid
+  if (nid === 4) return 'BS'
+  if (nid === 6 || nid === 7) return 'CS'
+  if (nid >= 0x7880 && nid <= 0x7fef) return '地上'
+  return 'その他'
 }
-
-function compareGroups(a: RenderGroup, b: RenderGroup): number {
-  if (BAND_ORDER[a.band] !== BAND_ORDER[b.band]) return BAND_ORDER[a.band] - BAND_ORDER[b.band]
-  return compareServices(a.columns[0], b.columns[0])
+function isGuideServiceType(value: unknown): boolean {
+  return value === null || value === undefined || Number(value) === 1 || Number(value) === 0xad
 }
-
-function groupServices(services: Service[]): ServiceGroup[] {
-  const map = new Map<string, Service[]>()
-  for (const svc of services) {
-    const key = `${svc.nid}:${svc.tsid}`
-    const list = map.get(key)
-    if (list) list.push(svc)
-    else map.set(key, [svc])
-  }
-  const groups: ServiceGroup[] = []
-  for (const [key, list] of map) {
-    const sorted = [...list].sort((a, b) => a.sid - b.sid)
-    groups.push({ key, main: sorted[0], subs: sorted.slice(1) })
-  }
-  return groups
+function genreLevel(genre: number | null): number | null {
+  return genre === null ? null : (genre >> 4) & 0xf
 }
-
-/** Slot identity used both for "is this sub-channel just a repeat of the main?" and cross-column cell merging. */
-/** Placeholder used when EIT carried no short-event name for a program. */
-const UNKNOWN_PROGRAM_NAME = '(番組名不明)'
-
-function isUnknownName(program: Program): boolean {
-  return program.name === UNKNOWN_PROGRAM_NAME || program.name.trim() === ''
+function genreLabel(genre: number | null): string {
+  const level = genreLevel(genre)
+  return level === null ? '—' : (GENRE_LABELS[level] ?? `不明(0x${level.toString(16)})`)
 }
-
-function programSlotKey(program: Program): string {
-  return `${program.start_at}:${program.duration_secs}:${program.name}`
+function genreColor(genre: number | null): string {
+  const level = genreLevel(genre)
+  return level === null ? 'transparent' : (GENRE_COLORS[level] ?? 'var(--muted)')
 }
-
-function programSlotKeySet(programs: Program[]): Set<string> {
-  return new Set(programs.map(programSlotKey))
+function fmtDateInput(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
-
-function sameSlotSets(a: Set<string>, b: Set<string>): boolean {
-  if (a.size !== b.size) return false
-  for (const key of a) if (!b.has(key)) return false
-  return true
+function fmtTime(epoch: number): string {
+  const date = new Date(epoch * 1000)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
-
-// --- date helpers ------------------------------------------------------
-
-function fmtDateInput(d: Date): string {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
-function fmtTime(epochSec: number): string {
-  const d = new Date(epochSec * 1000)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
-
-// --- state ---------------------------------------------------------
 
 const rawChannels = ref<JsonRecord[]>([])
 const rawPrograms = ref<JsonRecord[]>([])
@@ -250,51 +121,58 @@ const regionFilter = ref('すべて')
 const serviceQuery = ref('')
 const now = ref(Date.now())
 const detail = ref<Program | null>(null)
+const previewProgram = ref<Program | null>(null)
+const scrollArea = ref<HTMLElement | null>(null)
+const viewportHeight = ref(0)
+const visibleRangeTop = ref(0)
+const visibleRangeBottom = ref(TOTAL_HEIGHT)
+let scrollAnimationId: number | null = null
+let pendingScrollTop = 0
 let clockTimer = 0
-
-function shiftDate(days: number) {
-  const [y, m, d] = selectedDate.value.split('-').map(Number)
-  const dt = new Date(y, m - 1, d)
-  dt.setDate(dt.getDate() + days)
-  selectedDate.value = fmtDateInput(dt)
-}
-
-function goToday() {
-  selectedDate.value = fmtDateInput(new Date())
-}
-
 const gridStart = computed(() => {
-  const [y, m, d] = selectedDate.value.split('-').map(Number)
-  return new Date(y, m - 1, d, GRID_START_HOUR, 0, 0, 0)
+  const [year, month, day] = selectedDate.value.split('-').map(Number)
+  return new Date(year, month - 1, day, GRID_START_HOUR)
 })
-
 const gridBounds = computed(() => {
   const since = Math.floor(gridStart.value.getTime() / 1000)
   return { since, until: since + TOTAL_MINUTES * 60 }
 })
-
 const isToday = computed(() => selectedDate.value === fmtDateInput(new Date()))
-
-const nowOffset = computed(() => {
-  const minutes = (now.value / 1000 - gridBounds.value.since) / 60
-  return minutes * PX_PER_MIN
-})
-
+const nowOffset = computed(() => ((now.value / 1000 - gridBounds.value.since) / 60) * PX_PER_MIN)
 const showNowLine = computed(
   () => isToday.value && nowOffset.value >= 0 && nowOffset.value <= TOTAL_HEIGHT,
 )
-
 const hourMarks = computed(() =>
-  Array.from({ length: 24 }, (_, i) => {
-    const hour = GRID_START_HOUR + i
-    return {
-      offset: i * 60 * PX_PER_MIN,
-      label: `${String(hour).padStart(2, '0')}:00`,
-    }
-  }),
+  Array.from({ length: 24 }, (_, index) => ({
+    offset: index * 60 * PX_PER_MIN,
+    label: `${String((GRID_START_HOUR + index) % 24).padStart(2, '0')}:00`,
+  })),
 )
-
-// --- data loading ----------------------------------------------------
+function updateVisibleRange(top: number) {
+  const buffer = VISIBLE_BUFFER_MINUTES * PX_PER_MIN
+  visibleRangeTop.value = Math.max(0, top - buffer)
+  visibleRangeBottom.value = Math.min(TOTAL_HEIGHT, top + viewportHeight.value + buffer)
+}
+function scheduleScrollUpdate() {
+  if (scrollAnimationId !== null) return
+  scrollAnimationId = requestAnimationFrame(() => {
+    scrollAnimationId = null
+    updateVisibleRange(pendingScrollTop)
+  })
+}
+function onScroll() {
+  pendingScrollTop = scrollArea.value?.scrollTop ?? 0
+  scheduleScrollUpdate()
+}
+function resizeGrid() {
+  viewportHeight.value = scrollArea.value?.clientHeight ?? 0
+  updateVisibleRange(scrollArea.value?.scrollTop ?? 0)
+}
+function isProgramVisible(program: Program): boolean {
+  const start = ((program.start_at - gridBounds.value.since) / 60) * PX_PER_MIN
+  const end = start + (program.duration_secs / 60) * PX_PER_MIN
+  return end >= visibleRangeTop.value && start <= visibleRangeBottom.value
+}
 
 async function loadChannels() {
   try {
@@ -303,7 +181,6 @@ async function loadChannels() {
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
-
 async function loadPrograms() {
   loading.value = true
   try {
@@ -318,27 +195,22 @@ async function loadPrograms() {
     loading.value = false
   }
 }
-
 async function refresh() {
   await Promise.all([loadChannels(), loadPrograms()])
+  await nextTick()
+  resizeGrid()
 }
-
-// --- derived data ------------------------------------------------------
 
 const services = computed<Service[]>(() => {
   const seen = new Map<string, Service>()
   for (const row of rawChannels.value) {
-    const nid = Number(row.nid)
-    const sid = Number(row.sid)
-    const tsid = Number(row.tsid)
-    if (!Number.isFinite(nid) || !Number.isFinite(sid) || !Number.isFinite(tsid)) continue
-    if (!isGuideServiceType(row.service_type)) continue
+    const nid = Number(row.nid),
+      sid = Number(row.sid),
+      tsid = Number(row.tsid)
+    if (![nid, sid, tsid].every(Number.isFinite) || !isGuideServiceType(row.service_type)) continue
     const key = `${nid}:${sid}`
     if (seen.has(key)) continue
-    const remoteControlKey =
-      row.remote_control_key === null || row.remote_control_key === undefined
-        ? null
-        : Number(row.remote_control_key)
+    const remote = row.remote_control_key == null ? null : Number(row.remote_control_key)
     seen.set(key, {
       key,
       nid,
@@ -346,220 +218,171 @@ const services = computed<Service[]>(() => {
       tsid,
       name: String(row.channel_name ?? `${nid}-${sid}`),
       band: bandCategory(row.band_type, nid),
-      remoteControlKey:
-        remoteControlKey !== null && Number.isFinite(remoteControlKey) ? remoteControlKey : null,
-      region:
-        row.terrestrial_region === null || row.terrestrial_region === undefined
-          ? null
-          : String(row.terrestrial_region),
+      remoteControlKey: Number.isFinite(remote) ? remote : null,
+      region: row.terrestrial_region == null ? null : String(row.terrestrial_region),
     })
   }
-  return Array.from(seen.values()).sort((a, b) => a.nid - b.nid || a.sid - b.sid)
+  return [...seen.values()].sort(
+    (a, b) =>
+      BAND_ORDER[a.band] - BAND_ORDER[b.band] ||
+      a.nid - b.nid ||
+      (a.remoteControlKey ?? 999) - (b.remoteControlKey ?? 999) ||
+      a.sid - b.sid,
+  )
 })
-
-/** Region choices (terrestrial services), in first-seen order. Always visible. */
-const regionOptions = computed(() => {
-  const seen: string[] = []
-  for (const svc of services.value) {
-    if (svc.band !== '地上' || svc.region === null) continue
-    if (!seen.includes(svc.region)) seen.push(svc.region)
-  }
-  return seen
-})
-
+const regionOptions = computed(() => [
+  ...new Set(
+    services.value
+      .filter((service) => service.band === '地上' && service.region)
+      .map((service) => service.region as string),
+  ),
+])
 watch(bandFilter, (value) => {
   if (value !== '地上' && value !== 'すべて') regionFilter.value = 'すべて'
 })
-// Picking a concrete region implies terrestrial.
 watch(regionFilter, (value) => {
   if (value !== 'すべて' && bandFilter.value !== '地上') bandFilter.value = '地上'
 })
-
 const filteredServices = computed(() => {
   const query = serviceQuery.value.trim().toLowerCase()
-  return services.value.filter((svc) => {
-    if (bandFilter.value !== 'すべて' && svc.band !== bandFilter.value) return false
-    if (regionFilter.value !== 'すべて' && svc.region !== regionFilter.value) return false
-    if (!query) return true
-    return (
-      svc.name.toLowerCase().includes(query) ||
-      String(svc.nid).includes(query) ||
-      String(svc.sid).includes(query)
-    )
-  })
+  return services.value.filter(
+    (service) =>
+      (bandFilter.value === 'すべて' || service.band === bandFilter.value) &&
+      (regionFilter.value === 'すべて' || service.region === regionFilter.value) &&
+      (!query ||
+        service.name.toLowerCase().includes(query) ||
+        String(service.nid).includes(query) ||
+        String(service.sid).includes(query)),
+  )
 })
-
 const programsByService = computed(() => {
-  const map = new Map<string, Program[]>()
+  const result = new Map<string, Program[]>()
   for (const row of rawPrograms.value) {
-    const nid = Number(row.nid)
-    const sid = Number(row.sid)
-    const start_at = Number(row.start_at)
-    const duration_secs = Number(row.duration_secs)
-    if (![nid, sid, start_at, duration_secs].every(Number.isFinite)) continue
-    if (duration_secs < 0 || duration_secs > MAX_PROGRAM_DURATION_SECS) continue
-    const key = `${nid}:${sid}`
+    const nid = Number(row.nid),
+      sid = Number(row.sid),
+      start = Number(row.start_at),
+      duration = Number(row.duration_secs)
+    if (
+      ![nid, sid, start, duration].every(Number.isFinite) ||
+      duration < 0 ||
+      duration > MAX_PROGRAM_DURATION_SECS
+    )
+      continue
     const program: Program = {
       id: Number(row.id),
       nid,
       sid,
       event_id: Number(row.event_id),
-      start_at,
-      duration_secs,
-      name: String(row.name ?? UNKNOWN_PROGRAM_NAME),
-      description: String(row.description ?? ''),
-      extended: String(row.extended ?? ''),
-      genre: row.genre === null || row.genre === undefined ? null : Number(row.genre),
+      start_at: start,
+      duration_secs: duration,
+      name: row.name == null ? '' : String(row.name),
+      description: row.description == null ? '' : String(row.description),
+      extended: row.extended == null ? '' : String(row.extended),
+      genre: row.genre == null ? null : Number(row.genre),
     }
-    const list = map.get(key)
+    const list = result.get(`${nid}:${sid}`)
     if (list) list.push(program)
-    else map.set(key, [program])
+    else result.set(`${nid}:${sid}`, [program])
   }
-  for (const list of map.values()) list.sort((a, b) => a.start_at - b.start_at)
-  return map
+  for (const list of result.values()) list.sort((a, b) => a.start_at - b.start_at)
+  return result
 })
-
-const hasAnyPrograms = computed(() => rawPrograms.value.length > 0)
-
-function programsFor(svc: Service): Program[] {
-  return programsByService.value.get(svc.key) ?? []
+function programsFor(service: Service): Program[] {
+  return programsByService.value.get(service.key) ?? []
 }
-
-/**
- * (nid, tsid) multiplexes collapsed to what's actually shown: a sub-channel is dropped when its
- * programme list for the selected day is empty or an exact match of the main service's, and kept
- * (as its own column, immediately right of the main) otherwise.
- */
-const renderGroups = computed<RenderGroup[]>(() => {
-  const groups = groupServices(filteredServices.value).map((group): RenderGroup => {
-    const mainKeys = programSlotKeySet(programsFor(group.main))
-    const visibleSubs = group.subs.filter((sub) => {
-      const subPrograms = programsFor(sub)
-      if (subPrograms.length === 0) return false
-      return !sameSlotSets(mainKeys, programSlotKeySet(subPrograms))
+const groups = computed<ServiceGroup[]>(() => {
+  const map = new Map<string, Service[]>()
+  for (const service of filteredServices.value) {
+    const key = `${service.nid}:${service.tsid}`
+    const list = map.get(key)
+    if (list) list.push(service)
+    else map.set(key, [service])
+  }
+  return [...map]
+    .map(([key, list]) => {
+      const sorted = [...list].sort((a, b) => a.sid - b.sid)
+      const main = sorted[0]
+      const mainPrograms = programsFor(main)
+      const subs = sorted.slice(1).filter((service) => {
+        const subPrograms = programsFor(service)
+        if (subPrograms.length === 0) return false
+        return !sameSlotSets(mainPrograms, subPrograms)
+      })
+      return { key, main, subs, band: main.band }
     })
-    const columns = [group.main, ...visibleSubs]
-    return { key: group.key, band: group.main.band, columns, startIndex: 0 }
-  })
-  groups.sort(compareGroups)
-  let offset = 0
-  for (const group of groups) {
-    group.startIndex = offset
-    offset += group.columns.length
-  }
-  return groups
+    .sort(
+      (a, b) =>
+        BAND_ORDER[a.band] - BAND_ORDER[b.band] ||
+        a.main.nid - b.main.nid ||
+        a.main.sid - b.main.sid,
+    )
 })
-
-/**
- * Per-group, per-main-program span widths. For each program P on the main column, walk the
- * subsequent columns left-to-right and extend the span while each column either (a) has a program
- * in the exact same slot as P, or (b) has no *named* program overlapping P's time range — an EPG
- * gap, or only name-unknown placeholder rows, neither of which contradicts "same as main" (the
- * placeholder rows overlapping P are absorbed so they don't render under the span). The walk
- * stops at the first column with a different named program overlapping P's range. Widths of 1
- * (no extension) are not recorded as spans; those programs draw normally in their own column via
- * columnPrograms/consumedIds.
- */
-const groupSpanInfo = computed<GroupSpanInfo[]>(() =>
-  renderGroups.value.map((group): GroupSpanInfo => {
-    const consumedByColumn: Set<number>[] = group.columns.map(() => new Set<number>())
-    const items: SpanItem[] = []
-    if (group.columns.length > 1) {
-      const colPrograms = group.columns.map((service) => programsFor(service))
-      for (const program of colPrograms[0]) {
-        const pStart = program.start_at
-        const pEnd = pStart + program.duration_secs
-        const slotKey = programSlotKey(program)
-        const matchedByColumn: Program[][] = [[program]]
-        let width = 1
-        for (let col = 1; col < group.columns.length; col++) {
-          const sameSlot = colPrograms[col].find((p) => programSlotKey(p) === slotKey) ?? null
-          if (sameSlot) {
-            matchedByColumn.push([sameSlot])
-            width++
-            continue
-          }
-          const overlapping = colPrograms[col].filter(
-            (p) => p.start_at < pEnd && p.start_at + p.duration_secs > pStart,
-          )
-          if (overlapping.every(isUnknownName)) {
-            // EPG gap, or only name-unknown rows: absorb them under the span.
-            matchedByColumn.push(overlapping)
-            width++
-            continue
-          }
-          break
-        }
-        if (width > 1) {
-          items.push({ program, width })
-          for (let col = 0; col < width; col++) {
-            for (const matched of matchedByColumn[col]) consumedByColumn[col].add(matched.id)
-          }
-        }
-      }
-    }
-    return { group, items, consumedByColumn }
-  }),
-)
-
-/** Flattened one-entry-per-grid-column view of renderGroups, in display order. */
-const displayColumns = computed<DisplayColumn[]>(() =>
-  groupSpanInfo.value.flatMap((info) =>
-    info.group.columns.map((service, index) => ({
-      service,
-      groupKey: info.group.key,
-      consumedIds: info.consumedByColumn[index],
-    })),
-  ),
-)
-
-/** One overlay cell per spanning main-column program, positioned to cover its computed column width. */
-const spanRenderItems = computed(() =>
-  groupSpanInfo.value.flatMap((info) =>
-    info.items
-      .filter((item) => visible(item.program))
-      .map((item) => ({
-        key: `span-${info.group.key}-${item.program.id}`,
-        program: item.program,
-        gridColumn: `${info.group.startIndex + 2} / span ${item.width}`,
-      })),
-  ),
-)
-
-/** Programs to draw in an individual column: visible in the day grid and not already covered by a spanning cell. */
-function columnPrograms(col: DisplayColumn): Program[] {
-  return programsFor(col.service)
-    .filter(visible)
-    .filter((program) => !col.consumedIds.has(program.id))
+function overlaps(program: Program, others: Program[]): boolean {
+  const end = program.start_at + program.duration_secs
+  return others.some(
+    (other) => other.start_at < end && other.start_at + other.duration_secs > program.start_at,
+  )
 }
-
-function cellStyle(program: Program) {
-  const { since } = gridBounds.value
-  const topMin = Math.max(0, (program.start_at - since) / 60)
-  const bottomMin = Math.min(TOTAL_MINUTES, (program.start_at + program.duration_secs - since) / 60)
-  const height = Math.max(bottomMin - topMin, 1) * PX_PER_MIN
+function programSlotKey(program: Program): string | null {
+  if (!program.name.trim()) return null
+  return `${program.start_at}:${program.duration_secs}:${program.name}`
+}
+function sameSlotSets(mainPrograms: Program[], subPrograms: Program[]): boolean {
+  if (mainPrograms.length !== subPrograms.length || mainPrograms.length === 0) return false
+  const mainKeys = mainPrograms.map(programSlotKey)
+  const subKeys = subPrograms.map(programSlotKey)
+  if (mainKeys.some((key) => key === null) || subKeys.some((key) => key === null)) return false
+  const subKeySet = new Set(subKeys)
+  return mainKeys.every((key) => subKeySet.has(key))
+}
+function programsForRender(group: ServiceGroup) {
+  const subPrograms = group.subs.flatMap(programsFor)
+  return [
+    ...programsFor(group.main).map((program) => ({
+      program,
+      isSub: false,
+      split: subPrograms.length > 0 && overlaps(program, subPrograms),
+    })),
+    ...group.subs.flatMap((service) =>
+      programsFor(service).map((program) => ({
+        program,
+        isSub: true,
+        split: overlaps(program, programsFor(group.main)),
+      })),
+    ),
+  ].filter((item) => isProgramVisible(item.program))
+}
+function cellStyle(item: { program: Program; isSub: boolean; split: boolean }) {
+  const start = Math.max(0, (item.program.start_at - gridBounds.value.since) / 60) * PX_PER_MIN
+  const end =
+    Math.min(
+      TOTAL_MINUTES,
+      (item.program.start_at + item.program.duration_secs - gridBounds.value.since) / 60,
+    ) * PX_PER_MIN
   return {
-    top: `${topMin * PX_PER_MIN}px`,
-    height: `${height}px`,
-    borderLeftColor: genreColor(program.genre),
-    background: `color-mix(in srgb, ${genreColor(program.genre)} 12%, var(--surface))`,
+    top: `${start}px`,
+    height: `${Math.max(end - start, 2)}px`,
+    left: item.isSub && item.split ? '50%' : '0',
+    width: item.split ? '50%' : '100%',
+    borderLeftColor: genreColor(item.program.genre),
+    background: `color-mix(in srgb, ${genreColor(item.program.genre)} 12%, var(--surface))`,
   }
 }
-
-function visible(program: Program): boolean {
-  const { since, until } = gridBounds.value
-  return program.start_at < until && program.start_at + program.duration_secs > since
+function shiftDate(days: number) {
+  const [y, m, d] = selectedDate.value.split('-').map(Number)
+  const date = new Date(y, m - 1, d)
+  date.setDate(date.getDate() + days)
+  selectedDate.value = fmtDateInput(date)
 }
-
+function goToday() {
+  selectedDate.value = fmtDateInput(new Date())
+}
 function openDetail(program: Program) {
   detail.value = program
 }
-
 function closeDetail() {
   detail.value = null
 }
-
-const previewProgram = ref<Program | null>(null)
 function openPreview(program: Program) {
   detail.value = null
   previewProgram.value = program
@@ -567,33 +390,31 @@ function openPreview(program: Program) {
 function closePreview() {
   previewProgram.value = null
 }
-
-function gridTemplateColumns() {
-  return `64px repeat(${displayColumns.value.length}, minmax(160px, 1fr))`
-}
-
-watch(selectedDate, () => void loadPrograms())
-
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (previewProgram.value) closePreview()
   else closeDetail()
 }
-
+watch(selectedDate, () => void loadPrograms())
 onMounted(() => {
   void refresh()
-  clockTimer = window.setInterval(() => (now.value = Date.now()), 30000)
+  resizeGrid()
+  clockTimer = window.setInterval(() => {
+    now.value = Date.now()
+  }, 30000)
+  window.addEventListener('resize', resizeGrid)
   window.addEventListener('keydown', onKeydown)
 })
-
 onUnmounted(() => {
   window.clearInterval(clockTimer)
+  window.removeEventListener('resize', resizeGrid)
   window.removeEventListener('keydown', onKeydown)
+  if (scrollAnimationId !== null) cancelAnimationFrame(scrollAnimationId)
 })
 </script>
 
 <template>
-  <section class="view">
+  <section class="view guide-view">
     <div class="view-heading">
       <div>
         <h2>番組表</h2>
@@ -601,65 +422,57 @@ onUnmounted(() => {
       </div>
       <button class="button secondary" @click="refresh" v-text="loading ? '更新中…' : '更新'" />
     </div>
-
     <div class="guide-toolbar">
       <div class="guide-date-nav">
-        <button class="button small secondary" aria-label="前日" @click="shiftDate(-1)">◀</button>
-        <button class="button small secondary" @click="goToday">今日</button>
-        <button class="button small secondary" aria-label="翌日" @click="shiftDate(1)">▶</button>
-        <input v-model="selectedDate" type="date" aria-label="日付を選択" />
+        <button class="button small secondary" aria-label="前日" @click="shiftDate(-1)">◀</button
+        ><button class="button small secondary" @click="goToday">今日</button
+        ><button class="button small secondary" aria-label="翌日" @click="shiftDate(1)">▶</button
+        ><input v-model="selectedDate" type="date" aria-label="日付を選択" />
       </div>
-      <label class="field guide-band-filter">
-        <span>放送種別</span>
-        <select v-model="bandFilter">
+      <label class="field guide-band-filter"
+        ><span>放送種別</span
+        ><select v-model="bandFilter">
           <option value="すべて">すべて</option>
           <option value="地上">地上波</option>
           <option value="BS">BS</option>
           <option value="CS">CS</option>
-        </select>
-      </label>
-      <label class="field guide-region-filter">
-        <span>地域（地上）</span>
-        <select v-model="regionFilter" :disabled="!regionOptions.length">
+        </select></label
+      ><label class="field guide-region-filter"
+        ><span>地域（地上）</span
+        ><select v-model="regionFilter" :disabled="!regionOptions.length">
           <option value="すべて">すべての地域</option>
-          <option v-for="region in regionOptions" :key="region" :value="region" v-text="region" />
-        </select>
-      </label>
-      <label class="search guide-service-search">
-        <span>サービス絞り込み</span>
-        <input v-model="serviceQuery" type="search" placeholder="チャンネル名、NID、SID" />
-      </label>
+          <option
+            v-for="region in regionOptions"
+            :key="region"
+            :value="region"
+            v-text="region"
+          /></select></label
+      ><label class="search guide-service-search"
+        ><span>サービス絞り込み</span
+        ><input v-model="serviceQuery" type="search" placeholder="チャンネル名、NID、SID"
+      /></label>
     </div>
-
     <p v-if="error" class="notice error" role="alert" v-text="error" />
-
-    <p v-if="!hasAnyPrograms && !loading" class="empty-state">
+    <p v-if="!rawPrograms.length && !loading" class="empty-state">
       番組情報がありません。番組情報は視聴中のチャンネルから自動収集されます。
     </p>
-
-    <div v-else class="guide-scroll">
-      <!--
-        Every cell below is explicitly placed via gridColumn/gridRow rather than relying on
-        grid-auto-flow. The span overlays (merged sub-channel cells) need explicit both-axis
-        placement to cover multiple columns, and CSS Grid places all explicitly-both-axis items
-        *before* auto-placed ones regardless of DOM order — mixing that with auto-placed .guide-col
-        cells would make the auto items skip the overlay's reserved cells and drift out of column.
-        Placing everything explicitly sidesteps that entirely.
-      -->
-      <div class="guide-grid" :style="{ gridTemplateColumns: gridTemplateColumns() }">
-        <div class="guide-corner" aria-hidden="true" :style="{ gridColumn: 1, gridRow: 1 }" />
-        <div
-          v-for="(col, index) in displayColumns"
-          :key="`h-${col.service.key}`"
-          class="guide-header-cell"
-          :style="{ gridColumn: index + 2, gridRow: 1 }"
-          v-text="col.service.name"
-        />
-
-        <div
-          class="guide-timeaxis"
-          :style="{ gridColumn: 1, gridRow: 2, height: `${TOTAL_HEIGHT}px` }"
-        >
+    <div v-else ref="scrollArea" class="guide-scroll" @scroll="onScroll">
+      <div
+        class="guide-grid"
+        :style="{
+          width: `${64 + groups.length * 220}px`,
+          height: `${TOTAL_HEIGHT + 52}px`,
+          '--guide-columns': groups.length,
+        }"
+      >
+        <div class="guide-corner" />
+        <div v-for="group in groups" :key="`h-${group.key}`" class="guide-header-cell">
+          <span v-text="group.main.name" /><small
+            v-if="group.subs.length"
+            v-text="group.subs.map((service) => service.name).join(' / ')"
+          />
+        </div>
+        <div class="guide-timeaxis" :style="{ height: `${TOTAL_HEIGHT}px` }">
           <div
             v-for="mark in hourMarks"
             :key="mark.label"
@@ -668,51 +481,33 @@ onUnmounted(() => {
             v-text="mark.label"
           />
         </div>
-
         <div
-          v-for="(col, index) in displayColumns"
-          :key="`c-${col.service.key}`"
+          v-for="group in groups"
+          :key="`c-${group.key}`"
           class="guide-col"
-          :style="{ gridColumn: index + 2, gridRow: 2, height: `${TOTAL_HEIGHT}px` }"
+          :style="{ height: `${TOTAL_HEIGHT}px` }"
         >
+          <div class="guide-channel-background" :style="{ height: `${TOTAL_HEIGHT}px` }" />
           <div v-if="showNowLine" class="guide-now-line" :style="{ top: `${nowOffset}px` }" />
           <button
-            v-for="program in columnPrograms(col)"
-            :key="program.id"
+            v-for="item in programsForRender(group)"
+            :key="item.program.id"
             type="button"
             class="guide-cell"
-            :style="cellStyle(program)"
-            @click="openDetail(program)"
-          >
-            <strong v-text="program.name" />
-            <span class="guide-cell-time" v-text="fmtTime(program.start_at)" />
-          </button>
-        </div>
-
-        <!-- Spanning cells: a main-column program whose neighbouring columns either repeat the
-             same slot or have no EPG data at all for that time range is drawn once here, spanning
-             every column it covers, on top of the per-column cells above (which already skip
-             these programs via DisplayColumn.consumedIds). -->
-        <div
-          v-for="item in spanRenderItems"
-          :key="item.key"
-          class="guide-col guide-span-overlay"
-          :style="{ gridColumn: item.gridColumn, gridRow: '2 / 3', height: `${TOTAL_HEIGHT}px` }"
-        >
-          <button
-            type="button"
-            class="guide-cell"
-            :style="cellStyle(item.program)"
+            :aria-label="item.program.name || '番組名なし'"
+            :style="cellStyle(item)"
             @click="openDetail(item.program)"
           >
-            <strong v-text="item.program.name" />
-            <span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
+            <strong v-if="item.program.name" v-text="item.program.name" /><span
+              v-else
+              class="guide-untitled"
+              >番組名なし</span
+            ><span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
           </button>
         </div>
       </div>
-      <p v-if="!displayColumns.length" class="empty-state">条件に一致するサービスがありません</p>
+      <p v-if="!groups.length" class="empty-state">条件に一致するサービスがありません</p>
     </div>
-
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">
       <section
         class="dialog guide-detail-dialog"
@@ -720,7 +515,7 @@ onUnmounted(() => {
         aria-modal="true"
         aria-labelledby="guide-detail-title"
       >
-        <h2 id="guide-detail-title" v-text="detail.name" />
+        <h2 id="guide-detail-title" v-text="detail.name || '番組情報'" />
         <p class="guide-detail-time">
           <span v-text="fmtTime(detail.start_at)" />〜<span
             v-text="fmtTime(detail.start_at + detail.duration_secs)"
@@ -741,8 +536,8 @@ onUnmounted(() => {
           v-text="detail.extended"
         />
         <div class="actions">
-          <button class="button" @click="openPreview(detail)">▶ プレビュー</button>
-          <button class="button secondary" @click="closeDetail">閉じる</button>
+          <button class="button" @click="openPreview(detail)">▶ プレビュー</button
+          ><button class="button secondary" @click="closeDetail">閉じる</button>
         </div>
       </section>
     </div>
@@ -758,7 +553,7 @@ onUnmounted(() => {
             <h2 id="guide-preview-player-title">ブラウザプレビュー</h2>
             <p
               class="muted"
-              v-text="`${previewProgram.name || '—'}（SID ${previewProgram.sid}）`"
+              v-text="`${previewProgram.name || '番組名なし'}（SID ${previewProgram.sid}）`"
             />
           </div>
           <button class="button secondary" @click="closePreview">閉じる</button>
