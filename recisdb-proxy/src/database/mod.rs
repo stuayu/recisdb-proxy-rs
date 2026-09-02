@@ -272,6 +272,10 @@ impl Database {
             "031_purge_bogus_program_durations",
             Database::migration_031_purge_bogus_program_durations,
         ),
+        (
+            "032_epg_source_update_clocks",
+            Database::migration_032_epg_source_update_clocks,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -347,6 +351,15 @@ impl Database {
                 removed
             );
         }
+        Ok(())
+    }
+
+    fn migration_032_epg_source_update_clocks(&self) -> Result<()> {
+        self.add_column_if_not_exists("programs", "source", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_not_exists("programs", "pf_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "schedule_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "basic_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "extended_updated_at", "INTEGER")?;
         Ok(())
     }
 

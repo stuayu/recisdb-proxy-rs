@@ -5,7 +5,7 @@
 //! the dashboard API (`web/api/programs.rs`) and the Mirakurun-compatible
 //! API (`web/mirakurun.rs::get_programs`).
 
-use super::{Database, ProgramRecord, ProgramUpsert, Result};
+use super::{Database, EpgSource, ProgramRecord, ProgramUpsert, Result};
 use rusqlite::params;
 
 /// Upper bound for a stored event duration, in seconds.
@@ -49,19 +49,46 @@ impl Database {
             let mut stmt = tx.prepare(
                 "INSERT INTO programs (
                     nid, sid, tsid, event_id, start_at, duration_secs,
-                    name, description, extended, genre, free_ca_mode, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    name, description, extended, genre, free_ca_mode, updated_at,
+                    source, pf_updated_at, schedule_updated_at,
+                    basic_updated_at, extended_updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                          ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(nid, sid, tsid, event_id) DO UPDATE SET
                     tsid = excluded.tsid,
-                    start_at = excluded.start_at,
-                    duration_secs = excluded.duration_secs,
-                    name = excluded.name,
-                    description = excluded.description,
-                    extended = excluded.extended,
-                    genre = excluded.genre,
-                    free_ca_mode = excluded.free_ca_mode,
-                    updated_at = excluded.updated_at
-                 WHERE excluded.updated_at >= programs.updated_at",
+                    start_at = CASE WHEN (excluded.source = 0 AND
+                                      (programs.pf_updated_at IS NULL OR excluded.updated_at >= programs.pf_updated_at))
+                                  OR (excluded.source = 1 AND
+                                      (programs.schedule_updated_at IS NULL OR excluded.updated_at >= programs.schedule_updated_at))
+                                  THEN excluded.start_at ELSE programs.start_at END,
+                    duration_secs = CASE WHEN (excluded.source = 0 AND
+                                      (programs.pf_updated_at IS NULL OR excluded.updated_at >= programs.pf_updated_at))
+                                  OR (excluded.source = 1 AND
+                                      (programs.schedule_updated_at IS NULL OR excluded.updated_at >= programs.schedule_updated_at))
+                                  THEN excluded.duration_secs ELSE programs.duration_secs END,
+                    free_ca_mode = CASE WHEN (excluded.source = 0 AND
+                                      (programs.pf_updated_at IS NULL OR excluded.updated_at >= programs.pf_updated_at))
+                                  OR (excluded.source = 1 AND
+                                      (programs.schedule_updated_at IS NULL OR excluded.updated_at >= programs.schedule_updated_at))
+                                  THEN excluded.free_ca_mode ELSE programs.free_ca_mode END,
+                    name = CASE WHEN excluded.basic_updated_at IS NOT NULL AND
+                                      (programs.basic_updated_at IS NULL OR excluded.basic_updated_at >= programs.basic_updated_at)
+                                THEN COALESCE(excluded.name, programs.name) ELSE programs.name END,
+                    description = CASE WHEN excluded.basic_updated_at IS NOT NULL AND
+                                      (programs.basic_updated_at IS NULL OR excluded.basic_updated_at >= programs.basic_updated_at)
+                                THEN COALESCE(excluded.description, programs.description) ELSE programs.description END,
+                    genre = CASE WHEN excluded.basic_updated_at IS NOT NULL AND
+                                      (programs.basic_updated_at IS NULL OR excluded.basic_updated_at >= programs.basic_updated_at)
+                                THEN COALESCE(excluded.genre, programs.genre) ELSE programs.genre END,
+                    extended = CASE WHEN excluded.extended_updated_at IS NOT NULL AND
+                                      (programs.extended_updated_at IS NULL OR excluded.extended_updated_at >= programs.extended_updated_at)
+                                THEN COALESCE(excluded.extended, programs.extended) ELSE programs.extended END,
+                    updated_at = MAX(programs.updated_at, excluded.updated_at),
+                    source = excluded.source,
+                    pf_updated_at = CASE WHEN excluded.source = 0 THEN MAX(COALESCE(programs.pf_updated_at, 0), excluded.updated_at) ELSE programs.pf_updated_at END,
+                    schedule_updated_at = CASE WHEN excluded.source = 1 THEN MAX(COALESCE(programs.schedule_updated_at, 0), excluded.updated_at) ELSE programs.schedule_updated_at END,
+                    basic_updated_at = CASE WHEN excluded.basic_updated_at IS NOT NULL THEN MAX(COALESCE(programs.basic_updated_at, 0), excluded.basic_updated_at) ELSE programs.basic_updated_at END,
+                    extended_updated_at = CASE WHEN excluded.extended_updated_at IS NOT NULL THEN MAX(COALESCE(programs.extended_updated_at, 0), excluded.extended_updated_at) ELSE programs.extended_updated_at END",
             )?;
 
             for p in programs {
@@ -78,6 +105,11 @@ impl Database {
                     p.genre,
                     p.free_ca_mode,
                     p.updated_at,
+                    p.source as i64,
+                    if p.source == EpgSource::PresentFollowing { Some(p.updated_at) } else { None },
+                    if p.source == EpgSource::Schedule { Some(p.updated_at) } else { None },
+                    p.basic_updated_at,
+                    p.extended_updated_at,
                 ])?;
             }
         }
@@ -170,6 +202,9 @@ mod tests {
             genre: Some(0x21),
             free_ca_mode: false,
             updated_at,
+            source: EpgSource::PresentFollowing,
+            basic_updated_at: Some(updated_at),
+            extended_updated_at: None,
         }
     }
 
@@ -244,6 +279,49 @@ mod tests {
             rows.iter().map(|r| r.tsid).collect::<Vec<_>>(),
             vec![10, 20]
         );
+    }
+
+    #[test]
+    fn schedule_extended_empty_descriptors_do_not_erase_basic_info() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut basic = sample(1, 100, 1, 1_000, 10);
+        db.upsert_programs(&[basic.clone()]).unwrap();
+        basic.source = EpgSource::Schedule;
+        basic.name = None;
+        basic.description = None;
+        basic.genre = None;
+        basic.extended = None;
+        basic.basic_updated_at = None;
+        basic.extended_updated_at = None;
+        basic.updated_at = 11;
+        db.upsert_programs(&[basic]).unwrap();
+        let row = db.get_programs(0, 10_000, None, None).unwrap().remove(0);
+        assert_eq!(row.name.as_deref(), Some("Event 1"));
+        assert_eq!(row.description.as_deref(), Some("desc"));
+        assert_eq!(row.genre, Some(0x21));
+    }
+
+    #[test]
+    fn present_following_and_schedule_have_independent_update_clocks() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut pf = sample(1, 100, 2, 1_000, 20);
+        db.upsert_programs(&[pf.clone()]).unwrap();
+        pf.source = EpgSource::Schedule;
+        pf.start_at = 2_000;
+        pf.name = None;
+        pf.description = None;
+        pf.genre = None;
+        pf.basic_updated_at = None;
+        pf.extended_updated_at = None;
+        pf.updated_at = 30;
+        db.upsert_programs(&[pf.clone()]).unwrap();
+        pf.source = EpgSource::PresentFollowing;
+        pf.start_at = 3_000;
+        pf.updated_at = 40;
+        db.upsert_programs(&[pf]).unwrap();
+        let row = db.get_programs(0, 10_000, None, None).unwrap().remove(0);
+        assert_eq!(row.start_at, 3_000);
+        assert_eq!(row.name.as_deref(), Some("Event 2"));
     }
 
     #[test]

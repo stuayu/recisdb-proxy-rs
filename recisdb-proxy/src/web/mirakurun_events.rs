@@ -272,6 +272,9 @@ mod tests {
             genre: Some(0x71),
             free_ca_mode: false,
             updated_at: 1_700_000_000,
+            source: crate::database::EpgSource::PresentFollowing,
+            basic_updated_at: Some(1_700_000_000),
+            extended_updated_at: None,
         }
     }
 

@@ -1,7 +1,7 @@
 # EPG(番組表)収集・配信設計
 
 recisdb-proxy の番組表データがどこから来て、どう保存され、どう読まれるかの台帳。
-実装は 2026-07 時点のコードに対応する。
+実装は 2026-09 時点のコードに対応する。
 
 ## 全体像
 
@@ -31,9 +31,15 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
   - **schedule**: 0x50–0x5F(自TS)/ 0x60–0x6F(他TS)。数日先までの番組表。
     BS は他TS向け schedule を各TSが相互に流しているため、BS 1チャンネルの視聴で
     BS 全体の番組表が埋まりやすい。地上波は自TS分が基本。
-- p/f と schedule は区別せず同じ `programs` テーブルに UPSERT される。同一イベントは
-  `(nid, sid, tsid, event_id)` で一意なので、p/f で先に入った行が schedule で上書きされる(逆も同様)。
-  常に `updated_at`(収集時刻)が新しい方が勝つ。
+- p/f と schedule は同じ公開行へ統合するが、EDCBに合わせて論理的に独立した更新時計を持つ。
+  writerのバッチキーにもsourceを含め、片方の古い受信がもう片方を抑止しない。
+  schedule extended などbasic記述子を持たない入力は、既存のname/description/genreを
+  NULLで上書きしない。
+- どちらの系統に入れるかは EDCB `CEpgDBUtil::AddEIT` と同じ条件で決める。
+  `table_id <= 0x4F` かつ `section_number <= 1` が p/f、`PID != 0x0012` または
+  `table_id > 0x4F` が schedule(H-EIT以外では [p/f after] を含む)。どちらにも当たらない
+  ——H-EITでp/fのtable_idがsection 1より後——は TR-B14 §13.1 の運用にない組み合わせなので、
+  誤った時計へ入れずに捨てる。
 - 収集は B25 デコード**前**の生TSに対して行う。EIT は非スクランブルなのでデコード不要。
 - `EpgCollector` はリーダータスク起動ごとに作り直されるため、選局切替・再接続で
   PSI 再組み立て状態は自然にリセットされる。
@@ -88,7 +94,8 @@ TR-B39 Part 1 Vol.3 §5.5 表5.5-1 (PDF pp.43-44) は、`tlv_stream_id`をネッ
 
 MH-EITの `start_time` は40-bit MJD+BCDのJST、`duration`は24-bit BCDであり、
 STD-B60 §7.3.3.9 (PDF pp.67-68) の値をdantto4kがTS EITへ写す。未定値はall-1。
-本実装は開始時刻未定を捨て、duration未定を0秒保存する。8K/22.2ch、MH固有の
+本実装は開始時刻未定を捨てる。scheduleのduration未定もEDCBに合わせてイベントごと捨てる。
+実行中のp/fはduration未定を0秒として保持できる。8K/22.2ch、MH固有の
 音声・映像属性はTS EITに写像されても `programs` には保存しない。これは今回の
 主キー・時刻・基本番組名収集の不具合ではなく、メタデータ拡張の未実装。
 
@@ -131,7 +138,12 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
   - **prune**: 30フラッシュごと(≒5分)に、終了時刻が現在より24時間以上前の行を削除。
     未来分の保持期限はない(schedule で入った分はそのまま残る)。
 - 時刻はすべて epoch 秒(UTC)。EIT の MJD+BCD(JST壁時計)は `eit.rs` で変換済み。
-  start_time all-1 はイベントを除外、duration all-1 は終了時刻不明として0秒で保存する。
+  start_time all-1 はイベントを除外する。scheduleのduration all-1 は保存しない。
+  p/fのduration all-1 は終了時刻不明として0秒で保存する。保存行にはp/f・scheduleの
+  更新時計と、basic・extended記述子の更新時計を持たせ、EDCB同様に開始時刻系と記述子系を
+  別々に更新する(Migration 032)。
+  Migration 032は既存のNULL番組を削除しない。次回basic記述子を受信したとき、非NULL項目だけを
+  補完するため、収集再開で壊れた行を回復できる。
 
 ## 読み出し
 

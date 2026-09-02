@@ -23,7 +23,7 @@ use std::time::Duration;
 use recisdb_protocol::StreamClass;
 use serde::{Deserialize, Serialize};
 
-use crate::database::ProgramUpsert;
+use crate::database::{EpgSource, ProgramUpsert};
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::tuner::channel_key::ChannelKeySpec;
@@ -81,6 +81,10 @@ pub struct ProgramUpsertWire {
     pub extended: Option<String>,
     pub genre: Option<i64>,
     pub updated_at: i64,
+    #[serde(default)]
+    pub source: u8,
+    pub basic_updated_at: Option<i64>,
+    pub extended_updated_at: Option<i64>,
 }
 
 impl From<ProgramUpsert> for ProgramUpsertWire {
@@ -98,12 +102,22 @@ impl From<ProgramUpsert> for ProgramUpsertWire {
             extended: value.extended,
             genre: value.genre,
             updated_at: value.updated_at,
+            source: value.source as u8,
+            basic_updated_at: value.basic_updated_at,
+            extended_updated_at: value.extended_updated_at,
         }
     }
 }
 
 impl From<ProgramUpsertWire> for ProgramUpsert {
     fn from(value: ProgramUpsertWire) -> Self {
+        let basic_updated_at = value.basic_updated_at.or_else(|| {
+            (value.name.is_some() || value.description.is_some() || value.genre.is_some())
+                .then_some(value.updated_at)
+        });
+        let extended_updated_at = value
+            .extended_updated_at
+            .or_else(|| value.extended.as_ref().map(|_| value.updated_at));
         Self {
             nid: value.nid,
             sid: value.sid,
@@ -117,6 +131,13 @@ impl From<ProgramUpsertWire> for ProgramUpsert {
             extended: value.extended,
             genre: value.genre,
             updated_at: value.updated_at,
+            source: if value.source == EpgSource::Schedule as u8 {
+                EpgSource::Schedule
+            } else {
+                EpgSource::PresentFollowing
+            },
+            basic_updated_at,
+            extended_updated_at,
         }
     }
 }

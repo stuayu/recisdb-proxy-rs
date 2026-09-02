@@ -89,7 +89,7 @@ impl EpgWriter {
         // so a burst of duplicate present/following + schedule sections for
         // the same event within one flush window collapses into a single
         // UPSERT, keeping only the newest `updated_at`.
-        let mut batch: HashMap<(u16, u16, u16, u16), ProgramUpsert> = HashMap::new();
+        let mut batch: HashMap<(u16, u16, u16, u16, u8), ProgramUpsert> = HashMap::new();
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut flush_count: u32 = 0;
@@ -99,7 +99,7 @@ impl EpgWriter {
                 maybe_event = self.rx.recv() => {
                     match maybe_event {
                         Some(record) => {
-                            let key = (record.nid, record.sid, record.tsid, record.event_id);
+                            let key = (record.nid, record.sid, record.tsid, record.event_id, record.source as u8);
                             match batch.entry(key) {
                                 Entry::Occupied(mut e) => {
                                     if record.updated_at >= e.get().updated_at {
@@ -133,7 +133,7 @@ impl EpgWriter {
 
     async fn flush(
         &self,
-        batch: &mut HashMap<(u16, u16, u16, u16), ProgramUpsert>,
+        batch: &mut HashMap<(u16, u16, u16, u16, u8), ProgramUpsert>,
         flush_count: &mut u32,
     ) {
         if batch.is_empty() {

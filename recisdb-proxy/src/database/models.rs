@@ -241,6 +241,13 @@ impl MergeResult {
     }
 }
 
+/// Logical EIT database, matching EDCB's independent p/f and schedule stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpgSource {
+    PresentFollowing = 0,
+    Schedule = 1,
+}
+
 /// One EIT event ready to be UPSERTed into `programs` (Migration 015).
 /// Produced by `tuner::epg_collector::EpgCollector` from a parsed EIT
 /// section; consumed in batches by `crate::epg_writer::EpgWriter`.
@@ -261,6 +268,9 @@ pub struct ProgramUpsert {
     /// first content_descriptor genre entry, if present.
     pub genre: Option<i64>,
     pub updated_at: i64,
+    pub source: EpgSource,
+    pub basic_updated_at: Option<i64>,
+    pub extended_updated_at: Option<i64>,
 }
 
 /// A stored `programs` row (dashboard `GET /api/programs`, Mirakurun-

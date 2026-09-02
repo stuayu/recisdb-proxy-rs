@@ -494,6 +494,9 @@ mod tests {
             extended: None,
             genre: None,
             updated_at: 9_000,
+            source: crate::database::EpgSource::PresentFollowing,
+            basic_updated_at: Some(9_000),
+            extended_updated_at: None,
         }])
         .unwrap();
         assert_eq!(db.refresh_epg_coverage().unwrap(), Some(10_600));

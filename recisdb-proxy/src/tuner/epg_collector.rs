@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::database::ProgramUpsert;
+use crate::database::{EpgSource, ProgramUpsert};
 use crate::ts_analyzer::{
     pid, table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE,
 };
@@ -249,7 +249,44 @@ impl EpgCollector {
         let event_count = eit.events.len();
 
         let now = chrono::Utc::now().timestamp();
+        // Which logical store this section feeds, following EDCB's split in
+        // `CEpgDBUtil::AddEIT`: `table_id <= 0x4F && section_number <= 1` is
+        // p/f, and `PID != 0x0012 || table_id > 0x4F` is schedule (or, off
+        // H-EIT, [p/f after]). A section matching neither — H-EIT carrying a
+        // p/f table_id past section 1 — is not valid p/f under TR-B14 §13.1,
+        // so it is dropped rather than filed under the wrong clock.
+        let source = if eit.table_id <= 0x4F && eit.section_number <= 1 {
+            Some(EpgSource::PresentFollowing)
+        } else if pid != pid::EIT || eit.table_id > 0x4F {
+            Some(EpgSource::Schedule)
+        } else {
+            None
+        };
+        let Some(source) = source else {
+            return;
+        };
         for event in eit.events {
+            // EDCB discards non-running and stopped events.
+            if event.running_status == 1 || event.running_status == 3 {
+                continue;
+            }
+            // EDCB rejects schedule events with undefined duration.
+            if source == EpgSource::Schedule && event.duration_secs == 0 {
+                continue;
+            }
+            let basic_allowed = !is_schedule_extended(eit.table_id);
+            let name = if basic_allowed {
+                non_empty(event.name)
+            } else {
+                None
+            };
+            let description = if basic_allowed {
+                non_empty(event.description)
+            } else {
+                None
+            };
+            let extended = non_empty(event.extended);
+            let genre = basic_allowed.then_some(event.genre).flatten().map(|g| g as i64);
             let record = ProgramUpsert {
                 nid: eit.original_network_id,
                 sid: eit.service_id,
@@ -258,11 +295,18 @@ impl EpgCollector {
                 start_at: event.start_at,
                 duration_secs: event.duration_secs as i64,
                 free_ca_mode: event.free_ca_mode,
-                name: non_empty(event.name),
-                description: non_empty(event.description),
-                extended: non_empty(event.extended),
-                genre: event.genre.map(|g| g as i64),
+                name: name.clone(),
+                description: description.clone(),
+                extended: extended.clone(),
+                genre,
                 updated_at: now,
+                source,
+                basic_updated_at: if name.is_some() || description.is_some() || genre.is_some() {
+                    Some(now)
+                } else {
+                    None
+                },
+                extended_updated_at: extended.as_ref().map(|_| now),
             };
             if self.metadata_only {
                 self.metadata_records.push(record);
@@ -305,6 +349,10 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
+fn is_schedule_extended(table_id: u8) -> bool {
+    (0x58..=0x5F).contains(&table_id) || (0x68..=0x6F).contains(&table_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +370,71 @@ mod tests {
         let mut collector = EpgCollector::new();
         // Shorter than one TS packet: the while-loop body never executes.
         collector.process_ts_chunk(&[0x47, 0x00, 0x00]);
+    }
+
+    fn metadata_section(table_id: u8, running_status: u8, duration: [u8; 3]) -> Vec<u8> {
+        let mut section = vec![
+            table_id, 0xB0, 0x1B, 0x12, 0x34, 0x03, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x0B, 0x00, table_id, 0x00, 0x01,
+            0xEB, 0x5E, 0x12, 0x34, 0x56,
+        ];
+        section.extend_from_slice(&duration);
+        section.push((running_status << 5) as u8);
+        section.push(0);
+        section.extend_from_slice(&[0, 0, 0, 0]);
+        section
+    }
+
+    #[test]
+    fn running_status_non_running_events_are_not_saved() {
+        for status in [1, 3] {
+            let mut collector = EpgCollector::new_metadata();
+            let section = metadata_section(table_id::EIT_PF_ACTUAL, status, [0, 30, 0]);
+            collector.process_section(pid::EIT, &section);
+            assert!(collector.drain_metadata_records().is_empty(), "status={status}");
+        }
+    }
+
+    #[test]
+    fn schedule_event_with_undefined_duration_is_not_saved() {
+        let mut collector = EpgCollector::new_metadata();
+        let section = metadata_section(table_id::EIT_SCHEDULE_ACTUAL_START, 4, [0xFF; 3]);
+        collector.process_section(pid::EIT, &section);
+        assert!(collector.drain_metadata_records().is_empty());
+    }
+
+    /// EDCB treats `table_id <= 0x4F` as p/f only for section 0 and 1
+    /// (`CEpgDBUtil::AddEIT`). On H-EIT a p/f table_id past section 1 is not
+    /// valid p/f under TR-B14 §13.1, so it must not be filed under the p/f
+    /// clock; off H-EIT the same section is [p/f after] and belongs to the
+    /// schedule store.
+    #[test]
+    fn present_following_table_id_past_section_one_is_pf_only_off_h_eit() {
+        let mut section = metadata_section(table_id::EIT_PF_ACTUAL, 4, [0x00, 0x30, 0x00]);
+        section[6] = 2; // section_number
+
+        let mut h_eit = EpgCollector::new_metadata();
+        h_eit.process_section(pid::EIT, &section);
+        assert!(
+            h_eit.drain_metadata_records().is_empty(),
+            "H-EIT p/f table_id past section 1 is not valid p/f"
+        );
+
+        let mut m_eit = EpgCollector::new_metadata();
+        m_eit.process_section(pid::EIT_MOBILE, &section);
+        let records = m_eit.drain_metadata_records();
+        assert_eq!(records.len(), 1, "off H-EIT this is [p/f after]");
+        assert_eq!(records[0].source, EpgSource::Schedule);
+    }
+
+    #[test]
+    fn schedule_extended_table_ids_never_supply_basic_descriptors() {
+        assert!(is_schedule_extended(0x58));
+        assert!(is_schedule_extended(0x5F));
+        assert!(is_schedule_extended(0x68));
+        assert!(is_schedule_extended(0x6F));
+        assert!(!is_schedule_extended(0x50));
+        assert!(!is_schedule_extended(0x60));
     }
 
     fn crc32_mpeg2(data: &[u8]) -> u32 {
