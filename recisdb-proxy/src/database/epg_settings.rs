@@ -338,7 +338,7 @@ impl Database {
                 "invalid EPG settings ordering or CPU limits".into(),
             ));
         }
-        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,scheduler_interval_secs=?2,target_refresh_secs=?3,max_stale_secs=?4,min_future_coverage_hours=?5,target_future_coverage_hours=?6,startup_delay_secs=?7,startup_jitter_secs=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,max_concurrent_scans=?13,reserve_tuners=?14,prefer_local=?15,allow_remote=?16,preemptible=?17,cpu_soft_limit_percent=?18,cpu_hard_limit_percent=?19,remote_prefer_metadata_execution=?20,remote_allow_ts_transport=?21,selected_preset_id=?22,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,b(c.reserve_tuners),b(c.prefer_local),b(c.allow_remote),b(c.preemptible),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport),c.selected_preset_id])?;
+        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,scheduler_interval_secs=?2,target_refresh_secs=?3,max_stale_secs=?4,min_future_coverage_hours=?5,target_future_coverage_hours=?6,startup_delay_secs=?7,startup_jitter_secs=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,max_concurrent_scans=?13,reserve_tuners=?14,prefer_local=?15,allow_remote=?16,preemptible=?17,cpu_soft_limit_percent=?18,cpu_hard_limit_percent=?19,remote_prefer_metadata_execution=?20,remote_allow_ts_transport=?21,selected_preset_id=?22,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,c.max_concurrent_scans,b(c.reserve_tuners),b(c.prefer_local),b(c.allow_remote),b(c.preemptible),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport),c.selected_preset_id])?;
         Ok(())
     }
     pub fn list_epg_presets(&self) -> Result<Vec<EpgPreset>> {
@@ -468,6 +468,83 @@ mod tests {
         assert!(global.enabled);
         assert_eq!(global.target_refresh_secs, 21_600);
         assert_eq!(db.list_epg_presets().unwrap().len(), 7);
+    }
+
+    /// Round-trips every global setting through UPDATE and SELECT. The two
+    /// statements list their columns independently, so a params list that
+    /// drops one value shifts every later binding — and the failure only
+    /// surfaces when the dashboard actually saves. `max_concurrent_scans` was
+    /// missing from the UPDATE bindings, leaving the statement one parameter
+    /// short of its 22 placeholders; the existing tests never exercised the
+    /// success path, so nothing caught it.
+    #[test]
+    fn epg_global_settings_round_trip_through_update() {
+        let db = Database::open_in_memory().unwrap();
+        let mut global = db.get_epg_global_settings().unwrap();
+
+        // Values distinct from the seeded defaults, kept internally
+        // consistent so `valid()` accepts them.
+        global.enabled = false;
+        global.scheduler_interval_secs = 61;
+        global.target_refresh_secs = 4_321;
+        global.max_stale_secs = 9_876;
+        global.min_future_coverage_hours = 11;
+        global.target_future_coverage_hours = 77;
+        global.startup_delay_secs = 13;
+        global.startup_jitter_secs = 17;
+        global.min_dwell_secs = 19;
+        global.normal_dwell_secs = 23;
+        global.max_dwell_secs = 29;
+        global.idle_section_timeout_secs = 31;
+        global.max_concurrent_scans = 3;
+        global.reserve_tuners = !global.reserve_tuners;
+        global.prefer_local = !global.prefer_local;
+        global.allow_remote = !global.allow_remote;
+        global.preemptible = !global.preemptible;
+        global.cpu_soft_limit_percent = 41;
+        global.cpu_hard_limit_percent = 83;
+        global.remote_prefer_metadata_execution = !global.remote_prefer_metadata_execution;
+        global.remote_allow_ts_transport = !global.remote_allow_ts_transport;
+
+        db.update_epg_global_settings(&global).unwrap();
+        let stored = db.get_epg_global_settings().unwrap();
+
+        assert_eq!(stored.enabled, global.enabled);
+        assert_eq!(stored.scheduler_interval_secs, global.scheduler_interval_secs);
+        assert_eq!(stored.target_refresh_secs, global.target_refresh_secs);
+        assert_eq!(stored.max_stale_secs, global.max_stale_secs);
+        assert_eq!(
+            stored.min_future_coverage_hours,
+            global.min_future_coverage_hours
+        );
+        assert_eq!(
+            stored.target_future_coverage_hours,
+            global.target_future_coverage_hours
+        );
+        assert_eq!(stored.startup_delay_secs, global.startup_delay_secs);
+        assert_eq!(stored.startup_jitter_secs, global.startup_jitter_secs);
+        assert_eq!(stored.min_dwell_secs, global.min_dwell_secs);
+        assert_eq!(stored.normal_dwell_secs, global.normal_dwell_secs);
+        assert_eq!(stored.max_dwell_secs, global.max_dwell_secs);
+        assert_eq!(
+            stored.idle_section_timeout_secs,
+            global.idle_section_timeout_secs
+        );
+        assert_eq!(stored.max_concurrent_scans, global.max_concurrent_scans);
+        assert_eq!(stored.reserve_tuners, global.reserve_tuners);
+        assert_eq!(stored.prefer_local, global.prefer_local);
+        assert_eq!(stored.allow_remote, global.allow_remote);
+        assert_eq!(stored.preemptible, global.preemptible);
+        assert_eq!(stored.cpu_soft_limit_percent, global.cpu_soft_limit_percent);
+        assert_eq!(stored.cpu_hard_limit_percent, global.cpu_hard_limit_percent);
+        assert_eq!(
+            stored.remote_prefer_metadata_execution,
+            global.remote_prefer_metadata_execution
+        );
+        assert_eq!(
+            stored.remote_allow_ts_transport,
+            global.remote_allow_ts_transport
+        );
     }
 
     #[test]

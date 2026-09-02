@@ -253,6 +253,12 @@ fn validate_preset(p: &CreatePreset) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// `is_system` is written as a literal 0, so the 20 columns take 19 bound
+/// parameters. Kept as a constant so a test can prepare it and check that
+/// count against the params list — a miscount only shows up when the
+/// dashboard actually creates a preset.
+const INSERT_PRESET_SQL: &str = "INSERT INTO epg_scan_presets(name,description,is_system,enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport) VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
+
 fn preset_bool(value: Option<bool>) -> Option<i64> {
     value.map(i64::from)
 }
@@ -267,7 +273,7 @@ pub async fn create_epg_preset(
     let db = s.database.lock().await;
     db.connection()
         .execute(
-            "INSERT INTO epg_scan_presets(name,description,is_system,enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport) VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            INSERT_PRESET_SQL,
             rusqlite::params![p.name.trim(), p.description.unwrap_or_default(), p.enabled.map(i64::from).unwrap_or(1), p.target_refresh_secs, p.max_stale_secs, p.min_future_coverage_hours, p.target_future_coverage_hours, p.min_dwell_secs, p.normal_dwell_secs, p.max_dwell_secs, p.idle_section_timeout_secs, preset_bool(p.reserve_tuners), preset_bool(p.prefer_local), preset_bool(p.allow_remote), preset_bool(p.preemptible), p.cpu_soft_limit_percent, p.cpu_hard_limit_percent, preset_bool(p.remote_prefer_metadata_execution), preset_bool(p.remote_allow_ts_transport)],
         )
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -422,6 +428,21 @@ mod tests {
             failure_count: 1,
             last_failure_reason: Some(epg_reason(reason, json!({}))),
         }
+    }
+
+    /// The INSERT lists 20 columns but binds only 19 parameters, because
+    /// `is_system` is a literal. A stray `?20` in the VALUES list made SQLite
+    /// demand one more parameter than the params list supplies, so every
+    /// preset creation failed at runtime with "Wrong number of parameters".
+    #[test]
+    fn insert_preset_sql_binds_exactly_the_parameters_it_declares() {
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let stmt = db.connection().prepare(INSERT_PRESET_SQL).unwrap();
+        assert_eq!(
+            stmt.parameter_count(),
+            19,
+            "params! in create_epg_preset supplies 19 values"
+        );
     }
 
     #[test]
