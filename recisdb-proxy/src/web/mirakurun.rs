@@ -124,18 +124,18 @@
 //! actual client. Coverage is limited to unit/integration tests against an
 //! in-memory database and `tower::ServiceExt::oneshot`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use log::debug;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
@@ -512,6 +512,12 @@ pub struct MirakurunProgram {
     pub is_free: bool,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Extended-event text. The database currently stores the ARIB item
+    /// sequence as one flattened string, so expose it under one stable
+    /// heading rather than discarding useful detail or pretending the
+    /// original item boundaries can be reconstructed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended: Option<BTreeMap<String, String>>,
     pub genres: Vec<MirakurunGenre>,
 }
 
@@ -562,6 +568,7 @@ fn build_mirakurun_program(
     duration_secs: i64,
     name: Option<String>,
     description: Option<String>,
+    extended: Option<String>,
     genre: Option<i64>,
     free_ca_mode: bool,
 ) -> MirakurunProgram {
@@ -586,6 +593,9 @@ fn build_mirakurun_program(
         is_free: !free_ca_mode,
         name,
         description,
+        extended: extended
+            .filter(|text| !text.is_empty())
+            .map(|text| BTreeMap::from([("番組詳細".to_string(), text)])),
         genres,
     }
 }
@@ -600,6 +610,7 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
         r.duration_secs,
         r.name,
         r.description,
+        r.extended,
         r.genre,
         r.free_ca_mode,
     )
@@ -619,6 +630,7 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
         u.duration_secs,
         u.name.clone(),
         u.description.clone(),
+        u.extended.clone(),
         u.genre,
         u.free_ca_mode,
     )
@@ -969,14 +981,25 @@ pub async fn get_services(State(web_state): State<Arc<WebState>>) -> Response {
 /// `GET /mirakurun/api/programs`. See [`get_channels`] on response shape
 /// (bare array, not this project's usual envelope).
 ///
-/// Real Mirakurun accepts `?networkId=&serviceId=` filters; this reads the
-/// full `programs` table unfiltered (EPGStation/KonomiTV typically fetch
-/// everything and filter client-side for this subset's scale). `isFree`
-/// reflects the persisted EIT `free_CA_mode` value.
-pub async fn get_programs(State(web_state): State<Arc<WebState>>) -> Response {
+/// Optional service filters accepted by real Mirakurun.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirakurunProgramsQuery {
+    pub network_id: Option<u16>,
+    pub service_id: Option<u16>,
+}
+
+/// `networkId` and `serviceId` may be specified independently or together.
+/// With neither present the legacy full-table response is preserved. This
+/// lets EPGStation's service-scoped incremental update avoid transferring
+/// and decoding the entire guide for each changed service.
+pub async fn get_programs(
+    State(web_state): State<Arc<WebState>>,
+    Query(query): Query<MirakurunProgramsQuery>,
+) -> Response {
     let programs = {
         let db = web_state.database.lock().await;
-        match db.get_programs(i64::MIN, i64::MAX, None, None) {
+        match db.get_programs(i64::MIN, i64::MAX, query.network_id, query.service_id) {
             Ok(p) => p,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         }

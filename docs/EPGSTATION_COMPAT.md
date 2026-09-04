@@ -65,6 +65,15 @@ EPGStation が使う operationId は次のとおり (定義に含める必要が
 
 `getChannels` / `getChannelStream` などクライアントが持つ他のメソッドは EPGStation からは呼ばれない。
 
+`getPrograms` の引数型は `node_modules/mirakurun/lib/client.d.ts:33-37` の
+`ProgramsQuery` で、`networkId` / `serviceId` / `eventId` はいずれも省略可能。
+EPGStation の全件更新は引数なしで呼ぶ (`src/model/epgUpdater/EPGUpdateManageModel.ts:142-149`)。
+一方、差分更新は変更対象の各チャンネルについて `{ networkId, serviceId }` を併用して呼ぶ
+(`src/model/epgUpdater/EPGUpdateManageModel.ts:188-198`)。したがって互換 API は無指定時の
+全件応答を維持しつつ、`networkId` と `serviceId` の単独・併用絞り込みをサーバー側で行う。
+これにより、局単位の差分更新で全番組表を局数分転送・デコードする無駄を避ける。
+`eventId` は現行 EPGStation のこの経路では使わず、今回の実装対象外。
+
 ### `/docs` の中身が満たすべき条件 (client.js の実装から確定。2026-08-09 追記)
 
 `/docs` を実装するにあたって `client.js` を読み直した結果、**単に OpenAPI らしい JSON を返すだけでは動かない**
@@ -403,7 +412,7 @@ EPGStation は録画の開始・終了をストリームの挙動そのもので
 7. **`/tuners` の `types` が常に `[]` だった** — スキャン済みチャンネルの band から埋められる。
    → `channel_types_by_driver()`
 
-**残った差分** (いずれも既知・§6 の表のとおり): `Program` の `extended`/`video`/`audio`、`isFree` 固定、
+**残った差分** (いずれも既知・§6 の表のとおり): `Program` の `video`/`audio`、
 ロゴ、`X-Mirakurun-Priority` の反映。`NW1`〜`NW40` もこの時点では未対応だったが、§5.3 で実装した。
 
 ## 5.3 `NW1`〜`NW40` (県外地上波) の割り当て (2026-08-12)
@@ -574,14 +583,15 @@ EPGStation から見た差は無い (同じエンドポイント・同じレス�
 | `GET /config/server` | 実装済み (2026-08-09) | `api.d.ts` の `ConfigServer` のうち必須の `allowOrigins` / `allowPNA` のみ実値。EPGStation の `tunerServerType: auto` 判定を通すことが目的 |
 | `GET /tuners` | 実装済み (2026-08-09、`types` は 2026-08-12) | `bon_drivers` 1 行 = 1 tuner。`isUsing`/`isFree` は `TunerPool` の実行状態から算出。`types` はスキャン済みチャンネルの band から算出 (`channel_types_by_driver`)。`pid`/`users`/`isRemote`/`isFault` は既定値 (理由はハンドラの doc コメントに記載) |
 | `GET /status` | 実装済み (`tunerCount` は 2026-08-12 修正) | `tunerCount` は `bon_drivers` の行数 (旧実装は `TunerPool` のキー数を数えており、14 台のサーバーが 1 を返していた)。§5.2-4 |
-| `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12 修正) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`remoteControlKeyId` は地上波のみ。§5.2-1/2/3 |
+| `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12修正、`/programs` filter は 2026-09-04追加) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`/programs` は `networkId` / `serviceId` の単独・併用filterと無指定全件をDB queryで処理する。`remoteControlKeyId` は地上波のみ。§1・§5.2-1/2/3 |
 | `GET /services/{id}/stream` | 実装済み (2026-08-12 にサービスフィルタ追加、2026-08 に複数候補対応) | `TsServiceFilter` で対象サービスのみへ絞る (旧実装は multiplex 全体)。§5.2-5/6。**実起動で確認した事実**: `channels` テーブルは (BonDriver, サービス) ごとに1行なので同じサービスが複数ドライバに載ることがある (実例: SID 21520=ＦＴＶ福島テレビ１ が3行 — driver1 は disabled、driver2 (PX4-T3_PE5) は満杯、driver3 (PX4-T1) では既に稼働中)。修正前は先頭行 1件だけを `tuner::acquire::acquire` に渡していたため、先頭行のドライバが満杯だと**他ドライバで既に配信中でも** 503 になっていた。`resolve_service_by_sid`/`resolve_service_by_nid_sid` が全 enabled 行を候補として渡すよう修正し、この経路で `/services/{id}/stream` 経由の EPGStation 録画・視聴が同じ恩恵を受ける (満杯ドライバでも別ドライバに相乗りして 200 が返るようになった)。詳細: `docs/STREAMING_DESIGN.md` P6「複数候補への対応」節、`docs/TUNER_PIPELINE_REDESIGN.md` |
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
 | `remoteControlKeyId` の欠損 | 実装済み (2026-08-14) | 手動登録 (CSV インポート / `POST /api/channels`) した行は `remote_control_key` が NULL で、EPGStation の番組表・放映中で末尾に回されていた。視聴・EPG 収集中の NIT から NULL の列だけ補完する (`tuner/nit_collector.rs` → `nit_writer.rs`)。**一度も選局していない局は埋まらない**。§5.4 |
 | ダッシュボードのクライアント表示 | 実装済み (2026-08-14) | EPGStation の視聴・録画ストリームがクライアント一覧に出るようになった (`protocol` = `mirakurun`)。切断・グラフ・プレビューも同じ行から使える。§5.5 |
 | `X-Mirakurun-Priority` | 実装済み (2026-08-22、閾値設定を 2026-08-23 追加) | `/services/{id}/stream` と `/programs/{id}/stream` の両方で、ヘッダ値をそのまま `EffectiveClaim.priority` として `tuner::acquire::acquire` へ渡す (`channel_resolve::start_tuner_for_service_with_claim`)。**DB のチャンネル優先度を置き換えるのではなく、明示指定が無いときだけ DB 既定値へフォールバックする**。exclusive は同順位時の比較軸のままで、優先度へ畳み込まない。録画判定の閾値は `[mirakurun] record_priority_threshold` (既定 1)。§5.6 |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
-| `Program.extended` / `video` / `audio` / `relatedItems` | 無し | 番組詳細が埋まらない・イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 (`EPGUpdateManageModel.ts:144-147`) |
+| `Program.extended` | 実装済み (2026-09-04) | DB保存済みextended文字列を、型定義どおり `{ [description: string]: string }` として返す (`node_modules/mirakurun/api.d.ts:86-88`)。保存時点でARIB item境界を連結済みのため、復元を装わず単一の「番組詳細」項目に格納する。EPGStationは全key/valueを結合して詳細へ保存する (`src/model/db/ProgramDB.ts:274-288,325-340`) |
+| `Program.video` / `audio` / `relatedItems` | 無し | 映像・音声メタデータが埋まらず、イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 |
 | `isFree` | 常に `true` 固定 | 無料/有料の判別ができない |
 | 放送時間未定 (`duration: 1`) | 未確認 | 番組表・予約が壊れうる |
 | 衛星の `channel` 文字列 (`BS15_0` 形式) | 簡略化 | 表示のみ。実害は小さい |
@@ -598,7 +608,7 @@ EPGStation から見た差は無い (同じエンドポイント・同じレス�
    `GET /programs/{id}/stream` の EIT[p/f] ゲートが実際の放送波で開閉するかは、EPGStation から
    予約を通して初めて確認できる (§7)
 2. ~~`X-Mirakurun-Priority` をチューナー競合ポリシーへ反映する~~ — 2026-08-22 実装 (§5.6)。実起動での競合検証は未実施
-3. `Program.extended` / `video` / `audio` / `relatedItems`、`isFree`、放送時間未定 (`duration: 1`) — いずれも `programs` テーブルのスキーマ拡張が前提
+3. `Program.video` / `audio` / `relatedItems`、放送時間未定 (`duration: 1`) — `programs` テーブルまたは収集モデルの拡張が前提
 4. ~~`NW1`〜`NW40` (県外地上波)~~ — 2026-08-12 実装 (§5.3)。衛星の `channel` 文字列 (`BS15_0` 形式) は未対応のまま
 
 ## 7. 未確認事項

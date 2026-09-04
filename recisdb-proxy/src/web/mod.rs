@@ -467,6 +467,81 @@ mod tests {
         ))
     }
 
+    fn sample_program(nid: u16, sid: u16, event_id: u16) -> crate::database::ProgramUpsert {
+        crate::database::ProgramUpsert {
+            nid,
+            sid,
+            tsid: 1,
+            event_id,
+            start_at: 1_000,
+            duration_secs: 1_800,
+            free_ca_mode: false,
+            name: Some(format!("program-{event_id}")),
+            description: None,
+            extended: Some(format!("extended-{event_id}")),
+            genre: None,
+            updated_at: 1,
+            source: crate::database::EpgSource::Schedule,
+            basic_updated_at: Some(1),
+            extended_updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mirakurun_programs_supports_optional_service_filters() {
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
+        {
+            let mut db = state.database.lock().await;
+            db.upsert_programs(&[
+                sample_program(1, 100, 1),
+                sample_program(1, 200, 2),
+                sample_program(2, 100, 3),
+            ])
+            .unwrap();
+        }
+        let app = build_app(state, true);
+
+        for (query, expected_event_ids) in [
+            ("", vec![1, 2, 3]),
+            ("?networkId=1", vec![1, 2]),
+            ("?serviceId=100", vec![1, 3]),
+            ("?networkId=1&serviceId=200", vec![2]),
+            ("?networkId=9&serviceId=999", vec![]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/mirakurun/api/programs{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "query={query}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let programs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+            let actual: Vec<u64> = programs
+                .iter()
+                .map(|program| program["eventId"].as_u64().unwrap())
+                .collect();
+            assert_eq!(actual, expected_event_ids, "query={query}");
+            for program in programs {
+                let event_id = program["eventId"].as_u64().unwrap();
+                assert_eq!(
+                    program["extended"]["番組詳細"],
+                    format!("extended-{event_id}"),
+                    "query={query}"
+                );
+            }
+        }
+    }
+
     /// REVIEW S1 for `/api/preview-config`: the two executable paths are
     /// TOML-only. Sending them in the POST body must be silently ignored
     /// (serde drops unknown fields), while the legitimate fields

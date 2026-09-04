@@ -150,7 +150,7 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 | API | 用途 |
 |---|---|
 | `GET /api/programs?since=&until=&nid=&sid=` | Webダッシュボードの番組表タブ。`[start_at, start_at+duration)` が `[since, until)` と重なる行を返す |
-| Mirakurun互換 `GET /api/programs` | EPGStation 等の録画クライアント向け |
+| Mirakurun互換 `GET /api/programs?networkId=&serviceId=` | EPGStation 等の録画クライアント向け。両条件は単独・併用可能で、無指定は全件を返す |
 
 ## 既知の制約
 

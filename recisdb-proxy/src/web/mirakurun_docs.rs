@@ -136,7 +136,14 @@ fn build_docs() -> Value {
             "/status": get_path("getStatus", &["status"], json!([])),
             "/channels": get_path("getChannels", &["channels"], json!([])),
             "/services": get_path("getServices", &["services"], json!([])),
-            "/programs": get_path("getPrograms", &["programs"], json!([])),
+            "/programs": get_path(
+                "getPrograms",
+                &["programs"],
+                json!([
+                    { "name": "networkId", "in": "query", "type": "integer", "required": false },
+                    { "name": "serviceId", "in": "query", "type": "integer", "required": false },
+                ]),
+            ),
             "/tuners": get_path("getTuners", &["tuners"], json!([])),
             "/config/server": get_path("getServerConfig", &["config"], json!([])),
             "/services/{id}/stream": get_path(
