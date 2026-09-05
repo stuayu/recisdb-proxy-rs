@@ -104,6 +104,10 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   `useColumnVisibility` の既定表示列がそのままスマホの初期表示になる。
 - チューナーが埋まっている理由(視聴中/スキャン中)は必ず画面に出す。理由が見えないと
   「視聴できない」の原因を利用者が追えない。
+- **一覧・番組表は本番のデータ量(channels 1637行 / 当日の番組 2万件超)を前提に組む。** 全件をそのままDOMへ出すと操作不能になる。
+  - チャンネルタブ(`ChannelsView.vue`)はページング。フィルタは行ごとの検索用文字列を先に作って使い回し、打鍵ごとに全行×全プロパティを文字列化し直さない(入力は200msデバウンス)。ソートの比較で `localeCompare` を直接呼ぶと比較回数分 Collator が作られるため `Intl.Collator` を使い回す。
+  - 番組表(`GuideView.vue`)は縦(時間)・横(局)の両方で可視範囲だけをDOMへ出す。**`styles.css` の `.guide-scroll` から `height` / `overflow: auto` を落とすとスクロールコンテナでなくなり、`@scroll` が発火しないため可視判定が丸ごと無効になる**(全番組がDOMに出て固まる。過去に実際に起きた)。`.guide-cell` / `.guide-hour-label` の `position: absolute` も同様で、落とすとインラインの `top`/`left` が無視されてセルが素の縦積みになる。
+  - 番組データを `ref` で持つと2万件のオブジェクトが再帰的にProxy化され、分類ループが要素ごとに依存を張る。`shallowRef` を使う。
 - ソースは `web-ui/`(Vue)。`npm run build` の出力を `recisdb-proxy/static/vue/` へ吐き、
   RustEmbed でバイナリに埋め込む。**UIを変更したらビルドしてからサーバーをビルドする。**
   `static/vue/.gitkeep` はビルドで消えることがあるので消さない。
