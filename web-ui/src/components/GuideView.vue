@@ -7,7 +7,6 @@ const GRID_START_HOUR = 6
 const GRID_HOURS = 24
 const TOTAL_MINUTES = GRID_HOURS * 60
 const MAX_PROGRAM_DURATION_SECS = 24 * 60 * 60
-const HEADER_HEIGHT = 52
 const NARROW_MEDIA_QUERY = '(max-width: 700px)'
 
 /*
@@ -15,12 +14,18 @@ const NARROW_MEDIA_QUERY = '(max-width: 700px)'
  * 本番は放送局が 800 前後あり、1 列 220px のままだと横幅が 5 万px を超えて
  * スマホでは 2 列も入らない。狭幅では列を詰め、1 分あたりの高さも下げる。
  */
-const PX_PER_MIN_DESKTOP = 2
-const PX_PER_MIN_NARROW = 1.6
-const COLUMN_WIDTH_DESKTOP = 220
-const COLUMN_WIDTH_NARROW = 120
-const AXIS_WIDTH_DESKTOP = 64
-const AXIS_WIDTH_NARROW = 44
+const PX_PER_MIN_DESKTOP = 3
+const PX_PER_MIN_TABLET = 2.5
+const PX_PER_MIN_NARROW = 2
+const COLUMN_WIDTH_DESKTOP = 150
+const COLUMN_WIDTH_TABLET = 120
+const COLUMN_WIDTH_NARROW = 100
+const AXIS_WIDTH_DESKTOP = 50
+const AXIS_WIDTH_NARROW = 30
+const CHANNEL_PAGE_SIZE = 120
+const PROGRAM_WINDOW_BEFORE_SECS = 60 * 60
+const PROGRAM_WINDOW_AFTER_SECS = 4 * 60 * 60
+const PROGRAM_WINDOW_STEP_SECS = 4 * 60 * 60
 
 /*
  * 可視判定のバッファ。KonomiTV は デスクトップ 2 時間 / スマホ 3 時間で、
@@ -51,20 +56,9 @@ const GENRE_LABELS: Record<number, string> = {
   15: 'その他',
 }
 const GENRE_COLORS: Record<number, string> = {
-  0: '#3b82f6',
-  1: '#22c55e',
-  2: '#f59e0b',
-  3: '#ec4899',
-  4: '#a855f7',
-  5: '#f97316',
-  6: '#ef4444',
-  7: '#06b6d4',
-  8: '#14b8a6',
-  9: '#eab308',
-  10: '#84cc16',
-  11: '#64748b',
-  14: '#6366f1',
-  15: '#9ca3af',
+  0: 'white', 1: 'cyan', 2: 'white', 3: 'pink', 4: 'orange', 5: 'lime',
+  6: 'brown', 7: 'yellow', 8: 'blue', 9: 'ochre', 10: 'teal', 11: 'white',
+  14: 'white', 15: 'white',
 }
 type BandCategory = '地上' | 'BS' | 'CS' | 'その他'
 type Service = {
@@ -88,6 +82,7 @@ type Program = {
   description: string
   extended: string
   genre: number | null
+  loaded?: boolean
 }
 /** 事前に位置とスタイルまで計算した番組セル。スクロール中は作り直さない。 */
 type RenderItem = {
@@ -103,6 +98,7 @@ type GuideColumn = {
   subLabel: string
   band: BandCategory
   nid: number
+  tsid: number
   sid: number
   items: RenderItem[]
 }
@@ -137,7 +133,7 @@ function genreLabel(genre: number | null): string {
 }
 function genreColor(genre: number | null): string {
   const level = genreLevel(genre)
-  return level === null ? 'transparent' : (GENRE_COLORS[level] ?? 'var(--muted)')
+  return level === null ? 'white' : (GENRE_COLORS[level] ?? 'white')
 }
 function fmtDateInput(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
@@ -145,6 +141,16 @@ function fmtDateInput(date: Date): string {
 function fmtTime(epoch: number): string {
   const date = new Date(epoch * 1000)
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+function fmtMinute(epoch: number): string {
+  return String(new Date(epoch * 1000).getMinutes()).padStart(2, '0')
+}
+function isPast(program: Program): boolean {
+  return program.start_at + program.duration_secs <= Math.floor(now.value / 1000)
+}
+function isOnAir(program: Program): boolean {
+  const current = Math.floor(now.value / 1000)
+  return program.start_at <= current && current < program.start_at + program.duration_secs
 }
 
 /*
@@ -157,6 +163,10 @@ const rawChannels = shallowRef<JsonRecord[]>([])
 const rawPrograms = shallowRef<JsonRecord[]>([])
 const error = ref('')
 const loading = ref(false)
+const channelsLoading = ref(false)
+const programsLoading = ref(false)
+const channelsDone = ref(false)
+const loadedProgramWindows = ref<Array<[number, number]>>([])
 const selectedDate = ref(fmtDateInput(new Date()))
 const bandFilter = ref<'すべて' | BandCategory>('すべて')
 const regionFilter = ref('すべて')
@@ -177,8 +187,14 @@ let pendingScrollLeft = 0
 let clockTimer = 0
 let narrowMedia: MediaQueryList | null = null
 
-const pxPerMin = computed(() => (isNarrow.value ? PX_PER_MIN_NARROW : PX_PER_MIN_DESKTOP))
-const columnWidth = computed(() => (isNarrow.value ? COLUMN_WIDTH_NARROW : COLUMN_WIDTH_DESKTOP))
+const isTablet = computed(() => !isNarrow.value && window.innerWidth <= 1100)
+const pxPerMin = computed(() =>
+  isNarrow.value ? PX_PER_MIN_NARROW : isTablet.value ? PX_PER_MIN_TABLET : PX_PER_MIN_DESKTOP,
+)
+const columnWidth = computed(() =>
+  isNarrow.value ? COLUMN_WIDTH_NARROW : isTablet.value ? COLUMN_WIDTH_TABLET : COLUMN_WIDTH_DESKTOP,
+)
+const headerHeight = computed(() => Math.max(50, Math.round(Math.min(46, Math.max(32, columnWidth.value * 0.3)) * (2 / 3) + 20)))
 const axisWidth = computed(() => (isNarrow.value ? AXIS_WIDTH_NARROW : AXIS_WIDTH_DESKTOP))
 const totalHeight = computed(() => TOTAL_MINUTES * pxPerMin.value)
 const visibleBufferPx = computed(
@@ -253,8 +269,27 @@ function applyScrollUpdate(): void {
   if (element === null) return
   const nextViewportHeight = element.clientHeight
   if (viewportHeight.value !== nextViewportHeight) viewportHeight.value = nextViewportHeight
-  updateVisibleRangeIfNeeded(pendingScrollTop - HEADER_HEIGHT)
+  updateVisibleRangeIfNeeded(pendingScrollTop - headerHeight.value)
   updateVisibleColumns(pendingScrollLeft, element.clientWidth)
+  void loadMoreForScroll()
+}
+async function loadMoreForScroll(): Promise<void> {
+  const top = Math.max(0, pendingScrollTop - headerHeight.value)
+  const bottom = top + viewportHeight.value
+  const before = gridBounds.value.since + Math.floor(top / pxPerMin.value * 60)
+  const after = gridBounds.value.since + Math.ceil(bottom / pxPerMin.value * 60)
+  const edge = 45 * 60
+  if (before - gridBounds.value.since < edge && before > gridBounds.value.since) {
+    await loadProgramsWindow(Math.max(gridBounds.value.since, before - PROGRAM_WINDOW_STEP_SECS), before)
+  }
+  if (gridBounds.value.until - after < edge && after < gridBounds.value.until) {
+    await loadProgramsWindow(after, Math.min(gridBounds.value.until, after + PROGRAM_WINDOW_STEP_SECS))
+  }
+  if (pendingScrollLeft + (scrollArea.value?.clientWidth ?? 0) >
+      axisWidth.value + (visibleColumnEnd.value - 2) * columnWidth.value) {
+    await loadChannels()
+    await loadProgramsWindow(gridBounds.value.since, gridBounds.value.until)
+  }
 }
 function scheduleScrollUpdate(): void {
   if (scrollAnimationId !== null) return
@@ -276,33 +311,79 @@ function resizeGrid(): void {
   viewportHeight.value = element?.clientHeight ?? 0
   pendingScrollTop = element?.scrollTop ?? 0
   pendingScrollLeft = element?.scrollLeft ?? 0
-  updateVisibleRange(pendingScrollTop - HEADER_HEIGHT)
+  updateVisibleRange(pendingScrollTop - headerHeight.value)
   updateVisibleColumns(pendingScrollLeft, element?.clientWidth ?? 0)
 }
 
 async function loadChannels() {
+  if (channelsLoading.value || channelsDone.value) return
+  channelsLoading.value = true
   try {
-    rawChannels.value = unwrapArray(await api('/channels'), ['channels'])
+    const offset = rawChannels.value.length
+    const response = await api(`/channels?limit=${CHANNEL_PAGE_SIZE}&offset=${offset}&sort=nid`)
+    const rows = unwrapArray(response, ['channels'])
+    rawChannels.value = [...rawChannels.value, ...rows]
+    const total = Number((response as JsonRecord).total)
+    channelsDone.value = rows.length < CHANNEL_PAGE_SIZE || (Number.isFinite(total) && rawChannels.value.length >= total)
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    channelsLoading.value = false
   }
 }
-async function loadPrograms() {
-  loading.value = true
+function visibleServiceQuery(): string {
+  const start = Math.max(0, visibleColumnStart.value - columnBuffer.value)
+  const end = Math.min(columns.value.length, visibleColumnEnd.value + columnBuffer.value)
+  return columns.value.slice(start, end).flatMap((column) =>
+    services.value.filter((service) => service.nid === column.nid && service.tsid === column.tsid),
+  ).map((service) => `${service.nid}:${service.sid}`).join(',')
+}
+function windowLoaded(since: number, until: number): boolean {
+  return loadedProgramWindows.value.some(([start, end]) => start <= since && end >= until)
+}
+async function loadProgramsWindow(since: number, until: number, force = false) {
+  if (!force && windowLoaded(since, until)) return
+  programsLoading.value = true
   try {
-    const { since, until } = gridBounds.value
-    rawPrograms.value = unwrapArray(await api(`/programs?since=${since}&until=${until}`), [
-      'programs',
-    ])
+    const query = new URLSearchParams({ since: String(since), until: String(until), brief: 'true', limit: '20000' })
+    const servicesQuery = visibleServiceQuery()
+    if (servicesQuery) query.set('services', servicesQuery)
+    const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
+    const keys = new Set(rawPrograms.value.map((row) => String(row.id)))
+    rawPrograms.value = [...rawPrograms.value, ...rows.filter((row) => !keys.has(String(row.id)))]
+    loadedProgramWindows.value = [...loadedProgramWindows.value, [since, until]]
     error.value = ''
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
-    loading.value = false
+    programsLoading.value = false
   }
 }
+async function loadInitialPrograms() {
+  const { since: gridSince, until: gridUntil } = gridBounds.value
+  const current = Math.floor(Date.now() / 1000)
+  const since = isToday.value
+    ? Math.max(gridSince, current - PROGRAM_WINDOW_BEFORE_SECS)
+    : gridSince
+  const until = isToday.value
+    ? Math.min(gridUntil, current + PROGRAM_WINDOW_AFTER_SECS)
+    : Math.min(gridUntil, since + PROGRAM_WINDOW_STEP_SECS)
+  await loadProgramsWindow(since, until)
+  await nextTick()
+  if (isToday.value && scrollArea.value) {
+    scrollArea.value.scrollTop = Math.max(0, nowOffset.value - viewportHeight.value * 0.25 + headerHeight.value)
+    pendingScrollTop = scrollArea.value.scrollTop
+    resizeGrid()
+  }
+}
+async function loadPrograms() {
+  loadedProgramWindows.value = []
+  rawPrograms.value = []
+  await loadInitialPrograms()
+}
 async function refresh() {
-  await Promise.all([loadChannels(), loadPrograms()])
+  loading.value = true
+  void loadChannels().then(() => loadPrograms()).finally(() => { loading.value = false })
   await nextTick()
   resizeGrid()
 }
@@ -336,6 +417,31 @@ const services = computed<Service[]>(() => {
       a.sid - b.sid,
   )
 })
+const logoFallback = ref(new Map<string, 'own' | 'main' | 'hidden'>())
+const mainSidByGroup = computed(() => {
+  const result = new Map<string, number>()
+  for (const service of services.value) {
+    const key = `${service.nid}:${service.tsid}`
+    const current = result.get(key)
+    if (current === undefined || service.sid < current) result.set(key, service.sid)
+  }
+  return result
+})
+function logoSrc(column: GuideColumn): string {
+  const id = column.key
+  const state = logoFallback.value.get(id) ?? 'own'
+  if (state === 'hidden') return ''
+  if (state === 'main') {
+    const sid = mainSidByGroup.value.get(`${column.nid}:${column.key.split(':')[1]}`)
+    if (sid === undefined || sid === column.sid) return ''
+    return `/logos/${column.nid}_${sid}.png`
+  }
+  return `/logos/${column.nid}_${column.sid}.png`
+}
+function onLogoError(column: GuideColumn): void {
+  const state = logoFallback.value.get(column.key) ?? 'own'
+  logoFallback.value.set(column.key, state === 'own' ? 'main' : 'hidden')
+}
 const regionOptions = computed(() => [
   ...new Set(
     services.value
@@ -487,7 +593,9 @@ const columns = computed<GuideColumn[]>(() => {
           left: isSub && split ? '50%' : '0',
           width: split ? '50%' : '100%',
           borderLeftColor: color,
-          background: `color-mix(in srgb, ${color} 12%, var(--surface))`,
+          '--guide-genre-highlight': `var(--guide-genre-${color}-highlight)`,
+          '--guide-genre-background': `var(--guide-genre-${color}-background)`,
+          '--guide-cell-text': 'var(--text)',
         },
       })
     }
@@ -509,6 +617,7 @@ const columns = computed<GuideColumn[]>(() => {
       subLabel: subs.map((entry) => entry.service.name).join(' / '),
       band: main.band,
       nid: main.nid,
+      tsid: main.tsid,
       sid: main.sid,
       items,
     })
@@ -547,6 +656,22 @@ function goToday() {
 }
 function openDetail(program: Program) {
   detail.value = program
+  if (program.loaded) return
+  const since = Math.max(gridBounds.value.since, program.start_at - 60)
+  const until = Math.min(gridBounds.value.until, program.start_at + Math.max(program.duration_secs, 60))
+  void (async () => {
+    try {
+      const query = new URLSearchParams({ since: String(since), until: String(until), services: `${program.nid}:${program.sid}`, limit: '100' })
+      const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
+      const full = rows.find((row) => Number(row.id) === program.id)
+      if (!full) return
+      const updated = { ...program, description: String(full.description ?? ''), extended: String(full.extended ?? ''), loaded: true }
+      rawPrograms.value = rawPrograms.value.map((row) => String(row.id) === String(program.id) ? { ...row, ...full } : row)
+      detail.value = updated
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : String(cause)
+    }
+  })()
 }
 function closeDetail() {
   detail.value = null
@@ -634,12 +759,12 @@ onUnmounted(() => {
         class="guide-grid"
         :style="{
           width: `${axisWidth + columns.length * columnWidth}px`,
-          height: `${totalHeight + HEADER_HEIGHT}px`,
+          height: `${totalHeight + headerHeight}px`,
           '--guide-col-w': `${columnWidth}px`,
           '--guide-hour-h': `${60 * pxPerMin}px`,
         }"
       >
-        <div class="guide-header-row" :style="{ height: `${HEADER_HEIGHT}px` }">
+        <div class="guide-header-row" :style="{ height: `${headerHeight}px` }">
           <div class="guide-corner" :style="{ width: `${axisWidth}px` }" />
           <div
             v-for="entry in visibleColumns"
@@ -647,7 +772,15 @@ onUnmounted(() => {
             class="guide-header-cell"
             :style="{ left: `${axisWidth + entry.index * columnWidth}px`, width: `${columnWidth}px` }"
           >
-            <span v-text="entry.column.name" /><small
+            <img
+              v-if="logoSrc(entry.column)"
+              class="guide-channel-logo"
+              loading="lazy"
+              decoding="async"
+              :src="logoSrc(entry.column)"
+              :alt="entry.column.name"
+              @error="onLogoError(entry.column)"
+            /><span v-text="entry.column.name" /><small
               v-if="entry.column.subLabel"
               v-text="entry.column.subLabel"
             />
@@ -684,15 +817,21 @@ onUnmounted(() => {
               :key="item.program.id"
               type="button"
               class="guide-cell"
+              :class="{ 'guide-cell-past': isPast(item.program), 'guide-cell-onair': isOnAir(item.program) }"
               :aria-label="item.program.name || '番組名なし'"
               :style="item.style"
               @click="openDetail(item.program)"
             >
-              <strong v-if="item.program.name" v-text="item.program.name" /><span
+              <span class="guide-cell-highlight" aria-hidden="true" /><div class="guide-cell-content">
+                <span class="guide-cell-time" v-text="fmtMinute(item.program.start_at)" />
+                <strong v-if="item.program.name" v-text="item.program.name" /><span
                 v-else
                 class="guide-untitled"
-                >番組名なし</span
-              ><span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
+                >番組名なし</span><span
+                v-if="item.program.description"
+                class="guide-cell-description"
+                v-text="item.program.description"
+              /></div>
             </button>
           </div>
         </div>

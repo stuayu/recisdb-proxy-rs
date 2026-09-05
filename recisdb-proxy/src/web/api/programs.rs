@@ -54,6 +54,32 @@ pub struct ProgramApi {
     pub genre: Option<i64>,
 }
 
+/// How much of `description` the brief form keeps.
+///
+/// The grid cell shows a short summary under the title, so dropping the
+/// description entirely would make the timetable look wrong. Sending it in
+/// full is what made the response huge in the first place, so keep only what
+/// a cell can physically display. A cell is at most ~150px wide and a handful
+/// of lines tall; past roughly this many characters nothing more is visible.
+const BRIEF_DESCRIPTION_CHARS: usize = 80;
+
+/// Truncate on a character boundary (Japanese text is multi-byte, so slicing
+/// by byte index would panic).
+fn brief_description(value: Option<String>) -> Option<String> {
+    let text = value?;
+    let mut end = None;
+    for (count, (index, _)) in text.char_indices().enumerate() {
+        if count == BRIEF_DESCRIPTION_CHARS {
+            end = Some(index);
+            break;
+        }
+    }
+    Some(match end {
+        Some(index) => format!("{}…", &text[..index]),
+        None => text,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct BriefProgramApi {
     id: i64,
@@ -64,6 +90,9 @@ struct BriefProgramApi {
     start_at: i64,
     duration_secs: i64,
     name: Option<String>,
+    /// Shortened to [`BRIEF_DESCRIPTION_CHARS`]; the full text (and
+    /// `extended`) come from a non-brief fetch when a program is opened.
+    description: Option<String>,
     genre: Option<i64>,
 }
 
@@ -78,6 +107,7 @@ impl From<ProgramRecord> for BriefProgramApi {
             start_at: r.start_at,
             duration_secs: r.duration_secs,
             name: r.name,
+            description: brief_description(r.description),
             genre: r.genre,
         }
     }
@@ -171,7 +201,22 @@ fn parse_services(value: &str) -> Result<Vec<(u16, u16)>, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_services;
+    use super::{brief_description, parse_services};
+
+    #[test]
+    fn brief_description_truncates_on_a_character_boundary() {
+        // Multi-byte text: slicing by byte index would panic here.
+        let long = "あ".repeat(200);
+        let shortened = brief_description(Some(long)).unwrap();
+        assert_eq!(shortened.chars().count(), super::BRIEF_DESCRIPTION_CHARS + 1);
+        assert!(shortened.ends_with('…'));
+
+        // Short enough to keep verbatim, with no ellipsis appended.
+        let short = "短い説明".to_string();
+        assert_eq!(brief_description(Some(short.clone())), Some(short));
+        assert_eq!(brief_description(None), None);
+    }
+
 
     #[test]
     fn services_ignores_malformed_items() {

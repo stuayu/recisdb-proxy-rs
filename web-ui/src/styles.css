@@ -22,6 +22,18 @@
   --danger: #b42318;
   --success: #19704a;
   --warning: #8a5a00;
+
+  --guide-genre-white-highlight: #ffffff; --guide-genre-white-background: #f8f8f8;
+  --guide-genre-pink-highlight: #f50094; --guide-genre-pink-background: #f6eaef;
+  --guide-genre-red-highlight: #e1512d; --guide-genre-red-background: #ffecec;
+  --guide-genre-orange-highlight: #ff9800; --guide-genre-orange-background: #fff3e0;
+  --guide-genre-yellow-highlight: #ffeb3b; --guide-genre-yellow-background: #fffde7;
+  --guide-genre-lime-highlight: #8bc34a; --guide-genre-lime-background: #f1f8e9;
+  --guide-genre-teal-highlight: #009688; --guide-genre-teal-background: #e0f2f1;
+  --guide-genre-cyan-highlight: #03a9f4; --guide-genre-cyan-background: #e1f5fe;
+  --guide-genre-blue-highlight: #4e7ac1; --guide-genre-blue-background: #eff3fb;
+  --guide-genre-ochre-highlight: #c59a2f; --guide-genre-ochre-background: #fdf5e2;
+  --guide-genre-brown-highlight: #a3421f; --guide-genre-brown-background: #fff2eb;
 }
 
 * {
@@ -66,6 +78,13 @@ textarea {
   --danger: #ff9b90;
   --success: #6fd3a4;
   --warning: #e8b25a;
+
+  --guide-genre-white-background: #34383e; --guide-genre-pink-background: #422838;
+  --guide-genre-red-background: #452b2a; --guide-genre-orange-background: #453525;
+  --guide-genre-yellow-background: #454126; --guide-genre-lime-background: #304127;
+  --guide-genre-teal-background: #203b3a; --guide-genre-cyan-background: #203c4a;
+  --guide-genre-blue-background: #29364c; --guide-genre-ochre-background: #443a27;
+  --guide-genre-brown-background: #452c26;
 }
 
 .topbar {
@@ -615,10 +634,21 @@ textarea:focus-visible,
   justify-content: center;
   gap: 2px;
   min-width: 0;
-  padding: 8px 10px;
+  padding: 4px;
   overflow: hidden;
   color: #fff;
   font-weight: 700;
+}
+
+.guide-channel-logo {
+  flex: 0 0 auto;
+  width: clamp(32px, 30%, 46px);
+  height: auto;
+  max-height: 31px;
+  aspect-ratio: 3 / 2;
+  object-fit: contain;
+  background: var(--soft);
+  border-radius: 4px;
 }
 
 .guide-header-cell > span {
@@ -697,33 +727,93 @@ textarea:focus-visible,
   z-index: 1;
   box-sizing: border-box;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex-direction: row;
   min-width: 0;
   min-height: 2px;
   right: auto;
-  padding: 3px 6px;
+  padding: 0;
   overflow: hidden;
-  color: var(--text);
+  color: var(--guide-cell-text);
   text-align: left;
   cursor: pointer;
   border: 1px solid var(--border);
-  border-left: 4px solid var(--muted);
-  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--guide-genre-highlight) 35%, var(--border));
+  border-radius: 0;
+  background: var(--guide-genre-background);
+  contain: layout paint;
+  transition: box-shadow .15s ease, z-index 0s;
+}
+
+.guide-cell-highlight {
+  flex: 0 0 5px;
+  background: var(--guide-genre-highlight);
+}
+
+.guide-cell-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 4px;
+  overflow: hidden;
+}
+
+.guide-cell:hover,
+.guide-cell:focus-visible {
+  z-index: 5;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 25%);
+}
+
+.guide-cell-onair {
+  z-index: 3;
+  border: 2px solid var(--danger);
+}
+
+.guide-cell-past {
+  opacity: .62;
 }
 
 .guide-cell strong,
 .guide-untitled {
-  overflow: hidden;
-  font-size: 0.8rem;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.3;
+  word-break: break-all;
 }
 
 .guide-untitled {
   color: var(--muted);
   font-style: italic;
+}
+
+.guide-cell-time {
+  flex-shrink: 0;
+  color: var(--guide-cell-text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.guide-cell-description {
+  flex-grow: 1;
+  flex-shrink: 1;
+  min-height: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+@media (max-width: 700px) {
+  .guide-cell {
+    content-visibility: auto;
+    contain-intrinsic-size: 0 60px;
+  }
+  .guide-cell-description {
+    display: none;
+  }
 }
 
 @media (max-width: 700px) {
@@ -1486,8 +1576,9 @@ textarea:focus-visible,
 }
 
 .guide-cell-time {
-  color: var(--muted);
-  font-size: 0.68rem;
+  color: var(--guide-cell-text, var(--text));
+  font-size: 11px;
+  font-weight: 700;
 }
 
 /* 列 (.guide-col, z-index 1) より上、ヘッダー行 (z-index 4) より下に引く。
