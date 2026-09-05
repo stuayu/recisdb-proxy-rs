@@ -50,12 +50,15 @@ fn require_system_scope(scope: ServiceScope) -> Result<(), ServiceError> {
 /// `STOP_PENDING` のまま `start` しないよう、状態が確定するまで待つ。
 /// 特に BonDriver の解放には数秒かかることがあり、ここを待たないと
 /// `service restart` が「開始済み」に見えても実プロセスが残ったままになる。
+/// 既定の状態待ち上限。`sc start` / `sc stop` の同期待ちに使う。
+const DEFAULT_STATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn wait_for_state(
     service: &windows_service::service::Service,
     expected: ServiceState,
+    timeout: Duration,
 ) -> Result<(), ServiceError> {
-    const TIMEOUT: Duration = Duration::from_secs(60);
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
 
     loop {
         let status = service.query_status().map_err(to_windows_service_error)?;
@@ -178,7 +181,7 @@ pub fn start(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
     service
         .start(&Vec::<&OsStr>::new())
         .map_err(to_windows_service_error)?;
-    wait_for_state(&service, ServiceState::Running)
+    wait_for_state(&service, ServiceState::Running, DEFAULT_STATE_TIMEOUT)
 }
 
 pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
@@ -197,7 +200,7 @@ pub fn stop(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
         return Ok(());
     }
     service.stop().map_err(to_windows_service_error)?;
-    wait_for_state(&service, ServiceState::Stopped)
+    wait_for_state(&service, ServiceState::Stopped, DEFAULT_STATE_TIMEOUT)
 }
 
 pub fn restart(name: &str, scope: ServiceScope) -> Result<(), ServiceError> {
@@ -292,30 +295,121 @@ pub fn status(name: &str, scope: ServiceScope) -> ServiceStatus {
 /// `sanitize_service_name` を通した名前が `--service-name` で戻って
 /// きたものなので、コマンドラインに埋め込んでも安全。
 pub fn spawn_detached_restart(name: &str) -> Result<(), ServiceError> {
-    // 防御的に再検証する: ここで組み立てる文字列は cmd.exe が解釈する。
+    // 防御的に再検証する: 引数はこのあとコマンドラインに載る。
     let name = super::sanitize_service_name(name)?;
 
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-    // `ping -n 3` ≈ 2秒待ってから停止 (このレスポンスを返し切るため)、
-    // 停止後さらに待ってから開始する。
-    let line = format!(
-        "/C ping -n 3 127.0.0.1 >nul & sc stop \"{name}\" >nul & ping -n 6 127.0.0.1 >nul & sc start \"{name}\" >nul"
-    );
+    // 自分自身を「再起動係」として切り離して起動する。
+    //
+    // かつては `cmd /C ping … & sc stop & ping … & sc start` を撒いていたが、
+    // `sc stop` は非同期で、固定待ち (約5秒) のあと状態を確認せずに
+    // `sc start` を撃っていた。停止が終わっていなければ start は
+    // `ERROR_SERVICE_ALREADY_RUNNING` / `ERROR_SERVICE_REQUEST_TIMEOUT` で
+    // 失敗し、サービスは停止したまま取り残される。実際に本番で
+    // 「更新したのに再起動されない」「サービスが落ちたまま」を起こしていた。
+    //
+    // 状態をポーリングする再起動は cmd のバッチで書くと壊れやすいので、
+    // 隠しフラグ付きで自分自身を起動して Rust 側で待つ。
+    // 自己更新の直後に呼ばれるため、`current_exe()` は **更新後の** exe を
+    // 指す。再起動係自体は新しいバイナリで動く。
+    let exe = std::env::current_exe().map_err(ServiceError::Io)?;
 
-    std::process::Command::new("cmd")
-        .raw_arg(line)
+    std::process::Command::new(exe)
+        .arg(RESTART_WATCHDOG_FLAG)
+        .arg(&name)
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map(|_| ())
         .map_err(|e| ServiceError::CommandFailed {
-            command: "cmd /C sc stop && sc start".to_string(),
+            command: format!("{RESTART_WATCHDOG_FLAG} {name}"),
             exit_code: None,
             stderr: e.to_string(),
         })
 }
+
+/// 切り離しプロセスとして「停止を待ってから起動する」モードに入る隠しフラグ。
+/// 値は次の引数 (サービス名)。
+pub const RESTART_WATCHDOG_FLAG: &str = "--service-restart-watchdog";
+
+/// 停止完了を待つ上限。サービス側の `GRACEFUL_STOP_TIMEOUT` に、強制終了
+/// してから SCM が状態を反映するまでの余裕を足した値。
+const RESTART_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+/// 起動要求を出してから RUNNING になるまで待つ上限。
+const RESTART_START_TIMEOUT: Duration = Duration::from_secs(90);
+/// 起動要求のリトライ回数。停止直後は SCM がまだ後片付け中で
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` などを返すことがある。
+const RESTART_START_ATTEMPTS: u32 = 5;
+
+/// `--service-restart-watchdog <name>` で起動されたときの本体。
+///
+/// 1. 対象サービスへ停止を要求する (すでに停止していれば飛ばす)
+/// 2. **STOPPED になるまで待つ** — ここが固定待ちだったのが従来の不具合
+/// 3. 起動を要求し、RUNNING になるまで待つ。失敗したら間を空けて再試行
+///
+/// 成否は終了コードで返す (0=成功)。呼び出し元はすでに終了しているので、
+/// 経過は標準エラー出力へ書く。
+pub fn run_restart_watchdog(name: &str) -> Result<(), ServiceError> {
+    let name = super::sanitize_service_name(name)?;
+    let manager = ServiceManager::local_computer(
+        None::<&OsStr>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::ENUMERATE_SERVICE,
+    )
+    .map_err(to_windows_service_error)?;
+    let service = manager
+        .open_service(
+            &name,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        )
+        .map_err(to_windows_service_error)?;
+
+    // 呼び出し元 (更新API) がレスポンスを返し切る余裕。
+    std::thread::sleep(Duration::from_secs(2));
+
+    let current = service.query_status().map_err(to_windows_service_error)?;
+    if current.current_state != ServiceState::Stopped {
+        // 停止要求は「すでに停止処理中」なら失敗しうる。その場合も
+        // 待ちには入る (エラーで抜けない)。
+        if let Err(e) = service.stop() {
+            eprintln!("restart watchdog: stop request returned {e}; waiting for STOPPED anyway");
+        }
+    }
+    wait_for_state(&service, ServiceState::Stopped, RESTART_STOP_TIMEOUT)?;
+
+    let mut last_error = String::new();
+    for attempt in 1..=RESTART_START_ATTEMPTS {
+        match service.start::<&OsStr>(&[]) {
+            Ok(()) => {
+                return wait_for_state(&service, ServiceState::Running, RESTART_START_TIMEOUT)
+            }
+            Err(e) => {
+                last_error = e.to_string();
+                eprintln!("restart watchdog: start attempt {attempt} failed: {last_error}");
+                // すでに誰かが起こしていれば成功扱い。
+                if let Ok(status) = service.query_status() {
+                    if status.current_state == ServiceState::Running
+                        || status.current_state == ServiceState::StartPending
+                    {
+                        return wait_for_state(
+                            &service,
+                            ServiceState::Running,
+                            RESTART_START_TIMEOUT,
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    }
+    Err(ServiceError::CommandFailed {
+        command: format!("start {name}"),
+        exit_code: None,
+        stderr: last_error,
+    })
+}
+
 
 // ---------------------------------------------------------------------
 // SCM ディスパッチャ: `recisdb-proxy --run-as-service` 経路で
@@ -343,17 +437,65 @@ static MAIN_BODY_STORAGE: std::sync::OnceLock<
 
 define_windows_service!(ffi_service_main, service_main_entry);
 
+/// 停止要求を受けてからサーバ本体の終了を待つ上限。これを過ぎたら
+/// SCM に STOPPED を報告してからプロセスを落とす。
+///
+/// 本番 (fukushima) で観測した不具合の再発防止:
+/// 停止要求は受理されるのにサーバが終了せず、サービスが RUNNING の
+/// まま「停止処理中」として SCM に滞留した。以後の制御要求はすべて
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (1061) で弾かれるため、
+/// 自己更新後の `sc stop` → `sc start` が丸ごと不発になり、
+/// 新しい exe を置いても旧イメージが動き続けていた。
+///
+/// 停止できないサービスは運用できない。graceful shutdown を待つのは
+/// ここまで、と上限を切って必ず落とす。SQLite は WAL なので強制終了
+/// でも壊れない (次回起動時にリカバリされる)。
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// STOP_PENDING を報告するときに SCM へ伝える猶予。実際の待ち上限より
+/// 長めに申告しないと、SCM 側が「応答なし」と判断してしまう。
+const STOP_WAIT_HINT: Duration = Duration::from_secs(45);
+
 fn service_main_entry(_arguments: Vec<OsString>) {
     let service_name = SERVICE_NAME_STORAGE.get().cloned().unwrap_or_default();
     let should_stop = std::sync::Arc::new(AtomicBool::new(false));
     let should_stop_for_handler = std::sync::Arc::clone(&should_stop);
+
+    // ハンドラ内から状態を報告できるよう、登録より先に置き場所を作る。
+    // `register` が返すハンドルは Copy なので、登録後に埋める。
+    let handle_slot: std::sync::Arc<
+        std::sync::OnceLock<service_control_handler::ServiceStatusHandle>,
+    > = std::sync::Arc::new(std::sync::OnceLock::new());
+    let handle_for_handler = std::sync::Arc::clone(&handle_slot);
 
     let status_handle = match service_control_handler::register(
         &service_name,
         move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
-                    should_stop_for_handler.store(true, Ordering::SeqCst);
+                    // 二重に受けても副作用がないようにする (SCM は停止が
+                    // 完了しないと同じ制御を再送してくることがある)。
+                    let first = !should_stop_for_handler.swap(true, Ordering::SeqCst);
+                    if first {
+                        tracing::info!(
+                            "SCM stop control received; beginning graceful shutdown (timeout {}s)",
+                            GRACEFUL_STOP_TIMEOUT.as_secs()
+                        );
+                    }
+                    // **ここで STOP_PENDING を報告するのが SCM との契約。**
+                    // 報告しないと SCM から見て状態が RUNNING のまま
+                    // 停止要求だけが滞留し、以後の制御が 1061 で弾かれる。
+                    if let Some(handle) = handle_for_handler.get() {
+                        let _ = handle.set_service_status(WinServiceStatus {
+                            service_type: ServiceType::OWN_PROCESS,
+                            current_state: ServiceState::StopPending,
+                            controls_accepted: ServiceControlAccept::empty(),
+                            exit_code: ServiceExitCode::Win32(0),
+                            checkpoint: 1,
+                            wait_hint: STOP_WAIT_HINT,
+                            process_id: None,
+                        });
+                    }
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -364,6 +506,7 @@ fn service_main_entry(_arguments: Vec<OsString>) {
         Ok(h) => h,
         Err(_) => return,
     };
+    let _ = handle_slot.set(status_handle);
 
     let report = |state: ServiceState, accept: ServiceControlAccept, checkpoint: u32| {
         let _ = status_handle.set_service_status(WinServiceStatus {
@@ -383,16 +526,84 @@ fn service_main_entry(_arguments: Vec<OsString>) {
         .get()
         .and_then(|m| m.lock().ok().and_then(|mut g| g.take()))
     {
-        report(ServiceState::Running, ServiceControlAccept::STOP, 0);
+        // SHUTDOWN も受ける。受けないと OS 再起動時に停止通知が来ず、
+        // DB とログのフラッシュ機会がないままプロセスを落とされる。
+        report(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            0,
+        );
+        spawn_stop_watchdog(status_handle, std::sync::Arc::clone(&should_stop));
         // サーバ本体を実行。`should_stop` を見て graceful shutdown する
         // 責務は呼び出し元 (main.rs 側の run_server) にある。この呼び出し
-        // はサーバが終了するまでブロックする。
+        // はサーバが終了するまでブロックする。ここが戻ってこない場合は
+        // 上の watchdog がプロセスごと落とす。
         body(should_stop);
         report(ServiceState::StopPending, ServiceControlAccept::empty(), 1);
     }
 
+    SERVICE_STOPPED_CLEANLY.store(true, Ordering::SeqCst);
     report(ServiceState::Stopped, ServiceControlAccept::empty(), 0);
 }
+
+/// 停止要求を受けたのにサーバ本体が終了しないケースの最後の砦。
+///
+/// 停止フラグが立ってから `GRACEFUL_STOP_TIMEOUT` を過ぎても
+/// `service_main_entry` が STOPPED を報告していなければ、ここで
+/// STOPPED を報告してからプロセスを終了する。
+///
+/// **STOPPED を報告してから終了するのが重要**: 報告せずに落ちると SCM は
+/// 「予期しない終了」と見なして failure actions (RESTART) を発火させる。
+/// 自己更新の再起動シーケンスと二重に起動が走り、ポートを奪い合う。
+fn spawn_stop_watchdog(
+    status_handle: service_control_handler::ServiceStatusHandle,
+    should_stop: std::sync::Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        // 停止要求が来るまで待つ。
+        while !should_stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let deadline = std::time::Instant::now() + GRACEFUL_STOP_TIMEOUT;
+        let mut checkpoint = 2u32;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            if SERVICE_STOPPED_CLEANLY.load(Ordering::SeqCst) {
+                return;
+            }
+            // 進行中であることを SCM に伝え続ける (checkpoint を進める)。
+            let _ = status_handle.set_service_status(WinServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::StopPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint,
+                wait_hint: STOP_WAIT_HINT,
+                process_id: None,
+            });
+            checkpoint = checkpoint.saturating_add(1);
+        }
+        tracing::error!(
+            "graceful shutdown did not finish within {}s; forcing process exit so the service \
+             manager can restart us (this is the failure that used to leave self-update stuck)",
+            GRACEFUL_STOP_TIMEOUT.as_secs()
+        );
+        let _ = status_handle.set_service_status(WinServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+        std::process::exit(0);
+    });
+}
+
+/// `service_main_entry` が最後まで到達して STOPPED を報告できたか。
+/// watchdog が二重に STOPPED を報告して落とすのを防ぐ。
+static SERVICE_STOPPED_CLEANLY: AtomicBool = AtomicBool::new(false);
 
 /// SCM からのディスパッチを開始する。`main_body` はサーバ本体を起動する
 /// クロージャで、`Arc<AtomicBool>` (stop要求フラグ) を受け取り、サーバが

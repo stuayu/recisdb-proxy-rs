@@ -130,6 +130,14 @@ struct Args {
     /// passes it explicitly.
     #[arg(long, hide = true)]
     service_workdir: Option<PathBuf>,
+
+    /// Internal (Windows): run as the detached "restart this service" helper.
+    /// Spawned by `service::restart_self` after a self-update. It waits for
+    /// the service to reach STOPPED before starting it again — a fixed delay
+    /// used to fire `sc start` while the stop was still in flight, leaving the
+    /// service down and the update unapplied.
+    #[arg(long, hide = true)]
+    service_restart_watchdog: Option<String>,
 }
 
 /// Subcommands. `None` (the default) keeps the historical behaviour of
@@ -151,6 +159,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Command::Service { action }) = &args.command {
         let code = service_cli::run(action, args.config.as_deref());
         std::process::exit(code);
+    }
+
+    // The restart helper only talks to the SCM; it must not open the database
+    // or bind any port (the service it is restarting owns both).
+    #[cfg(windows)]
+    if let Some(name) = args.service_restart_watchdog.as_deref() {
+        return match recisdb_proxy::service::windows_scm::run_restart_watchdog(name) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("service restart watchdog failed: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     if args.run_as_service {
