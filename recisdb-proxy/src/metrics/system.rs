@@ -308,9 +308,13 @@ fn parse_windows_gpu_inventory(inventory: &str, memory: &str, usage: &str) -> Ve
         let Some(start) = path.find("luid_") else {
             continue;
         };
-        let Some(end) = path[start..].find(')') else {
+        let end = path[start..]
+            .find("_eng_")
+            .or_else(|| path[start..].find(')'))
+            .unwrap_or(path.len() - start);
+        if end == 0 {
             continue;
-        };
+        }
         let key = path[start..start + end].to_string();
         let entry = memory_by_luid.entry(key).or_default();
         if path.to_ascii_lowercase().contains("dedicated usage") {
@@ -327,9 +331,13 @@ fn parse_windows_gpu_inventory(inventory: &str, memory: &str, usage: &str) -> Ve
         let Some(start) = path.find("luid_") else {
             continue;
         };
-        let Some(end) = path[start..].find(')') else {
+        let end = path[start..]
+            .find("_eng_")
+            .or_else(|| path[start..].find(')'))
+            .unwrap_or(path.len() - start);
+        if end == 0 {
             continue;
-        };
+        }
         *usage_by_luid
             .entry(path[start..start + end].to_string())
             .or_default() += value.trim().parse::<f32>().unwrap_or(0.0);
