@@ -1,8 +1,6 @@
 //! Host resource metrics kept in a short-lived in-memory history.
 
 use serde::Serialize;
-#[cfg(windows)]
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::future::Future;
 #[cfg(target_os = "linux")]
@@ -119,8 +117,20 @@ struct WindowsGpuProbe;
 impl GpuProbe for WindowsGpuProbe {
     fn sample<'a>(&'a self) -> ProbeFuture<'a> {
         Box::pin(async move {
-            let Some(text) = command_output("powershell", &["-NoProfile", "-NonInteractive", "-Command", "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples | ForEach-Object { \"$($_.Path)|$($_.CookedValue)\" }"]).await else { return Vec::new(); };
-            parse_windows_gpu_counters(&text)
+            let Some(text) = command_output(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)|$($_.AdapterCompatibility)\" }",
+                ],
+            )
+            .await
+            else {
+                return Vec::new();
+            };
+            parse_windows_gpu_inventory(&text)
         })
     }
 }
@@ -288,25 +298,34 @@ fn parse_sysfs_number(value: &str) -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn parse_windows_gpu_counters(text: &str) -> Vec<GpuMetrics> {
-    let mut sums = BTreeMap::<String, f32>::new();
-    for line in text.lines() {
-        let Some((path, value)) = line.rsplit_once('|') else {
-            continue;
-        };
-        let Ok(value) = value.trim().parse::<f32>() else {
-            continue;
-        };
-        let adapter = path.split("phys_").next().unwrap_or(path);
-        *sums.entry(adapter.to_string()).or_default() += value;
-    }
-    sums.into_iter()
+fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, compatibility) = line.split_once('|')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let vendor_text = compatibility.trim().to_ascii_lowercase();
+            let vendor = if vendor_text.contains("nvidia")
+                || name.to_ascii_lowercase().contains("nvidia")
+            {
+                GpuVendor::Nvidia
+            } else if vendor_text.contains("amd") || vendor_text.contains("advanced micro") {
+                GpuVendor::Amd
+            } else if vendor_text.contains("intel") || name.to_ascii_lowercase().contains("intel") {
+                GpuVendor::Intel
+            } else {
+                GpuVendor::Unknown
+            };
+            Some((name.to_string(), vendor))
+        })
         .enumerate()
-        .map(|(index, (_, usage_percent))| GpuMetrics {
+        .map(|(index, (name, vendor))| GpuMetrics {
             index,
-            vendor: GpuVendor::Unknown,
-            name: format!("GPU {index}"),
-            usage_percent: Some(usage_percent),
+            vendor,
+            name,
+            usage_percent: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
         })
