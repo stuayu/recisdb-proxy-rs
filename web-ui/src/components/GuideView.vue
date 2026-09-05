@@ -384,7 +384,15 @@ async function loadPrograms() {
 }
 async function refresh() {
   loading.value = true
-  void loadChannels().then(() => loadPrograms()).finally(() => { loading.value = false })
+  void loadChannels()
+    .then(async () => {
+      // チャンネル取得前は visibleColumnEnd=0 のため、番組APIへ services を渡せず
+      // 本番の全サービス・数万件を初回取得していた。列範囲を確定してから読む。
+      await nextTick()
+      resizeGrid()
+      await loadPrograms()
+    })
+    .finally(() => { loading.value = false })
   await nextTick()
   resizeGrid()
 }
