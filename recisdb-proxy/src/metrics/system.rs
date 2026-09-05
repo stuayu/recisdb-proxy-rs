@@ -123,7 +123,7 @@ impl GpuProbe for WindowsGpuProbe {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)|$($_.AdapterCompatibility)\" }",
+                    r#"$mem = @{}; (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage','\GPU Adapter Memory(*)\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.Path -match '(luid_[^)]+)\\') { $key=$Matches[1]; if (!$mem.ContainsKey($key)) { $mem[$key]=@{dedicated=0;shared=0} }; if ($_.Path -match 'Dedicated Usage') { $mem[$key].dedicated += $_.CookedValue } else { $mem[$key].shared += $_.CookedValue } } }; $usage = @{}; (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.Path -match '(luid_[^)]+)\\') { $key=$Matches[1]; $usage[$key] = ($usage[$key] + $_.CookedValue) } }; $rows = @(); Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Remote Display|Microsoft Basic' } | ForEach-Object { $vendor=$_.AdapterCompatibility; $key=$null; if ($vendor -match 'NVIDIA' -or $_.Name -match 'NVIDIA') { $key=$mem.GetEnumerator() | Sort-Object { $_.Value.dedicated } -Descending | Select-Object -First 1 -ExpandProperty Key } elseif ($vendor -match 'Intel' -or $_.Name -match 'Intel') { $key=$mem.GetEnumerator() | Where-Object { $_.Key -ne ($mem.GetEnumerator() | Sort-Object { $_.Value.dedicated } -Descending | Select-Object -First 1 -ExpandProperty Key) } | Sort-Object { $_.Value.shared } -Descending | Select-Object -First 1 -ExpandProperty Key }; $d=0; $s=0; $u=$null; if ($key -and $mem.ContainsKey($key)) { $d=$mem[$key].dedicated; $s=$mem[$key].shared; $u=$usage[$key] }; \"$($_.Name)|$vendor|$u|$d|$s\" }"#,
                 ],
             )
             .await
@@ -297,11 +297,15 @@ fn parse_sysfs_number(value: &str) -> Option<u64> {
     value.trim().parse().ok()
 }
 
-#[cfg(windows)]
 fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
     text.lines()
         .filter_map(|line| {
-            let (name, compatibility) = line.split_once('|')?;
+            let mut fields = line.split('|');
+            let name = fields.next()?;
+            let compatibility = fields.next()?;
+            let usage_percent = fields.next().and_then(|v| v.trim().parse::<f32>().ok());
+            let dedicated = fields.next().and_then(|v| v.trim().parse::<f64>().ok());
+            let shared = fields.next().and_then(|v| v.trim().parse::<f64>().ok());
             let name = name.trim();
             if name.is_empty() {
                 return None;
@@ -318,17 +322,24 @@ fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
             } else {
                 GpuVendor::Unknown
             };
-            Some((name.to_string(), vendor))
+            Some((name.to_string(), vendor, usage_percent, dedicated, shared))
         })
         .enumerate()
-        .map(|(index, (name, vendor))| GpuMetrics {
-            index,
-            vendor,
-            name,
-            usage_percent: None,
-            memory_used_bytes: None,
-            memory_total_bytes: None,
-        })
+        .map(
+            |(index, (name, vendor, usage_percent, dedicated, shared))| GpuMetrics {
+                index,
+                vendor,
+                name,
+                usage_percent,
+                memory_used_bytes: dedicated
+                    .zip(shared)
+                    .map(|(d, s)| (d.max(0.0) + s.max(0.0)) as u64),
+                // Windows exposes shared usage but not a stable per-adapter VRAM
+                // capacity through these counters. Do not present shared usage as
+                // the total capacity.
+                memory_total_bytes: None,
+            },
+        )
         .collect()
 }
 
@@ -470,6 +481,17 @@ mod tests {
         );
         assert_eq!(result[0].usage_percent, Some(42.0));
         assert_eq!(result[0].memory_total_bytes, Some(456));
+    }
+    #[test]
+    fn parses_windows_gpu_inventory_with_usage_and_memory() {
+        let result = parse_windows_gpu_inventory(
+            "Intel(R) UHD Graphics 730|Intel Corporation|12.5|0|78303232\nNVIDIA GeForce GTX 1660 Ti|NVIDIA|0|466128896|25124864",
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].vendor, GpuVendor::Intel);
+        assert_eq!(result[0].usage_percent, Some(12.5));
+        assert_eq!(result[0].memory_used_bytes, Some(78303232));
+        assert_eq!(result[0].memory_total_bytes, None);
     }
     #[cfg(target_os = "linux")]
     #[test]
