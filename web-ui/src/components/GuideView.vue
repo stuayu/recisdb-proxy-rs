@@ -220,6 +220,7 @@ const showNowLine = computed(
 const hourMarks = computed(() =>
   Array.from({ length: GRID_HOURS }, (_, index) => ({
     offset: index * 60 * pxPerMin.value,
+    hour: (GRID_START_HOUR + index) % 24,
     label: `${String((GRID_START_HOUR + index) % 24).padStart(2, '0')}:00`,
   })),
 )
@@ -794,6 +795,7 @@ onUnmounted(() => {
               :key="mark.label"
               class="guide-hour-label"
               :style="{ top: `${mark.offset}px` }"
+              :data-hour="mark.hour"
               v-text="mark.label"
             />
           </div>

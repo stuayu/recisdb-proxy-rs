@@ -23,6 +23,20 @@
   --success: #19704a;
   --warning: #8a5a00;
 
+  /* KonomiTV/REGZA風の時刻軸。深夜から夜へ時間帯を連続して識別できる色。 */
+  --guide-time-00: #2a4068; --guide-time-01: #325080;
+  --guide-time-02: #3a5c90; --guide-time-03: #4268a0;
+  --guide-time-04: #4a7aa0; --guide-time-05: #4d8898;
+  --guide-time-06: #509690; --guide-time-07: #55a080;
+  --guide-time-08: #4c8860; --guide-time-09: #5c8a58;
+  --guide-time-10: #6c8c52; --guide-time-11: #7a8c4c;
+  --guide-time-12: #7c8a48; --guide-time-13: #888848;
+  --guide-time-14: #908248; --guide-time-15: #987a48;
+  --guide-time-16: #987048; --guide-time-17: #906248;
+  --guide-time-18: #80564c; --guide-time-19: #6c4a50;
+  --guide-time-20: #5c4058; --guide-time-21: #4c3a54;
+  --guide-time-22: #3c3850; --guide-time-23: #30384c;
+
   --guide-genre-white-highlight: #ffffff; --guide-genre-white-background: #f8f8f8;
   --guide-genre-pink-highlight: #f50094; --guide-genre-pink-background: #f6eaef;
   --guide-genre-red-highlight: #e1512d; --guide-genre-red-background: #ffecec;
@@ -700,7 +714,7 @@ textarea:focus-visible,
   position: sticky;
   left: 0;
   z-index: 2;
-  background: var(--soft);
+  background: var(--guide-time-04);
   border-right: 1px solid var(--border);
 }
 
@@ -708,11 +722,42 @@ textarea:focus-visible,
   position: absolute;
   left: 0;
   right: 0;
-  padding: 2px 6px;
-  color: var(--muted);
-  font-size: 0.72rem;
-  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 7px 4px 0;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 50%);
+  border-top: 1px solid rgb(255 255 255 / 22%);
 }
+
+.guide-hour-label[data-hour='0'] { background: var(--guide-time-00); }
+.guide-hour-label[data-hour='1'] { background: var(--guide-time-01); }
+.guide-hour-label[data-hour='2'] { background: var(--guide-time-02); }
+.guide-hour-label[data-hour='3'] { background: var(--guide-time-03); }
+.guide-hour-label[data-hour='4'] { background: var(--guide-time-04); }
+.guide-hour-label[data-hour='5'] { background: var(--guide-time-05); }
+.guide-hour-label[data-hour='6'] { background: var(--guide-time-06); }
+.guide-hour-label[data-hour='7'] { background: var(--guide-time-07); }
+.guide-hour-label[data-hour='8'] { background: var(--guide-time-08); }
+.guide-hour-label[data-hour='9'] { background: var(--guide-time-09); }
+.guide-hour-label[data-hour='10'] { background: var(--guide-time-10); }
+.guide-hour-label[data-hour='11'] { background: var(--guide-time-11); }
+.guide-hour-label[data-hour='12'] { background: var(--guide-time-12); }
+.guide-hour-label[data-hour='13'] { background: var(--guide-time-13); }
+.guide-hour-label[data-hour='14'] { background: var(--guide-time-14); }
+.guide-hour-label[data-hour='15'] { background: var(--guide-time-15); }
+.guide-hour-label[data-hour='16'] { background: var(--guide-time-16); }
+.guide-hour-label[data-hour='17'] { background: var(--guide-time-17); }
+.guide-hour-label[data-hour='18'] { background: var(--guide-time-18); }
+.guide-hour-label[data-hour='19'] { background: var(--guide-time-19); }
+.guide-hour-label[data-hour='20'] { background: var(--guide-time-20); }
+.guide-hour-label[data-hour='21'] { background: var(--guide-time-21); }
+.guide-hour-label[data-hour='22'] { background: var(--guide-time-22); }
+.guide-hour-label[data-hour='23'] { background: var(--guide-time-23); }
 
 .guide-col {
   position: absolute;
@@ -1590,6 +1635,19 @@ textarea:focus-visible,
   z-index: 3;
   height: 2px;
   background: var(--danger);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--danger) 70%, transparent);
+}
+
+.guide-now-line::before {
+  position: absolute;
+  left: -5px;
+  top: -5px;
+  width: 12px;
+  height: 12px;
+  content: '';
+  background: var(--danger);
+  border-radius: 50%;
+  box-shadow: 0 0 4px color-mix(in srgb, var(--danger) 70%, transparent);
 }
 
 .guide-detail-dialog {
