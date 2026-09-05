@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 pub const HISTORY_CAPACITY: usize = 180;
-const GPU_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const GPU_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
