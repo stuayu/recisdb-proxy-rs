@@ -274,7 +274,27 @@ pub async fn create_epg_preset(
     db.connection()
         .execute(
             INSERT_PRESET_SQL,
-            rusqlite::params![p.name.trim(), p.description.unwrap_or_default(), p.enabled.map(i64::from).unwrap_or(1), p.target_refresh_secs, p.max_stale_secs, p.min_future_coverage_hours, p.target_future_coverage_hours, p.min_dwell_secs, p.normal_dwell_secs, p.max_dwell_secs, p.idle_section_timeout_secs, preset_bool(p.reserve_tuners), preset_bool(p.prefer_local), preset_bool(p.allow_remote), preset_bool(p.preemptible), p.cpu_soft_limit_percent, p.cpu_hard_limit_percent, preset_bool(p.remote_prefer_metadata_execution), preset_bool(p.remote_allow_ts_transport)],
+            rusqlite::params![
+                p.name.trim(),
+                p.description.unwrap_or_default(),
+                p.enabled.map(i64::from).unwrap_or(1),
+                p.target_refresh_secs,
+                p.max_stale_secs,
+                p.min_future_coverage_hours,
+                p.target_future_coverage_hours,
+                p.min_dwell_secs,
+                p.normal_dwell_secs,
+                p.max_dwell_secs,
+                p.idle_section_timeout_secs,
+                preset_bool(p.reserve_tuners),
+                preset_bool(p.prefer_local),
+                preset_bool(p.allow_remote),
+                preset_bool(p.preemptible),
+                p.cpu_soft_limit_percent,
+                p.cpu_hard_limit_percent,
+                preset_bool(p.remote_prefer_metadata_execution),
+                preset_bool(p.remote_allow_ts_transport)
+            ],
         )
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(Json(json!({"success":true})))

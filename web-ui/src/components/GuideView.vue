@@ -1,14 +1,39 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
 import PreviewPlayer from './PreviewPlayer.vue'
 
-const PX_PER_MIN = 2
 const GRID_START_HOUR = 6
-const TOTAL_MINUTES = 24 * 60
-const TOTAL_HEIGHT = TOTAL_MINUTES * PX_PER_MIN
+const GRID_HOURS = 24
+const TOTAL_MINUTES = GRID_HOURS * 60
 const MAX_PROGRAM_DURATION_SECS = 24 * 60 * 60
-const VISIBLE_BUFFER_MINUTES = 180
+const HEADER_HEIGHT = 52
+const NARROW_MEDIA_QUERY = '(max-width: 700px)'
+
+/*
+ * 表示密度はデバイスで変える (KonomiTV の TimeTableUtils.CHANNEL_WIDTH / HOUR_HEIGHT と同じ考え方)。
+ * 本番は放送局が 800 前後あり、1 列 220px のままだと横幅が 5 万px を超えて
+ * スマホでは 2 列も入らない。狭幅では列を詰め、1 分あたりの高さも下げる。
+ */
+const PX_PER_MIN_DESKTOP = 2
+const PX_PER_MIN_NARROW = 1.6
+const COLUMN_WIDTH_DESKTOP = 220
+const COLUMN_WIDTH_NARROW = 120
+const AXIS_WIDTH_DESKTOP = 64
+const AXIS_WIDTH_NARROW = 44
+
+/*
+ * 可視判定のバッファ。KonomiTV は デスクトップ 2 時間 / スマホ 3 時間で、
+ * 指スクロールで一気に動く狭幅ほど厚くしている (VISIBLE_BUFFER_HOURS_*)。
+ * VISIBLE_RANGE_UPDATE_RATIO も KonomiTV と同じで、バッファの端に近づいたときだけ
+ * 範囲を引き直す (スクロールのたびに再計算しない)。
+ */
+const VISIBLE_BUFFER_MINUTES_DESKTOP = 120
+const VISIBLE_BUFFER_MINUTES_NARROW = 180
+const VISIBLE_RANGE_UPDATE_RATIO = 0.5
+const COLUMN_BUFFER_DESKTOP = 2
+const COLUMN_BUFFER_NARROW = 3
+
 const GENRE_LABELS: Record<number, string> = {
   0: 'ニュース/報道',
   1: 'スポーツ',
@@ -64,11 +89,22 @@ type Program = {
   extended: string
   genre: number | null
 }
-type ServiceGroup = {
+/** 事前に位置とスタイルまで計算した番組セル。スクロール中は作り直さない。 */
+type RenderItem = {
+  program: Program
+  top: number
+  bottom: number
+  style: Record<string, string>
+}
+/** 1 列 (= 同一 nid:tsid の多重化。メイン + 併置するサブチャンネル)。 */
+type GuideColumn = {
   key: string
-  main: Service
-  subs: Service[]
+  name: string
+  subLabel: string
   band: BandCategory
+  nid: number
+  sid: number
+  items: RenderItem[]
 }
 const BAND_ORDER: Record<BandCategory, number> = {
   地上: 0,
@@ -111,8 +147,14 @@ function fmtTime(epoch: number): string {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
-const rawChannels = ref<JsonRecord[]>([])
-const rawPrograms = ref<JsonRecord[]>([])
+/*
+ * 本番の /programs は 2 万件を超える。ref だと配列の要素まで再帰的に Proxy 化され、
+ * 分類ループが 2 万個 × 各プロパティぶんの依存を張って一気に重くなる。
+ * 差し替えしか起きないので shallowRef で持つ (KonomiTV の TimeTableStore も
+ * channels_data を shallowRef にしている)。
+ */
+const rawChannels = shallowRef<JsonRecord[]>([])
+const rawPrograms = shallowRef<JsonRecord[]>([])
 const error = ref('')
 const loading = ref(false)
 const selectedDate = ref(fmtDateInput(new Date()))
@@ -123,12 +165,29 @@ const now = ref(Date.now())
 const detail = ref<Program | null>(null)
 const previewProgram = ref<Program | null>(null)
 const scrollArea = ref<HTMLElement | null>(null)
+const isNarrow = ref(false)
 const viewportHeight = ref(0)
 const visibleRangeTop = ref(0)
-const visibleRangeBottom = ref(TOTAL_HEIGHT)
+const visibleRangeBottom = ref(0)
+const visibleColumnStart = ref(0)
+const visibleColumnEnd = ref(0)
 let scrollAnimationId: number | null = null
 let pendingScrollTop = 0
+let pendingScrollLeft = 0
 let clockTimer = 0
+let narrowMedia: MediaQueryList | null = null
+
+const pxPerMin = computed(() => (isNarrow.value ? PX_PER_MIN_NARROW : PX_PER_MIN_DESKTOP))
+const columnWidth = computed(() => (isNarrow.value ? COLUMN_WIDTH_NARROW : COLUMN_WIDTH_DESKTOP))
+const axisWidth = computed(() => (isNarrow.value ? AXIS_WIDTH_NARROW : AXIS_WIDTH_DESKTOP))
+const totalHeight = computed(() => TOTAL_MINUTES * pxPerMin.value)
+const visibleBufferPx = computed(
+  () =>
+    (isNarrow.value ? VISIBLE_BUFFER_MINUTES_NARROW : VISIBLE_BUFFER_MINUTES_DESKTOP) *
+    pxPerMin.value,
+)
+const columnBuffer = computed(() => (isNarrow.value ? COLUMN_BUFFER_NARROW : COLUMN_BUFFER_DESKTOP))
+
 const gridStart = computed(() => {
   const [year, month, day] = selectedDate.value.split('-').map(Number)
   return new Date(year, month - 1, day, GRID_START_HOUR)
@@ -138,40 +197,87 @@ const gridBounds = computed(() => {
   return { since, until: since + TOTAL_MINUTES * 60 }
 })
 const isToday = computed(() => selectedDate.value === fmtDateInput(new Date()))
-const nowOffset = computed(() => ((now.value / 1000 - gridBounds.value.since) / 60) * PX_PER_MIN)
+const nowOffset = computed(() => ((now.value / 1000 - gridBounds.value.since) / 60) * pxPerMin.value)
 const showNowLine = computed(
-  () => isToday.value && nowOffset.value >= 0 && nowOffset.value <= TOTAL_HEIGHT,
+  () => isToday.value && nowOffset.value >= 0 && nowOffset.value <= totalHeight.value,
 )
 const hourMarks = computed(() =>
-  Array.from({ length: 24 }, (_, index) => ({
-    offset: index * 60 * PX_PER_MIN,
+  Array.from({ length: GRID_HOURS }, (_, index) => ({
+    offset: index * 60 * pxPerMin.value,
     label: `${String((GRID_START_HOUR + index) % 24).padStart(2, '0')}:00`,
   })),
 )
-function updateVisibleRange(top: number) {
-  const buffer = VISIBLE_BUFFER_MINUTES * PX_PER_MIN
-  visibleRangeTop.value = Math.max(0, top - buffer)
-  visibleRangeBottom.value = Math.min(TOTAL_HEIGHT, top + viewportHeight.value + buffer)
+
+/** 縦方向の可視範囲を引き直す。 */
+function updateVisibleRange(anchor: number): void {
+  const buffer = visibleBufferPx.value
+  visibleRangeTop.value = Math.max(0, anchor - buffer)
+  visibleRangeBottom.value = Math.min(totalHeight.value, anchor + viewportHeight.value + buffer)
 }
-function scheduleScrollUpdate() {
+/**
+ * バッファの端に近づいたときだけ可視範囲を引き直す。
+ * (KonomiTV TimeTableGrid.updateVisibleRangeIfNeeded と同じヒステリシス)
+ */
+function updateVisibleRangeIfNeeded(anchor: number): void {
+  if (viewportHeight.value <= 0 || visibleRangeBottom.value === 0) {
+    updateVisibleRange(anchor)
+    return
+  }
+  const threshold = visibleBufferPx.value * VISIBLE_RANGE_UPDATE_RATIO
+  const nearTop = visibleRangeTop.value > 0 && anchor < visibleRangeTop.value + threshold
+  const nearBottom =
+    visibleRangeBottom.value < totalHeight.value &&
+    anchor + viewportHeight.value > visibleRangeBottom.value - threshold
+  if (nearTop || nearBottom) updateVisibleRange(anchor)
+}
+/**
+ * 横方向の可視範囲 (列の添字) を引き直す。
+ * 本番は列が 200 を超え、画面には数列しか映らない。列そのものを DOM から外す。
+ */
+function updateVisibleColumns(scrollLeft: number, clientWidth: number): void {
+  const width = columnWidth.value
+  const total = columns.value.length
+  const buffer = columnBuffer.value
+  const first = Math.max(0, Math.floor((scrollLeft - axisWidth.value) / width) - buffer)
+  const last = Math.min(
+    total,
+    Math.ceil((scrollLeft + clientWidth - axisWidth.value) / width) + buffer,
+  )
+  if (visibleColumnStart.value !== first) visibleColumnStart.value = first
+  if (visibleColumnEnd.value !== Math.max(first, last)) {
+    visibleColumnEnd.value = Math.max(first, last)
+  }
+}
+function applyScrollUpdate(): void {
+  const element = scrollArea.value
+  if (element === null) return
+  const nextViewportHeight = element.clientHeight
+  if (viewportHeight.value !== nextViewportHeight) viewportHeight.value = nextViewportHeight
+  updateVisibleRangeIfNeeded(pendingScrollTop - HEADER_HEIGHT)
+  updateVisibleColumns(pendingScrollLeft, element.clientWidth)
+}
+function scheduleScrollUpdate(): void {
   if (scrollAnimationId !== null) return
   scrollAnimationId = requestAnimationFrame(() => {
     scrollAnimationId = null
-    updateVisibleRange(pendingScrollTop)
+    applyScrollUpdate()
   })
 }
-function onScroll() {
-  pendingScrollTop = scrollArea.value?.scrollTop ?? 0
+function onScroll(): void {
+  const element = scrollArea.value
+  pendingScrollTop = element?.scrollTop ?? 0
+  pendingScrollLeft = element?.scrollLeft ?? 0
   scheduleScrollUpdate()
 }
-function resizeGrid() {
-  viewportHeight.value = scrollArea.value?.clientHeight ?? 0
-  updateVisibleRange(scrollArea.value?.scrollTop ?? 0)
-}
-function isProgramVisible(program: Program): boolean {
-  const start = ((program.start_at - gridBounds.value.since) / 60) * PX_PER_MIN
-  const end = start + (program.duration_secs / 60) * PX_PER_MIN
-  return end >= visibleRangeTop.value && start <= visibleRangeBottom.value
+/** 可視範囲を無条件で作り直す (初期表示・リサイズ・データ差し替え時)。 */
+function resizeGrid(): void {
+  const element = scrollArea.value
+  isNarrow.value = narrowMedia?.matches ?? window.innerWidth <= 700
+  viewportHeight.value = element?.clientHeight ?? 0
+  pendingScrollTop = element?.scrollTop ?? 0
+  pendingScrollLeft = element?.scrollLeft ?? 0
+  updateVisibleRange(pendingScrollTop - HEADER_HEIGHT)
+  updateVisibleColumns(pendingScrollLeft, element?.clientWidth ?? 0)
 }
 
 async function loadChannels() {
@@ -255,6 +361,10 @@ const filteredServices = computed(() => {
         String(service.sid).includes(query)),
   )
 })
+/**
+ * サービスごとの番組。rawPrograms が差し替わったときだけ作り直す。
+ * (KonomiTV が親ストアで局別に分けた配列を配るのと同じ役割)
+ */
 const programsByService = computed(() => {
   const result = new Map<string, Program[]>()
   for (const row of rawPrograms.value) {
@@ -287,42 +397,6 @@ const programsByService = computed(() => {
   for (const list of result.values()) list.sort((a, b) => a.start_at - b.start_at)
   return result
 })
-function programsFor(service: Service): Program[] {
-  return programsByService.value.get(service.key) ?? []
-}
-const groups = computed<ServiceGroup[]>(() => {
-  const map = new Map<string, Service[]>()
-  for (const service of filteredServices.value) {
-    const key = `${service.nid}:${service.tsid}`
-    const list = map.get(key)
-    if (list) list.push(service)
-    else map.set(key, [service])
-  }
-  return [...map]
-    .map(([key, list]) => {
-      const sorted = [...list].sort((a, b) => a.sid - b.sid)
-      const main = sorted[0]
-      const mainPrograms = programsFor(main)
-      const subs = sorted.slice(1).filter((service) => {
-        const subPrograms = programsFor(service)
-        if (subPrograms.length === 0) return false
-        return !sameSlotSets(mainPrograms, subPrograms)
-      })
-      return { key, main, subs, band: main.band }
-    })
-    .sort(
-      (a, b) =>
-        BAND_ORDER[a.band] - BAND_ORDER[b.band] ||
-        a.main.nid - b.main.nid ||
-        a.main.sid - b.main.sid,
-    )
-})
-function overlaps(program: Program, others: Program[]): boolean {
-  const end = program.start_at + program.duration_secs
-  return others.some(
-    (other) => other.start_at < end && other.start_at + other.duration_secs > program.start_at,
-  )
-}
 function programSlotKey(program: Program): string | null {
   if (!program.name.trim()) return null
   return `${program.start_at}:${program.duration_secs}:${program.name}`
@@ -335,38 +409,132 @@ function sameSlotSets(mainPrograms: Program[], subPrograms: Program[]): boolean 
   const subKeySet = new Set(subKeys)
   return mainKeys.every((key) => subKeySet.has(key))
 }
-function programsForRender(group: ServiceGroup) {
-  const subPrograms = group.subs.flatMap(programsFor)
-  return [
-    ...programsFor(group.main).map((program) => ({
-      program,
-      isSub: false,
-      split: subPrograms.length > 0 && overlaps(program, subPrograms),
-    })),
-    ...group.subs.flatMap((service) =>
-      programsFor(service).map((program) => ({
-        program,
-        isSub: true,
-        split: overlaps(program, programsFor(group.main)),
-      })),
-    ),
-  ].filter((item) => isProgramVisible(item.program))
-}
-function cellStyle(item: { program: Program; isSub: boolean; split: boolean }) {
-  const start = Math.max(0, (item.program.start_at - gridBounds.value.since) / 60) * PX_PER_MIN
-  const end =
-    Math.min(
-      TOTAL_MINUTES,
-      (item.program.start_at + item.program.duration_secs - gridBounds.value.since) / 60,
-    ) * PX_PER_MIN
-  return {
-    top: `${start}px`,
-    height: `${Math.max(end - start, 2)}px`,
-    left: item.isSub && item.split ? '50%' : '0',
-    width: item.split ? '50%' : '100%',
-    borderLeftColor: genreColor(item.program.genre),
-    background: `color-mix(in srgb, ${genreColor(item.program.genre)} 12%, var(--surface))`,
+/** 重なり判定用に、番組の占有区間を重複のない昇順区間へ畳む。 */
+function mergeSpans(programs: Program[]): Array<[number, number]> {
+  const spans = programs
+    .map((program): [number, number] => [
+      program.start_at,
+      program.start_at + program.duration_secs,
+    ])
+    .sort((a, b) => a[0] - b[0])
+  const merged: Array<[number, number]> = []
+  for (const span of spans) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && span[0] <= last[1]) {
+      if (span[1] > last[1]) last[1] = span[1]
+    } else merged.push([span[0], span[1]])
   }
+  return merged
+}
+/** 畳んだ区間に対する二分探索。総当たりだと列あたり O(番組数^2) になる。 */
+function overlapsSpans(spans: Array<[number, number]>, start: number, end: number): boolean {
+  let low = 0
+  let high = spans.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (spans[mid][1] <= start) low = mid + 1
+    else high = mid
+  }
+  return low < spans.length && spans[low][0] < end
+}
+/**
+ * 列と、その中の番組セルの位置・スタイルまでを一度に組み立てる。
+ * filteredServices / programsByService / 表示密度 が変わったときだけ走り、
+ * スクロール中は一切再計算しない。
+ */
+const columns = computed<GuideColumn[]>(() => {
+  const byService = programsByService.value
+  const { since, until } = gridBounds.value
+  const perMin = pxPerMin.value
+  const height = totalHeight.value
+  const grouped = new Map<string, Service[]>()
+  for (const service of filteredServices.value) {
+    const key = `${service.nid}:${service.tsid}`
+    const list = grouped.get(key)
+    if (list) list.push(service)
+    else grouped.set(key, [service])
+  }
+  const result: GuideColumn[] = []
+  for (const [key, list] of grouped) {
+    const sorted = list.length > 1 ? [...list].sort((a, b) => a.sid - b.sid) : list
+    const main = sorted[0]
+    const mainPrograms = byService.get(main.key) ?? []
+    // メインと EPG が同一のサブチャンネルは列に出さない (メインが全幅で残る)。
+    const subs = sorted
+      .slice(1)
+      .filter((service) => {
+        const subPrograms = byService.get(service.key) ?? []
+        return subPrograms.length > 0 && !sameSlotSets(mainPrograms, subPrograms)
+      })
+      .map((service) => ({ service, programs: byService.get(service.key) ?? [] }))
+    const subPrograms = subs.flatMap((entry) => entry.programs)
+    const mainSpans = subPrograms.length > 0 ? mergeSpans(mainPrograms) : []
+    const subSpans = subPrograms.length > 0 ? mergeSpans(subPrograms) : []
+    const items: RenderItem[] = []
+    const push = (program: Program, isSub: boolean, split: boolean): void => {
+      const end = program.start_at + program.duration_secs
+      if (end <= since || program.start_at >= until) return
+      const top = Math.max(0, (program.start_at - since) / 60) * perMin
+      const bottom = Math.min(TOTAL_MINUTES, (end - since) / 60) * perMin
+      const color = genreColor(program.genre)
+      items.push({
+        program,
+        top,
+        bottom: Math.min(height, Math.max(bottom, top + 2)),
+        style: {
+          top: `${top}px`,
+          height: `${Math.max(bottom - top, 2)}px`,
+          left: isSub && split ? '50%' : '0',
+          width: split ? '50%' : '100%',
+          borderLeftColor: color,
+          background: `color-mix(in srgb, ${color} 12%, var(--surface))`,
+        },
+      })
+    }
+    for (const program of mainPrograms) {
+      const end = program.start_at + program.duration_secs
+      push(program, false, subSpans.length > 0 && overlapsSpans(subSpans, program.start_at, end))
+    }
+    for (const entry of subs) {
+      for (const program of entry.programs) {
+        const end = program.start_at + program.duration_secs
+        push(program, true, overlapsSpans(mainSpans, program.start_at, end))
+      }
+    }
+    // 上から順に並べておくと、可視判定を先頭から走らせて途中で打ち切れる。
+    items.sort((a, b) => a.top - b.top)
+    result.push({
+      key,
+      name: main.name,
+      subLabel: subs.map((entry) => entry.service.name).join(' / '),
+      band: main.band,
+      nid: main.nid,
+      sid: main.sid,
+      items,
+    })
+  }
+  // 並びは従来どおり 地上 → BS → CS → その他、その中は nid / sid 昇順。
+  return result.sort(
+    (a, b) => BAND_ORDER[a.band] - BAND_ORDER[b.band] || a.nid - b.nid || a.sid - b.sid,
+  )
+})
+/** 画面に入っている列だけを切り出す。 */
+const visibleColumns = computed(() => {
+  const all = columns.value
+  const first = Math.min(visibleColumnStart.value, Math.max(0, all.length - 1))
+  const last = Math.min(visibleColumnEnd.value, all.length)
+  return all.slice(first, last).map((column, offset) => ({ column, index: first + offset }))
+})
+/** 列の中で可視範囲に入る番組セル。items は top 昇順なので途中で打ち切れる。 */
+function visibleItems(column: GuideColumn): RenderItem[] {
+  const top = visibleRangeTop.value
+  const bottom = visibleRangeBottom.value
+  const result: RenderItem[] = []
+  for (const item of column.items) {
+    if (item.top > bottom) break
+    if (item.bottom >= top) result.push(item)
+  }
+  return result
 }
 function shiftDate(days: number) {
   const [y, m, d] = selectedDate.value.split('-').map(Number)
@@ -396,7 +564,11 @@ function onKeydown(event: KeyboardEvent) {
   else closeDetail()
 }
 watch(selectedDate, () => void loadPrograms())
+// 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
+watch([columns, pxPerMin], () => void nextTick().then(resizeGrid))
 onMounted(() => {
+  narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)
+  narrowMedia.addEventListener('change', resizeGrid)
   void refresh()
   resizeGrid()
   clockTimer = window.setInterval(() => {
@@ -407,6 +579,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   window.clearInterval(clockTimer)
+  narrowMedia?.removeEventListener('change', resizeGrid)
   window.removeEventListener('resize', resizeGrid)
   window.removeEventListener('keydown', onKeydown)
   if (scrollAnimationId !== null) cancelAnimationFrame(scrollAnimationId)
@@ -456,57 +629,75 @@ onUnmounted(() => {
     <p v-if="!rawPrograms.length && !loading" class="empty-state">
       番組情報がありません。番組情報は視聴中のチャンネルから自動収集されます。
     </p>
-    <div v-else ref="scrollArea" class="guide-scroll" @scroll="onScroll">
+    <div v-else ref="scrollArea" class="guide-scroll" @scroll.passive="onScroll">
       <div
         class="guide-grid"
         :style="{
-          width: `${64 + groups.length * 220}px`,
-          height: `${TOTAL_HEIGHT + 52}px`,
-          '--guide-columns': groups.length,
+          width: `${axisWidth + columns.length * columnWidth}px`,
+          height: `${totalHeight + HEADER_HEIGHT}px`,
+          '--guide-col-w': `${columnWidth}px`,
+          '--guide-hour-h': `${60 * pxPerMin}px`,
         }"
       >
-        <div class="guide-corner" />
-        <div v-for="group in groups" :key="`h-${group.key}`" class="guide-header-cell">
-          <span v-text="group.main.name" /><small
-            v-if="group.subs.length"
-            v-text="group.subs.map((service) => service.name).join(' / ')"
-          />
-        </div>
-        <div class="guide-timeaxis" :style="{ height: `${TOTAL_HEIGHT}px` }">
+        <div class="guide-header-row" :style="{ height: `${HEADER_HEIGHT}px` }">
+          <div class="guide-corner" :style="{ width: `${axisWidth}px` }" />
           <div
-            v-for="mark in hourMarks"
-            :key="mark.label"
-            class="guide-hour-label"
-            :style="{ top: `${mark.offset}px` }"
-            v-text="mark.label"
-          />
-        </div>
-        <div
-          v-for="group in groups"
-          :key="`c-${group.key}`"
-          class="guide-col"
-          :style="{ height: `${TOTAL_HEIGHT}px` }"
-        >
-          <div class="guide-channel-background" :style="{ height: `${TOTAL_HEIGHT}px` }" />
-          <div v-if="showNowLine" class="guide-now-line" :style="{ top: `${nowOffset}px` }" />
-          <button
-            v-for="item in programsForRender(group)"
-            :key="item.program.id"
-            type="button"
-            class="guide-cell"
-            :aria-label="item.program.name || '番組名なし'"
-            :style="cellStyle(item)"
-            @click="openDetail(item.program)"
+            v-for="entry in visibleColumns"
+            :key="`h-${entry.column.key}`"
+            class="guide-header-cell"
+            :style="{ left: `${axisWidth + entry.index * columnWidth}px`, width: `${columnWidth}px` }"
           >
-            <strong v-if="item.program.name" v-text="item.program.name" /><span
-              v-else
-              class="guide-untitled"
-              >番組名なし</span
-            ><span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
-          </button>
+            <span v-text="entry.column.name" /><small
+              v-if="entry.column.subLabel"
+              v-text="entry.column.subLabel"
+            />
+          </div>
+        </div>
+        <div class="guide-body" :style="{ height: `${totalHeight}px` }">
+          <div class="guide-channel-background" :style="{ left: `${axisWidth}px` }" />
+          <div class="guide-timeaxis" :style="{ width: `${axisWidth}px`, height: `${totalHeight}px` }">
+            <div
+              v-for="mark in hourMarks"
+              :key="mark.label"
+              class="guide-hour-label"
+              :style="{ top: `${mark.offset}px` }"
+              v-text="mark.label"
+            />
+          </div>
+          <div
+            v-if="showNowLine"
+            class="guide-now-line"
+            :style="{ top: `${nowOffset}px`, left: `${axisWidth}px` }"
+          />
+          <div
+            v-for="entry in visibleColumns"
+            :key="`c-${entry.column.key}`"
+            class="guide-col"
+            :style="{
+              left: `${axisWidth + entry.index * columnWidth}px`,
+              width: `${columnWidth}px`,
+              height: `${totalHeight}px`,
+            }"
+          >
+            <button
+              v-for="item in visibleItems(entry.column)"
+              :key="item.program.id"
+              type="button"
+              class="guide-cell"
+              :aria-label="item.program.name || '番組名なし'"
+              :style="item.style"
+              @click="openDetail(item.program)"
+            >
+              <strong v-if="item.program.name" v-text="item.program.name" /><span
+                v-else
+                class="guide-untitled"
+                >番組名なし</span
+              ><span class="guide-cell-time" v-text="fmtTime(item.program.start_at)" />
+            </button>
+          </div>
         </div>
       </div>
-      <p v-if="!groups.length" class="empty-state">条件に一致するサービスがありません</p>
+      <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
     </div>
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">
       <section

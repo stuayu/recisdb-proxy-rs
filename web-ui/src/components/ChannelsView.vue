@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { api, downloadApi, unwrapArray, type JsonRecord } from '../api'
 import EntityLookup, { type LookupEntity } from './EntityLookup.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
@@ -57,8 +57,10 @@ const descending2 = ref(false)
 const sortKey3 = ref('')
 const descending3 = ref(false)
 const compactViewport = ref(false)
-const customizedColumns = ref(false)
+// 狭い画面では compact 指定の主要列だけに絞る(トグルで全列表示に戻せる)。
+const compactColumnsOnly = ref(true)
 let media: MediaQueryList | null = null
+let mediaHandler: (() => void) | null = null
 const previewRow = ref<JsonRecord | null>(null)
 const previewSid = computed<string | number>(() => {
   const value = previewRow.value?.sid
@@ -97,7 +99,6 @@ function initialColumns(): string[] {
   return defaultKeys
 }
 const visibleKeys = ref<string[]>(initialColumns())
-customizedColumns.value = Boolean(savedColumns)
 
 const form = reactive({
   bon_driver_id: 0,
@@ -111,17 +112,44 @@ const form = reactive({
   is_enabled: true,
 })
 
-const filtered = computed(() => {
-  const normalized = query.value.trim().toLowerCase()
-  if (!normalized) return rows.value
-  return rows.value.filter((row) =>
-    Object.values(row).some((value) =>
-      String(value ?? '')
-        .toLowerCase()
-        .includes(normalized),
-    ),
-  )
+/**
+ * 絞り込み入力のデバウンス。1600行規模では1打鍵ごとに再フィルタ・再ソート・再描画が
+ * 走ると入力自体が詰まるため、打ち終わってから適用する。
+ */
+const appliedQuery = ref('')
+let queryTimer: ReturnType<typeof setTimeout> | null = null
+watch(query, (value) => {
+  if (queryTimer) clearTimeout(queryTimer)
+  queryTimer = setTimeout(() => {
+    appliedQuery.value = value
+    queryTimer = null
+  }, 200)
 })
+
+/**
+ * 行ごとの検索用文字列(小文字化済み)。rows が入れ替わったときだけ作り直すので、
+ * 打鍵のたびに全行×全プロパティを文字列化し直さない。
+ */
+const searchIndex = computed(() =>
+  rows.value.map((row) => {
+    let text = ''
+    for (const value of Object.values(row)) {
+      if (value === null || value === undefined) continue
+      text += `${typeof value === 'string' ? value : String(value)}\u0001`
+    }
+    return text.toLowerCase()
+  }),
+)
+
+const filtered = computed(() => {
+  const normalized = appliedQuery.value.trim().toLowerCase()
+  if (!normalized) return rows.value
+  const index = searchIndex.value
+  return rows.value.filter((_row, position) => index[position].includes(normalized))
+})
+
+// localeCompare は呼び出しごとに Collator を作るため、比較回数分のコストが乗る。使い回す。
+const collator = new Intl.Collator('ja', { numeric: true })
 
 const sorted = computed(() => {
   const rules = [
@@ -135,27 +163,56 @@ const sorted = computed(() => {
       const a = left[rule.key]
       const b = right[rule.key]
       const numeric = typeof a === 'number' && typeof b === 'number'
-      const compared = numeric
-        ? a - b
-        : String(a ?? '').localeCompare(String(b ?? ''), 'ja', { numeric: true })
+      const compared = numeric ? a - b : collator.compare(String(a ?? ''), String(b ?? ''))
       if (compared !== 0) return rule.desc ? -compared : compared
     }
     return 0
   })
 })
 
+/**
+ * ページング。全行(本番で1600行超)をDOMへ出すと操作不能になるため1ページ分だけ描画する。
+ * 仮想スクロールにしないのは、狭幅(<=700px)で .data-table がカード表示へ落ちて行の高さが
+ * 可変になり、スクロールの主体も .table-region からページ側へ移るため(高さ計測が成立しない)。
+ */
+const pageSizeOptions = [50, 100, 200, 500]
+const savedPageSize = Number(localStorage.getItem('channelPageSize'))
+const pageSize = ref(pageSizeOptions.includes(savedPageSize) ? savedPageSize : 100)
+const page = ref(1)
+const totalPages = computed(() => Math.max(1, Math.ceil(sorted.value.length / pageSize.value)))
+const pageRows = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return sorted.value.slice(start, start + pageSize.value)
+})
+const rangeStart = computed(() => (sorted.value.length ? (page.value - 1) * pageSize.value + 1 : 0))
+const rangeEnd = computed(() => Math.min(page.value * pageSize.value, sorted.value.length))
+watch([appliedQuery, sortKey, descending, sortKey2, descending2, sortKey3, descending3], () => {
+  page.value = 1
+})
+watch(pageSize, (value) => {
+  page.value = 1
+  localStorage.setItem('channelPageSize', String(value))
+})
+watch(totalPages, (value) => {
+  if (page.value > value) page.value = value
+})
+function goToPage(next: number) {
+  page.value = Math.min(Math.max(1, next), totalPages.value)
+}
+
 const visibleColumns = computed(() => {
   const selectedKeys = new Set(visibleKeys.value)
-  return columns.filter(
-    (column) =>
-      selectedKeys.has(column.key) &&
-      (!compactViewport.value || customizedColumns.value || column.compact),
-  )
+  const chosen = columns.filter((column) => selectedKeys.has(column.key))
+  if (!compactViewport.value || !compactColumnsOnly.value) return chosen
+  const compact = chosen.filter((column) => column.compact)
+  return compact.length ? compact : chosen.slice(0, 4)
 })
 
+// selected を配列のまま includes すると 全行×選択数 になるため Set で引く。
+const selectedIds = computed(() => new Set(selected.value))
 const allSelected = computed(
   () =>
-    sorted.value.length > 0 && sorted.value.every((row) => selected.value.includes(Number(row.id))),
+    sorted.value.length > 0 && sorted.value.every((row) => selectedIds.value.has(Number(row.id))),
 )
 
 async function load() {
@@ -163,8 +220,16 @@ async function load() {
   try {
     rows.value = unwrapArray(await api('/channels'), ['channels'])
     const driverRows = unwrapArray(await api('/bondrivers'), ['bondrivers', 'tuners'])
-    drivers.value = driverRows.map((driver) => ({ id: Number(driver.id), name: String(driver.display_name ?? driver.driver_name ?? driver.dll_path ?? `Driver ${driver.id}`), description: String(driver.dll_path ?? ''), secondary: 'ローカル' }))
-    selected.value = selected.value.filter((id) => rows.value.some((row) => Number(row.id) === id))
+    drivers.value = driverRows.map((driver) => ({
+      id: Number(driver.id),
+      name: String(
+        driver.display_name ?? driver.driver_name ?? driver.dll_path ?? `Driver ${driver.id}`,
+      ),
+      description: String(driver.dll_path ?? ''),
+      secondary: 'ローカル',
+    }))
+    const knownIds = new Set(rows.value.map((row) => Number(row.id)))
+    selected.value = selected.value.filter((id) => knownIds.has(id))
     error.value = ''
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
@@ -202,9 +267,17 @@ async function edit(row: JsonRecord) {
   try {
     const response = await api<JsonRecord>(`/channels/${String(row.id)}/candidate-tuners`)
     const candidates = unwrapArray(response, ['tuners'])
-    drivers.value = candidates.map((driver) => ({ id: Number(driver.id), name: String(driver.name ?? `Tuner ${driver.id}`), description: String(driver.description ?? ''), secondary: String(driver.secondary ?? '') }))
-    if (!drivers.value.length && response.reason) error.value = '対応する受信帯域のチューナーがありません'
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+    drivers.value = candidates.map((driver) => ({
+      id: Number(driver.id),
+      name: String(driver.name ?? `Tuner ${driver.id}`),
+      description: String(driver.description ?? ''),
+      secondary: String(driver.secondary ?? ''),
+    }))
+    if (!drivers.value.length && response.reason)
+      error.value = '対応する受信帯域のチューナーがありません'
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  }
   requestAnimationFrame(() =>
     document.getElementById('channel-form')?.scrollIntoView({ behavior: 'smooth' }),
   )
@@ -322,13 +395,11 @@ function setColumn(key: string, checked: boolean) {
   if (checked) next.add(key)
   else next.delete(key)
   visibleKeys.value = columns.map((column) => column.key).filter((column) => next.has(column))
-  customizedColumns.value = true
   localStorage.setItem('channelColumns', JSON.stringify(visibleKeys.value))
 }
 
 function resetColumns() {
   visibleKeys.value = defaultKeys
-  customizedColumns.value = false
   localStorage.removeItem('channelColumns')
 }
 
@@ -399,16 +470,18 @@ function display(row: JsonRecord, key: string): string {
 
 onMounted(() => {
   media = window.matchMedia('(max-width: 1100px)')
-  const update = () => (compactViewport.value = media?.matches ?? false)
-  update()
-  media.addEventListener('change', update)
+  mediaHandler = () => (compactViewport.value = media?.matches ?? false)
+  mediaHandler()
+  media.addEventListener('change', mediaHandler)
   window.addEventListener('keydown', onPreviewKeydown)
   void load()
 })
 
 onUnmounted(() => {
-  media?.removeEventListener('change', () => undefined)
+  // 無名関数を渡していたため今まで解除できていなかった。同じ参照を渡す。
+  if (media && mediaHandler) media.removeEventListener('change', mediaHandler)
   window.removeEventListener('keydown', onPreviewKeydown)
+  if (queryTimer) clearTimeout(queryTimer)
 })
 </script>
 
@@ -509,6 +582,10 @@ onUnmounted(() => {
         </div>
         <button class="button small secondary" @click="resetColumns">既定に戻す</button>
       </details>
+      <label v-if="compactViewport" class="check compact-check">
+        <input v-model="compactColumnsOnly" type="checkbox" />
+        狭い画面では主要列だけ表示
+      </label>
     </div>
 
     <p v-if="message" class="notice success" aria-live="polite" v-text="message" />
@@ -532,94 +609,153 @@ onUnmounted(() => {
     </div>
 
     <div :class="['split', 'wide', { 'without-panel': !editMode }]">
-      <div class="table-region" role="region" aria-label="チャンネル一覧" tabindex="0">
-        <table class="data-table channel-table">
-          <thead>
-            <tr>
-              <th v-if="editMode">
-                <input
-                  type="checkbox"
-                  :checked="allSelected"
-                  aria-label="表示中のチャンネルをすべて選択"
-                  @change="toggleAll"
-                />
-              </th>
-              <th aria-label="プレビュー" />
-              <th v-for="column in visibleColumns" :key="column.key">
-                <button class="sort-button" @click="sort(column.key)">
-                  <span v-text="column.label" />
-                  <span
-                    aria-hidden="true"
-                    v-text="sortKey === column.key ? (descending ? '↓' : '↑') : '↕'"
+      <div class="channel-list">
+        <div class="table-region" role="region" aria-label="チャンネル一覧" tabindex="0">
+          <table class="data-table channel-table">
+            <thead>
+              <tr>
+                <th v-if="editMode">
+                  <input
+                    type="checkbox"
+                    :checked="allSelected"
+                    aria-label="絞り込み結果のチャンネルをすべて選択"
+                    @change="toggleAll"
                   />
-                </button>
-              </th>
-              <th v-if="editMode">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in sorted" :key="String(row.id)">
-              <td v-if="editMode" data-label="選択">
-                <input
-                  v-model="selected"
-                  type="checkbox"
-                  :value="Number(row.id)"
-                  :aria-label="`${String(row.channel_name ?? row.id)}を選択`"
-                />
-              </td>
-              <td data-label="プレビュー">
-                <button
-                  class="button small secondary preview-button"
-                  :disabled="row.sid == null || !row.is_enabled"
-                  :title="
-                    row.sid == null
-                      ? 'SID不明のためプレビューできません'
-                      : row.is_enabled
-                        ? 'ブラウザでプレビュー再生'
-                        : '無効チャンネルはプレビューできません'
-                  "
-                  :aria-label="`${String(row.channel_name ?? row.id)}をプレビュー`"
-                  @click="openPreview(row)"
-                >
-                  ▶
-                </button>
-              </td>
-              <td v-for="column in visibleColumns" :key="column.key" :data-label="column.label">
-                <button
-                  v-if="column.key === 'is_enabled'"
-                  class="status-button"
-                  :aria-label="`${String(row.channel_name ?? row.id)}を${row.is_enabled ? '無効' : '有効'}にする`"
-                  @click="toggle(row)"
-                  v-text="row.is_enabled ? '有効' : '無効'"
-                />
-                <span v-else-if="column.key === 'channel_name'" class="channel-name-cell">
-                  <img
-                    v-if="logoSrc(row)"
-                    :src="logoSrc(row)"
-                    class="channel-logo"
-                    alt=""
-                    loading="lazy"
-                    @error="onLogoError(row)"
+                </th>
+                <th aria-label="プレビュー" />
+                <th v-for="column in visibleColumns" :key="column.key">
+                  <button class="sort-button" @click="sort(column.key)">
+                    <span v-text="column.label" />
+                    <span
+                      aria-hidden="true"
+                      v-text="sortKey === column.key ? (descending ? '↓' : '↑') : '↕'"
+                    />
+                  </button>
+                </th>
+                <th v-if="editMode">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in pageRows" :key="String(row.id)">
+                <td v-if="editMode" data-label="選択">
+                  <input
+                    v-model="selected"
+                    type="checkbox"
+                    :value="Number(row.id)"
+                    :aria-label="`${String(row.channel_name ?? row.id)}を選択`"
                   />
-                  <span v-text="display(row, column.key)" />
-                </span>
-                <span v-else v-text="display(row, column.key)" />
-              </td>
-              <td v-if="editMode" data-label="操作">
-                <div class="actions">
-                  <button class="button small secondary" @click="edit(row)">編集</button>
-                  <button class="button small danger" @click="remove(row.id)">削除</button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <p v-if="!loading && !sorted.length" class="empty-state">該当するチャンネルはありません</p>
+                </td>
+                <td data-label="プレビュー">
+                  <button
+                    class="button small secondary preview-button"
+                    :disabled="row.sid == null || !row.is_enabled"
+                    :title="
+                      row.sid == null
+                        ? 'SID不明のためプレビューできません'
+                        : row.is_enabled
+                          ? 'ブラウザでプレビュー再生'
+                          : '無効チャンネルはプレビューできません'
+                    "
+                    :aria-label="`${String(row.channel_name ?? row.id)}をプレビュー`"
+                    @click="openPreview(row)"
+                  >
+                    ▶
+                  </button>
+                </td>
+                <td v-for="column in visibleColumns" :key="column.key" :data-label="column.label">
+                  <button
+                    v-if="column.key === 'is_enabled'"
+                    class="status-button"
+                    :aria-label="`${String(row.channel_name ?? row.id)}を${row.is_enabled ? '無効' : '有効'}にする`"
+                    @click="toggle(row)"
+                    v-text="row.is_enabled ? '有効' : '無効'"
+                  />
+                  <span v-else-if="column.key === 'channel_name'" class="channel-name-cell">
+                    <img
+                      v-if="logoSrc(row)"
+                      :src="logoSrc(row)"
+                      class="channel-logo"
+                      alt=""
+                      loading="lazy"
+                      @error="onLogoError(row)"
+                    />
+                    <span v-text="display(row, column.key)" />
+                  </span>
+                  <span v-else v-text="display(row, column.key)" />
+                </td>
+                <td v-if="editMode" data-label="操作">
+                  <div class="actions">
+                    <button class="button small secondary" @click="edit(row)">編集</button>
+                    <button class="button small danger" @click="remove(row.id)">削除</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-if="!loading && !sorted.length" class="empty-state">
+            該当するチャンネルはありません
+          </p>
+        </div>
+        <div v-if="sorted.length" class="channel-pager">
+          <span
+            class="pager-status"
+            v-text="`${rangeStart}〜${rangeEnd}件目 / 全${sorted.length}件`"
+          />
+          <div class="pager-controls">
+            <button
+              class="button small secondary"
+              :disabled="page <= 1"
+              aria-label="最初のページ"
+              @click="goToPage(1)"
+            >
+              «
+            </button>
+            <button
+              class="button small secondary"
+              :disabled="page <= 1"
+              @click="goToPage(page - 1)"
+            >
+              前へ
+            </button>
+            <span class="pager-position" v-text="`${page} / ${totalPages}`" />
+            <button
+              class="button small secondary"
+              :disabled="page >= totalPages"
+              @click="goToPage(page + 1)"
+            >
+              次へ
+            </button>
+            <button
+              class="button small secondary"
+              :disabled="page >= totalPages"
+              aria-label="最後のページ"
+              @click="goToPage(totalPages)"
+            >
+              »
+            </button>
+          </div>
+          <label class="pager-size">
+            <span>表示件数</span>
+            <select v-model.number="pageSize">
+              <option
+                v-for="size in pageSizeOptions"
+                :key="size"
+                :value="size"
+                v-text="`${size}件`"
+              />
+            </select>
+          </label>
+        </div>
       </div>
 
       <form v-if="editMode" id="channel-form" class="panel" @submit.prevent="save">
-        <h3>editing ? 'チャンネル編集' : 'チャンネル登録'</h3>
-        <EntityLookup v-model="form.bon_driver_id" :entities="drivers" label="チューナー" placeholder="名前・パスで検索" />
+        <h3 v-text="editing ? 'チャンネル編集' : 'チャンネル登録'" />
+        <EntityLookup
+          v-model="form.bon_driver_id"
+          :entities="drivers"
+          label="チューナー"
+          placeholder="名前・パスで検索"
+        />
         <div class="form-grid">
           <label class="field"
             ><span>NID</span
@@ -671,8 +807,86 @@ onUnmounted(() => {
           </div>
           <button class="button secondary" @click="closePreview">閉じる</button>
         </div>
-        <PreviewPlayer :key="`${previewNid}-${previewSid}`" :initial-sid="previewSid" :initial-nid="previewNid" />
+        <PreviewPlayer
+          :key="`${previewNid}-${previewSid}`"
+          :initial-sid="previewSid"
+          :initial-nid="previewNid"
+        />
       </section>
     </div>
   </section>
 </template>
+
+<style scoped>
+.channel-list {
+  min-width: 0;
+}
+
+.channel-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.pager-status {
+  color: var(--muted);
+}
+
+.pager-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.pager-position {
+  min-width: 5ch;
+  text-align: center;
+}
+
+.pager-size {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.pager-size select {
+  min-height: 36px;
+  padding: 4px 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+@media (max-width: 700px) {
+  .channel-pager {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pager-controls {
+    justify-content: space-between;
+  }
+
+  .pager-controls .button {
+    min-height: 44px;
+  }
+
+  .pager-size {
+    margin-left: 0;
+    justify-content: space-between;
+  }
+
+  .pager-size select {
+    min-height: 44px;
+  }
+}
+</style>

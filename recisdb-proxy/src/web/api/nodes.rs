@@ -584,9 +584,7 @@ pub async fn update_route_group(
     let id = match payload.id {
         Some(id) => {
             if !store.route_group_exists(id)? {
-                return Err(ApiError::not_found(format!(
-                    "route area {id} not found"
-                )));
+                return Err(ApiError::not_found(format!("route area {id} not found")));
             }
             if matches!(existing, Some(other) if other != id) {
                 return Err(ApiError::coded_conflict(
