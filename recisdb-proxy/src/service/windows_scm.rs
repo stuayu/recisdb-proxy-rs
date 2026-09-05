@@ -456,6 +456,33 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// 長めに申告しないと、SCM 側が「応答なし」と判断してしまう。
 const STOP_WAIT_HINT: Duration = Duration::from_secs(45);
 
+/// CRT の後始末を通さずにプロセスを即座に終わらせる (終了コード 0)。
+///
+/// `std::process::exit` はここでは使えない。停止時には
+/// `Runtime::shutdown_timeout` が見切りをつけた BonDriver リーダースレッドが
+/// まだ生きており、`exit` が走らせる CRT の後始末がそれらと競合して返って
+/// こない。本番では SCM に STOPPED を報告したあとプロセスだけが 30 秒近く
+/// residual に残り、DB と BonDriver ハンドルを掴んだまま次のインスタンスと
+/// 同居していた。
+///
+/// ここへ来る時点で SCM には STOPPED (exit code 0) を報告済みで、ログも
+/// フラッシュ済みなので、後始末を省いて落として構わない。SCM から見れば
+/// 正常停止のままなので failure actions は発火しない。
+///
+/// kernel32 は MSVC ターゲットでは既定でリンクされるため、宣言だけで足りる。
+/// どちらの関数もコールバックを取らず、巻き戻しも起こさない。
+fn terminate_process_now() -> ! {
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+    }
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+    // TerminateProcess が返ることはないが、型を合わせるために保険を置く。
+    std::process::exit(0);
+}
+
 fn service_main_entry(_arguments: Vec<OsString>) {
     let service_name = SERVICE_NAME_STORAGE.get().cloned().unwrap_or_default();
     let should_stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -477,7 +504,11 @@ fn service_main_entry(_arguments: Vec<OsString>) {
                     // 完了しないと同じ制御を再送してくることがある)。
                     let first = !should_stop_for_handler.swap(true, Ordering::SeqCst);
                     if first {
-                        tracing::info!(
+                        // `warn` rather than `info`: the deployed log level is
+                        // usually WARN, and "why did the service stop" is
+                        // exactly what an operator needs in the file. One line
+                        // per stop, so it cannot become noise.
+                        tracing::warn!(
                             "SCM stop control received; beginning graceful shutdown (timeout {}s)",
                             GRACEFUL_STOP_TIMEOUT.as_secs()
                         );
@@ -544,6 +575,18 @@ fn service_main_entry(_arguments: Vec<OsString>) {
 
     SERVICE_STOPPED_CLEANLY.store(true, Ordering::SeqCst);
     report(ServiceState::Stopped, ServiceControlAccept::empty(), 0);
+
+    // Returning from here would unwind back through `service_dispatcher::start`
+    // and `main`, and in production that did not actually end the process:
+    // after reporting STOPPED the old instance stayed alive alongside the one
+    // the SCM had just started, with both holding the database and the
+    // BonDriver handles. The blocking reader threads that `shutdown_timeout`
+    // gave up on are still around and nothing can join them, so exit outright.
+    //
+    // SCM has already been told STOPPED, so this is a clean stop as far as the
+    // service manager is concerned — failure actions do not fire.
+    crate::logging::flush_log_writer();
+    terminate_process_now();
 }
 
 /// 停止要求を受けたのにサーバ本体が終了しないケースの最後の砦。
@@ -597,7 +640,11 @@ fn spawn_stop_watchdog(
             wait_hint: Duration::default(),
             process_id: None,
         });
-        std::process::exit(0);
+        // `exit` skips every destructor, including the log writer's guard.
+        // Without this the "why did it not stop" lines never reach the file —
+        // which is exactly what made this failure so hard to diagnose.
+        crate::logging::flush_log_writer();
+        terminate_process_now();
     });
 }
 

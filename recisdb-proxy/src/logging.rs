@@ -19,6 +19,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
@@ -139,6 +140,60 @@ pub fn test_handle() -> Arc<LogLevelHandle> {
 ///   other shared handles.
 /// - The shared [`LogLevelHandle`], for runtime level changes from the Web
 ///   dashboard and for `main.rs` to apply the DB-configured level at startup.
+/// 強制終了の直前にログを吐き切るための置き場所。
+///
+/// ファイル出力は `tracing_appender::non_blocking` なので、まだ書けていない
+/// 行はワーカースレッド側のキューに残る。`WorkerGuard` の `Drop` がその
+/// フラッシュを行うため、`std::process::exit` のように Drop を走らせない
+/// 終わり方をすると**停止時のログがまるごと消える**。
+///
+/// 実際、Windows サービスの強制停止では「停止要求を受けた」というログすら
+/// 残らず、原因調査を空振りさせていた。強制終了する経路は落ちる前に
+/// [`flush_log_writer`] を呼ぶこと。
+static EXIT_FLUSH_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+/// [`EXIT_FLUSH_GUARD`] に `WorkerGuard` の複製を預ける…ことはできない
+/// (`WorkerGuard` は `Clone` ではない) ので、代わりに **所有権を預ける**。
+/// 呼び出し側は戻り値の guard を保持し続ける必要がなくなる。
+///
+/// `main` が `let _log_guard = ...` で持ち続ける従来の使い方と併用できる
+/// よう、預けるかどうかは呼び出し側が選ぶ。
+pub fn park_log_guard_for_exit(guard: WorkerGuard) {
+    if let Ok(mut slot) = EXIT_FLUSH_GUARD.lock() {
+        *slot = Some(guard);
+    }
+}
+
+/// フラッシュを待つ上限。これを過ぎたら書き切れていなくても先へ進む。
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 預けた `WorkerGuard` を落として、バッファに残ったログを書き切る。
+/// `std::process::exit` の直前に呼ぶ。二回呼んでも安全 (二回目は何もしない)。
+///
+/// **待ちには必ず上限を置く。** `WorkerGuard` の `Drop` は書き込みワーカーが
+/// キューを空にするまで待つが、停止時には `Runtime::shutdown_timeout` が
+/// 見切りをつけた BonDriver リーダースレッドがまだ生きていて、ログを吐き
+/// 続けていることがある。そうなるとキューは空にならず Drop が返らない。
+/// 実際、本番でサービスが STOPPED を報告したあともプロセスが 30 秒以上
+/// 残り続けた原因がこれだった。書き切れないログより、終われないプロセスの
+/// 方が害が大きい。
+pub fn flush_log_writer() {
+    let Ok(mut slot) = EXIT_FLUSH_GUARD.lock() else {
+        return;
+    };
+    let Some(guard) = slot.take() else {
+        return;
+    };
+    // Drop を別スレッドでやらせ、こちらは期限付きで待つ。時間切れの場合、
+    // そのスレッドは置き去りになるが、直後にプロセスごと終わるので問題ない。
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(guard);
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(FLUSH_TIMEOUT);
+}
+
 pub fn init_logging(
     log_dir: &Path,
     retention_days: u64,

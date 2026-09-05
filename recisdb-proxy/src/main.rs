@@ -208,6 +208,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 eprintln!("server exited with error: {e}");
             }
+            // Dropping the runtime here would block until every `spawn_blocking`
+            // task returns, and the BonDriver reader loops run on exactly those
+            // threads — a blocking `GetTsStream` call cannot be cancelled. That
+            // is why the service used to accept a stop request and then never
+            // reach STOPPED. Give the readers a bounded moment to notice the
+            // shutdown, then let go of them.
+            runtime.shutdown_timeout(BLOCKING_SHUTDOWN_GRACE);
+            // The guard lives in a process-global slot (so the stop watchdog
+            // can reach it), and statics are never dropped at exit — so the
+            // normal path has to flush explicitly too.
+            logging::flush_log_writer();
         })?;
         return Ok(());
     }
@@ -215,8 +226,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_server(args, shutdown_signal()))
+    let result = runtime.block_on(run_server(args, shutdown_signal()));
+    // Same reasoning as the service path above: the reader loops occupy
+    // blocking threads that cannot be cancelled, so bound the wait instead of
+    // hanging in the runtime's `Drop`.
+    runtime.shutdown_timeout(BLOCKING_SHUTDOWN_GRACE);
+    logging::flush_log_writer();
+    result
 }
+
+/// How long to wait for `spawn_blocking` tasks (the BonDriver reader loops)
+/// after the server has stopped. They cannot be cancelled, so this is a
+/// deadline rather than a promise; the process exits once it passes.
+const BLOCKING_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Resolves when the process is asked to stop: Ctrl+C on every platform, plus
 /// SIGTERM on Unix (what `systemctl stop` / `launchctl bootout` send — without
@@ -275,9 +297,14 @@ async fn run_server(
     //
     // Keep the returned guard alive for the whole program: dropping it stops
     // the background file-writer thread and flushes buffered log lines.
-    let (_log_guard, log_buffer, log_level_handle) =
+    // It is parked in a process-global slot rather than a local binding so
+    // that paths which end the process without unwinding (the Windows service
+    // stop watchdog calls `std::process::exit`) can still flush first — see
+    // `logging::flush_log_writer`.
+    let (log_guard, log_buffer, log_level_handle) =
         logging::init_logging(&log_dir, args.log_retention_days, args.verbose)
             .expect("Failed to initialize logging");
+    logging::park_log_guard_for_exit(log_guard);
 
     // Use log macros which are now bridged to tracing
     use log::{error, info};
@@ -982,7 +1009,9 @@ async fn run_server(
     tokio::pin!(shutdown);
     tokio::select! {
         result = server.run() => result?,
-        _ = &mut shutdown => info!("Shutdown signal received; stopping server"),
+        // `warn` so it survives the WARN log level that deployments run at:
+        // without it the log gives no hint why the server went away.
+        _ = &mut shutdown => log::warn!("Shutdown signal received; stopping server"),
     }
 
     Ok(())
