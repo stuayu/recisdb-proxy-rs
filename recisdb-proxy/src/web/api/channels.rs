@@ -58,6 +58,22 @@ pub struct ChannelQuery {
     pub bondriver_id: Option<i64>,
     pub enabled_only: Option<bool>,
     pub group_logical: Option<bool>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub q: Option<String>,
+    pub sort: Option<String>,
+    pub desc: Option<bool>,
+}
+
+fn channel_sort_column(value: Option<&str>) -> &str {
+    match value.unwrap_or("channel_name") {
+        "id" | "nid" | "sid" | "tsid" | "channel_name" | "raw_name" | "physical_ch"
+        | "network_name" | "bon_space" | "bon_channel" | "priority" | "failure_count"
+        | "scan_time" | "last_seen" | "created_at" | "updated_at" | "bon_driver_id" => {
+            value.unwrap_or("channel_name")
+        }
+        _ => "channel_name",
+    }
 }
 
 /// Get all channels.
@@ -67,6 +83,60 @@ pub async fn get_channels(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db = web_state.database.lock().await;
     let enabled_only = query.enabled_only.unwrap_or(false);
+
+    if !query.group_logical.unwrap_or(false)
+        && (query.limit.is_some()
+            || query.offset.is_some()
+            || query.q.is_some()
+            || query.sort.is_some()
+            || query.desc.is_some())
+    {
+        let sort_column = channel_sort_column(query.sort.as_deref());
+        let (channels, total) = db.get_channels_for_api(
+            query.bondriver_id,
+            enabled_only,
+            query.q.as_deref(),
+            sort_column,
+            query.desc.unwrap_or(false),
+            query.limit,
+            query.offset.unwrap_or(0),
+        )?;
+        let infos: Vec<ChannelInfoApi> = channels
+            .into_iter()
+            .map(|(c, path)| ChannelInfoApi {
+                id: c.id,
+                bon_driver_id: c.bon_driver_id,
+                bon_driver_path: Some(path),
+                nid: c.nid,
+                sid: c.sid,
+                tsid: c.tsid,
+                manual_sheet: c.manual_sheet,
+                raw_name: c.raw_name,
+                channel_name: c.channel_name,
+                physical_ch: c.physical_ch,
+                remote_control_key: c.remote_control_key,
+                service_type: c.service_type,
+                network_name: c.network_name,
+                bon_space: c.bon_space,
+                bon_channel: c.bon_channel,
+                band_type: c.band_type,
+                region_id: c.region_id,
+                terrestrial_region: c.terrestrial_region,
+                is_enabled: c.is_enabled,
+                priority: c.priority,
+                failure_count: c.failure_count,
+                scan_time: c.scan_time,
+                last_seen: c.last_seen,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+                tuner_count: None,
+                tuner_names: None,
+            })
+            .collect();
+        return Ok(Json(
+            json!({"success": true, "channels": infos, "count": infos.len(), "total": total}),
+        ));
+    }
 
     // Get channels based on query
     let channel_infos: Result<Vec<ChannelInfoApi>, String> = if let Some(bondriver_id) =
@@ -262,8 +332,20 @@ pub async fn get_channels(
     Ok(Json(json!({
         "success": true,
         "channels": infos,
-        "count": infos.len()
+        "count": infos.len(),
+        "total": infos.len()
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_sort_column;
+
+    #[test]
+    fn sort_key_is_whitelisted() {
+        assert_eq!(channel_sort_column(Some("channel_name")), "channel_name");
+        assert_eq!(channel_sort_column(Some("id DESC, secret")), "channel_name");
+    }
 }
 
 /// Return only tuners whose backend-reported channel capability matches the

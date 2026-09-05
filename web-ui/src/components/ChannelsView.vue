@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
 import { api, downloadApi, unwrapArray, type JsonRecord } from '../api'
 import EntityLookup, { type LookupEntity } from './EntityLookup.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
@@ -37,7 +37,7 @@ const columns: Column[] = [
 ]
 
 const defaultKeys = columns.slice(0, 12).map((column) => column.key)
-const rows = ref<JsonRecord[]>([])
+const rows = shallowRef<JsonRecord[]>([])
 const drivers = ref<LookupEntity[]>([])
 const query = ref('')
 const error = ref('')
@@ -123,76 +123,28 @@ watch(query, (value) => {
   queryTimer = setTimeout(() => {
     appliedQuery.value = value
     queryTimer = null
-  }, 200)
+  }, 300)
 })
 
-/**
- * 行ごとの検索用文字列(小文字化済み)。rows が入れ替わったときだけ作り直すので、
- * 打鍵のたびに全行×全プロパティを文字列化し直さない。
- */
-const searchIndex = computed(() =>
-  rows.value.map((row) => {
-    let text = ''
-    for (const value of Object.values(row)) {
-      if (value === null || value === undefined) continue
-      text += `${typeof value === 'string' ? value : String(value)}\u0001`
-    }
-    return text.toLowerCase()
-  }),
-)
-
-const filtered = computed(() => {
-  const normalized = appliedQuery.value.trim().toLowerCase()
-  if (!normalized) return rows.value
-  const index = searchIndex.value
-  return rows.value.filter((_row, position) => index[position].includes(normalized))
-})
-
-// localeCompare は呼び出しごとに Collator を作るため、比較回数分のコストが乗る。使い回す。
-const collator = new Intl.Collator('ja', { numeric: true })
-
-const sorted = computed(() => {
-  const rules = [
-    { key: sortKey.value, desc: descending.value },
-    { key: sortKey2.value, desc: descending2.value },
-    { key: sortKey3.value, desc: descending3.value },
-  ].filter((rule) => rule.key)
-  if (!rules.length) return filtered.value
-  return [...filtered.value].sort((left, right) => {
-    for (const rule of rules) {
-      const a = left[rule.key]
-      const b = right[rule.key]
-      const numeric = typeof a === 'number' && typeof b === 'number'
-      const compared = numeric ? a - b : collator.compare(String(a ?? ''), String(b ?? ''))
-      if (compared !== 0) return rule.desc ? -compared : compared
-    }
-    return 0
-  })
-})
-
-/**
- * ページング。全行(本番で1600行超)をDOMへ出すと操作不能になるため1ページ分だけ描画する。
- * 仮想スクロールにしないのは、狭幅(<=700px)で .data-table がカード表示へ落ちて行の高さが
- * 可変になり、スクロールの主体も .table-region からページ側へ移るため(高さ計測が成立しない)。
- */
 const pageSizeOptions = [50, 100, 200, 500]
 const savedPageSize = Number(localStorage.getItem('channelPageSize'))
 const pageSize = ref(pageSizeOptions.includes(savedPageSize) ? savedPageSize : 100)
 const page = ref(1)
-const totalPages = computed(() => Math.max(1, Math.ceil(sorted.value.length / pageSize.value)))
-const pageRows = computed(() => {
-  const start = (page.value - 1) * pageSize.value
-  return sorted.value.slice(start, start + pageSize.value)
-})
-const rangeStart = computed(() => (sorted.value.length ? (page.value - 1) * pageSize.value + 1 : 0))
-const rangeEnd = computed(() => Math.min(page.value * pageSize.value, sorted.value.length))
+const total = ref(0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+const pageRows = computed(() => rows.value)
+const sorted = computed(() => rows.value)
+const rangeStart = computed(() => (total.value ? (page.value - 1) * pageSize.value + 1 : 0))
+const rangeEnd = computed(() => Math.min(rangeStart.value + rows.value.length - 1, total.value))
 watch([appliedQuery, sortKey, descending, sortKey2, descending2, sortKey3, descending3], () => {
   page.value = 1
+  void load()
 })
 watch(pageSize, (value) => {
   page.value = 1
   localStorage.setItem('channelPageSize', String(value))
 })
+watch(page, () => void load())
 watch(totalPages, (value) => {
   if (page.value > value) page.value = value
 })
@@ -218,8 +170,20 @@ const allSelected = computed(
 async function load() {
   loading.value = true
   try {
-    rows.value = unwrapArray(await api('/channels'), ['channels'])
-    const driverRows = unwrapArray(await api('/bondrivers'), ['bondrivers', 'tuners'])
+    const params = new URLSearchParams({
+      limit: String(pageSize.value),
+      offset: String((page.value - 1) * pageSize.value),
+      sort: sortKey.value,
+      desc: String(descending.value),
+    })
+    if (appliedQuery.value.trim()) params.set('q', appliedQuery.value.trim())
+    const [channelResponse, driverResponse] = await Promise.all([
+      api<JsonRecord>(`/channels?${params.toString()}`),
+      api<JsonRecord>('/bondrivers'),
+    ])
+    rows.value = unwrapArray(channelResponse, ['channels'])
+    total.value = Number(channelResponse.total ?? channelResponse.count ?? rows.value.length)
+    const driverRows = unwrapArray(driverResponse, ['bondrivers', 'tuners'])
     drivers.value = driverRows.map((driver) => ({
       id: Number(driver.id),
       name: String(
@@ -636,6 +600,11 @@ onUnmounted(() => {
               </tr>
             </thead>
             <tbody>
+              <tr v-if="loading">
+                <td :colspan="visibleColumns.length + (editMode ? 3 : 2)" class="loading-state">
+                  読み込み中…
+                </td>
+              </tr>
               <tr v-for="row in pageRows" :key="String(row.id)">
                 <td v-if="editMode" data-label="選択">
                   <input
@@ -696,7 +665,7 @@ onUnmounted(() => {
             該当するチャンネルはありません
           </p>
         </div>
-        <div v-if="sorted.length" class="channel-pager">
+        <div v-if="total" class="channel-pager">
           <span
             class="pager-status"
             v-text="`${rangeStart}〜${rangeEnd}件目 / 全${sorted.length}件`"

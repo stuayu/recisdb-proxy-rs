@@ -188,6 +188,64 @@ impl Database {
         Ok(records)
     }
 
+    /// Dashboard channel query with filtering and SQL-side paging.
+    pub fn get_channels_for_api(
+        &self,
+        bondriver_id: Option<i64>,
+        enabled_only: bool,
+        search: Option<&str>,
+        sort_column: &str,
+        descending: bool,
+        limit: Option<u32>,
+        offset: u32,
+    ) -> Result<(Vec<(ChannelRecord, String)>, u64)> {
+        let mut where_sql =
+            String::from(" FROM channels c JOIN bon_drivers d ON d.id=c.bon_driver_id WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(id) = bondriver_id {
+            where_sql.push_str(" AND c.bon_driver_id=?");
+            values.push(Box::new(id));
+        }
+        if enabled_only {
+            where_sql.push_str(" AND c.is_enabled=1");
+        }
+        if let Some(q) = search {
+            where_sql.push_str(" AND (c.channel_name LIKE ? OR c.raw_name LIKE ? OR c.network_name LIKE ? OR c.terrestrial_region LIKE ? OR CAST(c.nid AS TEXT) LIKE ? OR CAST(c.sid AS TEXT) LIKE ? OR CAST(c.tsid AS TEXT) LIKE ? OR CAST(c.physical_ch AS TEXT) LIKE ? OR d.dll_path LIKE ?)");
+            let pattern = format!("%{}%", q);
+            for _ in 0..9 {
+                values.push(Box::new(pattern.clone()));
+            }
+        }
+        let count_sql = format!("SELECT COUNT(*){}", where_sql);
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let total: u64 = self
+            .conn
+            .query_row(&count_sql, bound.as_slice(), |r| r.get::<_, i64>(0))?
+            as u64;
+        let direction = if descending { " DESC" } else { " ASC" };
+        let sql = format!(
+            "SELECT c.*, d.dll_path{} ORDER BY c.{}{} , c.id ASC{}",
+            where_sql,
+            sort_column,
+            direction,
+            if limit.is_some() {
+                " LIMIT ? OFFSET ?"
+            } else {
+                ""
+            }
+        );
+        if let Some(limit) = limit {
+            values.push(Box::new(limit as i64));
+            values.push(Box::new(offset as i64));
+        }
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            Ok((Self::row_to_channel_record(row)?, row.get("dll_path")?))
+        })?;
+        Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, total))
+    }
+
     /// Get enabled channels by BonDriver ID.
     pub fn get_enabled_channels_by_bon_driver(
         &self,

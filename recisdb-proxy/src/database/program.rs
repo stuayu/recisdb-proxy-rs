@@ -161,6 +161,61 @@ impl Database {
             .map_err(|e| e.into())
     }
 
+    pub fn get_programs_page(
+        &self,
+        since: i64,
+        until: i64,
+        nid: Option<u16>,
+        sid: Option<u16>,
+        services: &[(u16, u16)],
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<ProgramRecord>, u64)> {
+        let mut where_sql =
+            String::from(" FROM programs WHERE start_at < ? AND (start_at + duration_secs) > ?");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until), Box::new(since)];
+        if let Some(n) = nid {
+            where_sql.push_str(" AND nid = ?");
+            values.push(Box::new(n as i32));
+        }
+        if let Some(s) = sid {
+            where_sql.push_str(" AND sid = ?");
+            values.push(Box::new(s as i32));
+        }
+        if !services.is_empty() {
+            where_sql.push_str(" AND (nid, sid) IN (");
+            where_sql.push_str(
+                &std::iter::repeat("(?, ?)")
+                    .take(services.len())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            where_sql.push(')');
+            for (n, s) in services {
+                values.push(Box::new(*n as i32));
+                values.push(Box::new(*s as i32));
+            }
+        }
+        let count_sql = format!("SELECT COUNT(*){}", where_sql);
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
+        let total: u64 = self
+            .connection()
+            .query_row(&count_sql, bound.as_slice(), |row| row.get::<_, i64>(0))?
+            as u64;
+        let sql = format!(
+            "SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
+                    name, description, extended, genre, free_ca_mode, updated_at
+             {} ORDER BY start_at ASC, id ASC LIMIT ? OFFSET ?",
+            where_sql
+        );
+        values.push(Box::new(limit as i64));
+        values.push(Box::new(offset as i64));
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.connection().prepare(&sql)?;
+        let rows = stmt.query_map(bound.as_slice(), Self::row_to_program_record)?;
+        Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, total))
+    }
+
     /// Delete programs that ended more than 24h before `now`. Intended to
     /// be called at low frequency from the EPG writer's flush loop, not on
     /// every flush (spec: "収集フラッシュ時に低頻度で呼ぶ").
@@ -242,6 +297,23 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_id, 1);
         assert_eq!(rows[0].sid, 200);
+    }
+
+    #[test]
+    fn page_filters_services_and_has_stable_start_order() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[
+            sample(1, 100, 1, 3_000, 1),
+            sample(1, 100, 2, 1_000, 1),
+            sample(2, 200, 3, 2_000, 1),
+        ])
+        .unwrap();
+        let (page, total) = db
+            .get_programs_page(0, 10_000, None, None, &[(1, 100)], 1, 1)
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].event_id, 1);
     }
 
     #[test]

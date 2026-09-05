@@ -29,6 +29,10 @@ pub struct ProgramQuery {
     pub until: Option<i64>,
     pub nid: Option<u16>,
     pub sid: Option<u16>,
+    pub brief: Option<bool>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub services: Option<String>,
 }
 
 /// A single program in the API response. Field names intentionally match
@@ -48,6 +52,35 @@ pub struct ProgramApi {
     pub description: Option<String>,
     pub extended: Option<String>,
     pub genre: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BriefProgramApi {
+    id: i64,
+    nid: u16,
+    sid: u16,
+    tsid: u16,
+    event_id: u16,
+    start_at: i64,
+    duration_secs: i64,
+    name: Option<String>,
+    genre: Option<i64>,
+}
+
+impl From<ProgramRecord> for BriefProgramApi {
+    fn from(r: ProgramRecord) -> Self {
+        Self {
+            id: r.id,
+            nid: r.nid,
+            sid: r.sid,
+            tsid: r.tsid,
+            event_id: r.event_id,
+            start_at: r.start_at,
+            duration_secs: r.duration_secs,
+            name: r.name,
+            genre: r.genre,
+        }
+    }
 }
 
 impl From<ProgramRecord> for ProgramApi {
@@ -77,16 +110,83 @@ pub async fn get_programs(
     let since = query.since.unwrap_or(i64::MIN);
     let until = query.until.unwrap_or(i64::MAX);
 
+    let services = query.services.as_deref().map(parse_services).transpose()?;
+    let limit = query.limit.unwrap_or(20_000).min(50_000);
+    let offset = query.offset.unwrap_or(0);
     let db = web_state.database.lock().await;
-    let programs: Vec<ProgramApi> = db
-        .get_programs(since, until, query.nid, query.sid)?
-        .into_iter()
-        .map(ProgramApi::from)
-        .collect();
+    let (records, total) = db.get_programs_page(
+        since,
+        until,
+        query.nid,
+        query.sid,
+        services.as_deref().unwrap_or(&[]),
+        limit,
+        offset,
+    )?;
+    let truncated = offset as u64 + (records.len() as u64) < total;
+    let programs = if query.brief.unwrap_or(false) {
+        serde_json::to_value(
+            records
+                .into_iter()
+                .map(BriefProgramApi::from)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        serde_json::to_value(
+            records
+                .into_iter()
+                .map(ProgramApi::from)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    };
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "count": programs.len(),
+        "count": programs.as_array().map_or(0, Vec::len),
+        "total": total,
+        "truncated": truncated,
         "programs": programs,
     })))
+}
+
+fn parse_services(value: &str) -> Result<Vec<(u16, u16)>, ApiError> {
+    let mut result = Vec::new();
+    for item in value.split(',').filter(|item| !item.trim().is_empty()) {
+        let mut parts = item.trim().split(':');
+        let (Some(nid), Some(sid), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(nid), Ok(sid)) = (nid.parse::<u16>(), sid.parse::<u16>()) else {
+            continue;
+        };
+        result.push((nid, sid));
+        if result.len() > 500 {
+            return Err(ApiError::bad_request("servicesは500件以下にしてください"));
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_services;
+
+    #[test]
+    fn services_ignores_malformed_items() {
+        assert_eq!(
+            parse_services("bad,1:2,,3:x,4:5:6,7:8").unwrap(),
+            vec![(1, 2), (7, 8)]
+        );
+    }
+
+    #[test]
+    fn services_rejects_more_than_500_valid_items() {
+        let value = (0..501)
+            .map(|n| format!("1:{}", n))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_services(&value).is_err());
+    }
 }
