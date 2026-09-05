@@ -313,7 +313,7 @@ fn parse_windows_gpu_inventory(inventory: &str, memory: &str, usage: &str) -> Ve
         };
         let key = path[start..start + end].to_string();
         let entry = memory_by_luid.entry(key).or_default();
-        if path.contains("Dedicated Usage") {
+        if path.to_ascii_lowercase().contains("dedicated usage") {
             entry.0 += value.trim().parse::<f64>().unwrap_or(0.0);
         } else {
             entry.1 += value.trim().parse::<f64>().unwrap_or(0.0);
@@ -365,6 +365,9 @@ fn parse_windows_gpu_inventory(inventory: &str, memory: &str, usage: &str) -> Ve
             } else {
                 GpuVendor::Unknown
             };
+            if vendor == GpuVendor::Nvidia {
+                return None;
+            }
             let luid = if vendor == GpuVendor::Nvidia {
                 nvidia_luid.clone()
             } else if vendor == GpuVendor::Intel {
@@ -547,7 +550,7 @@ mod tests {
             "luid_intel)Shared Usage|78303232\nluid_nvidia)Dedicated Usage|466128896\nluid_nvidia)Shared Usage|25124864",
             "luid_intel)engine|12.5\nluid_nvidia)engine|0",
         );
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 1);
         assert_eq!(result[0].vendor, GpuVendor::Intel);
         assert_eq!(result[0].usage_percent, Some(12.5));
         assert_eq!(result[0].memory_used_bytes, Some(78303232));
