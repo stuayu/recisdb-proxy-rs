@@ -117,20 +117,22 @@ struct WindowsGpuProbe;
 impl GpuProbe for WindowsGpuProbe {
     fn sample<'a>(&'a self) -> ProbeFuture<'a> {
         Box::pin(async move {
-            let Some(text) = command_output(
+            let Some(inventory) = command_output(
                 "powershell",
                 &[
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    r#"$mem = @{}; (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage','\GPU Adapter Memory(*)\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.Path -match '(luid_[^)]+)\)') { $key=$Matches[1]; if (!$mem.ContainsKey($key)) { $mem[$key]=@{dedicated=0;shared=0} }; if ($_.Path -match 'Dedicated Usage') { $mem[$key].dedicated += $_.CookedValue } else { $mem[$key].shared += $_.CookedValue } } }; $usage = @{}; (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.Path -match '(luid_[^)]+)\)') { $key=$Matches[1]; $usage[$key] = ($usage[$key] + $_.CookedValue) } }; Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Remote Display|Microsoft Basic' } | ForEach-Object { $vendor=$_.AdapterCompatibility; $key=$null; if ($vendor -match 'NVIDIA' -or $_.Name -match 'NVIDIA') { $key=$mem.GetEnumerator() | Sort-Object { $_.Value.dedicated } -Descending | Select-Object -First 1 -ExpandProperty Key } elseif ($vendor -match 'Intel' -or $_.Name -match 'Intel') { $key=$mem.GetEnumerator() | Where-Object { $_.Key -ne ($mem.GetEnumerator() | Sort-Object { $_.Value.dedicated } -Descending | Select-Object -First 1 -ExpandProperty Key) } | Sort-Object { $_.Value.shared } -Descending | Select-Object -First 1 -ExpandProperty Key }; $d=0; $s=0; $u=$null; if ($key -and $mem.ContainsKey($key)) { $d=$mem[$key].dedicated; $s=$mem[$key].shared; $u=$usage[$key] }; \"$($_.Name)|$vendor|$u|$d|$s\" }"#,
+                    "Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Remote Display|Microsoft Basic' } | ForEach-Object { \"$($_.Name)|$($_.AdapterCompatibility)\" }",
                 ],
             )
             .await
             else {
                 return Vec::new();
             };
-            parse_windows_gpu_inventory(&text)
+            let memory = command_output("powershell", &["-NoProfile", "-NonInteractive", "-Command", "(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage','\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { \"$($_.Path)|$($_.CookedValue)\" }"]).await.unwrap_or_default();
+            let usage = command_output("powershell", &["-NoProfile", "-NonInteractive", "-Command", "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { \"$($_.Path)|$($_.CookedValue)\" }"]).await.unwrap_or_default();
+            parse_windows_gpu_inventory(&inventory, &memory, &usage)
         })
     }
 }
@@ -297,15 +299,56 @@ fn parse_sysfs_number(value: &str) -> Option<u64> {
     value.trim().parse().ok()
 }
 
-fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
-    text.lines()
+fn parse_windows_gpu_inventory(inventory: &str, memory: &str, usage: &str) -> Vec<GpuMetrics> {
+    let mut memory_by_luid = std::collections::HashMap::<String, (f64, f64)>::new();
+    for line in memory.lines() {
+        let Some((path, value)) = line.rsplit_once('|') else {
+            continue;
+        };
+        let Some(start) = path.find("luid_") else {
+            continue;
+        };
+        let Some(end) = path[start..].find(')') else {
+            continue;
+        };
+        let key = path[start..start + end].to_string();
+        let entry = memory_by_luid.entry(key).or_default();
+        if path.contains("Dedicated Usage") {
+            entry.0 += value.trim().parse::<f64>().unwrap_or(0.0);
+        } else {
+            entry.1 += value.trim().parse::<f64>().unwrap_or(0.0);
+        }
+    }
+    let mut usage_by_luid = std::collections::HashMap::<String, f32>::new();
+    for line in usage.lines() {
+        let Some((path, value)) = line.rsplit_once('|') else {
+            continue;
+        };
+        let Some(start) = path.find("luid_") else {
+            continue;
+        };
+        let Some(end) = path[start..].find(')') else {
+            continue;
+        };
+        *usage_by_luid
+            .entry(path[start..start + end].to_string())
+            .or_default() += value.trim().parse::<f32>().unwrap_or(0.0);
+    }
+    let nvidia_luid = memory_by_luid
+        .iter()
+        .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+        .map(|(key, _)| key.clone());
+    let intel_luid = memory_by_luid
+        .iter()
+        .filter(|(key, _)| Some(*key) != nvidia_luid.as_ref())
+        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+        .map(|(key, _)| key.clone());
+    inventory
+        .lines()
         .filter_map(|line| {
             let mut fields = line.split('|');
             let name = fields.next()?;
             let compatibility = fields.next()?;
-            let usage_percent = fields.next().and_then(|v| v.trim().parse::<f32>().ok());
-            let dedicated = fields.next().and_then(|v| v.trim().parse::<f64>().ok());
-            let shared = fields.next().and_then(|v| v.trim().parse::<f64>().ok());
             let name = name.trim();
             if name.is_empty() {
                 return None;
@@ -322,7 +365,24 @@ fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
             } else {
                 GpuVendor::Unknown
             };
-            Some((name.to_string(), vendor, usage_percent, dedicated, shared))
+            let luid = if vendor == GpuVendor::Nvidia {
+                nvidia_luid.clone()
+            } else if vendor == GpuVendor::Intel {
+                intel_luid.clone()
+            } else {
+                None
+            };
+            let (dedicated, shared) = luid
+                .as_ref()
+                .and_then(|key| memory_by_luid.get(key).copied())
+                .unwrap_or_default();
+            Some((
+                name.to_string(),
+                vendor,
+                luid.and_then(|key| usage_by_luid.get(&key).copied()),
+                dedicated,
+                shared,
+            ))
         })
         .enumerate()
         .map(
@@ -331,9 +391,7 @@ fn parse_windows_gpu_inventory(text: &str) -> Vec<GpuMetrics> {
                 vendor,
                 name,
                 usage_percent,
-                memory_used_bytes: dedicated
-                    .zip(shared)
-                    .map(|(d, s)| (d.max(0.0) + s.max(0.0)) as u64),
+                memory_used_bytes: Some((dedicated.max(0.0) + shared.max(0.0)) as u64),
                 // Windows exposes shared usage but not a stable per-adapter VRAM
                 // capacity through these counters. Do not present shared usage as
                 // the total capacity.
@@ -485,7 +543,9 @@ mod tests {
     #[test]
     fn parses_windows_gpu_inventory_with_usage_and_memory() {
         let result = parse_windows_gpu_inventory(
-            "Intel(R) UHD Graphics 730|Intel Corporation|12.5|0|78303232\nNVIDIA GeForce GTX 1660 Ti|NVIDIA|0|466128896|25124864",
+            "Intel(R) UHD Graphics 730|Intel Corporation\nNVIDIA GeForce GTX 1660 Ti|NVIDIA",
+            "luid_intel)Shared Usage|78303232\nluid_nvidia)Dedicated Usage|466128896\nluid_nvidia)Shared Usage|25124864",
+            "luid_intel)engine|12.5\nluid_nvidia)engine|0",
         );
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].vendor, GpuVendor::Intel);
