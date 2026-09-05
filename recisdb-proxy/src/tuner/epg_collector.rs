@@ -286,7 +286,10 @@ impl EpgCollector {
                 None
             };
             let extended = non_empty(event.extended);
-            let genre = basic_allowed.then_some(event.genre).flatten().map(|g| g as i64);
+            let genre = basic_allowed
+                .then_some(event.genre)
+                .flatten()
+                .map(|g| g as i64);
             let record = ProgramUpsert {
                 nid: eit.original_network_id,
                 sid: eit.service_id,
@@ -374,9 +377,8 @@ mod tests {
 
     fn metadata_section(table_id: u8, running_status: u8, duration: [u8; 3]) -> Vec<u8> {
         let mut section = vec![
-            table_id, 0xB0, 0x1B, 0x12, 0x34, 0x03, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x0B, 0x00, table_id, 0x00, 0x01,
-            0xEB, 0x5E, 0x12, 0x34, 0x56,
+            table_id, 0xB0, 0x1B, 0x12, 0x34, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0B, 0x00,
+            table_id, 0x00, 0x01, 0xEB, 0x5E, 0x12, 0x34, 0x56,
         ];
         section.extend_from_slice(&duration);
         section.push((running_status << 5) as u8);
@@ -391,7 +393,10 @@ mod tests {
             let mut collector = EpgCollector::new_metadata();
             let section = metadata_section(table_id::EIT_PF_ACTUAL, status, [0, 30, 0]);
             collector.process_section(pid::EIT, &section);
-            assert!(collector.drain_metadata_records().is_empty(), "status={status}");
+            assert!(
+                collector.drain_metadata_records().is_empty(),
+                "status={status}"
+            );
         }
     }
 

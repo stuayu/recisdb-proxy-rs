@@ -18,6 +18,8 @@ const label = computed(() => endpoints.find((item) => item[1] === selected.value
 const isEpg = computed(() => selected.value === '/settings/epg')
 const epgPresets = ref<JsonRecord[]>([])
 const selectedEpgPreset = ref<number | null>(null)
+const epgEffective = ref<JsonRecord | null>(null)
+const epgEffectiveConfig = computed<JsonRecord>(() => (epgEffective.value?.effective as JsonRecord) ?? {})
 const epgStatus = ref<JsonRecord | null>(null)
 const editingPreset = ref<JsonRecord | null>(null)
 const creatingPreset = ref(false)
@@ -146,13 +148,24 @@ async function load() {
       const presets = await api<JsonRecord>('/epg-presets')
       epgPresets.value = Array.isArray(presets.presets) ? (presets.presets as JsonRecord[]) : []
       selectedEpgPreset.value = typeof config.value.selected_preset_id === 'number' ? Number(config.value.selected_preset_id) : null
-      epgStatus.value = await api<JsonRecord>('/epg/status')
+      const [status, effective] = await Promise.all([
+        api<JsonRecord>('/epg/status'),
+        api<JsonRecord>('/epg-effective'),
+      ])
+      epgStatus.value = status
+      epgEffective.value = effective
     }
     message.value = ''
     error.value = ''
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
+}
+function toggleEpgPreset(id: number, enabled: boolean) {
+  selectedEpgPreset.value = enabled ? id : null
+}
+function onEpgPresetToggle(id: number, event: Event) {
+  toggleEpgPreset(id, (event.target as HTMLInputElement).checked)
 }
 async function save() {
   try {
@@ -217,6 +230,13 @@ function presetValue(value: unknown, unit: 'seconds' | 'hours' | 'percent' | 'bo
   if (number >= 3600 && number % 3600 === 0) return `約${number / 3600}時間`
   if (number >= 60 && number % 60 === 0) return `約${number / 60}分`
   return `約${number}秒`
+}
+function effectiveValue(key: string, unit: 'seconds' | 'hours' | 'percent' | 'boolean'): string {
+  const value = presetValue(epgEffectiveConfig.value[key], unit)
+  const source = epgEffective.value?.source
+  const origin = source && typeof source === 'object' ? String((source as JsonRecord)[key] ?? '') : ''
+  const labels: Record<string, string> = { global: '全体設定', preset: 'プリセット', tunerOverride: 'チューナー個別設定' }
+  return origin && labels[origin] ? `${value}（${labels[origin]}）` : value
 }
 function presetPlaceholder(key: string): string {
   const examples: Record<string, string> = {
@@ -784,31 +804,41 @@ onMounted(() => {
         </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
         <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
+        <label class="check"><input v-model="config.autoTunerScanEnabled" type="checkbox" /><span>チューナーを自動起動してEPGを収集する</span></label>
+        <p class="hint">OFF にすると、番組表のためだけにチューナーを起動することをやめます。視聴・録画でチューナーが開いているあいだは、そのまま番組表も一緒に取り込みます。</p>
         <fieldset>
           <legend>更新方針とプリセット</legend>
           <p class="muted">組み込み初期値 → 全体設定 → プリセット → 物理チューナー個別設定の順に上書きされます。プリセットで空欄の項目は全体設定の値が使われます。</p>
-          <div class="epg-preset-cards">
-            <article v-for="preset in epgPresets" :key="String(preset.id)" class="panel epg-preset-card" :class="{ 'is-selected': selectedEpgPreset === Number(preset.id) }">
-              <label class="preset-choice">
-                <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="Number(preset.id)" />
-                <span class="epg-preset-content">
-                <span class="epg-preset-heading"><strong v-text="String(preset.name)" /><span v-if="preset.is_system" class="badge">おすすめ</span><span v-if="selectedEpgPreset === Number(preset.id)" class="badge">使用中</span></span>
-                <span class="muted" v-text="String(preset.description ?? '')" />
-                <span class="epg-preset-summary"><span>更新頻度: {{ presetValue(preset.target_refresh_secs, 'seconds') }}</span><span>維持日数: {{ presetValue(preset.target_future_coverage_hours, 'hours') }}</span><span>CPU延期上限: {{ presetValue(preset.cpu_soft_limit_percent, 'percent') }}</span><span>録画・視聴で中断: {{ presetValue(preset.preemptible, 'boolean') }}</span></span>
-                </span>
-              </label>
-              <span class="actions epg-preset-actions">
-                <button class="button secondary" type="button" :disabled="Boolean(preset.is_system)" @click="editEpgPreset(preset)">{{ preset.is_system ? 'システム設定（複製して編集）' : '編集' }}</button>
-                <button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button>
-                <button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button>
-              </span>
-            </article>
-            <article class="panel epg-preset-card" :class="{ 'is-selected': selectedEpgPreset === null }">
-              <label class="preset-choice">
-                <input v-model="selectedEpgPreset" type="radio" name="epg-preset" :value="null" />
-                <span class="epg-preset-content"><span class="epg-preset-heading"><strong>カスタム</strong><span v-if="selectedEpgPreset === null" class="badge">使用中</span></span><span class="muted">詳細設定を自分で決める</span><span class="epg-preset-summary"><span>全項目を個別に設定</span></span></span>
-              </label>
-            </article>
+          <div class="table-region epg-preset-table-region" role="region" aria-label="EPGプリセット一覧" tabindex="0">
+            <table class="data-table epg-preset-table">
+              <thead><tr><th>プリセット名</th><th>説明</th><th>更新頻度</th><th>維持日数</th><th>CPU延期上限</th><th>録画・視聴で中断</th><th>チューナー自動起動収集</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-if="epgEffective?.effective" class="epg-effective-row">
+                  <td data-label="プリセット名"><strong>現在有効な設定</strong></td>
+                  <td data-label="説明">APIの実効値</td>
+                  <td data-label="更新頻度">{{ effectiveValue('target_refresh_secs', 'seconds') }}</td>
+                  <td data-label="維持日数">{{ effectiveValue('target_future_coverage_hours', 'hours') }}</td>
+                  <td data-label="CPU延期上限">{{ effectiveValue('cpu_soft_limit_percent', 'percent') }}</td>
+                  <td data-label="録画・視聴で中断">{{ effectiveValue('preemptible', 'boolean') }}</td>
+                  <td data-label="チューナー自動起動収集">{{ effectiveValue('auto_tuner_scan_enabled', 'boolean') }}</td>
+                  <td data-label="操作">—</td>
+                </tr>
+                <tr v-for="preset in epgPresets" :key="String(preset.id)" :class="{ 'is-selected': selectedEpgPreset === Number(preset.id) }">
+                  <td data-label="プリセット名"><span class="epg-preset-name"><strong v-text="String(preset.name)" /><span v-if="preset.is_system" class="badge">おすすめ</span><span v-if="selectedEpgPreset === Number(preset.id)" class="badge">使用中</span></span><label class="epg-toggle"><input type="checkbox" role="switch" :checked="selectedEpgPreset === Number(preset.id)" :aria-label="`${String(preset.name)}を使用`" @change="onEpgPresetToggle(Number(preset.id), $event)" /><span aria-hidden="true" /></label></td>
+                  <td data-label="説明" v-text="String(preset.description ?? '')" />
+                  <td data-label="更新頻度">{{ presetValue(preset.target_refresh_secs, 'seconds') }}</td>
+                  <td data-label="維持日数">{{ presetValue(preset.target_future_coverage_hours, 'hours') }}</td>
+                  <td data-label="CPU延期上限">{{ presetValue(preset.cpu_soft_limit_percent, 'percent') }}</td>
+                  <td data-label="録画・視聴で中断">{{ presetValue(preset.preemptible, 'boolean') }}</td>
+                  <td data-label="チューナー自動起動収集">{{ presetValue(preset.autoTunerScanEnabled, 'boolean') }}</td>
+                  <td data-label="操作"><span class="actions epg-preset-actions"><button class="button secondary" type="button" :disabled="Boolean(preset.is_system)" @click="editEpgPreset(preset)">{{ preset.is_system ? '複製して編集' : '編集' }}</button><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></span></td>
+                </tr>
+                <tr :class="{ 'is-selected': selectedEpgPreset === null }">
+                  <td data-label="プリセット名"><span class="epg-preset-name"><strong>プリセットなし</strong><span v-if="selectedEpgPreset === null" class="badge">使用中</span></span><label class="epg-toggle"><input type="checkbox" role="switch" :checked="selectedEpgPreset === null" aria-label="プリセットなし（全体設定のみ）を使用" @change="selectedEpgPreset = null" /><span aria-hidden="true" /></label></td>
+                  <td data-label="説明">全体設定のみ</td><td data-label="更新頻度">{{ presetValue(null, 'seconds') }}</td><td data-label="維持日数">{{ presetValue(null, 'hours') }}</td><td data-label="CPU延期上限">{{ presetValue(null, 'percent') }}</td><td data-label="録画・視聴で中断">{{ presetValue(null, 'boolean') }}</td><td data-label="チューナー自動起動収集">{{ presetValue(null, 'boolean') }}</td><td data-label="操作">—</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
           <div class="actions"><button class="button secondary" type="button" @click="startCreateEpgPreset">新規作成</button><a class="button secondary" href="#bondrivers">チューナー個別設定を開く</a></div>
           <p class="muted">プリセットを物理チューナーへ割り当てる場合は、<a href="#bondrivers">BonDriver（チューナー個別設定）</a>から設定します。</p>
@@ -915,80 +945,4 @@ onMounted(() => {
   content: ',';
 }
 
-.epg-preset-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
-  gap: 12px;
-}
-
-.epg-preset-card {
-  margin: 0;
-  padding: 12px;
-}
-
-.epg-preset-card.is-selected {
-  border-color: var(--accent-color, currentColor);
-}
-
-.preset-choice {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  min-height: 44px;
-  cursor: pointer;
-}
-
-.epg-preset-actions {
-  margin-top: 10px;
-  flex-wrap: wrap;
-}
-
-.preset-choice > input {
-  flex: 0 0 auto;
-  margin-top: 4px;
-}
-
-.epg-preset-content {
-  display: grid;
-  flex: 1;
-  gap: 8px;
-  min-width: 0;
-}
-
-.epg-preset-heading {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.epg-preset-summary {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px 12px;
-  font-size: 0.9rem;
-}
-
-.epg-preset-card p {
-  min-height: 2.5em;
-}
-
-@media (max-width: 700px) {
-  .service-status {
-    grid-template-columns: 1fr;
-    gap: 2px;
-  }
-
-  .service-status dd {
-    margin-bottom: 6px;
-  }
-
-  .epg-preset-cards {
-    grid-template-columns: 1fr;
-  }
-
-  .epg-preset-summary {
-    grid-template-columns: 1fr;
-  }
-}
 </style>

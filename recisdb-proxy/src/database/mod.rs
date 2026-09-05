@@ -276,6 +276,10 @@ impl Database {
             "032_epg_source_update_clocks",
             Database::migration_032_epg_source_update_clocks,
         ),
+        (
+            "033_epg_auto_tuner_scan_settings",
+            Database::migration_033_epg_auto_tuner_scan_settings,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -360,6 +364,21 @@ impl Database {
         self.add_column_if_not_exists("programs", "schedule_updated_at", "INTEGER")?;
         self.add_column_if_not_exists("programs", "basic_updated_at", "INTEGER")?;
         self.add_column_if_not_exists("programs", "extended_updated_at", "INTEGER")?;
+        Ok(())
+    }
+
+    fn migration_033_epg_auto_tuner_scan_settings(&self) -> Result<()> {
+        self.add_column_if_not_exists(
+            "epg_global_settings",
+            "auto_tuner_scan_enabled",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        self.add_column_if_not_exists("epg_scan_presets", "auto_tuner_scan_enabled", "INTEGER")?;
+        self.add_column_if_not_exists(
+            "physical_tuner_epg_settings",
+            "auto_tuner_scan_enabled_override",
+            "INTEGER",
+        )?;
         Ok(())
     }
 

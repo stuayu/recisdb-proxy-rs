@@ -1013,6 +1013,22 @@ textarea:focus-visible,
   margin-bottom: 12px;
 }
 
+.system-metrics-panel {
+  margin-bottom: 24px;
+}
+
+.system-metric-value {
+  margin-top: 8px;
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.system-metrics-panel article > .muted {
+  display: block;
+  min-height: 1.3em;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1595,4 +1611,115 @@ textarea:focus-visible,
   border-color: var(--muted);
   color: var(--muted);
   margin-left: 6px;
+}
+
+/* EPGプリセット比較表。狭幅ではdata-table共通ルールで縦積みにする。 */
+.epg-preset-table-region {
+  margin-top: 12px;
+}
+
+.epg-preset-table {
+  min-width: 1050px;
+}
+
+.epg-preset-table td {
+  vertical-align: top;
+}
+
+.epg-preset-table tr.is-selected td {
+  border-bottom-color: var(--accent);
+}
+
+.epg-effective-row {
+  background: color-mix(in srgb, var(--soft) 72%, var(--surface));
+  font-weight: 600;
+}
+
+.epg-preset-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 10rem;
+}
+
+.epg-toggle {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.epg-toggle input {
+  position: absolute;
+  opacity: 0;
+}
+
+.epg-toggle span {
+  position: relative;
+  display: block;
+  width: 44px;
+  height: 24px;
+  background: var(--muted);
+  border-radius: 999px;
+}
+
+.epg-toggle span::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  background: var(--surface);
+  border-radius: 50%;
+  content: '';
+  transition: transform 0.15s ease;
+}
+
+.epg-toggle input:checked + span {
+  background: var(--accent);
+}
+
+.epg-toggle input:checked + span::after {
+  transform: translateX(20px);
+}
+
+.epg-toggle input:focus-visible + span {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.epg-preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+@media (max-width: 700px) {
+  .epg-preset-table {
+    min-width: 0;
+  }
+
+  .epg-preset-table td:nth-child(2),
+  .epg-preset-table td:nth-child(4),
+  .epg-preset-table td:nth-child(5),
+  .epg-preset-table td:nth-child(6),
+  .epg-preset-table th:nth-child(2),
+  .epg-preset-table th:nth-child(4),
+  .epg-preset-table th:nth-child(5),
+  .epg-preset-table th:nth-child(6) {
+    display: none;
+  }
+
+  .epg-preset-table td:first-child {
+    align-items: center;
+  }
+
+  .epg-preset-table td:first-child .epg-toggle {
+    margin-left: auto;
+  }
+
+  .epg-preset-table td .epg-preset-actions {
+    justify-content: flex-start;
+  }
 }

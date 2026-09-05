@@ -86,6 +86,11 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // Session/Client API
         .route("/clients", get(api::get_clients))
         .route("/stats", get(api::get_stats))
+        .route("/system/metrics", get(api::get_system_metrics))
+        .route(
+            "/system/metrics-history",
+            get(api::get_system_metrics_history),
+        )
         .route("/events", get(api::dashboard_events))
         .route("/client/:id/quality", get(api::get_client_quality))
         .route(
@@ -150,6 +155,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
             "/tuners/:id/epg-settings/effective",
             get(api::get_epg_effective),
         )
+        // Global-only resolution (built-in default -> global -> selected preset).
+        // The settings screen needs this before any tuner is picked; without it
+        // the dashboard has to invent a tuner id that does not exist.
+        .route("/epg-effective", get(api::get_global_epg_effective))
         .route("/epg/status", get(api::get_epg_status))
         .route("/epg/scans", get(api::get_epg_scan_history))
         .route("/epg/scans/history", get(api::get_epg_scan_history))
@@ -394,6 +403,7 @@ pub async fn start_web_server(
         *web_state.tuner_config.write().await = config;
     }
     let web_state = Arc::new(web_state);
+    web_state.system_metrics.spawn();
 
     if mirakurun_enabled {
         log::warn!(

@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, type JsonRecord } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
 import MetricsChart from './MetricsChart.vue'
+import MetricSparkline from './MetricSparkline.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
 const store = useDashboardStore()
 const selectedSession = ref<string | number>('')
@@ -15,6 +16,72 @@ const previewNid = computed<string | number | null>(() => {
   const value = previewRow.value?.nid
   return typeof value === 'number' || typeof value === 'string' ? value : null
 })
+const systemMetrics = ref<JsonRecord>({})
+const systemHistory = ref<JsonRecord>({})
+let systemTimer = 0
+let systemChartWidth = 320
+
+function record(value: unknown): JsonRecord {
+  return value && typeof value === 'object' ? (value as JsonRecord) : {}
+}
+const systemCpu = computed(() => record(systemMetrics.value.cpu))
+const systemMemory = computed(() => record(systemMetrics.value.memory))
+const systemNetwork = computed(() => record(systemMetrics.value.network))
+const systemGpus = computed(() => {
+  const gpus = systemMetrics.value.gpus
+  return Array.isArray(gpus) ? gpus.filter((gpu): gpu is JsonRecord => !!gpu && typeof gpu === 'object') : []
+})
+const systemGpuHistory = computed(() =>
+  Array.isArray(systemHistory.value.gpu_usage)
+    ? systemHistory.value.gpu_usage.filter((gpu): gpu is JsonRecord => !!gpu && typeof gpu === 'object')
+    : [],
+)
+function gpuHistory(gpu: JsonRecord): unknown {
+  return systemGpuHistory.value.find(
+    (item) => item.index === gpu.index && item.vendor === gpu.vendor,
+  )?.values
+}
+function formatPercent(value: unknown): string {
+  const number = Number(value)
+  return value == null || !Number.isFinite(number) ? '使用率 未取得' : `${number.toFixed(1)}%`
+}
+function formatBytes(value: unknown): string {
+  let bytes = Number(value)
+  if (!Number.isFinite(bytes)) return '—'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let index = 0
+  while (bytes >= 1024 && index < units.length - 1) {
+    bytes /= 1024
+    index += 1
+  }
+  return `${bytes.toFixed(index === 0 ? 0 : 1)} ${units[index]}`
+}
+function formatRate(value: unknown): string {
+  const rate = Number(value)
+  if (!Number.isFinite(rate)) return '—'
+  if (rate < 1000) return `${rate.toFixed(0)} bps`
+  if (rate < 1_000_000) return `${(rate / 1000).toFixed(1)} Kbps`
+  if (rate < 1_000_000_000) return `${(rate / 1_000_000).toFixed(1)} Mbps`
+  return `${(rate / 1_000_000_000).toFixed(1)} Gbps`
+}
+async function loadSystemMetrics() {
+  try {
+    const [current, history] = await Promise.all([
+      api<JsonRecord>('/system/metrics'),
+      api<JsonRecord>('/system/metrics-history'),
+    ])
+    if (current.current === null) return
+    systemMetrics.value = current
+    systemHistory.value = history
+  } catch {
+    // システムメトリクスは概要画面の他の状態を隠さない。
+  }
+}
+function startSystemMetrics() {
+  window.clearInterval(systemTimer)
+  void loadSystemMetrics()
+  systemTimer = window.setInterval(loadSystemMetrics, 5000)
+}
 function openPreview(row: JsonRecord) {
   if (row.sid == null) return
   previewRow.value = row
@@ -154,8 +221,14 @@ async function setExclusive(row: JsonRecord, event: Event) {
   })
   await store.refresh()
 }
-onMounted(() => store.start())
-onUnmounted(() => store.stop())
+onMounted(() => {
+  store.start()
+  startSystemMetrics()
+})
+onUnmounted(() => {
+  store.stop()
+  window.clearInterval(systemTimer)
+})
 </script>
 <template>
   <section class="view">
@@ -172,6 +245,58 @@ onUnmounted(() => store.stop())
         <span v-text="card[0]" /><strong v-text="card[1]" />
       </article>
     </div>
+    <section class="metrics-panel system-metrics-panel">
+      <div class="view-heading">
+        <div>
+          <h3>システム負荷</h3>
+          <p>ホスト全体・5秒ごとに更新（過去15分）</p>
+        </div>
+      </div>
+      <div class="metric-grid">
+        <article>
+          <strong>CPU</strong>
+          <div class="system-metric-value">
+            {{ Number.isFinite(Number(systemCpu.usage_percent)) ? `${Number(systemCpu.usage_percent).toFixed(1)}%` : '—' }}
+          </div>
+          <span class="muted">{{ systemCpu.cores ?? '—' }} コア / load {{ systemCpu.load_average_1 ?? '—' }}</span>
+          <MetricSparkline :source="systemHistory.cpu_usage" unit="%" label="CPU使用率推移" :width="systemChartWidth" :height="90" />
+        </article>
+        <article>
+          <strong>メモリ</strong>
+          <div class="system-metric-value">{{ formatBytes(systemMemory.used_bytes) }}</div>
+          <span class="muted">/ {{ formatBytes(systemMemory.total_bytes) }}</span>
+          <MetricSparkline :source="systemHistory.memory_used" unit="bytes" label="メモリ使用量推移" :width="systemChartWidth" :height="90" />
+        </article>
+        <template v-if="systemGpus.length">
+          <article v-for="gpu in systemGpus" :key="`${gpu.vendor}-${gpu.index}`">
+            <strong>{{ gpu.vendor }} #{{ gpu.index }} {{ gpu.name }}</strong>
+            <div class="system-metric-value">{{ formatPercent(gpu.usage_percent) }}</div>
+            <span class="muted">
+              VRAM:
+              {{ gpu.memory_used_bytes == null ? '未取得' : formatBytes(gpu.memory_used_bytes) }} /
+              {{ gpu.memory_total_bytes == null ? '未取得' : formatBytes(gpu.memory_total_bytes) }}
+            </span>
+            <details v-if="systemGpus.length >= 3" class="gpu-chart-details">
+              <summary>グラフを表示</summary>
+              <MetricSparkline :source="gpuHistory(gpu)" unit="%" :label="`${gpu.vendor} #${gpu.index} 使用率推移`" :width="systemChartWidth" :height="90" />
+            </details>
+            <MetricSparkline v-else :source="gpuHistory(gpu)" unit="%" :label="`${gpu.vendor} #${gpu.index} 使用率推移`" :width="systemChartWidth" :height="90" />
+          </article>
+        </template>
+        <article>
+          <strong>ネットワーク受信</strong>
+          <div class="system-metric-value">{{ formatRate(systemNetwork.receive_bps) }}</div>
+          <span class="muted">累計 {{ formatBytes(systemNetwork.received_bytes) }}</span>
+          <MetricSparkline :source="systemHistory.network_receive_bps" unit="bps" label="ネットワーク受信速度推移" :width="systemChartWidth" :height="90" />
+        </article>
+        <article>
+          <strong>ネットワーク送信</strong>
+          <div class="system-metric-value">{{ formatRate(systemNetwork.transmit_bps) }}</div>
+          <span class="muted">累計 {{ formatBytes(systemNetwork.transmitted_bytes) }}</span>
+          <MetricSparkline :source="systemHistory.network_transmit_bps" unit="bps" label="ネットワーク送信速度推移" :width="systemChartWidth" :height="90" />
+        </article>
+      </div>
+    </section>
     <h3>接続中のクライアント</h3>
     <details class="column-picker">
       <summary><span v-text="`表示列を調整（${visibleClientColumns.length}列）`" /></summary>

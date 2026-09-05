@@ -13,6 +13,7 @@ use recisdb_protocol::StreamClass;
 
 use crate::database::ProgramUpsert;
 use crate::logging::LogBuffer;
+use crate::metrics::system::SystemMetricsCollector;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
 use crate::web::auth::AuthConfig;
@@ -497,6 +498,8 @@ pub struct WebState {
     pub encoder_pool: Arc<EncoderPool>,
     /// Session registry.
     pub session_registry: Arc<SessionRegistry>,
+    /// Host CPU, memory, network, and best-effort GPU metrics.
+    pub system_metrics: Arc<SystemMetricsCollector>,
     /// Scan scheduler configuration.
     pub scan_config: RwLock<ScanSchedulerInfo>,
     /// Tuner optimization configuration.
@@ -582,6 +585,7 @@ impl WebState {
             tuner_pool,
             encoder_pool,
             session_registry,
+            system_metrics: SystemMetricsCollector::new(),
             auth,
             proxy_listen_addr: None,
             config_path: None,

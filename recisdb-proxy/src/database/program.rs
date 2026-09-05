@@ -106,8 +106,16 @@ impl Database {
                     p.free_ca_mode,
                     p.updated_at,
                     p.source as i64,
-                    if p.source == EpgSource::PresentFollowing { Some(p.updated_at) } else { None },
-                    if p.source == EpgSource::Schedule { Some(p.updated_at) } else { None },
+                    if p.source == EpgSource::PresentFollowing {
+                        Some(p.updated_at)
+                    } else {
+                        None
+                    },
+                    if p.source == EpgSource::Schedule {
+                        Some(p.updated_at)
+                    } else {
+                        None
+                    },
                     p.basic_updated_at,
                     p.extended_updated_at,
                 ])?;

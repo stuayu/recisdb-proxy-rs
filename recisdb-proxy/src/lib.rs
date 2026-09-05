@@ -21,6 +21,7 @@ pub mod bondriver;
 pub mod database;
 pub mod epg_writer;
 pub mod logging;
+pub mod metrics;
 pub mod nit_writer;
 pub mod node;
 pub mod preview_setup;

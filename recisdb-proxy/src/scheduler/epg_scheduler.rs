@@ -43,6 +43,7 @@ pub enum EpgScanDecision {
     SoftCpuLimit,
     AtCapacity,
     Backoff,
+    AutoTunerScanDisabled,
     NotDue,
 }
 
@@ -80,6 +81,7 @@ impl EpgScanDecision {
             Self::SoftCpuLimit => Some(EpgReasonCode::CpuSoftLimit),
             Self::AtCapacity => Some(EpgReasonCode::NoTunerAvailable),
             Self::Backoff => Some(EpgReasonCode::Backoff),
+            Self::AutoTunerScanDisabled => Some(EpgReasonCode::AutoTunerScanDisabled),
             Self::NotDue => Some(EpgReasonCode::NotDue),
             Self::Start => None,
         }
@@ -129,6 +131,9 @@ pub fn decide(
 ) -> EpgScanDecision {
     if !config.enabled {
         return EpgScanDecision::Disabled;
+    }
+    if !config.auto_tuner_scan_enabled {
+        return EpgScanDecision::AutoTunerScanDisabled;
     }
     if cpu_percent as i64 >= config.cpu_soft_limit_percent {
         return EpgScanDecision::SoftCpuLimit;
@@ -235,6 +240,10 @@ impl EpgScanScheduler {
         let Some((driver, channel)) = candidate else {
             return Ok(());
         };
+        let config = {
+            let db = self.database.lock().await;
+            db.get_epg_effective(Some(driver.id))?.effective
+        };
         let mux = crate::node::LogicalMuxId {
             nid: channel.nid,
             tsid: channel.tsid,
@@ -263,7 +272,10 @@ impl EpgScanScheduler {
         );
         if decision != EpgScanDecision::Start {
             if let Some(code) = decision.reason_code() {
-                let record_history = !matches!(decision, EpgScanDecision::NotDue);
+                let record_history = !matches!(
+                    decision,
+                    EpgScanDecision::NotDue | EpgScanDecision::AutoTunerScanDisabled
+                );
                 let reason = epg_reason(
                     code,
                     decision_details(
@@ -847,6 +859,7 @@ mod tests {
     fn config() -> EpgGlobalSettings {
         EpgGlobalSettings {
             enabled: true,
+            auto_tuner_scan_enabled: true,
             scheduler_interval_secs: 1,
             target_refresh_secs: 1,
             max_stale_secs: 2,
@@ -928,6 +941,12 @@ mod tests {
             decide(&disabled, 0, 0, 10, None, None, None).reason_code(),
             Some(EpgReasonCode::Disabled)
         );
+        let mut auto_disabled = config();
+        auto_disabled.auto_tuner_scan_enabled = false;
+        assert_eq!(
+            decide(&auto_disabled, 0, 0, 10, None, None, None).reason_code(),
+            Some(EpgReasonCode::AutoTunerScanDisabled)
+        );
         assert_eq!(
             decide(&config(), 0, 70, 10, None, None, None).reason_code(),
             Some(EpgReasonCode::CpuSoftLimit)
@@ -957,6 +976,7 @@ mod tests {
             EpgScanDecision::SoftCpuLimit,
             EpgScanDecision::AtCapacity,
             EpgScanDecision::Backoff,
+            EpgScanDecision::AutoTunerScanDisabled,
             EpgScanDecision::NotDue,
         ] {
             if let Some(code) = decision.reason_code() {

@@ -165,6 +165,13 @@ singleton global、system preset、scan state/history/retentionの初期行を�
 effective値を作り、API/UIはeffective値とsourceを表示する。現在の永続チューナーidentityは
 既存 `bon_drivers.id`（`/api/tuners/:id`）であり、tuner instance用の新identityは追加しない。
 
+EPG収集には、視聴・録画などで既に開いているチューナーのbroadcastを
+`spawn_si_collector` が購読する受動収集と、schedulerが空きチューナーを新規起動する
+能動収集の2経路がある。`auto_tuner_scan_enabled` は後者だけを制御する。global設定を
+falseにすると能動収集を停止し、受動収集、DB書き込み、番組表配信、履歴掃除は継続する。
+プリセットではNULLがglobal継承、物理チューナー設定ではNULLがプリセット/ global継承となり、
+物理チューナーoverrideで個別に能動収集を停止できる。
+
 設定更新はDBへ直ちに保存され、schedulerは次回評価で再読込する。Active scanは既存readerの
 subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、idle timeout、CPU limit、
 同時数を適用し、開始/完了/失敗をstate/historyへ記録する。EpgWriterのflush後とscheduler

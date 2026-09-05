@@ -19,6 +19,7 @@ mod nodes;
 mod programs;
 mod service;
 mod statics;
+mod system_metrics;
 mod tuners;
 mod update;
 
@@ -35,5 +36,6 @@ pub use nodes::*;
 pub use programs::*;
 pub use service::*;
 pub use statics::*;
+pub use system_metrics::*;
 pub use tuners::*;
 pub use update::*;
