@@ -48,6 +48,7 @@
   --guide-genre-blue-highlight: #4e7ac1; --guide-genre-blue-background: #eff3fb;
   --guide-genre-ochre-highlight: #c59a2f; --guide-genre-ochre-background: #fdf5e2;
   --guide-genre-brown-highlight: #a3421f; --guide-genre-brown-background: #fff2eb;
+  --guide-select: #ff7a00;
 }
 
 * {
@@ -92,6 +93,7 @@ textarea {
   --danger: #ff9b90;
   --success: #6fd3a4;
   --warning: #e8b25a;
+  --guide-select: #ffab3d;
 
   --guide-genre-white-background: #34383e; --guide-genre-pink-background: #422838;
   --guide-genre-red-background: #452b2a; --guide-genre-orange-background: #453525;
@@ -191,6 +193,10 @@ main {
   min-width: 0;
   padding: 24px;
   overflow: auto;
+}
+
+main.main-guide {
+  padding: 8px;
 }
 
 .view {
@@ -595,19 +601,26 @@ textarea:focus-visible,
    本番は放送局が 800 前後 (= 200 列以上) あり、画面に映るのは数列しかない。
    幅・高さは GuideView.vue が端末に応じて算出し、--guide-* のカスタムプロパティで渡す。 */
 .guide-view {
+  /* 高さはフレックスで配る。ツールバーは折り返しで行数が変わるので、
+     固定 px で引くと狭幅で番組表が画面外へはみ出す(実際に起きていた)。
+     ここで引くのはアプリのシェル(トップバー + main の余白)だけ。 */
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   max-width: 100%;
+  height: calc(100dvh - 80px);
+  min-height: 0;
 }
 
 .guide-scroll {
   width: 100%;
   max-width: 100%;
 
-  /* Fill the viewport below the topbar/heading/toolbar chrome (~250px).
-     ここで overflow/height を与えないとスクロールコンテナにならず、
+  /* ここで overflow/height を与えないとスクロールコンテナにならず、
      @scroll が発火しないため可視判定が初期値のまま全番組を DOM に出す。 */
-  height: calc(100dvh - 250px);
-  min-height: 400px;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 240px;
   overflow: auto;
   overscroll-behavior: contain;
   touch-action: pan-x pan-y;
@@ -625,8 +638,8 @@ textarea:focus-visible,
   position: sticky;
   top: 0;
   z-index: 4;
-  background: var(--nav);
-  border-bottom: 1px solid var(--nav2);
+  background: var(--nav2);
+  border-bottom: 2px solid var(--accent);
 }
 
 .guide-corner {
@@ -634,7 +647,8 @@ textarea:focus-visible,
   left: 0;
   z-index: 5;
   height: 100%;
-  background: var(--nav);
+  background: var(--nav2);
+  border-right: 1px solid rgb(255 255 255 / 18%);
 }
 
 .guide-header-cell {
@@ -646,19 +660,49 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
-  padding: 4px;
+  padding: 3px 5px;
   overflow: hidden;
   color: #fff;
   font-weight: 700;
+  border-right: 1px solid rgb(255 255 255 / 14%);
+}
+
+.guide-header-top {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.guide-ch-num {
+  flex: 0 0 auto;
+  min-width: 17px;
+  padding: 0 3px;
+  color: var(--nav2);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 16px;
+  text-align: center;
+  background: #fff;
+  border-radius: 2px;
+}
+
+.guide-ch-name {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .guide-channel-logo {
   flex: 0 0 auto;
-  width: clamp(32px, 30%, 46px);
+  width: clamp(26px, 34%, 38px);
   height: auto;
-  max-height: 31px;
+  max-height: 22px;
   aspect-ratio: 3 / 2;
   object-fit: contain;
   background: var(--soft);
@@ -698,8 +742,15 @@ textarea:focus-visible,
       to bottom,
       transparent 0,
       transparent calc(var(--guide-hour-h) / 2 - 1px),
-      var(--border) calc(var(--guide-hour-h) / 2 - 1px),
-      var(--border) calc(var(--guide-hour-h) / 2)
+      color-mix(in srgb, var(--border) 45%, transparent) calc(var(--guide-hour-h) / 2 - 1px),
+      color-mix(in srgb, var(--border) 45%, transparent) calc(var(--guide-hour-h) / 2)
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      var(--border) 0,
+      var(--border) 1px,
+      transparent 1px,
+      transparent var(--guide-hour-h)
     ),
     repeating-linear-gradient(
       to right,
@@ -714,7 +765,7 @@ textarea:focus-visible,
   position: sticky;
   left: 0;
   z-index: 2;
-  background: var(--guide-time-04);
+  background: color-mix(in srgb, var(--guide-time-04) 68%, #16202e);
   border-right: 1px solid var(--border);
 }
 
@@ -725,39 +776,41 @@ textarea:focus-visible,
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 7px 4px 0;
+  padding: 5px 2px 0;
   color: #fff;
-  font-size: 0.78rem;
-  font-weight: 700;
+  font-size: 0.95rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
-  text-shadow: 0 1px 2px rgb(0 0 0 / 50%);
-  border-top: 1px solid rgb(255 255 255 / 22%);
+  letter-spacing: .02em;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 55%);
+  border-top: 1px solid rgb(255 255 255 / 26%);
 }
 
-.guide-hour-label[data-hour='0'] { background: var(--guide-time-00); }
-.guide-hour-label[data-hour='1'] { background: var(--guide-time-01); }
-.guide-hour-label[data-hour='2'] { background: var(--guide-time-02); }
-.guide-hour-label[data-hour='3'] { background: var(--guide-time-03); }
-.guide-hour-label[data-hour='4'] { background: var(--guide-time-04); }
-.guide-hour-label[data-hour='5'] { background: var(--guide-time-05); }
-.guide-hour-label[data-hour='6'] { background: var(--guide-time-06); }
-.guide-hour-label[data-hour='7'] { background: var(--guide-time-07); }
-.guide-hour-label[data-hour='8'] { background: var(--guide-time-08); }
-.guide-hour-label[data-hour='9'] { background: var(--guide-time-09); }
-.guide-hour-label[data-hour='10'] { background: var(--guide-time-10); }
-.guide-hour-label[data-hour='11'] { background: var(--guide-time-11); }
-.guide-hour-label[data-hour='12'] { background: var(--guide-time-12); }
-.guide-hour-label[data-hour='13'] { background: var(--guide-time-13); }
-.guide-hour-label[data-hour='14'] { background: var(--guide-time-14); }
-.guide-hour-label[data-hour='15'] { background: var(--guide-time-15); }
-.guide-hour-label[data-hour='16'] { background: var(--guide-time-16); }
-.guide-hour-label[data-hour='17'] { background: var(--guide-time-17); }
-.guide-hour-label[data-hour='18'] { background: var(--guide-time-18); }
-.guide-hour-label[data-hour='19'] { background: var(--guide-time-19); }
-.guide-hour-label[data-hour='20'] { background: var(--guide-time-20); }
-.guide-hour-label[data-hour='21'] { background: var(--guide-time-21); }
-.guide-hour-label[data-hour='22'] { background: var(--guide-time-22); }
-.guide-hour-label[data-hour='23'] { background: var(--guide-time-23); }
+.guide-hour-label[data-hour='0'] { background: color-mix(in srgb, var(--guide-time-00) 68%, #16202e); }
+.guide-hour-label[data-hour='1'] { background: color-mix(in srgb, var(--guide-time-01) 68%, #16202e); }
+.guide-hour-label[data-hour='2'] { background: color-mix(in srgb, var(--guide-time-02) 68%, #16202e); }
+.guide-hour-label[data-hour='3'] { background: color-mix(in srgb, var(--guide-time-03) 68%, #16202e); }
+.guide-hour-label[data-hour='4'] { background: color-mix(in srgb, var(--guide-time-04) 68%, #16202e); }
+.guide-hour-label[data-hour='5'] { background: color-mix(in srgb, var(--guide-time-05) 68%, #16202e); }
+.guide-hour-label[data-hour='6'] { background: color-mix(in srgb, var(--guide-time-06) 68%, #16202e); }
+.guide-hour-label[data-hour='7'] { background: color-mix(in srgb, var(--guide-time-07) 68%, #16202e); }
+.guide-hour-label[data-hour='8'] { background: color-mix(in srgb, var(--guide-time-08) 68%, #16202e); }
+.guide-hour-label[data-hour='9'] { background: color-mix(in srgb, var(--guide-time-09) 68%, #16202e); }
+.guide-hour-label[data-hour='10'] { background: color-mix(in srgb, var(--guide-time-10) 68%, #16202e); }
+.guide-hour-label[data-hour='11'] { background: color-mix(in srgb, var(--guide-time-11) 68%, #16202e); }
+.guide-hour-label[data-hour='12'] { background: color-mix(in srgb, var(--guide-time-12) 68%, #16202e); }
+.guide-hour-label[data-hour='13'] { background: color-mix(in srgb, var(--guide-time-13) 68%, #16202e); }
+.guide-hour-label[data-hour='14'] { background: color-mix(in srgb, var(--guide-time-14) 68%, #16202e); }
+.guide-hour-label[data-hour='15'] { background: color-mix(in srgb, var(--guide-time-15) 68%, #16202e); }
+.guide-hour-label[data-hour='16'] { background: color-mix(in srgb, var(--guide-time-16) 68%, #16202e); }
+.guide-hour-label[data-hour='17'] { background: color-mix(in srgb, var(--guide-time-17) 68%, #16202e); }
+.guide-hour-label[data-hour='18'] { background: color-mix(in srgb, var(--guide-time-18) 68%, #16202e); }
+.guide-hour-label[data-hour='19'] { background: color-mix(in srgb, var(--guide-time-19) 68%, #16202e); }
+.guide-hour-label[data-hour='20'] { background: color-mix(in srgb, var(--guide-time-20) 68%, #16202e); }
+.guide-hour-label[data-hour='21'] { background: color-mix(in srgb, var(--guide-time-21) 68%, #16202e); }
+.guide-hour-label[data-hour='22'] { background: color-mix(in srgb, var(--guide-time-22) 68%, #16202e); }
+.guide-hour-label[data-hour='23'] { background: color-mix(in srgb, var(--guide-time-23) 68%, #16202e); }
 
 .guide-col {
   position: absolute;
@@ -790,7 +843,7 @@ textarea:focus-visible,
 }
 
 .guide-cell-highlight {
-  flex: 0 0 5px;
+  flex: 0 0 4px;
   background: var(--guide-genre-highlight);
 }
 
@@ -799,19 +852,49 @@ textarea:focus-visible,
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  padding: 2px 4px;
+  padding: 1px 3px;
   overflow: hidden;
 }
 
-.guide-cell:hover,
-.guide-cell:focus-visible {
+.guide-cell-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+}
+
+.guide-cell-onair {
+  z-index: 2;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+
+.guide-cell-onair .guide-cell-time::before {
+  margin-right: 2px;
+  content: '●';
+  color: var(--danger);
+  font-size: 8px;
+  vertical-align: middle;
+}
+
+.guide-cell:hover {
   z-index: 5;
   box-shadow: 0 2px 8px rgb(0 0 0 / 25%);
 }
 
-.guide-cell-onair {
-  z-index: 3;
-  border: 2px solid var(--danger);
+.guide-cell:focus-visible {
+  z-index: 7;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 選択枠はフォーカス枠より後・高い詳細度で書く。同じ outline を奪い合うので、
+   先に置くとクリック直後(フォーカスも当たっている状態)で青が勝ち、
+   「いま選んでいる番組」が分からなくなる。 */
+.guide-cell.guide-cell-selected {
+  z-index: 8;
+  outline: 3px solid var(--guide-select);
+  outline-offset: -3px;
 }
 
 .guide-cell-past {
@@ -820,10 +903,11 @@ textarea:focus-visible,
 
 .guide-cell strong,
 .guide-untitled {
-  flex-shrink: 0;
+  min-width: 0;
+  flex: 1 1 auto;
   font-size: 12px;
   font-weight: 700;
-  line-height: 1.3;
+  line-height: 1.25;
   word-break: break-all;
 }
 
@@ -833,19 +917,21 @@ textarea:focus-visible,
 }
 
 .guide-cell-time {
-  flex-shrink: 0;
+  flex: 0 0 auto;
   color: var(--guide-cell-text);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.1;
+  font-size: 12px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
 }
 
 .guide-cell-description {
   flex-grow: 1;
   flex-shrink: 1;
   min-height: 0;
-  margin-top: 2px;
+  margin-top: 1px;
   overflow: hidden;
+  color: color-mix(in srgb, var(--guide-cell-text) 68%, transparent);
   font-size: 11px;
   line-height: 1.4;
   word-break: break-all;
@@ -856,6 +942,7 @@ textarea:focus-visible,
     content-visibility: auto;
     contain-intrinsic-size: 0 60px;
   }
+
   .guide-cell-description {
     display: none;
   }
@@ -864,17 +951,21 @@ textarea:focus-visible,
 @media (max-width: 700px) {
   .guide-scroll {
     max-width: 100vw;
-    height: calc(100dvh - 210px);
     min-height: 320px;
   }
 
+  .guide-view {
+    /* 狭幅は横並びナビ(sticky)ぶんも引く。 */
+    height: calc(100dvh - 124px);
+  }
+
   .guide-header-cell {
-    padding: 6px;
+    padding: 3px 4px;
   }
 
   .guide-hour-label {
-    padding: 2px 4px;
-    font-size: 0.66rem;
+    padding: 3px 2px 0;
+    font-size: .8rem;
   }
 
   .guide-cell {
@@ -1590,12 +1681,18 @@ textarea:focus-visible,
 }
 
 /* EPG program guide */
-.guide-toolbar {
+.guide-topbar {
   display: flex;
   flex-wrap: wrap;
-  align-items: end;
-  gap: 16px;
-  margin-bottom: 16px;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.guide-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
 }
 
 .guide-date-nav {
@@ -1604,26 +1701,144 @@ textarea:focus-visible,
   gap: 6px;
 }
 
-.guide-date-nav input[type='date'] {
-  min-height: 44px;
-  padding: 6px 8px;
+.guide-icon-button,
+.guide-chip-button,
+.guide-band-tab {
+  min-height: 30px;
+  padding: 4px 9px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.guide-icon-button {
+  min-width: 30px;
+  padding: 4px;
+}
+
+.guide-chip-button.active,
+.guide-band-tab.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.guide-date-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 4px;
 }
 
-.guide-band-filter,
+.guide-date-label {
+  padding: 4px 9px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.guide-date-picker input[type='date'] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.guide-date-picker:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.guide-band-tabs {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.guide-band-tab {
+  border: 0;
+  border-radius: 0;
+}
+
+.guide-band-tab + .guide-band-tab {
+  border-left: 1px solid var(--border);
+}
+
 .guide-region-filter,
 .guide-service-search {
+  display: block;
+  flex: 0 1 150px;
+  min-width: 0;
   margin: 0;
-  min-width: 200px;
 }
 
-.guide-cell-time {
-  color: var(--guide-cell-text, var(--text));
-  font-size: 11px;
-  font-weight: 700;
+.guide-region-filter select,
+.guide-service-search input {
+  width: 100%;
+  min-width: 0;
+  max-width: 150px;
+  height: 30px;
+  padding: 4px 7px;
+  color: var(--text);
+  font-size: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.guide-topbar-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.guide-actionbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  margin-top: 6px;
+  padding: 0 2px;
+}
+
+.guide-actionbar-selected {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guide-chip-button:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: .55;
+}
+
+.guide-icon-button:focus-visible,
+.guide-chip-button:focus-visible,
+.guide-band-tab:focus-visible,
+:where(.guide-region-filter select:focus-visible, .guide-service-search input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* 列 (.guide-col, z-index 1) より上、ヘッダー行 (z-index 4) より下に引く。
@@ -1634,8 +1849,29 @@ textarea:focus-visible,
   right: 0;
   z-index: 3;
   height: 2px;
+  pointer-events: none;
   background: var(--danger);
   box-shadow: 0 0 4px color-mix(in srgb, var(--danger) 70%, transparent);
+}
+
+.guide-now-badge {
+  position: absolute;
+  top: -9px;
+  left: 4px;
+  padding: 0 5px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+  white-space: nowrap;
+  background: var(--danger);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.app.dark .guide-now-badge {
+  color: #1b1010;
 }
 
 .guide-now-line::before {
@@ -1717,33 +1953,80 @@ textarea:focus-visible,
 }
 
 @media (max-width: 700px) {
-  /* 320px 端末では、見出しの説明文と縦積みのフィルタだけで 460px 使い切り、
-     グリッドが画面外(y=598 / 表示領域 568px)へ完全に出ていた。
-     説明文を畳み、フィルタは 2 列で折り返して表の位置を上へ引き上げる。 */
-  .guide-view .view-heading p {
+  main.main-guide {
+    padding: 6px;
+  }
+
+  .guide-actionbar {
+    gap: 4px;
+    margin-top: 4px;
+  }
+
+  .guide-actionbar-selected {
+    flex: 1 1 100%;
+    order: -1;
+  }
+
+  .guide-topbar {
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+
+  /* 見出しはナビのタブ名と重複する。狭幅では番組表に高さを譲る。 */
+  .guide-title {
     display: none;
   }
 
-  .guide-toolbar {
-    flex-flow: row wrap;
-    gap: 8px;
-    margin-bottom: 8px;
-  }
-
+  /* 1行目に日付操作と更新、2行目に放送種別、3行目に地域と検索。
+     order を与えないと更新が最終行へ弾かれ、番組表が 1 行ぶん下がる。 */
   .guide-date-nav {
-    flex: 1 1 100%;
+    order: -2;
+    flex: 1 1 auto;
   }
 
-  .guide-band-filter,
-  .guide-region-filter {
-    flex: 1 1 130px;
-    min-width: 0;
+  .guide-topbar-actions {
+    order: -1;
+    flex: 0 0 auto;
+    margin-left: auto;
   }
 
+  /* 地域と検索は 2 列に並べる (縦積みだと番組表の開始位置が 100px 下がる)。 */
+  .guide-region-filter,
   .guide-service-search {
-    flex: 1 1 100%;
+    flex: 1 1 calc(50% - 3px);
     min-width: 0;
   }
+
+  .guide-icon-button,
+  .guide-chip-button,
+  .guide-band-tab {
+    min-height: 40px;
+  }
+
+  .guide-date-picker {
+    min-height: 40px;
+  }
+
+  .guide-band-tabs {
+    flex: 1 1 100%;
+  }
+
+  .guide-band-tab {
+    flex: 1 1 130px;
+  }
+
+  .guide-actionbar .guide-chip-button {
+    flex: 1 1 0;
+    min-height: 40px;
+  }
+
+  .guide-region-filter select,
+  .guide-service-search input {
+    max-width: none;
+    min-height: 40px;
+    height: 40px;
+  }
+
 }
 
 /* フォーム項目の補足説明。設定の意味が名前だけでは伝わらないもの

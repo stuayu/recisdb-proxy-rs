@@ -17,10 +17,10 @@ const NARROW_MEDIA_QUERY = '(max-width: 700px)'
 const PX_PER_MIN_DESKTOP = 3
 const PX_PER_MIN_TABLET = 2.5
 const PX_PER_MIN_NARROW = 2
-const COLUMN_WIDTH_DESKTOP = 150
-const COLUMN_WIDTH_TABLET = 120
-const COLUMN_WIDTH_NARROW = 100
-const AXIS_WIDTH_DESKTOP = 50
+const COLUMN_WIDTH_DESKTOP = 130
+const COLUMN_WIDTH_TABLET = 116
+const COLUMN_WIDTH_NARROW = 96
+const AXIS_WIDTH_DESKTOP = 44
 const AXIS_WIDTH_NARROW = 30
 const CHANNEL_PAGE_SIZE = 120
 const PROGRAM_WINDOW_BEFORE_SECS = 60 * 60
@@ -100,6 +100,7 @@ type GuideColumn = {
   nid: number
   tsid: number
   sid: number
+  remoteControlKey: number | null
   items: RenderItem[]
 }
 const BAND_ORDER: Record<BandCategory, number> = {
@@ -173,6 +174,8 @@ const regionFilter = ref('すべて')
 const serviceQuery = ref('')
 const now = ref(Date.now())
 const detail = ref<Program | null>(null)
+const selected = ref<{ columnIndex: number; programId: number } | null>(null)
+const selectedProgram = ref<Program | null>(null)
 const previewProgram = ref<Program | null>(null)
 const scrollArea = ref<HTMLElement | null>(null)
 const isNarrow = ref(false)
@@ -194,7 +197,8 @@ const pxPerMin = computed(() =>
 const columnWidth = computed(() =>
   isNarrow.value ? COLUMN_WIDTH_NARROW : isTablet.value ? COLUMN_WIDTH_TABLET : COLUMN_WIDTH_DESKTOP,
 )
-const headerHeight = computed(() => Math.max(50, Math.round(Math.min(46, Math.max(32, columnWidth.value * 0.3)) * (2 / 3) + 20)))
+/** チャンネルヘッダー行の高さ。リモコン番号+ロゴ+局名の2段が収まる最小値。 */
+const headerHeight = computed(() => (isNarrow.value ? 44 : 54))
 const axisWidth = computed(() => (isNarrow.value ? AXIS_WIDTH_NARROW : AXIS_WIDTH_DESKTOP))
 const totalHeight = computed(() => TOTAL_MINUTES * pxPerMin.value)
 const visibleBufferPx = computed(
@@ -213,7 +217,16 @@ const gridBounds = computed(() => {
   return { since, until: since + TOTAL_MINUTES * 60 }
 })
 const isToday = computed(() => selectedDate.value === fmtDateInput(new Date()))
+const BAND_TABS = ['地上', 'BS', 'CS', 'すべて'] as const
+const WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土']
+
+const dateLabel = computed(() => {
+  const [y, m, d] = selectedDate.value.split('-').map(Number)
+  const date = new Date(y, m - 1, d)
+  return `${m}/${d}(${WEEKDAYS[date.getDay()]})`
+})
 const nowOffset = computed(() => ((now.value / 1000 - gridBounds.value.since) / 60) * pxPerMin.value)
+const nowLabel = computed(() => fmtTime(Math.floor(now.value / 1000)))
 const showNowLine = computed(
   () => isToday.value && nowOffset.value >= 0 && nowOffset.value <= totalHeight.value,
 )
@@ -222,6 +235,7 @@ const hourMarks = computed(() =>
     offset: index * 60 * pxPerMin.value,
     hour: (GRID_START_HOUR + index) % 24,
     label: `${String((GRID_START_HOUR + index) % 24).padStart(2, '0')}:00`,
+    hourLabel: String((GRID_START_HOUR + index) % 24).padStart(2, '0'),
   })),
 )
 
@@ -628,6 +642,7 @@ const columns = computed<GuideColumn[]>(() => {
       nid: main.nid,
       tsid: main.tsid,
       sid: main.sid,
+      remoteControlKey: main.remoteControlKey,
       items,
     })
   }
@@ -654,6 +669,93 @@ function visibleItems(column: GuideColumn): RenderItem[] {
   }
   return result
 }
+/** セルを選ぶ。列の添字を持っておくと左右移動が O(1) で決まる。 */
+function selectProgram(columnIndex: number, program: Program): void {
+  selected.value = { columnIndex, programId: program.id }
+  selectedProgram.value = program
+}
+
+/** 列の中で、指定した時刻を含む(なければ直後の)番組を返す。items は top 昇順。 */
+function itemNearTime(column: GuideColumn, startAt: number): Program | null {
+  let candidate: Program | null = null
+  for (const item of column.items) {
+    if (item.program.start_at <= startAt) candidate = item.program
+    else if (candidate === null) return item.program
+    else break
+  }
+  return candidate
+}
+
+/** 選択中セルが可視範囲に入るまでスクロールする。DOM 計測はせず、事前計算した top を使う。 */
+function revealSelected(columnIndex: number, program: Program): void {
+  const element = scrollArea.value
+  if (element === null) return
+  const top = Math.max(0, (program.start_at - gridBounds.value.since) / 60) * pxPerMin.value
+  const header = headerHeight.value
+  const viewTop = element.scrollTop
+  const viewBottom = viewTop + element.clientHeight - header
+  if (top < viewTop) element.scrollTop = Math.max(0, top - 40)
+  else if (top + 40 > viewBottom) element.scrollTop = top - element.clientHeight + header + 80
+  const left = axisWidth.value + columnIndex * columnWidth.value
+  if (left < element.scrollLeft + axisWidth.value) element.scrollLeft = Math.max(0, left - axisWidth.value)
+  else if (left + columnWidth.value > element.scrollLeft + element.clientWidth) {
+    element.scrollLeft = left + columnWidth.value - element.clientWidth
+  }
+  pendingScrollTop = element.scrollTop
+  pendingScrollLeft = element.scrollLeft
+  scheduleScrollUpdate()
+}
+
+function moveSelection(dx: number, dy: number): void {
+  const all = columns.value
+  if (all.length === 0) return
+  const current = selected.value
+  if (current === null) {
+    const column = all[Math.max(0, visibleColumnStart.value)]
+    const first = column?.items[0]?.program
+    if (first) {
+      selectProgram(Math.max(0, visibleColumnStart.value), first)
+      revealSelected(Math.max(0, visibleColumnStart.value), first)
+    }
+    return
+  }
+  const columnIndex = Math.min(Math.max(current.columnIndex + dx, 0), all.length - 1)
+  const column = all[columnIndex]
+  if (column === undefined) return
+  if (dx !== 0) {
+    const anchor = selectedProgram.value?.start_at ?? gridBounds.value.since
+    const next = itemNearTime(column, anchor)
+    if (next === null) return
+    selectProgram(columnIndex, next)
+    revealSelected(columnIndex, next)
+    return
+  }
+  const at = column.items.findIndex((item) => item.program.id === current.programId)
+  if (at < 0) return
+  const target = column.items[at + dy]
+  if (target === undefined) return
+  selectProgram(columnIndex, target.program)
+  revealSelected(columnIndex, target.program)
+}
+
+function onGridKeydown(event: KeyboardEvent): void {
+  if (detail.value !== null || previewProgram.value !== null) return
+  const target = event.target
+  // 検索欄など、入力中のキー操作は奪わない。
+  if (target instanceof HTMLElement && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) return
+  switch (event.key) {
+    case 'ArrowUp': moveSelection(0, -1); break
+    case 'ArrowDown': moveSelection(0, 1); break
+    case 'ArrowLeft': moveSelection(-1, 0); break
+    case 'ArrowRight': moveSelection(1, 0); break
+    case 'Enter':
+      if (selectedProgram.value !== null) openDetail(selectedProgram.value)
+      else return
+      break
+    default: return
+  }
+  event.preventDefault()
+}
 function shiftDate(days: number) {
   const [y, m, d] = selectedDate.value.split('-').map(Number)
   const date = new Date(y, m - 1, d)
@@ -662,6 +764,22 @@ function shiftDate(days: number) {
 }
 function goToday() {
   selectedDate.value = fmtDateInput(new Date())
+}
+/** 今日へ移動し、現在時刻がビューポート中央付近に来るまで縦スクロールする。 */
+function scrollToNow() {
+  // 日付が変わる場合は watch(selectedDate) → loadPrograms → loadInitialPrograms が
+  // 現在時刻付近まで寄せるので、ここでは日付を変えるだけにする。
+  if (!isToday.value) {
+    goToday()
+    return
+  }
+  void nextTick().then(() => {
+    const element = scrollArea.value
+    if (element === null) return
+    element.scrollTop = Math.max(0, nowOffset.value - element.clientHeight * 0.4 + headerHeight.value)
+    pendingScrollTop = element.scrollTop
+    resizeGrid()
+  })
 }
 function openDetail(program: Program) {
   detail.value = program
@@ -695,7 +813,11 @@ function closePreview() {
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (previewProgram.value) closePreview()
-  else closeDetail()
+  else if (detail.value) closeDetail()
+  else {
+    selected.value = null
+    selectedProgram.value = null
+  }
 }
 watch(selectedDate, () => void loadPrograms())
 // 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
@@ -722,48 +844,49 @@ onUnmounted(() => {
 
 <template>
   <section class="view guide-view">
-    <div class="view-heading">
-      <div>
-        <h2>番組表</h2>
-        <p>視聴中チューナーが収集したEPGデータを表示します（歯抜けは正常です）</p>
-      </div>
-      <button class="button secondary" @click="refresh" v-text="loading ? '更新中…' : '更新'" />
-    </div>
-    <div class="guide-toolbar">
+    <div class="guide-topbar">
+      <h2 class="guide-title">番組表</h2>
       <div class="guide-date-nav">
-        <button class="button small secondary" aria-label="前日" @click="shiftDate(-1)">◀</button
-        ><button class="button small secondary" @click="goToday">今日</button
-        ><button class="button small secondary" aria-label="翌日" @click="shiftDate(1)">▶</button
-        ><input v-model="selectedDate" type="date" aria-label="日付を選択" />
+        <button class="guide-icon-button" aria-label="前日" @click="shiftDate(-1)">◀</button>
+        <div class="guide-date-picker">
+          <span class="guide-date-label" aria-hidden="true" v-text="dateLabel" />
+          <input v-model="selectedDate" type="date" aria-label="日付を選択" />
+        </div>
+        <button class="guide-icon-button" aria-label="翌日" @click="shiftDate(1)">▶</button>
+        <button class="guide-chip-button" :class="{ active: isToday }" @click="goToday">今日</button>
       </div>
-      <label class="field guide-band-filter"
-        ><span>放送種別</span
-        ><select v-model="bandFilter">
-          <option value="すべて">すべて</option>
-          <option value="地上">地上波</option>
-          <option value="BS">BS</option>
-          <option value="CS">CS</option>
-        </select></label
-      ><label class="field guide-region-filter"
-        ><span>地域（地上）</span
-        ><select v-model="regionFilter" :disabled="!regionOptions.length">
+      <div class="guide-band-tabs" role="group" aria-label="放送種別">
+        <button
+          v-for="tab in BAND_TABS"
+          :key="tab"
+          type="button"
+          class="guide-band-tab"
+          :class="{ active: bandFilter === tab }"
+          :aria-pressed="bandFilter === tab"
+          @click="bandFilter = tab"
+          v-text="tab === '地上' ? '地上' : tab"
+        />
+      </div>
+      <label class="guide-region-filter">
+        <span class="visually-hidden">地域（地上）</span>
+        <select v-model="regionFilter" :disabled="!regionOptions.length">
           <option value="すべて">すべての地域</option>
-          <option
-            v-for="region in regionOptions"
-            :key="region"
-            :value="region"
-            v-text="region"
-          /></select></label
-      ><label class="search guide-service-search"
-        ><span>サービス絞り込み</span
-        ><input v-model="serviceQuery" type="search" placeholder="チャンネル名、NID、SID"
-      /></label>
+          <option v-for="region in regionOptions" :key="region" :value="region" v-text="region" />
+        </select>
+      </label>
+      <label class="guide-service-search">
+        <span class="visually-hidden">サービス絞り込み</span>
+        <input v-model="serviceQuery" type="search" placeholder="局名 / NID / SID" />
+      </label>
+      <div class="guide-topbar-actions">
+        <button class="guide-chip-button" @click="refresh" v-text="loading ? '更新中…' : '更新'" />
+      </div>
     </div>
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <p v-if="!rawPrograms.length && !loading" class="empty-state">
       番組情報がありません。番組情報は視聴中のチャンネルから自動収集されます。
     </p>
-    <div v-else ref="scrollArea" class="guide-scroll" @scroll.passive="onScroll">
+    <div v-else ref="scrollArea" class="guide-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <div
         class="guide-grid"
         :style="{
@@ -781,6 +904,12 @@ onUnmounted(() => {
             class="guide-header-cell"
             :style="{ left: `${axisWidth + entry.index * columnWidth}px`, width: `${columnWidth}px` }"
           >
+            <div class="guide-header-top">
+              <span
+                v-if="entry.column.remoteControlKey !== null"
+                class="guide-ch-num"
+                v-text="entry.column.remoteControlKey"
+              />
             <img
               v-if="logoSrc(entry.column)"
               class="guide-channel-logo"
@@ -789,7 +918,9 @@ onUnmounted(() => {
               :src="logoSrc(entry.column)"
               :alt="entry.column.name"
               @error="onLogoError(entry.column)"
-            /><span v-text="entry.column.name" /><small
+            />
+            </div>
+            <span class="guide-ch-name" v-text="entry.column.name" /><small
               v-if="entry.column.subLabel"
               v-text="entry.column.subLabel"
             />
@@ -800,18 +931,18 @@ onUnmounted(() => {
           <div class="guide-timeaxis" :style="{ width: `${axisWidth}px`, height: `${totalHeight}px` }">
             <div
               v-for="mark in hourMarks"
-              :key="mark.label"
+              :key="mark.offset"
               class="guide-hour-label"
               :style="{ top: `${mark.offset}px` }"
               :data-hour="mark.hour"
-              v-text="mark.label"
+              v-text="mark.hourLabel"
             />
           </div>
           <div
             v-if="showNowLine"
             class="guide-now-line"
             :style="{ top: `${nowOffset}px`, left: `${axisWidth}px` }"
-          />
+          ><span class="guide-now-badge" v-text="nowLabel" /></div>
           <div
             v-for="entry in visibleColumns"
             :key="`c-${entry.column.key}`"
@@ -827,17 +958,24 @@ onUnmounted(() => {
               :key="item.program.id"
               type="button"
               class="guide-cell"
-              :class="{ 'guide-cell-past': isPast(item.program), 'guide-cell-onair': isOnAir(item.program) }"
+              :class="{
+                'guide-cell-past': isPast(item.program),
+                'guide-cell-onair': isOnAir(item.program),
+                'guide-cell-selected': selected?.programId === item.program.id,
+              }"
               :aria-label="item.program.name || '番組名なし'"
+              :aria-current="isOnAir(item.program) ? 'true' : undefined"
               :style="item.style"
-              @click="openDetail(item.program)"
+              @click="selectProgram(entry.index, item.program); openDetail(item.program)"
             >
               <span class="guide-cell-highlight" aria-hidden="true" /><div class="guide-cell-content">
-                <span class="guide-cell-time" v-text="fmtMinute(item.program.start_at)" />
-                <strong v-if="item.program.name" v-text="item.program.name" /><span
-                v-else
-                class="guide-untitled"
-                >番組名なし</span><span
+                <span class="guide-cell-head">
+                  <span class="guide-cell-time" v-text="fmtMinute(item.program.start_at)" /><strong
+                    v-if="item.program.name"
+                    v-text="item.program.name"
+                  /><span v-else class="guide-untitled">番組名なし</span>
+                </span>
+                <span
                 v-if="item.program.description"
                 class="guide-cell-description"
                 v-text="item.program.description"
@@ -847,6 +985,27 @@ onUnmounted(() => {
         </div>
       </div>
       <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
+    </div>
+    <div class="guide-actionbar">
+      <span
+        class="guide-actionbar-selected"
+        v-text="selectedProgram ? (selectedProgram.name || '番組名なし') : '番組を選ぶと詳細・視聴できます'"
+      />
+      <button
+        class="guide-chip-button"
+        :disabled="selectedProgram === null"
+        @click="selectedProgram && openDetail(selectedProgram)"
+      >
+        番組詳細
+      </button>
+      <button
+        class="guide-chip-button"
+        :disabled="selectedProgram === null"
+        @click="selectedProgram && openPreview(selectedProgram)"
+      >
+        視聴
+      </button>
+      <button class="guide-chip-button" @click="scrollToNow">現在時刻へ</button>
     </div>
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">
       <section

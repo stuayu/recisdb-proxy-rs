@@ -434,7 +434,7 @@ onUnmounted(() => {
           <span v-text="tab.label" />
         </button>
       </nav>
-      <main id="main" tabindex="-1">
+      <main id="main" tabindex="-1" :class="{ 'main-guide': active === 'guide' }">
         <OverviewView v-if="active === 'overview'" />
         <BonDriversView v-else-if="active === 'bondrivers'" />
         <ChannelsView v-else-if="active === 'channels'" />

@@ -12,6 +12,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "qa:responsive": "node scripts/responsive-check.mjs",
+    "qa:guide": "node scripts/guide-verify.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
