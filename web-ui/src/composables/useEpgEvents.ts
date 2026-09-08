@@ -112,6 +112,24 @@ export function epgStatusPresentation(
   return { kind: 'complete', label: '取得済み', text: `${coverageText}取得済み / ${ageText(state.last_complete_at, now)}` }
 }
 
+/**
+ * 「接続できた」だけではバックオフを戻さない。SSE を通さないリバースプロキシや、
+ * `/api/epg/events` に非ストリームの 200 を返す構成に当たると、
+ * 接続直後に本文が終端して再接続 → onReconnect で全件再取得、が毎秒繰り返される。
+ * 2万件の再取得と再描画が走り続けて番組表の選択が飛ぶ。
+ * 少なくともこの時間だけ繋がり続けたか、1フレームでも受け取れたときにだけ
+ * 「安定した接続」とみなして待ち時間を初期値へ戻す。
+ */
+const STABLE_CONNECTION_MS = 5000
+
+/**
+ * 接続をバックオフのリセットに値する「安定した接続」と数えてよいか。
+ * 純関数にして、切断ループでバックオフが戻らないことをテストできるようにする。
+ */
+export function isStableConnection(startedAt: number, endedAt: number, receivedFrame: boolean): boolean {
+  return receivedFrame || endedAt - startedAt >= STABLE_CONNECTION_MS
+}
+
 type EpgEventsOptions = {
   onProgram: (event: EpgProgramEvent) => void
   onLagged: () => void
@@ -167,12 +185,16 @@ export function useEpgEvents(options: EpgEventsOptions) {
     const headers = new Headers({ Accept: 'text/event-stream' })
     const token = localStorage.getItem('recisdbApiToken')
     if (token) headers.set('Authorization', `Bearer ${token}`)
+    const startedAt = Date.now()
+    let receivedFrame = false
     try {
       const response = await fetch('/api/epg/events', { headers, signal: currentController.signal })
       if (!response.ok || !response.body) throw new Error(`SSE ${response.status}`)
+      // ストリームでない 200 を「接続成功」と数えない。
+      const contentType = response.headers.get('Content-Type') ?? ''
+      if (!contentType.includes('text/event-stream')) throw new Error(`SSE content-type ${contentType}`)
       const wasConnected = connected
       connected = true
-      retryDelay = 1000
       if (wasConnected) options.onReconnect()
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -180,6 +202,7 @@ export function useEpgEvents(options: EpgEventsOptions) {
       while (!currentController.signal.aborted) {
         const result = await reader.read()
         if (result.done) break
+        receivedFrame = true
         buffer += decoder.decode(result.value, { stream: true })
         const frames = buffer.split('\n\n')
         buffer = frames.pop() ?? ''
@@ -188,6 +211,7 @@ export function useEpgEvents(options: EpgEventsOptions) {
     } catch {
       // abort と一時的な切断は同じ再接続経路へ送る。
     } finally {
+      if (isStableConnection(startedAt, Date.now(), receivedFrame)) retryDelay = 1000
       if (!stopped && !currentController.signal.aborted) schedule()
     }
   }
