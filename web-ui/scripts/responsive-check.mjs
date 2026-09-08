@@ -1,6 +1,6 @@
 import { mkdir, readFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { createServer } from 'node:http'
+import { extname, join, resolve } from 'node:path'
 import { chromium } from '@playwright/test'
 
 const root = resolve(process.cwd(), '../recisdb-proxy/static/vue')
@@ -71,10 +71,39 @@ try {
   process.exitCode = 1
   process.exit()
 }
+/* index.html は /static/vue/assets/* を絶対パスで読む。file:// だと CORS で
+   スクリプトごと読めず「空ページを測って合格」になっていたため、HTTP で配る。 */
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png' }
+const server = createServer(async (req, res) => {
+  const path = new URL(req.url, 'http://localhost').pathname
+  const file =
+    path === '/'
+      ? join(root, 'index.html')
+      : path.startsWith('/static/vue/')
+        ? join(root, path.slice('/static/vue/'.length))
+        : null
+  if (file === null) {
+    res.writeHead(404)
+    res.end()
+    return
+  }
+  try {
+    const body = await readFile(file)
+    res.writeHead(200, { 'Content-Type': MIME[extname(file)] ?? 'application/octet-stream' })
+    res.end(body)
+  } catch {
+    res.writeHead(404)
+    res.end()
+  }
+})
+await new Promise((done) => server.listen(0, '127.0.0.1', done))
+const origin = `http://127.0.0.1:${server.address().port}/`
+
 const tabs = [
   'overview',
   'bondrivers',
   'channels',
+  'guide',
   'client-guide',
   'scan-history',
   'session-history',
@@ -104,7 +133,7 @@ try {
         })
       }
     }, mockJson)
-    await page.goto(pathToFileURL(join(root, 'index.html')).href, { waitUntil: 'load' })
+    await page.goto(origin, { waitUntil: 'load' })
     for (const tab of tabs) {
       await page.evaluate((id) => {
         location.hash = id
@@ -114,7 +143,14 @@ try {
         viewport: document.documentElement.clientWidth,
         body: document.body.scrollWidth,
         root: document.documentElement.scrollWidth,
+        booted: document.querySelector('.app .nav-item') !== null,
       }))
+      // かつて file:// 配信でスクリプトが CORS に阻まれ、空ページの幅を測って
+      // 「合格」していた。アプリが起動していることを先に確かめる。
+      if (!metrics.booted) {
+        failures.push({ viewport: viewport.name, tab, reason: 'アプリが起動していない' })
+        continue
+      }
       if (metrics.body > metrics.viewport + 1 || metrics.root > metrics.viewport + 1) {
         failures.push({ viewport: viewport.name, tab, ...metrics })
       }
@@ -124,6 +160,7 @@ try {
   }
 } finally {
   await browser.close()
+  server.close()
 }
 
 if (failures.length) {
