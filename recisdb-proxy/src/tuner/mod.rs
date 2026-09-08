@@ -10,6 +10,7 @@ pub mod channel_key;
 pub mod claim;
 pub mod encoder_pool;
 pub mod epg_collector;
+pub mod epg_coverage_flusher;
 pub mod epg_progress;
 pub mod lock;
 pub mod logo_collector;

@@ -21,7 +21,7 @@
 //! helpers in `pool.rs`/`encoder_pool.rs`/`stream.rs`/`shared.rs`).
 //!
 //! Instead this collector only *parses* and forwards results through a
-//! process-wide unbounded channel, installed once at server startup
+//! process-wide bounded channel, installed once at server startup
 //! (`main.rs`, via `EpgWriter::new`) and consumed by a dedicated batching
 //! task (`crate::epg_writer::EpgWriter`) that owns the shared `Database`
 //! handle. When no writer has installed a sender yet (unit tests, or the
@@ -29,11 +29,13 @@
 //! silently dropped — the same "best effort" fallback the logo collector
 //! uses when it cannot create its output directory.
 
-use log::{debug, trace};
+use log::{trace, warn};
 use tokio::sync::mpsc;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::database::{EpgSource, ProgramUpsert};
 use crate::ts_analyzer::{
@@ -43,14 +45,58 @@ use crate::tuner::epg_progress::EpgProgress;
 
 const MAX_PENDING_TS: usize = TS_PACKET_SIZE * 3;
 
+/// 8192 rows are enough for a several-mux burst while keeping queued strings
+/// bounded to roughly the low tens of MiB in the worst case.
+pub const EPG_CHANNEL_CAPACITY: usize = 8192;
+
 /// Process-wide sender for parsed EPG rows. See module doc comment.
-static EPG_SENDER: OnceLock<mpsc::UnboundedSender<ProgramUpsert>> = OnceLock::new();
+static EPG_SENDER: OnceLock<mpsc::Sender<ProgramUpsert>> = OnceLock::new();
+static DROPPED_PROGRAM_ROWS: AtomicU64 = AtomicU64::new(0);
+static LAST_DROP_LOG_AT: AtomicU64 = AtomicU64::new(0);
+static LAST_DROP_LOG_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Install the process-wide EPG sender. Called once from
 /// `crate::epg_writer::EpgWriter::new`. Returns `false` (leaving the
 /// previously-installed sender in place) if a sender was already set.
-pub fn set_global_sender(tx: mpsc::UnboundedSender<ProgramUpsert>) -> bool {
+pub fn set_global_sender(tx: mpsc::Sender<ProgramUpsert>) -> bool {
     EPG_SENDER.set(tx).is_ok()
+}
+
+/// Total number of rows discarded because the bounded writer queue was full.
+pub fn dropped_program_rows() -> u64 {
+    DROPPED_PROGRAM_ROWS.load(Ordering::Relaxed)
+}
+
+fn record_dropped_program_row() {
+    let total = DROPPED_PROGRAM_ROWS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let previous = LAST_DROP_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < 60
+        || LAST_DROP_LOG_AT
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let logged = LAST_DROP_LOG_TOTAL.swap(total, Ordering::Relaxed);
+    warn!(
+        "[EpgCollector] dropped {} program row(s) recently because the writer queue was full",
+        total.saturating_sub(logged)
+    );
+}
+
+/// Try to forward one row without ever blocking the SI collector.
+pub fn try_send_program(tx: &mpsc::Sender<ProgramUpsert>, record: ProgramUpsert) -> bool {
+    match tx.try_send(record) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            record_dropped_program_row();
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 /// Forward rows returned by an authenticated remote metadata scan through the
@@ -61,11 +107,11 @@ pub fn submit_metadata_records(records: impl IntoIterator<Item = ProgramUpsert>)
     };
     records
         .into_iter()
-        .filter(|record| tx.send(record.clone()).is_ok())
+        .filter(|record| try_send_program(tx, record.clone()))
         .count()
 }
 
-fn global_sender() -> Option<&'static mpsc::UnboundedSender<ProgramUpsert>> {
+fn global_sender() -> Option<&'static mpsc::Sender<ProgramUpsert>> {
     EPG_SENDER.get()
 }
 
@@ -335,10 +381,7 @@ impl EpgCollector {
                 );
                 break;
             };
-            if tx.send(record).is_err() {
-                debug!(
-                    "[EpgCollector] writer task gone, dropping remaining events for this section"
-                );
+            if !try_send_program(tx, record) {
                 break;
             }
         }
@@ -623,10 +666,36 @@ mod tests {
         // deliberately does not assert on `EPG_SENDER`'s final state since
         // that static is shared across the whole test binary (other tests
         // in this crate may run concurrently and already have set it).
-        let (tx, _rx) = mpsc::unbounded_channel::<ProgramUpsert>();
+        let (tx, _rx) = mpsc::channel::<ProgramUpsert>(EPG_CHANNEL_CAPACITY);
         // Either this call wins (true) or a previous test already
         // installed a sender (false) — both are valid outcomes; the
         // function must not panic either way.
         let _ = set_global_sender(tx);
+    }
+
+    #[test]
+    fn dropped_rows_are_counted_when_the_channel_is_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        let row = || ProgramUpsert {
+            nid: 1,
+            sid: 2,
+            tsid: 3,
+            event_id: 4,
+            start_at: 5,
+            duration_secs: 60,
+            free_ca_mode: false,
+            name: Some("test".to_owned()),
+            description: None,
+            extended: None,
+            genre: None,
+            updated_at: 6,
+            source: EpgSource::Schedule,
+            basic_updated_at: None,
+            extended_updated_at: None,
+        };
+        assert!(try_send_program(&tx, row()));
+        let before = dropped_program_rows();
+        assert!(!try_send_program(&tx, row()));
+        assert_eq!(dropped_program_rows(), before + 1);
     }
 }

@@ -426,7 +426,7 @@ pub(super) async fn get_epg_status_value(s: &WebState) -> Result<serde_json::Val
         serde_json::to_value(states).map_err(|e| ApiError::internal(e.to_string()))?;
     let cpu_source = crate::scheduler::epg_scheduler::cpu_limit_source();
     Ok(
-        json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"reasons":reasons,"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source}}),
+        json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"reasons":reasons,"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source},"dropped_program_rows":crate::tuner::epg_collector::dropped_program_rows()}),
     )
 }
 
@@ -536,5 +536,49 @@ mod tests {
         let values = reason_values_with_labels(&states, &HashMap::new());
         assert_eq!(values.len(), 3);
         assert!(values.iter().all(|value| value["count"] == 4));
+    }
+
+    #[tokio::test]
+    async fn epg_status_still_exposes_its_existing_fields() {
+        let database = Arc::new(tokio::sync::Mutex::new(
+            crate::database::Database::open_in_memory().unwrap(),
+        ));
+        let (events_tx, _) = tokio::sync::broadcast::channel(1);
+        let state = WebState::new(
+            database,
+            Arc::new(crate::tuner::TunerPool::new(1)),
+            Arc::new(crate::tuner::EncoderPool::default()),
+            Arc::new(crate::web::SessionRegistry::new()),
+            crate::web::auth::AuthConfig {
+                enabled: false,
+                token: String::new(),
+            },
+            crate::logging::LogBuffer::new(crate::logging::LOG_BUFFER_CAPACITY),
+            std::path::PathBuf::from("logs"),
+            crate::logging::test_handle(),
+            events_tx,
+        );
+        let value = get_epg_status_value(&state).await.unwrap();
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let expected = [
+            "success",
+            "summary",
+            "state",
+            "states",
+            "active",
+            "reason",
+            "reasons",
+            "cpu",
+            "dropped_program_rows",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+        assert_eq!(keys, expected);
     }
 }

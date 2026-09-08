@@ -9,10 +9,7 @@ use super::epg_dwell::{
 };
 use crate::node::{MuxLeaseGuard, MuxLeaseManager, NodeTransportState};
 use crate::{
-    database::{
-        epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState, EpgScanStatus,
-        EpgServiceCoverageUpsert,
-    },
+    database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState, EpgScanStatus},
     server::listener::DatabaseHandle,
     tuner::{
         acquire::{self, AcquireError, AcquireRequest},
@@ -1066,26 +1063,8 @@ impl EpgScanScheduler {
     }
 
     async fn persist_progress(&self, progress: &crate::tuner::EpgProgress, now: i64) {
-        let rows = progress
-            .snapshot()
-            .into_iter()
-            .filter(|completion| completion.key.pid == crate::ts_analyzer::pid::EIT)
-            .map(|completion| EpgServiceCoverageUpsert {
-                network_id: completion.key.original_network_id,
-                tsid: completion.key.transport_stream_id,
-                service_id: completion.key.service_id,
-                pf_complete: completion.pf_complete,
-                schedule_basic_complete: completion.schedule_basic_complete,
-                schedule_extended_complete: completion.schedule_extended_complete,
-                coverage_until: completion.schedule_coverage_until,
-                sections_seen: i64::from(completion.sections_seen),
-                last_section_at: Some(completion.last_section_at),
-                updated_at: now,
-            })
-            .collect::<Vec<_>>();
-        let db = self.database.lock().await;
-        let _ = db.upsert_epg_service_coverage(&rows);
-        let _ = db.refresh_epg_section_coverage();
+        let _ = crate::tuner::epg_coverage_flusher::persist_progress(&self.database, progress, now)
+            .await;
     }
 }
 

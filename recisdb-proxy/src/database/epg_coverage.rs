@@ -147,13 +147,14 @@ impl Database {
             changed += self.connection().execute(
                 "INSERT INTO epg_scan_states (
                     network_id, tsid, section_coverage_until, services_total,
-                    services_complete, last_complete_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    services_complete, last_complete_at, last_eit_received_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(network_id, tsid) DO UPDATE SET
                     section_coverage_until = excluded.section_coverage_until,
                     services_total = excluded.services_total,
                     services_complete = excluded.services_complete,
-                    last_complete_at = excluded.last_complete_at",
+                    last_complete_at = excluded.last_complete_at,
+                    last_eit_received_at = excluded.last_eit_received_at",
                 params![
                     row.network_id,
                     row.tsid,
@@ -161,6 +162,7 @@ impl Database {
                     row.services_total,
                     row.services_complete,
                     row.last_complete_at,
+                    row.last_section_at,
                 ],
             )?;
         }
@@ -388,16 +390,17 @@ mod tests {
         db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(100), true)])
             .unwrap();
         db.refresh_epg_section_coverage().unwrap();
-        let values: (Option<i64>, i64, i64) = db
+        let values: (Option<i64>, i64, i64, Option<i64>) = db
             .connection()
             .query_row(
-                "SELECT section_coverage_until, services_total, services_complete
-                 FROM epg_scan_states WHERE network_id=1 AND tsid=2",
+                "SELECT section_coverage_until, services_total, services_complete,
+                        last_eit_received_at FROM epg_scan_states
+                 WHERE network_id=1 AND tsid=2",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(values, (Some(100), 1, 1));
+        assert_eq!(values, (Some(100), 1, 1, Some(10)));
     }
 
     #[test]

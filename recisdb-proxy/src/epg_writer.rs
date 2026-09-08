@@ -44,7 +44,7 @@ const PRUNE_EVERY_N_FLUSHES: u32 = 30;
 /// EPG batching/UPSERT task. See module doc comment.
 pub struct EpgWriter {
     database: DatabaseHandle,
-    rx: mpsc::UnboundedReceiver<ProgramUpsert>,
+    rx: mpsc::Receiver<ProgramUpsert>,
     /// Fan-out for `GET /mirakurun/api/events/stream`
     /// (`web/mirakurun_events.rs`) — every record that is successfully
     /// UPSERTed is also broadcast here so EPGStation's incremental EPG
@@ -67,7 +67,7 @@ impl EpgWriter {
     /// `web::state::WebState` (wired up in `main.rs`) — see
     /// [`Self::flush`] for what gets sent through it and when.
     pub fn new(database: DatabaseHandle, events_tx: broadcast::Sender<ProgramUpsert>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(epg_collector::EPG_CHANNEL_CAPACITY);
         if !epg_collector::set_global_sender(tx) {
             warn!(
                 "[EpgWriter] a global EPG sender was already installed; this EpgWriter \
@@ -145,7 +145,11 @@ impl EpgWriter {
         let mut db = self.database.lock().await;
         match db.upsert_programs(&records) {
             Ok(_) => {
-                debug!("[EpgWriter] flushed {} program row(s)", count);
+                debug!(
+                    "[EpgWriter] flushed {} program row(s); dropped_program_rows={}",
+                    count,
+                    epg_collector::dropped_program_rows()
+                );
                 if let Err(e) = db.refresh_epg_coverage() {
                     warn!("[EpgWriter] failed to refresh coverage: {}", e);
                 }

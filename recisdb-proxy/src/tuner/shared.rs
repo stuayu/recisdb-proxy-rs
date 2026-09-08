@@ -412,7 +412,11 @@ impl SharedTuner {
         Arc::new(Self {
             key,
             tx,
-            epg_progress: EpgProgress::new(),
+            epg_progress: {
+                let progress = EpgProgress::new();
+                crate::tuner::epg_coverage_flusher::register_progress(&progress);
+                progress
+            },
             channel_change_tx,
             subscriber_count: AtomicU32::new(0),
             claims: std::sync::Mutex::new(HashMap::new()),

@@ -711,6 +711,12 @@ async fn run_server(
         writer.run().await;
     });
 
+    // Persist passive EIT section coverage independently of active scans.
+    let epg_coverage_db = db.clone();
+    tokio::spawn(async move {
+        tuner::epg_coverage_flusher::run(epg_coverage_db).await;
+    });
+
     // Start the NIT writer: fills the `channels` metadata that a scan would
     // normally supply (remote-control key / physical channel / network name)
     // for rows registered by hand, from the NIT seen on every live terrestrial
