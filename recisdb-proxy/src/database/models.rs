@@ -1,7 +1,84 @@
 //! Database model definitions.
 
 use recisdb_protocol::ChannelInfo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpgScanStatus {
+    Complete,
+    Partial,
+    Failed,
+    Preempted,
+    NoData,
+    CpuAborted,
+}
+
+impl EpgScanStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Preempted => "preempted",
+            Self::NoData => "no_data",
+            Self::CpuAborted => "cpu_aborted",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        Some(match s {
+            "complete" => Self::Complete,
+            "partial" => Self::Partial,
+            "failed" => Self::Failed,
+            "preempted" => Self::Preempted,
+            "no_data" => Self::NoData,
+            "cpu_aborted" => Self::CpuAborted,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpgServiceCoverageUpsert {
+    pub network_id: u16,
+    pub tsid: u16,
+    pub service_id: u16,
+    pub pf_complete: bool,
+    pub schedule_basic_complete: bool,
+    pub schedule_extended_complete: bool,
+    pub coverage_until: Option<i64>,
+    pub sections_seen: i64,
+    pub last_section_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EpgServiceCoverage {
+    pub network_id: u16,
+    pub tsid: u16,
+    pub service_id: u16,
+    pub pf_complete: bool,
+    pub schedule_basic_complete: bool,
+    pub schedule_extended_complete: bool,
+    pub coverage_until: Option<i64>,
+    pub sections_seen: i64,
+    pub last_section_at: Option<i64>,
+    pub last_complete_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+/// Mux単位に集約したsection coverage。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct EpgMuxCoverage {
+    pub network_id: u16,
+    pub tsid: u16,
+    pub services_total: i64,
+    pub services_complete: i64,
+    pub coverage_until: Option<i64>,
+    pub last_section_at: Option<i64>,
+    pub last_complete_at: Option<i64>,
+}
 
 /// BonDriver record from database.
 #[derive(Debug, Clone, Serialize)]

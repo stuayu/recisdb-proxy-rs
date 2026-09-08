@@ -218,13 +218,9 @@ pub struct CreatePreset {
     #[serde(default)]
     pub idle_section_timeout_secs: Option<i64>,
     #[serde(default)]
-    pub reserve_tuners: Option<bool>,
-    #[serde(default)]
     pub prefer_local: Option<bool>,
     #[serde(default)]
     pub allow_remote: Option<bool>,
-    #[serde(default)]
-    pub preemptible: Option<bool>,
     #[serde(default)]
     pub cpu_soft_limit_percent: Option<i64>,
     #[serde(default)]
@@ -259,11 +255,11 @@ fn validate_preset(p: &CreatePreset) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `is_system` is written as a literal 0, so the 20 columns take 19 bound
+/// `is_system` is written as a literal 0, so the 19 columns take 18 bound
 /// parameters. Kept as a constant so a test can prepare it and check that
 /// count against the params list — a miscount only shows up when the
 /// dashboard actually creates a preset.
-const INSERT_PRESET_SQL: &str = "INSERT INTO epg_scan_presets(name,description,is_system,enabled,auto_tuner_scan_enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport) VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)";
+const INSERT_PRESET_SQL: &str = "INSERT INTO epg_scan_presets(name,description,is_system,enabled,auto_tuner_scan_enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,prefer_local,allow_remote,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport) VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)";
 
 fn preset_bool(value: Option<bool>) -> Option<i64> {
     value.map(i64::from)
@@ -293,10 +289,8 @@ pub async fn create_epg_preset(
                 p.normal_dwell_secs,
                 p.max_dwell_secs,
                 p.idle_section_timeout_secs,
-                preset_bool(p.reserve_tuners),
                 preset_bool(p.prefer_local),
                 preset_bool(p.allow_remote),
-                preset_bool(p.preemptible),
                 p.cpu_soft_limit_percent,
                 p.cpu_hard_limit_percent,
                 preset_bool(p.remote_prefer_metadata_execution),
@@ -330,7 +324,7 @@ pub async fn update_epg_preset(
             "system presetは複製して編集してください",
         ));
     }
-    db.connection().execute("UPDATE epg_scan_presets SET name=?1,description=?2,enabled=?3,auto_tuner_scan_enabled=?4,target_refresh_secs=?5,max_stale_secs=?6,min_future_coverage_hours=?7,target_future_coverage_hours=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,reserve_tuners=?13,prefer_local=?14,allow_remote=?15,preemptible=?16,cpu_soft_limit_percent=?17,cpu_hard_limit_percent=?18,remote_prefer_metadata_execution=?19,remote_allow_ts_transport=?20,updated_at=strftime('%s','now') WHERE id=?21",rusqlite::params![p.name.trim(),p.description.unwrap_or_default(),p.enabled.map(i64::from).unwrap_or(1),preset_bool(p.auto_tuner_scan_enabled),p.target_refresh_secs,p.max_stale_secs,p.min_future_coverage_hours,p.target_future_coverage_hours,p.min_dwell_secs,p.normal_dwell_secs,p.max_dwell_secs,p.idle_section_timeout_secs,preset_bool(p.reserve_tuners),preset_bool(p.prefer_local),preset_bool(p.allow_remote),preset_bool(p.preemptible),p.cpu_soft_limit_percent,p.cpu_hard_limit_percent,preset_bool(p.remote_prefer_metadata_execution),preset_bool(p.remote_allow_ts_transport),id]).map_err(|e|ApiError::bad_request(e.to_string()))?;
+    db.connection().execute("UPDATE epg_scan_presets SET name=?1,description=?2,enabled=?3,auto_tuner_scan_enabled=?4,target_refresh_secs=?5,max_stale_secs=?6,min_future_coverage_hours=?7,target_future_coverage_hours=?8,min_dwell_secs=?9,normal_dwell_secs=?10,max_dwell_secs=?11,idle_section_timeout_secs=?12,prefer_local=?13,allow_remote=?14,cpu_soft_limit_percent=?15,cpu_hard_limit_percent=?16,remote_prefer_metadata_execution=?17,remote_allow_ts_transport=?18,updated_at=strftime('%s','now') WHERE id=?19",rusqlite::params![p.name.trim(),p.description.unwrap_or_default(),p.enabled.map(i64::from).unwrap_or(1),preset_bool(p.auto_tuner_scan_enabled),p.target_refresh_secs,p.max_stale_secs,p.min_future_coverage_hours,p.target_future_coverage_hours,p.min_dwell_secs,p.normal_dwell_secs,p.max_dwell_secs,p.idle_section_timeout_secs,preset_bool(p.prefer_local),preset_bool(p.allow_remote),p.cpu_soft_limit_percent,p.cpu_hard_limit_percent,preset_bool(p.remote_prefer_metadata_execution),preset_bool(p.remote_allow_ts_transport),id]).map_err(|e|ApiError::bad_request(e.to_string()))?;
     Ok(Json(json!({"success":true})))
 }
 pub async fn delete_epg_preset(
@@ -409,9 +403,7 @@ pub async fn update_tuner_epg_settings(
     ))
 }
 
-pub async fn get_epg_status(
-    State(s): State<Arc<WebState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+pub(super) async fn get_epg_status_value(s: &WebState) -> Result<serde_json::Value, ApiError> {
     let db = s.database.lock().await;
     let states = db.get_epg_scan_states()?;
     let minimum_coverage = states.iter().filter_map(|state| state.coverage_until).min();
@@ -433,9 +425,15 @@ pub async fn get_epg_status(
     let states_json =
         serde_json::to_value(states).map_err(|e| ApiError::internal(e.to_string()))?;
     let cpu_source = crate::scheduler::epg_scheduler::cpu_limit_source();
-    Ok(Json(
+    Ok(
         json!({"success":true,"summary":{"coverageUntil":minimum_coverage,"multiplexCount":states_json.as_array().map_or(0, |items| items.len())},"state":{"coverageUntil":minimum_coverage},"states":states_json,"active":active,"reason":reason,"reasons":reasons,"cpu":{"available":!cpu_source.starts_with("unavailable:"),"source":cpu_source}}),
-    ))
+    )
+}
+
+pub async fn get_epg_status(
+    State(s): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(get_epg_status_value(&s).await?))
 }
 
 pub async fn get_epg_scan_history(
@@ -460,6 +458,11 @@ mod tests {
             last_scan_completed_at: None,
             last_eit_received_at: None,
             coverage_until: None,
+            section_coverage_until: None,
+            services_total: None,
+            services_complete: None,
+            last_complete_at: None,
+            last_scan_status: None,
             next_eligible_at: None,
             last_tuner_id: None,
             last_node_id: None,
@@ -468,15 +471,15 @@ mod tests {
         }
     }
 
-    /// `is_system` is a literal, so the 21 listed columns bind 20 parameters.
+    /// `is_system` is a literal, so the 19 listed columns bind 18 parameters.
     #[test]
     fn insert_preset_sql_binds_exactly_the_parameters_it_declares() {
         let db = crate::database::Database::open_in_memory().unwrap();
         let stmt = db.connection().prepare(INSERT_PRESET_SQL).unwrap();
         assert_eq!(
             stmt.parameter_count(),
-            20,
-            "params! in create_epg_preset supplies 20 values"
+            18,
+            "params! in create_epg_preset supplies 18 values"
         );
     }
 

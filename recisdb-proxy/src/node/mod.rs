@@ -44,12 +44,12 @@ pub use qualification::{
 };
 pub use replay::{ReplayBudget, ReplayBuffer, ReplayError};
 pub use route::{select_route, ReceptionCandidate, RouteDecision};
-pub use serve::{LocalMuxServer, ServeError};
+pub use serve::{LocalMuxServer, RemoteEpgMetadataOutcome, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteRoute};
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};
 pub use transport::{
     serve_h2c, LeaseStreamError, NodeCapabilities, NodeHello, NodeTransportClient,
-    NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgMetadataRequest,
+    NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgDwell, RemoteEpgMetadataRequest,
     PAIRING_CODE_TTL,
 };
 pub use types::*;

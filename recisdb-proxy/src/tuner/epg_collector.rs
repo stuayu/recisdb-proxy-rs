@@ -39,6 +39,7 @@ use crate::database::{EpgSource, ProgramUpsert};
 use crate::ts_analyzer::{
     pid, table_id, EitTable, PsiSection, SectionCollector, TsPacket, TS_PACKET_SIZE,
 };
+use crate::tuner::epg_progress::EpgProgress;
 
 const MAX_PENDING_TS: usize = TS_PACKET_SIZE * 3;
 
@@ -96,18 +97,24 @@ pub struct EpgCollector {
     pending_ts: Vec<u8>,
     metadata_only: bool,
     metadata_records: Vec<ProgramUpsert>,
+    progress: std::sync::Arc<EpgProgress>,
     #[cfg(test)]
     parsed_events: Vec<u16>,
 }
 
 impl EpgCollector {
     pub fn new() -> Self {
+        Self::with_progress(EpgProgress::new())
+    }
+
+    pub fn with_progress(progress: std::sync::Arc<EpgProgress>) -> Self {
         Self {
             collector: SectionCollector::new(),
             versions: HashMap::new(),
             pending_ts: Vec::new(),
             metadata_only: false,
             metadata_records: Vec::new(),
+            progress,
             #[cfg(test)]
             parsed_events: Vec::new(),
         }
@@ -120,6 +127,10 @@ impl EpgCollector {
             metadata_only: true,
             ..Self::new()
         }
+    }
+
+    pub fn progress(&self) -> &std::sync::Arc<EpgProgress> {
+        &self.progress
     }
 
     pub fn drain_metadata_records(&mut self) -> Vec<ProgramUpsert> {
@@ -207,6 +218,8 @@ impl EpgCollector {
         let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };
+        let now = chrono::Utc::now().timestamp();
+        self.progress.observe(pid, &section, now);
         if !accepts_table_id(pid, section.header.table_id) {
             return;
         }
@@ -248,7 +261,6 @@ impl EpgCollector {
         let tx = global_sender();
         let event_count = eit.events.len();
 
-        let now = chrono::Utc::now().timestamp();
         // Which logical store this section feeds, following EDCB's split in
         // `CEpgDBUtil::AddEIT`: `table_id <= 0x4F && section_number <= 1` is
         // p/f, and `PID != 0x0012 || table_id > 0x4F` is schedule (or, off
@@ -547,6 +559,37 @@ mod tests {
         collector.process_ts_chunk(&vec![0x00; MAX_PENDING_TS * 100]);
 
         assert!(collector.pending_ts.len() <= MAX_PENDING_TS);
+    }
+
+    #[test]
+    fn collector_tracks_sections_that_are_not_turned_into_programs() {
+        let mut collector = EpgCollector::new();
+        let section = empty_schedule_section();
+        collector.process_section(pid::EIT, &section);
+        assert!(collector.drain_metadata_records().is_empty());
+        assert_eq!(collector.progress().total_sections_seen(), 1);
+    }
+
+    fn empty_schedule_section() -> Vec<u8> {
+        let mut section = vec![
+            table_id::EIT_SCHEDULE_ACTUAL_START,
+            0xB0,
+            0x0F,
+            0x12,
+            0x34,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x0B,
+            0x00,
+            table_id::EIT_SCHEDULE_ACTUAL_START,
+        ];
+        let crc = crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        section
     }
 
     #[test]

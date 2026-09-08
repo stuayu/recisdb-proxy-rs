@@ -23,7 +23,10 @@ use std::time::Duration;
 use recisdb_protocol::StreamClass;
 use serde::{Deserialize, Serialize};
 
-use crate::database::{EpgSource, ProgramUpsert};
+use crate::database::{EpgScanStatus, EpgSource, ProgramUpsert};
+use crate::scheduler::epg_dwell::{
+    evaluate_dwell, mux_reached_target, DwellObservation, DwellVerdict, EpgDwellConfig,
+};
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 use crate::tuner::channel_key::ChannelKeySpec;
@@ -34,6 +37,7 @@ use crate::tuner::{ChannelKey, TunerPool};
 use super::frame::{FrameFlags, NodeTsFrame, MAX_NODE_TS_PAYLOAD};
 use super::identity::NodeIdentity;
 use super::lease::{MuxLeaseManager, RemoteLeaseManager, RemoteMuxLease};
+use super::transport::RemoteEpgDwell;
 use super::types::{HopError, LogicalMuxId, RequestContext};
 
 /// TS packets per node frame. 188 * 1000 ≈ 188 KB, comfortably under
@@ -65,6 +69,28 @@ pub enum ServeError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEpgMetadataReply {
     pub programs: Vec<ProgramUpsertWire>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub elapsed_secs: Option<i64>,
+    #[serde(default)]
+    pub sections_seen: Option<u64>,
+    #[serde(default)]
+    pub services_total: Option<usize>,
+    #[serde(default)]
+    pub services_complete: Option<usize>,
+    #[serde(default)]
+    pub coverage_until: Option<i64>,
+}
+
+pub struct RemoteEpgMetadataOutcome {
+    pub programs: Vec<ProgramUpsert>,
+    pub status: EpgScanStatus,
+    pub elapsed_secs: i64,
+    pub sections_seen: u64,
+    pub services_total: usize,
+    pub services_complete: usize,
+    pub coverage_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,7 +334,8 @@ impl LocalMuxServer {
         sid: Option<u16>,
         spent_ms: u64,
         dwell_secs: u64,
-    ) -> Result<Vec<ProgramUpsert>, ServeError> {
+        remote_dwell: Option<RemoteEpgDwell>,
+    ) -> Result<RemoteEpgMetadataOutcome, ServeError> {
         context.enter_node(&self.identity.node_id, spent_ms)?;
         let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
             return Err(ServeError::MuxLeaseUnavailable(mux));
@@ -340,20 +367,143 @@ impl LocalMuxServer {
             TunerUsage::EpgActiveScan,
         );
         let mut collector = EpgCollector::new_metadata();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(dwell_secs.clamp(1, 300));
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+        let progress = collector.progress().clone();
+        let started = tokio::time::Instant::now();
+        let dwell = remote_dwell.map(EpgDwellConfig::from);
+        let legacy_deadline = started + remote_metadata_dwell_duration(remote_dwell, dwell_secs);
+        let cpu_hard_limit_percent = self
+            .database
+            .lock()
+            .await
+            .get_epg_global_settings()
+            .ok()
+            .map(|settings| settings.cpu_hard_limit_percent);
+        let mut last_progress = progress.progress_counter();
+        let mut last_progress_at = started;
+        let status = loop {
+            let now = chrono::Utc::now().timestamp();
+            let completion = progress.mux_completion(mux.nid, mux.tsid);
+            let counter = progress.progress_counter();
+            if counter != last_progress {
+                last_progress = counter;
+                last_progress_at = tokio::time::Instant::now();
             }
-            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), subscription.recv())
-                .await
-            {
+            if let Some(dwell) = dwell {
+                let observation = DwellObservation {
+                    elapsed: started.elapsed(),
+                    since_progress: last_progress_at.elapsed(),
+                    any_sections: completion.sections_seen > 0,
+                    reached_target: mux_reached_target(
+                        &completion,
+                        now,
+                        dwell.target_future_coverage_hours,
+                    ),
+                    any_service_complete: completion.services_schedule_basic_complete > 0,
+                    stream_closed: false,
+                    cpu_hard_limit: cpu_hard_limit_percent.is_some_and(|limit| {
+                        crate::scheduler::epg_scheduler::cpu_percent() as i64 >= limit
+                    }),
+                };
+                if let DwellVerdict::Stop(status) = evaluate_dwell(&dwell, &observation) {
+                    break status;
+                }
+            } else if tokio::time::Instant::now() >= legacy_deadline {
+                break if completion.sections_seen > 0 {
+                    EpgScanStatus::Partial
+                } else {
+                    EpgScanStatus::NoData
+                };
+            }
+            let remaining = if dwell.is_some() {
+                Duration::from_secs(1)
+            } else {
+                legacy_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_secs(2))
+            };
+            match tokio::time::timeout(remaining, subscription.recv()).await {
                 Ok(Ok(chunk)) => collector.process_ts_chunk(&chunk),
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    if let Some(dwell) = dwell {
+                        let completion = progress.mux_completion(mux.nid, mux.tsid);
+                        let observation = DwellObservation {
+                            elapsed: started.elapsed(),
+                            since_progress: last_progress_at.elapsed(),
+                            any_sections: completion.sections_seen > 0,
+                            reached_target: mux_reached_target(
+                                &completion,
+                                chrono::Utc::now().timestamp(),
+                                dwell.target_future_coverage_hours,
+                            ),
+                            any_service_complete: completion.services_schedule_basic_complete > 0,
+                            stream_closed: true,
+                            cpu_hard_limit: cpu_hard_limit_percent.is_some_and(|limit| {
+                                crate::scheduler::epg_scheduler::cpu_percent() as i64 >= limit
+                            }),
+                        };
+                        if let DwellVerdict::Stop(status) = evaluate_dwell(&dwell, &observation) {
+                            break status;
+                        }
+                    } else {
+                        break if progress.progress_counter() > 0 {
+                            EpgScanStatus::Partial
+                        } else {
+                            EpgScanStatus::NoData
+                        };
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(_) => {}
             }
-        }
-        Ok(collector.drain_metadata_records())
+        };
+        let completion = progress.mux_completion(mux.nid, mux.tsid);
+        Ok(RemoteEpgMetadataOutcome {
+            programs: collector.drain_metadata_records(),
+            status,
+            elapsed_secs: started.elapsed().as_secs() as i64,
+            sections_seen: completion.sections_seen,
+            services_total: completion.services_total,
+            services_complete: completion.services_schedule_basic_complete,
+            coverage_until: completion.coverage_until,
+        })
+    }
+}
+
+fn remote_metadata_dwell_duration(dwell: Option<RemoteEpgDwell>, dwell_secs: u64) -> Duration {
+    dwell.map_or(Duration::from_secs(dwell_secs.clamp(1, 300)), |dwell| {
+        Duration::from_secs(dwell.max_dwell_secs.max(1))
+    })
+}
+
+#[cfg(test)]
+mod remote_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn remote_dwell_falls_back_to_dwell_secs_when_absent() {
+        assert_eq!(
+            remote_metadata_dwell_duration(None, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            remote_metadata_dwell_duration(None, 301),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn remote_epg_metadata_reply_without_status_deserializes() {
+        let reply: RemoteEpgMetadataReply = serde_json::from_value(serde_json::json!({
+            "programs": []
+        }))
+        .unwrap();
+        assert!(reply.status.is_none());
+        assert!(reply.elapsed_secs.is_none());
+        assert!(reply.sections_seen.is_none());
+        assert!(reply.services_total.is_none());
+        assert!(reply.services_complete.is_none());
+        assert!(reply.coverage_until.is_none());
     }
 }
 

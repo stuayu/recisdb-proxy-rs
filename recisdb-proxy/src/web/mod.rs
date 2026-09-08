@@ -129,6 +129,7 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/scan-history", get(api::get_scan_history))
         // EPG (program guide) API
         .route("/programs", get(api::get_programs))
+        .route("/epg/events", get(api::get_epg_events))
         // Alert API
         .route("/alerts", get(api::get_alerts))
         .route("/alert-rules", get(api::get_alert_rules))
@@ -639,6 +640,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn epg_events_requires_auth() {
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
+        let response = build_app(state, false)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/epg/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn epg_events_returns_event_stream_content_type() {
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
+        let response = build_app(state, false)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/epg/events")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
     }
 
     #[tokio::test]

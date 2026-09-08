@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const EPG_SCHEMA_SQL: &str = r#"
+-- reserve_tuners and preemptible are legacy columns. They remain for existing
+-- databases, but are intentionally absent from the runtime/API model: tuner
+-- capacity is governed by max_concurrent_scans and EPG claims always yield to
+-- higher-priority recording/viewing requests.
 CREATE TABLE IF NOT EXISTS epg_global_settings (
  id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 1,
  auto_tuner_scan_enabled INTEGER NOT NULL DEFAULT 1,
@@ -79,10 +83,8 @@ pub struct EpgGlobalSettings {
     pub max_dwell_secs: i64,
     pub idle_section_timeout_secs: i64,
     pub max_concurrent_scans: i64,
-    pub reserve_tuners: bool,
     pub prefer_local: bool,
     pub allow_remote: bool,
-    pub preemptible: bool,
     pub cpu_soft_limit_percent: i64,
     pub cpu_hard_limit_percent: i64,
     pub remote_prefer_metadata_execution: bool,
@@ -107,10 +109,8 @@ pub struct EpgPreset {
     pub normal_dwell_secs: Option<i64>,
     pub max_dwell_secs: Option<i64>,
     pub idle_section_timeout_secs: Option<i64>,
-    pub reserve_tuners: Option<bool>,
     pub prefer_local: Option<bool>,
     pub allow_remote: Option<bool>,
-    pub preemptible: Option<bool>,
     pub cpu_soft_limit_percent: Option<i64>,
     pub cpu_hard_limit_percent: Option<i64>,
     pub remote_prefer_metadata_execution: Option<bool>,
@@ -135,7 +135,6 @@ pub struct PhysicalTunerEpgSettings {
     pub max_dwell_secs_override: Option<i64>,
     pub allow_remote_override: Option<bool>,
     pub prefer_local_override: Option<bool>,
-    pub preemptible_override: Option<bool>,
     pub reserve_for_recording_override: Option<bool>,
 }
 
@@ -148,6 +147,11 @@ pub struct EpgScanState {
     pub last_scan_completed_at: Option<i64>,
     pub last_eit_received_at: Option<i64>,
     pub coverage_until: Option<i64>,
+    pub section_coverage_until: Option<i64>,
+    pub services_total: Option<i64>,
+    pub services_complete: Option<i64>,
+    pub last_complete_at: Option<i64>,
+    pub last_scan_status: Option<String>,
     pub next_eligible_at: Option<i64>,
     pub last_tuner_id: Option<i64>,
     pub last_node_id: Option<String>,
@@ -298,6 +302,10 @@ impl Database {
     }
 
     /// Reconcile state with rows actually retained in `programs`.
+    ///
+    /// This is a programs-derived auxiliary metric, not an EPG acquisition
+    /// completion signal. Completion is determined by
+    /// `refresh_epg_section_coverage` and `epg_scan_states.section_coverage_until`.
     /// Called after writer flushes, never from the reader loop.
     pub fn refresh_epg_coverage(&self) -> Result<Option<i64>> {
         let coverage: Option<i64> = self.connection().query_row(
@@ -324,7 +332,7 @@ impl Database {
         Ok(coverage)
     }
     pub fn get_epg_scan_states(&self) -> Result<Vec<EpgScanState>> {
-        let mut stmt = self.connection().prepare("SELECT network_id,tsid,last_scan_started_at,last_scan_completed_at,last_eit_received_at,coverage_until,next_eligible_at,last_tuner_id,last_node_id,failure_count,last_failure_reason FROM epg_scan_states ORDER BY network_id,tsid")?;
+        let mut stmt = self.connection().prepare("SELECT network_id,tsid,last_scan_started_at,last_scan_completed_at,last_eit_received_at,coverage_until,section_coverage_until,services_total,services_complete,last_complete_at,last_scan_status,next_eligible_at,last_tuner_id,last_node_id,failure_count,last_failure_reason FROM epg_scan_states ORDER BY network_id,tsid")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(EpgScanState {
@@ -334,18 +342,23 @@ impl Database {
                     last_scan_completed_at: r.get(3)?,
                     last_eit_received_at: r.get(4)?,
                     coverage_until: r.get(5)?,
-                    next_eligible_at: r.get(6)?,
-                    last_tuner_id: r.get(7)?,
-                    last_node_id: r.get(8)?,
-                    failure_count: r.get(9)?,
-                    last_failure_reason: r.get(10)?,
+                    section_coverage_until: r.get(6)?,
+                    services_total: r.get(7)?,
+                    services_complete: r.get(8)?,
+                    last_complete_at: r.get(9)?,
+                    last_scan_status: r.get(10)?,
+                    next_eligible_at: r.get(11)?,
+                    last_tuner_id: r.get(12)?,
+                    last_node_id: r.get(13)?,
+                    failure_count: r.get(14)?,
+                    last_failure_reason: r.get(15)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
     pub fn get_epg_global_settings(&self) -> Result<EpgGlobalSettings> {
-        self.connection().query_row("SELECT enabled,auto_tuner_scan_enabled,scheduler_interval_secs,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,startup_delay_secs,startup_jitter_secs,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,max_concurrent_scans,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport,selected_preset_id FROM epg_global_settings WHERE id=1",[],|r|Ok(EpgGlobalSettings{enabled:r.get::<_,i64>(0)?!=0,auto_tuner_scan_enabled:r.get::<_,i64>(1)?!=0,scheduler_interval_secs:r.get(2)?,target_refresh_secs:r.get(3)?,max_stale_secs:r.get(4)?,min_future_coverage_hours:r.get(5)?,target_future_coverage_hours:r.get(6)?,startup_delay_secs:r.get(7)?,startup_jitter_secs:r.get(8)?,min_dwell_secs:r.get(9)?,normal_dwell_secs:r.get(10)?,max_dwell_secs:r.get(11)?,idle_section_timeout_secs:r.get(12)?,max_concurrent_scans:r.get(13)?,reserve_tuners:r.get::<_,i64>(14)?!=0,prefer_local:r.get::<_,i64>(15)?!=0,allow_remote:r.get::<_,i64>(16)?!=0,preemptible:r.get::<_,i64>(17)?!=0,cpu_soft_limit_percent:r.get(18)?,cpu_hard_limit_percent:r.get(19)?,remote_prefer_metadata_execution:r.get::<_,i64>(20)?!=0,remote_allow_ts_transport:r.get::<_,i64>(21)?!=0,selected_preset_id:r.get(22)?})).map_err(Into::into)
+        self.connection().query_row("SELECT enabled,auto_tuner_scan_enabled,scheduler_interval_secs,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,startup_delay_secs,startup_jitter_secs,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,max_concurrent_scans,prefer_local,allow_remote,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport,selected_preset_id FROM epg_global_settings WHERE id=1",[],|r|Ok(EpgGlobalSettings{enabled:r.get::<_,i64>(0)?!=0,auto_tuner_scan_enabled:r.get::<_,i64>(1)?!=0,scheduler_interval_secs:r.get(2)?,target_refresh_secs:r.get(3)?,max_stale_secs:r.get(4)?,min_future_coverage_hours:r.get(5)?,target_future_coverage_hours:r.get(6)?,startup_delay_secs:r.get(7)?,startup_jitter_secs:r.get(8)?,min_dwell_secs:r.get(9)?,normal_dwell_secs:r.get(10)?,max_dwell_secs:r.get(11)?,idle_section_timeout_secs:r.get(12)?,max_concurrent_scans:r.get(13)?,prefer_local:r.get::<_,i64>(14)?!=0,allow_remote:r.get::<_,i64>(15)?!=0,cpu_soft_limit_percent:r.get(16)?,cpu_hard_limit_percent:r.get(17)?,remote_prefer_metadata_execution:r.get::<_,i64>(18)?!=0,remote_allow_ts_transport:r.get::<_,i64>(19)?!=0,selected_preset_id:r.get(20)?})).map_err(Into::into)
     }
     pub fn update_epg_global_settings(&self, c: &EpgGlobalSettings) -> Result<()> {
         if !valid(c) {
@@ -353,11 +366,11 @@ impl Database {
                 "invalid EPG settings ordering or CPU limits".into(),
             ));
         }
-        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,auto_tuner_scan_enabled=?2,scheduler_interval_secs=?3,target_refresh_secs=?4,max_stale_secs=?5,min_future_coverage_hours=?6,target_future_coverage_hours=?7,startup_delay_secs=?8,startup_jitter_secs=?9,min_dwell_secs=?10,normal_dwell_secs=?11,max_dwell_secs=?12,idle_section_timeout_secs=?13,max_concurrent_scans=?14,reserve_tuners=?15,prefer_local=?16,allow_remote=?17,preemptible=?18,cpu_soft_limit_percent=?19,cpu_hard_limit_percent=?20,remote_prefer_metadata_execution=?21,remote_allow_ts_transport=?22,selected_preset_id=?23,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),b(c.auto_tuner_scan_enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,c.max_concurrent_scans,b(c.reserve_tuners),b(c.prefer_local),b(c.allow_remote),b(c.preemptible),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport),c.selected_preset_id])?;
+        self.connection().execute("UPDATE epg_global_settings SET enabled=?1,auto_tuner_scan_enabled=?2,scheduler_interval_secs=?3,target_refresh_secs=?4,max_stale_secs=?5,min_future_coverage_hours=?6,target_future_coverage_hours=?7,startup_delay_secs=?8,startup_jitter_secs=?9,min_dwell_secs=?10,normal_dwell_secs=?11,max_dwell_secs=?12,idle_section_timeout_secs=?13,max_concurrent_scans=?14,prefer_local=?15,allow_remote=?16,cpu_soft_limit_percent=?17,cpu_hard_limit_percent=?18,remote_prefer_metadata_execution=?19,remote_allow_ts_transport=?20,selected_preset_id=?21,updated_at=strftime('%s','now') WHERE id=1",params![b(c.enabled),b(c.auto_tuner_scan_enabled),c.scheduler_interval_secs,c.target_refresh_secs,c.max_stale_secs,c.min_future_coverage_hours,c.target_future_coverage_hours,c.startup_delay_secs,c.startup_jitter_secs,c.min_dwell_secs,c.normal_dwell_secs,c.max_dwell_secs,c.idle_section_timeout_secs,c.max_concurrent_scans,b(c.prefer_local),b(c.allow_remote),c.cpu_soft_limit_percent,c.cpu_hard_limit_percent,b(c.remote_prefer_metadata_execution),b(c.remote_allow_ts_transport),c.selected_preset_id])?;
         Ok(())
     }
     pub fn list_epg_presets(&self) -> Result<Vec<EpgPreset>> {
-        let mut s=self.connection().prepare("SELECT id,name,description,is_system,enabled,auto_tuner_scan_enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,reserve_tuners,prefer_local,allow_remote,preemptible,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport FROM epg_scan_presets ORDER BY is_system DESC,id")?;
+        let mut s=self.connection().prepare("SELECT id,name,description,is_system,enabled,auto_tuner_scan_enabled,target_refresh_secs,max_stale_secs,min_future_coverage_hours,target_future_coverage_hours,min_dwell_secs,normal_dwell_secs,max_dwell_secs,idle_section_timeout_secs,prefer_local,allow_remote,cpu_soft_limit_percent,cpu_hard_limit_percent,remote_prefer_metadata_execution,remote_allow_ts_transport FROM epg_scan_presets ORDER BY is_system DESC,id")?;
         let rows = s
             .query_map([], |r| {
                 Ok(EpgPreset {
@@ -375,24 +388,22 @@ impl Database {
                     normal_dwell_secs: r.get(11)?,
                     max_dwell_secs: r.get(12)?,
                     idle_section_timeout_secs: r.get(13)?,
-                    reserve_tuners: r.get::<_, Option<i64>>(14)?.map(|v| v != 0),
-                    prefer_local: r.get::<_, Option<i64>>(15)?.map(|v| v != 0),
-                    allow_remote: r.get::<_, Option<i64>>(16)?.map(|v| v != 0),
-                    preemptible: r.get::<_, Option<i64>>(17)?.map(|v| v != 0),
-                    cpu_soft_limit_percent: r.get(18)?,
-                    cpu_hard_limit_percent: r.get(19)?,
-                    remote_prefer_metadata_execution: r.get::<_, Option<i64>>(20)?.map(|v| v != 0),
-                    remote_allow_ts_transport: r.get::<_, Option<i64>>(21)?.map(|v| v != 0),
+                    prefer_local: r.get::<_, Option<i64>>(14)?.map(|v| v != 0),
+                    allow_remote: r.get::<_, Option<i64>>(15)?.map(|v| v != 0),
+                    cpu_soft_limit_percent: r.get(16)?,
+                    cpu_hard_limit_percent: r.get(17)?,
+                    remote_prefer_metadata_execution: r.get::<_, Option<i64>>(18)?.map(|v| v != 0),
+                    remote_allow_ts_transport: r.get::<_, Option<i64>>(19)?.map(|v| v != 0),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
     pub fn get_physical_tuner_epg_settings(&self, id: i64) -> Result<PhysicalTunerEpgSettings> {
-        Ok(self.connection().query_row("SELECT enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,preemptible_override,reserve_for_recording_override FROM physical_tuner_epg_settings WHERE physical_tuner_id=?", [id], |r| Ok(PhysicalTunerEpgSettings { physical_tuner_id:id, enabled_override:r.get::<_,Option<i64>>(0)?.map(|v|v!=0), auto_tuner_scan_enabled_override:r.get::<_,Option<i64>>(1)?.map(|v|v!=0), preset_id:r.get(2)?, target_refresh_secs_override:r.get(3)?, max_stale_secs_override:r.get(4)?, min_dwell_secs_override:r.get(5)?, normal_dwell_secs_override:r.get(6)?, max_dwell_secs_override:r.get(7)?, allow_remote_override:r.get::<_,Option<i64>>(8)?.map(|v|v!=0), prefer_local_override:r.get::<_,Option<i64>>(9)?.map(|v|v!=0), preemptible_override:r.get::<_,Option<i64>>(10)?.map(|v|v!=0), reserve_for_recording_override:r.get::<_,Option<i64>>(11)?.map(|v|v!=0) })).optional()?.unwrap_or(PhysicalTunerEpgSettings { physical_tuner_id:id, ..Default::default() }))
+        Ok(self.connection().query_row("SELECT enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,reserve_for_recording_override FROM physical_tuner_epg_settings WHERE physical_tuner_id=?", [id], |r| Ok(PhysicalTunerEpgSettings { physical_tuner_id:id, enabled_override:r.get::<_,Option<i64>>(0)?.map(|v|v!=0), auto_tuner_scan_enabled_override:r.get::<_,Option<i64>>(1)?.map(|v|v!=0), preset_id:r.get(2)?, target_refresh_secs_override:r.get(3)?, max_stale_secs_override:r.get(4)?, min_dwell_secs_override:r.get(5)?, normal_dwell_secs_override:r.get(6)?, max_dwell_secs_override:r.get(7)?, allow_remote_override:r.get::<_,Option<i64>>(8)?.map(|v|v!=0), prefer_local_override:r.get::<_,Option<i64>>(9)?.map(|v|v!=0), reserve_for_recording_override:r.get::<_,Option<i64>>(10)?.map(|v|v!=0) })).optional()?.unwrap_or(PhysicalTunerEpgSettings { physical_tuner_id:id, ..Default::default() }))
     }
     pub fn update_physical_tuner_epg_settings(&self, c: &PhysicalTunerEpgSettings) -> Result<()> {
-        self.connection().execute("INSERT INTO physical_tuner_epg_settings(physical_tuner_id,enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,preemptible_override,reserve_for_recording_override,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,strftime('%s','now')) ON CONFLICT(physical_tuner_id) DO UPDATE SET enabled_override=?2,auto_tuner_scan_enabled_override=?3,preset_id=?4,target_refresh_secs_override=?5,max_stale_secs_override=?6,min_dwell_secs_override=?7,normal_dwell_secs_override=?8,max_dwell_secs_override=?9,allow_remote_override=?10,prefer_local_override=?11,preemptible_override=?12,reserve_for_recording_override=?13,updated_at=strftime('%s','now')", params![c.physical_tuner_id,c.enabled_override.map(b),c.auto_tuner_scan_enabled_override.map(b),c.preset_id,c.target_refresh_secs_override,c.max_stale_secs_override,c.min_dwell_secs_override,c.normal_dwell_secs_override,c.max_dwell_secs_override,c.allow_remote_override.map(b),c.prefer_local_override.map(b),c.preemptible_override.map(b),c.reserve_for_recording_override.map(b)])?;
+        self.connection().execute("INSERT INTO physical_tuner_epg_settings(physical_tuner_id,enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,reserve_for_recording_override,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,strftime('%s','now')) ON CONFLICT(physical_tuner_id) DO UPDATE SET enabled_override=?2,auto_tuner_scan_enabled_override=?3,preset_id=?4,target_refresh_secs_override=?5,max_stale_secs_override=?6,min_dwell_secs_override=?7,normal_dwell_secs_override=?8,max_dwell_secs_override=?9,allow_remote_override=?10,prefer_local_override=?11,reserve_for_recording_override=?12,updated_at=strftime('%s','now')", params![c.physical_tuner_id,c.enabled_override.map(b),c.auto_tuner_scan_enabled_override.map(b),c.preset_id,c.target_refresh_secs_override,c.max_stale_secs_override,c.min_dwell_secs_override,c.normal_dwell_secs_override,c.max_dwell_secs_override,c.allow_remote_override.map(b),c.prefer_local_override.map(b),c.reserve_for_recording_override.map(b)])?;
         Ok(())
     }
     pub fn get_epg_effective(&self, tuner_id: Option<i64>) -> Result<EffectiveEpgScanConfig> {
@@ -541,10 +552,8 @@ mod tests {
         global.max_dwell_secs = 29;
         global.idle_section_timeout_secs = 31;
         global.max_concurrent_scans = 3;
-        global.reserve_tuners = !global.reserve_tuners;
         global.prefer_local = !global.prefer_local;
         global.allow_remote = !global.allow_remote;
-        global.preemptible = !global.preemptible;
         global.cpu_soft_limit_percent = 41;
         global.cpu_hard_limit_percent = 83;
         global.remote_prefer_metadata_execution = !global.remote_prefer_metadata_execution;
@@ -582,10 +591,8 @@ mod tests {
             global.idle_section_timeout_secs
         );
         assert_eq!(stored.max_concurrent_scans, global.max_concurrent_scans);
-        assert_eq!(stored.reserve_tuners, global.reserve_tuners);
         assert_eq!(stored.prefer_local, global.prefer_local);
         assert_eq!(stored.allow_remote, global.allow_remote);
-        assert_eq!(stored.preemptible, global.preemptible);
         assert_eq!(stored.cpu_soft_limit_percent, global.cpu_soft_limit_percent);
         assert_eq!(stored.cpu_hard_limit_percent, global.cpu_hard_limit_percent);
         assert_eq!(

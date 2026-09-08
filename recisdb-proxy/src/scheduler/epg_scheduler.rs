@@ -4,9 +4,15 @@
 //! arbitration still belongs to `tuner::acquire::acquire`, which owns the
 //! `SlotPermit` and all policy/preemption side effects.
 
+use super::epg_dwell::{
+    evaluate_dwell, mux_reached_target, DwellObservation, DwellVerdict, EpgDwellConfig,
+};
 use crate::node::{MuxLeaseGuard, MuxLeaseManager, NodeTransportState};
 use crate::{
-    database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState},
+    database::{
+        epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState, EpgScanStatus,
+        EpgServiceCoverageUpsert,
+    },
     server::listener::DatabaseHandle,
     tuner::{
         acquire::{self, AcquireError, AcquireRequest},
@@ -16,23 +22,54 @@ use crate::{
 
 #[derive(Debug, thiserror::Error)]
 enum EpgScanError {
-    #[error("CPU hard limit reached")]
-    CpuHardLimit,
-    #[error("no TS data during EPG dwell")]
-    NoTsData,
     #[error(transparent)]
     Acquire(#[from] AcquireError),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpgScanOutcome {
+    pub status: EpgScanStatus,
+    pub elapsed_secs: i64,
+    pub sections_seen: u64,
+    pub services_total: usize,
+    pub services_complete: usize,
+    pub coverage_before: Option<i64>,
+    pub coverage_after: Option<i64>,
+}
+
+fn startup_wait_secs(delay_secs: i64, jitter_secs: i64, random_value: u32) -> u64 {
+    let base = delay_secs.max(1) as u64;
+    let jitter = jitter_secs.max(0) as u64;
+    base + u64::from(random_value) % (jitter + 1)
+}
+
+fn startup_random_value() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0)
+}
+
+fn full_evaluation_is_due(
+    last_evaluation: Option<Instant>,
+    scheduler_interval_secs: i64,
+    now: Instant,
+) -> bool {
+    last_evaluation.is_none_or(|last| {
+        now.duration_since(last) >= Duration::from_secs(scheduler_interval_secs.max(1) as u64)
+    })
+}
 use recisdb_protocol::{broadcast_region::classify_nid, BroadcastType};
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::Mutex,
+    sync::{watch, Notify},
     time::{interval, timeout},
 };
 
@@ -128,6 +165,7 @@ pub fn decide(
     next: Option<i64>,
     coverage_until: Option<i64>,
     last_eit_received_at: Option<i64>,
+    last_complete_at: Option<i64>,
 ) -> EpgScanDecision {
     if !config.enabled {
         return EpgScanDecision::Disabled;
@@ -146,8 +184,11 @@ pub fn decide(
     }
     let target_covered =
         coverage_until.is_some_and(|at| at >= now + config.target_future_coverage_hours * 3600);
-    let fresh = last_eit_received_at.is_some_and(|at| at + config.max_stale_secs > now);
-    if (target_covered && fresh) || next.is_some_and(|at| at > now) {
+    // target_refresh is a soft refresh interval; max_stale is the hard limit
+    // after which even recently sufficient coverage cannot be trusted.
+    let stale = last_complete_at.is_none_or(|at| at + config.target_refresh_secs <= now);
+    let hard_stale = last_eit_received_at.is_none_or(|at| at + config.max_stale_secs <= now);
+    if target_covered && !stale && !hard_stale {
         return EpgScanDecision::NotDue;
     }
     EpgScanDecision::Start
@@ -157,9 +198,42 @@ pub struct EpgScanScheduler {
     database: DatabaseHandle,
     pool: Arc<TunerPool>,
     active: Arc<AtomicUsize>,
-    stopped: Arc<Mutex<bool>>,
+    stopped: watch::Sender<bool>,
+    notify: Arc<Notify>,
+    in_flight: Arc<StdMutex<HashSet<(u16, u16)>>>,
     mux_leases: Arc<MuxLeaseManager>,
     remote_state: Arc<tokio::sync::RwLock<Option<Arc<NodeTransportState>>>>,
+}
+
+struct ActiveScanGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ActiveScanGuard {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self { active }
+    }
+}
+
+impl Drop for ActiveScanGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct InFlightGuard {
+    in_flight: Arc<StdMutex<HashSet<(u16, u16)>>>,
+    mux: (u16, u16),
+    notify: Arc<Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        in_flight.remove(&self.mux);
+        self.notify.notify_one();
+    }
 }
 
 impl EpgScanScheduler {
@@ -172,7 +246,9 @@ impl EpgScanScheduler {
             database,
             pool,
             active: Arc::new(AtomicUsize::new(0)),
-            stopped: Arc::new(Mutex::new(false)),
+            stopped: watch::channel(false).0,
+            notify: Arc::new(Notify::new()),
+            in_flight: Arc::new(StdMutex::new(HashSet::new())),
             mux_leases,
             remote_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
@@ -185,31 +261,64 @@ impl EpgScanScheduler {
         tokio::spawn(async move { self.run().await })
     }
     pub async fn stop(&self) {
-        *self.stopped.lock().await = true;
+        let _ = self.stopped.send(true);
+        self.notify.notify_waiters();
     }
-    async fn run(&self) {
+    async fn run(self: &Arc<Self>) {
         // Let EpgWriter install its broadcast subscriber before the first
         // scheduled acquisition. Runtime settings remain DB-backed.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let startup = self.database.lock().await.get_epg_global_settings();
+        let (delay_secs, jitter_secs) = startup
+            .map(|config| (config.startup_delay_secs, config.startup_jitter_secs))
+            .unwrap_or((1, 0));
+        let startup_wait = Duration::from_secs(startup_wait_secs(
+            delay_secs,
+            jitter_secs,
+            startup_random_value(),
+        ));
         let mut tick = interval(Duration::from_secs(5));
-        loop {
-            tick.tick().await;
-            if *self.stopped.lock().await {
-                break;
-            }
-            if let Err(e) = self.evaluate().await {
-                log::warn!("EPG scheduler evaluation failed: {}", e)
+        let mut stopped = self.stopped.subscribe();
+        tokio::select! {
+            _ = tokio::time::sleep(startup_wait) => {}
+            result = stopped.changed() => {
+                if result.is_err() || *stopped.borrow() { return; }
             }
         }
+        let mut last_evaluation = None;
+        let mut scheduler_interval_secs = 300;
+        loop {
+            let tick_woke = tokio::select! {
+                _ = tick.tick() => true,
+                _ = self.notify.notified() => false,
+                result = stopped.changed() => {
+                    if result.is_err() || *stopped.borrow() { break; }
+                    continue;
+                }
+            };
+            if *stopped.borrow() {
+                break;
+            }
+            if tick_woke {
+                if !full_evaluation_is_due(last_evaluation, scheduler_interval_secs, Instant::now())
+                {
+                    continue;
+                }
+            }
+            match self.evaluate().await {
+                Ok(interval) => scheduler_interval_secs = interval,
+                Err(e) => log::warn!("EPG scheduler evaluation failed: {}", e),
+            }
+            last_evaluation = Some(Instant::now());
+        }
     }
-    async fn evaluate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn evaluate(self: &Arc<Self>) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let (config, states) = {
             let db = self.database.lock().await;
             db.refresh_epg_coverage()?;
             (db.get_epg_global_settings()?, db.get_epg_scan_states()?)
         };
         let now = chrono::Utc::now().timestamp();
-        let candidate = {
+        let candidates = {
             let db = self.database.lock().await;
             let drivers = db.get_all_bon_drivers()?;
             let mut targets = Vec::new();
@@ -226,72 +335,141 @@ impl EpgScanScheduler {
                     targets.push(EpgTarget::from_state(channel.nid, channel.tsid, state));
                 }
             }
-            let Some(target) = select_next_target(&targets, now, &config) else {
-                return Ok(());
-            };
-            drivers.iter().find_map(|driver| {
-                db.get_enabled_channels_by_bon_driver(driver.id)
-                    .ok()?
-                    .into_iter()
-                    .find(|channel| channel.nid == target.network_id && channel.tsid == target.tsid)
-                    .map(|channel| (driver.clone(), channel))
-            })
+            rank_targets(&targets, now, &config)
+                .into_iter()
+                .filter_map(|target| {
+                    drivers.iter().find_map(|driver| {
+                        db.get_enabled_channels_by_bon_driver(driver.id)
+                            .ok()?
+                            .into_iter()
+                            .find(|channel| {
+                                channel.nid == target.network_id && channel.tsid == target.tsid
+                            })
+                            .map(|channel| (driver.clone(), channel))
+                    })
+                })
+                .collect::<Vec<_>>()
         };
-        let Some((driver, channel)) = candidate else {
-            return Ok(());
-        };
-        let config = {
-            let db = self.database.lock().await;
-            db.get_epg_effective(Some(driver.id))?.effective
-        };
-        let mux = crate::node::LogicalMuxId {
-            nid: channel.nid,
-            tsid: channel.tsid,
-        };
-        let Some(_mux_lease): Option<MuxLeaseGuard> = self.mux_leases.try_acquire(mux) else {
-            let db = self.database.lock().await;
-            let reason = epg_reason(
-                EpgReasonCode::MuxLeaseUnavailable,
-                serde_json::json!({"network_id": channel.nid, "tsid": channel.tsid}),
-            );
-            db.record_epg_deferred(channel.nid, channel.tsid, &reason, true)?;
-            return Ok(());
-        };
-        let state = states
-            .iter()
-            .find(|state| state.network_id == channel.nid && state.tsid == channel.tsid);
-        let cpu = cpu_percent();
-        let decision = decide(
-            &config,
-            self.active.load(Ordering::SeqCst),
-            cpu,
-            now,
-            state.and_then(|s| s.next_eligible_at),
-            state.and_then(|s| s.coverage_until),
-            state.and_then(|s| s.last_eit_received_at),
-        );
-        if decision != EpgScanDecision::Start {
-            if let Some(code) = decision.reason_code() {
-                let record_history = !matches!(
-                    decision,
-                    EpgScanDecision::NotDue | EpgScanDecision::AutoTunerScanDisabled
-                );
-                let reason = epg_reason(
-                    code,
-                    decision_details(
-                        decision,
-                        &config,
-                        self.active.load(Ordering::SeqCst),
-                        cpu,
-                        now,
-                        state.and_then(|s| s.next_eligible_at),
-                        channel.nid,
-                        channel.tsid,
-                    ),
-                );
-                let db = self.database.lock().await;
-                db.record_epg_deferred(channel.nid, channel.tsid, &reason, record_history)?;
+        let slots = (config.max_concurrent_scans.max(1) as usize)
+            .saturating_sub(self.active.load(Ordering::SeqCst));
+        if slots == 0 {
+            return Ok(config.scheduler_interval_secs);
+        }
+        let mut started = 0;
+        for (driver, channel) in candidates {
+            if started >= slots {
+                break;
             }
+            let mux_key = (channel.nid, channel.tsid);
+            {
+                let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                if !in_flight.insert(mux_key) {
+                    continue;
+                }
+            }
+            let effective = {
+                let db = self.database.lock().await;
+                db.get_epg_effective(Some(driver.id))?.effective
+            };
+            let state = states
+                .iter()
+                .find(|state| state.network_id == channel.nid && state.tsid == channel.tsid);
+            let cpu = cpu_percent();
+            let decision = decide(
+                &effective,
+                self.active.load(Ordering::SeqCst),
+                cpu,
+                now,
+                state.and_then(|s| s.next_eligible_at),
+                state.and_then(|s| s.section_coverage_until),
+                state.and_then(|s| s.last_eit_received_at),
+                state.and_then(|s| s.last_complete_at),
+            );
+            if decision != EpgScanDecision::Start {
+                {
+                    let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                    in_flight.remove(&mux_key);
+                }
+                if decision == EpgScanDecision::AtCapacity {
+                    break;
+                }
+                if let Some(code) = decision.reason_code() {
+                    let record_history = !matches!(
+                        decision,
+                        EpgScanDecision::NotDue | EpgScanDecision::AutoTunerScanDisabled
+                    );
+                    let reason = epg_reason(
+                        code,
+                        decision_details(
+                            decision,
+                            &effective,
+                            self.active.load(Ordering::SeqCst),
+                            cpu,
+                            now,
+                            state.and_then(|s| s.next_eligible_at),
+                            channel.nid,
+                            channel.tsid,
+                        ),
+                    );
+                    let db = self.database.lock().await;
+                    db.record_epg_deferred(channel.nid, channel.tsid, &reason, record_history)?;
+                }
+                continue;
+            }
+            let mux = crate::node::LogicalMuxId {
+                nid: channel.nid,
+                tsid: channel.tsid,
+            };
+            let Some(lease) = self.mux_leases.try_acquire(mux) else {
+                self.in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&mux_key);
+                let db = self.database.lock().await;
+                let reason = epg_reason(
+                    EpgReasonCode::MuxLeaseUnavailable,
+                    serde_json::json!({"network_id": channel.nid, "tsid": channel.tsid}),
+                );
+                db.record_epg_deferred(channel.nid, channel.tsid, &reason, true)?;
+                continue;
+            };
+            let active_guard = ActiveScanGuard::new(self.active.clone());
+            let in_flight_guard = InFlightGuard {
+                in_flight: self.in_flight.clone(),
+                mux: mux_key,
+                notify: self.notify.clone(),
+            };
+            let scheduler = Arc::clone(self);
+            let stopped = self.stopped.subscribe();
+            tokio::spawn(async move {
+                let _ = scheduler
+                    .run_scan(
+                        driver,
+                        channel,
+                        effective,
+                        lease,
+                        active_guard,
+                        in_flight_guard,
+                        stopped,
+                    )
+                    .await;
+            });
+            started += 1;
+        }
+        Ok(config.scheduler_interval_secs)
+    }
+
+    async fn run_scan(
+        self: Arc<Self>,
+        driver: crate::database::BonDriverRecord,
+        channel: crate::database::ChannelRecord,
+        config: EpgGlobalSettings,
+        _mux_lease: MuxLeaseGuard,
+        _active_guard: ActiveScanGuard,
+        _in_flight_guard: InFlightGuard,
+        mut stopped: watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if *stopped.borrow() {
             return Ok(());
         }
         let remote_available = if config.allow_remote {
@@ -321,7 +499,17 @@ impl EpgScanScheduler {
             )?
         };
         if execution_path == EpgExecutionPath::RemoteMetadata {
-            if let Err(error) = self.try_remote_metadata(channel.nid, channel.tsid).await {
+            let metadata_result = tokio::select! {
+                _ = stopped.changed() => {
+                    let now = chrono::Utc::now().timestamp();
+                    let db = self.database.lock().await;
+                    let _ = db.epg_scan_finished(history, "preempted", channel.nid, channel.tsid, None);
+                    let _ = db.set_epg_scan_status(channel.nid, channel.tsid, EpgScanStatus::Preempted, now);
+                    return Ok(());
+                }
+                result = self.try_remote_metadata(&config, channel.nid, channel.tsid) => result,
+            };
+            if let Err(error) = metadata_result {
                 let reason = epg_reason(
                     EpgReasonCode::RemoteMetadataFailed,
                     serde_json::json!({
@@ -340,14 +528,41 @@ impl EpgScanScheduler {
                 );
                 let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
             } else {
+                let outcome = metadata_result.unwrap();
+                let status = if matches!(
+                    outcome.status,
+                    EpgScanStatus::Complete | EpgScanStatus::Partial
+                ) {
+                    "completed"
+                } else if outcome.status == EpgScanStatus::Preempted {
+                    "preempted"
+                } else {
+                    "failed"
+                };
+                log::info!("EPG scan nid={} tsid={} path=remote_metadata status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
                 let db = self.database.lock().await;
-                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
+                let details = outcome_details(&outcome);
+                let _ = db.epg_scan_finished(
+                    history,
+                    status,
+                    channel.nid,
+                    channel.tsid,
+                    if status == "completed" {
+                        None
+                    } else {
+                        Some(&details)
+                    },
+                );
                 let _ = db.refresh_epg_coverage();
                 return Ok(());
             }
         }
         if execution_path == EpgExecutionPath::RemoteTs {
-            if let Err(error) = self.try_remote_ts(&config, channel.nid, channel.tsid).await {
+            let remote_ts_result = self
+                .try_remote_ts(&config, channel.nid, channel.tsid, &mut stopped)
+                .await;
+            if remote_ts_result.is_err() {
+                let error = remote_ts_result.unwrap_err();
                 let reason = epg_reason(
                     EpgReasonCode::RemoteTsFailed,
                     serde_json::json!({
@@ -366,11 +581,42 @@ impl EpgScanScheduler {
                 );
                 let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
             } else {
+                let outcome = remote_ts_result.unwrap();
+                let status = if matches!(
+                    outcome.status,
+                    EpgScanStatus::Complete | EpgScanStatus::Partial
+                ) {
+                    "completed"
+                } else if outcome.status == EpgScanStatus::Preempted {
+                    "preempted"
+                } else {
+                    "failed"
+                };
+                log::info!("EPG scan nid={} tsid={} path=remote_ts status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
                 let db = self.database.lock().await;
-                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
+                let details = outcome_details(&outcome);
+                let _ = db.epg_scan_finished(
+                    history,
+                    status,
+                    channel.nid,
+                    channel.tsid,
+                    if status == "completed" {
+                        None
+                    } else {
+                        Some(&details)
+                    },
+                );
                 let _ = db.refresh_epg_coverage();
                 return Ok(());
             }
+        }
+        if *stopped.borrow() {
+            let now = chrono::Utc::now().timestamp();
+            let db = self.database.lock().await;
+            let _ = db.epg_scan_finished(history, "preempted", channel.nid, channel.tsid, None);
+            let _ =
+                db.set_epg_scan_status(channel.nid, channel.tsid, EpgScanStatus::Preempted, now);
+            return Ok(());
         }
         let Some((space, number)) = channel.bon_space.zip(channel.bon_channel) else {
             let reason = epg_reason(
@@ -382,18 +628,39 @@ impl EpgScanScheduler {
             return Ok(());
         };
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
-        self.active.fetch_add(1, Ordering::SeqCst);
-        let result = self.scan_one(&config, key, channel.id).await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        let result = self
+            .scan_one(&config, key, channel.nid, channel.tsid, &mut stopped)
+            .await;
         let db = self.database.lock().await;
         match result {
-            Ok(()) => {
-                let _ = db.epg_scan_finished(history, "completed", channel.nid, channel.tsid, None);
+            Ok(outcome) => {
+                let status = if matches!(
+                    outcome.status,
+                    EpgScanStatus::Complete | EpgScanStatus::Partial
+                ) {
+                    "completed"
+                } else if outcome.status == EpgScanStatus::Preempted {
+                    "preempted"
+                } else {
+                    "failed"
+                };
+                let details = outcome_details(&outcome);
+                log::info!("EPG scan nid={} tsid={} path=local status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
+                let _ = db.epg_scan_finished(
+                    history,
+                    status,
+                    channel.nid,
+                    channel.tsid,
+                    if status == "completed" {
+                        None
+                    } else {
+                        Some(&details)
+                    },
+                );
             }
             Err(e) => {
                 let (code, conflict) =
                     match &e {
-                        EpgScanError::CpuHardLimit => (EpgReasonCode::CpuHardLimit, None),
                         EpgScanError::Acquire(AcquireError::AtCapacity { conflict, .. }) => {
                             let code = conflict.as_ref().map_or(
                                 EpgReasonCode::NoTunerAvailable,
@@ -437,9 +704,10 @@ impl EpgScanScheduler {
 
     async fn try_remote_metadata(
         &self,
+        config: &EpgGlobalSettings,
         network_id: u16,
         tsid: u16,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<EpgScanOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let Some(state) = self.remote_state.read().await.clone() else {
             return Err("node transport is not ready".into());
         };
@@ -452,6 +720,8 @@ impl EpgScanScheduler {
             };
             (store.local_identity()?, store.remote_routes_for(mux)?)
         };
+        let dwell = EpgDwellConfig::from_settings(config);
+        let coverage_before = self.coverage_until(network_id, tsid).await;
         for route in routes {
             let credential = {
                 let db = self.database.lock().await;
@@ -475,7 +745,7 @@ impl EpgScanScheduler {
                         ),
                         stream_class: recisdb_protocol::StreamClass::View,
                         claim: crate::tuner::EffectiveClaim::new(-1000, false),
-                        remaining_ms: 300_000,
+                        remaining_ms: (dwell.max_dwell.as_secs() * 1000).saturating_add(30_000),
                         origin_node: local.node_id.clone(),
                         visited_nodes: vec![local.node_id.clone()],
                         hop_count: 0,
@@ -483,16 +753,34 @@ impl EpgScanScheduler {
                     },
                     mux: route.mux,
                     sid: None,
-                    dwell_secs: 30,
+                    dwell_secs: dwell.max_dwell.as_secs(),
                     spent_ms: 0,
+                    dwell: Some(dwell.into()),
                 };
                 if let Ok(reply) = client
                     .collect_epg_metadata(&endpoint.address, &request)
                     .await
                 {
+                    let has_programs = !reply.programs.is_empty();
+                    let status = remote_metadata_status(reply.status.as_deref(), has_programs);
                     let records = reply.programs.into_iter().map(Into::into);
                     crate::tuner::epg_collector::submit_metadata_records(records);
-                    return Ok(());
+                    let now = chrono::Utc::now().timestamp();
+                    let coverage_after = self.coverage_until(network_id, tsid).await;
+                    let db = self.database.lock().await;
+                    let _ = db.set_epg_scan_status(network_id, tsid, status, now);
+                    let _ = db.set_epg_remote_coverage(network_id, tsid, reply.coverage_until, now);
+                    return Ok(EpgScanOutcome {
+                        status,
+                        elapsed_secs: reply.elapsed_secs.unwrap_or_default(),
+                        sections_seen: reply.sections_seen.unwrap_or_default(),
+                        services_total: reply.services_total.unwrap_or_default(),
+                        services_complete: reply.services_complete.unwrap_or_default(),
+                        coverage_before,
+                        // Remote metadata contains no local EIT sections, so this
+                        // remains section-derived local coverage, not submitted rows.
+                        coverage_after,
+                    });
                 }
             }
         }
@@ -505,7 +793,8 @@ impl EpgScanScheduler {
         config: &EpgGlobalSettings,
         network_id: u16,
         tsid: u16,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        stopped: &mut watch::Receiver<bool>,
+    ) -> Result<EpgScanOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let Some(state) = self.remote_state.read().await.clone() else {
             return Err("node transport is not ready".into());
         };
@@ -562,34 +851,92 @@ impl EpgScanScheduler {
                 };
                 let mut subscription = remote.subscribe();
                 let mut collector = crate::tuner::epg_collector::EpgCollector::new_metadata();
-                let deadline = tokio::time::Instant::now()
-                    + Duration::from_secs(config.max_dwell_secs.clamp(1, 300) as u64);
-                loop {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
+                let progress = collector.progress().clone();
+                let coverage_before = self.coverage_until(network_id, tsid).await;
+                let started = tokio::time::Instant::now();
+                let dwell = EpgDwellConfig::from_settings(config);
+                let mut last_progress = progress.progress_counter();
+                let mut last_progress_at = started;
+                let status = loop {
+                    if *stopped.borrow() {
+                        break EpgScanStatus::Preempted;
                     }
-                    match timeout(
-                        remaining.min(Duration::from_secs(
-                            config.idle_section_timeout_secs.max(1) as u64
-                        )),
-                        subscription.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(chunk)) => {
-                            collector.process_ts_chunk(&chunk);
+                    let counter = progress.progress_counter();
+                    if counter != last_progress {
+                        last_progress = counter;
+                        last_progress_at = tokio::time::Instant::now();
+                    }
+                    let mux = progress.mux_completion(network_id, tsid);
+                    let observation = DwellObservation {
+                        elapsed: started.elapsed(),
+                        since_progress: last_progress_at.elapsed(),
+                        any_sections: mux.sections_seen > 0,
+                        reached_target: mux_reached_target(
+                            &mux,
+                            chrono::Utc::now().timestamp(),
+                            dwell.target_future_coverage_hours,
+                        ),
+                        any_service_complete: mux.services_schedule_basic_complete > 0,
+                        stream_closed: false,
+                        cpu_hard_limit: cpu_percent() as i64 >= config.cpu_hard_limit_percent,
+                    };
+                    match evaluate_dwell(&dwell, &observation) {
+                        DwellVerdict::Stop(status) => break status,
+                        DwellVerdict::Continue => {}
+                    }
+                    let stream_closed = tokio::select! {
+                        _ = stopped.changed() => break EpgScanStatus::Preempted,
+                        result = timeout(Duration::from_secs(1), subscription.recv()) =>
+                            match result {
+                                Ok(Ok(chunk)) => {
+                                    collector.process_ts_chunk(&chunk);
+                                    false
+                                }
+                                Err(_)
+                                | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => false,
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => true,
+                            }
+                    };
+                    if stream_closed {
+                        let mux = progress.mux_completion(network_id, tsid);
+                        let observation = DwellObservation {
+                            elapsed: started.elapsed(),
+                            since_progress: last_progress_at.elapsed(),
+                            any_sections: mux.sections_seen > 0,
+                            reached_target: mux_reached_target(
+                                &mux,
+                                chrono::Utc::now().timestamp(),
+                                dwell.target_future_coverage_hours,
+                            ),
+                            any_service_complete: mux.services_schedule_basic_complete > 0,
+                            stream_closed: true,
+                            cpu_hard_limit: cpu_percent() as i64 >= config.cpu_hard_limit_percent,
+                        };
+                        if let DwellVerdict::Stop(status) = evaluate_dwell(&dwell, &observation) {
+                            break status;
                         }
-                        Ok(Err(_)) | Err(_) => break,
                     }
-                }
+                };
                 let records = collector.drain_metadata_records();
                 if !records.is_empty() {
                     crate::tuner::epg_collector::submit_metadata_records(records);
-                    drop(remote);
-                    return Ok(());
                 }
+                let now = chrono::Utc::now().timestamp();
+                self.persist_progress(&progress, now).await;
+                let mux = progress.mux_completion(network_id, tsid);
+                let coverage_after = self.coverage_until(network_id, tsid).await;
+                let db = self.database.lock().await;
+                let _ = db.set_epg_scan_status(network_id, tsid, status, now);
                 drop(remote);
+                return Ok(EpgScanOutcome {
+                    status,
+                    elapsed_secs: started.elapsed().as_secs() as i64,
+                    sections_seen: mux.sections_seen,
+                    services_total: mux.services_total,
+                    services_complete: mux.services_schedule_basic_complete,
+                    coverage_before,
+                    coverage_after,
+                });
             }
         }
         let _ = state;
@@ -599,8 +946,10 @@ impl EpgScanScheduler {
         &self,
         config: &EpgGlobalSettings,
         key: ChannelKey,
-        channel_id: i64,
-    ) -> Result<(), EpgScanError> {
+        network_id: u16,
+        tsid: u16,
+        stopped: &mut watch::Receiver<bool>,
+    ) -> Result<EpgScanOutcome, EpgScanError> {
         let outcome = acquire::acquire(
             &self.pool,
             &self.database,
@@ -617,43 +966,150 @@ impl EpgScanScheduler {
             },
         )
         .await?;
+        let progress = outcome.tuner.epg_progress();
+        let coverage_before = self.coverage_until(network_id, tsid).await;
         let mut subscription = outcome.tuner.subscribe_with_claim_class(
             -1000,
             false,
             crate::tuner::shared::TunerUsage::EpgActiveScan,
         );
         let started = tokio::time::Instant::now();
-        let mut useful = false;
-        loop {
-            if cpu_percent() as i64 >= config.cpu_hard_limit_percent {
-                return Err(EpgScanError::CpuHardLimit);
+        let mut last_progress = progress.progress_counter();
+        let mut last_progress_at = started;
+        let dwell = EpgDwellConfig::from_settings(config);
+        let status = loop {
+            if *stopped.borrow() {
+                break EpgScanStatus::Preempted;
             }
-            let elapsed = started.elapsed();
-            if elapsed >= Duration::from_secs(config.max_dwell_secs as u64) {
-                break;
+            let counter = progress.progress_counter();
+            if counter != last_progress {
+                last_progress = counter;
+                last_progress_at = tokio::time::Instant::now();
             }
-            let wait_for = Duration::from_secs(config.idle_section_timeout_secs.max(1) as u64);
-            match timeout(wait_for, subscription.recv()).await {
-                Ok(Ok(_)) => {
-                    useful = true;
-                    if elapsed >= Duration::from_secs(config.min_dwell_secs as u64) && useful {
-                        break;
+            let mux = progress.mux_completion(network_id, tsid);
+            let observation = DwellObservation {
+                elapsed: started.elapsed(),
+                since_progress: last_progress_at.elapsed(),
+                any_sections: mux.sections_seen > 0,
+                reached_target: mux_reached_target(
+                    &mux,
+                    chrono::Utc::now().timestamp(),
+                    dwell.target_future_coverage_hours,
+                ),
+                any_service_complete: mux.services_schedule_basic_complete > 0,
+                stream_closed: false,
+                cpu_hard_limit: cpu_percent() as i64 >= config.cpu_hard_limit_percent,
+            };
+            match evaluate_dwell(&dwell, &observation) {
+                DwellVerdict::Stop(status) => break status,
+                DwellVerdict::Continue => {}
+            }
+            let stream_closed = tokio::select! {
+                _ = stopped.changed() => break EpgScanStatus::Preempted,
+                result = timeout(Duration::from_secs(1), subscription.recv()) =>
+                    match result {
+                        Ok(Ok(_)) | Err(_) => false,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => false,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => true,
                     }
+            };
+            if stream_closed {
+                let mux = progress.mux_completion(network_id, tsid);
+                let observation = DwellObservation {
+                    elapsed: started.elapsed(),
+                    since_progress: last_progress_at.elapsed(),
+                    any_sections: mux.sections_seen > 0,
+                    reached_target: mux_reached_target(
+                        &mux,
+                        chrono::Utc::now().timestamp(),
+                        dwell.target_future_coverage_hours,
+                    ),
+                    any_service_complete: mux.services_schedule_basic_complete > 0,
+                    stream_closed: true,
+                    cpu_hard_limit: cpu_percent() as i64 >= config.cpu_hard_limit_percent,
+                };
+                if let DwellVerdict::Stop(status) = evaluate_dwell(&dwell, &observation) {
+                    break status;
                 }
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    if elapsed >= Duration::from_secs(config.min_dwell_secs as u64) {
-                        break;
-                    }
-                }
+                // Closed before `min_dwell`: `recv()` now returns
+                // immediately every time, so without this the loop spins at
+                // 100% CPU until the minimum dwell elapses.
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
+        };
+        let now = chrono::Utc::now().timestamp();
+        self.persist_progress(&progress, now).await;
+        let mux = progress.mux_completion(network_id, tsid);
+        let coverage_after = self.coverage_until(network_id, tsid).await;
+        {
+            let db = self.database.lock().await;
+            let _ = db.set_epg_scan_status(network_id, tsid, status, now);
         }
-        if !useful {
-            return Err(EpgScanError::NoTsData);
-        }
-        let _ = channel_id;
-        Ok(())
+        Ok(EpgScanOutcome {
+            status,
+            elapsed_secs: started.elapsed().as_secs() as i64,
+            sections_seen: mux.sections_seen,
+            services_total: mux.services_total,
+            services_complete: mux.services_schedule_basic_complete,
+            coverage_before,
+            coverage_after,
+        })
     }
+
+    async fn coverage_until(&self, network_id: u16, tsid: u16) -> Option<i64> {
+        let db = self.database.lock().await;
+        db.get_epg_mux_coverage()
+            .ok()?
+            .into_iter()
+            .find(|coverage| coverage.network_id == network_id && coverage.tsid == tsid)
+            .and_then(|coverage| coverage.coverage_until)
+    }
+
+    async fn persist_progress(&self, progress: &crate::tuner::EpgProgress, now: i64) {
+        let rows = progress
+            .snapshot()
+            .into_iter()
+            .filter(|completion| completion.key.pid == crate::ts_analyzer::pid::EIT)
+            .map(|completion| EpgServiceCoverageUpsert {
+                network_id: completion.key.original_network_id,
+                tsid: completion.key.transport_stream_id,
+                service_id: completion.key.service_id,
+                pf_complete: completion.pf_complete,
+                schedule_basic_complete: completion.schedule_basic_complete,
+                schedule_extended_complete: completion.schedule_extended_complete,
+                coverage_until: completion.schedule_coverage_until,
+                sections_seen: i64::from(completion.sections_seen),
+                last_section_at: Some(completion.last_section_at),
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
+        let db = self.database.lock().await;
+        let _ = db.upsert_epg_service_coverage(&rows);
+        let _ = db.refresh_epg_section_coverage();
+    }
+}
+
+fn outcome_details(outcome: &EpgScanOutcome) -> String {
+    serde_json::json!({
+        "status": outcome.status.as_str(),
+        "elapsed_secs": outcome.elapsed_secs,
+        "sections_seen": outcome.sections_seen,
+        "services_total": outcome.services_total,
+        "services_complete": outcome.services_complete,
+        "coverage_before": outcome.coverage_before,
+        "coverage_after": outcome.coverage_after,
+    })
+    .to_string()
+}
+
+fn remote_metadata_status(status: Option<&str>, has_programs: bool) -> EpgScanStatus {
+    status
+        .and_then(EpgScanStatus::from_str_opt)
+        .unwrap_or(if has_programs {
+            EpgScanStatus::Partial
+        } else {
+            EpgScanStatus::NoData
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -661,8 +1117,12 @@ struct EpgTarget {
     network_id: u16,
     tsid: u16,
     broadcast_type: BroadcastType,
-    coverage_until: Option<i64>,
+    /// EIT section 由来の mux coverage。判定に使う。
+    section_coverage_until: Option<i64>,
+    /// programs 由来の補助指標。診断表示用で、判定には使わない。
+    program_coverage_until: Option<i64>,
     last_eit_received_at: Option<i64>,
+    last_complete_at: Option<i64>,
     next_eligible_at: Option<i64>,
     failure_count: i64,
 }
@@ -673,8 +1133,10 @@ impl EpgTarget {
             network_id,
             tsid,
             broadcast_type: classify_nid(network_id).0,
-            coverage_until: state.and_then(|s| s.coverage_until),
+            section_coverage_until: state.and_then(|s| s.section_coverage_until),
+            program_coverage_until: state.and_then(|s| s.coverage_until),
             last_eit_received_at: state.and_then(|s| s.last_eit_received_at),
+            last_complete_at: state.and_then(|s| s.last_complete_at),
             next_eligible_at: state.and_then(|s| s.next_eligible_at),
             failure_count: state.map_or(0, |s| s.failure_count),
         }
@@ -686,44 +1148,101 @@ fn select_next_target(
     now: i64,
     config: &EpgGlobalSettings,
 ) -> Option<EpgTarget> {
+    rank_targets(targets, now, config).into_iter().next()
+}
+
+fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> Vec<EpgTarget> {
+    let mut candidates = targets
+        .iter()
+        .copied()
+        .filter(|target| target_needs_scan(target, now, config))
+        .collect::<Vec<_>>();
+
+    // BS/CS Other-TS EIT can fill every TS in one network from one tuned mux.
+    // FourK is excluded: dantto4k-converted TS EIT does not carry other-TS data.
+    let mut representatives = Vec::new();
+    for network_id in candidates
+        .iter()
+        .filter(|target| matches!(target.broadcast_type, BroadcastType::BS | BroadcastType::CS))
+        .map(|target| target.network_id)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let group = candidates
+            .iter()
+            .copied()
+            .filter(|target| target.network_id == network_id)
+            .collect::<Vec<_>>();
+        if let Some(representative) = choose_satellite_representative(&group, now, config) {
+            representatives.push(representative);
+        }
+    }
+    candidates.retain(|target| {
+        matches!(
+            target.broadcast_type,
+            BroadcastType::Terrestrial | BroadcastType::FourK
+        )
+    });
+    candidates.extend(representatives);
+    candidates.sort_by_key(|target| {
+        let coverage_missing = !target
+            .section_coverage_until
+            .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
+        let stale = !target
+            .last_complete_at
+            .is_some_and(|at| at + config.target_refresh_secs > now);
+        (
+            !coverage_missing,
+            !stale,
+            target.failure_count,
+            target.section_coverage_until.unwrap_or(i64::MIN),
+            target.tsid,
+        )
+    });
+    candidates
+}
+
+fn target_needs_scan(target: &EpgTarget, now: i64, config: &EpgGlobalSettings) -> bool {
+    let covered = target
+        .section_coverage_until
+        .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
+    // target_refresh is a soft candidate interval; max_stale is a hard EIT
+    // freshness threshold. Same rule applies to terrestrial, BS, CS, FourK.
+    let stale = target
+        .last_complete_at
+        .is_none_or(|at| at + config.target_refresh_secs <= now);
+    let hard_stale = target
+        .last_eit_received_at
+        .is_none_or(|at| at + config.max_stale_secs <= now);
+    !covered || stale || hard_stale
+}
+
+/// 同じ network_id の衛星ターゲット群から、選局する代表を1つ選ぶ。
+/// gain は、この mux を取ればまとめて更新できる「要スキャン TS 数」。
+/// cost は現状 tsid 昇順の安定タイブレークだけ。将来は tuner 占有、CPU、
+/// remote 通信、4K 変換負荷を比較対象にできる。
+fn choose_satellite_representative(
+    targets: &[EpgTarget],
+    now: i64,
+    config: &EpgGlobalSettings,
+) -> Option<EpgTarget> {
+    let eligible = targets
+        .iter()
+        .copied()
+        .filter(|target| target_needs_scan(target, now, config));
+    if eligible.count() == 0 {
+        return None;
+    }
     targets
         .iter()
         .copied()
         .filter(|target| target_needs_scan(target, now, config))
         .min_by_key(|target| {
-            let coverage_missing = !target
-                .coverage_until
-                .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
-            let stale = !target
-                .last_eit_received_at
-                .is_some_and(|at| at + config.max_stale_secs > now);
             (
-                !coverage_missing,
-                !stale,
                 target.failure_count,
-                target.coverage_until.unwrap_or(i64::MIN),
+                target.section_coverage_until.unwrap_or(i64::MIN),
+                target.tsid,
             )
         })
-}
-
-/// Satellite EIT may populate another multiplex's `(NID, TSID)` directly.
-/// Therefore a satellite target with sufficient retained coverage is skipped;
-/// terrestrial targets remain independently eligible per physical TS.
-fn target_needs_scan(target: &EpgTarget, now: i64, config: &EpgGlobalSettings) -> bool {
-    let covered = target
-        .coverage_until
-        .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
-    match target.broadcast_type {
-        BroadcastType::Terrestrial => {
-            let fresh = target
-                .last_eit_received_at
-                .is_some_and(|at| at + config.max_stale_secs > now);
-            !(covered && fresh)
-        }
-        // For satellite multiplexes, Other-TS EIT may have supplied this
-        // target without a direct tune. Retained coverage is sufficient.
-        BroadcastType::BS | BroadcastType::CS | BroadcastType::FourK => !covered,
-    }
 }
 
 fn cpu_percent_from_ticks(
@@ -752,7 +1271,7 @@ fn cpu_percent_from_ticks(
 }
 
 #[cfg(target_os = "linux")]
-fn cpu_percent() -> u32 {
+pub(crate) fn cpu_percent() -> u32 {
     let load = std::fs::read_to_string("/proc/loadavg")
         .ok()
         .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
@@ -764,7 +1283,7 @@ fn cpu_percent() -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-fn cpu_percent() -> u32 {
+pub(crate) fn cpu_percent() -> u32 {
     let mut loads = [0.0_f64; 1];
     let count = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
     if count != 1 {
@@ -777,7 +1296,7 @@ fn cpu_percent() -> u32 {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cpu_percent() -> u32 {
+pub(crate) fn cpu_percent() -> u32 {
     #[cfg(windows)]
     {
         use std::sync::{Mutex, OnceLock};
@@ -856,6 +1375,12 @@ pub fn cpu_limit_source() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_metadata_outcome_without_status_is_partial_when_rows_returned() {
+        assert_eq!(remote_metadata_status(None, true), EpgScanStatus::Partial);
+        assert_eq!(remote_metadata_status(None, false), EpgScanStatus::NoData);
+    }
     fn config() -> EpgGlobalSettings {
         EpgGlobalSettings {
             enabled: true,
@@ -872,10 +1397,8 @@ mod tests {
             max_dwell_secs: 3,
             idle_section_timeout_secs: 1,
             max_concurrent_scans: 1,
-            reserve_tuners: false,
             prefer_local: true,
             allow_remote: false,
-            preemptible: true,
             cpu_soft_limit_percent: 70,
             cpu_hard_limit_percent: 90,
             remote_prefer_metadata_execution: true,
@@ -886,7 +1409,7 @@ mod tests {
     #[test]
     fn policy_blocks_soft_cpu() {
         assert_eq!(
-            decide(&config(), 0, 70, 10, None, None, None),
+            decide(&config(), 0, 70, 10, None, None, None, None),
             EpgScanDecision::SoftCpuLimit
         )
     }
@@ -938,32 +1461,32 @@ mod tests {
         let mut disabled = config();
         disabled.enabled = false;
         assert_eq!(
-            decide(&disabled, 0, 0, 10, None, None, None).reason_code(),
+            decide(&disabled, 0, 0, 10, None, None, None, None).reason_code(),
             Some(EpgReasonCode::Disabled)
         );
         let mut auto_disabled = config();
         auto_disabled.auto_tuner_scan_enabled = false;
         assert_eq!(
-            decide(&auto_disabled, 0, 0, 10, None, None, None).reason_code(),
+            decide(&auto_disabled, 0, 0, 10, None, None, None, None).reason_code(),
             Some(EpgReasonCode::AutoTunerScanDisabled)
         );
         assert_eq!(
-            decide(&config(), 0, 70, 10, None, None, None).reason_code(),
+            decide(&config(), 0, 70, 10, None, None, None, None).reason_code(),
             Some(EpgReasonCode::CpuSoftLimit)
         );
         assert_eq!(
-            decide(&config(), 1, 0, 10, None, None, None).reason_code(),
+            decide(&config(), 1, 0, 10, None, None, None, None).reason_code(),
             Some(EpgReasonCode::NoTunerAvailable)
         );
         assert_eq!(
-            decide(&config(), 0, 0, 10, Some(100), None, None).reason_code(),
+            decide(&config(), 0, 0, 10, Some(100), None, None, None).reason_code(),
             Some(EpgReasonCode::Backoff)
         );
     }
     #[test]
     fn policy_starts_when_due() {
         assert_eq!(
-            decide(&config(), 0, 0, 10, None, None, None),
+            decide(&config(), 0, 0, 10, None, None, None, None),
             EpgScanDecision::Start
         )
     }
@@ -997,8 +1520,10 @@ mod tests {
                 network_id: 1,
                 tsid: 1,
                 broadcast_type: BroadcastType::Terrestrial,
-                coverage_until: Some(10 + 168 * 3600),
+                section_coverage_until: Some(10 + 168 * 3600),
+                program_coverage_until: None,
                 last_eit_received_at: Some(10),
+                last_complete_at: Some(10),
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1006,8 +1531,10 @@ mod tests {
                 network_id: 2,
                 tsid: 2,
                 broadcast_type: BroadcastType::Terrestrial,
-                coverage_until: None,
+                section_coverage_until: None,
+                program_coverage_until: None,
                 last_eit_received_at: None,
+                last_complete_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1015,8 +1542,10 @@ mod tests {
                 network_id: 3,
                 tsid: 3,
                 broadcast_type: BroadcastType::Terrestrial,
-                coverage_until: None,
+                section_coverage_until: None,
+                program_coverage_until: None,
                 last_eit_received_at: None,
+                last_complete_at: None,
                 next_eligible_at: Some(100),
                 failure_count: 0,
             },
@@ -1032,8 +1561,10 @@ mod tests {
                 network_id: 0x7fe8,
                 tsid: 1,
                 broadcast_type: BroadcastType::Terrestrial,
-                coverage_until: Some(10 + 168 * 3600),
+                section_coverage_until: Some(10 + 168 * 3600),
+                program_coverage_until: None,
                 last_eit_received_at: Some(10),
+                last_complete_at: Some(10),
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1041,8 +1572,10 @@ mod tests {
                 network_id: 0x7fe8,
                 tsid: 2,
                 broadcast_type: BroadcastType::Terrestrial,
-                coverage_until: None,
+                section_coverage_until: None,
+                program_coverage_until: None,
                 last_eit_received_at: None,
+                last_complete_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1056,8 +1589,10 @@ mod tests {
             network_id: 4,
             tsid: 1,
             broadcast_type: BroadcastType::BS,
-            coverage_until: Some(10 + 168 * 3600),
-            last_eit_received_at: Some(10),
+            section_coverage_until: Some(10 + 168 * 3600),
+            program_coverage_until: None,
+            last_eit_received_at: Some(100),
+            last_complete_at: Some(100),
             next_eligible_at: None,
             failure_count: 0,
         };
@@ -1071,11 +1606,260 @@ mod tests {
             network_id: 4,
             tsid: 2,
             broadcast_type: BroadcastType::BS,
-            coverage_until: None,
+            section_coverage_until: None,
+            program_coverage_until: None,
             last_eit_received_at: None,
+            last_complete_at: None,
             next_eligible_at: None,
             failure_count: 0,
         };
         assert!(select_next_target(&[target], 10, &config()).is_some());
+    }
+
+    fn target(
+        network_id: u16,
+        tsid: u16,
+        broadcast_type: BroadcastType,
+        section_coverage_until: Option<i64>,
+        last_complete_at: Option<i64>,
+        last_eit_received_at: Option<i64>,
+    ) -> EpgTarget {
+        EpgTarget {
+            network_id,
+            tsid,
+            broadcast_type,
+            section_coverage_until,
+            program_coverage_until: None,
+            last_eit_received_at,
+            last_complete_at,
+            next_eligible_at: None,
+            failure_count: 0,
+        }
+    }
+
+    #[test]
+    fn rank_targets_returns_candidates_in_priority_order() {
+        let targets = [
+            target(
+                1,
+                1,
+                BroadcastType::Terrestrial,
+                Some(10),
+                Some(10),
+                Some(10),
+            ),
+            target(1, 2, BroadcastType::Terrestrial, None, Some(10), Some(10)),
+            target(1, 3, BroadcastType::Terrestrial, Some(10), Some(0), Some(0)),
+            {
+                let mut target = target(1, 4, BroadcastType::Terrestrial, None, None, None);
+                target.failure_count = 2;
+                target
+            },
+        ];
+        let ranked = rank_targets(&targets, 10, &config());
+        assert_eq!(
+            ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
+            [3, 4, 2, 1]
+        );
+    }
+
+    #[test]
+    fn rank_targets_yields_one_representative_per_satellite_network() {
+        let targets = [
+            target(4, 3, BroadcastType::BS, None, None, None),
+            target(4, 1, BroadcastType::BS, None, None, None),
+            target(4, 2, BroadcastType::BS, None, None, None),
+        ];
+        let ranked = rank_targets(&targets, 10, &config());
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|target| target.network_id == 4)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rank_targets_keeps_terrestrial_transport_streams_separate() {
+        let targets = [
+            target(0x100, 1, BroadcastType::Terrestrial, None, None, None),
+            target(0x100, 2, BroadcastType::Terrestrial, None, None, None),
+        ];
+        let ranked = rank_targets(&targets, 10, &config());
+        assert_eq!(
+            ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn active_scan_guard_decrements_on_drop() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let guard = ActiveScanGuard::new(active.clone());
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn active_scan_guard_decrements_on_panic() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let active_for_panic = active.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = ActiveScanGuard::new(active_for_panic);
+            panic!("test panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn in_flight_set_blocks_a_second_scan_of_the_same_mux() {
+        let set = Arc::new(StdMutex::new(HashSet::new()));
+        let mux = (1, 2);
+        assert!(set.lock().unwrap().insert(mux));
+        assert!(!set.lock().unwrap().insert(mux));
+    }
+
+    #[test]
+    fn decide_stops_ranking_when_at_capacity() {
+        let mut config = config();
+        config.max_concurrent_scans = 3;
+        assert_eq!(
+            decide(&config, 3, 0, 10, None, None, None, None),
+            EpgScanDecision::AtCapacity
+        );
+    }
+
+    #[test]
+    fn stale_satellite_target_is_rescanned_even_when_covered() {
+        let target = target(
+            4,
+            1,
+            BroadcastType::BS,
+            Some(10 + 168 * 3600),
+            Some(0),
+            Some(0),
+        );
+        assert!(target_needs_scan(&target, 10, &config()));
+    }
+
+    #[test]
+    fn fresh_and_covered_satellite_target_is_skipped() {
+        let target = target(
+            4,
+            1,
+            BroadcastType::BS,
+            Some(10 + 168 * 3600),
+            Some(10),
+            Some(0),
+        );
+        let mut config = config();
+        config.target_refresh_secs = 100;
+        config.max_stale_secs = 100;
+        assert!(!target_needs_scan(&target, 10, &config));
+    }
+
+    #[test]
+    fn program_coverage_is_not_used_for_the_decision() {
+        let mut target = target(4, 1, BroadcastType::BS, None, Some(10), Some(10));
+        target.program_coverage_until = Some(10 + 7 * 86400);
+        assert!(target_needs_scan(&target, 10, &config()));
+    }
+
+    #[test]
+    fn terrestrial_transport_streams_stay_independent() {
+        let covered = target(
+            0x7fe8,
+            1,
+            BroadcastType::Terrestrial,
+            Some(10 + 168 * 3600),
+            Some(100),
+            Some(100),
+        );
+        let missing = target(0x7fe8, 2, BroadcastType::Terrestrial, None, None, None);
+        assert_eq!(
+            select_next_target(&[covered, missing], 10, &config())
+                .unwrap()
+                .tsid,
+            2
+        );
+    }
+
+    #[test]
+    fn satellite_group_yields_one_representative_per_network() {
+        let targets = [
+            target(4, 1, BroadcastType::BS, None, None, None),
+            target(4, 2, BroadcastType::BS, None, None, None),
+            target(4, 3, BroadcastType::BS, None, None, None),
+        ];
+        assert_eq!(select_next_target(&targets, 10, &config()).unwrap().tsid, 1);
+    }
+
+    #[test]
+    fn satellite_representative_prefers_the_most_behind_transport_stream() {
+        let targets = [
+            target(4, 1, BroadcastType::BS, Some(10 + 1000), None, None),
+            target(4, 2, BroadcastType::BS, Some(10 + 100), None, None),
+        ];
+        assert_eq!(
+            choose_satellite_representative(&targets, 10, &config())
+                .unwrap()
+                .tsid,
+            2
+        );
+    }
+
+    #[test]
+    fn four_k_targets_are_not_grouped() {
+        let targets = [
+            target(0x000b, 1, BroadcastType::FourK, None, None, None),
+            target(0x000b, 2, BroadcastType::FourK, None, None, None),
+        ];
+        assert_eq!(select_next_target(&targets, 10, &config()).unwrap().tsid, 1);
+        assert!(target_needs_scan(&targets[1], 10, &config()));
+    }
+
+    #[test]
+    fn hard_stale_forces_rescan_even_within_target_refresh() {
+        let target = target(
+            4,
+            1,
+            BroadcastType::BS,
+            Some(10 + 168 * 3600),
+            Some(10),
+            Some(0),
+        );
+        let mut config = config();
+        config.target_refresh_secs = 100;
+        config.max_stale_secs = 1;
+        assert!(target_needs_scan(&target, 10, &config));
+    }
+
+    #[test]
+    fn startup_wait_uses_delay_and_jitter() {
+        assert_eq!(startup_wait_secs(10, 5, 0), 10);
+        assert_eq!(startup_wait_secs(10, 5, 5), 15);
+    }
+
+    #[test]
+    fn startup_wait_is_at_least_one_second() {
+        assert!(startup_wait_secs(0, 0, 0) >= 1);
+    }
+
+    #[test]
+    fn full_evaluation_is_due_only_after_scheduler_interval() {
+        let last = Instant::now();
+        assert!(!full_evaluation_is_due(
+            Some(last),
+            60,
+            last + Duration::from_secs(59)
+        ));
+        assert!(full_evaluation_is_due(
+            Some(last),
+            60,
+            last + Duration::from_secs(60)
+        ));
     }
 }

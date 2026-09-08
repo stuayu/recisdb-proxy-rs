@@ -208,7 +208,10 @@ mod tests {
         // Multi-byte text: slicing by byte index would panic here.
         let long = "あ".repeat(200);
         let shortened = brief_description(Some(long)).unwrap();
-        assert_eq!(shortened.chars().count(), super::BRIEF_DESCRIPTION_CHARS + 1);
+        assert_eq!(
+            shortened.chars().count(),
+            super::BRIEF_DESCRIPTION_CHARS + 1
+        );
         assert!(shortened.ends_with('…'));
 
         // Short enough to keep verbatim, with no ellipsis appended.
@@ -216,7 +219,6 @@ mod tests {
         assert_eq!(brief_description(Some(short.clone())), Some(short));
         assert_eq!(brief_description(None), None);
     }
-
 
     #[test]
     fn services_ignores_malformed_items() {

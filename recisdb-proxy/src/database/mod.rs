@@ -10,6 +10,7 @@ mod bon_driver;
 mod channel;
 mod driver_quality;
 mod encode_profile;
+mod epg_coverage;
 mod epg_settings;
 mod models;
 mod program;
@@ -280,6 +281,10 @@ impl Database {
             "033_epg_auto_tuner_scan_settings",
             Database::migration_033_epg_auto_tuner_scan_settings,
         ),
+        (
+            "034_epg_section_coverage",
+            Database::migration_034_epg_section_coverage,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -379,6 +384,33 @@ impl Database {
             "auto_tuner_scan_enabled_override",
             "INTEGER",
         )?;
+        Ok(())
+    }
+
+    fn migration_034_epg_section_coverage(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS epg_service_coverage (
+                network_id INTEGER NOT NULL,
+                tsid INTEGER NOT NULL,
+                service_id INTEGER NOT NULL,
+                pf_complete INTEGER NOT NULL DEFAULT 0,
+                schedule_basic_complete INTEGER NOT NULL DEFAULT 0,
+                schedule_extended_complete INTEGER NOT NULL DEFAULT 0,
+                coverage_until INTEGER,
+                sections_seen INTEGER NOT NULL DEFAULT 0,
+                last_section_at INTEGER,
+                last_complete_at INTEGER,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(network_id, tsid, service_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_epg_service_coverage_mux
+                ON epg_service_coverage(network_id, tsid);",
+        )?;
+        self.add_column_if_not_exists("epg_scan_states", "section_coverage_until", "INTEGER")?;
+        self.add_column_if_not_exists("epg_scan_states", "services_total", "INTEGER")?;
+        self.add_column_if_not_exists("epg_scan_states", "services_complete", "INTEGER")?;
+        self.add_column_if_not_exists("epg_scan_states", "last_complete_at", "INTEGER")?;
+        self.add_column_if_not_exists("epg_scan_states", "last_scan_status", "TEXT")?;
         Ok(())
     }
 

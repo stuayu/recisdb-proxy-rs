@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -33,6 +34,7 @@ use super::store::{NodeStore, StoredNode};
 use super::types::{
     LogicalMuxId, NodeEndpoint, NodeId, ReceptionRouteAdvertisement, RequestContext,
 };
+use crate::scheduler::epg_dwell::EpgDwellConfig;
 use crate::server::listener::DatabaseHandle;
 
 pub const NODE_PROTOCOL_VERSION: u16 = 3;
@@ -148,6 +150,42 @@ pub struct RemoteEpgMetadataRequest {
     pub dwell_secs: u64,
     #[serde(default)]
     pub spent_ms: u64,
+    /// None keeps the legacy fixed-dwell behavior.
+    #[serde(default)]
+    pub dwell: Option<RemoteEpgDwell>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteEpgDwell {
+    pub min_dwell_secs: u64,
+    pub normal_dwell_secs: u64,
+    pub max_dwell_secs: u64,
+    pub idle_section_timeout_secs: u64,
+    pub target_future_coverage_hours: i64,
+}
+
+impl From<EpgDwellConfig> for RemoteEpgDwell {
+    fn from(value: EpgDwellConfig) -> Self {
+        Self {
+            min_dwell_secs: value.min_dwell.as_secs(),
+            normal_dwell_secs: value.normal_dwell.as_secs(),
+            max_dwell_secs: value.max_dwell.as_secs(),
+            idle_section_timeout_secs: value.idle_section_timeout.as_secs(),
+            target_future_coverage_hours: value.target_future_coverage_hours,
+        }
+    }
+}
+
+impl From<RemoteEpgDwell> for EpgDwellConfig {
+    fn from(value: RemoteEpgDwell) -> Self {
+        Self {
+            min_dwell: Duration::from_secs(value.min_dwell_secs),
+            normal_dwell: Duration::from_secs(value.normal_dwell_secs),
+            max_dwell: Duration::from_secs(value.max_dwell_secs),
+            idle_section_timeout: Duration::from_secs(value.idle_section_timeout_secs),
+            target_future_coverage_hours: value.target_future_coverage_hours,
+        }
+    }
 }
 
 fn default_epg_dwell_secs() -> u64 {
@@ -602,11 +640,22 @@ async fn epg_metadata(
             payload.sid,
             payload.spent_ms,
             payload.dwell_secs,
+            payload.dwell,
         )
         .await
     {
-        Ok(programs) => Json(RemoteEpgMetadataReply {
-            programs: programs.into_iter().map(ProgramUpsertWire::from).collect(),
+        Ok(outcome) => Json(RemoteEpgMetadataReply {
+            programs: outcome
+                .programs
+                .into_iter()
+                .map(ProgramUpsertWire::from)
+                .collect(),
+            status: Some(outcome.status.as_str().to_owned()),
+            elapsed_secs: Some(outcome.elapsed_secs),
+            sections_seen: Some(outcome.sections_seen),
+            services_total: Some(outcome.services_total),
+            services_complete: Some(outcome.services_complete),
+            coverage_until: outcome.coverage_until,
         })
         .into_response(),
         Err(e @ ServeError::MuxLeaseUnavailable(_)) => {
@@ -1046,6 +1095,34 @@ impl NodeTransportClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_epg_dwell_round_trips_through_epg_dwell_config() {
+        let config = EpgDwellConfig {
+            min_dwell: Duration::from_secs(7),
+            normal_dwell: Duration::from_secs(19),
+            max_dwell: Duration::from_secs(41),
+            idle_section_timeout: Duration::from_secs(5),
+            target_future_coverage_hours: 36,
+        };
+        let round_trip: EpgDwellConfig = RemoteEpgDwell::from(config).into();
+        assert_eq!(round_trip, config);
+    }
+
+    #[test]
+    fn remote_epg_metadata_request_without_dwell_deserializes() {
+        let json = serde_json::json!({
+            "context": {
+                "request_id": "r", "trace_id": "t", "stream_class": "View",
+                "claim": {"priority": -1000, "exclusive": false},
+                "remaining_ms": 1000, "origin_node": "node-a"
+            },
+            "mux": {"nid": 1, "tsid": 2}
+        });
+        let request: RemoteEpgMetadataRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.dwell, None);
+        assert_eq!(request.dwell_secs, 30);
+    }
     use crate::node::{LeasePolicy, LogicalMuxId};
     use crate::tuner::EffectiveClaim;
 

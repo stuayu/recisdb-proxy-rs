@@ -410,7 +410,6 @@ pub fn run_restart_watchdog(name: &str) -> Result<(), ServiceError> {
     })
 }
 
-
 // ---------------------------------------------------------------------
 // SCM ディスパッチャ: `recisdb-proxy --run-as-service` 経路で
 // ServiceMain として動く。

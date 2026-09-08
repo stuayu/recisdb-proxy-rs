@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { api, unwrapArray, type JsonRecord } from '../api'
+import {
+  buildProgramIndex,
+  epgStatusPresentation,
+  mergeProgramEvent,
+  normalizeProgramRow,
+  programEventKey,
+  useEpgEvents,
+  type EpgProgramEvent,
+  type EpgScanState,
+} from '../composables/useEpgEvents'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -72,7 +82,8 @@ type Service = {
   region: string | null
 }
 type Program = {
-  id: number
+  id: number | null
+  key: string
   nid: number
   sid: number
   event_id: number
@@ -174,9 +185,13 @@ const regionFilter = ref('すべて')
 const serviceQuery = ref('')
 const now = ref(Date.now())
 const detail = ref<Program | null>(null)
-const selected = ref<{ columnIndex: number; programId: number } | null>(null)
+const selected = ref<{ columnIndex: number; programId: string } | null>(null)
 const selectedProgram = ref<Program | null>(null)
 const previewProgram = ref<Program | null>(null)
+const epgStates = shallowRef<EpgScanState[]>([])
+const epgTargetHours = ref(168)
+const epgRefreshSecs = ref(86400)
+const activeEpgStatusKey = ref<string | null>(null)
 const scrollArea = ref<HTMLElement | null>(null)
 const isNarrow = ref(false)
 const viewportHeight = ref(0)
@@ -189,6 +204,9 @@ let pendingScrollTop = 0
 let pendingScrollLeft = 0
 let clockTimer = 0
 let narrowMedia: MediaQueryList | null = null
+let programIndex = new Map<string, number>()
+let pendingProgramEvents: EpgProgramEvent[] = []
+let programMergeTimer: number | null = null
 
 const isTablet = computed(() => !isNarrow.value && window.innerWidth <= 1100)
 const pxPerMin = computed(() =>
@@ -363,9 +381,10 @@ async function loadProgramsWindow(since: number, until: number, force = false) {
     const query = new URLSearchParams({ since: String(since), until: String(until), brief: 'true', limit: '20000' })
     const servicesQuery = visibleServiceQuery()
     if (servicesQuery) query.set('services', servicesQuery)
-    const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
-    const keys = new Set(rawPrograms.value.map((row) => String(row.id)))
-    rawPrograms.value = [...rawPrograms.value, ...rows.filter((row) => !keys.has(String(row.id)))]
+    const rows = unwrapArray(await api(`/programs?${query}`), ['programs']).map(normalizeProgramRow)
+    const keys = new Set(rawPrograms.value.map(programEventKey))
+    rawPrograms.value = [...rawPrograms.value, ...rows.filter((row) => !keys.has(programEventKey(row)))]
+    programIndex = buildProgramIndex(rawPrograms.value)
     loadedProgramWindows.value = [...loadedProgramWindows.value, [since, until]]
     error.value = ''
   } catch (cause) {
@@ -394,6 +413,7 @@ async function loadInitialPrograms() {
 async function loadPrograms() {
   loadedProgramWindows.value = []
   rawPrograms.value = []
+  programIndex = new Map()
   await loadInitialPrograms()
 }
 async function refresh() {
@@ -410,6 +430,56 @@ async function refresh() {
   await nextTick()
   resizeGrid()
 }
+
+function flushProgramEvents(): void {
+  programMergeTimer = null
+  if (!pendingProgramEvents.length) return
+  const rows = rawPrograms.value.slice()
+  const index = new Map(programIndex)
+  for (const event of pendingProgramEvents) {
+    mergeProgramEvent(rows, index, event, loadedProgramWindows.value)
+  }
+  pendingProgramEvents = []
+  rawPrograms.value = rows
+  programIndex = index
+}
+function queueProgramEvent(event: EpgProgramEvent): void {
+  pendingProgramEvents.push(event)
+  if (programMergeTimer === null) {
+    programMergeTimer = window.setTimeout(flushProgramEvents, 300)
+  }
+}
+function replaceEpgStates(states: EpgScanState[]): void {
+  epgStates.value = states
+}
+function statusForColumn(column: GuideColumn) {
+  const state = epgStates.value.find(
+    (item) => item.network_id === column.nid && item.tsid === column.tsid,
+  )
+  return epgStatusPresentation(state, Math.floor(Date.now() / 1000), epgTargetHours.value, epgRefreshSecs.value)
+}
+async function loadEpgStatus(): Promise<void> {
+  try {
+    const [status, effective] = await Promise.all([
+      api<JsonRecord>('/epg/status'),
+      api<JsonRecord>('/epg-effective'),
+    ])
+    if (Array.isArray(status.states)) replaceEpgStates(status.states as EpgScanState[])
+    const config = (effective.effective ?? effective) as JsonRecord
+    const target = Number(config.target_future_coverage_hours)
+    const refresh = Number(config.target_refresh_secs)
+    if (Number.isFinite(target) && target > 0) epgTargetHours.value = target
+    if (Number.isFinite(refresh) && refresh > 0) epgRefreshSecs.value = refresh
+  } catch {
+    // EPG status は番組表本体を止めない。
+  }
+}
+const epgEvents = useEpgEvents({
+  onProgram: queueProgramEvent,
+  onLagged: () => { void loadPrograms() },
+  onStatus: replaceEpgStates,
+  onReconnect: () => { void loadPrograms() },
+})
 
 const services = computed<Service[]>(() => {
   const seen = new Map<string, Service>()
@@ -508,7 +578,8 @@ const programsByService = computed(() => {
     )
       continue
     const program: Program = {
-      id: Number(row.id),
+      id: Number.isFinite(Number(row.id)) ? Number(row.id) : null,
+      key: programEventKey(row),
       nid,
       sid,
       event_id: Number(row.event_id),
@@ -651,6 +722,11 @@ const columns = computed<GuideColumn[]>(() => {
     (a, b) => BAND_ORDER[a.band] - BAND_ORDER[b.band] || a.nid - b.nid || a.sid - b.sid,
   )
 })
+const activeEpgStatusText = computed(() => {
+  if (activeEpgStatusKey.value === null) return ''
+  const column = columns.value.find((item) => item.key === activeEpgStatusKey.value)
+  return column ? `${column.name}: ${statusForColumn(column).text}` : ''
+})
 /** 画面に入っている列だけを切り出す。 */
 const visibleColumns = computed(() => {
   const all = columns.value
@@ -671,7 +747,7 @@ function visibleItems(column: GuideColumn): RenderItem[] {
 }
 /** セルを選ぶ。列の添字を持っておくと左右移動が O(1) で決まる。 */
 function selectProgram(columnIndex: number, program: Program): void {
-  selected.value = { columnIndex, programId: program.id }
+  selected.value = { columnIndex, programId: program.key }
   selectedProgram.value = program
 }
 
@@ -730,7 +806,7 @@ function moveSelection(dx: number, dy: number): void {
     revealSelected(columnIndex, next)
     return
   }
-  const at = column.items.findIndex((item) => item.program.id === current.programId)
+  const at = column.items.findIndex((item) => item.program.key === current.programId)
   if (at < 0) return
   const target = column.items[at + dy]
   if (target === undefined) return
@@ -790,10 +866,11 @@ function openDetail(program: Program) {
     try {
       const query = new URLSearchParams({ since: String(since), until: String(until), services: `${program.nid}:${program.sid}`, limit: '100' })
       const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
-      const full = rows.find((row) => Number(row.id) === program.id)
+      const full = rows.find((row) => programEventKey(row) === program.key)
       if (!full) return
       const updated = { ...program, description: String(full.description ?? ''), extended: String(full.extended ?? ''), loaded: true }
-      rawPrograms.value = rawPrograms.value.map((row) => String(row.id) === String(program.id) ? { ...row, ...full } : row)
+      rawPrograms.value = rawPrograms.value.map((row) => programEventKey(row) === program.key ? { ...row, ...full, key: program.key } : row)
+      programIndex = buildProgramIndex(rawPrograms.value)
       detail.value = updated
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : String(cause)
@@ -826,6 +903,8 @@ onMounted(() => {
   narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)
   narrowMedia.addEventListener('change', resizeGrid)
   void refresh()
+  void loadEpgStatus()
+  epgEvents.start()
   resizeGrid()
   clockTimer = window.setInterval(() => {
     now.value = Date.now()
@@ -839,6 +918,10 @@ onUnmounted(() => {
   window.removeEventListener('resize', resizeGrid)
   window.removeEventListener('keydown', onKeydown)
   if (scrollAnimationId !== null) cancelAnimationFrame(scrollAnimationId)
+  if (programMergeTimer !== null) window.clearTimeout(programMergeTimer)
+  programMergeTimer = null
+  pendingProgramEvents = []
+  epgEvents.stop()
 })
 </script>
 
@@ -919,6 +1002,16 @@ onUnmounted(() => {
               :alt="entry.column.name"
               @error="onLogoError(entry.column)"
             />
+              <span class="guide-epg-status">
+                <button
+                  type="button"
+                  class="guide-epg-status-dot"
+                  :class="`guide-epg-status-${statusForColumn(entry.column).kind}`"
+                  :title="statusForColumn(entry.column).text"
+                  :aria-label="statusForColumn(entry.column).text"
+                  @click.stop="activeEpgStatusKey = activeEpgStatusKey === entry.column.key ? null : entry.column.key"
+                >●</button>
+              </span>
             </div>
             <span class="guide-ch-name" v-text="entry.column.name" /><small
               v-if="entry.column.subLabel"
@@ -955,13 +1048,13 @@ onUnmounted(() => {
           >
             <button
               v-for="item in visibleItems(entry.column)"
-              :key="item.program.id"
+              :key="item.program.key"
               type="button"
               class="guide-cell"
               :class="{
                 'guide-cell-past': isPast(item.program),
                 'guide-cell-onair': isOnAir(item.program),
-                'guide-cell-selected': selected?.programId === item.program.id,
+                'guide-cell-selected': selected?.programId === item.program.key,
               }"
               :aria-label="item.program.name || '番組名なし'"
               :aria-current="isOnAir(item.program) ? 'true' : undefined"
@@ -986,6 +1079,7 @@ onUnmounted(() => {
       </div>
       <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
     </div>
+    <p v-if="activeEpgStatusText" class="notice guide-epg-status-notice" role="status" v-text="activeEpgStatusText" />
     <!-- 番組が 1 件も無いときはグリッドごと出ないので、押しても何も起きない
          ボタンだけが宙に浮く。空状態では操作バーごと畳む。 -->
     <div v-if="rawPrograms.length" class="guide-actionbar">
@@ -1068,3 +1162,32 @@ onUnmounted(() => {
     </div>
   </section>
 </template>
+
+<style scoped>
+.guide-epg-status {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.guide-epg-status-dot {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: .75rem;
+  line-height: 1;
+}
+
+.guide-epg-status-complete { color: var(--success); }
+.guide-epg-status-scanning { color: var(--accent); }
+.guide-epg-status-partial { color: var(--warning); }
+.guide-epg-status-stale { color: var(--warning); }
+.guide-epg-status-none { color: var(--muted); }
+.guide-epg-status-failed { color: var(--danger); }
+
+</style>

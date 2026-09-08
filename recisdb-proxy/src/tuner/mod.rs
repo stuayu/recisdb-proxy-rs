@@ -10,6 +10,7 @@ pub mod channel_key;
 pub mod claim;
 pub mod encoder_pool;
 pub mod epg_collector;
+pub mod epg_progress;
 pub mod lock;
 pub mod logo_collector;
 pub mod mmt_pipe;
@@ -30,6 +31,7 @@ pub use claim::EffectiveClaim;
 pub use encoder_pool::{
     EncodeKey, EncoderPool, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
 };
+pub use epg_progress::{EpgProgress, MuxCompletion};
 pub use pool::{CarriedSlotPermit, ScanReservation, SlotPermit, TunerPool, TunerPoolConfig};
 pub use quality_scorer::{BonDriverWithScore, QualityScorer};
 pub use shared::{ReaderState, SharedTuner, TunerSubscription};

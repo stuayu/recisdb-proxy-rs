@@ -24,6 +24,7 @@
 mod analyzer;
 mod descriptors;
 mod eit;
+mod eit_tracker;
 mod nit;
 mod packet;
 mod pat;
@@ -35,6 +36,10 @@ pub mod service_filter;
 pub use analyzer::{AnalyzerConfig, AnalyzerResult, TsAnalyzer};
 pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliveryDescriptor};
 pub use eit::{EitEvent, EitTable};
+pub use eit_tracker::{
+    eit_kind, EitKind, EitServiceCompletion, EitServiceKey, EpgSectionTracker, ObserveOutcome,
+    DEFAULT_MAX_SERVICES,
+};
 pub use nit::{uhf_channel_from_frequency, NitTable, NitTransportStream};
 pub use packet::{AdaptationField, TsHeader, TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
 pub use pat::{PatEntry, PatTable};

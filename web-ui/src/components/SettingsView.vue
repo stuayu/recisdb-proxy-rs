@@ -25,7 +25,7 @@ const editingPreset = ref<JsonRecord | null>(null)
 const creatingPreset = ref(false)
 const presetGroups = [
   { label: '基本', keys: ['enabled', 'target_refresh_secs', 'max_stale_secs', 'min_future_coverage_hours', 'target_future_coverage_hours'] },
-  { label: 'チューナー', keys: ['reserve_tuners', 'prefer_local', 'preemptible'] },
+  { label: 'チューナー', keys: ['prefer_local'] },
   { label: '負荷', keys: ['cpu_soft_limit_percent', 'cpu_hard_limit_percent'] },
   { label: 'リモート', keys: ['allow_remote', 'remote_prefer_metadata_execution', 'remote_allow_ts_transport'] },
   { label: '詳細', keys: ['min_dwell_secs', 'normal_dwell_secs', 'max_dwell_secs', 'idle_section_timeout_secs'] },
@@ -33,7 +33,7 @@ const presetGroups = [
 const presetLabels: Record<string, string> = {
   enabled: '有効', target_refresh_secs: '更新間隔(秒)', max_stale_secs: '最大古さ(秒)',
   min_future_coverage_hours: '最低coverage(時間)', target_future_coverage_hours: '目標coverage(時間)',
-  reserve_tuners: 'チューナー確保', prefer_local: 'ローカル優先', preemptible: '録画・視聴で中断',
+  prefer_local: 'ローカル優先',
   cpu_soft_limit_percent: 'CPU延期上限(%)', cpu_hard_limit_percent: 'CPU中断上限(%)', allow_remote: 'リモート許可',
   remote_prefer_metadata_execution: 'リモート解析優先', remote_allow_ts_transport: 'TS転送許可',
   min_dwell_secs: '最小滞在(秒)', normal_dwell_secs: '通常滞在(秒)', max_dwell_secs: '最大滞在(秒)', idle_section_timeout_secs: '無受信タイムアウト(秒)',
@@ -811,7 +811,7 @@ onMounted(() => {
           <p class="muted">組み込み初期値 → 全体設定 → プリセット → 物理チューナー個別設定の順に上書きされます。プリセットで空欄の項目は全体設定の値が使われます。</p>
           <div class="table-region epg-preset-table-region" role="region" aria-label="EPGプリセット一覧" tabindex="0">
             <table class="data-table epg-preset-table">
-              <thead><tr><th>プリセット名</th><th>説明</th><th>更新頻度</th><th>維持日数</th><th>CPU延期上限</th><th>録画・視聴で中断</th><th>チューナー自動起動収集</th><th>操作</th></tr></thead>
+              <thead><tr><th>プリセット名</th><th>説明</th><th>更新頻度</th><th>維持日数</th><th>CPU延期上限</th><th>チューナー自動起動収集</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-if="epgEffective?.effective" class="epg-effective-row">
                   <td data-label="プリセット名"><strong>現在有効な設定</strong></td>
@@ -819,7 +819,6 @@ onMounted(() => {
                   <td data-label="更新頻度">{{ effectiveValue('target_refresh_secs', 'seconds') }}</td>
                   <td data-label="維持日数">{{ effectiveValue('target_future_coverage_hours', 'hours') }}</td>
                   <td data-label="CPU延期上限">{{ effectiveValue('cpu_soft_limit_percent', 'percent') }}</td>
-                  <td data-label="録画・視聴で中断">{{ effectiveValue('preemptible', 'boolean') }}</td>
                   <td data-label="チューナー自動起動収集">{{ effectiveValue('auto_tuner_scan_enabled', 'boolean') }}</td>
                   <td data-label="操作">—</td>
                 </tr>
@@ -829,13 +828,12 @@ onMounted(() => {
                   <td data-label="更新頻度">{{ presetValue(preset.target_refresh_secs, 'seconds') }}</td>
                   <td data-label="維持日数">{{ presetValue(preset.target_future_coverage_hours, 'hours') }}</td>
                   <td data-label="CPU延期上限">{{ presetValue(preset.cpu_soft_limit_percent, 'percent') }}</td>
-                  <td data-label="録画・視聴で中断">{{ presetValue(preset.preemptible, 'boolean') }}</td>
                   <td data-label="チューナー自動起動収集">{{ presetValue(preset.autoTunerScanEnabled, 'boolean') }}</td>
                   <td data-label="操作"><span class="actions epg-preset-actions"><button class="button secondary" type="button" :disabled="Boolean(preset.is_system)" @click="editEpgPreset(preset)">{{ preset.is_system ? '複製して編集' : '編集' }}</button><button class="button secondary" type="button" @click="duplicateEpgPreset(preset)">複製</button><button v-if="!preset.is_system" class="button secondary" type="button" @click="deleteEpgPreset(preset)">削除</button></span></td>
                 </tr>
                 <tr :class="{ 'is-selected': selectedEpgPreset === null }">
                   <td data-label="プリセット名"><span class="epg-preset-name"><strong>プリセットなし</strong><span v-if="selectedEpgPreset === null" class="badge">使用中</span></span><label class="epg-toggle"><input type="checkbox" role="switch" :checked="selectedEpgPreset === null" aria-label="プリセットなし（全体設定のみ）を使用" @change="selectedEpgPreset = null" /><span aria-hidden="true" /></label></td>
-                  <td data-label="説明">全体設定のみ</td><td data-label="更新頻度">{{ presetValue(null, 'seconds') }}</td><td data-label="維持日数">{{ presetValue(null, 'hours') }}</td><td data-label="CPU延期上限">{{ presetValue(null, 'percent') }}</td><td data-label="録画・視聴で中断">{{ presetValue(null, 'boolean') }}</td><td data-label="チューナー自動起動収集">{{ presetValue(null, 'boolean') }}</td><td data-label="操作">—</td>
+                  <td data-label="説明">全体設定のみ</td><td data-label="更新頻度">{{ presetValue(null, 'seconds') }}</td><td data-label="維持日数">{{ presetValue(null, 'hours') }}</td><td data-label="CPU延期上限">{{ presetValue(null, 'percent') }}</td><td data-label="チューナー自動起動収集">{{ presetValue(null, 'boolean') }}</td><td data-label="操作">—</td>
                 </tr>
               </tbody>
             </table>
@@ -857,9 +855,13 @@ onMounted(() => {
           <label class="field"><span>更新頻度</span><select v-model.number="config.target_refresh_secs"><option :value="3600">約1時間</option><option :value="21600">約6時間</option><option :value="43200">約12時間</option></select></label>
           <label class="field"><span>何日先まで維持</span><select v-model.number="config.target_future_coverage_hours"><option :value="72">3日</option><option :value="168">7日</option><option :value="336">14日</option></select></label>
         </div>
-        <label class="check"><input v-model="config.reserve_tuners" type="checkbox" /><span>空いているチューナーを確保して取得</span></label>
-        <label class="check"><input v-model="config.preemptible" type="checkbox" /><span>録画・視聴が始まったら取得を中断</span></label>
         <label class="check"><input v-model="config.prefer_local" type="checkbox" /><span>ローカルチューナーを優先</span></label>
+        <div class="epg-setting-help"><p><strong>候補再評価間隔</strong>：候補を再評価する間隔。スキャン終了時は即座に再評価する。</p><p><strong>起動待ち時間とばらつき</strong>：起動直後に一斉にスキャンを始めないための待ち時間とばらつき。</p><p><strong>録画・視聴の優先</strong>：EPGは最低優先度で動作し、録画・視聴の要求が来たら取得を中断して譲る。</p></div>
+        <div class="epg-friendly-grid">
+          <label class="field"><span>候補再評価間隔(秒)</span><input v-model.number="config.scheduler_interval_secs" type="number" min="1" /></label>
+          <label class="field"><span>起動待ち(秒)</span><input v-model.number="config.startup_delay_secs" type="number" min="0" /></label>
+          <label class="field"><span>起動ばらつき(秒)</span><input v-model.number="config.startup_jitter_secs" type="number" min="0" /></label>
+        </div>
         <details><summary>エキスパート設定</summary>
           <p class="muted">秒単位の値。推奨: 最小30秒 / 通常90秒 / 最大180秒。</p>
           <div class="epg-friendly-grid"><label class="field"><span>最小滞在(秒)</span><input v-model.number="config.min_dwell_secs" type="number" min="1" /></label><label class="field"><span>通常滞在(秒)</span><input v-model.number="config.normal_dwell_secs" type="number" min="1" /></label><label class="field"><span>最大滞在(秒)</span><input v-model.number="config.max_dwell_secs" type="number" min="1" /></label><label class="field"><span>CPU上限(%)</span><input v-model.number="config.cpu_hard_limit_percent" type="number" min="1" max="100" /></label></div>

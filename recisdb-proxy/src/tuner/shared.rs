@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, watch};
 use crate::bondriver::BonDriverTuner;
 use crate::tuner::channel_key::ChannelKey;
 use crate::tuner::epg_collector::EpgCollector;
+use crate::tuner::epg_progress::EpgProgress;
 use crate::tuner::lock::TunerLock;
 use crate::tuner::logo_collector::ChannelLogoCollector;
 use crate::tuner::nit_collector::NitCollector;
@@ -338,6 +339,7 @@ pub struct SharedTuner {
     pub key: ChannelKey,
     /// Broadcast sender for TS data.
     tx: broadcast::Sender<Bytes>,
+    epg_progress: Arc<EpgProgress>,
     /// Channel change notification sender.
     channel_change_tx: broadcast::Sender<()>,
     /// Reference count of active subscribers. Only ever mutated by
@@ -410,6 +412,7 @@ impl SharedTuner {
         Arc::new(Self {
             key,
             tx,
+            epg_progress: EpgProgress::new(),
             channel_change_tx,
             subscriber_count: AtomicU32::new(0),
             claims: std::sync::Mutex::new(HashMap::new()),
@@ -431,6 +434,10 @@ impl SharedTuner {
             mmt_status: std::sync::Mutex::new(None),
             slot: std::sync::Mutex::new(None),
         })
+    }
+
+    pub fn epg_progress(&self) -> Arc<EpgProgress> {
+        self.epg_progress.clone()
     }
 
     /// Store `permit` as this entry's driver-slot reservation.
@@ -2051,14 +2058,16 @@ impl SharedTuner {
     /// on the fallback path where B25 is unavailable the bytes are the raw
     /// ones anyway.
     pub(crate) fn spawn_si_collector(self: &Arc<Self>) {
+        self.epg_progress.reset();
         let weak = Arc::downgrade(self);
+        let epg_progress = self.epg_progress.clone();
         let mut rx = self.subscribe_untracked();
         let mut state_rx = self.subscribe_state();
         let key = self.key.clone();
 
         tokio::spawn(async move {
             let mut logo_collector = ChannelLogoCollector::new();
-            let mut epg_collector = EpgCollector::new();
+            let mut epg_collector = EpgCollector::with_progress(epg_progress);
             let mut nit_collector = NitCollector::new();
             let mut scramble_watch = ScrambleWatch::new();
 

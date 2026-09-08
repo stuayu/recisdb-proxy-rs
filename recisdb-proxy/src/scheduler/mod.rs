@@ -3,6 +3,7 @@
 //! This module provides:
 //! - [`ScanScheduler`]: Periodic channel scanning scheduler
 
+pub mod epg_dwell;
 pub mod epg_scheduler;
 pub mod scan_scheduler;
 
