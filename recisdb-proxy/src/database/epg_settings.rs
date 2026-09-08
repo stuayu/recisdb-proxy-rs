@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const EPG_SCHEMA_SQL: &str = r#"
--- reserve_tuners and preemptible are legacy columns. They remain for existing
+-- reserve_tuners, preemptible, and reserve_for_recording_override are legacy
+-- columns. They remain for existing
 -- databases, but are intentionally absent from the runtime/API model: tuner
 -- capacity is governed by max_concurrent_scans and EPG claims always yield to
 -- higher-priority recording/viewing requests.
@@ -135,7 +136,6 @@ pub struct PhysicalTunerEpgSettings {
     pub max_dwell_secs_override: Option<i64>,
     pub allow_remote_override: Option<bool>,
     pub prefer_local_override: Option<bool>,
-    pub reserve_for_recording_override: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,10 +400,10 @@ impl Database {
         Ok(rows)
     }
     pub fn get_physical_tuner_epg_settings(&self, id: i64) -> Result<PhysicalTunerEpgSettings> {
-        Ok(self.connection().query_row("SELECT enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,reserve_for_recording_override FROM physical_tuner_epg_settings WHERE physical_tuner_id=?", [id], |r| Ok(PhysicalTunerEpgSettings { physical_tuner_id:id, enabled_override:r.get::<_,Option<i64>>(0)?.map(|v|v!=0), auto_tuner_scan_enabled_override:r.get::<_,Option<i64>>(1)?.map(|v|v!=0), preset_id:r.get(2)?, target_refresh_secs_override:r.get(3)?, max_stale_secs_override:r.get(4)?, min_dwell_secs_override:r.get(5)?, normal_dwell_secs_override:r.get(6)?, max_dwell_secs_override:r.get(7)?, allow_remote_override:r.get::<_,Option<i64>>(8)?.map(|v|v!=0), prefer_local_override:r.get::<_,Option<i64>>(9)?.map(|v|v!=0), reserve_for_recording_override:r.get::<_,Option<i64>>(10)?.map(|v|v!=0) })).optional()?.unwrap_or(PhysicalTunerEpgSettings { physical_tuner_id:id, ..Default::default() }))
+        Ok(self.connection().query_row("SELECT enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override FROM physical_tuner_epg_settings WHERE physical_tuner_id=?", [id], |r| Ok(PhysicalTunerEpgSettings { physical_tuner_id:id, enabled_override:r.get::<_,Option<i64>>(0)?.map(|v|v!=0), auto_tuner_scan_enabled_override:r.get::<_,Option<i64>>(1)?.map(|v|v!=0), preset_id:r.get(2)?, target_refresh_secs_override:r.get(3)?, max_stale_secs_override:r.get(4)?, min_dwell_secs_override:r.get(5)?, normal_dwell_secs_override:r.get(6)?, max_dwell_secs_override:r.get(7)?, allow_remote_override:r.get::<_,Option<i64>>(8)?.map(|v|v!=0), prefer_local_override:r.get::<_,Option<i64>>(9)?.map(|v|v!=0) })).optional()?.unwrap_or(PhysicalTunerEpgSettings { physical_tuner_id:id, ..Default::default() }))
     }
     pub fn update_physical_tuner_epg_settings(&self, c: &PhysicalTunerEpgSettings) -> Result<()> {
-        self.connection().execute("INSERT INTO physical_tuner_epg_settings(physical_tuner_id,enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,reserve_for_recording_override,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,strftime('%s','now')) ON CONFLICT(physical_tuner_id) DO UPDATE SET enabled_override=?2,auto_tuner_scan_enabled_override=?3,preset_id=?4,target_refresh_secs_override=?5,max_stale_secs_override=?6,min_dwell_secs_override=?7,normal_dwell_secs_override=?8,max_dwell_secs_override=?9,allow_remote_override=?10,prefer_local_override=?11,reserve_for_recording_override=?12,updated_at=strftime('%s','now')", params![c.physical_tuner_id,c.enabled_override.map(b),c.auto_tuner_scan_enabled_override.map(b),c.preset_id,c.target_refresh_secs_override,c.max_stale_secs_override,c.min_dwell_secs_override,c.normal_dwell_secs_override,c.max_dwell_secs_override,c.allow_remote_override.map(b),c.prefer_local_override.map(b),c.reserve_for_recording_override.map(b)])?;
+        self.connection().execute("INSERT INTO physical_tuner_epg_settings(physical_tuner_id,enabled_override,auto_tuner_scan_enabled_override,preset_id,target_refresh_secs_override,max_stale_secs_override,min_dwell_secs_override,normal_dwell_secs_override,max_dwell_secs_override,allow_remote_override,prefer_local_override,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,strftime('%s','now')) ON CONFLICT(physical_tuner_id) DO UPDATE SET enabled_override=?2,auto_tuner_scan_enabled_override=?3,preset_id=?4,target_refresh_secs_override=?5,max_stale_secs_override=?6,min_dwell_secs_override=?7,normal_dwell_secs_override=?8,max_dwell_secs_override=?9,allow_remote_override=?10,prefer_local_override=?11,updated_at=strftime('%s','now')", params![c.physical_tuner_id,c.enabled_override.map(b),c.auto_tuner_scan_enabled_override.map(b),c.preset_id,c.target_refresh_secs_override,c.max_stale_secs_override,c.min_dwell_secs_override,c.normal_dwell_secs_override,c.max_dwell_secs_override,c.allow_remote_override.map(b),c.prefer_local_override.map(b)])?;
         Ok(())
     }
     pub fn get_epg_effective(&self, tuner_id: Option<i64>) -> Result<EffectiveEpgScanConfig> {
@@ -418,12 +418,6 @@ impl Database {
         });
         let mut e = g.clone();
         let mut src = serde_json::Map::new();
-        if let Some(ref x) = physical {
-            if let Some(v) = x.enabled_override {
-                e.enabled = v;
-                src.insert("enabled".into(), serde_json::json!("tunerOverride"));
-            }
-        }
         macro_rules! pick {
             ($f:ident) => {
                 if let Some(ref x) = preset {
@@ -437,6 +431,12 @@ impl Database {
                     src.insert(stringify!($f).into(), serde_json::json!("global"));
                 }
             };
+        }
+        if let Some(ref x) = preset {
+            e.enabled = x.enabled;
+            src.insert("enabled".into(), serde_json::json!("preset"));
+        } else {
+            src.insert("enabled".into(), serde_json::json!("global"));
         }
         pick!(target_refresh_secs);
         pick!(max_stale_secs);
@@ -468,6 +468,10 @@ impl Database {
             );
         }
         if let Some(ref x) = physical {
+            if let Some(v) = x.enabled_override {
+                e.enabled = v;
+                src.insert("enabled".into(), serde_json::json!("tunerOverride"));
+            }
             if let Some(v) = x.auto_tuner_scan_enabled_override {
                 e.auto_tuner_scan_enabled = v;
                 src.insert(
@@ -617,7 +621,11 @@ mod tests {
     fn auto_tuner_scan_effective_resolution_uses_global_preset_and_override() {
         let db = Database::open_in_memory().unwrap();
         let mut global = db.get_epg_global_settings().unwrap();
+        global.enabled = false;
         global.auto_tuner_scan_enabled = true;
+        global.target_refresh_secs = 111;
+        global.min_future_coverage_hours = 11;
+        global.target_future_coverage_hours = 77;
         let preset_id = db
             .list_epg_presets()
             .unwrap()
@@ -629,17 +637,23 @@ mod tests {
         db.update_epg_global_settings(&global).unwrap();
         db.connection()
             .execute(
-                "UPDATE epg_scan_presets SET auto_tuner_scan_enabled=0 WHERE id=?",
+                "UPDATE epg_scan_presets SET enabled=1,auto_tuner_scan_enabled=0,target_refresh_secs=222,min_future_coverage_hours=22,target_future_coverage_hours=88 WHERE id=?",
                 [preset_id],
             )
             .unwrap();
 
         let inherited = db.get_epg_effective(None).unwrap();
+        assert!(inherited.effective.enabled);
         assert!(!inherited.auto_tuner_scan_enabled);
         assert!(!inherited.effective.auto_tuner_scan_enabled);
+        assert_eq!(inherited.effective.target_refresh_secs, 222);
+        assert_eq!(inherited.effective.min_future_coverage_hours, 22);
+        assert_eq!(inherited.effective.target_future_coverage_hours, 88);
+        assert_eq!(inherited.source["enabled"], "preset");
 
         db.update_physical_tuner_epg_settings(&PhysicalTunerEpgSettings {
             physical_tuner_id: 42,
+            enabled_override: Some(false),
             auto_tuner_scan_enabled_override: Some(true),
             ..Default::default()
         })
@@ -647,6 +661,56 @@ mod tests {
         let overridden = db.get_epg_effective(Some(42)).unwrap();
         assert!(overridden.auto_tuner_scan_enabled);
         assert!(overridden.effective.auto_tuner_scan_enabled);
+        assert!(!overridden.effective.enabled);
+        assert_eq!(overridden.source["enabled"], "tunerOverride");
+    }
+
+    #[test]
+    fn physical_tuner_epg_settings_round_trip_excludes_legacy_recording_reservation() {
+        let db = Database::open_in_memory().unwrap();
+        let settings = PhysicalTunerEpgSettings {
+            physical_tuner_id: 42,
+            enabled_override: Some(false),
+            auto_tuner_scan_enabled_override: Some(true),
+            preset_id: Some(1),
+            target_refresh_secs_override: Some(123),
+            max_stale_secs_override: Some(456),
+            min_dwell_secs_override: Some(7),
+            normal_dwell_secs_override: Some(8),
+            max_dwell_secs_override: Some(9),
+            allow_remote_override: Some(true),
+            prefer_local_override: Some(false),
+        };
+
+        db.update_physical_tuner_epg_settings(&settings).unwrap();
+        assert_eq!(
+            db.get_physical_tuner_epg_settings(42)
+                .unwrap()
+                .physical_tuner_id,
+            settings.physical_tuner_id
+        );
+        assert_eq!(
+            db.get_physical_tuner_epg_settings(42)
+                .unwrap()
+                .enabled_override,
+            settings.enabled_override
+        );
+        assert_eq!(
+            db.get_physical_tuner_epg_settings(42)
+                .unwrap()
+                .target_refresh_secs_override,
+            settings.target_refresh_secs_override
+        );
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT reserve_for_recording_override FROM physical_tuner_epg_settings WHERE physical_tuner_id=42",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -1163,6 +1163,9 @@ fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> 
     });
     candidates.extend(representatives);
     candidates.sort_by_key(|target| {
+        let min_coverage_missing = !target
+            .section_coverage_until
+            .is_some_and(|until| until >= now + config.min_future_coverage_hours * 3600);
         let coverage_missing = !target
             .section_coverage_until
             .is_some_and(|until| until >= now + config.target_future_coverage_hours * 3600);
@@ -1170,6 +1173,7 @@ fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> 
             .last_complete_at
             .is_some_and(|at| at + config.target_refresh_secs > now);
         (
+            !min_coverage_missing,
             !coverage_missing,
             !stale,
             target.failure_count,
@@ -1636,6 +1640,88 @@ mod tests {
             },
         ];
         let ranked = rank_targets(&targets, 10, &config());
+        assert_eq!(
+            ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
+            [3, 4, 2, 1]
+        );
+    }
+
+    #[test]
+    fn rank_targets_puts_targets_below_the_minimum_coverage_first() {
+        let mut config = config();
+        config.min_future_coverage_hours = 3;
+        config.target_future_coverage_hours = 7;
+        let targets = [
+            target(
+                1,
+                1,
+                BroadcastType::Terrestrial,
+                Some(10 + 4 * 3600),
+                Some(0),
+                Some(0),
+            ),
+            target(
+                1,
+                2,
+                BroadcastType::Terrestrial,
+                Some(10 + 5400),
+                Some(0),
+                Some(0),
+            ),
+        ];
+
+        let ranked = rank_targets(&targets, 10, &config);
+        assert_eq!(
+            ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn rank_targets_is_unchanged_when_every_target_clears_the_minimum() {
+        let mut config = config();
+        config.min_future_coverage_hours = 1;
+        config.target_future_coverage_hours = 2;
+        let targets = [
+            target(
+                1,
+                1,
+                BroadcastType::Terrestrial,
+                Some(10 + 5400),
+                Some(10),
+                Some(10),
+            ),
+            target(
+                1,
+                2,
+                BroadcastType::Terrestrial,
+                Some(10 + 3600),
+                Some(10),
+                Some(10),
+            ),
+            target(
+                1,
+                3,
+                BroadcastType::Terrestrial,
+                Some(10 + 3600),
+                Some(0),
+                Some(0),
+            ),
+            {
+                let mut target = target(
+                    1,
+                    4,
+                    BroadcastType::Terrestrial,
+                    Some(10 + 3600),
+                    None,
+                    None,
+                );
+                target.failure_count = 2;
+                target
+            },
+        ];
+
+        let ranked = rank_targets(&targets, 10, &config);
         assert_eq!(
             ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
             [3, 4, 2, 1]
