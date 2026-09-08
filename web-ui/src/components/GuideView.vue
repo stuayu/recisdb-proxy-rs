@@ -17,9 +17,9 @@ const NARROW_MEDIA_QUERY = '(max-width: 700px)'
 const PX_PER_MIN_DESKTOP = 3
 const PX_PER_MIN_TABLET = 2.5
 const PX_PER_MIN_NARROW = 2
-const COLUMN_WIDTH_DESKTOP = 130
+const COLUMN_WIDTH_DESKTOP = 140
 const COLUMN_WIDTH_TABLET = 116
-const COLUMN_WIDTH_NARROW = 96
+const COLUMN_WIDTH_NARROW = 130
 const AXIS_WIDTH_DESKTOP = 44
 const AXIS_WIDTH_NARROW = 30
 const CHANNEL_PAGE_SIZE = 120
@@ -986,7 +986,9 @@ onUnmounted(() => {
       </div>
       <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
     </div>
-    <div class="guide-actionbar">
+    <!-- 番組が 1 件も無いときはグリッドごと出ないので、押しても何も起きない
+         ボタンだけが宙に浮く。空状態では操作バーごと畳む。 -->
+    <div v-if="rawPrograms.length" class="guide-actionbar">
       <span
         class="guide-actionbar-selected"
         v-text="selectedProgram ? (selectedProgram.name || '番組名なし') : '番組を選ぶと詳細・視聴できます'"

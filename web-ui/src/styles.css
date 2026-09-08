@@ -857,10 +857,8 @@ textarea:focus-visible,
 }
 
 .guide-cell-head {
-  display: flex;
+  display: block;
   flex: 0 0 auto;
-  align-items: baseline;
-  gap: 3px;
   min-width: 0;
 }
 
@@ -903,8 +901,11 @@ textarea:focus-visible,
 
 .guide-cell strong,
 .guide-untitled {
+  /* サブチャンネルと重なる時間帯は列が 50% 幅になる (デスクトップで 70px)。
+     flex 行に分とタイトルを並べるとタイトル欄が 30px 程度まで潰れ、
+     1 文字ずつ折り返して読めなくなる。同じ段落にインラインで流す。 */
+  display: inline;
   min-width: 0;
-  flex: 1 1 auto;
   font-size: 12px;
   font-weight: 700;
   line-height: 1.25;
@@ -917,7 +918,8 @@ textarea:focus-visible,
 }
 
 .guide-cell-time {
-  flex: 0 0 auto;
+  display: inline;
+  margin-right: 3px;
   color: var(--guide-cell-text);
   font-size: 12px;
   font-weight: 800;
@@ -959,8 +961,15 @@ textarea:focus-visible,
     height: calc(100dvh - 124px);
   }
 
+  /* 狭幅のヘッダーは 44px しかない。ロゴとサブチャンネル名まで積むと
+     局名が上下に潰れて読めなくなるので、リモコン番号と局名だけ残す。 */
   .guide-header-cell {
     padding: 3px 4px;
+  }
+
+  .guide-channel-logo,
+  .guide-header-cell small {
+    display: none;
   }
 
   .guide-hour-label {
