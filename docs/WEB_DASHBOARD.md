@@ -31,6 +31,11 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 削除不可。effective値の表示・physical tuner override・状態/history画面はAPI基盤追加後に
 段階実装する。
 
+設定画面では `scheduler_interval_secs`、`startup_delay_secs`、`startup_jitter_secs` を設定
+できる。`reserve_tuners` と `preemptible` はAPI/UIから削除した。DB列は既存データとの互換性
+のため残るが、実行時には使わない。スキャン枠は `max_concurrent_scans` で管理し、EPGは
+録画・視聴へ常に退避する。
+
 Active scan状態は「取得中」「延期理由」「最終更新」「次回判定」をstatus APIから表示する。
 延期理由はbackendの構造化statusをUIで日本語化し、CPU負荷・録画/視聴による占有を区別する。
 
@@ -239,6 +244,16 @@ TVTest / EDCB 側の設定を画面の指示どおりに進められるガイド
 - **画面下部の細い操作バー** (`.guide-actionbar`) に選択中の番組名と
   「番組詳細」「視聴」「現在時刻へ」を置いています。選択がないときは前 2 つは disabled です。
 
+番組表は `GET /api/epg/events` のSSEも購読する。`program` を受け取ると、
+`(nid, tsid, sid, event_id)` をキーにしたMapへ反映し、300ms単位で差分描画する。現行の送信
+フレームのpayload `type` は `update` である（サーバー側のenumには `create` / `update` /
+`delete` が定義されている）。`ping` は15秒ごと、`epg_status` は30秒ごとに送られる。
+`lagged` を受け取った場合はskipped件数を使って全件再取得する。認証は `/api/programs` と
+同じである。
+
+チャンネル列ヘッダにはEPG取得状態のドットを表示する。状態は取得中、取得済み、一部取得、
+古い、未取得、失敗で、番組表を見ながら対象muxの取得状況を把握できる。
+
 番組一覧だけがテレビ風で、番組詳細ダイアログとブラウザプレビュー (PreviewPlayer) は
 従来どおりの Web UI のままです。
 
@@ -375,6 +390,14 @@ created_at は最古、updated_at は最新をマージ)。
 ### GET /api/events
 
 ダッシュボード更新通知用の Server-Sent Events エンドポイント。`event: refresh` を受け取ったクライアントは `/api/stats` や `/api/clients` を再取得する。
+
+### GET /api/epg/events
+
+番組表のリアルタイム差分用Server-Sent Eventsエンドポイント。`program`、`ping`、`lagged`、
+`epg_status`を配信する。`program`のpayloadは番組データと`type`を含み、番組を識別する
+`nid`、`tsid`、`sid`、`event_id`を持つ。現行の送信値は`type: update`である。`ping`は15秒間隔、
+`epg_status`は30秒間隔で、`lagged`には取りこぼした件数を含む。クライアントは`lagged`時に
+番組表を全件再取得する。`/api/programs` と同じBearer認証を使う。
 
 ### GET /api/stats
 

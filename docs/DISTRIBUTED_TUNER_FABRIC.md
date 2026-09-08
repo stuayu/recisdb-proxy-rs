@@ -9,6 +9,22 @@
 別の `MuxLeaseManager` で `(network_id, tsid)` を排他し、TTLまたはguard dropで解放する。
 `remote_allow_ts_transport` が無効でも、このmetadata経路はTS転送を行わない。
 
+`POST /node/v3/epg/metadata` の `RemoteEpgMetadataRequest` は、従来の固定滞在時間
+`dwell_secs` に加えて `dwell: Option<RemoteEpgDwell>` を持つ。`RemoteEpgDwell` のフィールドは
+`min_dwell_secs`、`normal_dwell_secs`、`max_dwell_secs`、`idle_section_timeout_secs`、
+`target_future_coverage_hours` である。
+
+`RemoteEpgMetadataReply` は `programs` に加えて `status`、`elapsed_secs`、`sections_seen`、
+`services_total`、`services_complete`、`coverage_until` を返す。追加フィールドはすべて
+`#[serde(default)]` の任意値である。
+
+新ノードから旧ノードへ送る場合、旧ノードは `dwell` を無視して従来の固定滞在を続ける。
+旧ノードから新ノードへ返る場合、追加フィールドが欠落していてもdefaultで受理し、番組行が
+あれば `Partial`、0件なら `NoData` として扱う。このため新旧どちらの組み合わせでも
+metadata経路を利用できる。remote metadataではsection/TSは自ノードへ転送されないため、
+返却された `coverage_until` は受信側の `epg_scan_states.section_coverage_until` に保存し、
+`epg_service_coverage` のローカルsection行は作らない。
+
 ## Dashboard setup flow
 
 The Vue dashboard presents distributed nodes as local/remote PC and reception

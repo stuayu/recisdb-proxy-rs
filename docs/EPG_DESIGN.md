@@ -19,6 +19,10 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
                    programs テーブル (database/program.rs, Migration 015/025/026)
                      ├─ GET /api/programs        (web/api/programs.rs, ダッシュボード)
                      └─ GET /api/programs (Mirakurun互換, web/mirakurun.rs)
+
+収集状況は `EpgProgress` (`tuner/epg_progress.rs`) を介して `spawn_si_collector` と
+EPG schedulerで共有する。reader起動ごとに `reset()` し、collectorが受信したEIT sectionを
+`EpgSectionTracker` (`ts_analyzer/eit_tracker.rs`)へ記録する。
 ```
 
 ## 収集(受動収集)
@@ -152,6 +156,76 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 | `GET /api/programs?since=&until=&nid=&sid=` | Webダッシュボードの番組表タブ。`[start_at, start_at+duration)` が `[since, until)` と重なる行を返す |
 | Mirakurun互換 `GET /api/programs?networkId=&serviceId=` | EPGStation 等の録画クライアント向け。両条件は単独・併用可能で、無指定は全件を返す |
 
+## EPG取得の完了判定
+
+EPG取得の完了判定は、`programs` の行数やTSを受信した事実ではなく、EIT sectionの完成度で
+行う。`EpgSectionTracker` は `(pid, table_id, service_id, transport_stream_id,
+original_network_id)` ごとにsub-tableのversion、section bitmap、segmentの終端を保持する。
+schedule basic / extended、p/fの完成状態と、当日00:00 JSTを起点にしたschedule coverageを
+サービス単位で算出する。`current_next_indicator=0` は対象外とし、version変更時は該当
+sub-tableだけをリセットする。version番号の5 bit wrapも考慮する。
+
+scheduleのsectionに番組イベントがない場合も、sectionを受信していれば正常な取得である。
+番組がない時間帯、放送休止、深夜帯の空sectionを欠損扱いしない。したがって「TSが1回流れた」
+だけでは成功にならず、イベント件数を見て完了を推測してはならない。
+
+`scan_one` の結果は `EpgScanOutcome` で記録する。状態は `Complete`、`Partial`、`Failed`、
+`Preempted`、`NoData`、`CpuAborted` のいずれかで、経過秒、受信section数、対象サービス数、
+完成サービス数、scan前後のcoverageを併せて保存する。dwellの判定は
+`scheduler/epg_dwell.rs::evaluate_dwell` に集約し、CPU hard limit、max dwell、min dwell、
+目標coverage、stream closed、idle timeout、normal dwellの順で評価する。
+
+local、remote metadata、remote TSの3経路はこの同じ完了判定を使う。remote metadataは
+section/TSが自ノードへ来ないため、返却されたcoverageをmuxのscan stateへ保存するが、
+`epg_service_coverage` にローカルsectionを偽造しない。旧ノードからstatus等が欠落した応答は、
+番組行があれば `Partial`、0件なら `NoData` として受理する。
+
+## coverageの定義
+
+判定用coverageは、EIT sectionからサービスごとに作る `schedule_coverage_until` である。
+scheduleは当日00:00 JSTを基準にsegmentを対応付け、受信済みsectionの連続範囲から終了時刻を
+求める。mux単位では番組表対象サービス（`channels.service_type` が1、2、またはNULL）の
+母数を使い、サービスごとのcoverageの **MIN** を採用する。対象サービスが1つでも未取得なら
+muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux全体の完了とはみなさない。
+
+従来の `MAX(start_at + duration_secs)` による `programs` coverageは補助指標へ降格した。
+例えば09:00の番組と7日後23:00の番組だけが保存されても、MAXだけなら7日後まで埋まったように
+見えるためである。スケジューラの完了・stale判定には
+`epg_scan_states.section_coverage_until` を使う。
+
+## EPGスケジューラ
+
+候補の判定はsection coverageを基準に、全帯域で `needs_scan = !covered || stale || hard_stale`
+を使う。`target_refresh_secs` はsoft stale（更新候補へ戻す時刻）、`max_stale_secs` はhard
+stale（これ以上古いEITを許さない時刻）であり、意味を分離する。BS/CSはother-TS EITで
+複数muxを埋められるため、NIDごとに代表muxを1つだけ候補にする。4Kはdantto4k変換後のTS
+EITにother-TS情報がないため、TS単位で独立して扱う。
+
+`evaluate()` は `rank_targets()` が作った順位付き候補を受け、空きスロット分を
+`tokio::spawn` して直ちに戻る。`max_concurrent_scans` が実行数を制限する。
+`ActiveScanGuard` と `InFlightGuard` はDrop時にカウンタとin-flight集合を解放し、
+`MuxLeaseGuard` は各スキャンタスクが所有する。プロセス内in-flight集合に加え、TTL付き
+`MuxLeaseManager` でも重複を防ぐ二重防御とする。
+
+内部wakeは5秒、full evaluation周期は `scheduler_interval_secs` として分離する。
+起動時は `startup_delay_secs` に `startup_jitter_secs`（最低1秒）を加える。
+`stop()` はwatchで走行中スキャンへ通知し、スキャンは `Preempted` で終了する。終了時は
+`Notify` で即時に再評価する。
+
+## DBスキーマ
+
+Migration 034 `epg_service_coverage` は `(network_id, tsid, service_id)` を主キーとし、
+`pf_complete`、`schedule_basic_complete`、`schedule_extended_complete`、`coverage_until`、
+`sections_seen`、`last_section_at`、`last_complete_at`、`updated_at`を保持する。
+`upsert_epg_service_coverage` / `get_epg_service_coverage` がサービス単位を扱い、
+`get_epg_mux_coverage` / `refresh_epg_section_coverage` がchannelsの対象サービスを母数に
+mux集約する。
+
+同じMigration 034で `epg_scan_states` に `section_coverage_until`、`services_total`、
+`services_complete`、`last_complete_at`、`last_scan_status` を追加する。
+`set_epg_scan_status` はスキャン結果を、`set_epg_remote_coverage` はremote metadataの
+mux-level coverageを保存する。既存の `coverage_until` はprograms由来の補助指標として残る。
+
 ## 既知の制約
 
 ### 自動取得設定のDB管理
@@ -175,7 +249,7 @@ falseにすると能動収集を停止し、受動収集、DB書き込み、番�
 設定更新はDBへ直ちに保存され、schedulerは次回評価で再読込する。Active scanは既存readerの
 subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、idle timeout、CPU limit、
 同時数を適用し、開始/完了/失敗をstate/historyへ記録する。EpgWriterのflush後とscheduler
-判定前にprogramsからcoverage_until/last_eit_received_atを再集計する。remote node側metadata
+判定前にsection coverageを再集計する。remote node側metadata
 実行は認証済み `POST /node/v3/epg/metadata` を使う。remote側は通常の `acquire()` と
 broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報だけ返す。schedulerと
 `LocalMuxServer` は別系統の `MuxLeaseManager` を共有し、TTLまたはguard dropで同一
@@ -191,12 +265,12 @@ broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報
 既存の `RemoteMuxStream` を broadcast 購読し、こちら側の `EpgCollector` で解析する。
 remote TS 収集も metadata 収集も同じ dwell・lease・失敗時local fallbackを使う。
 
-スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。EpgWriterのflush後および
-スケジューラ評価前に `programs` を同じキーでGROUP BYし、各系統の最終番組終了時刻を
-`coverage_until`へ反映する。状態APIの全体coverageは系統ごとの最小値であり、1系統だけ
-埋まった状態を全体正常とは扱わない。スケジューラは全BonDriverの有効チャンネルを重複排除し、
-coverage不足・stale・failure/backoffを使って次のTSを選ぶ。対象選択は純粋関数で、固定の
-先頭チャンネルには依存しない。
+スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。サービス単位のsection
+coverageを更新した後、対象サービスの最小値を `section_coverage_until` へ反映する。
+状態APIの全体coverageは系統ごとの最小値であり、1系統だけ埋まった状態を全体正常とは扱わない。
+スケジューラは全BonDriverの有効チャンネルを重複排除し、section coverage不足・soft/hard
+stale・failure/backoffを使って次のTSを選ぶ。対象選択は純粋関数で、固定の先頭チャンネルには
+依存しない。
 
 BS/CSではEIT parserが返す `original_network_id` と `transport_stream_id` をcollectorが
 そのまま `ProgramUpsert.nid/tsid` に設定する。Other-TS EITで供給された系統も同じcoverage

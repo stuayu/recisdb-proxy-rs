@@ -47,9 +47,17 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - 設定の解決順は **built-in default → global → preset → 物理チューナーoverride** の1本道で、
   `Database::get_epg_effective()` が返す `EffectiveEpgScanConfig` だけを実行系が見る。
   **フロントエンドで継承を解決しない**(effective APIの値をそのまま表示する)。
-- `epg_scan_states` は **`(network_id, tsid)` ごと**。coverageも `programs` を同じキーで
-  GROUP BYして集計する。全体coverageは**系統ごとの最小値**で、1系統だけ埋まった状態を
-  「全体正常」と表示しない。
+- EPG取得の完了判定は **EIT sectionの完成度**で行う。TSが流れたこと・番組行が入ったことを
+  完了の根拠にしない。schedule EITの**空sectionは正常な取得**であり、番組がない時間帯、
+  放送休止、深夜帯を欠損扱いしない。
+- coverageは `programs` の `MAX(start_at + duration_secs)` から作らない。それは補助指標であり、
+  完了・stale判定には `epg_scan_states.section_coverage_until` を使う。muxのcoverageは
+  番組表対象サービス（`channels.service_type` が1、2、またはNULL）の最小値とし、1つでも
+  未取得なら未取得扱いにする。
+- local / remote metadata / remote TS の完了判定は共通化し、`scheduler/epg_dwell.rs` の
+  `evaluate_dwell` を使う。経路ごとにdwell判定を書かない。
+- ノード間プロトコルの追加フィールドは `#[serde(default)]` にし、新旧どちらの組み合わせでも
+  動くようにする。
 - 巡回対象の判定は帯域で分ける(`broadcast_region::classify_nid` を使い、NIDをベタ書きしない)。
   地デジは物理TSごとに独立。**BS/CSはOther-TS EITで供給済みの系統を選局しない**
   (全TS無条件巡回は禁止)。
