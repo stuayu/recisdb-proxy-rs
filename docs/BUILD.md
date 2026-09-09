@@ -23,6 +23,25 @@ cargo test -p recisdb-protocol
 cargo test -p bondriver-proxy-client
 ```
 
+### web-uiのテストとブラウザ検証
+
+Vueのユニットテストと番組表・レスポンシブの実ブラウザ検証は、次のコマンドで実行する。
+`npm test` は `node --test` と `--experimental-strip-types` を使い、nodes 7件と
+composables 11件の計18件を実行する。
+
+```sh
+cd web-ui
+npm test              # node --test。nodes 7件 + composables 11件
+npm run qa:responsive # Playwright。390 / 768 / 1280px の全タブ
+npm run qa:guide      # Playwright。本番規模のモックEPGで番組表を検証
+```
+
+`qa:responsive` は390px、768px、1280pxの各幅で全10タブを開き、アプリが起動し、
+ページに横スクロールがないことを確認する。`qa:guide` は70サービス・約2800番組の
+モックEPGで、番組表の仮想化、sticky、状態表現、クリック・キーボード操作、放送種別フィルタ、
+詳細・プレビュー、ダークモード、レスポンシブを確認する。両方ともビルド済み成果物を
+ローカルHTTPで配信してPlaywright Chromiumから検証する。
+
 ### recisdb-proxy のバージョン表記
 
 `recisdb-proxy` のバージョン(ダッシュボードの `/api/version`・自己更新チェック等)は `Cargo.toml` の固定値ではなく、`recisdb-proxy/build.rs` がビルド時に決定して埋め込む。優先順位:

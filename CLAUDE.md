@@ -54,6 +54,10 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   完了・stale判定には `epg_scan_states.section_coverage_until` を使う。muxのcoverageは
   番組表対象サービス（`channels.service_type` が1、2、またはNULL）の最小値とし、1つでも
   未取得なら未取得扱いにする。
+- EPG行の書き込みは有界キューで行い、溢れた行は捨てて数える。送信側で待たない(SI collectorが
+  詰まるとbroadcastがLaggedして、EIT収集そのものが劣化する)。
+- 受動収集(視聴・録画中)のcoverageも定期的に永続化する。能動スキャンの結果だけをcoverageの
+  根拠にしない。
 - local / remote metadata / remote TS の完了判定は共通化し、`scheduler/epg_dwell.rs` の
   `evaluate_dwell` を使う。経路ごとにdwell判定を書かない。
 - ノード間プロトコルの追加フィールドは `#[serde(default)]` にし、新旧どちらの組み合わせでも
@@ -118,6 +122,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   - 番組データを `ref` で持つと2万件のオブジェクトが再帰的にProxy化され、分類ループが要素ごとに依存を張る。`shallowRef` を使う。
 - ソースは `web-ui/`(Vue)。`npm run build` の出力を `recisdb-proxy/static/vue/` へ吐き、
   RustEmbed でバイナリに埋め込む。**UIを変更したらビルドしてからサーバーをビルドする。**
+  変更後は `cd web-ui && npm test && npm run qa:responsive && npm run qa:guide` も実行する。
   `static/vue/.gitkeep` はビルドで消えることがあるので消さない。
 
 ## 設定・ログ

@@ -48,6 +48,21 @@ EPG schedulerで共有する。reader起動ごとに `reset()` し、collector�
 - `EpgCollector` はリーダータスク起動ごとに作り直されるため、選局切替・再接続で
   PSI 再組み立て状態は自然にリセットされる。
 
+#### 受動収集のcoverage永続化と書き込み上限
+
+視聴・録画・Preview中に `spawn_si_collector` が受信したEITも `EpgProgress` を更新し、
+能動スキャンの終了時だけでなく、60秒ごとにDBへcoverageを書き戻す。プロセス全体の
+`Weak<EpgProgress>` レジストリを使い、`DatabaseHandle`を持つ単一タスクが生存中の進捗を
+走査する。`SharedTuner` に `Database` ハンドルを持たせない既存方針を維持するためである。
+前回の永続化以降に進捗カウンタが動いていないハンドルは書き戻しをスキップする。集約した
+section coverageに加え、EITを最後に受信した時刻も更新する。
+
+EPG行の流入は容量8192のbounded channelで受ける。collectorは `try_send` だけを使い、
+キューが満杯なら行を捨てて `dropped_program_rows` のカウンタへ加算する。送信側が
+`send().await` で待つとSI collectorが詰まり、TSのbroadcastが `Lagged` してEIT収集自体が
+劣化するためである。破棄件数は `GET /api/epg/status` の `dropped_program_rows` で観測でき、
+満杯時の警告ログは60秒に1回までに抑える。
+
 #### 地上波 EIT の運用規定 (ARIB TR-B14)
 
 TR-B14 Version 6.7 Vol. 4 表13-7 (PDF printed p. 83) は PID を
@@ -197,7 +212,11 @@ muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux�
 
 候補の判定はsection coverageを基準に、全帯域で `needs_scan = !covered || stale || hard_stale`
 を使う。`target_refresh_secs` はsoft stale（更新候補へ戻す時刻）、`max_stale_secs` はhard
-stale（これ以上古いEITを許さない時刻）であり、意味を分離する。BS/CSはother-TS EITで
+stale（これ以上古いEITを許さない時刻）であり、意味を分離する。候補の優先順位は
+`min_future_coverage_hours` 未達、目標coverage未達、stale、failure_count、
+`section_coverage_until`、TSIDの順である。`min_future_coverage_hours` はcoverageの下限、
+`target_future_coverage_hours` は到達させたい目標であり、前者は「やるかやらないか」を
+決める条件ではなく、「どの候補を先にやるか」を決める最優先階層である。BS/CSはother-TS EITで
 複数muxを埋められるため、NIDごとに代表muxを1つだけ候補にする。4Kはdantto4k変換後のTS
 EITにother-TS情報がないため、TS単位で独立して扱う。
 

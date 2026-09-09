@@ -32,7 +32,8 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
 段階実装する。
 
 設定画面では `scheduler_interval_secs`、`startup_delay_secs`、`startup_jitter_secs` を設定
-できる。`reserve_tuners` と `preemptible` はAPI/UIから削除した。DB列は既存データとの互換性
+できる。`reserve_tuners`、`preemptible`、`reserve_for_recording_override` はAPI/UIから
+削除した。DB列は既存データとの互換性
 のため残るが、実行時には使わない。スキャン枠は `max_concurrent_scans` で管理し、EPGは
 録画・視聴へ常に退避する。
 
@@ -250,6 +251,17 @@ TVTest / EDCB 側の設定を画面の指示どおりに進められるガイド
 `delete` が定義されている）。`ping` は15秒ごと、`epg_status` は30秒ごとに送られる。
 `lagged` を受け取った場合はskipped件数を使って全件再取得する。認証は `/api/programs` と
 同じである。
+
+SSE接続はレスポンスの `Content-Type` が `text/event-stream` の場合だけ有効な接続として
+扱う。1フレームも受信せず5秒未満で切断した場合は再接続バックオフを初期値へ戻さない。
+SSEを通さないリバースプロキシや非ストリームの200応答で、接続・即切断・1秒後の全件再取得を
+繰り返さないためである。1フレームを受信した場合、または5秒以上接続が続いた場合は安定した
+接続としてバックオフを戻す。
+
+### GET /api/epg/status
+
+EPGの取得状態、coverage、延期・失敗理由、CPU情報を返す。既存のレスポンスフィールドに加え、
+`dropped_program_rows` がboundedなEPG行キューの満杯で破棄した累計行数を示す。
 
 チャンネル列ヘッダにはEPG取得状態のドットを表示する。状態は取得中、取得済み、一部取得、
 古い、未取得、失敗で、番組表を見ながら対象muxの取得状況を把握できる。
