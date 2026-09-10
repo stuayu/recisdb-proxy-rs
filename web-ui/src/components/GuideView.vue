@@ -12,6 +12,7 @@ import {
   type EpgScanState,
 } from '../composables/useEpgEvents'
 import { broadcastDateInput } from '../composables/useGuideDate'
+import { calculateGuideProgramWindow } from '../composables/useGuideProgramWindow'
 import { guideServiceGroupKey, mainGuideServices } from '../composables/useGuideServices'
 import PreviewPlayer from './PreviewPlayer.vue'
 
@@ -368,23 +369,26 @@ function applyScrollUpdate(): void {
   if (viewportHeight.value !== nextViewportHeight) viewportHeight.value = nextViewportHeight
   updateVisibleRangeIfNeeded(pendingScrollTop - headerHeight.value)
   updateVisibleColumns(pendingScrollLeft, element.clientWidth)
+  refreshProgramPopupPosition()
   void loadMoreForScroll()
 }
 async function loadMoreForScroll(): Promise<void> {
   const top = Math.max(0, pendingScrollTop - headerHeight.value)
   const bottom = top + viewportHeight.value
-  const before = gridBounds.value.since + Math.floor(top / pxPerMin.value * 60)
-  const after = gridBounds.value.since + Math.ceil(bottom / pxPerMin.value * 60)
-  const edge = 45 * 60
-  if (before - gridBounds.value.since < edge && before > gridBounds.value.since) {
-    await loadProgramsWindow(Math.max(gridBounds.value.since, before - PROGRAM_WINDOW_STEP_SECS), before)
-  }
-  if (gridBounds.value.until - after < edge && after < gridBounds.value.until) {
-    await loadProgramsWindow(after, Math.min(gridBounds.value.until, after + PROGRAM_WINDOW_STEP_SECS))
-  }
+  const { since, until } = gridBounds.value
+  const programWindow = calculateGuideProgramWindow({
+    top,
+    bottom,
+    gridSince: since,
+    gridUntil: until,
+    pxPerMin: pxPerMin.value,
+    bufferPx: visibleBufferPx.value,
+    stepSecs: PROGRAM_WINDOW_STEP_SECS,
+  })
+  if (programWindow !== null) await loadProgramsWindow(...programWindow)
   if (pendingScrollLeft + (scrollArea.value?.clientWidth ?? 0) >
       axisWidth.value + (visibleColumnEnd.value - 2) * columnWidth.value) {
-    await loadProgramsWindow(gridBounds.value.since, gridBounds.value.until)
+    await loadProgramsWindow(since, until)
   }
 }
 function scheduleScrollUpdate(): void {
@@ -395,11 +399,11 @@ function scheduleScrollUpdate(): void {
   })
 }
 function onScroll(): void {
-  closeProgramPopup()
   const element = scrollArea.value
   pendingScrollTop = element?.scrollTop ?? 0
   pendingScrollLeft = element?.scrollLeft ?? 0
   scheduleScrollUpdate()
+  refreshProgramPopupPosition()
 }
 /** 可視範囲を無条件で作り直す (初期表示・リサイズ・データ差し替え時)。 */
 function resizeGrid(): void {
@@ -823,6 +827,27 @@ function positionProgramPopup(): void {
   popupStyle.value = { left: `${left}px`, top: `${top}px`, visibility: 'visible' }
 }
 
+function findProgramAnchor(program: Program): HTMLElement | null {
+  return [...(scrollArea.value?.querySelectorAll<HTMLElement>('[data-program-key]') ?? [])]
+    .find((element) => element.dataset.programKey === program.key) ?? null
+}
+
+/** 再描画でセルが差し替わってもアンカーを引き直してポップアップを追従させる。 */
+function refreshProgramPopupPosition(): void {
+  const program = popupProgram.value
+  if (program === null) return
+  void nextTick().then(() => {
+    if (popupProgram.value?.key !== program.key) return
+    const anchor = findProgramAnchor(program)
+    if (anchor === null) {
+      closeProgramPopup()
+      return
+    }
+    popupAnchor = anchor
+    positionProgramPopup()
+  })
+}
+
 function showProgramPopup(program: Program, anchor: HTMLElement | null = null): void {
   clearPopupHideTimer()
   popupProgram.value = program
@@ -834,8 +859,7 @@ function showSelectedPopup(): void {
   const program = selectedProgram.value
   if (program === null) return
   void nextTick().then(() => {
-    const anchor = [...(scrollArea.value?.querySelectorAll<HTMLElement>('[data-program-key]') ?? [])]
-      .find((element) => element.dataset.programKey === program.key) ?? null
+    const anchor = findProgramAnchor(program)
     showProgramPopup(program, anchor)
   })
 }
@@ -1027,7 +1051,10 @@ watch(selectedDate, () => {
   void loadPrograms()
 })
 // 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
-watch([columns, pxPerMin], () => void nextTick().then(resizeGrid))
+watch([columns, pxPerMin], () => void nextTick().then(() => {
+  resizeGrid()
+  refreshProgramPopupPosition()
+}))
 watch(showSubchannels, (enabled) => {
   if (!enabled) return
   void nextTick().then(async () => {
@@ -1053,7 +1080,7 @@ onMounted(() => {
   }, 30000)
   window.addEventListener('resize', resizeGrid)
   window.visualViewport?.addEventListener('resize', positionProgramPopup)
-  window.visualViewport?.addEventListener('scroll', closeProgramPopup)
+  window.visualViewport?.addEventListener('scroll', refreshProgramPopupPosition)
   window.addEventListener('keydown', onKeydown)
 })
 onUnmounted(() => {
@@ -1061,7 +1088,7 @@ onUnmounted(() => {
   narrowMedia?.removeEventListener('change', resizeGrid)
   window.removeEventListener('resize', resizeGrid)
   window.visualViewport?.removeEventListener('resize', positionProgramPopup)
-  window.visualViewport?.removeEventListener('scroll', closeProgramPopup)
+  window.visualViewport?.removeEventListener('scroll', refreshProgramPopupPosition)
   window.removeEventListener('keydown', onKeydown)
   scrollResizeObserver?.disconnect()
   scrollResizeObserver = null

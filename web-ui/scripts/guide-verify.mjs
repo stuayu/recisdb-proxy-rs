@@ -232,7 +232,26 @@ for (const vp of [
     if (vp.name === '390') {
       // 狭幅はホバー相当の実操作でポップアップを開き、viewport内に収まることを測る。
       // 狭幅にホバーは無い。実機と同じくタップで開く。
-      await page.locator('.guide-cell').first().click()
+      // 仮想化のバッファぶん、DOM 順の先頭セルは画面外にいることがある。
+      // 実際にタップできる (viewport 内の) セルを選ぶ。
+      const tapIndex = await page.evaluate(() => {
+        // sticky なヘッダー行と時刻軸に覆われていないセルでないと実際には押せない。
+        const header = document.querySelector('.guide-header-row')?.getBoundingClientRect()
+        const axis = document.querySelector('.guide-timeaxis')?.getBoundingClientRect()
+        const top = header ? header.bottom : 0
+        const left = axis ? axis.right : 0
+        const cells = [...document.querySelectorAll('.guide-cell')]
+        return cells.findIndex((cell) => {
+          const r = cell.getBoundingClientRect()
+          return r.top >= top && r.bottom <= window.innerHeight &&
+            r.left >= left && r.right <= window.innerWidth && r.height > 12 && r.width > 12
+        })
+      })
+      if (tapIndex < 0) failures.push('390: viewport 内に押せる番組セルがない')
+      // locator.click() の visible/stable 判定ではなく、実機のタップと同じく座標を叩く。
+      const tapBox = await page.locator('.guide-cell').nth(Math.max(0, tapIndex)).boundingBox()
+      if (tapBox === null) failures.push('390: 番組セルの矩形が取れない')
+      else await page.mouse.click(tapBox.x + tapBox.width / 2, tapBox.y + tapBox.height / 2)
       await page.waitForTimeout(400)
       const narrowPopup = await page.evaluate(() => {
         const popups = [...document.querySelectorAll('.guide-program-popup')]
