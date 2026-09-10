@@ -24,15 +24,15 @@ const NARROW_MEDIA_QUERY = '(max-width: 700px)'
  * 本番は放送局が 800 前後あり、1 列 220px のままだと横幅が 5 万px を超えて
  * スマホでは 2 列も入らない。狭幅では列を詰め、1 分あたりの高さも下げる。
  */
-const PX_PER_MIN_DESKTOP = 3
-const PX_PER_MIN_TABLET = 2.5
-const PX_PER_MIN_NARROW = 2
-const COLUMN_WIDTH_DESKTOP = 140
-const COLUMN_WIDTH_TABLET = 116
-const COLUMN_WIDTH_NARROW = 130
 const AXIS_WIDTH_DESKTOP = 44
 const AXIS_WIDTH_NARROW = 30
-const CHANNEL_PAGE_SIZE = 120
+const DEFAULT_CHANNEL_COUNT = 7
+const DEFAULT_CHANNEL_COUNT_NARROW = 5
+const DEFAULT_HOURS = 4
+const CHANNEL_COUNT_OPTIONS = [5, 7, 9] as const
+const HOURS_OPTIONS = [3, 4, 6] as const
+const DENSITY_STORAGE_KEY = 'guide:density'
+const DETAIL_LOAD_DEBOUNCE_MS = 250
 const PROGRAM_WINDOW_BEFORE_SECS = 60 * 60
 const PROGRAM_WINDOW_AFTER_SECS = 4 * 60 * 60
 const PROGRAM_WINDOW_STEP_SECS = 4 * 60 * 60
@@ -157,6 +157,9 @@ function fmtTime(epoch: number): string {
 function fmtMinute(epoch: number): string {
   return String(new Date(epoch * 1000).getMinutes()).padStart(2, '0')
 }
+function guideTimeVariable(epoch: number): string {
+  return `var(--guide-time-${String(new Date(epoch * 1000).getHours()).padStart(2, '0')})`
+}
 function isPast(program: Program): boolean {
   return program.start_at + program.duration_secs <= Math.floor(now.value / 1000)
 }
@@ -177,7 +180,6 @@ const error = ref('')
 const loading = ref(false)
 const channelsLoading = ref(false)
 const programsLoading = ref(false)
-const channelsDone = ref(false)
 const loadedProgramWindows = ref<Array<[number, number]>>([])
 const selectedDate = ref(fmtDateInput(new Date()))
 const bandFilter = ref<'すべて' | BandCategory>('すべて')
@@ -199,6 +201,12 @@ const visibleRangeTop = ref(0)
 const visibleRangeBottom = ref(0)
 const visibleColumnStart = ref(0)
 const visibleColumnEnd = ref(0)
+const viewportWidth = ref(0)
+const channelCount = ref<number>(DEFAULT_CHANNEL_COUNT)
+/* ユーザーが局数を自分で選んだか。選んでいない間は画面幅に合わせて既定を切り替える
+   (390px で 7 局だと 1 列 51px しかなく局名が読めない)。 */
+const channelCountExplicit = ref(false)
+const displayHours = ref<number>(DEFAULT_HOURS)
 let scrollAnimationId: number | null = null
 let pendingScrollTop = 0
 let pendingScrollLeft = 0
@@ -207,14 +215,11 @@ let narrowMedia: MediaQueryList | null = null
 let programIndex = new Map<string, number>()
 let pendingProgramEvents: EpgProgramEvent[] = []
 let programMergeTimer: number | null = null
+let scrollResizeObserver: ResizeObserver | null = null
+let detailLoadTimer: number | null = null
 
-const isTablet = computed(() => !isNarrow.value && window.innerWidth <= 1100)
-const pxPerMin = computed(() =>
-  isNarrow.value ? PX_PER_MIN_NARROW : isTablet.value ? PX_PER_MIN_TABLET : PX_PER_MIN_DESKTOP,
-)
-const columnWidth = computed(() =>
-  isNarrow.value ? COLUMN_WIDTH_NARROW : isTablet.value ? COLUMN_WIDTH_TABLET : COLUMN_WIDTH_DESKTOP,
-)
+const pxPerMin = computed(() => Math.max(1, (viewportHeight.value - headerHeight.value) / (displayHours.value * 60)))
+const columnWidth = computed(() => Math.max(40, (viewportWidth.value - axisWidth.value) / channelCount.value))
 /** チャンネルヘッダー行の高さ。リモコン番号+ロゴ+局名の2段が収まる最小値。 */
 const headerHeight = computed(() => (isNarrow.value ? 44 : 54))
 const axisWidth = computed(() => (isNarrow.value ? AXIS_WIDTH_NARROW : AXIS_WIDTH_DESKTOP))
@@ -225,6 +230,42 @@ const visibleBufferPx = computed(
     pxPerMin.value,
 )
 const columnBuffer = computed(() => (isNarrow.value ? COLUMN_BUFFER_NARROW : COLUMN_BUFFER_DESKTOP))
+const densityChannelOptions = computed(() => isNarrow.value ? CHANNEL_COUNT_OPTIONS.filter((count) => count < 9) : CHANNEL_COUNT_OPTIONS)
+
+function loadDensity(): void {
+  try {
+    const stored = JSON.parse(localStorage.getItem(DENSITY_STORAGE_KEY) ?? '{}') as { channels?: unknown; hours?: unknown }
+    if (CHANNEL_COUNT_OPTIONS.includes(Number(stored.channels) as 5 | 7 | 9)) {
+      channelCount.value = Number(stored.channels)
+      channelCountExplicit.value = true
+    }
+    if (HOURS_OPTIONS.includes(Number(stored.hours) as 3 | 4 | 6)) displayHours.value = Number(stored.hours)
+  } catch {
+    channelCountExplicit.value = false
+    channelCount.value = DEFAULT_CHANNEL_COUNT
+    displayHours.value = DEFAULT_HOURS
+  }
+}
+function saveDensity(): void {
+  try {
+    localStorage.setItem(DENSITY_STORAGE_KEY, JSON.stringify({ channels: channelCount.value, hours: displayHours.value }))
+  } catch {
+    // localStorage unavailable: the current selection remains usable in memory.
+  }
+}
+function setChannelCount(value: number): void {
+  if (densityChannelOptions.value.includes(value as 5 | 7 | 9)) {
+    channelCount.value = value
+    channelCountExplicit.value = true
+    saveDensity()
+  }
+}
+function setDisplayHours(value: number): void {
+  if (HOURS_OPTIONS.includes(value as 3 | 4 | 6)) {
+    displayHours.value = value
+    saveDensity()
+  }
+}
 
 const gridStart = computed(() => {
   const [year, month, day] = selectedDate.value.split('-').map(Number)
@@ -320,7 +361,6 @@ async function loadMoreForScroll(): Promise<void> {
   }
   if (pendingScrollLeft + (scrollArea.value?.clientWidth ?? 0) >
       axisWidth.value + (visibleColumnEnd.value - 2) * columnWidth.value) {
-    await loadChannels()
     await loadProgramsWindow(gridBounds.value.since, gridBounds.value.until)
   }
 }
@@ -341,7 +381,18 @@ function onScroll(): void {
 function resizeGrid(): void {
   const element = scrollArea.value
   isNarrow.value = narrowMedia?.matches ?? window.innerWidth <= 700
+  if (channelCountExplicit.value) {
+    // 狭幅に 9 局は入らない。明示選択でも 1 段落とす。
+    if (isNarrow.value && channelCount.value === 9) {
+      channelCount.value = DEFAULT_CHANNEL_COUNT
+      saveDensity()
+    }
+  } else {
+    channelCount.value = isNarrow.value ? DEFAULT_CHANNEL_COUNT_NARROW : DEFAULT_CHANNEL_COUNT
+  }
+  viewportWidth.value = element?.clientWidth ?? 0
   viewportHeight.value = element?.clientHeight ?? 0
+  if (element && scrollResizeObserver) scrollResizeObserver.observe(element)
   pendingScrollTop = element?.scrollTop ?? 0
   pendingScrollLeft = element?.scrollLeft ?? 0
   updateVisibleRange(pendingScrollTop - headerHeight.value)
@@ -349,15 +400,12 @@ function resizeGrid(): void {
 }
 
 async function loadChannels() {
-  if (channelsLoading.value || channelsDone.value) return
+  if (channelsLoading.value) return
   channelsLoading.value = true
   try {
-    const offset = rawChannels.value.length
-    const response = await api(`/channels?limit=${CHANNEL_PAGE_SIZE}&offset=${offset}&sort=nid`)
+    const response = await api('/channels?group_logical=true')
     const rows = unwrapArray(response, ['channels'])
-    rawChannels.value = [...rawChannels.value, ...rows]
-    const total = Number((response as JsonRecord).total)
-    channelsDone.value = rows.length < CHANNEL_PAGE_SIZE || (Number.isFinite(total) && rawChannels.value.length >= total)
+    rawChannels.value = rows
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
@@ -535,6 +583,12 @@ function onLogoError(column: GuideColumn): void {
   const state = logoFallback.value.get(column.key) ?? 'own'
   logoFallback.value.set(column.key, state === 'own' ? 'main' : 'hidden')
 }
+function channelColorStyle(column: GuideColumn): string {
+  const paletteIndex = column.remoteControlKey !== null && column.remoteControlKey >= 1 && column.remoteControlKey <= 12
+    ? column.remoteControlKey
+    : ((Math.abs(column.nid * 31 + column.sid) % 12) + 1)
+  return `var(--guide-ch-${paletteIndex})`
+}
 const regionOptions = computed(() => [
   ...new Set(
     services.value
@@ -689,6 +743,7 @@ const columns = computed<GuideColumn[]>(() => {
           borderLeftColor: color,
           '--guide-genre-highlight': `var(--guide-genre-${color}-highlight)`,
           '--guide-genre-background': `var(--guide-genre-${color}-background)`,
+          '--guide-hour-tint': guideTimeVariable(program.start_at),
           '--guide-cell-text': 'var(--text)',
         },
       })
@@ -749,6 +804,14 @@ function visibleItems(column: GuideColumn): RenderItem[] {
 function selectProgram(columnIndex: number, program: Program): void {
   selected.value = { columnIndex, programId: program.key }
   selectedProgram.value = program
+  // 一覧の行には説明文が入っていない。詳細ペインに出すぶんだけ後から取りに行く。
+  // 十字キーを押しっぱなしにすると通過した番組ぶん要求が飛ぶので、止まってから引く。
+  if (detailLoadTimer !== null) window.clearTimeout(detailLoadTimer)
+  if (program.loaded) return
+  detailLoadTimer = window.setTimeout(() => {
+    detailLoadTimer = null
+    if (selectedProgram.value?.key === program.key) void loadProgramDetail(program)
+  }, DETAIL_LOAD_DEBOUNCE_MS)
 }
 
 /** 列の中で、指定した時刻を含む(なければ直後の)番組を返す。items は top 昇順。 */
@@ -857,25 +920,28 @@ function scrollToNow() {
     resizeGrid()
   })
 }
-function openDetail(program: Program) {
-  detail.value = program
+/** 一覧に無い説明文・拡張情報を 1 番組ぶんだけ取り、開いている詳細と選択中に反映する。 */
+async function loadProgramDetail(program: Program): Promise<void> {
   if (program.loaded) return
   const since = Math.max(gridBounds.value.since, program.start_at - 60)
   const until = Math.min(gridBounds.value.until, program.start_at + Math.max(program.duration_secs, 60))
-  void (async () => {
-    try {
-      const query = new URLSearchParams({ since: String(since), until: String(until), services: `${program.nid}:${program.sid}`, limit: '100' })
-      const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
-      const full = rows.find((row) => programEventKey(row) === program.key)
-      if (!full) return
-      const updated = { ...program, description: String(full.description ?? ''), extended: String(full.extended ?? ''), loaded: true }
-      rawPrograms.value = rawPrograms.value.map((row) => programEventKey(row) === program.key ? { ...row, ...full, key: program.key } : row)
-      programIndex = buildProgramIndex(rawPrograms.value)
-      detail.value = updated
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
-    }
-  })()
+  try {
+    const query = new URLSearchParams({ since: String(since), until: String(until), services: `${program.nid}:${program.sid}`, limit: '100' })
+    const rows = unwrapArray(await api(`/programs?${query}`), ['programs'])
+    const full = rows.find((row) => programEventKey(row) === program.key)
+    if (!full) return
+    const updated = { ...program, description: String(full.description ?? ''), extended: String(full.extended ?? ''), loaded: true }
+    rawPrograms.value = rawPrograms.value.map((row) => programEventKey(row) === program.key ? { ...row, ...full, key: program.key } : row)
+    programIndex = buildProgramIndex(rawPrograms.value)
+    if (detail.value?.key === program.key) detail.value = updated
+    if (selectedProgram.value?.key === program.key) selectedProgram.value = updated
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  }
+}
+function openDetail(program: Program) {
+  detail.value = program
+  void loadProgramDetail(program)
 }
 function closeDetail() {
   detail.value = null
@@ -900,8 +966,10 @@ watch(selectedDate, () => void loadPrograms())
 // 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
 watch([columns, pxPerMin], () => void nextTick().then(resizeGrid))
 onMounted(() => {
+  loadDensity()
   narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)
   narrowMedia.addEventListener('change', resizeGrid)
+  scrollResizeObserver = new ResizeObserver(() => resizeGrid())
   void refresh()
   void loadEpgStatus()
   epgEvents.start()
@@ -917,9 +985,13 @@ onUnmounted(() => {
   narrowMedia?.removeEventListener('change', resizeGrid)
   window.removeEventListener('resize', resizeGrid)
   window.removeEventListener('keydown', onKeydown)
+  scrollResizeObserver?.disconnect()
+  scrollResizeObserver = null
   if (scrollAnimationId !== null) cancelAnimationFrame(scrollAnimationId)
   if (programMergeTimer !== null) window.clearTimeout(programMergeTimer)
   programMergeTimer = null
+  if (detailLoadTimer !== null) window.clearTimeout(detailLoadTimer)
+  detailLoadTimer = null
   pendingProgramEvents = []
   epgEvents.stop()
 })
@@ -950,6 +1022,32 @@ onUnmounted(() => {
           v-text="tab === '地上' ? '地上' : tab"
         />
       </div>
+      <div class="guide-density" role="group" aria-label="表示局数">
+        <span class="guide-density-label">局数</span>
+        <button
+          v-for="count in densityChannelOptions"
+          :key="`channels-${count}`"
+          type="button"
+          class="guide-density-button"
+          :class="{ active: channelCount === count }"
+          :aria-pressed="channelCount === count"
+          @click="setChannelCount(count)"
+          v-text="`${count}局`"
+        />
+      </div>
+      <div class="guide-density" role="group" aria-label="表示時間幅">
+        <span class="guide-density-label">時間</span>
+        <button
+          v-for="hours in HOURS_OPTIONS"
+          :key="`hours-${hours}`"
+          type="button"
+          class="guide-density-button"
+          :class="{ active: displayHours === hours }"
+          :aria-pressed="displayHours === hours"
+          @click="setDisplayHours(hours)"
+          v-text="`${hours}時間`"
+        />
+      </div>
       <label class="guide-region-filter">
         <span class="visually-hidden">地域（地上）</span>
         <select v-model="regionFilter" :disabled="!regionOptions.length">
@@ -969,23 +1067,24 @@ onUnmounted(() => {
     <p v-if="!rawPrograms.length && !loading" class="empty-state">
       番組情報がありません。番組情報は視聴中のチャンネルから自動収集されます。
     </p>
-    <div v-else ref="scrollArea" class="guide-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
-      <div
-        class="guide-grid"
-        :style="{
-          width: `${axisWidth + columns.length * columnWidth}px`,
-          height: `${totalHeight + headerHeight}px`,
-          '--guide-col-w': `${columnWidth}px`,
-          '--guide-hour-h': `${60 * pxPerMin}px`,
-        }"
-      >
+    <div v-else class="guide-layout">
+      <div ref="scrollArea" class="guide-scroll" tabindex="0" @scroll.passive="onScroll" @keydown="onGridKeydown">
+        <div
+          class="guide-grid"
+          :style="{
+            width: `${axisWidth + columns.length * columnWidth}px`,
+            height: `${totalHeight + headerHeight}px`,
+            '--guide-col-w': `${columnWidth}px`,
+            '--guide-hour-h': `${60 * pxPerMin}px`,
+          }"
+        >
         <div class="guide-header-row" :style="{ height: `${headerHeight}px` }">
           <div class="guide-corner" :style="{ width: `${axisWidth}px` }" />
           <div
             v-for="entry in visibleColumns"
             :key="`h-${entry.column.key}`"
             class="guide-header-cell"
-            :style="{ left: `${axisWidth + entry.index * columnWidth}px`, width: `${columnWidth}px` }"
+            :style="{ left: `${axisWidth + entry.index * columnWidth}px`, width: `${columnWidth}px`, '--guide-channel-color': channelColorStyle(entry.column) }"
           >
             <div class="guide-header-top">
               <span
@@ -1059,7 +1158,7 @@ onUnmounted(() => {
               :aria-label="item.program.name || '番組名なし'"
               :aria-current="isOnAir(item.program) ? 'true' : undefined"
               :style="item.style"
-              @click="selectProgram(entry.index, item.program); openDetail(item.program)"
+              @click="selectProgram(entry.index, item.program)"
             >
               <span class="guide-cell-highlight" aria-hidden="true" /><div class="guide-cell-content">
                 <span class="guide-cell-head">
@@ -1076,33 +1175,35 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
+        </div>
+        <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
       </div>
-      <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
+      <aside class="guide-detail-pane" aria-live="polite">
+        <template v-if="selectedProgram">
+          <div class="guide-detail-pane-heading">
+            <span class="guide-detail-pane-kicker">選択中の番組</span>
+            <h2 v-text="selectedProgram.name || '番組情報'" />
+          </div>
+          <p class="guide-detail-time">
+            <span v-text="fmtTime(selectedProgram.start_at)" />〜<span v-text="fmtTime(selectedProgram.start_at + selectedProgram.duration_secs)" />
+          </p>
+          <p class="guide-detail-genre">ジャンル: <span class="genre-badge" v-text="genreLabel(selectedProgram.genre)" /></p>
+          <div class="guide-detail-pane-copy">
+            <p v-if="selectedProgram.description" class="preserve-lines" v-text="selectedProgram.description" />
+            <p v-if="selectedProgram.extended" class="preserve-lines guide-detail-extended" v-text="selectedProgram.extended" />
+            <p v-if="!selectedProgram.description && !selectedProgram.extended" class="muted">説明なし</p>
+          </div>
+          <div class="guide-actionbar">
+            <span class="guide-actionbar-selected" v-text="selectedProgram.name || '番組名なし'" />
+            <button class="guide-chip-button" @click="openDetail(selectedProgram)">番組詳細</button>
+            <button class="guide-chip-button" @click="openPreview(selectedProgram)">視聴</button>
+            <button class="guide-chip-button" @click="scrollToNow">現在時刻へ</button>
+          </div>
+        </template>
+        <p v-else class="muted">番組を選ぶと詳細・視聴できます</p>
+      </aside>
     </div>
     <p v-if="activeEpgStatusText" class="notice guide-epg-status-notice" role="status" v-text="activeEpgStatusText" />
-    <!-- 番組が 1 件も無いときはグリッドごと出ないので、押しても何も起きない
-         ボタンだけが宙に浮く。空状態では操作バーごと畳む。 -->
-    <div v-if="rawPrograms.length" class="guide-actionbar">
-      <span
-        class="guide-actionbar-selected"
-        v-text="selectedProgram ? (selectedProgram.name || '番組名なし') : '番組を選ぶと詳細・視聴できます'"
-      />
-      <button
-        class="guide-chip-button"
-        :disabled="selectedProgram === null"
-        @click="selectedProgram && openDetail(selectedProgram)"
-      >
-        番組詳細
-      </button>
-      <button
-        class="guide-chip-button"
-        :disabled="selectedProgram === null"
-        @click="selectedProgram && openPreview(selectedProgram)"
-      >
-        視聴
-      </button>
-      <button class="guide-chip-button" @click="scrollToNow">現在時刻へ</button>
-    </div>
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">
       <section
         class="dialog guide-detail-dialog"

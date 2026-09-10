@@ -36,8 +36,7 @@
   --guide-time-18: #80564c; --guide-time-19: #6c4a50;
   --guide-time-20: #5c4058; --guide-time-21: #4c3a54;
   --guide-time-22: #3c3850; --guide-time-23: #30384c;
-
-  --guide-genre-white-highlight: #ffffff; --guide-genre-white-background: #f8f8f8;
+  --guide-genre-white-highlight: #fff; --guide-genre-white-background: #f8f8f8;
   --guide-genre-pink-highlight: #f50094; --guide-genre-pink-background: #f6eaef;
   --guide-genre-red-highlight: #e1512d; --guide-genre-red-background: #ffecec;
   --guide-genre-orange-highlight: #ff9800; --guide-genre-orange-background: #fff3e0;
@@ -49,6 +48,10 @@
   --guide-genre-ochre-highlight: #c59a2f; --guide-genre-ochre-background: #fdf5e2;
   --guide-genre-brown-highlight: #a3421f; --guide-genre-brown-background: #fff2eb;
   --guide-select: #ff7a00;
+  --guide-ch-1: #d84b4b; --guide-ch-2: #d47b25; --guide-ch-3: #b08b20;
+  --guide-ch-4: #5c9b45; --guide-ch-5: #168f87; --guide-ch-6: #3189c5;
+  --guide-ch-7: #566bc0; --guide-ch-8: #8156b3; --guide-ch-9: #b14d93;
+  --guide-ch-10: #b64c6c; --guide-ch-11: #6d7d3e; --guide-ch-12: #467d92;
 }
 
 * {
@@ -94,13 +97,16 @@ textarea {
   --success: #6fd3a4;
   --warning: #e8b25a;
   --guide-select: #ffab3d;
-
   --guide-genre-white-background: #34383e; --guide-genre-pink-background: #422838;
   --guide-genre-red-background: #452b2a; --guide-genre-orange-background: #453525;
   --guide-genre-yellow-background: #454126; --guide-genre-lime-background: #304127;
   --guide-genre-teal-background: #203b3a; --guide-genre-cyan-background: #203c4a;
   --guide-genre-blue-background: #29364c; --guide-genre-ochre-background: #443a27;
   --guide-genre-brown-background: #452c26;
+  --guide-ch-1: #f07171; --guide-ch-2: #e9a14d; --guide-ch-3: #d2b34b;
+  --guide-ch-4: #7fc26a; --guide-ch-5: #4ac2b8; --guide-ch-6: #69b8ec;
+  --guide-ch-7: #8999ec; --guide-ch-8: #b18ce2; --guide-ch-9: #df83bd;
+  --guide-ch-10: #e77e9d; --guide-ch-11: #aebf69; --guide-ch-12: #76b4ca;
 }
 
 .topbar {
@@ -612,6 +618,15 @@ textarea:focus-visible,
   min-height: 0;
 }
 
+.guide-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+
 .guide-scroll {
   width: 100%;
   max-width: 100%;
@@ -627,6 +642,13 @@ textarea:focus-visible,
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
+}
+
+/* grid item として置かれたときに、中身の幅・高さで押し広げられないようにする。
+   min-* を 0 にしないとグリッドセルが番組表の実寸(数万px)まで伸びる。 */
+.guide-layout > .guide-scroll {
+  min-width: 0;
+  min-height: 0;
 }
 
 .guide-grid {
@@ -666,7 +688,22 @@ textarea:focus-visible,
   overflow: hidden;
   color: #fff;
   font-weight: 700;
+
+  /* 局ごとの色帯。REGZA の番組表と同じく、局の識別は色で先に付く。
+     下端 4px のラインだけだとヘッダ行の accent ボーダーに埋もれるので、
+     背景も局色を混ぜて段差を付ける。 */
+  background: color-mix(in srgb, var(--guide-channel-color, var(--accent)) 32%, var(--nav2));
   border-right: 1px solid rgb(255 255 255 / 14%);
+}
+
+.guide-header-cell::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 4px;
+  content: '';
+  background: var(--guide-channel-color, var(--accent));
 }
 
 .guide-header-top {
@@ -679,15 +716,16 @@ textarea:focus-visible,
 
 .guide-ch-num {
   flex: 0 0 auto;
-  min-width: 17px;
-  padding: 0 3px;
-  color: var(--nav2);
-  font-size: 11px;
+  min-width: 24px;
+  min-height: 20px;
+  padding: 0 4px;
+  color: #fff;
+  font-size: 20px;
   font-weight: 800;
-  line-height: 16px;
+  line-height: 20px;
   text-align: center;
-  background: #fff;
-  border-radius: 2px;
+  background: var(--guide-channel-color, var(--accent));
+  border-radius: 3px;
 }
 
 .guide-ch-name {
@@ -758,6 +796,61 @@ textarea:focus-visible,
       var(--border) 1px,
       transparent 1px,
       transparent var(--guide-col-w)
+    ),
+    /* 時間帯色の横帯。1 段 = var(--guide-hour-h) で、色は GuideView.vue の
+       GRID_START_HOUR (= 6) から始まり 06,07,…,23,00,…,05 の 24 段。
+       GRID_START_HOUR を変えたらこのストップの並びも合わせること。
+       罫線より後ろに置く(先頭ほど手前に描かれる)。 */
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--guide-time-06) 68%, #16202e) 0,
+      color-mix(in srgb, var(--guide-time-06) 68%, #16202e) var(--guide-hour-h),
+      color-mix(in srgb, var(--guide-time-07) 68%, #16202e) var(--guide-hour-h),
+      color-mix(in srgb, var(--guide-time-07) 68%, #16202e) calc(var(--guide-hour-h) * 2),
+      color-mix(in srgb, var(--guide-time-08) 68%, #16202e) calc(var(--guide-hour-h) * 2),
+      color-mix(in srgb, var(--guide-time-08) 68%, #16202e) calc(var(--guide-hour-h) * 3),
+      color-mix(in srgb, var(--guide-time-09) 68%, #16202e) calc(var(--guide-hour-h) * 3),
+      color-mix(in srgb, var(--guide-time-09) 68%, #16202e) calc(var(--guide-hour-h) * 4),
+      color-mix(in srgb, var(--guide-time-10) 68%, #16202e) calc(var(--guide-hour-h) * 4),
+      color-mix(in srgb, var(--guide-time-10) 68%, #16202e) calc(var(--guide-hour-h) * 5),
+      color-mix(in srgb, var(--guide-time-11) 68%, #16202e) calc(var(--guide-hour-h) * 5),
+      color-mix(in srgb, var(--guide-time-11) 68%, #16202e) calc(var(--guide-hour-h) * 6),
+      color-mix(in srgb, var(--guide-time-12) 68%, #16202e) calc(var(--guide-hour-h) * 6),
+      color-mix(in srgb, var(--guide-time-12) 68%, #16202e) calc(var(--guide-hour-h) * 7),
+      color-mix(in srgb, var(--guide-time-13) 68%, #16202e) calc(var(--guide-hour-h) * 7),
+      color-mix(in srgb, var(--guide-time-13) 68%, #16202e) calc(var(--guide-hour-h) * 8),
+      color-mix(in srgb, var(--guide-time-14) 68%, #16202e) calc(var(--guide-hour-h) * 8),
+      color-mix(in srgb, var(--guide-time-14) 68%, #16202e) calc(var(--guide-hour-h) * 9),
+      color-mix(in srgb, var(--guide-time-15) 68%, #16202e) calc(var(--guide-hour-h) * 9),
+      color-mix(in srgb, var(--guide-time-15) 68%, #16202e) calc(var(--guide-hour-h) * 10),
+      color-mix(in srgb, var(--guide-time-16) 68%, #16202e) calc(var(--guide-hour-h) * 10),
+      color-mix(in srgb, var(--guide-time-16) 68%, #16202e) calc(var(--guide-hour-h) * 11),
+      color-mix(in srgb, var(--guide-time-17) 68%, #16202e) calc(var(--guide-hour-h) * 11),
+      color-mix(in srgb, var(--guide-time-17) 68%, #16202e) calc(var(--guide-hour-h) * 12),
+      color-mix(in srgb, var(--guide-time-18) 68%, #16202e) calc(var(--guide-hour-h) * 12),
+      color-mix(in srgb, var(--guide-time-18) 68%, #16202e) calc(var(--guide-hour-h) * 13),
+      color-mix(in srgb, var(--guide-time-19) 68%, #16202e) calc(var(--guide-hour-h) * 13),
+      color-mix(in srgb, var(--guide-time-19) 68%, #16202e) calc(var(--guide-hour-h) * 14),
+      color-mix(in srgb, var(--guide-time-20) 68%, #16202e) calc(var(--guide-hour-h) * 14),
+      color-mix(in srgb, var(--guide-time-20) 68%, #16202e) calc(var(--guide-hour-h) * 15),
+      color-mix(in srgb, var(--guide-time-21) 68%, #16202e) calc(var(--guide-hour-h) * 15),
+      color-mix(in srgb, var(--guide-time-21) 68%, #16202e) calc(var(--guide-hour-h) * 16),
+      color-mix(in srgb, var(--guide-time-22) 68%, #16202e) calc(var(--guide-hour-h) * 16),
+      color-mix(in srgb, var(--guide-time-22) 68%, #16202e) calc(var(--guide-hour-h) * 17),
+      color-mix(in srgb, var(--guide-time-23) 68%, #16202e) calc(var(--guide-hour-h) * 17),
+      color-mix(in srgb, var(--guide-time-23) 68%, #16202e) calc(var(--guide-hour-h) * 18),
+      color-mix(in srgb, var(--guide-time-00) 68%, #16202e) calc(var(--guide-hour-h) * 18),
+      color-mix(in srgb, var(--guide-time-00) 68%, #16202e) calc(var(--guide-hour-h) * 19),
+      color-mix(in srgb, var(--guide-time-01) 68%, #16202e) calc(var(--guide-hour-h) * 19),
+      color-mix(in srgb, var(--guide-time-01) 68%, #16202e) calc(var(--guide-hour-h) * 20),
+      color-mix(in srgb, var(--guide-time-02) 68%, #16202e) calc(var(--guide-hour-h) * 20),
+      color-mix(in srgb, var(--guide-time-02) 68%, #16202e) calc(var(--guide-hour-h) * 21),
+      color-mix(in srgb, var(--guide-time-03) 68%, #16202e) calc(var(--guide-hour-h) * 21),
+      color-mix(in srgb, var(--guide-time-03) 68%, #16202e) calc(var(--guide-hour-h) * 22),
+      color-mix(in srgb, var(--guide-time-04) 68%, #16202e) calc(var(--guide-hour-h) * 22),
+      color-mix(in srgb, var(--guide-time-04) 68%, #16202e) calc(var(--guide-hour-h) * 23),
+      color-mix(in srgb, var(--guide-time-05) 68%, #16202e) calc(var(--guide-hour-h) * 23),
+      color-mix(in srgb, var(--guide-time-05) 68%, #16202e) 100%
     );
 }
 
@@ -773,6 +866,7 @@ textarea:focus-visible,
   position: absolute;
   left: 0;
   right: 0;
+  height: var(--guide-hour-h);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -837,7 +931,10 @@ textarea:focus-visible,
   border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--guide-genre-highlight) 35%, var(--border));
   border-radius: 0;
-  background: var(--guide-genre-background);
+  /* --guide-hour-tint は GuideView が番組の開始時刻から渡す。渡らなかったときに
+     var() が無効値になると background ごと落ちるので、ジャンル色自身をフォールバック
+     に置く(同色どうしの混色なので見た目は変わらない)。 */
+  background: color-mix(in srgb, var(--guide-hour-tint, var(--guide-genre-background)) 14%, var(--guide-genre-background));
   contain: layout paint;
   transition: box-shadow .15s ease, z-index 0s;
 }
@@ -896,7 +993,8 @@ textarea:focus-visible,
 }
 
 .guide-cell-past {
-  opacity: .62;
+  opacity: .58;
+  filter: saturate(.72);
 }
 
 .guide-cell strong,
@@ -967,6 +1065,14 @@ textarea:focus-visible,
     padding: 3px 4px;
   }
 
+  .guide-ch-num {
+    min-width: 20px;
+    min-height: 16px;
+    padding: 0 3px;
+    font-size: 16px;
+    line-height: 16px;
+  }
+
   .guide-channel-logo,
   .guide-header-cell small {
     display: none;
@@ -984,6 +1090,24 @@ textarea:focus-visible,
   .guide-cell strong,
   .guide-untitled {
     font-size: 0.72rem;
+  }
+
+  .guide-density {
+    flex: 1 1 auto;
+  }
+
+  .guide-density-button {
+    flex: 1 1 0;
+    min-height: 36px;
+  }
+
+  .guide-detail-pane {
+    max-height: 190px;
+    padding: 10px;
+  }
+
+  .guide-detail-pane-heading h2 {
+    font-size: 1rem;
   }
 }
 
@@ -1826,6 +1950,96 @@ textarea:focus-visible,
   padding: 0 2px;
 }
 
+.guide-density {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.guide-density-label {
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.guide-density-button {
+  min-height: 26px;
+  padding: 3px 7px;
+  color: var(--text);
+  font-size: 11px;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.guide-density-button.active {
+  color: #fff;
+  background: var(--accent);
+  font-weight: 700;
+}
+
+.guide-density-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.guide-detail-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.guide-detail-pane-heading h2 {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 1.15rem;
+}
+
+.guide-detail-pane-kicker {
+  color: var(--muted);
+  font-size: .75rem;
+  font-weight: 700;
+}
+
+.guide-detail-pane-copy {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.guide-detail-pane-copy p {
+  margin: 8px 0;
+}
+
+.guide-detail-pane .guide-actionbar {
+  margin-top: 10px;
+  padding: 0;
+}
+
+@media (max-width: 1100px) {
+  .guide-layout {
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .guide-detail-pane {
+    max-height: 230px;
+  }
+}
+
 .guide-actionbar-selected {
   flex: 1 1 auto;
   min-width: 0;
@@ -2034,6 +2248,19 @@ textarea:focus-visible,
     max-width: none;
     min-height: 40px;
     height: 40px;
+  }
+
+  .guide-density-button {
+    min-height: 36px;
+  }
+
+  .guide-detail-pane {
+    max-height: 190px;
+    padding: 10px;
+  }
+
+  .guide-detail-pane-heading h2 {
+    font-size: 1rem;
   }
 
 }

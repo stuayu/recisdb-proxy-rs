@@ -124,6 +124,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   - チャンネルタブ(`ChannelsView.vue`)はページング。フィルタは行ごとの検索用文字列を先に作って使い回し、打鍵ごとに全行×全プロパティを文字列化し直さない(入力は200msデバウンス)。ソートの比較で `localeCompare` を直接呼ぶと比較回数分 Collator が作られるため `Intl.Collator` を使い回す。
   - 番組表(`GuideView.vue`)は縦(時間)・横(局)の両方で可視範囲だけをDOMへ出す。**`styles.css` の `.guide-scroll` から `height` / `overflow: auto` を落とすとスクロールコンテナでなくなり、`@scroll` が発火しないため可視判定が丸ごと無効になる**(全番組がDOMに出て固まる。過去に実際に起きた)。`.guide-cell` / `.guide-hour-label` の `position: absolute` も同様で、落とすとインラインの `top`/`left` が無視されてセルが素の縦積みになる。
   - 番組データを `ref` で持つと2万件のオブジェクトが再帰的にProxy化され、分類ループが要素ごとに依存を張る。`shallowRef` を使う。
+  - 番組表の列幅・1分あたりの高さは**スクロール領域の実測サイズ**(`ResizeObserver`)から、ユーザーが選んだ局数(5/7/9)・時間幅(3/4/6時間)で割って求める。`window.innerWidth` だけを見るとサイドバー開閉やスクロールバーの有無に追従しない。狭幅(700px以下)では9局を選択肢に出さない(1列40pxになり局名が読めない)。
 - ソースは `web-ui/`(Vue)。`npm run build` の出力を `recisdb-proxy/static/vue/` へ吐き、
   RustEmbed でバイナリに埋め込む。**UIを変更したらビルドしてからサーバーをビルドする。**
   変更後は `cd web-ui && npm test && npm run qa:responsive && npm run qa:guide` も実行する。

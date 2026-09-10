@@ -106,9 +106,7 @@ for (const vp of [
         if (url.pathname === '/api/events') return new Response(null, { status: 204 })
         let body = responses[url.pathname] || {}
         if (url.pathname === '/api/channels') {
-          const limit = Number(url.searchParams.get('limit') || 120)
-          const offset = Number(url.searchParams.get('offset') || 0)
-          body = { channels: chs.slice(offset, offset + limit), total: chs.length }
+          body = { channels: chs, total: chs.length, count: chs.length }
         }
         if (url.pathname === '/api/programs') {
           const since = Number(url.searchParams.get('since') || 0)
@@ -155,6 +153,7 @@ for (const vp of [
         onAir: document.querySelectorAll('.guide-cell-onair').length,
         chNum: document.querySelector('.guide-ch-num')?.textContent ?? null,
         bandTabs: document.querySelectorAll('.guide-band-tab').length,
+        densityButtons: document.querySelectorAll('.guide-density-button').length,
         actionbar: document.querySelectorAll('.guide-actionbar .guide-chip-button').length,
         isDark: document.querySelector('.app')?.classList.contains('dark') ?? false,
         cellBg: (() => {
@@ -186,6 +185,11 @@ for (const vp of [
     if (!m.nowLine) failures.push(`${tag}: 現在時刻ラインなし`)
     if (m.onAir === 0) failures.push(`${tag}: 放送中セルなし`)
     if (m.bandTabs !== 4) failures.push(`${tag}: バンドタブ ${m.bandTabs}`)
+    // 局数 (狭幅は 9 局を出さない) + 時間幅の切替ボタン
+    const wantDensity = vp.width <= 700 ? 5 : 6
+    if (m.densityButtons !== wantDensity) {
+      failures.push(`${tag}: 密度ボタン ${m.densityButtons} (期待 ${wantDensity})`)
+    }
     if ((theme === 'dark') !== m.isDark) failures.push(`${tag}: テーマが当たっていない (isDark=${m.isDark})`)
 
     await page.screenshot({ path: join(output, `guide-${tag}.png`) })
@@ -193,20 +197,28 @@ for (const vp of [
     if (vp.name === '1280x720' && theme === 'light') {
       // --- 対話確認 ---
       // クリック → 選択 + 詳細ダイアログ
+      // クリックは「選択」だけ。詳細は常設ペインに出る (REGZA の番組表と同じ)。
       await page.locator('.guide-cell').nth(3).click()
-      await page.waitForTimeout(300)
+      await page.waitForTimeout(600)
       const afterClick = await page.evaluate(() => ({
         dialog: !!document.querySelector('.guide-detail-dialog'),
         selected: document.querySelectorAll('.guide-cell-selected').length,
         actionLabel: document.querySelector('.guide-actionbar-selected')?.textContent?.trim() ?? '',
+        paneTitle: document.querySelector('.guide-detail-pane-heading h2')?.textContent?.trim() ?? '',
+        paneCopy: document.querySelector('.guide-detail-pane-copy')?.textContent?.trim() ?? '',
       }))
-      if (!afterClick.dialog) failures.push('クリックで詳細ダイアログが開かない')
+      if (afterClick.dialog) failures.push('クリックだけで詳細ダイアログが開いている')
       if (afterClick.selected !== 1) failures.push(`クリック後の選択セル数 ${afterClick.selected}`)
+      if (!afterClick.paneTitle) failures.push('詳細ペインに番組名が出ていない')
+      if (!afterClick.paneCopy) failures.push('詳細ペインに説明文が出ていない (遅延取得が効いていない)')
       if (!afterClick.actionLabel || afterClick.actionLabel.includes('番組を選ぶと')) {
-        failures.push('下部バーに選択番組名が出ていない')
+        failures.push('操作バーに選択番組名が出ていない')
       }
+      // Enter → ダイアログ、Escape → 閉じる
+      await page.locator('.guide-scroll').focus()
+      await page.keyboard.press('Enter'); await page.waitForTimeout(300)
+      if (!(await page.locator('.guide-detail-dialog').count())) failures.push('Enterで詳細ダイアログが開かない')
       await page.screenshot({ path: join(output, 'guide-detail.png') })
-      // Escape → 閉じる
       await page.keyboard.press('Escape'); await page.waitForTimeout(250)
       if (await page.locator('.guide-detail-dialog').count()) failures.push('Escapeで詳細が閉じない')
       // 矢印キー → 選択移動
@@ -221,6 +233,30 @@ for (const vp of [
       const afterRight = await page.evaluate(() =>
         document.querySelector('.guide-cell-selected')?.getAttribute('aria-label') ?? null)
       if (afterRight === afterDown || afterRight === null) failures.push(`ArrowRightで選択が動かない (${afterDown} → ${afterRight})`)
+      // 密度切替: 局数を変えると 1 画面に収まる列数が変わる
+      const colsBefore = await page.evaluate(() => document.querySelectorAll('.guide-header-cell').length)
+      await page.locator('.guide-density-button', { hasText: '9局' }).click()
+      await page.waitForTimeout(500)
+      const after9 = await page.evaluate(() => ({
+        width: parseFloat(getComputedStyle(document.querySelector('.guide-header-cell')).width),
+        cols: document.querySelectorAll('.guide-header-cell').length,
+        stored: localStorage.getItem('guide:density'),
+      }))
+      if (!after9.stored || !after9.stored.includes('9')) failures.push(`局数が localStorage に残らない (${after9.stored})`)
+      if (!(after9.cols >= colsBefore)) failures.push(`9局にしても列が増えない (${colsBefore} → ${after9.cols})`)
+      const hourBefore = await page.evaluate(() =>
+        parseFloat(getComputedStyle(document.querySelector('.guide-grid')).getPropertyValue('--guide-hour-h')))
+      await page.locator('.guide-density-button', { hasText: '3時間' }).click()
+      await page.waitForTimeout(500)
+      const hourAfter = await page.evaluate(() =>
+        parseFloat(getComputedStyle(document.querySelector('.guide-grid')).getPropertyValue('--guide-hour-h')))
+      if (!(hourAfter > hourBefore)) failures.push(`3時間にしても 1 時間の高さが伸びない (${hourBefore} → ${hourAfter})`)
+      await page.locator('.guide-density-button', { hasText: '7局' }).click()
+      await page.locator('.guide-density-button', { hasText: '4時間' }).click()
+      await page.waitForTimeout(400)
+      // 密度ボタンにフォーカスが残ったままだと、以降の Enter がボタンの再押下になる。
+      await page.locator('.guide-cell-selected').first().focus()
+
       const states = await page.evaluate(() => {
         const pick = (el) => {
           if (!el) return null
