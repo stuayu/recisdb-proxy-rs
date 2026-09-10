@@ -8,12 +8,22 @@ import { chromium } from '@playwright/test'
 const root = resolve(process.cwd(), '../recisdb-proxy/static/vue')
 const output = resolve(process.cwd(), 'test-results/guide')
 
+// GuideView.vue の GRID_START_HOUR=6 と useGuideDate.broadcastDateInput に合わせる。
+const GUIDE_GRID_START_HOUR = 6
+const FIXED_NOW = new Date('2026-01-15T12:00:00')
+function broadcastDateStart(timestamp) {
+  const date = new Date(timestamp)
+  if (date.getHours() < GUIDE_GRID_START_HOUR) date.setDate(date.getDate() - 1)
+  date.setHours(GUIDE_GRID_START_HOUR, 0, 0, 0)
+  return date
+}
+
 // 本番相当: 地上30 + BS20 + CS20 = 70サービス、各24時間ぶんの番組 (約 70*40 = 2800件)
 const CH_NAMES = ['NHK総合', 'NHK Eテレ', '日本テレビ', 'テレビ朝日', 'TBS', 'テレビ東京', 'フジテレビ', 'TOKYO MX', 'tvk', 'チバテレ']
 const channels = []
 const programs = []
 let pid = 1
-const dayStart = new Date(); dayStart.setHours(6, 0, 0, 0)
+const dayStart = broadcastDateStart(FIXED_NOW)
 const base = Math.floor(dayStart.getTime() / 1000)
 
 function pushService(nid, sid, tsid, name, band, rck, region) {
@@ -75,6 +85,16 @@ const browser = await chromium.launch({ headless: true })
 const failures = []
 const notes = []
 
+async function guideDiagnostics(page) {
+  return page.evaluate(() => ({
+    emptyState: [...document.querySelectorAll('.empty-state')].map((node) => node.textContent?.trim()).filter(Boolean),
+    selectedDate: document.querySelector('.guide-date-picker input')?.value ?? null,
+    guideScroll: !!document.querySelector('.guide-scroll'),
+    guideCellCount: document.querySelectorAll('.guide-cell').length,
+    programFetches: globalThis.__guideProgramFetches ?? [],
+  }))
+}
+
 for (const vp of [
   { name: '1920x1080', width: 1920, height: 1080 },
   { name: '1280x720', width: 1280, height: 720 },
@@ -83,6 +103,7 @@ for (const vp of [
 ]) {
   for (const theme of vp.name === '1280x720' ? ['light', 'dark'] : ['light']) {
     const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height } })
+    await page.clock.install({ time: FIXED_NOW })
     const consoleErrors = []
     // ロゴ画像は本番にしか無い。404 は onLogoError が握るので雑音として除き、
     // それ以外の 404 とスクリプト例外だけを失敗として拾う。
@@ -99,6 +120,7 @@ for (const vp of [
     page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`))
     await page.addInitScript(([responses, chs, progs, wantDark]) => {
       if (wantDark) localStorage.setItem('dashboardTheme', 'dark')
+      globalThis.__guideProgramFetches = []
       const nativeFetch = window.fetch.bind(window)
       window.fetch = async (input, init) => {
         const url = new URL(typeof input === 'string' ? input : input.url, window.location.href)
@@ -113,17 +135,31 @@ for (const vp of [
           const until = Number(url.searchParams.get('until') || 0)
           const svc = url.searchParams.get('services')
           const set = svc ? new Set(svc.split(',')) : null
-          body = { programs: progs.filter((p) =>
+          const matched = progs.filter((p) =>
             p.start_at + p.duration_secs > since && p.start_at < until &&
-            (set === null || set.has(`${p.nid}:${p.sid}`))) }
+            (set === null || set.has(`${p.nid}:${p.sid}`)))
+          globalThis.__guideProgramFetches.push({ since, until, services: svc, count: matched.length })
+          body = { programs: matched }
         }
         return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
     }, [mock, channels, programs, theme === 'dark'])
     await page.goto(origin, { waitUntil: 'load' })
     await page.evaluate(() => { location.hash = 'guide' })
-    await page.waitForSelector('.guide-scroll', { timeout: 10000 })
+    try {
+      await page.waitForSelector('.guide-scroll', { timeout: 10000 })
+    } catch (cause) {
+      const diagnostics = await guideDiagnostics(page)
+      console.error(`GuideView の描画待機に失敗: ${JSON.stringify(diagnostics, null, 2)}`)
+      throw cause
+    }
     await page.waitForTimeout(1200)
+
+    const initialDiagnostics = await guideDiagnostics(page)
+    if (initialDiagnostics.guideCellCount === 0) {
+      console.error(`GuideView に番組セルがない: ${JSON.stringify(initialDiagnostics, null, 2)}`)
+      throw new Error('GuideView rendered zero program cells')
+    }
 
     const tag = `${vp.name}-${theme}`
     const m = await page.evaluate(() => {
@@ -185,8 +221,8 @@ for (const vp of [
     if (!m.nowLine) failures.push(`${tag}: 現在時刻ラインなし`)
     if (m.onAir === 0) failures.push(`${tag}: 放送中セルなし`)
     if (m.bandTabs !== 4) failures.push(`${tag}: バンドタブ ${m.bandTabs}`)
-    // 局数 (狭幅は 9 局を出さない) + 時間幅の切替ボタン
-    const wantDensity = vp.width <= 700 ? 5 : 6
+    // 局数 (狭幅は 9 局を出さない) + 時間幅 + サブCH の切替ボタン
+    const wantDensity = (vp.width <= 700 ? 5 : 6) + 1
     if (m.densityButtons !== wantDensity) {
       failures.push(`${tag}: 密度ボタン ${m.densityButtons} (期待 ${wantDensity})`)
     }

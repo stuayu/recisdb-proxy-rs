@@ -12,6 +12,7 @@ import {
   type EpgScanState,
 } from '../composables/useEpgEvents'
 import { broadcastDateInput } from '../composables/useGuideDate'
+import { guideServiceGroupKey, mainGuideServices } from '../composables/useGuideServices'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -209,6 +210,7 @@ const channelCount = ref<number>(DEFAULT_CHANNEL_COUNT)
    (390px で 7 局だと 1 列 51px しかなく局名が読めない)。 */
 const channelCountExplicit = ref(false)
 const displayHours = ref<number>(DEFAULT_HOURS)
+const showSubchannels = ref(false)
 let scrollAnimationId: number | null = null
 let pendingScrollTop = 0
 let pendingScrollLeft = 0
@@ -236,21 +238,31 @@ const densityChannelOptions = computed(() => isNarrow.value ? CHANNEL_COUNT_OPTI
 
 function loadDensity(): void {
   try {
-    const stored = JSON.parse(localStorage.getItem(DENSITY_STORAGE_KEY) ?? '{}') as { channels?: unknown; hours?: unknown }
+    const stored = JSON.parse(localStorage.getItem(DENSITY_STORAGE_KEY) ?? '{}') as {
+      channels?: unknown
+      hours?: unknown
+      subchannels?: unknown
+    }
     if (CHANNEL_COUNT_OPTIONS.includes(Number(stored.channels) as 5 | 7 | 9)) {
       channelCount.value = Number(stored.channels)
       channelCountExplicit.value = true
     }
     if (HOURS_OPTIONS.includes(Number(stored.hours) as 3 | 4 | 6)) displayHours.value = Number(stored.hours)
+    if (typeof stored.subchannels === 'boolean') showSubchannels.value = stored.subchannels
   } catch {
     channelCountExplicit.value = false
     channelCount.value = DEFAULT_CHANNEL_COUNT
     displayHours.value = DEFAULT_HOURS
+    showSubchannels.value = false
   }
 }
 function saveDensity(): void {
   try {
-    localStorage.setItem(DENSITY_STORAGE_KEY, JSON.stringify({ channels: channelCount.value, hours: displayHours.value }))
+    localStorage.setItem(DENSITY_STORAGE_KEY, JSON.stringify({
+      channels: channelCount.value,
+      hours: displayHours.value,
+      subchannels: showSubchannels.value,
+    }))
   } catch {
     // localStorage unavailable: the current selection remains usable in memory.
   }
@@ -267,6 +279,10 @@ function setDisplayHours(value: number): void {
     displayHours.value = value
     saveDensity()
   }
+}
+function setShowSubchannels(value: boolean): void {
+  showSubchannels.value = value
+  saveDensity()
 }
 
 const gridStart = computed(() => {
@@ -417,24 +433,12 @@ async function loadChannels() {
 function visibleServiceQuery(serviceKeys = visibleServiceKeys()): string {
   return serviceKeys.join(',')
 }
-const servicesByMux = computed(() => {
-  const result = new Map<string, Service[]>()
-  for (const service of services.value) {
-    const key = `${service.nid}:${service.tsid}`
-    const list = result.get(key)
-    if (list) list.push(service)
-    else result.set(key, [service])
-  }
-  return result
-})
 function visibleServiceKeys(): string[] {
   const start = Math.max(0, visibleColumnStart.value - columnBuffer.value)
   const end = Math.min(columns.value.length, visibleColumnEnd.value + columnBuffer.value)
   const keys = new Set<string>()
   for (const column of columns.value.slice(start, end)) {
-    for (const service of servicesByMux.value.get(`${column.nid}:${column.tsid}`) ?? []) {
-      keys.add(service.key)
-    }
+    keys.add(column.key)
   }
   return [...keys]
 }
@@ -590,22 +594,20 @@ const services = computed<Service[]>(() => {
       a.sid - b.sid,
   )
 })
-const logoFallback = ref(new Map<string, 'own' | 'main' | 'hidden'>())
 const mainSidByGroup = computed(() => {
   const result = new Map<string, number>()
-  for (const service of services.value) {
-    const key = `${service.nid}:${service.tsid}`
-    const current = result.get(key)
-    if (current === undefined || service.sid < current) result.set(key, service.sid)
+  for (const service of mainGuideServices(services.value)) {
+    result.set(guideServiceGroupKey(service), service.sid)
   }
   return result
 })
+const logoFallback = ref(new Map<string, 'own' | 'main' | 'hidden'>())
 function logoSrc(column: GuideColumn): string {
   const id = column.key
   const state = logoFallback.value.get(id) ?? 'own'
   if (state === 'hidden') return ''
   if (state === 'main') {
-    const sid = mainSidByGroup.value.get(`${column.nid}:${column.key.split(':')[1]}`)
+    const sid = mainSidByGroup.value.get(guideServiceGroupKey(column))
     if (sid === undefined || sid === column.sid) return ''
     return `/logos/${column.nid}_${sid}.png`
   }
@@ -646,6 +648,12 @@ const filteredServices = computed(() => {
         String(service.sid).includes(query)),
   )
 })
+const displayedServices = computed(() => {
+  if (showSubchannels.value) return filteredServices.value
+  return filteredServices.value.filter((service) =>
+    mainSidByGroup.value.get(guideServiceGroupKey(service)) === service.sid,
+  )
+})
 /**
  * サービスごとの番組。rawPrograms が差し替わったときだけ作り直す。
  * (KonomiTV が親ストアで局別に分けた配列を配るのと同じ役割)
@@ -683,46 +691,6 @@ const programsByService = computed(() => {
   for (const list of result.values()) list.sort((a, b) => a.start_at - b.start_at)
   return result
 })
-function programSlotKey(program: Program): string | null {
-  if (!program.name.trim()) return null
-  return `${program.start_at}:${program.duration_secs}:${program.name}`
-}
-function sameSlotSets(mainPrograms: Program[], subPrograms: Program[]): boolean {
-  if (mainPrograms.length !== subPrograms.length || mainPrograms.length === 0) return false
-  const mainKeys = mainPrograms.map(programSlotKey)
-  const subKeys = subPrograms.map(programSlotKey)
-  if (mainKeys.some((key) => key === null) || subKeys.some((key) => key === null)) return false
-  const subKeySet = new Set(subKeys)
-  return mainKeys.every((key) => subKeySet.has(key))
-}
-/** 重なり判定用に、番組の占有区間を重複のない昇順区間へ畳む。 */
-function mergeSpans(programs: Program[]): Array<[number, number]> {
-  const spans = programs
-    .map((program): [number, number] => [
-      program.start_at,
-      program.start_at + program.duration_secs,
-    ])
-    .sort((a, b) => a[0] - b[0])
-  const merged: Array<[number, number]> = []
-  for (const span of spans) {
-    const last = merged[merged.length - 1]
-    if (last !== undefined && span[0] <= last[1]) {
-      if (span[1] > last[1]) last[1] = span[1]
-    } else merged.push([span[0], span[1]])
-  }
-  return merged
-}
-/** 畳んだ区間に対する二分探索。総当たりだと列あたり O(番組数^2) になる。 */
-function overlapsSpans(spans: Array<[number, number]>, start: number, end: number): boolean {
-  let low = 0
-  let high = spans.length
-  while (low < high) {
-    const mid = (low + high) >> 1
-    if (spans[mid][1] <= start) low = mid + 1
-    else high = mid
-  }
-  return low < spans.length && spans[low][0] < end
-}
 /**
  * 列と、その中の番組セルの位置・スタイルまでを一度に組み立てる。
  * filteredServices / programsByService / 表示密度 が変わったときだけ走り、
@@ -733,31 +701,12 @@ const columns = computed<GuideColumn[]>(() => {
   const { since, until } = gridBounds.value
   const perMin = pxPerMin.value
   const height = totalHeight.value
-  const grouped = new Map<string, Service[]>()
-  for (const service of filteredServices.value) {
-    const key = `${service.nid}:${service.tsid}`
-    const list = grouped.get(key)
-    if (list) list.push(service)
-    else grouped.set(key, [service])
-  }
   const result: GuideColumn[] = []
-  for (const [key, list] of grouped) {
-    const sorted = list.length > 1 ? [...list].sort((a, b) => a.sid - b.sid) : list
-    const main = sorted[0]
-    const mainPrograms = byService.get(main.key) ?? []
-    // メインと EPG が同一のサブチャンネルは列に出さない (メインが全幅で残る)。
-    const subs = sorted
-      .slice(1)
-      .filter((service) => {
-        const subPrograms = byService.get(service.key) ?? []
-        return subPrograms.length > 0 && !sameSlotSets(mainPrograms, subPrograms)
-      })
-      .map((service) => ({ service, programs: byService.get(service.key) ?? [] }))
-    const subPrograms = subs.flatMap((entry) => entry.programs)
-    const mainSpans = subPrograms.length > 0 ? mergeSpans(mainPrograms) : []
-    const subSpans = subPrograms.length > 0 ? mergeSpans(subPrograms) : []
+  for (const service of displayedServices.value) {
+    const key = service.key
+    const programs = byService.get(service.key) ?? []
     const items: RenderItem[] = []
-    const push = (program: Program, isSub: boolean, split: boolean): void => {
+    const push = (program: Program): void => {
       const end = program.start_at + program.duration_secs
       if (end <= since || program.start_at >= until) return
       const top = Math.max(0, (program.start_at - since) / 60) * perMin
@@ -770,8 +719,8 @@ const columns = computed<GuideColumn[]>(() => {
         style: {
           top: `${top}px`,
           height: `${Math.max(bottom - top, 2)}px`,
-          left: isSub && split ? '50%' : '0',
-          width: split ? '50%' : '100%',
+          left: '0',
+          width: '100%',
           borderLeftColor: color,
           '--guide-genre-highlight': `var(--guide-genre-${color}-highlight)`,
           '--guide-genre-background': `var(--guide-genre-${color}-background)`,
@@ -780,27 +729,18 @@ const columns = computed<GuideColumn[]>(() => {
         },
       })
     }
-    for (const program of mainPrograms) {
-      const end = program.start_at + program.duration_secs
-      push(program, false, subSpans.length > 0 && overlapsSpans(subSpans, program.start_at, end))
-    }
-    for (const entry of subs) {
-      for (const program of entry.programs) {
-        const end = program.start_at + program.duration_secs
-        push(program, true, overlapsSpans(mainSpans, program.start_at, end))
-      }
-    }
+    for (const program of programs) push(program)
     // 上から順に並べておくと、可視判定を先頭から走らせて途中で打ち切れる。
     items.sort((a, b) => a.top - b.top)
     result.push({
       key,
-      name: main.name,
-      subLabel: subs.map((entry) => entry.service.name).join(' / '),
-      band: main.band,
-      nid: main.nid,
-      tsid: main.tsid,
-      sid: main.sid,
-      remoteControlKey: main.remoteControlKey,
+      name: service.name,
+      subLabel: '',
+      band: service.band,
+      nid: service.nid,
+      tsid: service.tsid,
+      sid: service.sid,
+      remoteControlKey: service.remoteControlKey,
       items,
     })
   }
@@ -997,6 +937,17 @@ function onKeydown(event: KeyboardEvent) {
 watch(selectedDate, () => void loadPrograms())
 // 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
 watch([columns, pxPerMin], () => void nextTick().then(resizeGrid))
+watch(showSubchannels, (enabled) => {
+  if (!enabled) return
+  void nextTick().then(async () => {
+    resizeGrid()
+    const top = Math.max(0, pendingScrollTop - headerHeight.value)
+    const bottom = top + Math.max(viewportHeight.value, headerHeight.value)
+    const since = Math.max(gridBounds.value.since, gridBounds.value.since + Math.floor(top / pxPerMin.value * 60))
+    const until = Math.min(gridBounds.value.until, gridBounds.value.since + Math.ceil(bottom / pxPerMin.value * 60))
+    if (since < until) await loadProgramsWindow(since, until)
+  })
+})
 onMounted(() => {
   loadDensity()
   narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)
@@ -1078,6 +1029,17 @@ onUnmounted(() => {
           :aria-pressed="displayHours === hours"
           @click="setDisplayHours(hours)"
           v-text="`${hours}時間`"
+        />
+      </div>
+      <div class="guide-density" role="group" aria-label="サブチャンネル表示">
+        <span class="guide-density-label">サブCH</span>
+        <button
+          type="button"
+          class="guide-density-button"
+          :class="{ active: showSubchannels }"
+          :aria-pressed="showSubchannels"
+          @click="setShowSubchannels(!showSubchannels)"
+          v-text="showSubchannels ? 'オン' : 'オフ'"
         />
       </div>
       <label class="guide-region-filter">
