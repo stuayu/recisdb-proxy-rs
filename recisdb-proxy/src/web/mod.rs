@@ -12,6 +12,7 @@ pub mod state;
 pub mod stream;
 
 use axum::{
+    body::HttpBody,
     extract::{ConnectInfo, Request},
     middleware::Next,
     response::Response,
@@ -23,6 +24,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tower_http::compression::{
+    predicate::{DefaultPredicate, Predicate},
+    CompressionLayer,
+};
+
 use crate::logging::{LogBuffer, ACCESS_LOG_TARGET};
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::{EncoderPool, TunerPool};
@@ -31,6 +37,31 @@ use state::WebState;
 
 pub mod http_session;
 pub use state::{SessionInfo, SessionProtocol, SessionRegistry};
+
+#[derive(Clone, Copy)]
+struct DashboardCompressionPredicate;
+
+impl Predicate for DashboardCompressionPredicate {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool
+    where
+        B: HttpBody,
+    {
+        let Some(content_type) = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+
+        let dashboard_content = content_type.starts_with("application/json")
+            || content_type.starts_with("application/javascript")
+            || content_type.starts_with("text/css")
+            || content_type.starts_with("text/html");
+
+        dashboard_content && DefaultPredicate::new().should_compress(response)
+    }
+}
 
 /// Build the `/api/*` router (auth middleware attached, no state bound yet).
 ///
@@ -345,6 +376,11 @@ fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
 
     router
         .with_state(web_state)
+        // Compress only dashboard JSON/HTML/JS/CSS when the client accepts
+        // gzip. TS (`video/mp2t`) and SSE (`text/event-stream`) are outside
+        // this content-type allowlist, so live streams are never buffered or
+        // transformed by this layer.
+        .layer(CompressionLayer::new().compress_when(DashboardCompressionPredicate))
         // Access log covers every route above (dashboard, /api/*, and the
         // Mirakurun router when enabled).
         .layer(axum::middleware::from_fn(access_log))

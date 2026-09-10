@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import mpegts from 'mpegts.js'
-import DPlayer from 'dplayer'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+
+type Mpegts = typeof import('mpegts.js').default
+type DPlayer = InstanceType<typeof import('dplayer').default>
 
 const props = defineProps<{
   /** When set, the player locks onto this SID and starts automatically. */
@@ -21,8 +22,10 @@ const locked = props.initialSid != null
 const container = ref<HTMLElement | null>(null)
 const error = ref('')
 const active = ref(false)
+const loading = ref(false)
 let dp: DPlayer | null = null
-let mpegtsPlayer: ReturnType<typeof mpegts.createPlayer> | null = null
+let mpegtsPlayer: ReturnType<Mpegts['createPlayer']> | null = null
+let playbackGeneration = 0
 
 /// mpegts.js swallows the HTTP response body, so on failure re-fetch the
 /// stream URL once to surface the server's human-readable reason (e.g.
@@ -51,9 +54,16 @@ async function explainStreamError(url: string, token: string | null, fallback: s
 
 async function start() {
   stop()
+  const generation = ++playbackGeneration
   error.value = ''
+  loading.value = true
   try {
-    if (!mpegts.isSupported() || !container.value) {
+    const [{ default: mpegtsModule }, { default: DPlayer }] = await Promise.all([
+      import('mpegts.js'),
+      import('dplayer'),
+    ])
+    if (generation !== playbackGeneration) return
+    if (!mpegtsModule.isSupported() || !container.value) {
       throw new Error('このブラウザでは再生できません')
     }
     const token = localStorage.getItem('recisdbApiToken')
@@ -82,7 +92,7 @@ async function start() {
         customType: {
           customMpegts: (video) => {
             try {
-              mpegtsPlayer = mpegts.createPlayer(
+              mpegtsPlayer = mpegtsModule.createPlayer(
                 {
                   type: 'mpegts',
                   isLive: true,
@@ -98,7 +108,7 @@ async function start() {
                 },
               )
               mpegtsPlayer.on(
-                mpegts.Events.ERROR,
+                mpegtsModule.Events.ERROR,
                 (errType: string, detail: string, info: unknown) => {
                   let extra = ''
                   try {
@@ -123,15 +133,19 @@ async function start() {
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
     stop()
+  } finally {
+    if (generation === playbackGeneration) loading.value = false
   }
 }
 
 function stop() {
+  playbackGeneration += 1
   mpegtsPlayer?.destroy()
   mpegtsPlayer = null
   dp?.destroy()
   dp = null
   active.value = false
+  loading.value = false
 }
 
 if (locked) {
@@ -161,7 +175,9 @@ onBeforeUnmount(stop)
       </div>
       <div class="actions">
         <button v-if="active" class="button danger" @click="stop">停止</button>
-        <button v-else class="button" :disabled="!sid" @click="start">再生</button>
+        <button v-else class="button" :disabled="!sid || loading" @click="start">
+          {{ loading ? '読み込み中…' : '再生' }}
+        </button>
       </div>
     </div>
     <div class="preview-fields">

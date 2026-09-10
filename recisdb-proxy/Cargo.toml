@@ -44,7 +44,7 @@ futures-util = { version = "0.3", features = ["io"] }
 futures-executor = "0.3"
 axum = { version = "0.7", features = ["macros"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 
 log = "0.4"
 env_logger = "0.11"
