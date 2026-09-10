@@ -240,8 +240,11 @@ sudo systemctl enable --now pcscd
 pcsc_scan   # 任意: カードリーダーが見えるか確認 (pcsc-tools パッケージ)
 ```
 
-recisdb-proxy は PC/SC ライブラリを実行時に `dlopen` します
-(`libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so` の順。`B25_PCSC_LIB` で明示指定も可能)。
+recisdb-proxy は PC/SC ライブラリを実行時に `dlopen` します。Linux では
+`libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so`、macOS では
+`libpcsclite.1.0.0.dylib` → `libpcsclite.dylib` の順です。`B25_PCSC_LIB` で明示指定も可能です。
+macOS は同梱 dylib が見つからない場合、`/System/Library/Frameworks/PCSC.framework/PCSC`
+へフォールバックします。
 どれも見つからない・`pcscd` が動いていない場合はカードリーダー初期化に失敗し、
 スクランブルされたままの TS が流れます。`RUST_LOG=info` で起動すると
 `pcsc_shim: using PC/SC backend ...` として実際に使われたライブラリが出ます。
@@ -424,7 +427,8 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 
 **制約**
 
-- B-CAS カードリーダーは PCSC.framework 経由で利用します。libaribb25 が初期化できない
+- B-CAS カードリーダーは PC/SC ライブラリを実行時選択して利用します。macOS では
+  PCSC.framework にもフォールバックします。libaribb25 が初期化できない
   環境では、スクランブルされたままの TS が流れます。
 - カードリーダーを複数つないでいる場合は、Web ダッシュボードの「設定」タブで
   **B-CAS カードリーダーを選択してください**。未選択のままだと見つかった順に接続を

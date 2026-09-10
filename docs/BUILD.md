@@ -57,19 +57,22 @@ npm run qa:guide      # Playwright。本番規模のモックEPGで番組表を�
 | プラットフォーム | 要件 |
 |---|---|
 | Linux | `libpcsclite-dev`(**ヘッダのみ使用**。後述の通りリンクはしない)、gcc/g++ |
-| macOS | Xcode CLT のみ(PCSC.framework を使用) |
+| macOS | Xcode CLT のみ(PCSC.framework または実行時指定の libpcsclite を使用) |
 | Windows (MSVC) | Visual Studio。`winscard.lib` は SDK 付属 |
 | Windows (GNU) | MSYS2 UCRT64/MinGW64 + Ninja |
 
-### Linux の PC/SC バックエンドは実行時選択
+### Linux/macOS の PC/SC バックエンドは実行時選択
 
-Linux ビルドは pcsclite を**リンクしない**。`b25-sys/src/pcsc_shim.rs` が SCard* シンボルを提供し、初回利用時に以下の順で dlopen する:
+Linux/macOS ビルドは PC/SC を**リンクしない**。`b25-sys/src/pcsc_shim.rs` が SCard* シンボルを提供し、初回利用時に以下の順で dlopen する。
 
 1. 環境変数 `B25_PCSC_LIB` で指定されたパス
-2. 実行ファイルと同じディレクトリの `libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so`
-3. システムの `libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so`
+2. 実行ファイルと同じディレクトリのライブラリ
+   - Linux: `libpcsckai.so` → `libpcsclite.so.1` → `libpcsclite.so`
+   - macOS: `libpcsclite.1.0.0.dylib` → `libpcsclite.dylib`
+3. システム検索の同名ライブラリ
+4. macOS の `/System/Library/Frameworks/PCSC.framework/PCSC`
 
-したがって**実行時にも libpcsclite は必須ではない**(libpcsckai だけの環境でも動く)。どれも見つからない場合はカードリーダー初期化失敗(`SCARD_E_NO_SERVICE`)として扱われる。選択結果は `RUST_LOG=info` で `pcsc_shim: using PC/SC backend ...` と出力される。
+したがって**実行時にも libpcsclite は必須ではない**。macOS は dylib がなくても PCSC.framework にフォールバックし、Linux は libpcsckai だけの環境でも動く。どれも見つからない場合はカードリーダー初期化失敗(`SCARD_E_NO_SERVICE`)として扱われる。選択結果は `RUST_LOG=info` で `pcsc_shim: using PC/SC backend ...` と出力される。
 
 注意: システムに共有 `libaribb25.so` がインストールされていると build.rs はそちらを優先リンクし、その .so 自身が libpcsclite に依存するためシムは効かない。実行時切り替えを使う場合は同梱ビルド(静的 aribb25)にすること。
 

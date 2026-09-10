@@ -344,10 +344,10 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib64", res.display());
         println!("cargo:rustc-link-lib=dylib=winscard");
     } else if cx.os.clone().unwrap_or_default().contains("macos") {
-        // macOS: use the built-in PCSC.framework (no libpcsclite pkg-config needed).
+        // macOS: PC/SC headers are used by cmake, but the backend is selected
+        // at runtime by pcsc_shim (no PCSC.framework link here).
         // cmake's find_package(PCSC REQUIRED) in libaribb25 automatically finds
         // /System/Library/Frameworks/PCSC.framework, so no extra cmake flags are needed.
-        println!("cargo:rustc-link-lib=framework=PCSC");
         // libaribb25 is compiled as C++; link libc++ so exception-handling and
         // operator new/delete symbols resolve on macOS.
         println!("cargo:rustc-link-lib=dylib=c++");
