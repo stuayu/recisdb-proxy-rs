@@ -11,6 +11,7 @@ import {
   type EpgProgramEvent,
   type EpgScanState,
 } from '../composables/useEpgEvents'
+import { broadcastDateInput } from '../composables/useGuideDate'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -114,6 +115,7 @@ type GuideColumn = {
   remoteControlKey: number | null
   items: RenderItem[]
 }
+type ProgramWindow = [number, number]
 const BAND_ORDER: Record<BandCategory, number> = {
   地上: 0,
   BS: 1,
@@ -180,12 +182,12 @@ const error = ref('')
 const loading = ref(false)
 const channelsLoading = ref(false)
 const programsLoading = ref(false)
-const loadedProgramWindows = ref<Array<[number, number]>>([])
-const selectedDate = ref(fmtDateInput(new Date()))
+const loadedProgramWindows = shallowRef<Map<string, ProgramWindow[]>>(new Map())
 const bandFilter = ref<'すべて' | BandCategory>('すべて')
 const regionFilter = ref('すべて')
 const serviceQuery = ref('')
 const now = ref(Date.now())
+const selectedDate = ref(broadcastDateInput(now.value, GRID_START_HOUR))
 const detail = ref<Program | null>(null)
 const selected = ref<{ columnIndex: number; programId: string } | null>(null)
 const selectedProgram = ref<Program | null>(null)
@@ -275,7 +277,7 @@ const gridBounds = computed(() => {
   const since = Math.floor(gridStart.value.getTime() / 1000)
   return { since, until: since + TOTAL_MINUTES * 60 }
 })
-const isToday = computed(() => selectedDate.value === fmtDateInput(new Date()))
+const isToday = computed(() => selectedDate.value === broadcastDateInput(now.value, GRID_START_HOUR))
 const BAND_TABS = ['地上', 'BS', 'CS', 'すべて'] as const
 const WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土']
 
@@ -412,28 +414,55 @@ async function loadChannels() {
     channelsLoading.value = false
   }
 }
-function visibleServiceQuery(): string {
+function visibleServiceQuery(serviceKeys = visibleServiceKeys()): string {
+  return serviceKeys.join(',')
+}
+const servicesByMux = computed(() => {
+  const result = new Map<string, Service[]>()
+  for (const service of services.value) {
+    const key = `${service.nid}:${service.tsid}`
+    const list = result.get(key)
+    if (list) list.push(service)
+    else result.set(key, [service])
+  }
+  return result
+})
+function visibleServiceKeys(): string[] {
   const start = Math.max(0, visibleColumnStart.value - columnBuffer.value)
   const end = Math.min(columns.value.length, visibleColumnEnd.value + columnBuffer.value)
-  return columns.value.slice(start, end).flatMap((column) =>
-    services.value.filter((service) => service.nid === column.nid && service.tsid === column.tsid),
-  ).map((service) => `${service.nid}:${service.sid}`).join(',')
+  const keys = new Set<string>()
+  for (const column of columns.value.slice(start, end)) {
+    for (const service of servicesByMux.value.get(`${column.nid}:${column.tsid}`) ?? []) {
+      keys.add(service.key)
+    }
+  }
+  return [...keys]
 }
-function windowLoaded(since: number, until: number): boolean {
-  return loadedProgramWindows.value.some(([start, end]) => start <= since && end >= until)
+function windowLoaded(serviceKey: string, since: number, until: number): boolean {
+  return (loadedProgramWindows.value.get(serviceKey) ?? [])
+    .some(([start, end]) => start <= since && end >= until)
 }
 async function loadProgramsWindow(since: number, until: number, force = false) {
-  if (!force && windowLoaded(since, until)) return
+  const visibleKeys = visibleServiceKeys()
+  const requestedKeys = force
+    ? visibleKeys
+    : visibleKeys.filter((serviceKey) => !windowLoaded(serviceKey, since, until))
+  if (!requestedKeys.length) return
   programsLoading.value = true
   try {
     const query = new URLSearchParams({ since: String(since), until: String(until), brief: 'true', limit: '20000' })
-    const servicesQuery = visibleServiceQuery()
+    const servicesQuery = visibleServiceQuery(requestedKeys)
     if (servicesQuery) query.set('services', servicesQuery)
     const rows = unwrapArray(await api(`/programs?${query}`), ['programs']).map(normalizeProgramRow)
     const keys = new Set(rawPrograms.value.map(programEventKey))
     rawPrograms.value = [...rawPrograms.value, ...rows.filter((row) => !keys.has(programEventKey(row)))]
     programIndex = buildProgramIndex(rawPrograms.value)
-    loadedProgramWindows.value = [...loadedProgramWindows.value, [since, until]]
+    const nextWindows = new Map(loadedProgramWindows.value)
+    for (const serviceKey of requestedKeys) {
+      const windows = nextWindows.get(serviceKey) ?? []
+      nextWindows.set(serviceKey, [...windows, [since, until]])
+    }
+    loadedProgramWindows.value = nextWindows
     error.value = ''
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
@@ -450,6 +479,7 @@ async function loadInitialPrograms() {
   const until = isToday.value
     ? Math.min(gridUntil, current + PROGRAM_WINDOW_AFTER_SECS)
     : Math.min(gridUntil, since + PROGRAM_WINDOW_STEP_SECS)
+  if (since >= until) return
   await loadProgramsWindow(since, until)
   await nextTick()
   if (isToday.value && scrollArea.value) {
@@ -459,7 +489,7 @@ async function loadInitialPrograms() {
   }
 }
 async function loadPrograms() {
-  loadedProgramWindows.value = []
+  loadedProgramWindows.value = new Map()
   rawPrograms.value = []
   programIndex = new Map()
   await loadInitialPrograms()
@@ -485,7 +515,9 @@ function flushProgramEvents(): void {
   const rows = rawPrograms.value.slice()
   const index = new Map(programIndex)
   for (const event of pendingProgramEvents) {
-    mergeProgramEvent(rows, index, event, loadedProgramWindows.value)
+    const program = event.program
+    const serviceKey = program ? `${Number(program.nid)}:${Number(program.sid)}` : null
+    mergeProgramEvent(rows, index, event, serviceKey ? loadedProgramWindows.value.get(serviceKey) ?? [] : [])
   }
   pendingProgramEvents = []
   rawPrograms.value = rows
@@ -902,7 +934,7 @@ function shiftDate(days: number) {
   selectedDate.value = fmtDateInput(date)
 }
 function goToday() {
-  selectedDate.value = fmtDateInput(new Date())
+  selectedDate.value = broadcastDateInput(now.value, GRID_START_HOUR)
 }
 /** 今日へ移動し、現在時刻がビューポート中央付近に来るまで縦スクロールする。 */
 function scrollToNow() {
