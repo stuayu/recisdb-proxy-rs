@@ -1228,130 +1228,27 @@ fn choose_satellite_representative(
         })
 }
 
-fn cpu_percent_from_ticks(
-    idle: u64,
-    kernel: u64,
-    user: u64,
-    previous: Option<(u64, u64, u64)>,
-) -> (u32, (u64, u64, u64)) {
-    let current = (idle, kernel, user);
-    let Some((previous_idle, previous_kernel, previous_user)) = previous else {
-        return (0, current);
-    };
-    let total = kernel
-        .saturating_sub(previous_kernel)
-        .saturating_add(user.saturating_sub(previous_user));
-    let idle = idle.saturating_sub(previous_idle);
-    let busy = total.saturating_sub(idle);
-    let percent = if total == 0 {
-        0
-    } else {
-        ((busy as f64 / total as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u32
-    };
-    (percent, current)
-}
-
-#[cfg(target_os = "linux")]
+/// Whole-host CPU utilisation in percent, as seen by the EPG scheduler.
+///
+/// Measured utilisation, not load average: the run-queue length that
+/// `getloadavg`/`/proc/loadavg` report counts threads waiting on I/O too, so on
+/// a busy-but-not-CPU-bound host it sits far above the real usage and deferred
+/// every scan against `cpu_soft_limit_percent` forever.
+///
+/// 0 while the sampler has no reading yet, which lets a scan through rather
+/// than blocking on a limit nothing can measure; `cpu_limit_source` reports
+/// that state as unavailable.
 pub(crate) fn cpu_percent() -> u32 {
-    let load = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1) as f64;
-    ((load / cores) * 100.0).round().clamp(0.0, 100.0) as u32
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn cpu_percent() -> u32 {
-    let mut loads = [0.0_f64; 1];
-    let count = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
-    if count != 1 {
-        return 0;
-    }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1) as f64;
-    ((loads[0] / cores) * 100.0).round().clamp(0.0, 100.0) as u32
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn cpu_percent() -> u32 {
-    #[cfg(windows)]
-    {
-        use std::sync::{Mutex, OnceLock};
-        #[repr(C)]
-        struct FileTime {
-            low: u32,
-            high: u32,
-        }
-        unsafe extern "system" {
-            fn GetSystemTimes(
-                idle: *mut FileTime,
-                kernel: *mut FileTime,
-                user: *mut FileTime,
-            ) -> i32;
-        }
-        fn value(time: FileTime) -> u64 {
-            (u64::from(time.high) << 32) | u64::from(time.low)
-        }
-        let mut idle = FileTime { low: 0, high: 0 };
-        let mut kernel = FileTime { low: 0, high: 0 };
-        let mut user = FileTime { low: 0, high: 0 };
-        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
-            // The limit cannot be enforced without a reading. Record it so
-            // `cpu_limit_source` reports "unavailable" instead of letting a
-            // hard-coded 0% look like an idle machine.
-            windows_cpu_probe_failed().store(true, std::sync::atomic::Ordering::Relaxed);
-            return 0;
-        }
-        windows_cpu_probe_failed().store(false, std::sync::atomic::Ordering::Relaxed);
-        let current = (value(idle), value(kernel), value(user));
-        static PREVIOUS: OnceLock<Mutex<Option<(u64, u64, u64)>>> = OnceLock::new();
-        let previous = PREVIOUS.get_or_init(|| Mutex::new(None));
-        let mut previous = previous.lock().unwrap_or_else(|error| error.into_inner());
-        let (percent, current) = cpu_percent_from_ticks(current.0, current.1, current.2, *previous);
-        *previous = Some(current);
-        return percent;
-    }
-    #[cfg(not(windows))]
-    {
-        0
-    }
-}
-
-#[cfg(windows)]
-fn windows_cpu_probe_failed() -> &'static std::sync::atomic::AtomicBool {
-    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    &FAILED
+    crate::metrics::system::cpu_usage_percent()
+        .map(|percent| percent.round().clamp(0.0, 100.0) as u32)
+        .unwrap_or(0)
 }
 
 pub fn cpu_limit_source() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "linux:/proc/loadavg"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "macos:getloadavg"
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        #[cfg(windows)]
-        {
-            if windows_cpu_probe_failed().load(std::sync::atomic::Ordering::Relaxed) {
-                "unavailable:GetSystemTimes failed"
-            } else {
-                "windows:GetSystemTimes"
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            "unavailable:cpu limit disabled"
-        }
+    if crate::metrics::system::cpu_usage_percent().is_some() {
+        "sysinfo:global_cpu_usage"
+    } else {
+        "unavailable:cpu sample not ready"
     }
 }
 
@@ -1395,14 +1292,6 @@ mod tests {
             decide(&config(), 0, 70, 10, None, None, None, None),
             EpgScanDecision::SoftCpuLimit
         )
-    }
-
-    #[test]
-    fn cpu_ticks_convert_to_busy_percentage() {
-        let (percent, previous) = cpu_percent_from_ticks(10, 100, 100, None);
-        assert_eq!(percent, 0);
-        let (percent, _) = cpu_percent_from_ticks(20, 150, 150, Some(previous));
-        assert_eq!(percent, 90);
     }
 
     #[test]

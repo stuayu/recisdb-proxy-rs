@@ -306,6 +306,16 @@ CPU値、対象TS、次回時刻などの付加情報はdetailsに入れ、画�
 reason codeと対象TS・CPU値・次回時刻などを記録する。複数条件はdetailsの
 `additional_codes`で同時に返す。
 
+CPU soft/hard limitが見る使用率は `metrics::system::cpu_usage_percent()`(sysinfoの
+`global_cpu_usage`)だけを情報源とする。**load average をCPU使用率として使わない。**
+loadavgは実行可能キュー長でI/O待ちスレッドも数えるため、CPUが空いていても実使用率より
+大きく出る。soft limitと比べると全ターゲットが恒久的にdeferredになり、能動収集が
+一度も走らなくなる(macOSで実際に発生。実使用率39%に対しloadavg由来の値は89%)。
+サンプラはプロセスで1つを共有する。sysinfoは前回refreshからの差分を返すため、
+複数箇所が個別にrefreshすると各呼び出し元が「直前に誰かがrefreshしてからの差分」を
+受け取ってしまう。最初のrefreshは差分の相手がなく、値は取れない(`None`)。この間
+`cpu_percent()` は0を返して制限をかけず、`cpu_limit_source` が `unavailable:` を返す。
+
 - **受動収集ゆえ、視聴していないネットワークの番組表は増えない。** 特に地上波は
   そのチャンネル(物理TS)を選局しないと埋まらない。BS/CS は1チャンネル視聴で広く埋まる。
 - **schedule EIT の送出周期は遠い日付ほど長い**(地上波で数分オーダー)。選局直後は

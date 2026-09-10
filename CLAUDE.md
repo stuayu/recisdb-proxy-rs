@@ -67,6 +67,10 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   (全TS無条件巡回は禁止)。
 - 延期・失敗理由は `EpgReasonCode` のenumだけから生む。文字列リテラルをその場で書かない。
   `not_due` は state にだけ残し履歴に積まない(毎ループ1行増やさない)。
+- **CPU soft/hard limit の使用率は `metrics::system::cpu_usage_percent()`(sysinfo)だけを見る。
+  load average をCPU使用率に換算しない。** loadavgはI/O待ちも数えるので実使用率より大きく出て、
+  全ターゲットが恒久的にdeferredになり能動収集が一度も走らなくなる(macOSで実際に発生)。
+  サンプラはプロセスで1つ(sysinfoは前回refreshからの差分を返す)。
 - スキャン前に `(network_id, tsid)` の **mux リース**を取る。リースは `Drop` で解放し、
   握ったまま死んでもTTLで他ノードが取り直せること。ストリーム用リースとは別系統。
 

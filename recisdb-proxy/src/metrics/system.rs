@@ -6,13 +6,16 @@ use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Networks, System};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+/// Shortest gap between two CPU refreshes. Readings taken closer together than
+/// this are dominated by the sampling overhead itself.
+const CPU_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const HISTORY_CAPACITY: usize = 180;
 const GPU_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -473,7 +476,6 @@ impl SystemMetricsCollector {
         let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
         loop {
             interval.tick().await;
-            system.refresh_cpu_usage();
             system.refresh_memory();
             networks.refresh(true);
             let received: u64 = networks.values().map(|data| data.total_received()).sum();
@@ -496,7 +498,7 @@ impl SystemMetricsCollector {
             }
             let sample = SystemMetricSample {
                 timestamp: now,
-                cpu_usage_percent: system.global_cpu_usage(),
+                cpu_usage_percent: cpu_usage_percent().unwrap_or(0.0),
                 cpu_cores: system.cpus().len(),
                 load_average_1,
                 load_average_5,
@@ -526,6 +528,99 @@ fn load_average() -> (Option<f64>, Option<f64>, Option<f64>) {
 fn load_average() -> (Option<f64>, Option<f64>, Option<f64>) {
     (None, None, None)
 }
+/// Host CPU utilisation, sampled through sysinfo.
+///
+/// sysinfo reports the usage accumulated since the previous refresh of the same
+/// `System`, so every reader has to share one sampler: refreshing from several
+/// places would hand each caller the delta since whoever refreshed last rather
+/// than a comparable reading. The EPG scheduler polls this from a synchronous
+/// context, hence the plain `Mutex`.
+struct CpuSampler {
+    system: System,
+    sampled_at: Option<Instant>,
+    percent: Option<f32>,
+}
+
+impl CpuSampler {
+    fn new() -> Self {
+        Self {
+            system: System::new(),
+            sampled_at: None,
+            percent: None,
+        }
+    }
+
+    /// Refresh if the previous reading is older than `CPU_SAMPLE_MIN_INTERVAL`,
+    /// otherwise reuse it. Readings closer together than that measure mostly
+    /// the sampling overhead.
+    fn sample(&mut self, now: Instant) -> Option<f32> {
+        let due = match self.sampled_at {
+            Some(at) => now.duration_since(at) >= CPU_SAMPLE_MIN_INTERVAL,
+            None => true,
+        };
+        if due {
+            let first = self.sampled_at.is_none();
+            self.system.refresh_cpu_usage();
+            self.sampled_at = Some(now);
+            if !first {
+                self.percent = Some(self.system.global_cpu_usage().clamp(0.0, 100.0));
+            }
+        }
+        self.percent
+    }
+}
+
+fn cpu_sampler() -> &'static Mutex<CpuSampler> {
+    static SAMPLER: OnceLock<Mutex<CpuSampler>> = OnceLock::new();
+    SAMPLER.get_or_init(|| Mutex::new(CpuSampler::new()))
+}
+
+/// Whole-host CPU utilisation in percent (0-100), averaged over all cores.
+///
+/// Returns `None` until two refreshes at least `CPU_SAMPLE_MIN_INTERVAL` apart
+/// have happened: the first refresh has nothing to diff against and would
+/// always read as 0%, which an idle machine and a missing probe share.
+pub fn cpu_usage_percent() -> Option<f32> {
+    cpu_sampler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .sample(Instant::now())
+}
+
+#[cfg(test)]
+mod cpu_sampler_tests {
+    use super::*;
+
+    // Drives its own sampler rather than `cpu_usage_percent`, whose sampler is
+    // shared with every other test in this binary.
+    #[test]
+    fn first_reading_is_unavailable_and_later_ones_are_measured() {
+        let mut sampler = CpuSampler::new();
+        let start = Instant::now();
+        // The very first refresh has nothing to diff against, so callers must
+        // be able to tell "no reading yet" from a genuinely idle host.
+        assert!(sampler.sample(start).is_none());
+        // Within the minimum interval the cached value is reused instead of
+        // refreshing, which would report the delta over a few microseconds.
+        assert!(sampler
+            .sample(start + CPU_SAMPLE_MIN_INTERVAL / 2)
+            .is_none());
+        let percent = sampler
+            .sample(start + CPU_SAMPLE_MIN_INTERVAL)
+            .expect("a reading once two refreshes are apart");
+        assert!(
+            (0.0..=100.0).contains(&percent),
+            "utilisation out of range: {percent}"
+        );
+        // A reading stays available even when the next call is too early to
+        // refresh.
+        assert_eq!(
+            sampler.sample(start + CPU_SAMPLE_MIN_INTERVAL),
+            Some(percent)
+        );
+    }
+}
+
 fn unix_timestamp_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
