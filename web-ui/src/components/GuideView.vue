@@ -192,6 +192,11 @@ const selectedDate = ref(broadcastDateInput(now.value, GRID_START_HOUR))
 const detail = ref<Program | null>(null)
 const selected = ref<{ columnIndex: number; programId: string } | null>(null)
 const selectedProgram = ref<Program | null>(null)
+const popupProgram = ref<Program | null>(null)
+const popupStyle = ref<Record<string, string>>({ visibility: 'hidden' })
+const popupElement = ref<HTMLElement | null>(null)
+let popupHideTimer: number | null = null
+let popupAnchor: HTMLElement | null = null
 const previewProgram = ref<Program | null>(null)
 const epgStates = shallowRef<EpgScanState[]>([])
 const epgTargetHours = ref(168)
@@ -390,6 +395,7 @@ function scheduleScrollUpdate(): void {
   })
 }
 function onScroll(): void {
+  closeProgramPopup()
   const element = scrollArea.value
   pendingScrollTop = element?.scrollTop ?? 0
   pendingScrollLeft = element?.scrollLeft ?? 0
@@ -786,6 +792,83 @@ function selectProgram(columnIndex: number, program: Program): void {
   }, DETAIL_LOAD_DEBOUNCE_MS)
 }
 
+function clearPopupHideTimer(): void {
+  if (popupHideTimer !== null) window.clearTimeout(popupHideTimer)
+  popupHideTimer = null
+}
+
+function positionProgramPopup(): void {
+  const anchor = popupAnchor
+  const popup = popupElement.value
+  if (anchor === null || popup === null) return
+  const anchorRect = anchor.getBoundingClientRect()
+  const popupRect = popup.getBoundingClientRect()
+  const viewport = window.visualViewport
+  const viewportLeft = viewport?.offsetLeft ?? 0
+  const viewportTop = viewport?.offsetTop ?? 0
+  const viewportWidth = viewport?.width ?? document.documentElement.clientWidth
+  const viewportHeight = viewport?.height ?? document.documentElement.clientHeight
+  const gap = 8
+  const margin = 8
+  let left = anchorRect.right + gap
+  if (left + popupRect.width > viewportLeft + viewportWidth - margin) {
+    left = anchorRect.left - popupRect.width - gap
+  }
+  left = Math.max(viewportLeft + margin, Math.min(left, viewportLeft + viewportWidth - popupRect.width - margin))
+  let top = anchorRect.top
+  if (top + popupRect.height > viewportTop + viewportHeight - margin) {
+    top = anchorRect.bottom - popupRect.height
+  }
+  top = Math.max(viewportTop + margin, Math.min(top, viewportTop + viewportHeight - popupRect.height - margin))
+  popupStyle.value = { left: `${left}px`, top: `${top}px`, visibility: 'visible' }
+}
+
+function showProgramPopup(program: Program, anchor: HTMLElement | null = null): void {
+  clearPopupHideTimer()
+  popupProgram.value = program
+  if (anchor !== null) popupAnchor = anchor
+  void nextTick().then(positionProgramPopup)
+}
+
+function showSelectedPopup(): void {
+  const program = selectedProgram.value
+  if (program === null) return
+  void nextTick().then(() => {
+    const anchor = [...(scrollArea.value?.querySelectorAll<HTMLElement>('[data-program-key]') ?? [])]
+      .find((element) => element.dataset.programKey === program.key) ?? null
+    showProgramPopup(program, anchor)
+  })
+}
+
+function schedulePopupHide(): void {
+  clearPopupHideTimer()
+  popupHideTimer = window.setTimeout(() => {
+    popupHideTimer = null
+    if (!popupElement.value?.matches(':hover')) closeProgramPopup()
+  }, 180)
+}
+
+function closeProgramPopup(): void {
+  clearPopupHideTimer()
+  popupProgram.value = null
+  popupAnchor = null
+  popupStyle.value = { visibility: 'hidden' }
+}
+
+function onProgramEnter(event: MouseEvent, columnIndex: number, program: Program): void {
+  selectProgram(columnIndex, program)
+  showProgramPopup(program, event.currentTarget as HTMLElement)
+}
+
+function onProgramClick(event: MouseEvent, columnIndex: number, program: Program): void {
+  selectProgram(columnIndex, program)
+  showProgramPopup(program, event.currentTarget as HTMLElement)
+}
+
+function onProgramFocus(event: FocusEvent, program: Program): void {
+  showProgramPopup(program, event.currentTarget as HTMLElement)
+}
+
 /** 列の中で、指定した時刻を含む(なければ直後の)番組を返す。items は top 昇順。 */
 function itemNearTime(column: GuideColumn, startAt: number): Program | null {
   let candidate: Program | null = null
@@ -865,6 +948,7 @@ function onGridKeydown(event: KeyboardEvent): void {
       break
     default: return
   }
+  if (event.key.startsWith('Arrow')) showSelectedPopup()
   event.preventDefault()
 }
 function shiftDate(days: number) {
@@ -907,11 +991,13 @@ async function loadProgramDetail(program: Program): Promise<void> {
     programIndex = buildProgramIndex(rawPrograms.value)
     if (detail.value?.key === program.key) detail.value = updated
     if (selectedProgram.value?.key === program.key) selectedProgram.value = updated
+    if (popupProgram.value?.key === program.key) popupProgram.value = updated
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
 function openDetail(program: Program) {
+  closeProgramPopup()
   detail.value = program
   void loadProgramDetail(program)
 }
@@ -919,6 +1005,7 @@ function closeDetail() {
   detail.value = null
 }
 function openPreview(program: Program) {
+  closeProgramPopup()
   detail.value = null
   previewProgram.value = program
 }
@@ -929,12 +1016,16 @@ function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (previewProgram.value) closePreview()
   else if (detail.value) closeDetail()
+  else if (popupProgram.value) closeProgramPopup()
   else {
     selected.value = null
     selectedProgram.value = null
   }
 }
-watch(selectedDate, () => void loadPrograms())
+watch(selectedDate, () => {
+  closeProgramPopup()
+  void loadPrograms()
+})
 // 絞り込みや表示密度で列数が変わったら、可視範囲を取り直す。
 watch([columns, pxPerMin], () => void nextTick().then(resizeGrid))
 watch(showSubchannels, (enabled) => {
@@ -961,12 +1052,16 @@ onMounted(() => {
     now.value = Date.now()
   }, 30000)
   window.addEventListener('resize', resizeGrid)
+  window.visualViewport?.addEventListener('resize', positionProgramPopup)
+  window.visualViewport?.addEventListener('scroll', closeProgramPopup)
   window.addEventListener('keydown', onKeydown)
 })
 onUnmounted(() => {
   window.clearInterval(clockTimer)
   narrowMedia?.removeEventListener('change', resizeGrid)
   window.removeEventListener('resize', resizeGrid)
+  window.visualViewport?.removeEventListener('resize', positionProgramPopup)
+  window.visualViewport?.removeEventListener('scroll', closeProgramPopup)
   window.removeEventListener('keydown', onKeydown)
   scrollResizeObserver?.disconnect()
   scrollResizeObserver = null
@@ -975,6 +1070,7 @@ onUnmounted(() => {
   programMergeTimer = null
   if (detailLoadTimer !== null) window.clearTimeout(detailLoadTimer)
   detailLoadTimer = null
+  clearPopupHideTimer()
   pendingProgramEvents = []
   epgEvents.stop()
 })
@@ -992,6 +1088,7 @@ onUnmounted(() => {
         </div>
         <button class="guide-icon-button" aria-label="翌日" @click="shiftDate(1)">▶</button>
         <button class="guide-chip-button" :class="{ active: isToday }" @click="goToday">今日</button>
+        <button class="guide-chip-button" aria-label="現在時刻へ" @click="scrollToNow">現在時刻へ</button>
       </div>
       <div class="guide-band-tabs" role="group" aria-label="放送種別">
         <button
@@ -1144,6 +1241,7 @@ onUnmounted(() => {
               :key="item.program.key"
               type="button"
               class="guide-cell"
+              :data-program-key="item.program.key"
               :class="{
                 'guide-cell-past': isPast(item.program),
                 'guide-cell-onair': isOnAir(item.program),
@@ -1152,7 +1250,10 @@ onUnmounted(() => {
               :aria-label="item.program.name || '番組名なし'"
               :aria-current="isOnAir(item.program) ? 'true' : undefined"
               :style="item.style"
-              @click="selectProgram(entry.index, item.program)"
+              @mouseenter="onProgramEnter($event, entry.index, item.program)"
+              @mouseleave="schedulePopupHide"
+              @focus="onProgramFocus($event, item.program)"
+              @click="onProgramClick($event, entry.index, item.program)"
             >
               <span class="guide-cell-highlight" aria-hidden="true" /><div class="guide-cell-content">
                 <span class="guide-cell-head">
@@ -1172,30 +1273,33 @@ onUnmounted(() => {
         </div>
         <p v-if="!columns.length" class="empty-state">条件に一致するサービスがありません</p>
       </div>
-      <aside class="guide-detail-pane" aria-live="polite">
-        <template v-if="selectedProgram">
-          <div class="guide-detail-pane-heading">
-            <span class="guide-detail-pane-kicker">選択中の番組</span>
-            <h2 v-text="selectedProgram.name || '番組情報'" />
-          </div>
-          <p class="guide-detail-time">
-            <span v-text="fmtTime(selectedProgram.start_at)" />〜<span v-text="fmtTime(selectedProgram.start_at + selectedProgram.duration_secs)" />
-          </p>
-          <p class="guide-detail-genre">ジャンル: <span class="genre-badge" v-text="genreLabel(selectedProgram.genre)" /></p>
-          <div class="guide-detail-pane-copy">
-            <p v-if="selectedProgram.description" class="preserve-lines" v-text="selectedProgram.description" />
-            <p v-if="selectedProgram.extended" class="preserve-lines guide-detail-extended" v-text="selectedProgram.extended" />
-            <p v-if="!selectedProgram.description && !selectedProgram.extended" class="muted">説明なし</p>
-          </div>
-          <div class="guide-actionbar">
-            <span class="guide-actionbar-selected" v-text="selectedProgram.name || '番組名なし'" />
-            <button class="guide-chip-button" @click="openDetail(selectedProgram)">番組詳細</button>
-            <button class="guide-chip-button" @click="openPreview(selectedProgram)">視聴</button>
-            <button class="guide-chip-button" @click="scrollToNow">現在時刻へ</button>
-          </div>
-        </template>
-        <p v-else class="muted">番組を選ぶと詳細・視聴できます</p>
-      </aside>
+      <section
+        v-if="popupProgram"
+        ref="popupElement"
+        class="guide-program-popup"
+        :style="popupStyle"
+        role="dialog"
+        aria-label="番組情報"
+        @mouseenter="clearPopupHideTimer"
+        @mouseleave="schedulePopupHide"
+      >
+        <span class="guide-detail-pane-kicker">番組情報</span>
+        <h2 v-text="popupProgram.name || '番組情報'" />
+        <p class="guide-detail-time">
+          <span v-text="fmtTime(popupProgram.start_at)" />〜<span v-text="fmtTime(popupProgram.start_at + popupProgram.duration_secs)" />
+        </p>
+        <p class="guide-detail-genre">ジャンル: <span class="genre-badge" v-text="genreLabel(popupProgram.genre)" /></p>
+        <div class="guide-detail-pane-copy">
+          <p v-if="!popupProgram.loaded" class="muted">説明を読み込み中…</p>
+          <p v-if="popupProgram.description" class="preserve-lines" v-text="popupProgram.description" />
+          <p v-if="popupProgram.extended" class="preserve-lines guide-detail-extended" v-text="popupProgram.extended" />
+          <p v-if="popupProgram.loaded && !popupProgram.description && !popupProgram.extended" class="muted">説明なし</p>
+        </div>
+        <div class="guide-actionbar">
+          <button class="guide-chip-button" @click="openDetail(popupProgram)">番組詳細</button>
+          <button class="guide-chip-button" @click="openPreview(popupProgram)">視聴</button>
+        </div>
+      </section>
     </div>
     <p v-if="activeEpgStatusText" class="notice guide-epg-status-notice" role="status" v-text="activeEpgStatusText" />
     <div v-if="detail" class="dialog-backdrop" @click.self="closeDetail">

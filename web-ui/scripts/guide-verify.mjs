@@ -190,7 +190,7 @@ for (const vp of [
         chNum: document.querySelector('.guide-ch-num')?.textContent ?? null,
         bandTabs: document.querySelectorAll('.guide-band-tab').length,
         densityButtons: document.querySelectorAll('.guide-density-button').length,
-        actionbar: document.querySelectorAll('.guide-actionbar .guide-chip-button').length,
+        toolbarNowButton: document.querySelectorAll('.guide-date-nav [aria-label="現在時刻へ"]').length,
         isDark: document.querySelector('.app')?.classList.contains('dark') ?? false,
         cellBg: (() => {
           const c = document.querySelector('.guide-cell')
@@ -221,6 +221,7 @@ for (const vp of [
     if (!m.nowLine) failures.push(`${tag}: 現在時刻ラインなし`)
     if (m.onAir === 0) failures.push(`${tag}: 放送中セルなし`)
     if (m.bandTabs !== 4) failures.push(`${tag}: バンドタブ ${m.bandTabs}`)
+    if (m.toolbarNowButton !== 1) failures.push(`${tag}: ツールバーの「現在時刻へ」ボタン ${m.toolbarNowButton}`)
     // 局数 (狭幅は 9 局を出さない) + 時間幅 + サブCH の切替ボタン
     const wantDensity = (vp.width <= 700 ? 5 : 6) + 1
     if (m.densityButtons !== wantDensity) {
@@ -228,29 +229,52 @@ for (const vp of [
     }
     if ((theme === 'dark') !== m.isDark) failures.push(`${tag}: テーマが当たっていない (isDark=${m.isDark})`)
 
+    if (vp.name === '390') {
+      // 狭幅はホバー相当の実操作でポップアップを開き、viewport内に収まることを測る。
+      // 狭幅にホバーは無い。実機と同じくタップで開く。
+      await page.locator('.guide-cell').first().click()
+      await page.waitForTimeout(400)
+      const narrowPopup = await page.evaluate(() => {
+        const popups = [...document.querySelectorAll('.guide-program-popup')]
+        const rect = popups[0]?.getBoundingClientRect()
+        return {
+          count: popups.length,
+          inViewport: !!rect && rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
+        }
+      })
+      if (narrowPopup.count !== 1) failures.push(`390: ポップアップ数が1でない (${narrowPopup.count})`)
+      if (!narrowPopup.inViewport) failures.push('390: ポップアップがviewport外にはみ出している')
+      await page.keyboard.press('Escape')
+    }
+
     await page.screenshot({ path: join(output, `guide-${tag}.png`) })
 
     if (vp.name === '1280x720' && theme === 'light') {
       // --- 対話確認 ---
-      // クリック → 選択 + 詳細ダイアログ
-      // クリックは「選択」だけ。詳細は常設ペインに出る (REGZA の番組表と同じ)。
+      // クリック → 選択 + 1 個だけのポップアップ
       await page.locator('.guide-cell').nth(3).click()
       await page.waitForTimeout(600)
       const afterClick = await page.evaluate(() => ({
         dialog: !!document.querySelector('.guide-detail-dialog'),
         selected: document.querySelectorAll('.guide-cell-selected').length,
-        actionLabel: document.querySelector('.guide-actionbar-selected')?.textContent?.trim() ?? '',
-        paneTitle: document.querySelector('.guide-detail-pane-heading h2')?.textContent?.trim() ?? '',
-        paneCopy: document.querySelector('.guide-detail-pane-copy')?.textContent?.trim() ?? '',
+        popupCount: document.querySelectorAll('.guide-program-popup').length,
+        popupTitle: document.querySelector('.guide-program-popup h2')?.textContent?.trim() ?? '',
+        popupTime: document.querySelector('.guide-program-popup .guide-detail-time')?.textContent?.trim() ?? '',
       }))
       if (afterClick.dialog) failures.push('クリックだけで詳細ダイアログが開いている')
       if (afterClick.selected !== 1) failures.push(`クリック後の選択セル数 ${afterClick.selected}`)
-      if (!afterClick.paneTitle) failures.push('詳細ペインに番組名が出ていない')
-      if (!afterClick.paneCopy) failures.push('詳細ペインに説明文が出ていない (遅延取得が効いていない)')
-      if (!afterClick.actionLabel || afterClick.actionLabel.includes('番組を選ぶと')) {
-        failures.push('操作バーに選択番組名が出ていない')
-      }
-      // Enter → ダイアログ、Escape → 閉じる
+      if (afterClick.popupCount !== 1) failures.push(`ポップアップ数が1でない (${afterClick.popupCount})`)
+      if (!afterClick.popupTitle) failures.push('ポップアップに番組名が出ていない')
+      if (!/^\d{2}:\d{2}〜\d{2}:\d{2}$/.test(afterClick.popupTime)) failures.push(`ポップアップに時刻がない (${afterClick.popupTime})`)
+      await page.locator('.guide-program-popup .guide-chip-button', { hasText: '番組詳細' }).click()
+      await page.waitForTimeout(300)
+      if (!(await page.locator('.guide-detail-dialog').count())) failures.push('ポップアップの「番組詳細」で詳細が開かない')
+      await page.keyboard.press('Escape'); await page.waitForTimeout(250)
+      // ポップアップのEscape閉鎖
+      await page.locator('.guide-cell-selected').focus()
+      await page.keyboard.press('Escape'); await page.waitForTimeout(250)
+      if (await page.locator('.guide-program-popup').count()) failures.push('Escapeでポップアップが閉じない')
+      // Enter → 詳細ダイアログ、Escape → 閉じる
       await page.locator('.guide-scroll').focus()
       await page.keyboard.press('Enter'); await page.waitForTimeout(300)
       if (!(await page.locator('.guide-detail-dialog').count())) failures.push('Enterで詳細ダイアログが開かない')
@@ -269,6 +293,7 @@ for (const vp of [
       const afterRight = await page.evaluate(() =>
         document.querySelector('.guide-cell-selected')?.getAttribute('aria-label') ?? null)
       if (afterRight === afterDown || afterRight === null) failures.push(`ArrowRightで選択が動かない (${afterDown} → ${afterRight})`)
+      if (await page.locator('.guide-program-popup').count() !== 1) failures.push('矢印キー移動後にポップアップが1個でない')
       // 密度切替: 局数を変えると 1 画面に収まる列数が変わる
       const colsBefore = await page.evaluate(() => document.querySelectorAll('.guide-header-cell').length)
       await page.locator('.guide-density-button', { hasText: '9局' }).click()
@@ -320,8 +345,14 @@ for (const vp of [
       await page.keyboard.press('Enter'); await page.waitForTimeout(300)
       if (!(await page.locator('.guide-detail-dialog').count())) failures.push('Enterで詳細が開かない')
       await page.keyboard.press('Escape'); await page.waitForTimeout(200)
-      // 「視聴」→ PreviewPlayer が載ることを確認 (実ストリームは流れないので mount まで)
-      await page.locator('.guide-actionbar .guide-chip-button', { hasText: '視聴' }).click()
+      // Esc は詳細ダイアログと一緒にポップアップも閉じる。ホバーで出し直してから押す。
+      await page.locator('.guide-cell-selected').first().hover()
+      await page.waitForTimeout(400)
+      if (!(await page.locator('.guide-program-popup').count())) {
+        failures.push('ホバーでポップアップが出ない')
+      }
+      // ポップアップの「視聴」→ PreviewPlayer が載ることを確認 (実ストリームは流れないので mount まで)
+      await page.locator('.guide-program-popup .guide-chip-button', { hasText: '視聴' }).click()
       await page.waitForTimeout(600)
       if (!(await page.locator('.preview-dialog').count())) failures.push('「視聴」でプレビューが開かない')
       await page.screenshot({ path: join(output, 'guide-preview.png') })
@@ -358,8 +389,8 @@ for (const vp of [
       if (Math.abs(scrolled.axisLeft - scrolled.scrollLeft) > 2) failures.push(`スクロール後 時刻軸が追従していない (${scrolled.axisLeft} vs ${scrolled.scrollLeft})`)
       notes.push({ tag: 'scrolled', ...scrolled })
       await page.screenshot({ path: join(output, 'guide-scrolled.png') })
-      // 「現在時刻へ」
-      await page.locator('.guide-actionbar .guide-chip-button', { hasText: '現在時刻へ' }).click()
+      // ツールバーの「現在時刻へ」
+      await page.locator('.guide-date-nav [aria-label="現在時刻へ"]').click()
       await page.waitForTimeout(600)
       const nowVisible = await page.evaluate(() => {
         const line = document.querySelector('.guide-now-line')?.getBoundingClientRect()

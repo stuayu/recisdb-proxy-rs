@@ -620,8 +620,7 @@ textarea:focus-visible,
 
 .guide-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -1101,12 +1100,12 @@ textarea:focus-visible,
     min-height: 36px;
   }
 
-  .guide-detail-pane {
-    max-height: 190px;
+  .guide-program-popup {
+    max-height: 65dvh;
     padding: 10px;
   }
 
-  .guide-detail-pane-heading h2 {
+  .guide-program-popup h2 {
     font-size: 1rem;
   }
 }
@@ -1989,19 +1988,7 @@ textarea:focus-visible,
   outline-offset: 1px;
 }
 
-.guide-detail-pane {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  padding: 16px;
-  overflow: hidden;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-
-.guide-detail-pane-heading h2 {
+.guide-program-popup h2 {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
   font-size: 1.15rem;
@@ -2013,31 +2000,39 @@ textarea:focus-visible,
   font-weight: 700;
 }
 
-.guide-detail-pane-copy {
+.guide-program-popup .guide-detail-pane-copy {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   overflow-wrap: anywhere;
 }
 
-.guide-detail-pane-copy p {
+.guide-program-popup .guide-detail-pane-copy p {
   margin: 8px 0;
 }
 
-.guide-detail-pane .guide-actionbar {
+.guide-program-popup .guide-actionbar {
   margin-top: 10px;
   padding: 0;
 }
 
-@media (max-width: 1100px) {
-  .guide-layout {
-    grid-template-rows: minmax(0, 1fr) auto;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .guide-detail-pane {
-    max-height: 230px;
-  }
+.guide-program-popup {
+  position: fixed;
+  z-index: 20;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  width: min(24rem, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: 70dvh;
+  padding: 12px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  pointer-events: auto;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
 }
 
 .guide-actionbar-selected {
@@ -2252,15 +2247,6 @@ textarea:focus-visible,
 
   .guide-density-button {
     min-height: 36px;
-  }
-
-  .guide-detail-pane {
-    max-height: 190px;
-    padding: 10px;
-  }
-
-  .guide-detail-pane-heading h2 {
-    font-size: 1rem;
   }
 
 }
