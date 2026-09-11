@@ -31,6 +31,13 @@ recisdb-proxy --listen 0.0.0.0:40070 --web-listen 0.0.0.0:40080
   初期バンドルには入れません。実測で `app.js` は 869KB → 306KB (分割後) → gzip 105KB。
   拠点間 WAN 越しに使う構成では、この転送量が体感を支配します
   (API も描画も本番規模で数十 ms しかかかっていませんでした)。
+- **ビルド成果物は内容ハッシュ付きの名前です** (`assets/app-<hash>.js` など。
+  `web-ui/vite.config.ts`)。`index.html` (`/`) は `Cache-Control: no-cache`、
+  `/static/vue/assets/*` は `public, max-age=31536000, immutable` で配ります
+  (`web/api/statics.rs::cache_control_for`)。以前は固定名 `app.css` をヘッダ無しで
+  配っており、Cloudflare が `max-age=14400` を付けるため、更新後もスマホだけ
+  最大 4 時間古い CSS/JS のままになっていました (番組表の時刻軸の着色が
+  スマホに反映されなかった件)。
 
 ## 機能
 

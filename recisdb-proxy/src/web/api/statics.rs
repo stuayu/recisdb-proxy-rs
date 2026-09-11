@@ -2,7 +2,10 @@
 
 use axum::{
     extract::Path,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+        StatusCode,
+    },
     response::IntoResponse,
     Json,
 };
@@ -39,6 +42,21 @@ pub async fn get_logo(Path(file): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// `Cache-Control` for an embedded Vue file.
+///
+/// Vite emits everything under `assets/` with a content hash in the file name
+/// (`web-ui/vite.config.ts`), so those never change under the same URL and can
+/// be cached for good. Anything else (`index.html`) must be revalidated, or a
+/// front proxy's default TTL (Cloudflare adds `max-age=14400` when the origin
+/// sends nothing) keeps phones on the previous build for hours.
+pub(crate) fn cache_control_for(path: &str) -> &'static str {
+    if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
 /// Serve a Vite-generated Vue asset embedded in the server binary.
 pub async fn get_vue_asset(Path(path): Path<String>) -> impl IntoResponse {
     let clean = path.trim_start_matches('/');
@@ -62,8 +80,25 @@ pub async fn get_vue_asset(Path(path): Path<String>) -> impl IntoResponse {
     };
     (
         StatusCode::OK,
-        [(CONTENT_TYPE, content_type)],
+        [
+            (CONTENT_TYPE, content_type),
+            (CACHE_CONTROL, cache_control_for(clean)),
+        ],
         asset.data.into_owned(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_control_for;
+
+    #[test]
+    fn hashed_assets_are_immutable_and_index_is_revalidated() {
+        assert_eq!(
+            cache_control_for("assets/app-3f9a1c.css"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control_for("index.html"), "no-cache");
+    }
 }
