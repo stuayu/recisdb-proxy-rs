@@ -225,6 +225,11 @@ let narrowMedia: MediaQueryList | null = null
 let programIndex = new Map<string, number>()
 let pendingProgramEvents: EpgProgramEvent[] = []
 let programMergeTimer: number | null = null
+/** 応答待ちの取得範囲 (局ごと)。再描画に関わらないので reactive にしない。 */
+const pendingProgramWindows = new Map<string, ProgramWindow[]>()
+/** loadPrograms のたびに進める。古い応答を捨てるための世代番号。 */
+let programGeneration = 0
+let initialProgramsReady = false
 let scrollResizeObserver: ResizeObserver | null = null
 let detailLoadTimer: number | null = null
 
@@ -373,19 +378,8 @@ function applyScrollUpdate(): void {
   void loadMoreForScroll()
 }
 async function loadMoreForScroll(): Promise<void> {
-  const top = Math.max(0, pendingScrollTop - headerHeight.value)
-  const bottom = top + viewportHeight.value
   const { since, until } = gridBounds.value
-  const programWindow = calculateGuideProgramWindow({
-    top,
-    bottom,
-    gridSince: since,
-    gridUntil: until,
-    pxPerMin: pxPerMin.value,
-    bufferPx: visibleBufferPx.value,
-    stepSecs: PROGRAM_WINDOW_STEP_SECS,
-  })
-  if (programWindow !== null) await loadProgramsWindow(...programWindow)
+  await loadVisiblePrograms()
   if (pendingScrollLeft + (scrollArea.value?.clientWidth ?? 0) >
       axisWidth.value + (visibleColumnEnd.value - 2) * columnWidth.value) {
     await loadProgramsWindow(since, until)
@@ -453,8 +447,9 @@ function visibleServiceKeys(): string[] {
   return [...keys]
 }
 function windowLoaded(serviceKey: string, since: number, until: number): boolean {
-  return (loadedProgramWindows.value.get(serviceKey) ?? [])
-    .some(([start, end]) => start <= since && end >= until)
+  const covers = ([start, end]: ProgramWindow) => start <= since && end >= until
+  return (loadedProgramWindows.value.get(serviceKey) ?? []).some(covers) ||
+    (pendingProgramWindows.get(serviceKey) ?? []).some(covers)
 }
 async function loadProgramsWindow(since: number, until: number, force = false) {
   const visibleKeys = visibleServiceKeys()
@@ -462,12 +457,19 @@ async function loadProgramsWindow(since: number, until: number, force = false) {
     ? visibleKeys
     : visibleKeys.filter((serviceKey) => !windowLoaded(serviceKey, since, until))
   if (!requestedKeys.length) return
+  // 応答待ちの範囲も「取得済み」とみなす。列の入れ替えで同じ窓を二重に要求しない。
+  const generation = programGeneration
+  for (const serviceKey of requestedKeys) {
+    pendingProgramWindows.set(serviceKey, [...(pendingProgramWindows.get(serviceKey) ?? []), [since, until]])
+  }
   programsLoading.value = true
   try {
     const query = new URLSearchParams({ since: String(since), until: String(until), brief: 'true', limit: '20000' })
     const servicesQuery = visibleServiceQuery(requestedKeys)
     if (servicesQuery) query.set('services', servicesQuery)
     const rows = unwrapArray(await api(`/programs?${query}`), ['programs']).map(normalizeProgramRow)
+    // 待っている間に日付変更・再取得 (loadPrograms) が走っていたら、古い応答は捨てる。
+    if (generation !== programGeneration) return
     const keys = new Set(rawPrograms.value.map(programEventKey))
     rawPrograms.value = [...rawPrograms.value, ...rows.filter((row) => !keys.has(programEventKey(row)))]
     programIndex = buildProgramIndex(rawPrograms.value)
@@ -481,8 +483,38 @@ async function loadProgramsWindow(since: number, until: number, force = false) {
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
+    if (generation === programGeneration) {
+      for (const serviceKey of requestedKeys) {
+        const rest = (pendingProgramWindows.get(serviceKey) ?? [])
+          .filter(([start, end]) => start !== since || end !== until)
+        if (rest.length) pendingProgramWindows.set(serviceKey, rest)
+        else pendingProgramWindows.delete(serviceKey)
+      }
+    }
     programsLoading.value = false
   }
+}
+/**
+ * 今見えている時間帯 (+ バッファ) を、見えている列のぶんだけ読む。取得済みの局は飛ばす。
+ * スクロールだけでなく、列の顔ぶれが変わったとき (帯域タブ・地域・検索・サブCH・局数) にも
+ * 呼ぶ。以前はスクロールでしか呼ばれず、帯域タブを押すと新しく並んだ局が空のまま
+ * 指でスクロールするまで番組が出なかった。
+ */
+async function loadVisiblePrograms(): Promise<void> {
+  if (!initialProgramsReady) return
+  const top = Math.max(0, pendingScrollTop - headerHeight.value)
+  const bottom = top + viewportHeight.value
+  const { since, until } = gridBounds.value
+  const programWindow = calculateGuideProgramWindow({
+    top,
+    bottom,
+    gridSince: since,
+    gridUntil: until,
+    pxPerMin: pxPerMin.value,
+    bufferPx: visibleBufferPx.value,
+    stepSecs: PROGRAM_WINDOW_STEP_SECS,
+  })
+  if (programWindow !== null) await loadProgramsWindow(...programWindow)
 }
 async function loadInitialPrograms() {
   const { since: gridSince, until: gridUntil } = gridBounds.value
@@ -503,10 +535,17 @@ async function loadInitialPrograms() {
   }
 }
 async function loadPrograms() {
+  programGeneration += 1
+  initialProgramsReady = false
+  pendingProgramWindows.clear()
   loadedProgramWindows.value = new Map()
   rawPrograms.value = []
   programIndex = new Map()
   await loadInitialPrograms()
+  // 初回窓 (現在時刻の前後) を読み終えてから、列の変化に応じた追加取得を解禁する。
+  // 先に解禁すると、スクロール位置が 06:00 のままの窓を取りに行って無駄になる。
+  initialProgramsReady = true
+  void loadVisiblePrograms()
 }
 async function refresh() {
   loading.value = true
@@ -1054,18 +1093,10 @@ watch(selectedDate, () => {
 watch([columns, pxPerMin], () => void nextTick().then(() => {
   resizeGrid()
   refreshProgramPopupPosition()
+  // 新しく見えた局の番組を取る。取得済みなら要求は飛ばない (番組の到着で columns が
+  // 変わってもここへ来るが、同じ窓は windowLoaded で弾かれるので往復しない)。
+  void loadVisiblePrograms()
 }))
-watch(showSubchannels, (enabled) => {
-  if (!enabled) return
-  void nextTick().then(async () => {
-    resizeGrid()
-    const top = Math.max(0, pendingScrollTop - headerHeight.value)
-    const bottom = top + Math.max(viewportHeight.value, headerHeight.value)
-    const since = Math.max(gridBounds.value.since, gridBounds.value.since + Math.floor(top / pxPerMin.value * 60))
-    const until = Math.min(gridBounds.value.until, gridBounds.value.since + Math.ceil(bottom / pxPerMin.value * 60))
-    if (since < until) await loadProgramsWindow(since, until)
-  })
-})
 onMounted(() => {
   loadDensity()
   narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)

@@ -382,13 +382,28 @@ for (const vp of [
       // 帯域タブ (BS)
       await page.locator('.guide-band-tab', { hasText: 'BS' }).first().click()
       await page.waitForTimeout(800)
-      const bs = await page.evaluate(() => ({
-        pressed: document.querySelectorAll('.guide-band-tab[aria-pressed="true"]').length,
-        first: document.querySelector('.guide-ch-name')?.textContent ?? '',
-        cols: document.querySelectorAll('.guide-col').length,
-      }))
+      const bs = await page.evaluate(() => {
+        const scroll = document.querySelector('.guide-scroll')
+        const r = scroll.getBoundingClientRect()
+        // スクロールせずに見えている列。帯域を切り替えただけで番組が埋まること
+        // (以前はスクロールしないと取得が走らず、列が空のままだった)。
+        const visible = [...document.querySelectorAll('.guide-col')].filter((c) => {
+          const b = c.getBoundingClientRect()
+          return b.right > r.left + 50 && b.left < r.right
+        })
+        return {
+          pressed: document.querySelectorAll('.guide-band-tab[aria-pressed="true"]').length,
+          first: document.querySelector('.guide-ch-name')?.textContent ?? '',
+          cols: document.querySelectorAll('.guide-col').length,
+          visibleCols: visible.length,
+          emptyVisibleCols: visible.filter((c) => !c.querySelector('.guide-cell')).length,
+        }
+      })
       if (bs.pressed !== 1) failures.push(`BSタブ aria-pressed=${bs.pressed}`)
       if (!bs.first.startsWith('BS')) failures.push(`BSフィルタが効いていない (先頭=${bs.first})`)
+      if (bs.visibleCols === 0 || bs.emptyVisibleCols > 0) {
+        failures.push(`BSタブ切替後、スクロールなしで番組が出ない列 ${bs.emptyVisibleCols}/${bs.visibleCols}`)
+      }
       await page.screenshot({ path: join(output, 'guide-band-bs.png') })
       await page.locator('.guide-band-tab', { hasText: 'すべて' }).first().click()
       await page.waitForTimeout(600)
