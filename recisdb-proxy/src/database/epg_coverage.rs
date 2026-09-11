@@ -3,6 +3,7 @@
 use crate::database::{
     Database, EpgMuxCoverage, EpgScanStatus, EpgServiceCoverage, EpgServiceCoverageUpsert, Result,
 };
+use recisdb_protocol::broadcast_region::is_real_broadcast_service;
 use rusqlite::params;
 
 impl Database {
@@ -10,6 +11,9 @@ impl Database {
     pub fn upsert_epg_service_coverage(&self, rows: &[EpgServiceCoverageUpsert]) -> Result<usize> {
         let mut changed = 0;
         for row in rows {
+            if !is_real_broadcast_service(row.service_id, row.tsid) {
+                continue;
+            }
             changed += self.connection().execute(
                 "INSERT INTO epg_service_coverage (
                     network_id, tsid, service_id, pf_complete,
@@ -89,7 +93,11 @@ impl Database {
             "WITH target_services AS (
                  SELECT nid AS network_id, tsid, sid AS service_id
                  FROM channels
-                 WHERE service_type IS NULL OR service_type IN (1, 2)
+                 -- Keep this in sync with
+                 -- recisdb_protocol::broadcast_region::is_real_broadcast_service:
+                 -- sid != 0 AND tsid != 0.
+                 WHERE (service_type IS NULL OR service_type IN (1, 2))
+                   AND sid != 0 AND tsid != 0
                  GROUP BY nid, tsid, sid
              ), joined AS (
                  -- 母数は channels 側の対象サービスだけ。coverage 行しか無い
@@ -344,6 +352,23 @@ mod tests {
         let mux = &db.get_epg_mux_coverage().unwrap()[0];
         assert_eq!(mux.services_total, 1);
         assert_eq!(mux.coverage_until, Some(100));
+    }
+
+    #[test]
+    fn zero_sid_or_tsid_is_excluded_from_coverage_targets() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 0, None);
+        channel(&db, driver, 1, 2, 10, None);
+        channel(&db, driver, 1, 0, 11, None);
+        db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(100), true)])
+            .unwrap();
+
+        let muxes = db.get_epg_mux_coverage().unwrap();
+        assert_eq!(muxes.len(), 1);
+        assert_eq!((muxes[0].network_id, muxes[0].tsid), (1, 2));
+        assert_eq!(muxes[0].services_total, 1);
+        assert_eq!(muxes[0].coverage_until, Some(100));
     }
 
     #[test]

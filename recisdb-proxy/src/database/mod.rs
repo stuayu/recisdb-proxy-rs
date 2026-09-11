@@ -285,6 +285,10 @@ impl Database {
             "034_epg_section_coverage",
             Database::migration_034_epg_section_coverage,
         ),
+        (
+            "035_purge_placeholder_epg_rows",
+            Database::migration_035_purge_placeholder_epg_rows,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -411,6 +415,17 @@ impl Database {
         self.add_column_if_not_exists("epg_scan_states", "services_complete", "INTEGER")?;
         self.add_column_if_not_exists("epg_scan_states", "last_complete_at", "INTEGER")?;
         self.add_column_if_not_exists("epg_scan_states", "last_scan_status", "TEXT")?;
+        Ok(())
+    }
+
+    /// Migration 035: remove EPG state/coverage rows that were created for
+    /// physical-channel placeholders. The shared service-identity rule is
+    /// `is_real_broadcast_service(sid, tsid)`, i.e. both values must be nonzero.
+    fn migration_035_purge_placeholder_epg_rows(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM epg_scan_states WHERE tsid = 0;
+             DELETE FROM epg_service_coverage WHERE tsid = 0 OR service_id = 0;",
+        )?;
         Ok(())
     }
 
@@ -2312,6 +2327,61 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(final_version, target);
+    }
+
+    #[test]
+    fn placeholder_epg_cleanup_migration_is_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO epg_scan_states(network_id,tsid) VALUES (1,0),(1,2);
+                 INSERT INTO epg_service_coverage(network_id,tsid,service_id)
+                     VALUES (1,0,100),(1,2,0),(1,2,101);
+                 PRAGMA user_version = 34;",
+            )
+            .unwrap();
+
+        db.apply_migrations().unwrap();
+        let first: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM epg_scan_states WHERE tsid=0),
+                    (SELECT COUNT(*) FROM epg_service_coverage
+                     WHERE tsid=0 OR service_id=0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        // apply_migrations は user_version を見て 2 回目を飛ばすので、
+        // 冪等性 (pre-ledger DB で全再生されても壊れない) は関数を直接もう一度流して確かめる。
+        db.migration_035_purge_placeholder_epg_rows().unwrap();
+        let second: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM epg_scan_states WHERE tsid=0),
+                    (SELECT COUNT(*) FROM epg_service_coverage
+                     WHERE tsid=0 OR service_id=0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, (0, 0));
+        assert_eq!(second, first);
+        // 実在する mux / サービスの行は残る。
+        let kept: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM epg_scan_states WHERE network_id=1 AND tsid=2),
+                    (SELECT COUNT(*) FROM epg_service_coverage
+                     WHERE network_id=1 AND tsid=2 AND service_id=101)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, (1, 1));
     }
 }
 

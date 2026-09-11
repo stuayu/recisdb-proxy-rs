@@ -13,7 +13,7 @@ import {
 } from '../composables/useEpgEvents'
 import { broadcastDateInput } from '../composables/useGuideDate'
 import { calculateGuideProgramWindow } from '../composables/useGuideProgramWindow'
-import { guideServiceGroupKey, mainGuideServices } from '../composables/useGuideServices'
+import { guideServiceGroupKey, isRealGuideService, mainGuideServices } from '../composables/useGuideServices'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -620,7 +620,11 @@ const services = computed<Service[]>(() => {
     const nid = Number(row.nid),
       sid = Number(row.sid),
       tsid = Number(row.tsid)
-    if (![nid, sid, tsid].every(Number.isFinite) || !isGuideServiceType(row.service_type)) continue
+    if (
+      ![nid, sid, tsid].every(Number.isFinite)
+      || !isRealGuideService({ sid, tsid })
+      || !isGuideServiceType(row.service_type)
+    ) continue
     const key = `${nid}:${sid}`
     if (seen.has(key)) continue
     const remote = row.remote_control_key == null ? null : Number(row.remote_control_key)

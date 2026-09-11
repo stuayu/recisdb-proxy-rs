@@ -5,6 +5,11 @@ export type GuideServiceGroupFields = {
   remoteControlKey?: number | null
 }
 
+/** SID/TSID 0 は物理チャンネルだけの仮行。番組表のサービスではない。 */
+export function isRealGuideService(service: Pick<GuideServiceGroupFields, 'sid' | 'tsid'>): boolean {
+  return service.sid !== 0 && service.tsid !== 0
+}
+
 /** RCKがあるサービスは同じRCKを1局へ畳み、ないサービスはSID単位で独立させる。 */
 export function guideServiceGroupKey(service: GuideServiceGroupFields): string {
   if (service.remoteControlKey === null || service.remoteControlKey === undefined) {

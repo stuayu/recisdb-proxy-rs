@@ -1,12 +1,19 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { guideServiceGroupKey, mainGuideServices, type GuideServiceGroupFields } from './useGuideServices.ts'
+import { guideServiceGroupKey, isRealGuideService, mainGuideServices, type GuideServiceGroupFields } from './useGuideServices.ts'
 
 type TestService = GuideServiceGroupFields & { name: string }
 
 function service(nid: number, tsid: number, sid: number, name: string, remoteControlKey?: number | null): TestService {
   return { nid, tsid, sid, name, remoteControlKey }
 }
+
+test('SID/TSID zero rows are not guide services', () => {
+  assert.equal(isRealGuideService(service(1, 1, 100, '実在')), true)
+  assert.equal(isRealGuideService(service(1, 0, 100, 'TSIDなし')), false)
+  assert.equal(isRealGuideService(service(1, 1, 0, 'SIDなし')), false)
+  assert.equal(isRealGuideService(service(1, 0, 0, '仮行')), false)
+})
 
 test('CS services with distinct RCKs remain as eight services', () => {
   const services = [

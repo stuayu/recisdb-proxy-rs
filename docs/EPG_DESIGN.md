@@ -199,9 +199,12 @@ section/TSが自ノードへ来ないため、返却されたcoverageをmuxのsc
 
 判定用coverageは、EIT sectionからサービスごとに作る `schedule_coverage_until` である。
 scheduleは当日00:00 JSTを基準にsegmentを対応付け、受信済みsectionの連続範囲から終了時刻を
-求める。mux単位では番組表対象サービス（`channels.service_type` が1、2、またはNULL）の
+求める。mux単位では番組表対象サービス（`channels.service_type` が1、2、またはNULL、かつ
+`sid != 0` かつ `tsid != 0`）の
 母数を使い、サービスごとのcoverageの **MIN** を採用する。対象サービスが1つでも未取得なら
 muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux全体の完了とはみなさない。
+`sid=0` はPAT上でNITを指す予約値、`tsid=0` は物理チャンネルだけを登録した仮行なので、
+放送サービスとして扱わない。
 
 従来の `MAX(start_at + duration_secs)` による `programs` coverageは補助指標へ降格した。
 例えば09:00の番組と7日後23:00の番組だけが保存されても、MAXだけなら7日後まで埋まったように
@@ -210,6 +213,8 @@ muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux�
 
 ## EPGスケジューラ
 
+候補は実在しうるサービス（`sid != 0` かつ `tsid != 0`）を持つmuxだけから組み立てる。
+`sid=0` はPAT上でNITを指す予約値、`tsid=0` は物理チャンネルだけを登録した仮行である。
 候補の判定はsection coverageを基準に、全帯域で `needs_scan = !covered || stale || hard_stale`
 を使う。`target_refresh_secs` はsoft stale（更新候補へ戻す時刻）、`max_stale_secs` はhard
 stale（これ以上古いEITを許さない時刻）であり、意味を分離する。候補の優先順位は

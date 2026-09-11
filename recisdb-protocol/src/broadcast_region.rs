@@ -415,6 +415,15 @@ pub fn get_prefecture_name(nid: u16) -> Option<&'static str> {
     get_region_id_from_nid(nid).and_then(get_prefecture_name_from_region_id)
 }
 
+/// Return whether a channel row can represent a real broadcast service.
+///
+/// `service_id = 0` is the PAT-reserved NIT entry, and `transport_stream_id = 0`
+/// is the placeholder used when only a physical channel has been registered.
+/// Keep SQL filters for this rule synchronized with this function.
+pub fn is_real_broadcast_service(service_id: u16, transport_stream_id: u16) -> bool {
+    service_id != 0 && transport_stream_id != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +573,13 @@ mod tests {
         // Non-terrestrial should return None
         assert_eq!(get_prefecture_name(4), None); // BS
         assert_eq!(get_prefecture_name(6), None); // CS
+    }
+
+    #[test]
+    fn only_nonzero_service_and_transport_stream_ids_are_real_services() {
+        assert!(!is_real_broadcast_service(0, 0));
+        assert!(!is_real_broadcast_service(1, 0));
+        assert!(!is_real_broadcast_service(0, 1));
+        assert!(is_real_broadcast_service(1, 1));
     }
 }

@@ -56,10 +56,10 @@
 //! - No tuner/recording-process introspection beyond `/status`'s coarse
 //!   tuner counts (real Mirakurun's `/status` reports process RSS, EPG gather
 //!   progress, RPC/stream/error counters, etc. — none of that exists here).
-//! - `/services` and `/channels` only list channels that are `is_enabled`
-//!   **and** have a scanned physical assignment (`bon_channel` present) — an
-//!   unscanned row has no meaningful `channel` string to report and nothing
-//!   to stream.
+//! - `/services` and `/channels` only list rows that are enabled, have a
+//!   scanned physical assignment (`bon_channel` present), and satisfy the
+//!   real-service identity rule (`sid != 0 && tsid != 0`). An unscanned row or
+//!   physical-channel placeholder has nothing meaningful to report or stream.
 //! - Service logos are served from this project's own logo store
 //!   (`logos/<nid>_<sid>.png`, filled by `tuner/logo_collector.rs` from CDT on
 //!   live streams): `hasLogoData` reports whether that file exists and
@@ -150,7 +150,7 @@ use crate::web::stream::{
     service_filtered_body_stream, session_info_for, session_info_for_source, BodyReceiver,
     LossPolicy, StreamCleanup,
 };
-use recisdb_protocol::{BandType, StreamClass};
+use recisdb_protocol::{broadcast_region::is_real_broadcast_service, BandType, StreamClass};
 
 // ============================================================================
 // Service id <-> (nid, sid) conversion
@@ -701,14 +701,16 @@ pub async fn get_status(State(web_state): State<Arc<WebState>>) -> impl IntoResp
     }))
 }
 
-/// Channels usable by this API: enabled and with a scanned physical
-/// assignment (`bon_channel`). See module doc comment.
+/// Channels usable by this API: enabled, with a scanned physical assignment
+/// (`bon_channel`), and with a real service identity. See module doc comment.
 fn usable_channels(db: &Database) -> Result<Vec<ChannelRecord>, crate::database::DatabaseError> {
     Ok(db
         .get_all_channels_for_export()?
         .into_iter()
         .map(|(channel, _dll_path)| channel)
-        .filter(|c| c.is_enabled && c.bon_channel.is_some())
+        .filter(|c| {
+            c.is_enabled && c.bon_channel.is_some() && is_real_broadcast_service(c.sid, c.tsid)
+        })
         .collect())
 }
 
@@ -1571,6 +1573,24 @@ pub async fn stream_program_by_mirakurun_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usable_channels_excludes_physical_channel_placeholders() {
+        let db = Database::open_in_memory().unwrap();
+        let driver = db.get_or_create_bon_driver("test.dll").unwrap();
+        for (sid, tsid) in [(0, 0), (100, 0), (0, 200), (100, 200)] {
+            let mut info = recisdb_protocol::ChannelInfo::new(1, sid, tsid);
+            info.bon_space = Some(0);
+            info.bon_channel = Some(1);
+            db.insert_channel(driver, &info).unwrap();
+        }
+
+        let channels = usable_channels(&db).unwrap();
+        assert_eq!(
+            channels.iter().map(|c| (c.sid, c.tsid)).collect::<Vec<_>>(),
+            [(100, 200)]
+        );
+    }
 
     // ------------------------------------------------------------------
     // id <-> (nid, sid) round trip

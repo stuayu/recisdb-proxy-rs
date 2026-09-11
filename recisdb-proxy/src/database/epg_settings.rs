@@ -315,7 +315,13 @@ impl Database {
         )?;
         let configured: Vec<(i64, i64)> = self
             .connection()
-            .prepare("SELECT DISTINCT nid,tsid FROM channels")?
+            .prepare(
+                "SELECT DISTINCT nid,tsid FROM channels
+                 -- Keep this in sync with
+                 -- recisdb_protocol::broadcast_region::is_real_broadcast_service:
+                 -- sid != 0 AND tsid != 0.
+                 WHERE sid != 0 AND tsid != 0",
+            )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (nid, tsid) in configured {
@@ -324,7 +330,7 @@ impl Database {
                 params![nid, tsid],
             )?;
         }
-        let grouped: Vec<_> = self.connection().prepare("SELECT nid,tsid,MAX(start_at + duration_secs),MAX(updated_at) FROM programs GROUP BY nid,tsid")?.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<i64>>(2)?, r.get::<_,Option<i64>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let grouped: Vec<_> = self.connection().prepare("SELECT nid,tsid,MAX(start_at + duration_secs),MAX(updated_at) FROM programs WHERE sid != 0 AND tsid != 0 GROUP BY nid,tsid")?.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<i64>>(2)?, r.get::<_,Option<i64>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (nid, tsid, until, updated) in grouped {
             self.connection().execute("INSERT INTO epg_scan_states(network_id,tsid,coverage_until,last_eit_received_at) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,tsid) DO UPDATE SET coverage_until=?3,last_eit_received_at=?4", params![nid,tsid,until,updated])?;
         }
@@ -745,6 +751,36 @@ mod tests {
                 .unwrap(),
             Some(10_600)
         );
+    }
+
+    #[test]
+    fn refresh_does_not_create_state_for_placeholder_mux() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_id = db
+            .connection()
+            .execute("INSERT INTO bon_drivers (dll_path) VALUES ('test')", [])
+            .map(|_| db.connection().last_insert_rowid())
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO channels (bon_driver_id, nid, sid, tsid, service_type)
+                 VALUES (?1, 1, 0, 0, NULL), (?1, 1, 100, 0, NULL),
+                         (?1, 1, 101, 2, NULL)",
+                [driver_id],
+            )
+            .unwrap();
+
+        db.refresh_epg_coverage().unwrap();
+
+        let muxes: Vec<(i64, i64)> = db
+            .connection()
+            .prepare("SELECT network_id, tsid FROM epg_scan_states ORDER BY network_id, tsid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(muxes, vec![(1, 2)]);
     }
 
     #[test]

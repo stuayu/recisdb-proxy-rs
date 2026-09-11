@@ -9,7 +9,9 @@ use super::epg_dwell::{
 };
 use crate::node::{MuxLeaseGuard, MuxLeaseManager, NodeTransportState};
 use crate::{
-    database::{epg_reason, EpgGlobalSettings, EpgReasonCode, EpgScanState, EpgScanStatus},
+    database::{
+        epg_reason, ChannelRecord, EpgGlobalSettings, EpgReasonCode, EpgScanState, EpgScanStatus,
+    },
     server::listener::DatabaseHandle,
     tuner::{
         acquire::{self, AcquireError, AcquireRequest},
@@ -56,7 +58,7 @@ fn full_evaluation_is_due(
         now.duration_since(last) >= Duration::from_secs(scheduler_interval_secs.max(1) as u64)
     })
 }
-use recisdb_protocol::{broadcast_region::classify_nid, BroadcastType};
+use recisdb_protocol::{broadcast_region::{classify_nid, is_real_broadcast_service}, BroadcastType};
 use std::{
     collections::HashSet,
     sync::{
@@ -321,15 +323,7 @@ impl EpgScanScheduler {
             let mut targets = Vec::new();
             for driver in &drivers {
                 for channel in db.get_enabled_channels_by_bon_driver(driver.id)? {
-                    if targets.iter().any(|target: &EpgTarget| {
-                        target.network_id == channel.nid && target.tsid == channel.tsid
-                    }) {
-                        continue;
-                    }
-                    let state = states.iter().find(|state| {
-                        state.network_id == channel.nid && state.tsid == channel.tsid
-                    });
-                    targets.push(EpgTarget::from_state(channel.nid, channel.tsid, state));
+                    append_epg_target(&mut targets, &channel, &states);
                 }
             }
             rank_targets(&targets, now, &config)
@@ -340,7 +334,9 @@ impl EpgScanScheduler {
                             .ok()?
                             .into_iter()
                             .find(|channel| {
-                                channel.nid == target.network_id && channel.tsid == target.tsid
+                                channel.nid == target.network_id
+                                    && channel.tsid == target.tsid
+                                    && is_real_broadcast_service(channel.sid, channel.tsid)
                             })
                             .map(|channel| (driver.clone(), channel))
                     })
@@ -1122,6 +1118,24 @@ impl EpgTarget {
     }
 }
 
+fn append_epg_target(
+    targets: &mut Vec<EpgTarget>,
+    channel: &ChannelRecord,
+    states: &[EpgScanState],
+) {
+    if !is_real_broadcast_service(channel.sid, channel.tsid)
+        || targets
+            .iter()
+            .any(|target| target.network_id == channel.nid && target.tsid == channel.tsid)
+    {
+        return;
+    }
+    let state = states
+        .iter()
+        .find(|state| state.network_id == channel.nid && state.tsid == channel.tsid);
+    targets.push(EpgTarget::from_state(channel.nid, channel.tsid, state));
+}
+
 fn select_next_target(
     targets: &[EpgTarget],
     now: i64,
@@ -1644,6 +1658,32 @@ mod tests {
         assert_eq!(
             ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
             [1, 2]
+        );
+    }
+
+    #[test]
+    fn scheduler_target_list_excludes_placeholder_service_identity() {
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let driver = db.get_or_create_bon_driver("test.dll").unwrap();
+        for (sid, tsid) in [(0, 0), (100, 0), (0, 2), (100, 2)] {
+            let mut info = recisdb_protocol::ChannelInfo::new(1, sid, tsid);
+            info.bon_space = Some(0);
+            info.bon_channel = Some(1);
+            db.insert_channel(driver, &info).unwrap();
+        }
+
+        let channels = db.get_enabled_channels_by_bon_driver(driver).unwrap();
+        let mut targets = Vec::new();
+        for channel in &channels {
+            append_epg_target(&mut targets, channel, &[]);
+        }
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.network_id, target.tsid))
+                .collect::<Vec<_>>(),
+            [(1, 2)]
         );
     }
 
