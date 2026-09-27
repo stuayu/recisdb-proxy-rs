@@ -1127,9 +1127,11 @@ impl SetupApp {
 impl SetupJob {
     fn run(
         mut self,
-        mut progress: impl FnMut(&str),
+        progress: impl FnMut(&str),
         smart_card_readers: impl FnMut(Vec<String>),
     ) -> Result<SetupResult, String> {
+        #[cfg(windows)]
+        let mut smart_card_readers = smart_card_readers;
         #[cfg(not(windows))]
         let _ = &smart_card_readers;
         std::fs::create_dir_all(&self.install_dir)
