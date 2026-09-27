@@ -30,7 +30,11 @@ use std::path::Path;
 use thiserror::Error;
 
 const DEFAULT_TSREPLACE_COMMAND_PATH: &str = "tsreplace";
-const DEFAULT_TSREPLACE_ARGUMENTS: &str = "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -";
+pub(crate) const DEFAULT_TSREPLACE_ARGUMENTS: &str = "-i - -o - --preserve-other-services -e QSVEncC64.exe -i - --input-format mpegts --tff --vpp-deinterlace normal -c hevc --icq 19 --gop-len 90 --output-format mpegts -o -";
+
+pub(crate) fn default_tsreplace_arguments() -> &'static str {
+    DEFAULT_TSREPLACE_ARGUMENTS
+}
 const DEFAULT_TSREPLACE_READ_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_TSREPLACE_PASSTHROUGH_ON_ERROR: bool = true;
 const DEFAULT_TSREPLACE_MAX_CONCURRENT_ENCODERS: i64 = 2;

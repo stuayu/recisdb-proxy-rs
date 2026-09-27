@@ -81,6 +81,24 @@ dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の
 
 ## セットアップ
 
+### かんたんセットアップの自動構成 (Windows)
+
+セットアップウィザードの「詳細設定」で「BS4Kチューナーを使う」を有効にすると、
+`dantto4k` のWindows x64リリースを `<install_dir>/thirdparty/dantto4k/` へ取得・展開し、
+検出またはファイル選択した基底BonDriverごとにラッパーを作る。ラッパーは基底DLLと同じ
+フォルダに `BonDriver_dantto4k_<基底名>.dll` として配置し、同名INIへ基底DLLの絶対パスと
+選択したACAS方法を書き込む。既存INIの未知のキーとコメントは保持する。
+
+ラッパーはDBへグループ`BS4K`、`stream_format='ts'`、`disable_b25=true`で登録する。
+基底DLLそのものは通常チューナー登録から除外する。`[mmttlv] command_path`は自動生成しない。
+4Kチャンネルはスキャン後に番組表・チャンネル一覧の末尾(BS4K)へ追加されるため、TVTestの
+`.ch2`は再生成する。
+
+「tsreplaceを用意する」を有効にしたWindows x64環境では、GitHub Releases APIから
+`tsreplace_<version>_x64.7z`だけを選び、`<install_dir>/thirdparty/tsreplace/`へ展開する。
+ダウンロード・展開・DB登録・プレビュー準備・サービス登録はウィザードのワーカースレッドで
+実行し、画面にはスピナーと直近ログを表示する。
+
 ## 障害診断ログ
 
 4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued/capacity` はstdin待ち行列、`dropped` は投入できず破棄したチャンク。`no_output_for` が30秒に達した場合は変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。

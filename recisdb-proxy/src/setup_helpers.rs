@@ -3,6 +3,7 @@
 //! `bin/setup_gui.rs` (GUIウィザード) から使われる、UIを持たない純粋なロジック
 //! (チューナー検出・設定ファイル生成・DB登録)。GUIに依存しないためテストしやすい。
 
+use crate::config_file::{self, TomlValue};
 use crate::database::Database;
 use std::path::{Path, PathBuf};
 
@@ -464,82 +465,98 @@ pub fn detect_tuners(install_dir: &Path) -> Vec<DetectedTuner> {
 // 設定ファイル生成
 // =============================================================================
 
-/// TOMLの基本文字列(ダブルクォート)にそのまま埋め込めるよう、バックスラッシュを
-/// エスケープする。Windowsの絶対パス(`C:\DTV\...`)をそのまま埋め込むと、
-/// `\D` が不正なエスケープシーケンスとして扱われて設定ファイルが壊れ、
-/// recisdb-proxy本体が起動できなくなる(`\r`のように偶然有効なエスケープに
-/// 化けて経路が化けるケースもある)。
-pub(crate) fn escape_toml_basic_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-}
-
 /// 実際に配布している `recisdb-proxy.toml.example` そのものをテンプレートとして
 /// 埋め込む(ビルド時に取り込まれるため、実行時のネットワークアクセスは不要)。
 /// コメント・セクション構成の唯一の情報源をこのファイルに一本化し、
 /// ウィザードが独自に持つ古い説明文と食い違う事態を防ぐ。
 const CONFIG_TEMPLATE: &str = include_str!("../recisdb-proxy.toml.example");
 
-/// `template` の `[section]` セクション内にある `key = "..."` の行を
-/// `key = "new_value"` に書き換える。それ以外の行(コメント・他セクション)は
-/// 一切変更しない。
+/// セットアップウィザードが扱う設定値。
 ///
-/// テンプレート側の構造が変わってキーが見つからなかった場合、値が反映されない
-/// まま古い既定値が黙って使われる事故を防ぐため panic する(セットアップ時に
-/// すぐ気付けるように)。
-pub(crate) fn replace_scalar_in_section(
-    template: &str,
-    section: &str,
-    key: &str,
-    new_value: &str,
-) -> String {
-    let key_prefix = format!("{key} = ");
-    let mut current_section = String::new();
-    let mut replaced = false;
-    let mut out = String::with_capacity(template.len());
-
-    for line in template.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                current_section = name.to_string();
-            }
-        }
-
-        if !replaced && current_section == section && trimmed.starts_with(&key_prefix) {
-            out.push_str(&format!("{key} = \"{new_value}\"\n"));
-            replaced = true;
-            continue;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    assert!(
-        replaced,
-        "generate_config: `{key}` not found in [{section}] section of recisdb-proxy.toml.example \
-         (テンプレートの構造が変わった可能性があります)"
-    );
-
-    out
+/// `None` の項目はコメントアウトされた状態で出力する(テンプレートに開発環境の
+/// パス等が有効行で残っていても、利用者の設定ファイルへ持ち込まない)。実行ファイルのパスは
+/// Web APIから来た値を受け取らず、検出またはこのウィザードが取得した値だけを
+/// 呼び出し側で設定する。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupConfig {
+    pub listen_addr: String,
+    pub web_listen_addr: String,
+    pub db_path: String,
+    pub mirakurun_enabled: bool,
+    pub mirakurun_home_region: Option<String>,
+    pub node_display_name: Option<String>,
+    pub tsreplace_command_path: Option<String>,
+    pub tsreplace_preprocessor_path: Option<String>,
+    pub preview_command_path: Option<String>,
+    pub preview_preprocessor_path: Option<String>,
 }
 
 /// recisdb-proxy.toml の設定ファイルを生成する。
 ///
-/// `recisdb-proxy.toml.example` をテンプレートとしてそのまま使い、ウィザードで
-/// 決まる3つの値(listen/web_listen/データベースパス)だけを書き換える。
-/// それ以外の内容([web]/[mirakurun]/[tsreplace]/[preview]/[tls] 等)は
-/// テンプレートのままなので、そちらを更新すればウィザードの生成結果にも
-/// 自動的に反映される。
-pub fn generate_config(listen_addr: &str, web_listen_addr: &str, db_path: &str) -> String {
-    let db_path = escape_toml_basic_string(db_path);
+/// `recisdb-proxy.toml.example` をテンプレートとして使い、ウィザードが扱う
+/// キーをすべて確定値で書く(テンプレート側の有効行に依存しない)。
+/// Web認証は常に有効にする。テンプレートのコメント・並び・説明は保持する。
+pub fn generate_config(opts: &SetupConfig) -> String {
     let mut content = CONFIG_TEMPLATE.replace(
         "# このファイルを recisdb-proxy.toml にコピーして編集してください。",
         "# かんたんセットアップにより自動生成されました。",
     );
-    content = replace_scalar_in_section(&content, "server", "listen", listen_addr);
-    content = replace_scalar_in_section(&content, "server", "web_listen", web_listen_addr);
-    content = replace_scalar_in_section(&content, "database", "path", &db_path);
+    for (section, key, value) in [
+        ("server", "listen", TomlValue::Str(opts.listen_addr.clone())),
+        (
+            "server",
+            "web_listen",
+            TomlValue::Str(opts.web_listen_addr.clone()),
+        ),
+        ("database", "path", TomlValue::Str(opts.db_path.clone())),
+        ("web", "auth_enabled", TomlValue::Bool(true)),
+        (
+            "mirakurun",
+            "enabled",
+            TomlValue::Bool(opts.mirakurun_enabled),
+        ),
+    ] {
+        content = config_file::upsert_key(&content, section, key, &value);
+    }
+
+    let optional_values = [
+        (
+            "mirakurun",
+            "home_region",
+            opts.mirakurun_home_region.clone().map(TomlValue::Str),
+        ),
+        (
+            "node",
+            "display_name",
+            opts.node_display_name.clone().map(TomlValue::Str),
+        ),
+        (
+            "tsreplace",
+            "command_path",
+            opts.tsreplace_command_path.clone().map(TomlValue::Str),
+        ),
+        (
+            "tsreplace",
+            "preprocessor_path",
+            opts.tsreplace_preprocessor_path.clone().map(TomlValue::Str),
+        ),
+        (
+            "preview",
+            "command_path",
+            opts.preview_command_path.clone().map(TomlValue::Str),
+        ),
+        (
+            "preview",
+            "preprocessor_path",
+            opts.preview_preprocessor_path.clone().map(TomlValue::Str),
+        ),
+    ];
+    for (section, key, value) in optional_values {
+        content = match value {
+            Some(value) => config_file::upsert_key(&content, section, key, &value),
+            None => config_file::remove_key(&content, section, key),
+        };
+    }
     content
 }
 
@@ -1081,18 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_toml_basic_string_doubles_backslashes() {
-        assert_eq!(
-            escape_toml_basic_string(r"C:\DTV\recisdb-proxy-rs\recisdb-proxy.db"),
-            r"C:\\DTV\\recisdb-proxy-rs\\recisdb-proxy.db"
-        );
-        assert_eq!(
-            escape_toml_basic_string("no_backslashes.db"),
-            "no_backslashes.db"
-        );
-    }
-
-    #[test]
     fn generate_client_ini_replaces_address_and_tuner() {
         let ini = generate_client_ini("192.168.1.10:40070", "PX-MLT");
         assert!(ini.contains("Address = 192.168.1.10:40070"));
@@ -1216,7 +1221,12 @@ mod tests {
 
     #[test]
     fn generate_config_embeds_all_fields() {
-        let toml = generate_config("0.0.0.0:40070", "0.0.0.0:40080", "recisdb-proxy.db");
+        let toml = generate_config(&SetupConfig {
+            listen_addr: "0.0.0.0:40070".into(),
+            web_listen_addr: "0.0.0.0:40080".into(),
+            db_path: "recisdb-proxy.db".into(),
+            ..Default::default()
+        });
         assert!(toml.contains(r#"listen = "0.0.0.0:40070""#));
         assert!(toml.contains(r#"web_listen = "0.0.0.0:40080""#));
         assert!(toml.contains(r#"path = "recisdb-proxy.db""#));
@@ -1224,7 +1234,12 @@ mod tests {
 
     #[test]
     fn generate_config_is_valid_toml_and_up_to_date_with_sections() {
-        let generated = generate_config("0.0.0.0:40070", "0.0.0.0:40080", "recisdb-proxy.db");
+        let generated = generate_config(&SetupConfig {
+            listen_addr: "0.0.0.0:40070".into(),
+            web_listen_addr: "0.0.0.0:40080".into(),
+            db_path: "recisdb-proxy.db".into(),
+            ..Default::default()
+        });
 
         // recisdb-proxy.toml.example に存在する全セクションを、コメントアウト
         // 済みでもよいので案内として含んでいることを確認する
@@ -1251,7 +1266,12 @@ mod tests {
         // recisdb-proxy.toml.example と setup_helpers.rs の内容が食い違う
         // 状況を根本的に防ぐためのもの)。動的に書き換える3値
         // (listen/web_listen/database.path) 以外の行は完全に一致するはず。
-        let generated = generate_config("1.2.3.4:1", "5.6.7.8:2", "custom.db");
+        let generated = generate_config(&SetupConfig {
+            listen_addr: "1.2.3.4:1".into(),
+            web_listen_addr: "5.6.7.8:2".into(),
+            db_path: "custom.db".into(),
+            ..Default::default()
+        });
         let template_lines: Vec<&str> = CONFIG_TEMPLATE.lines().collect();
         let generated_lines: Vec<&str> = generated.lines().collect();
         assert_eq!(
@@ -1260,24 +1280,78 @@ mod tests {
             "generated config must have the same number of lines as the template"
         );
 
-        let mut differing_lines = 0;
+        // ウィザードが確定値で書くキー(と冒頭の案内コメント)以外は
+        // テンプレートと完全に一致するはず。
+        const WIZARD_KEYS: &[&str] = &[
+            "listen",
+            "web_listen",
+            "path",
+            "auth_enabled",
+            "enabled",
+            "home_region",
+            "display_name",
+            "command_path",
+            "preprocessor_path",
+        ];
         for (t, g) in template_lines.iter().zip(generated_lines.iter()) {
-            if t != g {
-                differing_lines += 1;
+            if t == g || g.starts_with("# かんたんセットアップ") {
+                continue;
             }
+            let key = g
+                .trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            assert!(
+                WIZARD_KEYS.contains(&key),
+                "unexpected difference from template: {t:?} -> {g:?}"
+            );
         }
-        // 冒頭の案内コメント1行 + listen / web_listen / database.path の3行、
-        // 合計4行だけが変わっているはず。
-        assert_eq!(
-            differing_lines, 4,
-            "only the wizard-controlled lines should differ from the template"
-        );
     }
 
     #[test]
-    #[should_panic(expected = "not found in [server] section")]
-    fn replace_scalar_in_section_panics_when_key_missing() {
-        replace_scalar_in_section("[server]\nfoo = \"bar\"\n", "server", "listen", "x");
+    fn generate_config_forces_safe_defaults_over_template_values() {
+        // テンプレートに開発環境の値(認証無効・Mirakurun有効・個人のパス)が
+        // 有効行で残っていても、生成結果には持ち込まない。
+        let generated = generate_config(&SetupConfig {
+            listen_addr: "0.0.0.0:40070".into(),
+            web_listen_addr: "0.0.0.0:40080".into(),
+            db_path: "recisdb-proxy.db".into(),
+            ..Default::default()
+        });
+        let value: toml::Value = toml::from_str(&generated).unwrap();
+        assert_eq!(value["web"]["auth_enabled"].as_bool(), Some(true));
+        assert_eq!(value["mirakurun"]["enabled"].as_bool(), Some(false));
+        for section in ["tsreplace", "preview"] {
+            if let Some(table) = value.get(section).and_then(|v| v.as_table()) {
+                assert!(table.get("command_path").is_none(), "[{section}] command_path leaked");
+                assert!(
+                    table.get("preprocessor_path").is_none(),
+                    "[{section}] preprocessor_path leaked"
+                );
+            }
+        }
+        assert!(value
+            .get("mirakurun")
+            .and_then(|m| m.get("home_region"))
+            .is_none());
+
+        let enabled = generate_config(&SetupConfig {
+            listen_addr: "0.0.0.0:40070".into(),
+            web_listen_addr: "0.0.0.0:40080".into(),
+            db_path: "recisdb-proxy.db".into(),
+            mirakurun_enabled: true,
+            mirakurun_home_region: Some("福島".into()),
+            preview_command_path: Some(r"C:\x\ffmpeg.exe".into()),
+            ..Default::default()
+        });
+        let value: toml::Value = toml::from_str(&enabled).unwrap();
+        assert_eq!(value["mirakurun"]["enabled"].as_bool(), Some(true));
+        assert_eq!(value["mirakurun"]["home_region"].as_str(), Some("福島"));
+        assert_eq!(value["preview"]["command_path"].as_str(), Some(r"C:\x\ffmpeg.exe"));
     }
 
     #[test]
@@ -1289,7 +1363,12 @@ mod tests {
         // recisdb-proxy本体がこの設定ファイルを読み込めず起動に失敗する
         // 不具合があった。
         let db_path = r"C:\DTV\recisdb-proxy-rs\recisdb-proxy.db";
-        let generated = generate_config("0.0.0.0:40070", "0.0.0.0:40080", db_path);
+        let generated = generate_config(&SetupConfig {
+            listen_addr: "0.0.0.0:40070".into(),
+            web_listen_addr: "0.0.0.0:40080".into(),
+            db_path: db_path.into(),
+            ..Default::default()
+        });
 
         let parsed: toml::Value = toml::from_str(&generated)
             .expect("generated config with a Windows-style path must still be valid TOML");

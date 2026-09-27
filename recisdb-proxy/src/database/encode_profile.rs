@@ -115,19 +115,39 @@ fn legacy_preview_encode_args_ffmpeg_pre_tuning(video_encoder: &str) -> String {
 /// 引数は `encoder_pool` が `split_whitespace` で分割する (シェル解釈なし) ので、
 /// **1トークンの中に空白を入れてはいけない**。
 pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
+    let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
+    let pre_input = spec
+        .as_ref()
+        .map(|spec| spec.pre_input.join(" "))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    let filter_suffix = spec
+        .as_ref()
+        .map(|spec| spec.filter_suffix.as_str())
+        .unwrap_or_default();
+    let tuning = spec
+        .as_ref()
+        .map(|spec| spec.tuning)
+        .unwrap_or_else(|| video_encoder_tuning(video_encoder));
+    let tuning = if tuning.is_empty() && video_encoder.starts_with("h264_") {
+        "-profile:v high"
+    } else {
+        tuning
+    };
     format!(
         "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
          -analyzeduration 600000 -probesize 1000000 \
-         -f mpegts -i pipe:0 \
+         {pre_input}-f mpegts -i pipe:0 \
          -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
-         -vf yadif=0:-1:1,scale=1280:720,setsar=1 \
+         -vf yadif=0:-1:1,scale=1280:720,setsar=1{filter_suffix} \
          -c:v {video_encoder} {tuning} -b:v 2000k -maxrate 3000k -bufsize 4000k \
          -g 60 -aspect 16:9 \
          -c:a aac -b:a 192k -ar 48000 -ac 2 \
          -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 \
          -c:d copy \
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
-        tuning = video_encoder_tuning(video_encoder)
+        tuning = tuning
     )
 }
 
@@ -176,18 +196,38 @@ fn legacy_preview_4k_encode_args_ffmpeg(video_encoder: &str) -> [String; 2] {
 /// here after actually decoding a sample HEVC clip with it, because being
 /// listed in `-decoders` says nothing about whether a GPU backs it.
 pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &str) -> String {
+    let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
+    let pre_input = spec
+        .as_ref()
+        .map(|spec| spec.pre_input.join(" "))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    let filter_suffix = spec
+        .as_ref()
+        .map(|spec| spec.filter_suffix.as_str())
+        .unwrap_or_default();
+    let tuning = spec
+        .as_ref()
+        .map(|spec| spec.tuning)
+        .unwrap_or_else(|| video_encoder_tuning(video_encoder));
+    let tuning = if tuning.is_empty() && video_encoder.starts_with("h264_") {
+        "-profile:v high"
+    } else {
+        tuning
+    };
     format!(
         "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
          -analyzeduration 600000 -probesize 1000000 \
          -c:v {hevc_decoder} \
-         -f mpegts -i pipe:0 \
+         {pre_input}-f mpegts -i pipe:0 \
          -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
-         -vf scale=1920:1080,setsar=1 \
+         -vf scale=1920:1080,setsar=1{filter_suffix} \
          -c:v {video_encoder} {tuning} -b:v 4000k -maxrate 6000k -bufsize 8000k \
          -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
          -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
-        tuning = video_encoder_tuning(video_encoder)
+        tuning = tuning
     )
 }
 
@@ -227,18 +267,38 @@ pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &s
 /// Both options are scoped to `:v` because an unscoped `-skip_frame` is also
 /// applied to the AAC decoder, which rejects it and aborts the whole command.
 pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
+    let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
+    let pre_input = spec
+        .as_ref()
+        .map(|spec| spec.pre_input.join(" "))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    let filter_suffix = spec
+        .as_ref()
+        .map(|spec| spec.filter_suffix.as_str())
+        .unwrap_or_default();
+    let tuning = spec
+        .as_ref()
+        .map(|spec| spec.tuning)
+        .unwrap_or_else(|| video_encoder_tuning(video_encoder));
+    let tuning = if tuning.is_empty() && video_encoder.starts_with("h264_") {
+        "-profile:v high"
+    } else {
+        tuning
+    };
     format!(
         "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
          -analyzeduration 600000 -probesize 1000000 \
          -skip_loop_filter:v all -skip_frame:v noref \
-         -f mpegts -i pipe:0 \
+         {pre_input}-f mpegts -i pipe:0 \
          -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
-         -vf scale=1280:720:flags=fast_bilinear,setsar=1 \
+         -vf scale=1280:720:flags=fast_bilinear,setsar=1{filter_suffix} \
          -c:v {video_encoder} {tuning} -b:v 3000k -maxrate 4500k -bufsize 6000k \
          -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
          -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
-        tuning = video_encoder_tuning(video_encoder)
+        tuning = tuning
     )
 }
 

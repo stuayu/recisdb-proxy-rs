@@ -12,7 +12,6 @@
 //! - [`SetupMode::FullAuto`]    … 本体インストール(全自動)。ドライバ導入まで自動
 //! - [`SetupMode::Manual`]      … 本体インストール(ドライバ導入をスキップ、手動設定)
 //! - [`SetupMode::DllOnly`]     … クライアントDLLの差し替えのみ
-
 // リリースビルドでは黒いコンソール窓を出さない(デバッグ時は println! を見たいので
 // デバッグビルドではコンソールを残す)。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -22,7 +21,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use recisdb_proxy::config_file::{self, TomlValue};
 use recisdb_proxy::database::Database;
+use recisdb_proxy::database::StreamFormat;
+use recisdb_proxy::encoder_probe::{self, TsreplaceQuality};
+use recisdb_proxy::fourk_setup::{self, AcasSelection};
 use recisdb_proxy::px4_installer;
 use recisdb_proxy::setup_helpers::{
     self, bulk_update_bondriver_dlls, generate_config, register_manual_tuner,
@@ -33,6 +36,43 @@ use recisdb_proxy::setup_helpers::{
 enum InstallEvent {
     Progress(String),
     Done(Result<Vec<String>, String>),
+}
+
+enum SetupEvent {
+    Progress(String),
+    SmartCardReaders(Vec<String>),
+    Done(Result<SetupResult, String>),
+}
+
+struct SetupResult {
+    log_lines: Vec<String>,
+    service_registered: bool,
+}
+
+struct SetupJob {
+    install_dir: PathBuf,
+    source_dir: Option<PathBuf>,
+    config_path: PathBuf,
+    db_path: PathBuf,
+    setup_config: setup_helpers::SetupConfig,
+    overwrite_config: bool,
+    recreate_db: bool,
+    detected: Vec<DetectedTuner>,
+    selected: Vec<bool>,
+    manual_entries: Vec<ManualEntry>,
+    setup_preview: bool,
+    setup_tsreplace: bool,
+    tsreplace_quality: TsreplaceQuality,
+    setup_4k: bool,
+    fourk_paths: Vec<PathBuf>,
+    fourk_acas: AcasSelection,
+    listen_addr: String,
+    web_listen_addr: String,
+    lan_access: bool,
+    firewall_allow: bool,
+    register_service: bool,
+    service_name: String,
+    service_user_scope: bool,
 }
 
 const WINDOW_TITLE: &str = "recisdb-proxy かんたんセットアップ";
@@ -412,7 +452,7 @@ impl SetupMode {
     fn step_label(self, step_of: usize) -> String {
         let total = match self {
             Self::DllOnly => 1,
-            _ => 3,
+            _ => 4,
         };
         format!("{} ─ ステップ {step_of} / {total}", self.title())
     }
@@ -425,6 +465,7 @@ enum Step {
     Location,
     Detecting,
     SelectTuners,
+    Options,
     Confirm,
     Done,
     /// DLL差し替え専用画面 ([`SetupMode::DllOnly`])
@@ -448,6 +489,7 @@ impl Default for ManualEntryForm {
     }
 }
 
+#[derive(Clone)]
 struct ManualEntry {
     path: String,
     group: String,
@@ -463,6 +505,15 @@ fn default_install_location() -> String {
     }
 }
 
+fn default_node_display_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default()
+}
+
 struct SetupApp {
     step: Step,
     /// 入口で選んだセットアップの種類
@@ -471,6 +522,8 @@ struct SetupApp {
     // ステップ1: 基本設定 (ほぼ既定値のまま「次へ」を押すだけで進める)
     listen_addr: String,
     web_listen_addr: String,
+    /// Web/APIとチューナー接続をLANへ公開するか。
+    lan_access: bool,
     /// recisdb-proxy 本体・設定ファイル・データベースを配置するフォルダ。
     /// 設定ファイル/DBのパスはここから常に導出する ([`SetupApp::config_file_path`] /
     /// [`SetupApp::db_file_path`])。
@@ -510,6 +563,25 @@ struct SetupApp {
     register_service: bool,
     /// ブラウザプレビューを使えるようにする (エンコーダと前段処理を自動で用意)。
     setup_preview: bool,
+    /// TVTest向けtsreplaceを検出・準備する。
+    setup_tsreplace: bool,
+    tsreplace_quality: TsreplaceQuality,
+    /// Windows BS4Kラッパーを構成する。
+    setup_4k: bool,
+    /// BS4Kラッパー化する基底BonDriverの候補と選択状態。
+    fourk_paths: Vec<String>,
+    fourk_selected: Vec<bool>,
+    fourk_acas: AcasSelection,
+    fourk_reader_candidates: Vec<String>,
+    fourk_probe_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Windowsでプログラム単位の受信許可ルールを追加する。
+    firewall_allow: bool,
+    /// Mirakurun互換APIを有効にする。
+    mirakurun_enabled: bool,
+    /// Mirakurunの地元都道府県。空文字は未指定。
+    home_region: String,
+    /// ノード間通信で表示する名前。
+    node_display_name: String,
     service_name: String,
     /// サービスとしての登録に成功したか。完了画面での「起動する」ボタンを
     /// 「ダッシュボードを開く」に切り替えるのに使う (サービスが既に
@@ -522,6 +594,8 @@ struct SetupApp {
     // 実行結果
     log_lines: Vec<String>,
     setup_error: Option<String>,
+    /// セットアップ本体のワーカースレッド。
+    setup_rx: Option<mpsc::Receiver<SetupEvent>>,
 
     // 完了画面
     launch_deadline: Option<Instant>,
@@ -540,6 +614,7 @@ impl SetupApp {
             mode: SetupMode::FullAuto,
             listen_addr: "0.0.0.0:40070".to_string(),
             web_listen_addr: "0.0.0.0:40080".to_string(),
+            lan_access: true,
             install_location: default_install_location(),
             bulk_update_dir: String::new(),
             dll_source_path: String::new(),
@@ -557,11 +632,24 @@ impl SetupApp {
             recreate_db: false,
             register_service: true,
             setup_preview: true,
+            setup_tsreplace: false,
+            tsreplace_quality: TsreplaceQuality::Compatibility,
+            setup_4k: false,
+            fourk_paths: Vec::new(),
+            fourk_selected: Vec::new(),
+            fourk_acas: AcasSelection::Automatic,
+            fourk_reader_candidates: Vec::new(),
+            fourk_probe_rx: None,
+            firewall_allow: true,
+            mirakurun_enabled: false,
+            home_region: String::new(),
+            node_display_name: default_node_display_name(),
             service_name: recisdb_proxy::service::DEFAULT_SERVICE_NAME.to_string(),
             service_registered: false,
             service_user_scope: false,
             log_lines: Vec::new(),
             setup_error: None,
+            setup_rx: None,
             launch_deadline: None,
             launch_message: None,
             bulk_update_log: Vec::new(),
@@ -577,6 +665,7 @@ impl SetupApp {
             SetupMode::FullAuto => {
                 // 全部お任せ。プレビューもサービスも用意する。
                 self.setup_preview = true;
+                self.setup_tsreplace = false;
                 self.register_service = true;
                 self.step = Step::Location;
             }
@@ -584,6 +673,7 @@ impl SetupApp {
                 // 自分で決めたい人向け。ダウンロードを伴うプレビュー準備は
                 // 既定でOFFにし、必要なら確認画面で明示的に選んでもらう。
                 self.setup_preview = false;
+                self.setup_tsreplace = false;
                 self.register_service = true;
                 self.step = Step::Location;
             }
@@ -605,6 +695,119 @@ impl SetupApp {
     /// 全自動モードかどうか (ドライバ導入を自動で進めてよいか)。
     fn is_full_auto(&self) -> bool {
         self.mode == SetupMode::FullAuto
+    }
+
+    fn set_access_scope(&mut self, lan: bool) {
+        self.lan_access = lan;
+        let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
+        self.listen_addr = replace_address_host(&self.listen_addr, host);
+        self.web_listen_addr = replace_address_host(&self.web_listen_addr, host);
+    }
+
+    fn setup_config(&self) -> setup_helpers::SetupConfig {
+        setup_helpers::SetupConfig {
+            listen_addr: self.listen_addr.clone(),
+            web_listen_addr: self.web_listen_addr.clone(),
+            db_path: self.db_file_path().to_string_lossy().into_owned(),
+            mirakurun_enabled: self.mirakurun_enabled,
+            mirakurun_home_region: (!self.home_region.trim().is_empty())
+                .then(|| self.home_region.trim().to_owned()),
+            node_display_name: (!self.node_display_name.trim().is_empty())
+                .then(|| self.node_display_name.trim().to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn refresh_fourk_candidates(&mut self) {
+        let mut paths = self
+            .detected
+            .iter()
+            .flat_map(|tuner| tuner.device_paths.iter())
+            .chain(self.manual_entries.iter().map(|entry| &entry.path))
+            .filter(|path| path.to_ascii_lowercase().ends_with(".dll"))
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let old = self
+            .fourk_paths
+            .iter()
+            .zip(self.fourk_selected.iter())
+            .filter_map(|(path, selected)| selected.then_some(path.clone()))
+            .collect::<std::collections::HashSet<_>>();
+        self.fourk_selected = paths.iter().map(|path| old.contains(path)).collect();
+        self.fourk_paths = paths;
+    }
+
+    fn make_setup_job(&self) -> SetupJob {
+        SetupJob {
+            install_dir: self.install_dir(),
+            source_dir: setup_exe_dir(),
+            config_path: self.config_file_path(),
+            db_path: self.db_file_path(),
+            setup_config: self.setup_config(),
+            overwrite_config: self.overwrite_config,
+            recreate_db: self.recreate_db,
+            detected: self.detected.clone(),
+            selected: self.selected.clone(),
+            manual_entries: self.manual_entries.clone(),
+            setup_preview: self.setup_preview,
+            setup_tsreplace: self.setup_tsreplace,
+            tsreplace_quality: self.tsreplace_quality,
+            setup_4k: self.setup_4k,
+            fourk_paths: self
+                .fourk_paths
+                .iter()
+                .zip(self.fourk_selected.iter())
+                .filter_map(|(path, selected)| selected.then(|| PathBuf::from(path)))
+                .collect(),
+            fourk_acas: self.fourk_acas.clone(),
+            listen_addr: self.listen_addr.clone(),
+            web_listen_addr: self.web_listen_addr.clone(),
+            lan_access: self.lan_access,
+            firewall_allow: self.firewall_allow,
+            register_service: self.register_service,
+            service_name: self.service_name.clone(),
+            service_user_scope: self.service_user_scope,
+        }
+    }
+
+    fn apply_existing_options(&self, mut content: String) -> String {
+        // 既存ファイルではウィザードで選んだ詳細設定だけを反映し、listen と
+        // database.path は既存値を優先する。
+        content = config_file::upsert_key(
+            &content,
+            "server",
+            "web_listen",
+            &TomlValue::Str(self.web_listen_addr.clone()),
+        );
+        content = config_file::upsert_key(
+            &content,
+            "mirakurun",
+            "enabled",
+            &TomlValue::Bool(self.mirakurun_enabled),
+        );
+        content = if self.home_region.trim().is_empty() {
+            config_file::remove_key(&content, "mirakurun", "home_region")
+        } else {
+            config_file::upsert_key(
+                &content,
+                "mirakurun",
+                "home_region",
+                &TomlValue::Str(self.home_region.trim().to_owned()),
+            )
+        };
+        content = if self.node_display_name.trim().is_empty() {
+            config_file::remove_key(&content, "node", "display_name")
+        } else {
+            config_file::upsert_key(
+                &content,
+                "node",
+                "display_name",
+                &TomlValue::Str(self.node_display_name.trim().to_owned()),
+            )
+        };
+        content
     }
 
     fn start_detection(&mut self) {
@@ -781,271 +984,109 @@ impl SetupApp {
         }
     }
 
-    fn run_setup(&mut self) {
-        self.log_lines.clear();
-        self.setup_error = None;
+    fn poll_setup(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.setup_rx else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(SetupEvent::Progress(message)) => self.log_lines.push(message),
+                Ok(SetupEvent::SmartCardReaders(readers)) => {
+                    self.fourk_reader_candidates = readers;
+                }
+                Ok(SetupEvent::Done(result)) => {
+                    self.setup_rx = None;
+                    match result {
+                        Ok(result) => {
+                            self.log_lines = result.log_lines;
+                            self.service_registered = result.service_registered;
+                            self.step = Step::Done;
+                        }
+                        Err(error) => self.setup_error = Some(error),
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.setup_rx = None;
+                    self.setup_error = Some("セットアップ処理が予期せず終了しました。".to_owned());
+                    break;
+                }
+            }
+        }
+    }
 
-        let install_dir = self.install_dir();
-        if let Err(e) = std::fs::create_dir_all(&install_dir) {
-            self.setup_error = Some(format!("インストール先フォルダの作成に失敗しました: {e}"));
+    fn start_fourk_probe(&mut self) {
+        if self.fourk_probe_rx.is_some() {
             return;
         }
+        let install_dir = self.install_dir();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = {
+                let mut ignored_progress = |_message: &str| {};
+                fourk_setup::ensure_dantto_package_for_setup(&install_dir, &mut ignored_progress)
+                    .and_then(|_| {
+                        let exe =
+                            fourk_setup::find_dantto_executable(&install_dir).ok_or_else(|| {
+                                "展開後にdantto4k.exeが見つかりませんでした".to_owned()
+                            })?;
+                        fourk_setup::list_smart_card_readers(&exe)
+                    })
+            };
+            let _ = tx.send(result);
+        });
+        self.fourk_probe_rx = Some(rx);
+    }
 
-        // recisdb-proxy 本体をインストール先に配置/更新する。既にインストール
-        // 済みで内容が同一なら何もしない(設定ファイル・DBには触れない)。
-        match setup_exe_dir() {
-            Some(source_dir) => match setup_helpers::sync_program_binary(&source_dir, &install_dir)
-            {
-                Ok(setup_helpers::BinarySyncAction::FreshInstall) => self.log_lines.push(format!(
-                    "recisdb-proxy をインストールしました: {}",
-                    install_dir.display()
-                )),
-                Ok(setup_helpers::BinarySyncAction::Updated) => self
-                    .log_lines
-                    .push("recisdb-proxy を最新版に更新しました。".to_string()),
-                Ok(setup_helpers::BinarySyncAction::AlreadyUpToDate) => self
-                    .log_lines
-                    .push("recisdb-proxy は既に最新の状態です。".to_string()),
-                Err(e) => {
-                    self.setup_error = Some(e);
-                    return;
+    fn poll_fourk_probe(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.fourk_probe_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.fourk_probe_rx = None;
+                match result {
+                    Ok(readers) => self.fourk_reader_candidates = readers,
+                    Err(error) => self.log_lines.push(format!(
+                        "カードリーダー候補を取得できませんでした。手入力できます: {error}"
+                    )),
                 }
-            },
-            None => {
-                self.setup_error = Some("実行ファイルの場所を取得できませんでした。".to_string());
-                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.fourk_probe_rx = None;
             }
         }
+    }
 
-        let config_file_path = self.config_file_path();
-        if !config_file_path.exists() || self.overwrite_config {
-            let content = generate_config(
-                &self.listen_addr,
-                &self.web_listen_addr,
-                &self.db_file_path().to_string_lossy(),
+    fn run_setup(&mut self) {
+        if self.setup_rx.is_some() {
+            return;
+        }
+        self.log_lines.clear();
+        self.setup_error = None;
+        let job = self.make_setup_job();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let reader_tx = tx.clone();
+            let result = job.run(
+                |message| {
+                    let _ = progress_tx.send(SetupEvent::Progress(message.to_owned()));
+                },
+                |readers| {
+                    let _ = reader_tx.send(SetupEvent::SmartCardReaders(readers));
+                },
             );
-            match std::fs::write(&config_file_path, content) {
-                Ok(()) => self.log_lines.push(format!(
-                    "設定ファイルを保存しました: {}",
-                    config_file_path.display()
-                )),
-                Err(e) => {
-                    self.setup_error = Some(format!("設定ファイルの保存に失敗しました: {e}"));
-                    return;
-                }
-            }
-        } else {
-            self.log_lines
-                .push("既存の設定ファイルをそのまま使用します。".to_string());
-        }
-
-        let db_file_path = self.db_file_path();
-        if db_file_path.exists() && self.recreate_db {
-            let backup_path = format!("{}.backup", db_file_path.display());
-            if let Err(e) = std::fs::rename(&db_file_path, &backup_path) {
-                self.setup_error = Some(format!("データベースのバックアップに失敗しました: {e}"));
-                return;
-            }
-            self.log_lines.push(format!(
-                "既存のデータベースをバックアップしました: {backup_path}"
-            ));
-        }
-
-        let db = match Database::open(&db_file_path) {
-            Ok(db) => db,
-            Err(e) => {
-                self.setup_error = Some(format!("データベースの初期化に失敗しました: {e}"));
-                return;
-            }
-        };
-        self.log_lines.push(format!(
-            "データベースを初期化しました: {}",
-            db_file_path.display()
-        ));
-
-        let selected_indices: Vec<usize> = self
-            .selected
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &checked)| checked.then_some(i))
-            .collect();
-
-        if !selected_indices.is_empty() {
-            let results = register_tuners_to_db(&db, &self.detected, &selected_indices);
-            for r in results {
-                match r.outcome {
-                    Ok(id) => self.log_lines.push(format!(
-                        "チューナーを登録しました: {} (ID: {id})",
-                        r.device_path
-                    )),
-                    Err(e) => self.log_lines.push(format!(
-                        "チューナーの登録に失敗しました: {} ({e})",
-                        r.device_path
-                    )),
-                }
-            }
-        }
-
-        for entry in &self.manual_entries {
-            match register_manual_tuner(&db, &entry.path, &entry.group, entry.max_instances) {
-                Ok(id) => self.log_lines.push(format!(
-                    "チューナーを登録しました: {} (ID: {id})",
-                    entry.path
-                )),
-                Err(e) => self.log_lines.push(format!(
-                    "チューナーの登録に失敗しました: {} ({e})",
-                    entry.path
-                )),
-            }
-        }
-
-        // クライアント (TVTest/EDCB側PC) に配布する設定一式を出力する。
-        // Tuner= は登録済みドライバーのグループ名を優先 (グループ指定なら
-        // サーバーが空きチューナーを自動選択できるため)、無ければ先頭の
-        // DLLパスを入れる。
-        {
-            let tuner_hint = db
-                .get_all_bon_drivers()
-                .ok()
-                .and_then(|drivers| {
-                    drivers
-                        .iter()
-                        .find_map(|d| d.group_name.clone().filter(|g| !g.trim().is_empty()))
-                        .or_else(|| drivers.first().map(|d| d.dll_path.clone()))
-                })
-                .unwrap_or_default();
-            let proxy_port = self.listen_addr.rsplit(':').next().unwrap_or("40070");
-            let web_port = self.web_listen_addr.rsplit(':').next().unwrap_or("40080");
-            let ip = setup_helpers::local_lan_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            match setup_helpers::write_client_config_bundle(
-                &install_dir,
-                setup_exe_dir().as_deref(),
-                &format!("{ip}:{proxy_port}"),
-                &tuner_hint,
-                &format!("http://{ip}:{web_port}"),
-            ) {
-                Ok(lines) => self.log_lines.extend(lines),
-                Err(e) => self
-                    .log_lines
-                    .push(format!("クライアント設定の出力に失敗しました: {e}")),
-            }
-        }
-
-        if self.setup_preview {
-            self.setup_browser_preview(&db, &install_dir);
-        }
-
-        if self.register_service && recisdb_proxy::service::is_supported() {
-            self.register_os_service(&install_dir);
-        }
-
-        self.step = Step::Done;
-    }
-
-    /// ブラウザプレビュー (Webダッシュボードでの映像確認) を使えるようにする。
-    ///
-    /// エンコーダ (ffmpeg) と前段処理 (tsreadex) を検出し、無ければ取得して
-    /// 設定ファイルとDBに書き込む。ダウンロードやビルドを伴うため失敗しうるが、
-    /// **失敗してもセットアップ全体は続行する** — プレビューが無くても
-    /// TVTest からの視聴という主目的には影響しないため。理由はログに残し、
-    /// あとからダッシュボードの「プレビューを使えるようにする」で再試行できる。
-    fn setup_browser_preview(
-        &mut self,
-        db: &recisdb_proxy::database::Database,
-        install_dir: &Path,
-    ) {
-        let config_path = install_dir.join("recisdb-proxy.toml");
-        self.log_lines.push(
-            "ブラウザプレビューの準備中... (ダウンロードを伴うため時間がかかります)".to_string(),
-        );
-        match recisdb_proxy::preview_setup::ensure_preview_ready(
-            db,
-            install_dir,
-            Some(&config_path),
-        ) {
-            Ok(report) => {
-                self.log_lines.push(format!(
-                    "ブラウザプレビューを有効にしました (エンコーダ: {} / 映像: {})",
-                    report.encoder_path, report.video_encoder
-                ));
-                if report.preprocessor_path.is_empty() {
-                    self.log_lines.push(
-                        "前段処理 (tsreadex) は未設定です。字幕が表示されない場合があります。"
-                            .to_string(),
-                    );
-                }
-                self.log_lines.extend(report.warnings);
-            }
-            Err(e) => self.log_lines.push(format!(
-                "ブラウザプレビューの準備に失敗しました (視聴・録画には影響しません): {e}"
-            )),
-        }
-    }
-
-    /// セットアップ本体の最後に、インストールした実行ファイルをOSの
-    /// サービスとして登録する。失敗しても致命的ではない (サーバ自体は
-    /// 手動で起動できる) ので、`setup_error` にはせずログに理由と手動
-    /// 登録用コマンドを残す。
-    fn register_os_service(&mut self, install_dir: &Path) {
-        use recisdb_proxy::service::{self, ServiceScope};
-
-        let name = match service::sanitize_service_name(&self.service_name) {
-            Ok(name) => name,
-            Err(e) => {
-                self.log_lines
-                    .push(format!("サービス名が不正なため登録をスキップしました: {e}"));
-                return;
-            }
-        };
-        let scope = if self.service_user_scope && !cfg!(windows) {
-            ServiceScope::User
-        } else {
-            ServiceScope::System
-        };
-
-        let exe_name = if cfg!(windows) {
-            "recisdb-proxy.exe"
-        } else {
-            "recisdb-proxy"
-        };
-        let exe_path = install_dir.join(exe_name);
-        let config_file_path = self.config_file_path();
-        let spec = service::default_spec(
-            name.clone(),
-            scope,
-            exe_path,
-            install_dir.to_path_buf(),
-            vec![
-                "-f".to_string(),
-                config_file_path.to_string_lossy().into_owned(),
-            ],
-        );
-
-        match service::install(&spec) {
-            Ok(()) => {
-                self.service_registered = true;
-                self.log_lines
-                    .push(format!("サービス `{name}` を登録し、開始しました。"));
-            }
-            Err(e) => {
-                let hint = if cfg!(windows) {
-                    format!(
-                        "管理者として実行したコマンドプロンプトで `\"{}\" service install --name {name}` を実行してください。",
-                        install_dir.join(exe_name).display()
-                    )
-                } else {
-                    format!(
-                        "`sudo \"{}\" service install --name {name}` を実行してください。",
-                        install_dir.join(exe_name).display()
-                    )
-                };
-                self.log_lines
-                    .push(format!("サービスの登録に失敗しました: {e}"));
-                self.log_lines.push(hint);
-            }
-        }
+            let _ = tx.send(SetupEvent::Done(result));
+        });
+        self.setup_rx = Some(rx);
     }
 
     fn launch_server_and_open_dashboard(&mut self) {
@@ -1079,6 +1120,501 @@ impl SetupApp {
             Err(e) => {
                 self.launch_message = Some(format!("recisdb-proxy の起動に失敗しました: {e}"));
             }
+        }
+    }
+}
+
+impl SetupJob {
+    fn run(
+        mut self,
+        mut progress: impl FnMut(&str),
+        smart_card_readers: impl FnMut(Vec<String>),
+    ) -> Result<SetupResult, String> {
+        #[cfg(not(windows))]
+        let _ = &smart_card_readers;
+        std::fs::create_dir_all(&self.install_dir)
+            .map_err(|e| format!("インストール先フォルダの作成に失敗しました: {e}"))?;
+        let logs = std::cell::RefCell::new(Vec::new());
+        let progress = std::cell::RefCell::new(progress);
+        let mut emit = |message: String| {
+            progress.borrow_mut()(&message);
+            logs.borrow_mut().push(message);
+        };
+
+        let source_dir = self
+            .source_dir
+            .as_deref()
+            .ok_or_else(|| "実行ファイルの場所を取得できませんでした。".to_owned())?;
+        match setup_helpers::sync_program_binary(source_dir, &self.install_dir)? {
+            setup_helpers::BinarySyncAction::FreshInstall => emit(format!(
+                "recisdb-proxyをインストールしました: {}",
+                self.install_dir.display()
+            )),
+            setup_helpers::BinarySyncAction::Updated => {
+                emit("recisdb-proxyを最新版に更新しました。".to_owned())
+            }
+            setup_helpers::BinarySyncAction::AlreadyUpToDate => {
+                emit("recisdb-proxyは既に最新の状態です。".to_owned())
+            }
+        }
+
+        if self.setup_tsreplace {
+            emit("tsreplaceを準備しています…".to_owned());
+            let result = fourk_setup::ensure_tsreplace(&self.install_dir, &mut |message: &str| {
+                progress.borrow_mut()(message);
+                logs.borrow_mut().push(message.to_owned());
+            });
+            match result {
+                Ok(path) => {
+                    self.setup_config.tsreplace_command_path =
+                        Some(path.to_string_lossy().into_owned());
+                    match recisdb_proxy::preview_setup::resolve_tsreadex_ready(&self.install_dir) {
+                        Ok(tsreadex) => {
+                            self.setup_config.tsreplace_preprocessor_path =
+                                Some(tsreadex.to_string_lossy().into_owned());
+                            emit(format!(
+                                "tsreplaceとtsreadexを設定します: {} / {}",
+                                path.display(),
+                                tsreadex.display()
+                            ));
+                        }
+                        Err(error) => {
+                            self.setup_config.tsreplace_preprocessor_path = Some(String::new());
+                            emit(format!("tsreplaceは見つかりましたがtsreadexの準備に失敗しました。前段なしで設定します: {error}"));
+                        }
+                    }
+                }
+                Err(error) => emit(format!(
+                    "tsreplaceの準備に失敗しました。設定には書きません: {error}"
+                )),
+            }
+        }
+
+        let config_content = if !self.config_path.exists() || self.overwrite_config {
+            generate_config(&self.setup_config)
+        } else {
+            let content = std::fs::read_to_string(&self.config_path)
+                .map_err(|e| format!("既存の設定ファイルの読み込みに失敗しました: {e}"))?;
+            apply_existing_options_job(&self, content)
+        };
+        config_file::validate(&config_content)
+            .map_err(|error| format!("設定ファイルが不正なTOMLです。保存しません: {error}"))?;
+        std::fs::write(&self.config_path, config_content)
+            .map_err(|e| format!("設定ファイルの保存に失敗しました: {e}"))?;
+        emit(format!(
+            "設定ファイルを保存しました: {}",
+            self.config_path.display()
+        ));
+
+        configure_firewall_job(&self, &mut emit);
+
+        if self.db_path.exists() && self.recreate_db {
+            let backup = format!("{}.backup", self.db_path.display());
+            std::fs::rename(&self.db_path, &backup)
+                .map_err(|e| format!("データベースのバックアップに失敗しました: {e}"))?;
+            emit(format!(
+                "既存のデータベースをバックアップしました: {backup}"
+            ));
+        }
+        let db = Database::open(&self.db_path)
+            .map_err(|e| format!("データベースの初期化に失敗しました: {e}"))?;
+        emit(format!(
+            "データベースを初期化しました: {}",
+            self.db_path.display()
+        ));
+
+        if let Some(command_path) = self.setup_config.tsreplace_command_path.as_deref() {
+            db.set_tsreplace_command_path(command_path)
+                .map_err(|error| format!("tsreplaceの実行ファイルパス保存に失敗しました: {error}"))?;
+            let preprocessor_path = self
+                .setup_config
+                .tsreplace_preprocessor_path
+                .as_deref()
+                .unwrap_or_default();
+            db.set_tsreplace_preprocessor_path(preprocessor_path).map_err(|error| {
+                format!("tsreplace前処理の実行ファイルパス保存に失敗しました: {error}")
+            })?;
+        }
+
+        if self.setup_tsreplace {
+            if let Some(tsreplace_path) = self.setup_config.tsreplace_command_path.as_deref() {
+                emit("tsreplaceのエンコード設定を検出しています…".to_owned());
+                match encoder_probe::select_tsreplace_arguments(
+                    &self.install_dir,
+                    Path::new(tsreplace_path),
+                    self.tsreplace_quality,
+                ) {
+                    Ok(selection) => {
+                        let current = db
+                            .get_tsreplace_config()
+                            .map_err(|error| format!("tsreplace設定の読み込みに失敗しました: {error}"))?;
+                        if encoder_probe::tsreplace_arguments_is_auto_generated(Some(&current.2)) {
+                            db.update_tsreplace_config(
+                                current.0,
+                                &current.1,
+                                &selection.arguments,
+                                current.3,
+                                current.4,
+                                current.5,
+                                &current.6,
+                                &current.7,
+                            )
+                            .map_err(|error| format!("tsreplace引数の保存に失敗しました: {error}"))?;
+                            emit(format!(
+                                "tsreplace設定を自動更新しました: エンコーダ={} / コーデック={} / 理由={}",
+                                selection.encoder, selection.codec, selection.reason
+                            ));
+                        } else {
+                            emit("tsreplace引数は管理者が編集済みのため上書きしませんでした。enabledはダッシュボードで変更してください。".to_owned());
+                        }
+                        for warning in selection.warnings {
+                            emit(format!("tsreplace候補を不採用: {warning}"));
+                        }
+                    }
+                    Err(error) => emit(format!(
+                        "tsreplaceの自動設定に失敗しました。現在の引数とenabledは変更しません: {error}"
+                    )),
+                }
+            } else {
+                emit("tsreplace本体が準備できなかったため、エンコード設定を変更しませんでした。".to_owned());
+            }
+        }
+
+        let fourk_set: std::collections::HashSet<String> = self
+            .fourk_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        let mut normal_detected = self.detected.clone();
+        for tuner in &mut normal_detected {
+            let removed = tuner
+                .device_paths
+                .iter()
+                .filter(|path| fourk_set.contains(*path))
+                .count();
+            if removed > 0 {
+                emit(format!(
+                    "4K選択済みの基底BonDriverを通常チューナー登録から除外しました: {}件",
+                    removed
+                ));
+            }
+            tuner.device_paths.retain(|path| !fourk_set.contains(path));
+        }
+        let selected_indices: Vec<usize> = self
+            .selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| selected.then_some(index))
+            .collect();
+        for result in register_tuners_to_db(&db, &normal_detected, &selected_indices) {
+            match result.outcome {
+                Ok(id) => emit(format!(
+                    "チューナーを登録しました: {} (ID: {id})",
+                    result.device_path
+                )),
+                Err(error) => emit(format!(
+                    "チューナーの登録に失敗しました: {} ({error})",
+                    result.device_path
+                )),
+            }
+        }
+
+        for entry in &self.manual_entries {
+            if fourk_set.contains(&entry.path) {
+                emit(format!(
+                    "4K選択済みの手動BonDriverを通常登録から除外しました: {}",
+                    entry.path
+                ));
+                continue;
+            }
+            match register_manual_tuner(&db, &entry.path, &entry.group, entry.max_instances) {
+                Ok(id) => emit(format!(
+                    "チューナーを登録しました: {} (ID: {id})",
+                    entry.path
+                )),
+                Err(error) => emit(format!(
+                    "チューナーの登録に失敗しました: {} ({error})",
+                    entry.path
+                )),
+            }
+        }
+
+        if self.setup_4k && !self.fourk_paths.is_empty() {
+            emit("dantto4kラッパーを準備しています…".to_owned());
+            let wrappers_result = fourk_setup::prepare_wrappers(
+                &self.install_dir,
+                &self.fourk_paths,
+                &self.fourk_acas,
+                &mut |message: &str| {
+                    progress.borrow_mut()(message);
+                    logs.borrow_mut().push(message.to_owned());
+                },
+            );
+            let wrappers = wrappers_result?;
+            #[cfg(windows)]
+            if let Some(exe) = fourk_setup::find_dantto_executable(&self.install_dir) {
+                match fourk_setup::list_smart_card_readers(&exe) {
+                    Ok(readers) => smart_card_readers(readers),
+                    Err(error) => emit(format!(
+                        "カードリーダー候補の取得に失敗しました。手入力できます: {error}"
+                    )),
+                }
+            }
+            for wrapper in wrappers {
+                // 検出済みチューナーの本数(地デジ+衛星)はユニット全体の値で、
+                // ラッパー1個(=基底DLL1個)の同時オープン数ではない。
+                // 手動追加で明示された場合だけその値を使い、他は1とする。
+                let max_instances = self
+                    .manual_entries
+                    .iter()
+                    .find(|entry| entry.path == wrapper.base_path.to_string_lossy())
+                    .map(|entry| entry.max_instances.max(1))
+                    .unwrap_or(1);
+                let wrapper_path = wrapper.wrapper_path.to_string_lossy().to_string();
+                match register_manual_tuner(&db, &wrapper_path, "BS4K", max_instances) {
+                    Ok(id) => {
+                        db.set_driver_stream_format(&wrapper_path, StreamFormat::Ts)
+                            .map_err(|e| format!("4Kストリーム形式の保存に失敗しました: {e}"))?;
+                        db.set_driver_disable_b25(&wrapper_path, true)
+                            .map_err(|e| format!("4K B25無効化の保存に失敗しました: {e}"))?;
+                        emit(format!("BS4Kラッパーを登録しました: {} (ID: {id}, stream_format=ts, disable_b25=true)", wrapper_path));
+                    }
+                    Err(error) => emit(format!(
+                        "BS4Kラッパーの登録に失敗しました: {wrapper_path} ({error})"
+                    )),
+                }
+            }
+            emit("4Kチャンネルはスキャン後に番組表/チャンネル一覧の末尾(BS4K)に追加されます。TVTestの.ch2は再生成してください。".to_owned());
+        }
+
+        let tuner_hint = db
+            .get_all_bon_drivers()
+            .ok()
+            .and_then(|drivers| {
+                drivers
+                    .iter()
+                    .find_map(|driver| {
+                        driver
+                            .group_name
+                            .clone()
+                            .filter(|group| !group.trim().is_empty())
+                    })
+                    .or_else(|| drivers.first().map(|driver| driver.dll_path.clone()))
+            })
+            .unwrap_or_default();
+        let proxy_port = self.listen_addr.rsplit(':').next().unwrap_or("40070");
+        let web_port = self.web_listen_addr.rsplit(':').next().unwrap_or("40080");
+        let ip = setup_helpers::local_lan_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_owned());
+        if let Err(error) = setup_helpers::write_client_config_bundle(
+            &self.install_dir,
+            self.source_dir.as_deref(),
+            &format!("{ip}:{proxy_port}"),
+            &tuner_hint,
+            &format!("http://{ip}:{web_port}"),
+        ) {
+            emit(format!("クライアント設定の出力に失敗しました: {error}"));
+        }
+
+        if self.setup_preview {
+            emit("ブラウザプレビューを準備しています…".to_owned());
+            let result = recisdb_proxy::preview_setup::ensure_preview_ready(
+                &db,
+                &self.install_dir,
+                Some(&self.config_path),
+            );
+            match result {
+                Ok(report) => {
+                    emit(format!(
+                        "ブラウザプレビューを有効にしました (エンコーダ: {} / 映像: {})",
+                        report.encoder_path, report.video_encoder
+                    ));
+                    if report.preprocessor_path.is_empty() {
+                        emit(
+                            "前段処理(tsreadex)は未設定です。字幕が表示されない場合があります。"
+                                .to_owned(),
+                        );
+                    }
+                    for warning in report.warnings {
+                        emit(warning);
+                    }
+                }
+                Err(error) => emit(format!(
+                    "ブラウザプレビューの準備に失敗しました (視聴・録画には影響しません): {error}"
+                )),
+            }
+        }
+
+        let service_registered = if self.register_service && recisdb_proxy::service::is_supported()
+        {
+            register_os_service_job(&self, &mut emit)
+        } else {
+            false
+        };
+        let _ = emit;
+        Ok(SetupResult {
+            log_lines: logs.into_inner(),
+            service_registered,
+        })
+    }
+}
+
+fn apply_existing_options_job(job: &SetupJob, mut content: String) -> String {
+    content = config_file::upsert_key(
+        &content,
+        "server",
+        "web_listen",
+        &TomlValue::Str(job.web_listen_addr.clone()),
+    );
+    content = config_file::upsert_key(
+        &content,
+        "mirakurun",
+        "enabled",
+        &TomlValue::Bool(job.setup_config.mirakurun_enabled),
+    );
+    content = match &job.setup_config.mirakurun_home_region {
+        Some(value) => config_file::upsert_key(
+            &content,
+            "mirakurun",
+            "home_region",
+            &TomlValue::Str(value.clone()),
+        ),
+        None => config_file::remove_key(&content, "mirakurun", "home_region"),
+    };
+    content = match &job.setup_config.node_display_name {
+        Some(value) => config_file::upsert_key(
+            &content,
+            "node",
+            "display_name",
+            &TomlValue::Str(value.clone()),
+        ),
+        None => config_file::remove_key(&content, "node", "display_name"),
+    };
+    if let Some(path) = &job.setup_config.tsreplace_command_path {
+        content = config_file::upsert_key(
+            &content,
+            "tsreplace",
+            "command_path",
+            &TomlValue::Str(path.clone()),
+        );
+    }
+    if let Some(path) = &job.setup_config.tsreplace_preprocessor_path {
+        content = config_file::upsert_key(
+            &content,
+            "tsreplace",
+            "preprocessor_path",
+            &TomlValue::Str(path.clone()),
+        );
+    }
+    content
+}
+
+fn configure_firewall_job(job: &SetupJob, log: &mut impl FnMut(String)) {
+    if !job.lan_access {
+        return;
+    }
+    let proxy_port = job.listen_addr.rsplit(':').next().unwrap_or("40070");
+    let node_port = proxy_port
+        .parse::<u16>()
+        .ok()
+        .and_then(|port| port.checked_add(1))
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "40071".to_owned());
+    let web_port = job.web_listen_addr.rsplit(':').next().unwrap_or("40080");
+    if cfg!(windows) {
+        if !job.firewall_allow {
+            log(format!("Windowsファイアウォールの自動設定をスキップしました。必要なら{proxy_port}/{node_port}/{web_port}を許可してください。"));
+            return;
+        }
+        let exe = job.install_dir.join("recisdb-proxy.exe");
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=recisdb-proxy",
+            ])
+            .status();
+        let result = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=recisdb-proxy",
+                "dir=in",
+                "action=allow",
+                &format!("program={}", exe.display()),
+                "enable=yes",
+                "profile=private,domain",
+            ])
+            .status();
+        if matches!(result, Ok(status) if status.success()) {
+            log("WindowsファイアウォールにPrivate/Domain用の受信許可ルールを追加しました。Publicは開けていません。".to_owned());
+        } else {
+            log(format!(
+                "Windowsファイアウォールの設定に失敗しました。管理者権限で手動設定してください: {}",
+                exe.display()
+            ));
+        }
+    } else {
+        log(format!("ファイアウォールを使っている場合はポート{proxy_port}/{node_port}/{web_port}を許可してください。"));
+    }
+}
+
+fn register_os_service_job(job: &SetupJob, log: &mut impl FnMut(String)) -> bool {
+    use recisdb_proxy::service::{self, ServiceScope};
+    let name = match service::sanitize_service_name(&job.service_name) {
+        Ok(name) => name,
+        Err(error) => {
+            log(format!(
+                "サービス名が不正なため登録をスキップしました: {error}"
+            ));
+            return false;
+        }
+    };
+    let scope = if job.service_user_scope && !cfg!(windows) {
+        ServiceScope::User
+    } else {
+        ServiceScope::System
+    };
+    let exe_name = if cfg!(windows) {
+        "recisdb-proxy.exe"
+    } else {
+        "recisdb-proxy"
+    };
+    let exe_path = job.install_dir.join(exe_name);
+    let spec = service::default_spec(
+        name.clone(),
+        scope,
+        exe_path.clone(),
+        job.install_dir.clone(),
+        vec![
+            "-f".to_owned(),
+            job.config_path.to_string_lossy().into_owned(),
+        ],
+    );
+    match service::install(&spec) {
+        Ok(()) => {
+            log(format!("サービス`{name}`を登録し、開始しました。"));
+            true
+        }
+        Err(error) => {
+            log(format!("サービスの登録に失敗しました: {error}"));
+            log(if cfg!(windows) {
+                format!(
+                    "管理者として`\"{}\" service install --name {name}`を実行してください。",
+                    exe_path.display()
+                )
+            } else {
+                format!(
+                    "`sudo \"{}\" service install --name {name}`を実行してください。",
+                    exe_path.display()
+                )
+            });
+            false
         }
     }
 }
@@ -1118,6 +1654,31 @@ fn dashboard_url(web_listen_addr: &str) -> String {
     format!("http://localhost:{port}")
 }
 
+fn replace_address_host(address: &str, host: &str) -> String {
+    address
+        .rsplit_once(':')
+        .map(|(_, port)| format!("{host}:{port}"))
+        .unwrap_or_else(|| format!("{host}:{address}"))
+}
+
+fn prefecture_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for region_id in 1..=62 {
+        if let Some(name) =
+            recisdb_protocol::broadcast_region::get_prefecture_name_from_region_id(region_id)
+        {
+            if recisdb_protocol::broadcast_region::region_ids_from_prefecture_name(name).is_empty()
+            {
+                continue;
+            }
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
 impl eframe::App for SetupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1128,6 +1689,7 @@ impl eframe::App for SetupApp {
                 Ok(result) => {
                     self.selected = vec![true; result.len()];
                     self.detected = result;
+                    self.refresh_fourk_candidates();
                     self.detect_rx = None;
                     self.step = Step::SelectTuners;
                     // 全自動モードなら、ドライバ未導入のチューナーを続けて処理する。
@@ -1145,6 +1707,8 @@ impl eframe::App for SetupApp {
         }
 
         self.poll_px4_install(&ctx);
+        self.poll_fourk_probe(&ctx);
+        self.poll_setup(&ctx);
 
         // recisdb-proxy 起動後、少し待ってからダッシュボードを開く
         if let Some(deadline) = self.launch_deadline {
@@ -1174,6 +1738,7 @@ impl eframe::App for SetupApp {
                         Step::Location => self.ui_location(ui),
                         Step::Detecting => self.ui_detecting(ui),
                         Step::SelectTuners => self.ui_select_tuners(ui),
+                        Step::Options => self.ui_options(ui),
                         Step::Confirm => self.ui_confirm(ui),
                         Step::Done => self.ui_done(ui),
                         Step::DllOnly => self.ui_dll_only(ui),
@@ -1470,25 +2035,6 @@ impl SetupApp {
             });
         });
 
-        ui.add_space(12.0);
-        ui.collapsing(
-            egui::RichText::new("詳しい設定 (通常は変更不要)").size(17.0),
-            |ui| {
-                egui::Grid::new("advanced_grid")
-                    .num_columns(2)
-                    .spacing([16.0, 10.0])
-                    .show(ui, |ui| {
-                        ui.label("録画・視聴ソフトが接続するアドレス:");
-                        ui.text_edit_singleline(&mut self.listen_addr);
-                        ui.end_row();
-
-                        ui.label("Webダッシュボードのアドレス:");
-                        ui.text_edit_singleline(&mut self.web_listen_addr);
-                        ui.end_row();
-                    });
-            },
-        );
-
         ui.add_space(20.0);
         ui.horizontal(|ui| {
             if secondary_button(ui, "◀ 戻る").clicked() {
@@ -1664,6 +2210,7 @@ impl SetupApp {
                         group: self.manual_form.group.trim().to_string(),
                         max_instances,
                     });
+                    self.refresh_fourk_candidates();
                     self.manual_form = ManualEntryForm::default();
                 }
 
@@ -1694,13 +2241,269 @@ impl SetupApp {
             if primary_button(ui, "次へ  ▶").clicked() {
                 self.overwrite_config = !self.config_file_path().exists();
                 self.recreate_db = !self.db_file_path().exists();
-                self.step = Step::Confirm;
+                self.step = Step::Options;
+            }
+        });
+    }
+
+    fn ui_options(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, &self.mode.step_label(3), "詳細設定");
+        hint(
+            ui,
+            "既定値のまま「次へ」を押せば安全に動作します。必要な項目だけ変更してください。",
+        );
+        ui.add_space(12.0);
+
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("アクセス範囲").size(19.0));
+            hint(
+                ui,
+                "LANを選ぶと、同じ家庭内のスマートフォンやTVTestから接続できます。認証は常に有効です。",
+            );
+            let old = self.lan_access;
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.lan_access, false, "このPCだけ");
+                ui.radio_value(&mut self.lan_access, true, "家のネットワーク(LAN)から使う");
+            });
+            if old != self.lan_access {
+                self.set_access_scope(self.lan_access);
+            }
+        });
+
+        ui.add_space(10.0);
+        if cfg!(windows) {
+            card(ui, |ui| {
+                ui.label(egui::RichText::new("Windowsファイアウォール").size(19.0));
+                ui.add_enabled_ui(self.lan_access, |ui| {
+                    ui.checkbox(&mut self.firewall_allow, "受信許可ルールを追加する");
+                });
+                hint(
+                    ui,
+                    "Private/Domainプロファイルだけを、recisdb-proxy.exe単位で許可します。Publicは開けません。",
+                );
+            });
+        } else if self.lan_access {
+            hint(
+                ui,
+                "ファイアウォールを使っている場合はポート 40070/40071/40080 を許可してください。",
+            );
+        }
+
+        ui.add_space(10.0);
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("録画ソフト連携 (Mirakurun互換API)").size(19.0));
+            ui.checkbox(
+                &mut self.mirakurun_enabled,
+                "EPGStation など Mirakurun 対応ソフトから使う",
+            );
+            hint(
+                ui,
+                "既定では無効です。有効にすると /mirakurun/api/* が使えます。このAPIは認証なしのため、信頼できるネットワークだけで有効にしてください。",
+            );
+            if !self.lan_access && self.mirakurun_enabled {
+                hint(
+                    ui,
+                    "「このPCだけ」の場合は、EPGStationも同じPCで動く場合だけ使えます。",
+                );
+            }
+            let prefectures = prefecture_names();
+            egui::ComboBox::from_id_salt("home_region")
+                .selected_text(if self.home_region.is_empty() {
+                    "指定しない"
+                } else {
+                    &self.home_region
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.home_region, String::new(), "指定しない");
+                    for name in prefectures {
+                        ui.selectable_value(&mut self.home_region, name.clone(), name);
+                    }
+                });
+            hint(
+                ui,
+                "地元の都道府県を指定すると、他地域の地上波をNW1〜NW40に分けます。関東広域は「東京」を選びます。",
+            );
+        });
+
+        ui.add_space(10.0);
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("分散ノード名").size(19.0));
+            ui.text_edit_singleline(&mut self.node_display_name);
+            hint(
+                ui,
+                "他のrecisdb-proxyから見える名前です。空欄なら自動生成名を使います。",
+            );
+        });
+
+        ui.add_space(10.0);
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("エンコーダ").size(19.0));
+            ui.checkbox(
+                &mut self.setup_preview,
+                "ブラウザプレビューを使えるようにする",
+            );
+            hint(
+                ui,
+                "ffmpeg と tsreadex を検出または自動取得します。失敗してもTVTest視聴には影響しません。",
+            );
+            ui.checkbox(
+                &mut self.setup_tsreplace,
+                "TVTest向けエンコード(tsreplace)を用意する",
+            );
+            hint(
+                ui,
+                "tsreplaceとエンコーダを検出し、動作確認できた組み合わせを自動設定します。",
+            );
+            ui.add_enabled_ui(self.setup_tsreplace, |ui| {
+                ui.label("画質方針");
+                ui.radio_value(
+                    &mut self.tsreplace_quality,
+                    TsreplaceQuality::Compatibility,
+                    "互換性重視 (H.264)",
+                );
+                ui.radio_value(
+                    &mut self.tsreplace_quality,
+                    TsreplaceQuality::Compression,
+                    "圧縮率重視 (HEVC)",
+                );
+            });
+        });
+
+        if cfg!(windows) {
+            ui.add_space(10.0);
+            card(ui, |ui| {
+                ui.label(egui::RichText::new("BS4Kチューナー (Windows)").size(19.0));
+                ui.checkbox(&mut self.setup_4k, "BS4Kチューナーを使う");
+                hint(
+                    ui,
+                    "4K放送を復号してTSへ変換するBonDriver_dantto4kラッパーを自動構成します。既定はOFFです。",
+                );
+                if self.setup_4k {
+                    ui.add_space(6.0);
+                    ui.label("4KチューナーのBonDriver (複数選択可)");
+                    if self.fourk_paths.is_empty() {
+                        hint(ui, "選択可能なDLLがありません。「チューナー選択」で検出または手動追加してください。");
+                    }
+                    for (index, path) in self.fourk_paths.iter().enumerate() {
+                        ui.checkbox(&mut self.fourk_selected[index], path);
+                    }
+                    #[cfg(windows)]
+                    if ui.button("ファイルを選ぶ").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("BonDriver DLL", &["dll"])
+                            .pick_file()
+                        {
+                            let path = path.to_string_lossy().to_string();
+                            if !self.fourk_paths.iter().any(|known| known == &path) {
+                                self.fourk_paths.push(path);
+                                self.fourk_selected.push(true);
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label("B-CAS/A-CASカードの読み方");
+                    if self.fourk_probe_rx.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("dantto4kを準備してカードリーダー候補を取得しています…");
+                        });
+                    }
+                    let automatic = matches!(self.fourk_acas, AcasSelection::Automatic);
+                    if ui
+                        .radio(automatic, "このPCのカードリーダーを使う (自動)")
+                        .clicked()
+                    {
+                        self.fourk_acas = AcasSelection::Automatic;
+                    }
+                    hint(
+                        ui,
+                        "ACASは4K放送の復号に使うカードです。自動で利用可能なリーダーを探します。",
+                    );
+                    let reader_mode = matches!(self.fourk_acas, AcasSelection::SmartCardReader(_));
+                    if ui.radio(reader_mode, "カードリーダーを指定する").clicked() && !reader_mode
+                    {
+                        self.fourk_acas = AcasSelection::SmartCardReader(String::new());
+                    }
+                    if let AcasSelection::SmartCardReader(reader) = &mut self.fourk_acas {
+                        let candidates = self.fourk_reader_candidates.clone();
+                        if !self.fourk_reader_candidates.is_empty() {
+                            let selected_text = if reader.is_empty() {
+                                "候補を選択".to_owned()
+                            } else {
+                                reader.clone()
+                            };
+                            egui::ComboBox::from_id_salt("fourk_card_reader")
+                                .selected_text(selected_text)
+                                .show_ui(ui, |ui| {
+                                    for candidate in &candidates {
+                                        ui.selectable_value(
+                                            &mut *reader,
+                                            candidate.clone(),
+                                            candidate,
+                                        );
+                                    }
+                                });
+                        }
+                        ui.text_edit_singleline(reader);
+                        hint(
+                            ui,
+                            "候補を取得できない場合は、カードリーダー名を直接入力します。",
+                        );
+                    }
+                    let proxy_mode = matches!(self.fourk_acas, AcasSelection::CasProxyServer(_));
+                    if ui.radio(proxy_mode, "CasProxyServerを使う").clicked() && !proxy_mode {
+                        self.fourk_acas =
+                            AcasSelection::CasProxyServer("127.0.0.1:24000".to_owned());
+                    }
+                    if let AcasSelection::CasProxyServer(address) = &mut self.fourk_acas {
+                        ui.text_edit_singleline(address);
+                        hint(ui, "別PCまたは同じPCのCasProxyServerへ接続します。既定は127.0.0.1:24000です。");
+                    }
+                    hint(ui, "選んだDLLは通常チューナーとして登録せず、ラッパーだけをBS4K用に登録します。");
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        ui.collapsing(
+            egui::RichText::new("詳しい設定 (通常は変更不要)").size(17.0),
+            |ui| {
+                egui::Grid::new("advanced_grid_options")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label("録画・視聴ソフトが接続するアドレス:");
+                        ui.text_edit_singleline(&mut self.listen_addr);
+                        ui.end_row();
+                        ui.label("Webダッシュボードのアドレス:");
+                        ui.text_edit_singleline(&mut self.web_listen_addr);
+                        ui.end_row();
+                    });
+                hint(ui, "ポートを変更した場合、Windowsファイアウォールの許可ルールは実行ファイル単位で更新されます。");
+            },
+        );
+
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            if secondary_button(ui, "◀ 戻る").clicked() {
+                self.step = Step::SelectTuners;
+            }
+            if primary_button(ui, "次へ  ▶").clicked() {
+                let needs_reader_probe = cfg!(windows)
+                    && self.setup_4k
+                    && matches!(self.fourk_acas, AcasSelection::SmartCardReader(ref name) if name.trim().is_empty())
+                    && self.fourk_reader_candidates.is_empty();
+                if needs_reader_probe {
+                    self.start_fourk_probe();
+                } else {
+                    self.step = Step::Confirm;
+                }
             }
         });
     }
 
     fn ui_confirm(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, &self.mode.step_label(3), "内容の確認");
+        page_title(ui, &self.mode.step_label(4), "内容の確認");
 
         let selected_count =
             self.selected.iter().filter(|&&b| b).count() + self.manual_entries.len();
@@ -1731,6 +2534,22 @@ impl SetupApp {
                     ui.label("登録するチューナー数:");
                     ui.label(format!("{selected_count} 台"));
                     ui.end_row();
+
+                    ui.label("アクセス範囲:");
+                    ui.label(if self.lan_access {
+                        "家のネットワーク(LAN)"
+                    } else {
+                        "このPCだけ"
+                    });
+                    ui.end_row();
+
+                    ui.label("Mirakurun互換API:");
+                    ui.label(if self.mirakurun_enabled {
+                        "有効"
+                    } else {
+                        "無効"
+                    });
+                    ui.end_row();
                 });
 
             if config_file_path.exists() || db_file_path.exists() {
@@ -1755,17 +2574,16 @@ impl SetupApp {
         card(ui, |ui| {
             ui.label(egui::RichText::new("追加で行うこと").size(19.0));
             ui.add_space(6.0);
-            ui.checkbox(
-                &mut self.setup_preview,
-                "ブラウザで映像を確認できるようにする(エンコーダーを自動で用意します)",
-            );
-            if self.setup_preview {
-                hint(
-                    ui,
-                    "必要なプログラムをインターネットから取得するため、数分かかることがあります。",
-                );
-            }
-
+            ui.label(if self.setup_preview {
+                "ブラウザプレビュー: 有効"
+            } else {
+                "ブラウザプレビュー: 無効"
+            });
+            ui.label(if self.setup_tsreplace {
+                "tsreplace: 準備する"
+            } else {
+                "tsreplace: 準備しない"
+            });
             if recisdb_proxy::service::is_supported() {
                 ui.add_space(10.0);
                 ui.checkbox(
@@ -1808,6 +2626,19 @@ impl SetupApp {
             }
         });
 
+        if self.setup_rx.is_some() {
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("セットアップを実行しています…");
+                });
+                if let Some(line) = self.log_lines.last() {
+                    ui.label(line);
+                }
+            });
+        }
+
         if let Some(err) = &self.setup_error {
             ui.add_space(12.0);
             error_box(ui, err);
@@ -1815,10 +2646,20 @@ impl SetupApp {
 
         ui.add_space(20.0);
         ui.horizontal(|ui| {
-            if secondary_button(ui, "◀ 戻る").clicked() {
-                self.step = Step::SelectTuners;
+            let running = self.setup_rx.is_some();
+            if ui
+                .add_enabled(!running, egui::Button::new("◀ 戻る"))
+                .clicked()
+            {
+                self.step = Step::Options;
             }
-            if primary_button(ui, "この内容でセットアップを実行  ▶").clicked() {
+            if ui
+                .add_enabled(
+                    !running,
+                    egui::Button::new("この内容でセットアップを実行  ▶"),
+                )
+                .clicked()
+            {
                 self.run_setup();
             }
         });

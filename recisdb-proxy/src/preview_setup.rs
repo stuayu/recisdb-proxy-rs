@@ -238,14 +238,15 @@ fn konomitv_ffmpeg_path() -> Option<PathBuf> {
 fn detect_ffmpeg(install_dir: &Path) -> Option<PathBuf> {
     let managed = managed_ffmpeg_path(install_dir);
     if managed.is_file() {
-        return Some(managed);
+        return Some(std::fs::canonicalize(&managed).unwrap_or(managed));
     }
     if let Some(path) = konomitv_ffmpeg_path() {
         if path.is_file() {
-            return Some(path);
+            return Some(std::fs::canonicalize(&path).unwrap_or(path));
         }
     }
     which_on_path(exe_file_name("ffmpeg").as_str())
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn run_ffmpeg_encoders(ffmpeg_path: &Path) -> Result<String, String> {
@@ -341,25 +342,7 @@ fn listed_hardware_encoders(os: HostOs, encoders_output: &str) -> Vec<&'static s
 /// 試しておけば、その場合はこの候補を落として次 (最終的には libx264) へ回せる。
 /// `h264_vaapi` のようにデバイス初期化が要るものも、ここで自然に脱落する。
 fn test_encode_works(ffmpeg_path: &Path, video_encoder: &str) -> bool {
-    let mut args: Vec<&str> = vec![
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=d=0.2",
-        "-c:v",
-        video_encoder,
-    ];
-    args.extend(crate::database::video_encoder_tuning(video_encoder).split_whitespace());
-    args.extend(["-f", "null", "-"]);
-
-    std::process::Command::new(ffmpeg_path)
-        .args(&args)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    crate::encoder_probe::test_ffmpeg_encoder(ffmpeg_path, video_encoder).is_ok()
 }
 
 /// Picks the video encoder to use: the first candidate (OS-appropriate
@@ -693,7 +676,7 @@ mod ffmpeg_download {
 
 /// Detect an existing ffmpeg, verifying it works; if none is usable,
 /// download one. Returns `(path, source_label, -encoders output)`.
-fn resolve_ffmpeg(install_dir: &Path) -> Result<(PathBuf, &'static str, String), String> {
+pub fn resolve_ffmpeg(install_dir: &Path) -> Result<(PathBuf, &'static str, String), String> {
     if let Some(path) = detect_ffmpeg(install_dir) {
         if let Ok(encoders) = verify_ffmpeg_binary(&path) {
             return Ok((path, "detected", encoders));
@@ -1010,7 +993,7 @@ mod tsreadex_setup {
 /// allowed to fail: the caller ([`ensure_preview_ready`]) treats an `Err`
 /// here as a warning, not a hard failure — the preview pipeline still works
 /// without a preprocessor, just without per-service ID3 caption conversion.
-fn resolve_tsreadex_ready(install_dir: &Path) -> Result<PathBuf, String> {
+pub fn resolve_tsreadex_ready(install_dir: &Path) -> Result<PathBuf, String> {
     if let Some(path) = detect_tsreadex(install_dir) {
         return Ok(path);
     }
@@ -1023,27 +1006,6 @@ fn resolve_tsreadex_ready(install_dir: &Path) -> Result<PathBuf, String> {
 // silently undo itself on the next restart).
 // ============================================================================
 
-/// Cheap existence check mirroring `setup_helpers::replace_scalar_in_section`'s
-/// own per-line section tracking, used to fail with a clear message instead
-/// of hitting that function's internal `assert!` when a hand-edited config
-/// file's `[preview]` section doesn't have the expected keys.
-fn toml_section_has_key(toml: &str, section: &str, key: &str) -> bool {
-    let key_prefix = format!("{key} = ");
-    let mut current_section = String::new();
-    for line in toml.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                current_section = name.to_string();
-            }
-        }
-        if current_section == section && trimmed.starts_with(&key_prefix) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Rewrites `[preview] command_path`/`preprocessor_path` in the config file
 /// at `config_path` to the resolved paths, leaving every other line
 /// (including comments and other sections) untouched.
@@ -1053,35 +1015,21 @@ fn write_preview_paths_to_toml(
     preprocessor_path: &str,
 ) -> Result<(), String> {
     let contents = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
-
-    if !toml_section_has_key(&contents, "preview", "command_path")
-        || !toml_section_has_key(&contents, "preview", "preprocessor_path")
-    {
-        return Err(format!(
-            "{} の [preview] セクションに command_path / preprocessor_path が見つかりませんでした。\
-             手動で追記してください。",
-            config_path.display()
-        ));
-    }
-
-    // Windows paths contain backslashes, which are TOML escape characters
-    // inside a basic (double-quoted) string — must be escaped the same way
-    // `setup_helpers::generate_config` escapes the database path.
-    let command_path = crate::setup_helpers::escape_toml_basic_string(command_path);
-    let preprocessor_path = crate::setup_helpers::escape_toml_basic_string(preprocessor_path);
-
-    let rewritten = crate::setup_helpers::replace_scalar_in_section(
+    let rewritten = crate::config_file::upsert_key(
         &contents,
         "preview",
         "command_path",
-        &command_path,
+        &crate::config_file::TomlValue::Str(command_path.to_owned()),
     );
-    let rewritten = crate::setup_helpers::replace_scalar_in_section(
+    let rewritten = crate::config_file::upsert_key(
         &rewritten,
         "preview",
         "preprocessor_path",
-        &preprocessor_path,
+        &crate::config_file::TomlValue::Str(preprocessor_path.to_owned()),
     );
+
+    crate::config_file::validate(&rewritten)
+        .map_err(|error| format!("生成した設定ファイルが不正なTOMLです: {error}"))?;
 
     std::fs::write(config_path, rewritten).map_err(|e| e.to_string())
 }
@@ -1562,12 +1510,14 @@ enabled = false
     }
 
     #[test]
-    fn write_preview_paths_fails_clearly_when_keys_are_missing() {
+    fn write_preview_paths_upserts_missing_keys() {
         let path = unique_temp_path("rewrite-missing-key");
         std::fs::write(&path, "[preview]\n# no keys here\n").unwrap();
 
-        let err = write_preview_paths_to_toml(&path, "/x/ffmpeg", "/x/tsreadex").unwrap_err();
-        assert!(err.contains("command_path"), "{err}");
+        write_preview_paths_to_toml(&path, "/x/ffmpeg", "/x/tsreadex").unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains(r#"command_path = "/x/ffmpeg"#));
+        assert!(updated.contains(r#"preprocessor_path = "/x/tsreadex"#));
 
         std::fs::remove_file(&path).unwrap();
     }
