@@ -13,7 +13,7 @@ import {
 } from '../composables/useEpgEvents'
 import { broadcastDateInput } from '../composables/useGuideDate'
 import { calculateGuideProgramWindow } from '../composables/useGuideProgramWindow'
-import { guideServiceGroupKey, isRealGuideService, mainGuideServices } from '../composables/useGuideServices'
+import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices } from '../composables/useGuideServices'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -83,7 +83,9 @@ type Service = {
   band: BandCategory
   remoteControlKey: number | null
   region: string | null
+  prefectureCode: number | null
 }
+type SubchannelInfo = { service: string; parent: string; distinct: boolean }
 type Program = {
   id: number | null
   key: string
@@ -138,7 +140,7 @@ function bandCategory(value: unknown, nid: number): BandCategory {
   return 'その他'
 }
 function isGuideServiceType(value: unknown): boolean {
-  return value === null || value === undefined || Number(value) === 1 || Number(value) === 0xad
+  return value === null || value === undefined || [1, 2, 0xa1, 0xa2, 0xa5, 0xa6, 0xad].includes(Number(value))
 }
 function genreLevel(genre: number | null): number | null {
   return genre === null ? null : (genre >> 4) & 0xf
@@ -180,6 +182,18 @@ function isOnAir(program: Program): boolean {
  */
 const rawChannels = shallowRef<JsonRecord[]>([])
 const rawPrograms = shallowRef<JsonRecord[]>([])
+/**
+ * 表示日に番組を持つサービス (`nid:sid`)。列はこれに載っているものだけにする。
+ * channels は全国のスキャン結果 (受信できない地域を含む) なので、そのまま列にすると
+ * 先頭が番組のない局で埋まり、番組のある局 (福島など) が画面外に追いやられる。
+ * 番組取得は見えている列だけなので、先頭が全部空だと 0 件 → 空表示でグリッドごと
+ * 消え、スクロールもできず二度と取りに行かなかった。EDCB の EpgTimer も
+ * 「表示対象サービス ∩ EPG データのあるサービス」を列にしている (EpgViewBase.cs)。
+ * null = 未取得/取得失敗 (旧サーバー) で、そのときは従来どおり全サービスを出す。
+ */
+const epgServiceKeys = shallowRef<Set<string> | null>(null)
+const subchannelByService = shallowRef<Map<string, SubchannelInfo> | null>(null)
+const subchannelParents = computed(() => new Set([...(subchannelByService.value?.values() ?? [])].map((item) => item.parent)))
 const error = ref('')
 const loading = ref(false)
 const channelsLoading = ref(false)
@@ -187,7 +201,10 @@ const programsLoading = ref(false)
 const loadedProgramWindows = shallowRef<Map<string, ProgramWindow[]>>(new Map())
 const bandFilter = ref<'すべて' | BandCategory>('すべて')
 const regionFilter = ref('すべて')
+const regionFilterTouched = ref(false)
 const serviceQuery = ref('')
+/** 畳んだ中で既定から外れた絞り込みがあるか (閉じていても気付けるように印を付ける)。 */
+const filtersActive = computed(() => regionFilter.value !== 'すべて' || serviceQuery.value.trim() !== '')
 const now = ref(Date.now())
 const selectedDate = ref(broadcastDateInput(now.value, GRID_START_HOUR))
 const detail = ref<Program | null>(null)
@@ -203,6 +220,8 @@ const epgStates = shallowRef<EpgScanState[]>([])
 const epgTargetHours = ref(168)
 const epgRefreshSecs = ref(86400)
 const activeEpgStatusKey = ref<string | null>(null)
+/** 狭幅で畳んだ表示設定・絞り込みを開いているか。 */
+const filtersOpen = ref(false)
 const scrollArea = ref<HTMLElement | null>(null)
 const isNarrow = ref(false)
 const viewportHeight = ref(0)
@@ -236,7 +255,7 @@ let detailLoadTimer: number | null = null
 const pxPerMin = computed(() => Math.max(1, (viewportHeight.value - headerHeight.value) / (displayHours.value * 60)))
 const columnWidth = computed(() => Math.max(40, (viewportWidth.value - axisWidth.value) / channelCount.value))
 /** チャンネルヘッダー行の高さ。リモコン番号+ロゴ+局名の2段が収まる最小値。 */
-const headerHeight = computed(() => (isNarrow.value ? 44 : 54))
+const headerHeight = computed(() => (isNarrow.value ? 48 : 54))
 const axisWidth = computed(() => (isNarrow.value ? AXIS_WIDTH_NARROW : AXIS_WIDTH_DESKTOP))
 const totalHeight = computed(() => TOTAL_MINUTES * pxPerMin.value)
 const visibleBufferPx = computed(
@@ -443,6 +462,8 @@ function visibleServiceKeys(): string[] {
   const keys = new Set<string>()
   for (const column of columns.value.slice(start, end)) {
     keys.add(column.key)
+    const parent = subchannelByService.value?.get(column.key)?.parent
+    if (parent) keys.add(parent)
   }
   return [...keys]
 }
@@ -534,13 +555,46 @@ async function loadInitialPrograms() {
     resizeGrid()
   }
 }
+async function loadEpgServices(): Promise<void> {
+  const { since, until } = gridBounds.value
+  try {
+    const query = new URLSearchParams({ since: String(since), until: String(until) })
+    const response = await api<JsonRecord>(`/programs/services?${query}`)
+    const keys = Array.isArray(response.services) ? response.services.map(String) : null
+    epgServiceKeys.value = keys ? new Set(keys) : null
+    if (Array.isArray(response.subchannels)) {
+      const map = new Map<string, SubchannelInfo>()
+      for (const item of response.subchannels) {
+        if (!item || typeof item !== 'object') continue
+        const value = item as JsonRecord
+        if (typeof value.service === 'string' && typeof value.parent === 'string') {
+          map.set(value.service, { service: value.service, parent: value.parent, distinct: value.distinct === true })
+        }
+      }
+      subchannelByService.value = map
+    } else {
+      subchannelByService.value = null
+    }
+    await applyGuideDefaultRegion()
+  } catch {
+    epgServiceKeys.value = null
+    subchannelByService.value = null
+    await applyGuideDefaultRegion()
+  }
+}
 async function loadPrograms() {
   programGeneration += 1
+  const generation = programGeneration
   initialProgramsReady = false
   pendingProgramWindows.clear()
   loadedProgramWindows.value = new Map()
   rawPrograms.value = []
   programIndex = new Map()
+  // 列 (= 番組のある局) を先に確定させてから、見えている列の番組を読む。
+  await loadEpgServices()
+  if (generation !== programGeneration) return
+  await nextTick()
+  resizeGrid()
   await loadInitialPrograms()
   // 初回窓 (現在時刻の前後) を読み終えてから、列の変化に応じた追加取得を解禁する。
   // 先に解禁すると、スクロール位置が 06:00 のままの窓を取りに行って無駄になる。
@@ -570,6 +624,9 @@ function flushProgramEvents(): void {
   for (const event of pendingProgramEvents) {
     const program = event.program
     const serviceKey = program ? `${Number(program.nid)}:${Number(program.sid)}` : null
+    // 収集中に初めて番組が届いた局は列に加える (更新ボタンを押さなくても出る)。
+    const known = epgServiceKeys.value
+    if (serviceKey && known && !known.has(serviceKey)) epgServiceKeys.value = new Set(known).add(serviceKey)
     mergeProgramEvent(rows, index, event, serviceKey ? loadedProgramWindows.value.get(serviceKey) ?? [] : [])
   }
   pendingProgramEvents = []
@@ -614,8 +671,29 @@ const epgEvents = useEpgEvents({
   onReconnect: () => { void loadPrograms() },
 })
 
+/**
+ * 並び: 帯域 → (地上) 都道府県コード → チャンネル番号 (EDCB 規則) → nid → sid。
+ * 番号は同じ NID の中の順位で決まるので、比較のたびに全サービスを舐めず先に一度だけ求める
+ * (本番は 800 サービス前後。比較ごとに求めると数千万回の走査になる)。
+ */
+function sortServices(all: Service[]): Service[] {
+  const byNid = new Map<number, Service[]>()
+  for (const service of all) {
+    const list = byNid.get(service.nid)
+    if (list) list.push(service)
+    else byNid.set(service.nid, [service])
+  }
+  const numbers = new Map(all.map((service) => [service.key, guideChannelNumber(service, byNid.get(service.nid) ?? [])]))
+  return all.sort((a, b) =>
+    BAND_ORDER[a.band] - BAND_ORDER[b.band]
+    || (a.band === '地上' ? (a.prefectureCode ?? 255) - (b.prefectureCode ?? 255) : 0)
+    || (numbers.get(a.key) ?? 0) - (numbers.get(b.key) ?? 0)
+    || a.nid - b.nid || a.sid - b.sid)
+}
+
 const services = computed<Service[]>(() => {
   const seen = new Map<string, Service>()
+  const withEpg = epgServiceKeys.value
   for (const row of rawChannels.value) {
     const nid = Number(row.nid),
       sid = Number(row.sid),
@@ -626,7 +704,8 @@ const services = computed<Service[]>(() => {
       || !isGuideServiceType(row.service_type)
     ) continue
     const key = `${nid}:${sid}`
-    if (seen.has(key)) continue
+    const sub = subchannelByService.value?.get(key)
+    if (seen.has(key) || (withEpg && !withEpg.has(key) && !sub && !subchannelParents.value.has(key))) continue
     const remote = row.remote_control_key == null ? null : Number(row.remote_control_key)
     seen.set(key, {
       key,
@@ -637,15 +716,10 @@ const services = computed<Service[]>(() => {
       band: bandCategory(row.band_type, nid),
       remoteControlKey: Number.isFinite(remote) ? remote : null,
       region: row.terrestrial_region == null ? null : String(row.terrestrial_region),
+      prefectureCode: row.prefecture_code == null ? null : Number(row.prefecture_code),
     })
   }
-  return [...seen.values()].sort(
-    (a, b) =>
-      BAND_ORDER[a.band] - BAND_ORDER[b.band] ||
-      a.nid - b.nid ||
-      (a.remoteControlKey ?? 999) - (b.remoteControlKey ?? 999) ||
-      a.sid - b.sid,
-  )
+  return sortServices([...seen.values()])
 })
 const mainSidByGroup = computed(() => {
   const result = new Map<string, number>()
@@ -676,19 +750,32 @@ function channelColorStyle(column: GuideColumn): string {
     : ((Math.abs(column.nid * 31 + column.sid) % 12) + 1)
   return `var(--guide-ch-${paletteIndex})`
 }
-const regionOptions = computed(() => [
-  ...new Set(
-    services.value
-      .filter((service) => service.band === '地上' && service.region)
-      .map((service) => service.region as string),
-  ),
-])
+const regionOptions = computed(() => [...new Map(
+  services.value.filter((service) => service.band === '地上' && service.region)
+    .map((service) => [service.region as string, service.prefectureCode ?? 255]),
+)].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0])).map(([name]) => name))
+
+async function applyGuideDefaultRegion(): Promise<void> {
+  if (regionFilterTouched.value) return
+  try {
+    const config = await api<JsonRecord>('/guide-config')
+    const configured = config.default_region
+    if (configured === '*') regionFilter.value = 'すべて'
+    else if (typeof configured === 'string' && regionOptions.value.includes(configured)) regionFilter.value = configured
+    else regionFilter.value = regionOptions.value[0] ?? 'すべて'
+  } catch {
+    regionFilter.value = regionOptions.value[0] ?? 'すべて'
+  }
+}
 watch(bandFilter, (value) => {
   if (value !== '地上' && value !== 'すべて') regionFilter.value = 'すべて'
 })
 watch(regionFilter, (value) => {
   if (value !== 'すべて' && bandFilter.value !== '地上') bandFilter.value = '地上'
 })
+function onRegionChange(): void {
+  regionFilterTouched.value = true
+}
 const filteredServices = computed(() => {
   const query = serviceQuery.value.trim().toLowerCase()
   return services.value.filter(
@@ -702,11 +789,28 @@ const filteredServices = computed(() => {
   )
 })
 const displayedServices = computed(() => {
-  if (showSubchannels.value) return filteredServices.value
-  return filteredServices.value.filter((service) =>
-    mainSidByGroup.value.get(guideServiceGroupKey(service)) === service.sid,
-  )
+  if (!subchannelByService.value) {
+    if (showSubchannels.value) return filteredServices.value
+    return filteredServices.value.filter((service) => mainSidByGroup.value.get(guideServiceGroupKey(service)) === service.sid)
+  }
+  const filtered = filteredServices.value.filter((service) => {
+    const sub = subchannelByService.value?.get(service.key)
+    return showSubchannels.value || !sub || sub.distinct
+  })
+  // サブは親のすぐ右。キー = (親の順位, サブか, 自分の順位) で全順序にする。
+  const order = serviceOrder.value
+  const subs = subchannelByService.value
+  const rank = (service: Service): [number, number, number] => {
+    const own = order.get(service.key) ?? Number.MAX_SAFE_INTEGER
+    const parent = subs?.get(service.key)?.parent
+    return parent === undefined ? [own, 0, own] : [order.get(parent) ?? own, 1, own]
+  }
+  return filtered
+    .map((service) => ({ service, key: rank(service) }))
+    .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.key[2] - b.key[2])
+    .map((entry) => entry.service)
 })
+const serviceOrder = computed(() => new Map(services.value.map((service, index) => [service.key, index])))
 /**
  * サービスごとの番組。rawPrograms が差し替わったときだけ作り直す。
  * (KonomiTV が親ストアで局別に分けた配列を配るのと同じ役割)
@@ -758,6 +862,8 @@ const columns = computed<GuideColumn[]>(() => {
   for (const service of displayedServices.value) {
     const key = service.key
     const programs = byService.get(service.key) ?? []
+    const sub = subchannelByService.value?.get(service.key)
+    const parentPrograms = sub ? byService.get(sub.parent) ?? [] : []
     const items: RenderItem[] = []
     const push = (program: Program): void => {
       const end = program.start_at + program.duration_secs
@@ -782,13 +888,18 @@ const columns = computed<GuideColumn[]>(() => {
         },
       })
     }
-    for (const program of programs) push(program)
+    for (const program of programs) {
+      if (!showSubchannels.value && sub && (!sub.distinct || isPlaceholderProgramName(program.name)
+        || parentPrograms.some((parent) => parent.start_at === program.start_at
+          && parent.name.trim() === program.name.trim()))) continue
+      push(program)
+    }
     // 上から順に並べておくと、可視判定を先頭から走らせて途中で打ち切れる。
     items.sort((a, b) => a.top - b.top)
     result.push({
       key,
       name: service.name,
-      subLabel: '',
+      subLabel: sub ? 'サブ' : '',
       band: service.band,
       nid: service.nid,
       tsid: service.tsid,
@@ -797,10 +908,8 @@ const columns = computed<GuideColumn[]>(() => {
       items,
     })
   }
-  // 並びは従来どおり 地上 → BS → CS → その他、その中は nid / sid 昇順。
-  return result.sort(
-    (a, b) => BAND_ORDER[a.band] - BAND_ORDER[b.band] || a.nid - b.nid || a.sid - b.sid,
-  )
+  // displayedServices の順 (チャンネル番号順・サブは親の右) をそのまま使う。
+  return result
 })
 const activeEpgStatusText = computed(() => {
   if (activeEpgStatusKey.value === null) return ''
@@ -1160,10 +1269,22 @@ onUnmounted(() => {
           class="guide-band-tab"
           :class="{ active: bandFilter === tab }"
           :aria-pressed="bandFilter === tab"
-          @click="bandFilter = tab"
+          @click="bandFilter = tab; regionFilterTouched = true"
           v-text="tab === '地上' ? '地上' : tab"
         />
       </div>
+      <!-- 狭幅では表示設定と絞り込みを畳む (縦画面でツールバーが 4 段・約180px になり、
+           番組表が画面の半分しか使えなかった)。広い画面では display: contents で素通し。 -->
+      <button
+        type="button"
+        class="guide-chip-button guide-filters-toggle"
+        :class="{ active: filtersOpen || filtersActive }"
+        :aria-expanded="filtersOpen"
+        aria-controls="guide-filters"
+        @click="filtersOpen = !filtersOpen"
+        v-text="filtersActive ? '表示設定●' : '表示設定'"
+      />
+      <div id="guide-filters" class="guide-filters" :class="{ open: filtersOpen }">
       <div class="guide-density" role="group" aria-label="表示局数">
         <span class="guide-density-label">局数</span>
         <button
@@ -1203,7 +1324,7 @@ onUnmounted(() => {
       </div>
       <label class="guide-region-filter">
         <span class="visually-hidden">地域（地上）</span>
-        <select v-model="regionFilter" :disabled="!regionOptions.length">
+        <select v-model="regionFilter" :disabled="!regionOptions.length" @change="onRegionChange">
           <option value="すべて">すべての地域</option>
           <option v-for="region in regionOptions" :key="region" :value="region" v-text="region" />
         </select>
@@ -1212,12 +1333,13 @@ onUnmounted(() => {
         <span class="visually-hidden">サービス絞り込み</span>
         <input v-model="serviceQuery" type="search" placeholder="局名 / NID / SID" />
       </label>
+      </div>
       <div class="guide-topbar-actions">
         <button class="guide-chip-button" @click="refresh" v-text="loading ? '更新中…' : '更新'" />
       </div>
     </div>
     <p v-if="error" class="notice error" role="alert" v-text="error" />
-    <p v-if="!rawPrograms.length && !loading" class="empty-state">
+    <p v-if="!services.length && !loading" class="empty-state">
       番組情報がありません。番組情報は視聴中のチャンネルから自動収集されます。
     </p>
     <div v-else class="guide-layout">
@@ -1425,23 +1547,36 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* ヘッダー右上に重ねる。フローに置くとタップ領域の高さで上段が膨らみ、
+   狭幅 (ヘッダー 48px) では局名が押し出されて見えなくなる。
+   見た目は小さく、タップ領域は ::before で広げる。 */
 .guide-epg-status {
-  position: relative;
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 1;
   display: inline-flex;
-  align-items: center;
-  vertical-align: middle;
 }
 
 .guide-epg-status-dot {
-  min-width: 32px;
-  min-height: 32px;
+  position: relative;
+  width: 14px;
+  height: 14px;
+  min-width: 0;
+  min-height: 0;
   padding: 0;
   border: 0;
   color: var(--muted);
   background: transparent;
   cursor: pointer;
-  font-size: .75rem;
-  line-height: 1;
+  font-size: .7rem;
+  line-height: 14px;
+}
+
+.guide-epg-status-dot::before {
+  position: absolute;
+  inset: -10px;
+  content: '';
 }
 
 .guide-epg-status-complete { color: var(--success); }

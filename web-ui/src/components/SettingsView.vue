@@ -8,6 +8,7 @@ const endpoints = [
   ['チューナー最適化', '/tuner-config'],
   ['BNDP外部エンコード（tsreplace）', '/tsreplace-config'],
   ['ブラウザプレビュー', '/preview-config'],
+  ['番組表', '/guide-config'],
   ['ログ出力', '/log-config'],
 ] as const
 const selected = ref<string>(endpoints[0][1])
@@ -16,6 +17,9 @@ const message = ref('')
 const error = ref('')
 const label = computed(() => endpoints.find((item) => item[1] === selected.value)?.[0] ?? '設定')
 const isEpg = computed(() => selected.value === '/settings/epg')
+const isGuide = computed(() => selected.value === '/guide-config')
+const guideDefaultRegion = ref<string | null>(null)
+const guideRegions = ref<JsonRecord[]>([])
 const epgPresets = ref<JsonRecord[]>([])
 const selectedEpgPreset = ref<number | null>(null)
 const epgEffective = ref<JsonRecord | null>(null)
@@ -155,6 +159,10 @@ async function load() {
       epgStatus.value = status
       epgEffective.value = effective
     }
+    if (isGuide.value) {
+      guideDefaultRegion.value = response.default_region == null ? null : String(response.default_region)
+      guideRegions.value = Array.isArray(response.regions) ? response.regions as JsonRecord[] : []
+    }
     message.value = ''
     error.value = ''
   } catch (cause) {
@@ -169,6 +177,13 @@ function onEpgPresetToggle(id: number, event: Event) {
 }
 async function save() {
   try {
+    if (isGuide.value) {
+      await api('/guide-config', { method: 'POST', body: JSON.stringify({ default_region: guideDefaultRegion.value }) })
+      message.value = '番組表の設定を保存しました。'
+      error.value = ''
+      await load()
+      return
+    }
     if (isEpg.value) config.value.selected_preset_id = selectedEpgPreset.value
     const payload = Object.fromEntries(entries.value.filter(([key]) => !protectedKeys.has(key)))
     await api(selected.value, {
@@ -867,6 +882,14 @@ onMounted(() => {
           <div class="epg-friendly-grid"><label class="field"><span>最小滞在(秒)</span><input v-model.number="config.min_dwell_secs" type="number" min="1" /></label><label class="field"><span>通常滞在(秒)</span><input v-model.number="config.normal_dwell_secs" type="number" min="1" /></label><label class="field"><span>最大滞在(秒)</span><input v-model.number="config.max_dwell_secs" type="number" min="1" /></label><label class="field"><span>CPU上限(%)</span><input v-model.number="config.cpu_hard_limit_percent" type="number" min="1" max="100" /></label></div>
         </details>
         <p class="muted">この設定では、録画と視聴を優先し、最大{{ config.max_concurrent_scans }}台の取得チューナーを使います。</p>
+      </template>
+      <template v-else-if="isGuide">
+        <p class="hint">番組表を開いたときの初期表示地域です。自動は番組のある地域のうち都道府県コードが最も若い地域を選びます。</p>
+        <label class="field"><span>初期表示地域</span><select v-model="guideDefaultRegion">
+          <option :value="null">自動 (都道府県コードが最も若い地域)</option>
+          <option value="*">すべての地域</option>
+          <option v-for="region in guideRegions" :key="String(region.name)" :value="String(region.name)">{{ String(region.name) }}</option>
+        </select></label>
       </template>
       <template v-for="[key, value] in entries" v-else :key="key">
         <label v-if="typeof value === 'boolean'" class="check"

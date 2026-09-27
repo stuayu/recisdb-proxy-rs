@@ -11,6 +11,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::web::state::WebState;
+use recisdb_protocol::broadcast_region::prefecture_code;
 
 use super::error::ApiError;
 
@@ -37,6 +38,7 @@ pub struct ChannelInfoApi {
     pub band_type: Option<u8>,
     pub region_id: Option<u8>,
     pub terrestrial_region: Option<String>,
+    pub prefecture_code: Option<u8>,
     pub is_enabled: bool,
     pub priority: i32,
     pub failure_count: i32,
@@ -121,6 +123,7 @@ pub async fn get_channels(
                 bon_channel: c.bon_channel,
                 band_type: c.band_type,
                 region_id: c.region_id,
+                prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                 terrestrial_region: c.terrestrial_region,
                 is_enabled: c.is_enabled,
                 priority: c.priority,
@@ -166,6 +169,7 @@ pub async fn get_channels(
                         bon_channel: c.bon_channel,
                         band_type: c.band_type,
                         region_id: c.region_id,
+                        prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                         terrestrial_region: c.terrestrial_region,
                         is_enabled: c.is_enabled,
                         priority: c.priority,
@@ -245,6 +249,7 @@ pub async fn get_channels(
                                     bon_channel: c.bon_channel,
                                     band_type: c.band_type,
                                     region_id: c.region_id,
+                                    prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                                     terrestrial_region: c.terrestrial_region.clone(),
                                     is_enabled: c.is_enabled,
                                     priority: c.priority,
@@ -303,6 +308,7 @@ pub async fn get_channels(
                             bon_channel: c.bon_channel,
                             band_type: c.band_type,
                             region_id: c.region_id,
+                            prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                             terrestrial_region: c.terrestrial_region,
                             is_enabled: c.is_enabled,
                             priority: c.priority,

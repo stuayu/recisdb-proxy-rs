@@ -289,6 +289,10 @@ impl Database {
             "035_purge_placeholder_epg_rows",
             Database::migration_035_purge_placeholder_epg_rows,
         ),
+        (
+            "036_guide_display_config",
+            Database::migration_036_guide_display_config,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -427,6 +431,54 @@ impl Database {
              DELETE FROM epg_service_coverage WHERE tsid = 0 OR service_id = 0;",
         )?;
         Ok(())
+    }
+
+    fn migration_036_guide_display_config(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS guide_display_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                default_region TEXT
+            );
+            INSERT OR IGNORE INTO guide_display_config (id, default_region) VALUES (1, NULL);",
+        )?;
+        Ok(())
+    }
+
+    pub fn get_guide_display_config(&self) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT default_region FROM guide_display_config WHERE id = 1",
+            [], |row| row.get(0),
+        )?)
+    }
+
+    pub fn update_guide_display_config(&self, default_region: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guide_display_config (id, default_region) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET default_region = excluded.default_region",
+            [default_region],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_terrestrial_prefectures(&self) -> Result<Vec<(String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT nid, terrestrial_region FROM channels
+             WHERE terrestrial_region IS NOT NULL",
+        )?;
+        let mut values = stmt.query_map([], |row| {
+            Ok((row.get::<_, i32>(0)? as u16, row.get::<_, String>(1)?))
+        })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values.retain(|(nid, name)| {
+            matches!(recisdb_protocol::broadcast_region::classify_nid(*nid).0, recisdb_protocol::types::BroadcastType::Terrestrial)
+                && recisdb_protocol::broadcast_region::prefecture_code(name).is_some()
+        });
+        values.sort_by_key(|(_, name)| recisdb_protocol::broadcast_region::prefecture_code(name).unwrap_or(u8::MAX));
+        let mut names = values.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+        names.dedup();
+        Ok(names.into_iter().filter_map(|name| {
+            recisdb_protocol::broadcast_region::prefecture_code(&name).map(|code| (name, code))
+        }).collect())
     }
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,

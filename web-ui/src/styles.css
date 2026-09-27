@@ -205,6 +205,41 @@ main.main-guide {
   padding: 8px;
 }
 
+/* 番組表はページ(ドキュメント)自体をスクロールさせない。
+   以前は .guide-view の高さを calc(100dvh - シェルの推定高) で決めていたが、
+   シェルの実高 (更新通知の有無・スマホ横向きのデスクトップ配置) とずれるとページが
+   はみ出し、指の慣性がページ側へ抜けて番組表ごと上へ流れ、局名ヘッダーが画面外へ
+   消えていた (iPhone で発生)。シェルを画面高に固定し、残りをフレックスで配る。 */
+.app.app-guide {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app.app-guide > .topbar {
+  flex: 0 0 auto;
+}
+
+.app.app-guide > .layout {
+  flex: 1 1 auto;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+
+.app.app-guide .nav {
+  overflow-y: auto;
+}
+
+main.main-guide {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .view {
   margin: auto;
 }
@@ -496,14 +531,63 @@ textarea:focus-visible,
 }
 
 @media (max-width: 700px) {
+  /* 高さを固定すると、開発版の長いバージョン文字列 (v0.0.1-alpha.18-164-g…-dirty) が
+     折り返して下のナビへはみ出し、鍵/テーマのボタンも縦に積まれて切れていた。
+     バージョンは省略表示にし、副題は落として 1 段に収める。 */
   .topbar {
-    height: 68px;
-    padding: 8px 16px;
+    height: auto;
+    min-height: 56px;
+    gap: 8px;
+    padding: 6px 12px;
+  }
+
+  .topbar > div:first-child {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .topbar h1 {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 6px;
+  }
+
+  .topbar .app-version {
+    max-width: 9em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar p:not(.connection-status) {
+    display: none;
+  }
+
+  .top-actions {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
   }
 
   .layout {
     display: block;
     min-height: calc(100vh - 68px);
+  }
+
+  /* 番組表のときは block のままだと main が中身の高さまで伸び、
+     .guide-scroll がスクロールコンテナでなくなる (全番組が DOM に出る)。 */
+  .app.app-guide > .layout {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .app.app-guide .nav {
+    flex: 0 0 auto;
+    overflow-y: hidden;
+  }
+
+  .app.app-guide main.main-guide {
+    flex: 1 1 auto;
   }
 
   .nav {
@@ -614,7 +698,9 @@ textarea:focus-visible,
   flex-direction: column;
   min-width: 0;
   max-width: 100%;
-  height: calc(100dvh - 80px);
+  flex: 1 1 auto;
+  width: 100%;
+  margin: 0;
   min-height: 0;
 }
 
@@ -711,6 +797,7 @@ textarea:focus-visible,
   align-items: center;
   gap: 4px;
   min-width: 0;
+  padding-right: 14px;
 }
 
 .guide-ch-num {
@@ -1053,15 +1140,17 @@ textarea:focus-visible,
     min-height: 320px;
   }
 
-  .guide-view {
-    /* 狭幅は横並びナビ(sticky)ぶんも引く。 */
-    height: calc(100dvh - 124px);
-  }
-
-  /* 狭幅のヘッダーは 44px しかない。ロゴとサブチャンネル名まで積むと
-     局名が上下に潰れて読めなくなるので、リモコン番号と局名だけ残す。 */
+  /* 狭幅のヘッダーは 2 段 (Komorebi の番組表と同じ):
+     上段 = リモコン番号 + 小さいロゴ、下段 = 局名。サブチャンネル名は落とす。
+     EPG 状態の点は右上に重ねて置き、段の高さに関与させない
+     (32px のタップ領域で上段が膨らみ、局名が高さ 3px に潰れて消えていた)。 */
   .guide-header-cell {
     padding: 3px 4px;
+    gap: 2px;
+  }
+
+  .guide-header-top {
+    padding-right: 12px;
   }
 
   .guide-ch-num {
@@ -1072,9 +1161,17 @@ textarea:focus-visible,
     line-height: 16px;
   }
 
-  .guide-channel-logo,
+  .guide-channel-logo {
+    width: 24px;
+    max-height: 16px;
+  }
+
   .guide-header-cell small {
     display: none;
+  }
+
+  .guide-ch-name {
+    font-size: 11px;
   }
 
   .guide-hour-label {
@@ -1813,6 +1910,14 @@ textarea:focus-visible,
 }
 
 /* EPG program guide */
+.guide-filters {
+  display: contents;
+}
+
+.guide-filters-toggle {
+  display: none;
+}
+
 .guide-topbar {
   display: flex;
   flex-wrap: wrap;
@@ -2225,12 +2330,34 @@ textarea:focus-visible,
     min-height: 40px;
   }
 
+  /* 2 行目 = 放送種別 + 表示設定。basis を 0 にすると 1 行目 (日付・更新) の
+     残り幅へ潰れて入り込むので、行を跨がせる幅を与える。 */
   .guide-band-tabs {
+    flex: 1 1 220px;
+    min-width: 0;
+  }
+
+  .guide-filters-toggle {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+  }
+
+  .guide-filters {
+    display: none;
+  }
+
+  .guide-filters.open {
+    display: flex;
     flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 
   .guide-band-tab {
-    flex: 1 1 130px;
+    flex: 1 1 0;
+    min-width: 0;
+    padding-inline: 4px;
   }
 
   .guide-actionbar .guide-chip-button {
@@ -2375,5 +2502,51 @@ textarea:focus-visible,
 
   .epg-preset-table td .epg-preset-actions {
     justify-content: flex-start;
+  }
+}
+
+/* スマホ横向き (幅はデスクトップ扱い・高さ 400px 前後)。番組表のときだけ
+   シェルとツールバーを詰め、表示設定を畳む。詰めないと番組表が 150px 程度しか残らない。 */
+@media (min-width: 701px) and (max-height: 500px) {
+  .app.app-guide > .topbar {
+    height: 44px;
+    padding: 0 12px;
+  }
+
+  .app.app-guide .topbar p {
+    display: none;
+  }
+
+  .app.app-guide .top-actions .icon-button {
+    min-height: 36px;
+  }
+
+  .app.app-guide main.main-guide {
+    padding: 4px;
+  }
+
+  .guide-title {
+    display: none;
+  }
+
+  .guide-topbar {
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+
+  .guide-filters-toggle {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .guide-filters {
+    display: none;
+  }
+
+  .guide-filters.open {
+    display: flex;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 }

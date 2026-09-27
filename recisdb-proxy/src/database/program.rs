@@ -6,6 +6,7 @@
 //! API (`web/mirakurun.rs::get_programs`).
 
 use super::{Database, EpgSource, ProgramRecord, ProgramUpsert, Result};
+use crate::guide_services::{self, ProgramNameAt, ServiceMeta, SubchannelInfo};
 use rusqlite::params;
 
 /// Upper bound for a stored event duration, in seconds.
@@ -216,6 +217,69 @@ impl Database {
         Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, total))
     }
 
+    /// Distinct `(nid, sid)` that have at least one program overlapping
+    /// `[since, until)`.
+    ///
+    /// The guide builds its columns from this, not from the `channels` table:
+    /// channels holds every scanned service nationwide (including regions no
+    /// tuner can receive), so columns taken from it are mostly empty and the
+    /// services that do have EPG end up far off-screen. EDCB's EpgTimer makes
+    /// the same cut (`EpgViewBase.cs`: view services ∩ services in the EPG DB).
+    pub fn get_program_services(&self, since: i64, until: i64) -> Result<Vec<(u16, u16)>> {
+        let mut stmt = self.connection().prepare(
+            "SELECT DISTINCT nid, sid FROM programs
+             WHERE start_at < ?1 AND (start_at + duration_secs) > ?2
+             ORDER BY nid, sid",
+        )?;
+        let rows = stmt.query_map(params![until, since], |row| {
+            Ok((row.get::<_, i32>(0)? as u16, row.get::<_, i32>(1)? as u16))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Read the service window once and derive subchannel visibility from it.
+    pub fn get_program_services_with_subchannels(
+        &self,
+        since: i64,
+        until: i64,
+    ) -> Result<(Vec<(u16, u16)>, Vec<SubchannelInfo>)> {
+        let mut programs_stmt = self.connection().prepare(
+            "SELECT DISTINCT nid, sid, start_at, name FROM programs
+             WHERE start_at < ?1 AND (start_at + duration_secs) > ?2",
+        )?;
+        let programs = programs_stmt.query_map(params![until, since], |row| {
+            Ok(ProgramNameAt {
+                nid: row.get::<_, i32>(0)? as u16,
+                sid: row.get::<_, i32>(1)? as u16,
+                start_at: row.get(2)?,
+                name: row.get(3)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut services = programs.iter().map(|p| (p.nid, p.sid)).collect::<Vec<_>>();
+        services.sort_unstable();
+        services.dedup();
+
+        let mut channels_stmt = self.connection().prepare(
+            // SID/TSID 0 は物理チャンネルだけの仮行。最小 SID として親に選ばれると
+            // 本物のメインがサブ扱いになるので、ここで落とす。
+            "SELECT DISTINCT nid, sid, service_type FROM channels
+             WHERE sid <> 0 AND tsid <> 0",
+        )?;
+        let channels = channels_stmt.query_map([], |row| {
+            Ok(ServiceMeta {
+                nid: row.get::<_, i32>(0)? as u16,
+                sid: row.get::<_, i32>(1)? as u16,
+                service_type: row.get::<_, Option<i32>>(2)?.map(|v| v as u8),
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let subchannels = guide_services::subchannels(&channels, &programs)
+            .into_iter()
+            .filter(|item| services.contains(&item.service))
+            .collect();
+        Ok((services, subchannels))
+    }
+
     /// Delete programs that ended more than 24h before `now`. Intended to
     /// be called at low frequency from the EPG writer's flush loop, not on
     /// every flush (spec: "収集フラッシュ時に低頻度で呼ぶ").
@@ -314,6 +378,23 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].event_id, 1);
+    }
+
+    #[test]
+    fn program_services_lists_only_services_overlapping_the_window() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[
+            sample(2, 200, 1, 1_000, 1),
+            sample(1, 100, 1, 1_000, 1),
+            sample(1, 100, 2, 2_000, 1), // same service twice -> one entry
+            sample(3, 300, 1, 50_000, 1), // outside the window
+        ])
+        .unwrap();
+        assert_eq!(
+            db.get_program_services(0, 10_000).unwrap(),
+            vec![(1, 100), (2, 200)]
+        );
+        assert!(db.get_program_services(100_000, 200_000).unwrap().is_empty());
     }
 
     #[test]

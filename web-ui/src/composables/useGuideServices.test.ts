@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { guideServiceGroupKey, isRealGuideService, mainGuideServices, type GuideServiceGroupFields } from './useGuideServices.ts'
+import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices, type GuideServiceGroupFields } from './useGuideServices.ts'
 
 type TestService = GuideServiceGroupFields & { name: string }
 
@@ -68,4 +68,18 @@ test('services without RCK are never folded together', () => {
   assert.equal(guideServiceGroupKey(services[0]), '7:28768:sid:400')
   assert.equal(guideServiceGroupKey(services[1]), '7:28768:sid:401')
   assert.deepEqual(mainGuideServices(services).map(({ sid }) => sid), [400, 401])
+})
+
+test('channel number follows EDCB branch ordering', () => {
+  const services = [
+    { ...service(0x7fe8, 1, 1025, 'sub', 1), band: '地上' as const },
+    { ...service(0x7fe8, 1, 1024, 'main', 1), band: '地上' as const },
+  ]
+  assert.equal(guideChannelNumber(services[0], services), 12)
+})
+
+test('placeholder names match server-side rules', () => {
+  assert.equal(isPlaceholderProgramName(null), true)
+  assert.equal(isPlaceholderProgramName('この時間は０４１ｃｈをご覧ください。'), true)
+  assert.equal(isPlaceholderProgramName('ＭＸショッピング'), false)
 })

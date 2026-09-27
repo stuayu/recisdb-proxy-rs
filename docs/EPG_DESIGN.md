@@ -18,6 +18,7 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
                └─ 約5分ごとに終了後24時間経過した行を削除
                    programs テーブル (database/program.rs, Migration 015/025/026)
                      ├─ GET /api/programs        (web/api/programs.rs, ダッシュボード)
+                     ├─ GET /api/programs/services (同上, 番組表の列=番組のあるサービス)
                      └─ GET /api/programs (Mirakurun互換, web/mirakurun.rs)
 
 収集状況は `EpgProgress` (`tuner/epg_progress.rs`) を介して `spawn_si_collector` と
@@ -169,6 +170,9 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 | API | 用途 |
 |---|---|
 | `GET /api/programs?since=&until=&nid=&sid=` | Webダッシュボードの番組表タブ。`[start_at, start_at+duration)` が `[since, until)` と重なる行を返す |
+| `GET /api/programs/services?since=&until=` | 窓内に番組を持つ `nid:sid` の一覧。番組表タブはこれと `channels` の積集合だけを列にする (受信できない地域の空列で番組のある局が画面外へ追いやられないように) |
+| `GET /api/programs/services?since=&until=` の `subchannels` | `{service, parent, distinct}` の配列。映像サービスの親子関係と、窓内に親と異なる実番組があるかを返す。空名・番組未定・放送休止・休止中・ご覧くださいを含む名前は実番組に数えない |
+| `GET /api/guide-config` / `POST /api/guide-config` | 番組表の初期地域と、番組のある地上波地域一覧を取得・更新する。`default_region` は `null`（自動）、`*`（すべて）、または都道府県名 |
 | Mirakurun互換 `GET /api/programs?networkId=&serviceId=` | EPGStation 等の録画クライアント向け。両条件は単独・併用可能で、無指定は全件を返す |
 
 ## EPG取得の完了判定

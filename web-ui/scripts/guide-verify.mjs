@@ -26,13 +26,15 @@ let pid = 1
 const dayStart = broadcastDateStart(FIXED_NOW)
 const base = Math.floor(dayStart.getTime() / 1000)
 
-function pushService(nid, sid, tsid, name, band, rck, region) {
+function pushService(nid, sid, tsid, name, band, rck, region, withPrograms = true) {
   channels.push({
     id: channels.length + 1, bon_driver_id: 1, channel_name: name,
     nid, sid, tsid, band_type: band, service_type: 1,
     remote_control_key: rck, terrestrial_region: region,
+    prefecture_code: region === '東京' ? 13 : region === '福島' ? 7 : null,
     priority: 10, is_enabled: true, bon_space: 0, bon_channel: 13,
   })
+  if (!withPrograms) return
   // 30分〜2時間のランダムでない決定的な長さで24時間を埋める
   let t = base
   let k = 0
@@ -47,8 +49,13 @@ function pushService(nid, sid, tsid, name, band, rck, region) {
     t += dur; k++
   }
 }
+// 本番の再現: 全国スキャンで channels にはあるが受信できず番組が1件もない局が、
+// NID昇順で先頭に並ぶ。これを列にすると先頭が空列で埋まり番組表が出なかった。
+for (let i = 0; i < 12; i++) {
+  pushService(0x7800 + i, 60000 + i * 8, 0x7800 + i, `受信不可局${i + 1}`, 0, (i % 12) + 1, '九州', false)
+}
 for (let i = 0; i < 30; i++) {
-  pushService(0x7880 + i, 1024 + i * 8, 0x7880 + i, `${CH_NAMES[i % 10]}${i < 10 ? '' : i}`, 0, (i % 12) + 1, i < 15 ? '関東' : '東北')
+  pushService(0x7880 + i, 1024 + i * 8, 0x7880 + i, `${CH_NAMES[i % 10]}${i < 10 ? '' : i}`, 0, ((15 - i) % 12) + 1, i < 15 ? '東京' : '福島')
 }
 for (let i = 0; i < 20; i++) pushService(4, 101 + i, 0x4000 + i, `BS局${i + 1}`, 1, null, null)
 for (let i = 0; i < 20; i++) pushService(6, 201 + i, 0x6000 + i, `CS局${i + 1}`, 2, null, null)
@@ -100,6 +107,8 @@ for (const vp of [
   { name: '1280x720', width: 1280, height: 720 },
   { name: '768', width: 768, height: 1024 },
   { name: '390', width: 390, height: 844 },
+  // スマホ横向き: 幅はデスクトップ扱いだが高さが 400px 弱しかない。
+  { name: '852x393', width: 852, height: 393 },
 ]) {
   for (const theme of vp.name === '1280x720' ? ['light', 'dark'] : ['light']) {
     const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height } })
@@ -129,6 +138,23 @@ for (const vp of [
         let body = responses[url.pathname] || {}
         if (url.pathname === '/api/channels') {
           body = { channels: chs, total: chs.length, count: chs.length }
+        }
+        if (url.pathname === '/api/programs/services') {
+          const since = Number(url.searchParams.get('since') || 0)
+          const until = Number(url.searchParams.get('until') || 0)
+          const keys = new Set(progs
+            .filter((p) => p.start_at + p.duration_secs > since && p.start_at < until)
+            .map((p) => `${p.nid}:${p.sid}`))
+          body = {
+            services: [...keys],
+            subchannels: [
+              { service: '4:102', parent: '4:101', distinct: true },
+              { service: '4:103', parent: '4:101', distinct: false },
+            ],
+          }
+        }
+        if (url.pathname === '/api/guide-config') {
+          body = { success: true, default_region: null, regions: [{ name: '福島', prefecture_code: 7 }, { name: '東京', prefecture_code: 13 }] }
         }
         if (url.pathname === '/api/programs') {
           const since = Number(url.searchParams.get('since') || 0)
@@ -196,6 +222,12 @@ for (const vp of [
           const c = document.querySelector('.guide-cell')
           return c ? getComputedStyle(c).backgroundColor : null
         })(),
+        // ページ自体がスクロールできると、指の慣性がページへ抜けて番組表ごと流れ、
+        // 局名ヘッダーが画面外へ消える (iPhone で発生)。
+        docOverflowY: document.documentElement.scrollHeight - window.innerHeight,
+        // EPG状態の点がフローに入ると上段が膨らみ、局名が数 px に潰れて消える。
+        squashedNames: [...document.querySelectorAll('.guide-header-cell .guide-ch-name')]
+          .filter((n) => n.getBoundingClientRect().height < 10).length,
         visibleCols: (() => {
           if (!scroll) return 0
           const r = scroll.getBoundingClientRect()
@@ -210,6 +242,8 @@ for (const vp of [
     })
     notes.push({ tag, ...m })
     if (m.pageOverflowX > 1) failures.push(`${tag}: ページに横スクロール ${m.pageOverflowX}px`)
+    if (m.docOverflowY > 1) failures.push(`${tag}: ページに縦スクロール ${m.docOverflowY}px (番組表ヘッダーが流れる)`)
+    if (m.squashedNames > 0) failures.push(`${tag}: 局名が潰れたヘッダー ${m.squashedNames}件`)
     if (m.scrollOverflow !== 'auto') failures.push(`${tag}: .guide-scroll overflow=${m.scrollOverflow}`)
     if (m.cellAbsolute !== 'absolute') failures.push(`${tag}: .guide-cell position=${m.cellAbsolute}`)
     if (m.hourAbsolute !== 'absolute') failures.push(`${tag}: .guide-hour-label position=${m.hourAbsolute}`)

@@ -339,7 +339,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app" :class="{ dark }">
+  <div class="app" :class="{ dark, 'app-guide': active === 'guide' }">
     <a class="skip-link" href="#main">本文へ移動</a>
     <header class="topbar">
       <div>

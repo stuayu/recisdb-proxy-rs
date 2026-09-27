@@ -181,6 +181,79 @@ pub async fn get_programs(
     })))
 }
 
+/// Query parameters for `GET /api/programs/services`.
+#[derive(Debug, Deserialize)]
+pub struct ProgramServicesQuery {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+}
+
+/// `GET /api/programs/services?since=&until=`: the services that have EPG in
+/// the window, as `"nid:sid"` keys. The guide uses this to pick its columns
+/// (see [`crate::database::Database::get_program_services`]).
+pub async fn get_program_services(
+    State(web_state): State<Arc<WebState>>,
+    Query(query): Query<ProgramServicesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let since = query.since.unwrap_or(i64::MIN);
+    let until = query.until.unwrap_or(i64::MAX);
+    let (services, subchannels) = web_state
+        .database
+        .lock()
+        .await
+        .get_program_services_with_subchannels(since, until)?;
+    let keys = services
+        .iter()
+        .map(|(nid, sid)| format!("{}:{}", nid, sid))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "count": keys.len(),
+        "services": keys,
+        "subchannels": subchannels.iter().map(|item| serde_json::json!({
+            "service": format!("{}:{}", item.service.0, item.service.1),
+            "parent": format!("{}:{}", item.parent.0, item.parent.1),
+            "distinct": item.distinct,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET/POST /api/guide-config`: persistent guide display preference.
+pub async fn get_guide_config(
+    State(web_state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = web_state.database.lock().await;
+    let default_region = db.get_guide_display_config()?;
+    let regions = db.get_terrestrial_prefectures()?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "default_region": default_region,
+        "regions": regions.into_iter().map(|(name, prefecture_code)| serde_json::json!({
+            "name": name, "prefecture_code": prefecture_code,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GuideConfigRequest {
+    pub default_region: Option<String>,
+}
+
+pub async fn update_guide_config(
+    State(web_state): State<Arc<WebState>>,
+    Json(payload): Json<GuideConfigRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = web_state.database.lock().await;
+    let regions = db.get_terrestrial_prefectures()?;
+    if let Some(region) = payload.default_region.as_deref() {
+        if region != "*" && !regions.iter().any(|(name, _)| name == region) {
+            return Err(ApiError::bad_request("default_regionが不正です"));
+        }
+    }
+    db.update_guide_display_config(payload.default_region.as_deref())?;
+    Ok(Json(serde_json::json!({ "success": true, "default_region": payload.default_region })))
+}
+
 fn parse_services(value: &str) -> Result<Vec<(u16, u16)>, ApiError> {
     let mut result = Vec::new();
     for item in value.split(',').filter(|item| !item.trim().is_empty()) {

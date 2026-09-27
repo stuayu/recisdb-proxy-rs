@@ -160,6 +160,8 @@ fn build_api_router() -> Router<Arc<WebState>> {
         .route("/scan-history", get(api::get_scan_history))
         // EPG (program guide) API
         .route("/programs", get(api::get_programs))
+        .route("/programs/services", get(api::get_program_services))
+        .route("/guide-config", get(api::get_guide_config).post(api::update_guide_config))
         .route("/epg/events", get(api::get_epg_events))
         // Alert API
         .route("/alerts", get(api::get_alerts))
@@ -1462,5 +1464,28 @@ mod tests {
         };
         assert_eq!(level, "debug");
         assert_eq!(retention_days, 14);
+    }
+
+    #[tokio::test]
+    async fn guide_config_api_get_post_and_reject_invalid_region() {
+        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let app = build_app(Arc::clone(&state), false);
+        let response = app.clone().oneshot(Request::builder().uri("/api/guide-config").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["default_region"], serde_json::Value::Null);
+        assert!(json["regions"].is_array());
+
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/guide-config")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"default_region": "*"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.database.lock().await.get_guide_display_config().unwrap(), Some("*".to_string()));
+
+        let response = app.oneshot(Request::builder().method("POST").uri("/api/guide-config")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"default_region": "存在しない県"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

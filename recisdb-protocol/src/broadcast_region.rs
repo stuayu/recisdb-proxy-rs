@@ -157,6 +157,18 @@ pub fn get_prefecture_name_from_region_id(region_id: u8) -> Option<&'static str>
     }
 }
 
+/// Return the JIS X 0401 prefecture code for the display name used here.
+pub fn prefecture_code(name: &str) -> Option<u8> {
+    const NAMES: [&str; 47] = [
+        "北海道", "青森", "岩手", "宮城", "秋田", "山形", "福島", "茨城", "栃木", "群馬",
+        "埼玉", "千葉", "東京", "神奈川", "新潟", "富山", "石川", "福井", "山梨", "長野",
+        "岐阜", "静岡", "愛知", "三重", "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山",
+        "鳥取", "島根", "岡山", "広島", "山口", "徳島", "香川", "愛媛", "高知", "福岡",
+        "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島", "沖縄",
+    ];
+    NAMES.iter().position(|candidate| *candidate == name).map(|index| (index + 1) as u8)
+}
+
 /// Every region ID that [`get_prefecture_name_from_region_id`] reports under
 /// `name` — the reverse of that function.
 ///
@@ -573,6 +585,24 @@ mod tests {
         // Non-terrestrial should return None
         assert_eq!(get_prefecture_name(4), None); // BS
         assert_eq!(get_prefecture_name(6), None); // CS
+    }
+
+    #[test]
+    fn prefecture_codes_follow_jis_x_0401() {
+        assert_eq!(prefecture_code("北海道"), Some(1));
+        assert_eq!(prefecture_code("東京"), Some(13));
+        assert_eq!(prefecture_code("沖縄"), Some(47));
+        for (code, name) in [
+            (2, "青森"), (3, "岩手"), (4, "宮城"), (5, "秋田"), (6, "山形"), (7, "福島"),
+            (8, "茨城"), (9, "栃木"), (10, "群馬"), (11, "埼玉"), (12, "千葉"), (14, "神奈川"),
+            (15, "新潟"), (16, "富山"), (17, "石川"), (18, "福井"), (19, "山梨"), (20, "長野"),
+            (21, "岐阜"), (22, "静岡"), (23, "愛知"), (24, "三重"), (25, "滋賀"), (26, "京都"),
+            (27, "大阪"), (28, "兵庫"), (29, "奈良"), (30, "和歌山"), (31, "鳥取"), (32, "島根"),
+            (33, "岡山"), (34, "広島"), (35, "山口"), (36, "徳島"), (37, "香川"), (38, "愛媛"),
+            (39, "高知"), (40, "福岡"), (41, "佐賀"), (42, "長崎"), (43, "熊本"), (44, "大分"),
+            (45, "宮崎"), (46, "鹿児島"),
+        ] { assert_eq!(prefecture_code(name), Some(code)); }
+        assert_eq!(prefecture_code("未知"), None);
     }
 
     #[test]
