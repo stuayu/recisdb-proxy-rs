@@ -12,6 +12,13 @@ test('builds an offline-safe pairing connection for QR and copy', () => {
   })
 })
 
+test('uses the first enabled candidate for the pairing connection', () => {
+  assert.equal(
+    pairingConnectionText(['http://100.64.0.3:40071', 'http://192.168.1.10:40071'], 'ABCD-EFGH'),
+    'recisdb://pair?endpoint=http%3A%2F%2F100.64.0.3%3A40071&code=ABCD-EFGH',
+  )
+})
+
 test('encodes pairing text as QR data and detects expiry', async () => {
   const svg = await QRCode.toString(pairingConnectionText('https://node.example', 'ABCD-EFGH'), {
     type: 'svg',

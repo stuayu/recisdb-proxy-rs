@@ -1344,13 +1344,13 @@ mod tests {
             web_listen_addr: "0.0.0.0:40080".into(),
             db_path: "recisdb-proxy.db".into(),
             mirakurun_enabled: true,
-            mirakurun_home_region: Some("福島".into()),
+            mirakurun_home_region: Some("大阪".into()),
             preview_command_path: Some(r"C:\x\ffmpeg.exe".into()),
             ..Default::default()
         });
         let value: toml::Value = toml::from_str(&enabled).unwrap();
         assert_eq!(value["mirakurun"]["enabled"].as_bool(), Some(true));
-        assert_eq!(value["mirakurun"]["home_region"].as_str(), Some("福島"));
+        assert_eq!(value["mirakurun"]["home_region"].as_str(), Some("大阪"));
         assert_eq!(value["preview"]["command_path"].as_str(), Some(r"C:\x\ffmpeg.exe"));
     }
 

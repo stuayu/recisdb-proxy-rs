@@ -15,7 +15,7 @@ use crate::database::ProgramUpsert;
 use crate::logging::LogBuffer;
 use crate::metrics::system::SystemMetricsCollector;
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::{EncoderPool, TunerPool};
+use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::auth::AuthConfig;
 
 /// Scan scheduler configuration (for Web API).
@@ -130,6 +130,8 @@ pub struct SessionInfo {
     pub override_priority: Option<i32>,
     /// Server override exclusive lock (if set).
     pub override_exclusive: Option<bool>,
+    /// Whether this session's live claim currently locks its reader.
+    pub locked: bool,
     /// Metrics history (last 60 seconds).
     pub metrics_history: SessionMetricsHistory,
     /// Chunks skipped due to broadcast::Receiver lag (unit: broadcast
@@ -159,16 +161,22 @@ impl SessionInfo {
 }
 
 /// Registry for tracking active sessions.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<u64, SessionInfo>>,
     shutdown_txs: RwLock<HashMap<u64, mpsc::Sender<()>>>,
+    claim_bindings: RwLock<HashMap<u64, ClaimBinding>>,
     /// Source of session ids for **every** transport. BNDP used to count its
     /// own accepted connections; HTTP sessions share the same id space (they
     /// live in the same map and are addressed by the same
     /// `POST /api/clients/:id/disconnect`), so the counter has to be shared
     /// or the two would collide.
     next_id: std::sync::atomic::AtomicU64,
+}
+
+struct ClaimBinding {
+    tuner: Arc<SharedTuner>,
+    claim_id: u64,
 }
 
 /// Session metrics history for sparklines.
@@ -230,6 +238,7 @@ impl SessionRegistry {
         Self {
             sessions: RwLock::new(HashMap::new()),
             shutdown_txs: RwLock::new(HashMap::new()),
+            claim_bindings: RwLock::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -276,6 +285,7 @@ impl SessionRegistry {
             client_exclusive: false,
             override_priority: None,
             override_exclusive: None,
+            locked: false,
             metrics_history: SessionMetricsHistory::default(),
             loss_broadcast_lag_chunks: 0,
             loss_ts_queue_chunks: 0,
@@ -293,6 +303,47 @@ impl SessionRegistry {
     pub async fn unregister(&self, id: u64) {
         self.sessions.write().await.remove(&id);
         self.shutdown_txs.write().await.remove(&id);
+        self.claim_bindings.write().await.remove(&id);
+    }
+
+    /// Associate a dashboard session with its live tuner claim.  The binding
+    /// lets an override update the actual claim immediately, without waiting
+    /// for the next SetChannel request.
+    pub async fn bind_tuner_claim(&self, id: u64, tuner: Arc<SharedTuner>, sub: &TunerSubscription) {
+        // An untracked subscription has no claim to update; nothing to bind.
+        let Some(claim_id) = sub.claim_id() else {
+            return;
+        };
+        self.claim_bindings
+            .write()
+            .await
+            .insert(id, ClaimBinding { tuner: Arc::clone(&tuner), claim_id });
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.locked = tuner.claim(claim_id).is_some_and(|claim| claim.exclusive);
+        }
+    }
+
+    pub async fn unbind_tuner_claim(&self, id: u64) {
+        self.claim_bindings.write().await.remove(&id);
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.locked = false;
+        }
+    }
+
+    async fn refresh_bound_claim(&self, id: u64, priority: Option<i32>, exclusive: bool) {
+        let binding = self.claim_bindings.read().await.get(&id).map(|b| {
+            (Arc::clone(&b.tuner), b.claim_id)
+        });
+        let Some((tuner, claim_id)) = binding else {
+            return;
+        };
+        let claim = tuner.claim(claim_id);
+        let priority = priority.unwrap_or_else(|| claim.map(|c| c.priority).unwrap_or(0));
+        if tuner.update_claim(claim_id, priority, exclusive) {
+            if let Some(info) = self.sessions.write().await.get_mut(&id) {
+                info.locked = exclusive;
+            }
+        }
     }
 
     /// Update session tuner path.
@@ -390,6 +441,8 @@ impl SessionRegistry {
                 info.client_exclusive = e;
             }
         }
+        let (priority, exclusive) = self.get_effective_controls(id).await.unwrap_or((None, false));
+        self.refresh_bound_claim(id, priority, exclusive).await;
     }
 
     /// Update server override controls (use None to clear).
@@ -407,6 +460,8 @@ impl SessionRegistry {
                 info.override_exclusive = e;
             }
         }
+        let (priority, exclusive) = self.get_effective_controls(id).await.unwrap_or((None, false));
+        self.refresh_bound_claim(id, priority, exclusive).await;
     }
 
     /// Get effective controls (override if set, otherwise client values).
@@ -673,6 +728,29 @@ mod tests {
         assert_eq!(info.top_loss_pids, vec![(0x0100, 5), (0x0200, 2)]);
     }
 
+    #[tokio::test]
+    async fn override_exclusive_updates_live_claim_immediately() {
+        let registry = SessionRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let _shutdown_rx = registry.register(7, addr, SessionProtocol::Bndp).await;
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::ChannelKey::simple("/dev/test", 1),
+            2,
+        );
+        let sub = tuner.subscribe_with_claim(10, true);
+        let claim_id = sub.claim_id().unwrap();
+        registry
+            .bind_tuner_claim(7, Arc::clone(&tuner), &sub)
+            .await;
+
+        registry
+            .update_override_controls(7, None, Some(Some(false)))
+            .await;
+
+        assert!(!tuner.claim(claim_id).unwrap().exclusive);
+        assert!(!registry.get_all().await[0].locked);
+    }
+
     #[test]
     fn session_info_loss_fields_serialize_to_json() {
         let info = SessionInfo {
@@ -697,6 +775,7 @@ mod tests {
             client_exclusive: false,
             override_priority: None,
             override_exclusive: None,
+            locked: false,
             metrics_history: SessionMetricsHistory::default(),
             loss_broadcast_lag_chunks: 4,
             loss_ts_queue_chunks: 1,

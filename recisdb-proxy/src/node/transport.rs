@@ -79,6 +79,8 @@ impl Default for NodeCapabilities {
 pub struct NodeHello {
     pub identity: NodeIdentity,
     pub capabilities: NodeCapabilities,
+    /// Older nodes omit this field. An empty list remains a valid response.
+    #[serde(default)]
     pub endpoints: Vec<NodeEndpoint>,
 }
 
@@ -256,6 +258,9 @@ pub struct NodeTransportState {
     pub display_name: Arc<RwLock<String>>,
     pub capabilities: NodeCapabilities,
     pub endpoints: Arc<RwLock<Vec<NodeEndpoint>>>,
+    /// Listener address used to derive fresh peer-reachable advertisements.
+    /// `None` is retained for unit-test states that do not serve a listener.
+    pub node_listen_addr: Option<SocketAddr>,
     pub routes: Arc<RwLock<Vec<ReceptionRouteAdvertisement>>>,
     pub peers: Arc<RwLock<HashMap<NodeId, NodeCredential>>>,
     pub leases: Arc<RemoteLeaseManager>,
@@ -277,6 +282,7 @@ impl NodeTransportState {
             identity,
             capabilities: NodeCapabilities::default(),
             endpoints: Arc::new(RwLock::new(Vec::new())),
+            node_listen_addr: None,
             routes: Arc::new(RwLock::new(Vec::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             leases,
@@ -303,6 +309,20 @@ impl NodeTransportState {
     pub fn with_database(mut self, database: DatabaseHandle) -> Self {
         self.database = Some(database);
         self
+    }
+
+    /// Attach the derived listener address so hello responses can advertise
+    /// actual interface addresses instead of a wildcard bind address.
+    pub fn with_node_listen_addr(mut self, node_listen_addr: SocketAddr) -> Self {
+        self.node_listen_addr = Some(node_listen_addr);
+        self
+    }
+
+    pub async fn advertised_endpoints(&self) -> Vec<NodeEndpoint> {
+        if let Some(listen_addr) = self.node_listen_addr {
+            return super::discovery::discover_advertised_endpoints(listen_addr).await;
+        }
+        self.endpoints.read().await.clone()
     }
 
     /// Offer this node's own tuners to peers.
@@ -520,7 +540,7 @@ async fn hello(State(state): State<Arc<NodeTransportState>>, headers: HeaderMap)
     Json(NodeHello {
         identity: state.current_identity().await,
         capabilities: state.capabilities.clone(),
-        endpoints: state.endpoints.read().await.clone(),
+        endpoints: state.advertised_endpoints().await,
     })
     .into_response()
 }
@@ -850,9 +870,17 @@ pub struct NodeTransportClient {
     h2c: reqwest::Client,
 }
 
+/// TCP connect bound for node-to-node requests (see `NodeTransportClient::new`).
+const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl NodeTransportClient {
     pub fn new(identity: NodeId, credential: NodeCredential) -> Result<Self, reqwest::Error> {
+        // Without a connect timeout an unreachable endpoint (e.g. an IPv6
+        // Tailscale address on a peer listening on 0.0.0.0) blocks each probe
+        // request for the OS SYN timeout (~21s on Windows); a 5-sample probe
+        // then took ~100s. Streams are long-lived, so only connect is bounded.
         let https = reqwest::Client::builder()
+            .connect_timeout(NODE_CONNECT_TIMEOUT)
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
@@ -860,6 +888,7 @@ impl NodeTransportClient {
             .build()?;
         let h2c = reqwest::Client::builder()
             .http2_prior_knowledge()
+            .connect_timeout(NODE_CONNECT_TIMEOUT)
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
@@ -898,9 +927,14 @@ impl NodeTransportClient {
     ) -> Result<PairingAcceptance, reqwest::Error> {
         let base = base.trim_end_matches('/');
         let client = if base.starts_with("http://") {
-            reqwest::Client::builder().http2_prior_knowledge().build()?
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .connect_timeout(NODE_CONNECT_TIMEOUT)
+                .build()?
         } else {
-            reqwest::Client::builder().build()?
+            reqwest::Client::builder()
+                .connect_timeout(NODE_CONNECT_TIMEOUT)
+                .build()?
         };
         client
             .post(format!("{base}/node/v3/pair"))
@@ -1130,12 +1164,12 @@ mod tests {
     async fn auth_rejects_wrong_peer_token() {
         let state = Arc::new(NodeTransportState::new(
             NodeIdentity {
-                node_id: NodeId::new("gunma").unwrap(),
-                display_name: "群馬".into(),
+                node_id: NodeId::new("site-b").unwrap(),
+                display_name: "拠点B".into(),
             },
             Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
         ));
-        let peer = NodeId::new("fukushima").unwrap();
+        let peer = NodeId::new("site-a").unwrap();
         state
             .trust_peer(peer.clone(), NodeCredential::random())
             .await;
@@ -1152,14 +1186,53 @@ mod tests {
         );
     }
 
+    /// The client speaks HTTP/2 prior-knowledge; the listener must accept it
+    /// over a real socket. Without axum's `http2` feature the server only
+    /// spoke HTTP/1.1 and every node request was reset (in-process router
+    /// tests never noticed).
+    #[tokio::test]
+    async fn listener_accepts_http2_prior_knowledge_over_tcp() {
+        let state = Arc::new(NodeTransportState::new(
+            NodeIdentity {
+                node_id: NodeId::new("site-b").unwrap(),
+                display_name: "拠点B".into(),
+            },
+            Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
+        ));
+        let addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        let server = tokio::spawn(serve_h2c(addr, state));
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/node/v3/hello");
+        let mut status = None;
+        for _ in 0..50 {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    status = Some(resp.status().as_u16());
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        server.abort();
+        // Unauthenticated hello: the point is that an h2c request got an
+        // HTTP answer at all instead of a connection reset.
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED.as_u16()));
+    }
+
     fn test_state_with_db() -> (Arc<NodeTransportState>, DatabaseHandle) {
         let db = crate::database::Database::open_in_memory().unwrap();
         let database: DatabaseHandle = Arc::new(tokio::sync::Mutex::new(db));
         let state = Arc::new(
             NodeTransportState::new(
                 NodeIdentity {
-                    node_id: NodeId::new("fukushima").unwrap(),
-                    display_name: "福島".into(),
+                    node_id: NodeId::new("site-a").unwrap(),
+                    display_name: "拠点A".into(),
                 },
                 Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
             )
@@ -1172,11 +1245,24 @@ mod tests {
         PairingRequest {
             code: code.to_string(),
             identity: NodeIdentity {
-                node_id: NodeId::new("tokyo").unwrap(),
-                display_name: "東京".into(),
+                node_id: NodeId::new("site-c").unwrap(),
+                display_name: "拠点C".into(),
             },
-            endpoints: vec![NodeEndpoint::direct("http://tokyo.tailnet:20773")],
+            endpoints: vec![NodeEndpoint::direct("http://site-c.example.com:20773")],
         }
+    }
+
+    #[test]
+    fn old_hello_without_endpoints_deserializes() {
+        let value = serde_json::json!({
+            "identity": {
+                "node_id": "old-node",
+                "display_name": "旧ノード"
+            },
+            "capabilities": NodeCapabilities::default(),
+        });
+        let hello: NodeHello = serde_json::from_value(value).unwrap();
+        assert!(hello.endpoints.is_empty());
     }
 
     /// Reachability is not authentication: without a live code the request is
@@ -1210,7 +1296,7 @@ mod tests {
         let response = pair(State(Arc::clone(&state)), Json(peer_request(code.as_str()))).await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let peer = NodeId::new("tokyo").unwrap();
+        let peer = NodeId::new("site-c").unwrap();
         let credential = state
             .peers
             .read()
@@ -1223,6 +1309,10 @@ mod tests {
             let store = NodeStore::new(&db).unwrap();
             assert_eq!(store.credential_for(&peer).unwrap().unwrap(), credential);
             assert_eq!(store.endpoints(&peer).unwrap().len(), 1);
+            assert_eq!(
+                store.endpoints(&peer).unwrap()[0].address,
+                "http://site-c.example.com:20773"
+            );
         }
 
         // Replaying the same code must not pair anything else.
@@ -1366,7 +1456,7 @@ mod tests {
         );
         assert_eq!(restarted.reload_peers().await.unwrap(), 1);
 
-        let peer = NodeId::new("tokyo").unwrap();
+        let peer = NodeId::new("site-c").unwrap();
         let credential = restarted.peers.read().await.get(&peer).cloned().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-recisdb-node-id", peer.as_str().parse().unwrap());
@@ -1402,7 +1492,7 @@ mod tests {
             let db = database.lock().await;
             let store = NodeStore::new(&db).unwrap();
             store
-                .set_node_enabled(&NodeId::new("tokyo").unwrap(), false)
+                .set_node_enabled(&NodeId::new("site-c").unwrap(), false)
                 .unwrap();
         }
         let restarted = Arc::new(
@@ -1420,7 +1510,7 @@ mod tests {
         let leases = Arc::new(RemoteLeaseManager::new(LeasePolicy::default()));
         let lease = leases
             .create(
-                NodeId::new("fukushima").unwrap(),
+                NodeId::new("site-a").unwrap(),
                 "r".into(),
                 LogicalMuxId { nid: 1, tsid: 1 },
                 None,

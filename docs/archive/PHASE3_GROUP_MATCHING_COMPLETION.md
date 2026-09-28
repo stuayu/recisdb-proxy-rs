@@ -178,7 +178,7 @@ client.open_tuner_with_group("PX-MLT")?;
 
 // グループ内のすべてのドライバー対応チャネルを見ることが可能
 let spaces = group_info.all_virtual_spaces();  // [0, 1, 2, 3, ...]
-let space_name = group_info.get_space_name(0); // "福島" など
+let space_name = group_info.get_space_name(0); // "地域A" など
 
 // チャネル選局（自動ドライバー選択）
 client.set_channel_space_in_group("PX-MLT", 0, 23, 0, false)?;

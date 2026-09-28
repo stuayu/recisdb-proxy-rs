@@ -102,7 +102,7 @@ onMounted(async () => {
     <section v-if="!loading && !nodes.length" class="panel empty">
       <h3>まだ別のPCは接続されていません</h3>
       <p>
-        東京のPCから地方局を視聴、別PCの空いているチューナー利用、故障時の別拠点切り替えができます。
+        ある拠点のPCから地方局を視聴、別PCの空いているチューナー利用、故障時の別拠点切り替えができます。
       </p>
       <button class="button" @click="wizard = true">＋ 最初のPCを追加</button>
       <NodeAdvancedSettings @saved="load" />

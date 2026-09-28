@@ -515,9 +515,8 @@ P2b に残した (下記)。
     は既存の `Busy { id, running, max }` へ (`running`/`max` の診断値は
     `acquire()` が知る必要のない HTTP 固有の情報なのでここで計算する)。
   - `AcquireRequest` の組み立て: 候補は `resolved.channel_key` の 1 つのみ
-    (フォールバック探索なし)、`exclusive: false` (HTTP 視聴要求は他セッションの
-    ライブ購読者と競合しない、という既存の保証を「`exclusive` 分岐が
-    到達しない」という構造で維持)、`carried_permit`/`warm` は常に `None`
+    (フォールバック探索なし)、`exclusive: false` (HTTP 視聴要求は既存の
+    exclusive reader をロックとして尊重)、`carried_permit`/`warm` は常に `None`
     (HTTP 経路はどちらも保持したことがない)。
   - `priority` には `resolved.channel.priority` (このチャンネル自身の DB
     優先度) を採用する。`session.rs` の `SetChannelSpace` がクライアント
@@ -532,10 +531,9 @@ P2b に残した (下記)。
       優先度で条件付けてはならない。
     - その後に走る `decide()` の容量制限 eviction は、旧経路が
       `Busy` を返して諦めていた場面に**追加の**退避機会を与えるだけ。
-    - `exclusive: false` なので、購読者のいるリーダーを奪う分岐
-      (`decide_exclusive_at_capacity`) には到達しない。「HTTP リクエストが
-      他セッションのライブ視聴を止めることはない」という既存の保証は
-      構造で維持されている。
+    - `exclusive: false` でも高 priority の HTTP/Mirakurun 要求は、非ロックの
+      live reader を退避できる。既存の exclusive reader は用途に関係なく
+      ロックとして保護される。
 
     P2b-3 で優先度比較を `>=` から `>` に変える際、この経路も同じ規則に
     従う (同値では退避しない)。
@@ -631,13 +629,13 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
 `&mut Option<SlotPermit>` として候補間で持ち回り、消費されなければ次の候補へ、
 全候補が失敗したら旧チューナーへ返す。順序規則の統一は P2b-3 の判断事項。
 
-**挙動を保つために `exclusive: false` を渡している経路が 2 つある**:
+**旧設計で `exclusive: false` を渡していた経路が 2 つある**:
 - v1 選局 … 旧実装は購読者のいるリーダーを退避したことがなく、容量不足なら
   単に CONFLICT を返していた。
 - 論理チャンネル選局 … 同様に、退避せず次の候補へ移っていた。
 
-どちらも `decide()` の非排他分岐しか通らないため、退避対象は idle のみに
-限られる。v2 と揃えるかどうかは P2b-3 で判断する。
+現在は両経路とも同じ claim 比較を通り、非ロックの live reader は優先度により
+退避対象になる。既存 exclusive reader は lock として退避不可。
 
 ### P2b-3 — eviction ポリシーの一本化 (実装済み)
 
@@ -657,9 +655,13 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
 5. それでも駄目なら `Reject`。
 
 `may_evict(req, victim)` は、要求側の client claim と居座り側の client claim を
-同じ `(priority, exclusive)` 物差しで比較する。以前は要求側が client priority、
-居座り側が DB channel priority で、比較する値の出自が揃っていなかった。この差分と
-最低保持時間・warming の扱いは `docs/TUNER_SELECTION_LIVELOCK_2026-08.md` に記録する。
+同じ `(priority, exclusive)` 物差しで比較する。居座り側に live な exclusive claim が
+1つでもあれば、その reader はロック中として要求の priority・用途に関係なく退避不可。
+keep-alive 残骸は claim が無いためロックしない。
+
+チャンネル切替では snapshot 作成時に要求元 subscription の claim ID だけを incumbent
+集計から除外する。他の購読者の claim は残るため、低優先度の相乗り相手なら旧 reader
+を退避でき、高優先度の相手なら拒否する。
 
 ```text
 (req.priority, req.exclusive) > (victim.priority, victim.incumbent_exclusive)
@@ -667,8 +669,8 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
 
 - **同値では奪わない** (`>=` → `>`)。同順位の要求が先着を蹴散らしても得るものが
   無く、動いているストリームを切るだけだったため。
-- **`exclusive` は辞書式比較のタイブレーク**。同順位で incumbent も exclusive
-  なら奪わず、非 exclusive には勝つ。
+- **要求側の `exclusive` は辞書式比較のタイブレーク**。同順位で要求側だけ
+  exclusive なら勝つ。既存側の `exclusive` はタイブレークではなく reader ロック。
 
 **`max_instances` を超えて作ることは無くなった。** 従来、容量到達かつ idle の
 退避候補が無い場合は、退避もフォールバックも拒否もせずそのまま追加のリーダーを
@@ -686,6 +688,16 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
 - 論理チャンネル選局 … BNDP の `SelectLogicalChannel` に排他フラグが無いため
   `false`。優先度で上回れば退避は起きる (`exclusive` はタイの判定のみ)。
 - HTTP / Mirakurun … `false`。
+
+#### 排他 claim の手動解除
+
+`GET /api/clients` は各セッションの `locked`、`effective_exclusive`、
+`lock_override` を返す。概要画面の「ロック解除」は
+`POST /api/clients/:id/controls` に `{"override_exclusive":false}` を送り、
+registry が live subscription claim を即時更新する。`null` はクライアント設定へ戻す。
+解除は BNDP、HTTP、Mirakurun の登録セッションに適用される。ロックで拒否した要求は
+`RejectReason::Locked` → `AcquireError::Locked` として伝播し、同じ組み合わせの WARN は
+1分間集約する。
 
 `decide_fallback` も優先度を見るようになった。従来は「最初に見つかった idle」を
 無条件に退避しており、プライマリドライバなら守られるはずの高優先度 idle が
@@ -936,7 +948,7 @@ prefill (既定 1 秒) の後に出る。固定 4 秒のドレインでは、サ
 
 | 経路 / パターン | 結果 |
 |---|---|
-| 排他選局 (`exclusive=true`、同値優先度) | 通過し、視聴者 1 人を退避 |
+| 排他選局 (`exclusive=true`、同値優先度) | 非ロック視聴者を退避。既存 exclusive reader はロックで拒否 |
 | `SelectLogicalChannel` (NID/TSID 指定) | 選局・受信とも成立 |
 | 切断 → 再接続 (keep-alive 合流) | `create=1, reuse=1` |
 | HTTP と BNDP が同一物理チャンネル | `create=1, reuse=1` (1 チューナーを共有) |
@@ -1017,8 +1029,22 @@ P1b でスロットが permit 制になったため、症状は「そのドラ�
 - **チャンネル列挙順は変更しない**。`server/client_view.rs` と channels テーブルの
   内容に触れないため、`.ch2` / ChSet の再生成は不要。
 - DB スキーマ変更なし (`MIGRATIONS` への追記は発生しない)。
-- BNDP プロトコルは P4 の退避通知メッセージ追加のみ。それまでは互換。
-- `bondriver-proxy-client` 側は P4 まで変更なし。
+- BNDP メッセージ形式は変更なし。remote fallback は既存の
+  `SetChannelSpace` / `SetChannel` / `SelectLogicalChannel` にサーバ側で接続。
+- `bondriver-proxy-client` のDLL exportsは変更なし。Rust rlibと、Mac/Linuxから
+  同じBNDP経路を試験する `examples/bndp_probe.rs` を追加。
+
+## 5.1 ノード間 remote fallback (2026-09)
+
+`server/channel_resolve.rs` の `should_try_remote_fallback` が、HTTP/Mirakurunと
+BNDPのAcquireError判定を共有する。`Locked`もHTTPと同じくremote試行対象。
+lease生成は `open_remote_source_for_mux` に集約し、Sessionは要求のNID/TSID・claim・
+StreamClassを渡して成功後の状態適用だけを行う。
+
+Sessionの配信源はlocal `TunerSubscription`かremote `RemoteMuxStream`+broadcast
+Receiverの排他的状態。remote dropでleaseをreleaseし、TTLを最後の保険にする。
+供給側 `node/serve.rs::LocalMuxServer::open_lease` は `local_candidates` と
+`acquire`だけを呼び、remote fallbackを呼ばない。これでBNDP多段ループを作らない。
 
 ## 6. リスク
 
@@ -1026,7 +1052,8 @@ P1b でスロットが permit 制になったため、症状は「そのドラ�
   により、プール・ポリシー層は CI で検証可能になるが、DLL 実挙動 (SetChannel の
   遅延、EALREADY、GetTsStream の切り詰め) は実機確認が必要。
 - P2 は 3 経路の挙動差を意図的に潰すため、既存クライアントの体感が変わる箇所が
-  ある (特に排他選局時の退避対象)。P0 で現状挙動をテストに固定してから変更する。
+  ある。現在は既存 exclusive reader をロックとして保護し、ダッシュボードから
+  セッション単位で手動解除できる。
 
 ## 7. `OpenTuner` 連続失敗のバックオフとログ抑制 (2026-08-11)
 

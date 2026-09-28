@@ -873,7 +873,8 @@ async fn run_server(
                 let state = Arc::new(
                     recisdb_proxy::node::NodeTransportState::new(identity.clone(), leases)
                         .with_database(db.clone())
-                        .with_mux_server(mux_server),
+                        .with_mux_server(mux_server)
+                        .with_node_listen_addr(node_addr),
                 );
                 match state.reload_peers().await {
                     Ok(count) => info!(

@@ -27,7 +27,8 @@ pub mod types;
 
 pub use consume::{ConsumeError, RemoteMuxStream};
 pub use discovery::{
-    classify_tailscale_ping, discover_tailscale_endpoint, inspect_tailscale_path, probe_endpoint,
+    build_advertised_endpoints, classify_tailscale_ping, discover_advertised_endpoints,
+    discover_tailscale_endpoint, inspect_tailscale_path, parse_interface_addresses, probe_endpoint,
     ProbeConfig,
 };
 pub use frame::{FrameFlags, NodeTsFrame};

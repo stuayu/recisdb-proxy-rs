@@ -63,7 +63,7 @@ DLL差し替えモードの「更新元のDLL」は、未指定なら次の順�
 - アクセス範囲はLAN。Web認証は常に有効です。「このPCだけ」を選ぶとWeb/APIと視聴接続をループバックに限定します。
 - Windowsでは、LANを選んだ場合に `recisdb-proxy.exe` 単位の受信許可ルールを Private/Domain だけへ追加できます。失敗時は画面ログの手動コマンドを使います。Publicは開きません。
 - Linux/macOSでは、ファイアウォール使用時に視聴ポート、ノード間ポート(視聴ポート+1)、Webポートを許可します。既定は `40070`、`40071`、`40080` です。
-- Mirakurun互換APIは既定でOFFです。EPGStation等から使う場合だけONにします。認証なしAPIのため、信頼できるネットワークでのみ有効にします。関東広域は地元を「東京」にします。
+- Mirakurun互換APIは既定でOFFです。EPGStation等から使う場合だけONにします。認証なしAPIのため、信頼できるネットワークでのみ有効にします。地元設定の例には「大阪」を使います。
 - 分散ノード名はOSのホスト名が初期値です。空欄なら自動生成名を使います。
 - ブラウザプレビューはffmpeg + tsreadexを検出または自動取得します。TVTest向けtsreplaceは別チェックです。Linux/macOSはPATH上の実行ファイルを検出します。Windowsで未導入の場合は既存配置またはPATHを案内します。
 - Windowsでは「BS4Kチューナーを使う」を有効にすると、dantto4kのBonDriverラッパーを取得し、選択した基底BonDriverと同じフォルダへ配置してBS4K用として登録します。基底DLLは通常登録から除外され、`stream_format=ts` / `disable_b25=true`になります。4Kはチャンネル一覧の末尾へ追加されるため、完了後にTVTestの`.ch2`を再生成してください。

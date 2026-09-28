@@ -2,9 +2,9 @@
 import QRCode from 'qrcode'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../../api'
-import type { IssuedPairing, ProbeResponse } from './types'
+import type { IssuedPairing, NodeEndpoint, NodesResponse, ProbeResponse } from './types'
 import { nodeError } from './errors'
-import { isPairingExpired, pairingConnectionText, parsePairingConnection } from './pairing'
+import { isPairingExpired, isUsablePairingEndpoint, pairingConnectionText, parsePairingConnection } from './pairing'
 const emit = defineEmits<{ close: []; complete: [] }>()
 const step = ref(1)
 const purpose = ref('both')
@@ -12,6 +12,8 @@ const connection = ref('')
 const issuing = ref(false)
 const redeeming = ref(false)
 const issued = ref<IssuedPairing | null>(null)
+const localEndpoints = ref<NodeEndpoint[]>([])
+const loadingEndpoints = ref(false)
 const error = ref('')
 const diagnostic = ref<ProbeResponse | null>(null)
 const rolledBack = ref(false)
@@ -21,9 +23,16 @@ const dialog = ref<HTMLElement | null>(null)
 const qrCanvas = ref<HTMLCanvasElement | null>(null)
 const now = ref(Date.now())
 const expired = computed(() => !!issued.value && isPairingExpired(issued.value.expires_at_unix_ms, now.value))
-const pairingText = computed(() =>
-  issued.value ? pairingConnectionText(issued.value.node_listen_addr || '', issued.value.code) : '',
-)
+const pairingText = computed(() => {
+  if (!issued.value) return ''
+  const candidates = issued.value.endpoints?.filter((endpoint) => endpoint.enabled).map((endpoint) => endpoint.address) || []
+  const legacy = issued.value.node_listen_addr || ''
+  return pairingConnectionText(candidates.length ? candidates : isUsablePairingEndpoint(legacy) ? legacy : '', issued.value.code)
+})
+const pairingEndpoint = computed(() => {
+  const endpoint = issued.value?.endpoints?.find((candidate) => candidate.enabled)?.address || ''
+  return endpoint || (issued.value?.node_listen_addr && isUsablePairingEndpoint(issued.value.node_listen_addr) ? issued.value.node_listen_addr : '')
+})
 let clock: ReturnType<typeof setInterval> | undefined
 function keydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
@@ -60,6 +69,30 @@ watch([issued, step], () => {
     width: 240,
   })
 })
+watch(step, (value) => {
+  if (value === 3 && !localEndpoints.value.length) void loadLocalEndpoints()
+})
+function endpointKindLabel(kind: NodeEndpoint['kind']): string {
+  return ({
+    tailscale: 'Tailscale',
+    lan: 'LAN',
+    internet_direct: 'その他',
+    cloudflare_private: 'Cloudflare Private',
+    cloudflare_public: 'Cloudflare Public',
+    static: '手動',
+  })[kind]
+}
+async function loadLocalEndpoints() {
+  loadingEndpoints.value = true
+  try {
+    const result = await api<NodesResponse>('/nodes')
+    localEndpoints.value = (result.local.endpoints || []).map((endpoint) => ({ ...endpoint }))
+  } catch (cause) {
+    error.value = `接続先候補を取得できません: ${nodeError(cause)}`
+  } finally {
+    loadingEndpoints.value = false
+  }
+}
 async function issue() {
   issuing.value = true
   error.value = ''
@@ -92,7 +125,7 @@ async function redeem() {
   try {
     const result = await api<{ node: { node_id: string } }>('/nodes/pairing/redeem', {
       method: 'POST',
-      body: JSON.stringify({ base_url: pair.base_url, code: pair.code, endpoints: [] }),
+      body: JSON.stringify({ base_url: pair.base_url, code: pair.code, endpoints: localEndpoints.value }),
     })
     rollbackNodeId.value = result.node.node_id
     diagnostic.value = await api<ProbeResponse>(
@@ -133,6 +166,7 @@ function retry() {
   step.value = 1
   issued.value = null
   connection.value = ''
+  localEndpoints.value = []
   diagnostic.value = null
   rolledBack.value = false
   error.value = ''
@@ -173,13 +207,16 @@ async function copyPairing() {
           <p v-if="expired" class="notice error" role="alert">
             接続情報の有効期限が切れています。再発行してください。
           </p>
-          <div v-else class="qr-box">
+          <div v-else-if="pairingEndpoint" class="qr-box">
             <canvas ref="qrCanvas" role="img" aria-label="ペアリング接続情報のQRコード" />
             <span>QRを読み取って接続できます。</span>
           </div>
+          <p v-else class="notice warning" role="alert">
+            到達可能な接続先を検出できません。ネットワーク接続を確認して再発行してください。
+          </p>
           <code class="pairing-text">{{ pairingText }}</code>
           <div class="actions">
-            <button class="button secondary" :disabled="expired" @click="copyPairing">
+            <button class="button secondary" :disabled="expired || !pairingEndpoint" @click="copyPairing">
               接続情報をコピー
             </button>
           </div>
@@ -209,8 +246,21 @@ async function copyPairing() {
           <summary>通信方法を手動指定</summary>
           <p>LAN → Tailscale → Cloudflare Private → Static → Direct HTTPS → Cloudflare Public</p>
         </details>
+        <div class="endpoint-picker">
+          <p><strong>このPCの接続先</strong></p>
+          <p class="muted">相手PCから到達できる候補です。必要なものを選択し、URLを編集できます。</p>
+          <p v-if="loadingEndpoints" class="muted">候補を取得中…</p>
+          <p v-else-if="!localEndpoints.length" class="notice warning" role="alert">
+            候補なし。相手PCから到達できるネットワーク接続を確認してください。
+          </p>
+          <label v-for="(endpoint, index) in localEndpoints" :key="index" class="endpoint-option">
+            <input v-model="endpoint.enabled" type="checkbox" />
+            <span class="endpoint-kind">{{ endpointKindLabel(endpoint.kind) }}</span>
+            <input v-model="endpoint.address" type="url" inputmode="url" aria-label="接続先URL" />
+          </label>
+        </div>
         <div class="actions">
-          <button class="button" :disabled="redeeming" @click="redeem">
+          <button class="button" :disabled="redeeming || loadingEndpoints" @click="redeem">
             {{ redeeming ? '診断中…' : '接続確認へ' }}</button
           ><button class="button secondary" @click="step = 2">戻る</button>
         </div>
@@ -336,6 +386,56 @@ async function copyPairing() {
 .pairing-text {
   font-size: 0.8rem !important;
   overflow-wrap: anywhere;
+}
+
+.endpoint-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  background: var(--soft);
+  border-radius: 8px;
+}
+
+.endpoint-picker p {
+  margin: 0;
+}
+
+.endpoint-option {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+}
+
+.endpoint-option input[type='url'] {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.endpoint-kind {
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 700px) {
+  .endpoint-option {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .endpoint-kind {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .endpoint-option input[type='url'] {
+    grid-column: 1 / -1;
+  }
 }
 
 /* .field's stacked-form margin would fight the dialog's grid gap. */

@@ -36,6 +36,17 @@ pub struct ServerStats {
     pub uptime_seconds: u64,
     pub total_sessions_db: u64,
     pub total_channels: u64,
+    /// Active exclusive claims. The dashboard uses this to explain why a
+    /// tuner cannot be preempted.
+    pub locked_tuners: Vec<LockedTunerInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LockedTunerInfo {
+    pub tuner_path: String,
+    pub session_id: u64,
+    pub protocol: String,
+    pub address: String,
 }
 
 /// Session history query.
@@ -46,10 +57,23 @@ pub struct SessionHistoryQuery {
     pub client_address: Option<String>,
 }
 
+/// Deserialize a present field (including `null`) as `Some(..)`.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Client control override request.
 #[derive(Debug, Deserialize)]
 pub struct ClientControlOverrideRequest {
+    // Field absent = leave unchanged, `null` = clear the override. Plain
+    // serde maps `null` to the outer `None`, which made "clear" a no-op.
+    #[serde(default, deserialize_with = "deserialize_present")]
     pub override_priority: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
     pub override_exclusive: Option<Option<bool>>,
 }
 
@@ -86,6 +110,8 @@ pub async fn get_clients(State(web_state): State<Arc<WebState>>) -> impl IntoRes
                 "override_exclusive": s.override_exclusive,
                 "effective_priority": effective_priority,
                 "effective_exclusive": effective_exclusive,
+                "locked": s.locked,
+                "lock_override": s.override_exclusive == Some(false),
                 "stream_class": s.stream_class,
                 "prefilling": s.prefilling
             })
@@ -103,7 +129,8 @@ pub async fn get_clients(State(web_state): State<Arc<WebState>>) -> impl IntoRes
 
 /// Get server statistics.
 pub async fn get_stats(State(web_state): State<Arc<WebState>>) -> impl IntoResponse {
-    let active_sessions = web_state.session_registry.count().await;
+    let sessions = web_state.session_registry.get_all().await;
+    let active_sessions = sessions.len();
     let tuner_keys = web_state.tuner_pool.keys().await;
     let total_tuners = tuner_keys.len();
 
@@ -131,6 +158,19 @@ pub async fn get_stats(State(web_state): State<Arc<WebState>>) -> impl IntoRespo
         )
     };
 
+    let locked_tuners = sessions
+        .iter()
+        .filter(|s| s.locked)
+        .filter_map(|s| {
+            Some(LockedTunerInfo {
+                tuner_path: s.tuner_path.clone()?,
+                session_id: s.id,
+                protocol: s.protocol.as_str().to_string(),
+                address: s.addr.clone(),
+            })
+        })
+        .collect();
+
     let stats = ServerStats {
         total_sessions: total_sessions_db,
         active_sessions: active_sessions as u64,
@@ -141,6 +181,7 @@ pub async fn get_stats(State(web_state): State<Arc<WebState>>) -> impl IntoRespo
         uptime_seconds: web_state.started_at.elapsed().as_secs(),
         total_sessions_db,
         total_channels,
+        locked_tuners,
     };
 
     Json(json!({
@@ -280,4 +321,21 @@ pub async fn override_client_controls(
     Json(json!({
         "success": true
     }))
+}
+
+#[cfg(test)]
+mod override_request_tests {
+    use super::ClientControlOverrideRequest;
+
+    #[test]
+    fn null_clears_and_absent_leaves_unchanged() {
+        let req: ClientControlOverrideRequest =
+            serde_json::from_str(r#"{"override_exclusive": null}"#).unwrap();
+        assert_eq!(req.override_exclusive, Some(None));
+        assert_eq!(req.override_priority, None);
+
+        let req: ClientControlOverrideRequest =
+            serde_json::from_str(r#"{"override_exclusive": false}"#).unwrap();
+        assert_eq!(req.override_exclusive, Some(Some(false)));
+    }
 }

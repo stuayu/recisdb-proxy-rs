@@ -773,9 +773,9 @@ mod tests {
         assert!(!local.node_id.as_str().is_empty());
 
         let node = StoredNode {
-            node_id: NodeId::new("gunma").unwrap(),
-            display_name: "群馬".into(),
-            site_name: Some("群馬".into()),
+            node_id: NodeId::new("site-b").unwrap(),
+            display_name: "拠点B".into(),
+            site_name: Some("拠点B".into()),
             enabled: true,
             allow_transit: false,
             auto_connect: true,
@@ -788,7 +788,7 @@ mod tests {
                 &node.node_id,
                 &[NodeEndpoint {
                     kind: EndpointKind::Tailscale,
-                    address: "http://gunma.tailnet:4512".into(),
+                    address: "http://site-b.example.com:4512".into(),
                     enabled: true,
                     record_allowed: true,
                     metered: false,
@@ -812,7 +812,7 @@ mod tests {
         let expires = chrono::Utc::now().timestamp_millis() + 600_000;
 
         store
-            .create_pending_pairing(&code, Some("東京"), expires)
+            .create_pending_pairing(&code, Some("拠点A"), expires)
             .unwrap();
         assert_eq!(store.pending_pairings().unwrap().len(), 1);
 
@@ -826,7 +826,7 @@ mod tests {
     fn duplicate_endpoints_collapse_instead_of_violating_the_unique_index() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let node = paired_node(&store, "tokyo");
+        let node = paired_node(&store, "site-a");
         let endpoint = NodeEndpoint {
             kind: EndpointKind::Lan,
             address: "http://192.0.2.10:20773".into(),
@@ -862,7 +862,7 @@ mod tests {
     fn route_group_members_can_be_renamed_removed_and_deleted() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let node = paired_node(&store, "tokyo");
+        let node = paired_node(&store, "site-a");
         let group = store.ensure_route_group("関東").unwrap();
         store.set_group_member(group, &node, 200).unwrap();
         assert_eq!(
@@ -959,7 +959,7 @@ mod tests {
     fn peer_routes_round_trip_and_keep_logical_and_physical_apart() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let peer = paired_node(&store, "tokyo");
+        let peer = paired_node(&store, "site-a");
         let mux = LogicalMuxId {
             nid: 0x0004,
             tsid: 0x4010,
@@ -994,7 +994,7 @@ mod tests {
     fn replacing_peer_routes_drops_what_is_no_longer_advertised() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let peer = paired_node(&store, "tokyo");
+        let peer = paired_node(&store, "site-a");
         let mux = LogicalMuxId {
             nid: 0x0004,
             tsid: 0x4010,
@@ -1028,7 +1028,7 @@ mod tests {
     fn quarantined_routes_are_kept_but_not_offered() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let peer = paired_node(&store, "tokyo");
+        let peer = paired_node(&store, "site-a");
         let mux = LogicalMuxId {
             nid: 0x0004,
             tsid: 0x4010,
@@ -1064,8 +1064,8 @@ mod tests {
     fn route_ids_are_namespaced_per_node() {
         let db = Database::open_in_memory().unwrap();
         let store = NodeStore::new(&db).unwrap();
-        let tokyo = paired_node(&store, "tokyo");
-        let gunma = paired_node(&store, "gunma");
+        let site_a = paired_node(&store, "site-a");
+        let site_b = paired_node(&store, "site-b");
         let mux = LogicalMuxId {
             nid: 0x0004,
             tsid: 0x4010,
@@ -1074,9 +1074,9 @@ mod tests {
 
         store
             .replace_remote_routes(
-                &tokyo,
+                &site_a,
                 &[advertisement(
-                    &tokyo,
+                    &site_a,
                     shared_id,
                     mux,
                     ReceptionRouteState::Usable,
@@ -1085,9 +1085,9 @@ mod tests {
             .unwrap();
         store
             .replace_remote_routes(
-                &gunma,
+                &site_b,
                 &[advertisement(
-                    &gunma,
+                    &site_b,
                     shared_id,
                     mux,
                     ReceptionRouteState::Usable,

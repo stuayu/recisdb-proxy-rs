@@ -92,9 +92,9 @@ LogicalService (NID/TSID/SID)
         v
 LogicalMux (NID/TSID)
         |
-        +-- ReceptionRoute: Gunma UHF xx, direct ISDB-T
-        +-- ReceptionRoute: Gunma UHF yy, weak repeater
-        +-- ReceptionRoute: Tokyo node, direct ISDB-T
+        +-- ReceptionRoute: site-a UHF xx, direct ISDB-T
+        +-- ReceptionRoute: site-a UHF yy, weak repeater
+        +-- ReceptionRoute: site-b node, direct ISDB-T
         +-- ReceptionRoute: CATV TSMF carrying logical BS
 ```
 
@@ -145,8 +145,8 @@ against real hardware.
 
 ## 3. Site and route groups
 
-A deployment can define groups such as `Kanto` containing Gunma, Tochigi,
-Ibaraki, Tokyo, Saitama and Kanagawa nodes. A group limits the search domain;
+A deployment can define groups containing site-a, site-b and other nodes. A
+group limits the search domain;
 it does not merge unrelated services.
 
 For a requested NID/TSID, only nodes advertising that logical mux are
@@ -213,15 +213,20 @@ Flow:
    backup cannot be replayed into a trusted peer, and the dashboard can only
    ever report *that* a code is outstanding and until when.
 2. On node B the operator enters A's node-transport URL and the code
-   (`POST /api/nodes/pairing/redeem`). B calls A's `POST /node/v3/pair` with its
-   own `NodeIdentity` and the endpoints A should use to reach it back.
+   (`POST /api/nodes/pairing/redeem`). The dashboard shows B's automatically
+   discovered, editable endpoint candidates (all enabled by default; Tailscale
+   first) and sends them with B's `NodeIdentity` to A's `POST /node/v3/pair`.
+   These are the endpoints A should use to reach B back.
 3. A redeems the code with a single `DELETE ... WHERE code_hash = ? AND
    expires_at_unix_ms > ?`. Because that is one statement, two concurrent
    redemptions cannot both succeed — exactly one sees a non-zero row count.
    A then generates the shared `NodeCredential`, stores B as a `remote_nodes`
    row, trusts it in memory immediately (no restart), and returns
    `PairingAcceptance { identity, credential }`.
-4. B stores the same credential against A. Both sides now authenticate with it.
+4. B stores the same credential against A. Both sides now authenticate with it,
+   and A's `remote_nodes`/`node_endpoints` rows contain B's advertised
+   endpoints. An empty endpoint list remains accepted for old clients, but it
+   does not provide a reciprocal route until an endpoint is added.
 
 Rules that must not be relaxed:
 
@@ -252,6 +257,25 @@ accepted for configuration-file compatibility but ignored. Restrict the
 resulting h2c listener with a firewall or trusted overlay. The display name can
 be changed at runtime from the dashboard's 「分散ノード」 screen, so a new
 installation needs no TOML editing.
+
+#### Endpoint advertisement
+
+The bind address is not itself a peer address. For a wildcard listener
+(`0.0.0.0` or `::`), the server enumerates addresses from the existing OS
+commands (`ip -o addr`/`ifconfig`, or Windows `ipconfig`) and also consults
+`tailscale status --json` when available. Loopback, link-local, multicast and
+unspecified addresses are omitted. Candidates are emitted as `http://` URLs on
+the node port, ordered Tailscale (`100.64.0.0/10` or
+`fd7a:115c:a1e0::/48`), private LAN, then other interface addresses. A
+non-wildcard listener contributes only that address. No new interface-discovery
+crate is required.
+
+`POST /api/nodes/pairing` keeps the legacy `node_listen_addr` field and adds an
+`endpoints` array. `GET /api/nodes` includes the same array under `local`, and
+authenticated `GET /node/v3/hello` advertises it as well. These fields use
+`#[serde(default)]` where received, so an alpha.20 peer that omits them remains
+compatible. The pairing wizard uses the first enabled candidate for the QR/text
+connection, and lets the redeeming operator uncheck or edit its own candidates.
 
 ### 4.2 Leases (`POST /node/v3/lease`)
 
@@ -296,8 +320,9 @@ Consuming side (`RemoteMuxStream`):
   peer's replay buffer no longer covers that point it answers `410 Gone`:
   **RECORD ends with an error**, VIEW/PREVIEW restart from live.
 
-Status: both halves are implemented and reachable over the transport. What is
-still missing is the *arbitration* integration — see §12.
+Status: both halves are implemented and reachable over the transport. The
+request-path arbitration fallback is now shared by HTTP/Mirakurun and BNDP
+sessions; the serving side remains local-only by construction.
 
 ### 4.3 Route advertisement sync (`GET /node/v3/routes`)
 
@@ -329,10 +354,30 @@ later instead of being deleted and rediscovered forever (§2).
 The stored picture is a **cache, not an authority**: a peer can still refuse
 the lease, and `available_slots` may already be stale when it is read.
 
-### 4.4 Using a peer from the HTTP/Mirakurun paths
+### 4.4 Using a peer from HTTP/Mirakurun and BNDP paths
 
 `channel_resolve::start_source_for_service_with_claim` returns a
 `StreamSource`: either a local `SharedTuner` or a `RemoteMuxStream`.
+
+The three BNDP selection paths (`SetChannelSpace`, v1 `SetChannel`, and
+`SelectLogicalChannel`) use the same `tuner::acquire::AcquireError` admission
+predicate (`channel_resolve::should_try_remote_fallback`) and the same
+`open_remote_source_for_mux` helper. The mux identity comes from the resolved
+channel map entry (`NID`, `TSID`); the session's canonical claim and
+`StreamClass` are passed through unchanged. This permits the operator to keep
+the site-a-side site-b `channels` rows while setting that driver's
+`max_instances=0`: local acquire fails by typed capacity/lock/start errors and
+the BNDP session opens the site-b lease directly instead of using a cascaded
+BonDriver.
+
+Session delivery is an exclusive `SessionStreamSource`: local mode owns a
+`TunerSubscription`; remote mode owns a `RemoteMuxStream` and its
+`broadcast::Receiver<Bytes>`. Replacing or dropping the remote variant sends
+lease release (with the lease TTL as backstop), including channel switches,
+`StopStream`, `PurgeStream`, `CloseTuner`, and disconnect cleanup. RECORD keeps
+the existing fatal `broadcast::Lagged` behavior. Remote BNDP signal level is
+20 dB while frames arrived within the active window, otherwise 0 dB; this
+avoids scan code treating a live peer as an absent channel.
 
 **The remote path is a fallback, never a preference.** It is only tried when
 no local tuner could serve the request. A locally receivable channel is never
@@ -576,8 +621,8 @@ NodeHealth      process / CPU / memory / workers
 TransportHealth direct / Tailscale / Cloudflare path
 ```
 
-Example: a Cloudflare path to Gunma can be Degraded while the Gunma UHF route
-remains Healthy. Route learning must preserve that distinction.
+Example: a Cloudflare path to site-a can be Degraded while the site-a UHF
+route remains Healthy. Route learning must preserve that distinction.
 
 ## 12. Implementation status
 
@@ -592,7 +637,11 @@ Done:
 
 - Node domain types, store schema, path scoring, qualification, replay/framing.
 - Node transport listener (always-on, derived from `[server] listen` port + 1),
-  wired into `main.rs` and served on its own port. A bind failure is logged while
+  wired into `main.rs` and served on its own port. The same `/node/v3/*`
+  routes are also merged into the web dashboard listener, so a site reachable
+  only through a dashboard HTTP tunnel (e.g. a Cloudflare Tunnel public
+  hostname for `web_listen`) can be paired and leased via
+  `https://<that hostname>` without publishing another port. A bind failure is logged while
   the dashboard and local proxy continue running.
 - One-time pairing (§4.1), dashboard API and the 分散ノード dashboard tab,
   including issuing/redeeming codes and per-class path probes.
@@ -612,6 +661,35 @@ Done:
   the score was permanently `1.0`.
 - Remote fallback for `GET /mirakurun/api/services/:id/stream` and
   `/programs/:id/stream` (§4.4), including per-class endpoint admission.
+- Remote fallback for BNDP `SetChannelSpace`, v1 `SetChannel`, and
+  `SelectLogicalChannel`, with the same typed error predicate and lease source
+  helper as HTTP.
+
+### 12.1 First real two-site test (2026-09-28, anonymized WAN test)
+
+The first test with two physical sites exposed three defects that no unit test
+covered, all fixed:
+
+- **The node listener spoke HTTP/1.1 only.** axum was built without its
+  `http2` feature while `NodeTransportClient` uses `http2_prior_knowledge()`,
+  so every node request (pair, hello, lease) was reset. A regression test now
+  issues an h2c request over a real TCP socket
+  (`listener_accepts_http2_prior_knowledge_over_tcp`).
+- **IPv6 endpoints were advertised by a `0.0.0.0` listener.** They could never
+  connect. A `0.0.0.0` listener now advertises IPv4 only; `::` keeps both.
+- **Unreachable endpoints made a probe take ~100 s.** Node clients now bound
+  TCP connect to 5 s, and a probe skips the download samples when every ping
+  failed.
+
+The physical two-site test confirmed the BNDP remote fallback path in a real
+environment. It also confirmed that route admission can intentionally reject
+one direction when measured capacity is below the VIEW requirement. Detailed
+bandwidth, RTT, congestion-counter and per-site switching results are omitted.
+
+The test also confirmed that a retained `channels` row with
+`max_instances=0` can resolve a service while forcing the BNDP session to open
+a remote lease. `allow_remote=true` then permits EIT retrieval as remote
+metadata. Lease release on `CloseTuner` was confirmed.
 
 Not done yet:
 
@@ -620,9 +698,6 @@ Not done yet:
   against local drivers. Ranking them in one place needs a single lease type
   covering both a local `SharedTuner` and a remote stream (the TunerManager
   step below). Until then a healthy peer cannot beat a marginal local tuner.
-- **BNDP sessions (TVTest/EDCB) have no remote fallback.** Only the
-  HTTP/Mirakurun paths do; `server/session.rs` still resolves to a
-  `SharedTuner` directly.
 - **Path selection on the request path is static, not measured** (§4.4).
 - Route-group weights are stored but not consulted during candidate
   generation.

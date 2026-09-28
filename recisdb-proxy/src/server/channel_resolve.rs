@@ -350,10 +350,35 @@ pub async fn start_tuner_for_service(
 /// `broadcast::Receiver<Bytes>` of raw TS. The distinction only matters for
 /// lifetime management, which is why it survives as far as `StreamCleanup`.
 pub enum StreamSource {
-    Local(Arc<SharedTuner>),
+    Local {
+        tuner: Arc<SharedTuner>,
+        claim: EffectiveClaim,
+        usage: crate::tuner::shared::TunerUsage,
+    },
     /// A lease on a peer's tuner (`node::consume`). The stream is kept alive
     /// by holding this handle: dropping it releases the peer's lease.
     Remote(Arc<crate::node::RemoteMuxStream>),
+}
+
+/// Acquire errors that mean this node did not produce a usable source.
+///
+/// This is the one remote-fallback admission rule. BNDP sessions and HTTP /
+/// Mirakurun must not grow separate matches: in particular, a live exclusive
+/// lock (`Locked`) is treated exactly like HTTP treats it and may fall back to
+/// a peer. Errors are listed explicitly so a newly added local error cannot
+/// silently become a network hop without a policy decision.
+pub(crate) fn should_try_remote_fallback(error: &AcquireError) -> bool {
+    matches!(
+        error,
+        AcquireError::NoCandidates
+            | AcquireError::AtCapacity { .. }
+            | AcquireError::Locked { .. }
+            | AcquireError::Warming { .. }
+            | AcquireError::Conflict(_)
+            | AcquireError::ReaderStart(_)
+            | AcquireError::Pool(_)
+            | AcquireError::OpenCooldown { .. }
+    )
 }
 
 /// End-to-end budget for finding a remote node that can serve a request.
@@ -375,34 +400,31 @@ pub async fn start_source_for_service_with_claim(
     claim: EffectiveClaim,
     stream_class: recisdb_protocol::StreamClass,
 ) -> Result<StreamSource, ChannelResolveError> {
-    let local = start_tuner_for_service_with_claim(tuner_pool, database, resolved, claim).await;
-    let local_error = match local {
-        Ok(tuner) => return Ok(StreamSource::Local(tuner)),
-        Err(e) => e,
-    };
-
-    let mux = crate::node::LogicalMuxId {
-        nid: resolved.channel.nid,
-        tsid: resolved.channel.tsid,
-    };
-    let local_identity = {
-        let db = database.lock().await;
-        match crate::node::NodeStore::new(&db).and_then(|s| s.local_identity()) {
-            Ok(identity) => identity,
-            // The fabric was never initialised on this node; the local error
-            // is the only answer there is.
-            Err(_) => return Err(local_error),
+    let local = try_acquire(tuner_pool, database, resolved, claim).await;
+    let outcome = match local {
+        Ok(outcome) => {
+            tuner_pool.cancel_idle_close(&outcome.key).await;
+            return Ok(StreamSource::Local {
+                tuner: finish_outcome(outcome, resolved),
+                claim,
+                usage: crate::tuner::shared::TunerUsage::from(stream_class),
+            });
+        }
+        Err(error) => {
+            if !should_try_remote_fallback(&error) {
+                return Err(map_acquire_error(tuner_pool, resolved, error).await);
+            }
+            error
         }
     };
 
-    match crate::node::RemoteMuxStream::open_best(
+    match open_remote_source_for_mux(
         database,
-        &local_identity,
-        mux,
+        resolved.channel.nid,
+        resolved.channel.tsid,
         Some(resolved.channel.sid),
         stream_class,
         claim,
-        REMOTE_SEARCH_BUDGET_MS,
     )
     .await
     {
@@ -413,7 +435,7 @@ pub async fn start_source_for_service_with_claim(
                 stream.lease().lease_id,
                 stream.base_url()
             );
-            Ok(StreamSource::Remote(Arc::new(stream)))
+            Ok(StreamSource::Remote(stream))
         }
         Err(remote_error) => {
             // Report the *local* failure: it is what the operator can act on,
@@ -422,9 +444,40 @@ pub async fn start_source_for_service_with_claim(
                 "[HTTP stream] no remote node could serve service id={} either: {}",
                 resolved.channel.id, remote_error
             );
-            Err(local_error)
+            Err(map_acquire_error(tuner_pool, resolved, outcome).await)
         }
     }
+}
+
+/// Open a peer lease for a resolved logical mux. Session code calls this
+/// helper after it has assembled the channel request; lease/path selection
+/// stays in the node transport layer, not in `session.rs`.
+pub(crate) async fn open_remote_source_for_mux(
+    database: &DatabaseHandle,
+    nid: u16,
+    tsid: u16,
+    sid: Option<u16>,
+    stream_class: recisdb_protocol::StreamClass,
+    claim: EffectiveClaim,
+) -> Result<Arc<crate::node::RemoteMuxStream>, crate::node::ConsumeError> {
+    let local_identity = {
+        let db = database.lock().await;
+        crate::node::NodeStore::new(&db)
+            .and_then(|store| store.local_identity())
+            .map_err(|e| crate::node::ConsumeError::Transport(e.to_string()))?
+    };
+
+    let stream = crate::node::RemoteMuxStream::open_best(
+        database,
+        &local_identity,
+        crate::node::LogicalMuxId { nid, tsid },
+        sid,
+        stream_class,
+        claim,
+        REMOTE_SEARCH_BUDGET_MS,
+    )
+    .await?;
+    Ok(Arc::new(stream))
 }
 
 /// Same resolver with an explicit canonical contention claim.
@@ -510,6 +563,7 @@ async fn try_acquire(
             // caller was already on" to exclude from capacity, and nothing
             // to hand a permit down from.
             own_key: None,
+            own_claim_id: None,
             own_key_will_free_slot: false,
             bondriver_version: HTTP_BONDRIVER_VERSION,
             carried_permit: None,
@@ -542,7 +596,10 @@ async fn map_acquire_error(
         AcquireError::NoCandidates => {
             ChannelResolveError::Pool(TunerPoolError::OpenFailed("no candidates supplied".to_string()))
         }
-        AcquireError::AtCapacity { .. } | AcquireError::Warming { .. } | AcquireError::Conflict(_) => {
+        AcquireError::Locked { .. }
+        | AcquireError::AtCapacity { .. }
+        | AcquireError::Warming { .. }
+        | AcquireError::Conflict(_) => {
             let primary = resolved.primary();
             let running = count_running_instances_on_driver(tuner_pool, &primary.dll_path, Some(&primary.channel_key)).await;
             ChannelResolveError::Busy {
@@ -575,6 +632,29 @@ mod tests {
     use super::*;
     use crate::database::{Database, NewBonDriver};
     use recisdb_protocol::ChannelInfo;
+
+    #[test]
+    fn remote_fallback_policy_is_shared_for_bndp_and_http_acquire_errors() {
+        let errors = [
+            AcquireError::NoCandidates,
+            AcquireError::AtCapacity {
+                lowest_idle_priority: None,
+                conflict: None,
+            },
+            AcquireError::Locked { conflict: None },
+            AcquireError::Warming {
+                retry_after: std::time::Duration::from_secs(1),
+            },
+            AcquireError::Conflict(1),
+            AcquireError::ReaderStart(std::io::Error::other("open")),
+            AcquireError::OpenCooldown {
+                tuner_path: "driver".to_string(),
+                consecutive: 1,
+                retry_in: std::time::Duration::from_secs(1),
+            },
+        ];
+        assert!(errors.iter().all(should_try_remote_fallback));
+    }
 
     fn setup_db_with_channel(
         space: Option<u32>,

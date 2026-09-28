@@ -54,7 +54,7 @@ export type Topology = {
 }
 export type NodesResponse = {
   success: boolean
-  local: { node_id: string; display_name: string }
+  local: { node_id: string; display_name: string; endpoints?: NodeEndpoint[] }
   nodes: NodeEntry[]
   route_groups: RouteGroup[]
   setup_status: SetupStatus[]
@@ -68,6 +68,7 @@ export type IssuedPairing = {
   ttl_secs: number
   label: string | null
   node_listen_addr: string | null
+  endpoints: NodeEndpoint[]
 }
 export type ProbePath = {
   id: string

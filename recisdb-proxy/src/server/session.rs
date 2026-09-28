@@ -63,6 +63,23 @@ use crate::server::session_space_cache::{
 use crate::server::session_tuner_handoff::handoff_current_tuner;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
 
+/// The active BNDP payload source. A remote lease has the same broadcast
+/// receiver shape as a local tuner, but its lease handle must stay alive until
+/// the receiver is dropped. `ts_receiver` remains the local RAII subscription;
+/// this enum is the explicit local/remote exclusivity marker.
+enum SessionStreamSource {
+    Local,
+    Remote {
+        stream: Arc<crate::node::RemoteMuxStream>,
+        /// Present only while the session is Streaming, mirroring the local
+        /// path where `ts_receiver` exists only between StartStream and
+        /// StopStream. The lease itself (`stream`) lives from SetChannel*
+        /// until the channel changes or the tuner closes, so a Stop/Start or
+        /// Purge cycle does not tear it down.
+        receiver: Option<broadcast::Receiver<Bytes>>,
+    },
+}
+
 /// Weight of a new sample in the measured-bitrate EWMA.
 ///
 /// The rate is sampled once a second; 0.3 settles within a few seconds while
@@ -171,6 +188,8 @@ pub struct Session {
     /// TS data receiver (when streaming). RAII: dropping releases the
     /// tracked subscription automatically (see `TunerSubscription`).
     ts_receiver: Option<TunerSubscription>,
+    /// Remote lease source when the session is not using `current_tuner`.
+    stream_source: Option<SessionStreamSource>,
     /// Since when this session has been `Streaming` without anything to read
     /// from (no `ts_receiver`, no shared encoder). Normally `None`: every
     /// successful selection re-subscribes. It becomes `Some` only when a
@@ -186,7 +205,7 @@ pub struct Session {
     /// 1回だけDBスキャンする (clear_caches でクリア)。
     channel_map_cache: HashMap<String, Vec<ChannelEntry>>,
     // ★追加: 仮想space_idx(0..N-1) -> (actual_space, display_name, region_key) のマップをチューナごとにキャッシュ
-    // 例: [(0, "地デジ", "宮城"), (0, "地デジ", "福島"), (1, "BS", "BS"), (2, "CS", "CS")]
+    // 例: [(0, "地デジ", "大阪"), (0, "地デジ", "愛媛"), (1, "BS", "BS"), (2, "CS", "CS")]
     // region_key はチャンネルフィルタリング用、display_name は EnumTuningSpace 表示用
     space_list_cache: HashMap<String, Vec<(u32, String, String)>>,
     /// Session registry for web dashboard.
@@ -320,6 +339,7 @@ impl Session {
             current_group_name: None,
             group_driver_paths: Vec::new(),
             ts_receiver: None,
+            stream_source: None,
             no_ts_source_since: None,
             ts_bytes_sent: 0,
             ts_msgs_sent: 0,
@@ -783,6 +803,11 @@ impl Session {
                 self.tuner_claim_exclusive,
                 crate::tuner::shared::TunerUsage::from(self.stream_class),
             ));
+            if let Some(sub) = self.ts_receiver.as_ref() {
+                self.session_registry
+                    .bind_tuner_claim(self.id, Arc::clone(&old_tuner), sub)
+                    .await;
+            }
         }
     }
 
@@ -814,6 +839,116 @@ impl Session {
         current_or_default_tuner_path(&self.current_tuner_path, &self.default_tuner)
     }
 
+    fn has_stream_source(&self) -> bool {
+        self.ts_receiver.is_some() || self.stream_source.is_some()
+    }
+
+    fn remote_signal_level(&self) -> Option<f32> {
+        match self.stream_source.as_ref() {
+            Some(SessionStreamSource::Remote { stream, .. }) => Some(stream.signal_level()),
+            _ => None,
+        }
+    }
+
+    /// Replace the local source with a remote lease. The old local tuner is
+    /// released/scheduled only after its tracked subscription is dropped;
+    /// dropping the remote enum later sends the lease release request.
+    async fn install_remote_source(
+        &mut self,
+        stream: Arc<crate::node::RemoteMuxStream>,
+        nid: u16,
+        tsid: u16,
+        sid: Option<u16>,
+    ) {
+        self.stop_tsreplace_pipeline().await;
+        self.session_registry.unbind_tuner_claim(self.id).await;
+        self.ts_receiver = None;
+        self.stream_source = None;
+
+        if let Some(tuner) = self.current_tuner.take() {
+            self.reader_state_rx = None;
+            if tuner.subscriber_count() == 0 {
+                self.tuner_pool
+                    .schedule_idle_close(tuner.key.clone(), tuner)
+                    .await;
+            }
+        }
+
+        let display = format!("node:{} ({})", stream.lease().owner_node, stream.base_url());
+        let receiver = (self.state == SessionState::Streaming).then(|| stream.subscribe());
+        self.stream_source = Some(SessionStreamSource::Remote { receiver, stream });
+        self.current_nid = Some(nid);
+        self.current_tsid = Some(tsid);
+        self.current_sid = sid;
+        self.session_registry
+            .update_channel_ids(self.id, Some(nid), sid)
+            .await;
+        self.session_registry
+            .update_tuner(self.id, Some(display))
+            .await;
+        self.no_ts_source_since = None;
+    }
+
+    /// Drop the remote lease on StopStream, CloseTuner, or a successful local
+    /// switch. `RemoteMuxStream::Drop` performs best-effort release and its
+    /// TTL remains the final safety net if the request cannot be delivered.
+    async fn drop_remote_source(&mut self) {
+        if self
+            .stream_source
+            .as_ref()
+            .is_some_and(|source| matches!(source, SessionStreamSource::Remote { .. }))
+        {
+            self.stream_source = None;
+        }
+    }
+
+    async fn apply_remote_metadata(&mut self, nid: u16, tsid: u16, sid: Option<u16>) {
+        self.current_channel_info = Some(format!("NID 0x{nid:04X}, TSID 0x{tsid:04X}"));
+        let name = {
+            let db = self.database.lock().await;
+            sid.and_then(|sid| {
+                db.get_channel_by_nid_sid(nid, sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.channel_name.or(row.raw_name))
+            })
+        };
+        self.current_channel_name = name.clone();
+        self.session_registry
+            .update_channel(self.id, self.current_channel_info.clone())
+            .await;
+        self.session_registry
+            .update_channel_name(self.id, name)
+            .await;
+        self.update_service_filter_for_sid(Some(nid), Some(tsid), sid)
+            .await;
+    }
+
+    async fn try_remote_fallback(
+        &self,
+        error: &AcquireError,
+        nid: u16,
+        tsid: u16,
+        sid: Option<u16>,
+    ) -> Option<Arc<crate::node::RemoteMuxStream>> {
+        if !crate::server::channel_resolve::should_try_remote_fallback(error) {
+            return None;
+        }
+        crate::server::channel_resolve::open_remote_source_for_mux(
+            &self.database,
+            nid,
+            tsid,
+            sid,
+            self.stream_class,
+            crate::tuner::EffectiveClaim::new(
+                self.tuner_claim_priority,
+                self.tuner_claim_exclusive,
+            ),
+        )
+        .await
+        .ok()
+    }
+
     /// チューナに紐づく「実スペース一覧」を DB から構築してキャッシュする
     async fn ensure_space_list(&mut self) -> Vec<u32> {
         ensure_space_list_cached(
@@ -828,7 +963,7 @@ impl Session {
     }
 
     /// Map virtual space index to (actual_space, region_key) for filtering.
-    /// Returns the region_key (e.g., "宮城", "BS", "CS") used for channel matching,
+    /// Returns the region_key (e.g., "大阪", "BS", "CS") used for channel matching,
     /// NOT the display name (which may differ, e.g., "地デジ").
     async fn map_space_idx_to_actual_with_region(
         &mut self,
@@ -917,7 +1052,7 @@ impl Session {
             // Only handle TS data if we are actually streaming
             if self.state == SessionState::Streaming {
                 // A source is attached again (or still): forget the deadline.
-                if self.ts_receiver.is_some() || self.current_encoder.is_some() {
+                if self.has_stream_source() || self.current_encoder.is_some() {
                     self.no_ts_source_since = None;
                 }
 
@@ -1060,10 +1195,16 @@ impl Session {
                         match (&mut self.ts_receiver, self.current_encoder.is_some()) {
                             (_, true) => std::future::pending::<Option<Result<Bytes, broadcast::error::RecvError>>>().await,
                             (Some(rx), false) => Some(rx.recv().await),
-                            (None, false) => {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                None
-                            }
+                            (None, false) => match self.stream_source.as_mut() {
+                                Some(SessionStreamSource::Remote {
+                                    receiver: Some(receiver),
+                                    ..
+                                }) => Some(receiver.recv().await),
+                                _ => {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                    None
+                                }
+                            },
                         }
                     } => {
                         match ts_result {
@@ -1621,6 +1762,18 @@ impl Session {
 
         let key = ChannelKey::simple(&tuner_path, channel);
         let old_tuner_key = self.current_tuner.as_ref().map(|t| t.key.clone());
+        let remote_mux = {
+            let db = self.database.lock().await;
+            db.get_channel_by_physical(&tuner_path, 0, channel as u32)
+                .ok()
+                .flatten()
+                .map(|row| (row.nid, row.tsid, Some(row.sid)))
+                .or_else(|| {
+                    self.current_nid
+                        .zip(self.current_tsid)
+                        .map(|(nid, tsid)| (nid, tsid, self.current_sid))
+                })
+        };
 
         // Permit handoff, same as the v2 path: extract the current tuner's
         // slot before anything can stop it, so a same-DLL switch on a
@@ -1665,6 +1818,7 @@ impl Session {
             carried_permit: inherited_permit,
             warm,
             own_key: old_tuner_key.clone(),
+            own_claim_id: self.ts_receiver.as_ref().and_then(|sub| sub.claim_id()),
             own_key_will_free_slot,
             client_host: self.addr.ip().to_string(),
         };
@@ -1672,6 +1826,18 @@ impl Session {
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
             Ok(outcome) => outcome,
             Err(e) => {
+                if let Some((nid, tsid, sid)) = remote_mux {
+                    if let Some(remote) = self.try_remote_fallback(&e, nid, tsid, sid).await {
+                        self.install_remote_source(remote, nid, tsid, sid).await;
+                        self.apply_remote_metadata(nid, tsid, sid).await;
+                        return self
+                            .send_message(ServerMessage::SetChannelAck {
+                                success: true,
+                                error_code: 0,
+                            })
+                            .await;
+                    }
+                }
                 // `OpenCooldown` fires at the same cadence as the client's
                 // own reconnect loop (up to ~13/s during the 2026-08 flood
                 // that motivated tuner::open_backoff) — logging every one at
@@ -1702,6 +1868,7 @@ impl Session {
         }
 
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
+        self.drop_remote_source().await;
 
         let cleanup_old = handoff_current_tuner(
             self.id,
@@ -1738,6 +1905,7 @@ impl Session {
     ) {
         if let Some(tuner) = self.current_tuner.take() {
             if self.ts_receiver.take().is_some() {
+                self.session_registry.unbind_tuner_claim(self.id).await;
                 debug!(
                     "[Session {}] {} unsubscribed from old tuner, remaining subscribers: {}",
                     self.id,
@@ -1767,6 +1935,11 @@ impl Session {
     }
 
     async fn finalize_tuner_switch(&mut self, tuner: &Arc<SharedTuner>) {
+        self.stream_source = if self.ts_receiver.is_some() {
+            Some(SessionStreamSource::Local)
+        } else {
+            None
+        };
         tuner.notify_channel_change();
         // Re-point the reader-state watch at whatever tuner we just settled
         // on, so the run loop notices *this* reader dying (P4). Every
@@ -2177,6 +2350,7 @@ impl Session {
             carried_permit: inherited_permit,
             warm,
             own_key: old_tuner_key.clone(),
+            own_claim_id: self.ts_receiver.as_ref().and_then(|sub| sub.claim_id()),
             own_key_will_free_slot,
             client_host: self.addr.ip().to_string(),
         };
@@ -2184,6 +2358,21 @@ impl Session {
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
             Ok(outcome) => outcome,
             Err(e) => {
+                if let Some(remote) = self
+                    .try_remote_fallback(&e, entry.nid, entry.tsid, None)
+                    .await
+                {
+                    self.install_remote_source(remote, entry.nid, entry.tsid, None)
+                        .await;
+                    self.apply_remote_metadata(entry.nid, entry.tsid, None)
+                        .await;
+                    return self
+                        .send_message(ServerMessage::SetChannelSpaceAck {
+                            success: true,
+                            error_code: 0,
+                        })
+                        .await;
+                }
                 // See the matching comment in SetChannel above: OpenCooldown
                 // is a symptom of a reconnect loop, not a new fact worth an
                 // ERROR line here — acquire.rs already logged the underlying
@@ -2220,6 +2409,7 @@ impl Session {
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
         self.set_selected_tuner_path_and_registry(&chosen_path)
             .await;
+        self.drop_remote_source().await;
 
         let cleanup_old = handoff_current_tuner(
             self.id,
@@ -2300,6 +2490,7 @@ impl Session {
             .current_tuner
             .as_ref()
             .map(|t| t.signal_level())
+            .or_else(|| self.remote_signal_level())
             .unwrap_or(0.0);
 
         self.send_message(ServerMessage::GetSignalLevelAck { signal_level })
@@ -2368,17 +2559,20 @@ impl Session {
                 .await;
         }
 
-        let tuner = match &self.current_tuner {
-            Some(t) => t.clone(),
-            None => {
-                return self
-                    .send_message(ServerMessage::StartStreamAck {
-                        success: false,
-                        error_code: ErrorCode::InvalidState.into(),
-                    })
-                    .await;
-            }
-        };
+        let tuner = self.current_tuner.clone();
+        if tuner.is_none()
+            && !self
+                .stream_source
+                .as_ref()
+                .is_some_and(|source| matches!(source, SessionStreamSource::Remote { .. }))
+        {
+            return self
+                .send_message(ServerMessage::StartStreamAck {
+                    success: false,
+                    error_code: ErrorCode::InvalidState.into(),
+                })
+                .await;
+        }
 
         info!("[Session {}] Starting stream", self.id);
 
@@ -2387,15 +2581,27 @@ impl Session {
         // has_subscribers()==0 and might stop the reader.  Canceling first minimises
         // that window; the has_subscribers() double-check inside the idle-close task
         // (Bug F fix) provides the final backstop.
-        self.tuner_pool.cancel_idle_close(&tuner.key).await;
+        if let Some(tuner) = tuner {
+            self.tuner_pool.cancel_idle_close(&tuner.key).await;
 
-        // Subscribe to the tuner's broadcast channel
-        let rx = tuner.subscribe_with_claim_class(
-            self.tuner_claim_priority,
-            self.tuner_claim_exclusive,
-            crate::tuner::shared::TunerUsage::from(self.stream_class),
-        );
-        self.ts_receiver = Some(rx);
+            // Subscribe to the local tuner's broadcast channel.
+            let rx = tuner.subscribe_with_claim_class(
+                self.tuner_claim_priority,
+                self.tuner_claim_exclusive,
+                crate::tuner::shared::TunerUsage::from(self.stream_class),
+            );
+            self.ts_receiver = Some(rx);
+            self.stream_source = Some(SessionStreamSource::Local);
+            if let Some(sub) = self.ts_receiver.as_ref() {
+                self.session_registry
+                    .bind_tuner_claim(self.id, Arc::clone(&tuner), sub)
+                    .await;
+            }
+        } else if let Some(SessionStreamSource::Remote { stream, receiver }) =
+            self.stream_source.as_mut()
+        {
+            *receiver = Some(stream.subscribe());
+        }
         self.state = SessionState::Streaming;
 
         if let Err(e) = self.start_tsreplace_pipeline().await {
@@ -2406,7 +2612,11 @@ impl Session {
                 );
                 self.stop_tsreplace_pipeline().await;
             } else {
+                self.session_registry.unbind_tuner_claim(self.id).await;
                 self.ts_receiver = None;
+                if let Some(SessionStreamSource::Remote { receiver, .. }) = self.stream_source.as_mut() {
+                    *receiver = None;
+                }
                 self.state = SessionState::TunerOpen;
                 return self
                     .send_message(ServerMessage::StartStreamAck {
@@ -2442,6 +2652,7 @@ impl Session {
         // RAII makes that structurally impossible instead — there is simply
         // nothing to drop a second time).
         if let Some(sub) = self.ts_receiver.take() {
+            self.session_registry.unbind_tuner_claim(self.id).await;
             drop(sub);
             if let Some(tuner) = &self.current_tuner {
                 // ★ Check if this was the last subscriber
@@ -2453,6 +2664,12 @@ impl Session {
                         .await;
                 }
             }
+        }
+        // Keep a remote lease across Stop/Start like a local tuner is kept;
+        // only stop forwarding its data.
+        match self.stream_source.as_mut() {
+            Some(SessionStreamSource::Remote { receiver, .. }) => *receiver = None,
+            _ => self.stream_source = None,
         }
         self.stop_tsreplace_pipeline().await;
         self.state = SessionState::TunerOpen;
@@ -2477,6 +2694,16 @@ impl Session {
         // Drain the receiver
         if let Some(rx) = &mut self.ts_receiver {
             while rx.try_recv().is_ok() {}
+        }
+        // Purge only discards buffered data. The client DLL purges right
+        // after every SetChannel and TVTest purges routinely, so releasing
+        // the remote lease here left the session with no source at all.
+        if let Some(SessionStreamSource::Remote {
+            receiver: Some(receiver),
+            ..
+        }) = self.stream_source.as_mut()
+        {
+            while receiver.try_recv().is_ok() {}
         }
 
         // STREAMING_DESIGN.md §4.3: also drop any frames queued in the
@@ -2667,6 +2894,7 @@ impl Session {
             carried_permit,
             warm,
             own_key: old_tuner_key.clone(),
+            own_claim_id: self.ts_receiver.as_ref().and_then(|sub| sub.claim_id()),
             own_key_will_free_slot,
             client_host: self.addr.ip().to_string(),
         };
@@ -2674,6 +2902,24 @@ impl Session {
         let outcome = match acquire(&self.tuner_pool, &self.database, request).await {
             Ok(outcome) => outcome,
             Err(e) => {
+                if let Some(remote) = self.try_remote_fallback(&e, nid, tsid, sid).await {
+                    let display =
+                        format!("node:{} ({})", remote.lease().owner_node, remote.base_url());
+                    self.install_remote_source(remote, nid, tsid, sid).await;
+                    self.apply_remote_metadata(nid, tsid, sid).await;
+                    if self.state == SessionState::Ready {
+                        self.state = SessionState::TunerOpen;
+                    }
+                    return self
+                        .send_message(ServerMessage::SelectLogicalChannelAck {
+                            success: true,
+                            error_code: 0,
+                            tuner_id: Some(display),
+                            space: None,
+                            channel: None,
+                        })
+                        .await;
+                }
                 if let Some(old) = old_tuner_for_permit.as_ref() {
                     debug!(
                         "[Session {}] SelectLogicalChannel: acquire failed with previous tuner {:?}: {}",
@@ -2710,6 +2956,7 @@ impl Session {
             .unwrap_or(0);
 
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
+        self.drop_remote_source().await;
         let cleanup_old = handoff_current_tuner(
             self.id,
             &mut self.ts_receiver,
@@ -2991,8 +3238,13 @@ impl Session {
             self.last_ts_log = std::time::Instant::now();
 
             // Update session registry with signal and packet stats
-            if let Some(tuner) = &self.current_tuner {
-                let signal_level = tuner.signal_level();
+            if self.has_stream_source() {
+                let signal_level = self
+                    .current_tuner
+                    .as_ref()
+                    .map(|tuner| tuner.signal_level())
+                    .or_else(|| self.remote_signal_level())
+                    .unwrap_or(0.0);
                 // Use bytes sent to this client (not tuner's received packets)
                 let packets_sent = self.ts_bytes_sent / 188; // TS packet size
 
@@ -3312,9 +3564,11 @@ impl Session {
         }
 
         self.stop_warm_tuner().await;
+        self.drop_remote_source().await;
         // Release the tracked subscription (if any) first — dropping it
         // performs the decrement that used to be a manual `tuner.unsubscribe()`
         // call gated on `ts_receiver.is_some()`.
+        self.session_registry.unbind_tuner_claim(self.id).await;
         self.ts_receiver = None;
         if self.current_tuner.is_none() {
             // Nothing to hand back. If a reader is still running for this

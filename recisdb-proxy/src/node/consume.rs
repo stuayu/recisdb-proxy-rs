@@ -19,7 +19,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use recisdb_protocol::StreamClass;
@@ -68,6 +68,9 @@ pub struct RemoteMuxStream {
     tx: broadcast::Sender<Bytes>,
     /// Highest source sequence handed downstream, used for resume.
     last_sequence: Arc<AtomicU64>,
+    /// Wall-clock timestamp of the last frame handed to local consumers.
+    /// Used only for the BonDriver signal-level compatibility value.
+    last_data_at_ms: Arc<AtomicU64>,
     /// Ends the pump/renew tasks when this handle drops.
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -99,6 +102,7 @@ impl RemoteMuxStream {
 
         let (tx, _) = broadcast::channel(REPUBLISH_CAPACITY);
         let last_sequence = Arc::new(AtomicU64::new(0));
+        let last_data_at_ms = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(tokio::sync::Notify::new());
 
         let stream = Self {
@@ -106,6 +110,7 @@ impl RemoteMuxStream {
             base_url: base_url.clone(),
             tx: tx.clone(),
             last_sequence: Arc::clone(&last_sequence),
+            last_data_at_ms: Arc::clone(&last_data_at_ms),
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -115,7 +120,15 @@ impl RemoteMuxStream {
             lease.clone(),
             Arc::clone(&shutdown),
         );
-        spawn_pump(client, base_url, lease, tx, last_sequence, shutdown);
+        spawn_pump(
+            client,
+            base_url,
+            lease,
+            tx,
+            last_sequence,
+            last_data_at_ms,
+            shutdown,
+        );
 
         Ok(stream)
     }
@@ -259,6 +272,33 @@ impl RemoteMuxStream {
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence.load(Ordering::Acquire)
     }
+
+    /// Return the compatibility signal used by BNDP while this source is
+    /// remote. There is no RF meter at the consuming node, so 20 dB is a
+    /// fixed non-zero value while frames are arriving; zero means the lease
+    /// has not delivered data recently and prevents a scan from accepting a
+    /// dead remote channel.
+    pub fn signal_level(&self) -> f32 {
+        const ACTIVE_WINDOW_MS: u64 = 2_000;
+        let now = unix_now_ms();
+        let last = self.last_data_at_ms.load(Ordering::Acquire);
+        signal_level_from_last_data(last, now, ACTIVE_WINDOW_MS)
+    }
+}
+
+fn signal_level_from_last_data(last: u64, now: u64, active_window_ms: u64) -> f32 {
+    if last != 0 && now.saturating_sub(last) <= active_window_ms {
+        20.0
+    } else {
+        0.0
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Drop for RemoteMuxStream {
@@ -314,6 +354,7 @@ fn spawn_pump(
     lease: OpenLeaseReply,
     tx: broadcast::Sender<Bytes>,
     last_sequence: Arc<AtomicU64>,
+    last_data_at_ms: Arc<AtomicU64>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let is_record = lease.stream_class == StreamClass::Record;
@@ -332,6 +373,7 @@ fn spawn_pump(
                     &lease,
                     &tx,
                     &last_sequence,
+                    &last_data_at_ms,
                     resume_from,
                 ) => outcome,
             };
@@ -387,6 +429,7 @@ async fn pump_once(
     lease: &OpenLeaseReply,
     tx: &broadcast::Sender<Bytes>,
     last_sequence: &AtomicU64,
+    last_data_at_ms: &AtomicU64,
     resume_from: Option<u64>,
 ) -> Result<(), ConsumeError> {
     let is_record = lease.stream_class == StreamClass::Record;
@@ -452,6 +495,7 @@ async fn pump_once(
             }
 
             last_sequence.store(frame.sequence, Ordering::Release);
+            last_data_at_ms.store(unix_now_ms(), Ordering::Release);
             // A closed channel means every local consumer went away; there is
             // nothing left to feed, so stop rather than keep the peer's tuner.
             if tx.send(frame.payload).is_err() && tx.receiver_count() == 0 {
@@ -507,6 +551,50 @@ mod tests {
     use super::super::types::NodeId;
     use super::*;
 
+    #[test]
+    fn remote_signal_is_fixed_nonzero_only_while_data_is_recent() {
+        assert_eq!(signal_level_from_last_data(0, 10_000, 2_000), 0.0);
+        assert_eq!(signal_level_from_last_data(8_500, 10_000, 2_000), 20.0);
+        assert_eq!(signal_level_from_last_data(7_999, 10_000, 2_000), 0.0);
+    }
+
+    #[tokio::test]
+    async fn dropping_remote_stream_notifies_lease_tasks_for_release() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let notified = shutdown.notified();
+        let (tx, _) = broadcast::channel(1);
+        let stream = RemoteMuxStream {
+            lease: OpenLeaseReply {
+                lease_id: "lease".into(),
+                generation: 1,
+                owner_node: NodeId::new("site-b").unwrap(),
+                route_id: "route".into(),
+                stream_class: StreamClass::View,
+                ttl_ms: 8_000,
+                context: RequestContext {
+                    request_id: "request".into(),
+                    trace_id: "trace".into(),
+                    stream_class: StreamClass::View,
+                    claim: EffectiveClaim::new(0, false),
+                    remaining_ms: 1_000,
+                    origin_node: NodeId::new("site-a").unwrap(),
+                    visited_nodes: Vec::new(),
+                    hop_count: 0,
+                    max_hops: 3,
+                },
+            },
+            base_url: "http://127.0.0.1".into(),
+            tx,
+            last_sequence: Arc::new(AtomicU64::new(0)),
+            last_data_at_ms: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::clone(&shutdown),
+        };
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("drop must wake renew/pump tasks");
+    }
+
     fn context(class: StreamClass) -> RequestContext {
         RequestContext {
             request_id: "r".into(),
@@ -514,7 +602,7 @@ mod tests {
             stream_class: class,
             claim: EffectiveClaim::new(2, false),
             remaining_ms: 10_000,
-            origin_node: NodeId::new("tokyo").unwrap(),
+            origin_node: NodeId::new("site-c").unwrap(),
             visited_nodes: Vec::new(),
             hop_count: 0,
             max_hops: 3,
@@ -552,7 +640,7 @@ mod tests {
     #[test]
     fn entering_a_node_spends_from_the_shared_budget() {
         let mut ctx = context(StreamClass::View);
-        let node = NodeId::new("fukushima").unwrap();
+        let node = NodeId::new("site-a").unwrap();
         ctx.enter_node(&node, 3_000).unwrap();
         assert_eq!(ctx.remaining_ms, 7_000);
         assert_eq!(ctx.hop_count, 1);

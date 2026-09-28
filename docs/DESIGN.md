@@ -86,7 +86,7 @@ recisdb-proxy は、Windows/Linux 上の TV チューナー (BonDriver / キャ�
 |---|---|---|---|
 | ハンドシェイク | `Hello{version}` / `Ping` | `HelloAck` / `Pong` | **認証なし (既知の課題 → REVIEW S3)** |
 | チューナー | `OpenTuner{path}` / `OpenTunerWithGroup{group}` / `CloseTuner` | `OpenTunerAck{bondriver_version}` 他 | グループ指定時はサーバーがドライバー自動選択 |
-| 選局 | `SetChannel{ch,priority,exclusive}` (v1) / `SetChannelSpace{space,ch,priority,exclusive}` (v2) / `SetChannelSpaceInGroup{...}` / `SelectLogicalChannel{nid,tsid,sid?}` | 各 Ack | priority=0 は DB 既定を使用。exclusive は i32::MAX 扱い |
+| 選局 | `SetChannel{ch,priority,exclusive}` (v1) / `SetChannelSpace{space,ch,priority,exclusive}` (v2) / `SetChannelSpaceInGroup{...}` / `SelectLogicalChannel{nid,tsid,sid?}` | 各 Ack | priority=0 は DB 既定を使用。要求側 exclusive は同順位 tie-breaker、既存 live exclusive claim はロック |
 | 列挙 | `EnumTuningSpace` / `EnumChannelName` / `GetChannelList{filter}` | 各 Ack | 列挙は DB の仮想空間 (SpaceGenerator) を返す |
 | ストリーム | `StartStream` / `StopStream` / `PurgeStream` / `SetServiceFilter{single_service}` | `TsData{data}` ほか | TsData のみ高頻度。サービスフィルタで単一 SID 配信 |
 | その他 | `GetSignalLevel` / `SetLnbPower` | 各 Ack / `Error{code,msg}` | |
@@ -232,7 +232,9 @@ TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
 - 選局 4 経路はすべて `acquire()` を通る。各経路は「要求の組み立て」と
   「成功後のメタデータ適用」だけを持つ。**新しい選局経路を session/web に直接書かない。**
 
-**優先度**: `exclusive=true → i32::MAX` > `クライアント指定 (>0)` > `channels.priority (DB)` > `0`。
+**優先度**: `クライアント指定 (>0)` > `channels.priority (DB)` > `0`。
+`exclusive` は要求側の同順位 tie-breaker。既存 reader の live exclusive claim はロックで、
+要求 priority・用途に関係なく退避不可。
 目安は 録画(排他)=255 / 録画=200 / 視聴=10 / スキャン=0。
 **サーバー側でクライアント申告値を制限する仕組みは未実装 (REVIEW S3)。**
 
@@ -253,11 +255,10 @@ TuneRequest ─→ tuner/policy.rs::decide(TunerSnapshot, req) ─→ Decision
 4. どれも退避できなければ別の候補ドライバの退避を試す
 5. それでも駄目なら拒否
 
-退避可否は、まず購読者がいて `Running` に入ってから `min_hold_secs` 未満のリーダーを
-無条件に保護し、その後 `(要求優先度, exclusive)` と `(相手の優先度, 相手の exclusive)` の
-辞書式順序を比較して、要求側が**厳密に大きい**ときだけ許可する。
-**同値では奪わない**。`exclusive` はハードウェアそのものの要求なので、同じ優先度のタイには勝つが、
-優先度を無視して勝つわけではない。
+退避可否は、live exclusive claim を持つ reader をまずロックとして除外する。残りは
+購読者がいて `Running` に入ってから `min_hold_secs` 未満のリーダーを無条件に保護し、
+`(要求優先度, exclusive)` と `(相手の優先度, false)` を比較して要求側が**厳密に大きい**ときだけ許可する。
+要求元自身の claim は切替時の snapshot から除外する。
 **`max_instances` を超えて作ることはない** — 上限はハードウェアの事実なので、
 超過するくらいなら稼働中のリーダーを停止して作り直す。
 

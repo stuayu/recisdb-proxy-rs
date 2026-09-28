@@ -1163,8 +1163,12 @@ pub async fn stream_service_by_mirakurun_id(
     };
 
     let (rx, cleanup, info) = match &source {
-        channel_resolve::StreamSource::Local(tuner) => (
-            BodyReceiver::Tuner(tuner.subscribe()),
+        channel_resolve::StreamSource::Local { tuner, claim, usage } => (
+            BodyReceiver::Tuner(tuner.subscribe_with_claim_class(
+                claim.priority,
+                claim.exclusive,
+                *usage,
+            )),
             StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
             session_info_for_source(
                 SessionProtocol::Mirakurun,
@@ -1195,6 +1199,12 @@ pub async fn stream_service_by_mirakurun_id(
         info,
     )
     .await;
+    if let BodyReceiver::Tuner(sub) = &rx {
+        web_state
+            .session_registry
+            .bind_tuner_claim(session.id(), Arc::clone(sub.tuner()), sub)
+            .await;
+    }
     let cleanup = cleanup.with_session(session, shutdown_rx);
     respond_with_stream(service_filtered_body_stream(rx, cleanup, sid, loss_policy))
 }
@@ -1291,7 +1301,15 @@ pub async fn stream_channel_by_type(
     )
     .await;
 
-    let tuner_rx = tuner.subscribe();
+    let tuner_rx = tuner.subscribe_with_claim_class(
+        resolved.channel.priority,
+        false,
+        crate::tuner::shared::TunerUsage::View,
+    );
+    web_state
+        .session_registry
+        .bind_tuner_claim(session.id(), Arc::clone(&tuner), &tuner_rx)
+        .await;
     let cleanup = StreamCleanup::tuner_only(Arc::clone(&tuner), Arc::clone(&web_state.tuner_pool))
         .with_session(session, shutdown_rx);
     respond_with_stream(broadcast_to_body_stream(
@@ -1532,8 +1550,12 @@ pub async fn stream_program_by_mirakurun_id(
     };
 
     let (rx, cleanup, info) = match &source {
-        channel_resolve::StreamSource::Local(tuner) => (
-            BodyReceiver::Tuner(tuner.subscribe()),
+        channel_resolve::StreamSource::Local { tuner, claim, usage } => (
+            BodyReceiver::Tuner(tuner.subscribe_with_claim_class(
+                claim.priority,
+                claim.exclusive,
+                *usage,
+            )),
             StreamCleanup::tuner_only(Arc::clone(tuner), Arc::clone(&web_state.tuner_pool)),
             session_info_for_source(
                 SessionProtocol::Mirakurun,
@@ -1564,6 +1586,12 @@ pub async fn stream_program_by_mirakurun_id(
         info,
     )
     .await;
+    if let BodyReceiver::Tuner(sub) = &rx {
+        web_state
+            .session_registry
+            .bind_tuner_claim(session.id(), Arc::clone(sub.tuner()), sub)
+            .await;
+    }
     let cleanup = cleanup.with_session(session, shutdown_rx);
     respond_with_stream(mirakurun_program_stream::gated_program_stream(
         rx, cleanup, sid, event_id, deadline,
@@ -1980,12 +2008,12 @@ mod tests {
     // GR / NW1..NW40 split
     // ------------------------------------------------------------------
 
-    /// Terrestrial network ids of a few real areas, so the region derivation
+    /// Terrestrial network ids of a few areas, so the region derivation
     /// (`0x7FF0 - 0x10 × region + operator`) is exercised rather than mocked.
-    const NID_FUKUSHIMA: u16 = 32416; // region 21
-    const NID_AKITA: u16 = 32466; // region 18
-    const NID_NIIGATA: u16 = 32256; // region 31
-    const NID_TOKYO_WIDE: u16 = 32736; // region 1 (関東広域)
+    const NID_REGION_A: u16 = 32416; // region 21
+    const NID_REGION_B: u16 = 32466; // region 18
+    const NID_REGION_C: u16 = 32256; // region 31
+    const NID_WIDE_AREA: u16 = 32736; // region 1
 
     fn gr_row(id: i64, nid: u16, sid: u16, physical_ch: u8) -> ChannelRecord {
         service_row(
@@ -2003,14 +2031,14 @@ mod tests {
 
     #[test]
     fn region_is_derived_from_the_network_id_when_the_column_is_empty() {
-        let row = gr_row(1, NID_FUKUSHIMA, 21504, 15);
+        let row = gr_row(1, NID_REGION_A, 21504, 15);
         assert_eq!(row.region_id, None, "this row has no scanned region_id");
         assert_eq!(region_id_of(&row), Some(21));
 
         // An explicitly scanned value wins over the derivation.
         let scanned = ChannelRecord {
             region_id: Some(9),
-            ..gr_row(2, NID_FUKUSHIMA, 21504, 15)
+            ..gr_row(2, NID_REGION_A, 21504, 15)
         };
         assert_eq!(region_id_of(&scanned), Some(9));
     }
@@ -2018,8 +2046,8 @@ mod tests {
     #[test]
     fn without_a_home_region_everything_terrestrial_stays_gr() {
         let services = unique_services(vec![
-            gr_row(1, NID_FUKUSHIMA, 21504, 15),
-            gr_row(2, NID_AKITA, 18448, 15),
+            gr_row(1, NID_REGION_A, 21504, 15),
+            gr_row(2, NID_REGION_B, 18448, 15),
         ]);
         let types = terrestrial_type_map(&services, &[]);
         assert!(types.is_empty());
@@ -2033,9 +2061,9 @@ mod tests {
     #[test]
     fn out_of_area_regions_become_nw_types_in_region_order() {
         let services = unique_services(vec![
-            gr_row(1, NID_FUKUSHIMA, 21504, 15), // region 21 (home)
-            gr_row(2, NID_AKITA, 18448, 15),     // region 18
-            gr_row(3, NID_NIIGATA, 12345, 15),   // region 31
+            gr_row(1, NID_REGION_A, 21504, 15), // region 21 (home)
+            gr_row(2, NID_REGION_B, 18448, 15), // region 18
+            gr_row(3, NID_REGION_C, 12345, 15), // region 31
         ]);
         let types = terrestrial_type_map(&services, &[21]);
 
@@ -2044,16 +2072,16 @@ mod tests {
         assert_eq!(types[&31], "NW2");
     }
 
-    /// `home_region = "東京"` covers both the wide-area Kanto id and the
-    /// Tokyo prefecture id, so both must land on `GR`.
+    /// A wide-area `home_region` can cover both a wide-area id and its
+    /// prefecture id, so both must land on `GR`.
     #[test]
     fn every_region_id_of_the_home_prefecture_is_gr() {
         let home = recisdb_protocol::broadcast_region::region_ids_from_prefecture_name("東京");
-        assert_eq!(home, vec![1, 23], "sanity: 東京 is two region ids");
+        assert_eq!(home, vec![1, 23], "sanity: wide-area name has two region ids");
 
         let services = unique_services(vec![
-            gr_row(1, NID_TOKYO_WIDE, 1024, 21), // region 1
-            gr_row(2, NID_FUKUSHIMA, 21504, 15), // region 21
+            gr_row(1, NID_WIDE_AREA, 1024, 21), // region 1
+            gr_row(2, NID_REGION_A, 21504, 15), // region 21
         ]);
         let types = terrestrial_type_map(&services, &home);
         let type_of = |nid: u16| {
@@ -2061,8 +2089,8 @@ mod tests {
             mirakurun_type_of(row, &types)
         };
 
-        assert_eq!(type_of(NID_TOKYO_WIDE), "GR");
-        assert_eq!(type_of(NID_FUKUSHIMA), "NW1");
+        assert_eq!(type_of(NID_WIDE_AREA), "GR");
+        assert_eq!(type_of(NID_REGION_A), "NW1");
     }
 
     #[test]
@@ -2128,18 +2156,18 @@ mod tests {
     #[test]
     fn splitting_areas_removes_channel_string_collisions() {
         let services = unique_services(vec![
-            gr_row(1, NID_FUKUSHIMA, 21504, 15),
-            gr_row(2, NID_AKITA, 18448, 15),
+            gr_row(1, NID_REGION_A, 21504, 15),
+            gr_row(2, NID_REGION_B, 18448, 15),
         ]);
         let types = terrestrial_type_map(&services, &[21]);
         let assigned = assign_channel_strings(&services, &types);
 
         assert_eq!(
-            assigned[&(NID_FUKUSHIMA, NID_FUKUSHIMA)],
+            assigned[&(NID_REGION_A, NID_REGION_A)],
             ("GR".to_string(), "15".to_string())
         );
         assert_eq!(
-            assigned[&(NID_AKITA, NID_AKITA)],
+            assigned[&(NID_REGION_B, NID_REGION_B)],
             ("NW1".to_string(), "15".to_string())
         );
     }
@@ -2199,7 +2227,7 @@ mod tests {
                 Some(0),
                 Some(15),
                 Some(2),
-                Some("ＮＨＫ総合・福島"),
+                Some("ＮＨＫ総合・地域A"),
             ),
             service_row(
                 2,
@@ -2210,7 +2238,7 @@ mod tests {
                 Some(0),
                 Some(15),
                 Some(3),
-                Some("ＡＢＳ秋田放送"),
+                Some("地域B放送"),
             ),
         ]);
         let assigned = assign_channel_strings(&services, &HashMap::new());

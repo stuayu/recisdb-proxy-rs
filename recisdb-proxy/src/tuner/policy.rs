@@ -371,6 +371,9 @@ pub enum RejectReason {
     /// driver, when there was one, for diagnostics/logging by the caller —
     /// mirrors the value `handle_set_channel_space_capacity_limit` logs.
     AtCapacity { lowest_idle_priority: Option<i32> },
+    /// Every usable eviction candidate on the requested driver is held by an
+    /// exclusive live claim.  Exclusive is a lock, not a stronger rank.
+    Locked { tuner: ChannelKey },
     /// All occupied slots are still starting and therefore cannot be evicted.
     Warming { retry_after: Duration },
 }
@@ -546,14 +549,17 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
 /// - **idle** (no subscribers) — always yes. It is only alive because of the
 ///   keep-alive window.
 /// - **live viewer** — only if the request strictly outranks it in the
-///   `(priority, exclusive)` lexicographic rank. Exclusive is a tie-breaker,
-///   not an unconditional override.
+///   `(priority, exclusive)` lexicographic rank. Exclusive is a tie-breaker
+///   for the request; an incumbent exclusive claim is a lock.
 fn may_evict(
     req: &TuneRequest,
     victim: &EntryState,
     victim_is_keep_alive: bool,
     min_hold: Duration,
 ) -> bool {
+    if victim.incumbent_exclusive {
+        return false;
+    }
     if victim_is_keep_alive {
         // Nobody is watching it and its keep-alive timer is already running.
         // That window exists to make zapping back cheap — an optimisation,
@@ -591,6 +597,14 @@ fn eviction_options(
     let idle: Vec<EvictionCandidate> = all.iter().filter(|(_, _, subs)| !subs).cloned().collect();
 
     (choose_eviction_target(&idle), choose_eviction_target(&all))
+}
+
+fn locked_victim(snapshot: &TunerSnapshot, dll_path: &str) -> Option<ChannelKey> {
+    snapshot
+        .entries
+        .iter()
+        .find(|e| e.key.tuner_path == dll_path && e.is_running() && e.incumbent_exclusive)
+        .map(|e| e.key.clone())
 }
 
 /// Is this key a keep-alive leftover — running, unsubscribed, and already
@@ -644,6 +658,7 @@ fn decide_at_capacity(
         return Decision::Create { key, evict: vec![] };
     }
 
+    let locked = locked_victim(snapshot, dll_path);
     let (idle_victim, any_victim) = eviction_options(snapshot, dll_path);
     let lowest_idle_priority = idle_victim.as_ref().map(|(_, p, _)| *p);
 
@@ -673,6 +688,13 @@ fn decide_at_capacity(
         exclude_own,
         lowest_idle_priority,
     );
+    if matches!(fallback_decision, Decision::Reject { .. }) {
+        if let Some(tuner) = locked {
+            return Decision::Reject {
+                reason: RejectReason::Locked { tuner },
+            };
+        }
+    }
     if matches!(fallback_decision, Decision::Reject { .. })
         && all_candidate_drivers_warming(snapshot, candidate_tuples, max_instances_map, exclude_own)
     {
@@ -783,6 +805,14 @@ fn decide_fallback(
                 }
             }
         }
+    }
+
+    if let Some(tuner) = candidate_tuples.iter().find_map(|(path, _, _)| {
+        locked_victim(snapshot, path)
+    }) {
+        return Decision::Reject {
+            reason: RejectReason::Locked { tuner },
+        };
     }
 
     Decision::Reject {
@@ -1649,6 +1679,70 @@ mod tests {
                 evict: vec![own_key],
             }
         );
+    }
+
+    #[test]
+    fn repro_shared_current_reader_can_be_evicted_by_own_switch() {
+        let own_key = ChannelKey::space_channel("A.dll", 0, 1);
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 2, 0)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 10;
+        req.own_key = Some(own_key.clone());
+        req.own_key_will_free_slot = false;
+
+        let decision = decide(&snapshot, &req);
+        assert!(
+            matches!(decision, Decision::Create { ref evict, .. } if *evict == vec![own_key]),
+            "a lower-ranked co-viewer may be evicted after the requester's claim is excluded: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn shared_reader_with_higher_rank_co_viewer_rejects_own_switch() {
+        let own_key = ChannelKey::space_channel("A.dll", 0, 1);
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 2, 20)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 10;
+        req.own_key = Some(own_key);
+
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn locked_reader_rejects_even_a_higher_priority_request() {
+        let mut locked = entry("A.dll", 0, 1, true, 1, 1);
+        locked.incumbent_exclusive = true;
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![locked],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 100;
+
+        assert!(matches!(
+            decide(&snapshot, &req),
+            Decision::Reject {
+                reason: RejectReason::Locked { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn unlocked_reader_can_be_evicted_after_claim_update() {
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![entry("A.dll", 0, 1, true, 1, 1)],
+        };
+        let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        req.priority = 100;
+
+        assert!(matches!(decide(&snapshot, &req), Decision::Create { evict, .. } if evict.len() == 1));
     }
 
     /// Rule 1/3/4: candidate ordering feeds directly into which driver is

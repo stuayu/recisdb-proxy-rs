@@ -241,6 +241,9 @@ impl LocalMuxServer {
         sid: Option<u16>,
         spent_ms: u64,
     ) -> Result<Arc<RemoteMuxLease>, ServeError> {
+        // Supply-side invariant: this endpoint is the terminal hop.  It may
+        // acquire only this node's physical candidates; calling the
+        // requester-side remote fallback here would create a multi-node loop.
         context.enter_node(&self.identity.node_id, spent_ms)?;
 
         let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
@@ -261,6 +264,7 @@ impl LocalMuxServer {
             carried_permit: None,
             warm: None,
             own_key: None,
+            own_claim_id: None,
             own_key_will_free_slot: false,
             client_host: format!("node:{}", context.origin_node),
         };
@@ -355,6 +359,7 @@ impl LocalMuxServer {
                 carried_permit: None,
                 warm: None,
                 own_key: None,
+                own_claim_id: None,
                 own_key_will_free_slot: false,
                 client_host: format!("node-epg:{}", context.origin_node),
             },
@@ -680,5 +685,50 @@ mod tests {
         let key = ChannelKey::space_channel("/dev/px4video0", 0, 27);
         assert_eq!(route_id_for(&key), "/dev/px4video0#0:27");
         assert_eq!(route_id_for(&key), route_id_for(&key.clone()));
+    }
+
+    #[tokio::test]
+    async fn open_lease_never_falls_back_when_no_local_route_exists() {
+        let database = Arc::new(tokio::sync::Mutex::new(
+            crate::database::Database::open_in_memory().unwrap(),
+        ));
+        let server = LocalMuxServer::new(
+            NodeIdentity {
+                node_id: super::super::types::NodeId::new("supply-node").unwrap(),
+                display_name: "Supply node".to_owned(),
+            },
+            Arc::new(TunerPool::new(1)),
+            database,
+            Arc::new(RemoteLeaseManager::new(Default::default())),
+            MuxLeaseManager::new(Duration::from_secs(60)),
+        );
+        let mut context = RequestContext {
+            request_id: "test-request".to_owned(),
+            trace_id: "test-trace".to_owned(),
+            stream_class: StreamClass::View,
+            claim: crate::tuner::EffectiveClaim::new(1, false),
+            remaining_ms: 10_000,
+            origin_node: super::super::types::NodeId::new("requester-node").unwrap(),
+            visited_nodes: Vec::new(),
+            hop_count: 0,
+            max_hops: 3,
+        };
+
+        let error = match server
+            .open_lease(
+                &mut context,
+                LogicalMuxId {
+                    nid: 0x1001,
+                    tsid: 0x2001,
+                },
+                None,
+                0,
+            )
+            .await
+        {
+            Ok(_) => panic!("a supply node must not invent a remote route"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ServeError::NoRoute(_)));
     }
 }

@@ -1,7 +1,20 @@
 export type PairingConnection = { base_url: string; code: string }
 
-export function pairingConnectionText(endpoint: string, code: string): string {
-  return `recisdb://pair?endpoint=${encodeURIComponent(endpoint)}&code=${encodeURIComponent(code)}`
+export function pairingConnectionText(endpoint: string | string[], code: string): string {
+  const selected = Array.isArray(endpoint) ? endpoint.find((value) => value.trim()) || '' : endpoint
+  return `recisdb://pair?endpoint=${encodeURIComponent(selected)}&code=${encodeURIComponent(code)}`
+}
+
+export function isUsablePairingEndpoint(value: string): boolean {
+  try {
+    const url = new URL(value.trim())
+    return (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      !['0.0.0.0', '::', '[::'].includes(url.hostname)
+    )
+  } catch {
+    return false
+  }
 }
 
 export function isPairingExpired(expiresAtUnixMs: number, currentUnixMs = Date.now()): boolean {

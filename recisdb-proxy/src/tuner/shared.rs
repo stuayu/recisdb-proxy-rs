@@ -711,6 +711,56 @@ impl SharedTuner {
             .max_by_key(|c| (c.priority, c.exclusive as u8))
     }
 
+    /// Return the highest claim except for one subscription.  Channel
+    /// switching must not let the requester's own claim block its switch.
+    ///
+    /// `exclusive` of the result is the *lock* state: true when any remaining
+    /// claim is exclusive, not only the highest-ranked one. A recording
+    /// (50, false) sharing a reader with a locked viewer (10, true) must still
+    /// leave the reader locked.
+    pub fn incumbent_claim_excluding(&self, excluded_id: Option<u64>) -> Option<Claim> {
+        let claims = self.claims.lock().unwrap();
+        let mut remaining = claims
+            .iter()
+            .filter(|(id, _)| Some(**id) != excluded_id)
+            .map(|(_, claim)| *claim);
+        let first = remaining.next()?;
+        let (mut top, mut locked) = (first, first.exclusive);
+        for claim in remaining {
+            locked |= claim.exclusive;
+            if (claim.priority, claim.exclusive as u8) > (top.priority, top.exclusive as u8) {
+                top = claim;
+            }
+        }
+        top.exclusive = locked;
+        Some(top)
+    }
+
+    /// Update a live subscription claim immediately after dashboard control
+    /// changes.  Returns false when the subscription already disappeared.
+    pub fn update_claim(&self, claim_id: u64, priority: i32, exclusive: bool) -> bool {
+        let mut claims = self.claims.lock().unwrap();
+        let Some(claim) = claims.get_mut(&claim_id) else {
+            return false;
+        };
+        claim.priority = priority;
+        claim.exclusive = exclusive;
+        true
+    }
+
+    pub fn claim(&self, claim_id: u64) -> Option<Claim> {
+        self.claims.lock().unwrap().get(&claim_id).copied()
+    }
+
+    pub fn locked_claim(&self) -> Option<Claim> {
+        self.claims
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .find(|claim| claim.exclusive)
+    }
+
     pub fn held_for(&self) -> Duration {
         self.running_since
             .lock()
@@ -2172,6 +2222,12 @@ impl TunerSubscription {
     /// the subscription itself.
     pub fn tuner(&self) -> &Arc<SharedTuner> {
         &self.tuner
+    }
+
+    /// Stable ID of this subscription's live claim, for arbitration and
+    /// immediate dashboard control updates.
+    pub fn claim_id(&self) -> Option<u64> {
+        self.claim_id
     }
 }
 

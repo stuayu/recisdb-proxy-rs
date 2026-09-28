@@ -188,7 +188,11 @@ const tunerSummary = computed(() => {
   const active = store.stats.active_tuners
   if (active === undefined || active === null) return '—'
   const scanning = Number(store.stats.scanning_tuners ?? 0)
-  return scanning > 0 ? `${active} (+スキャン ${scanning})` : String(active)
+  const locked = Array.isArray(store.stats.locked_tuners) ? store.stats.locked_tuners : []
+  const lockText = locked.length
+    ? ` / ロック中(${locked.map((item) => `セッション${String(record(item).session_id)}`).join('、')})`
+    : ''
+  return `${scanning > 0 ? `${active} (+スキャン ${scanning})` : String(active)}${lockText}`
 })
 const cards = computed(() => [
   // スキャンもチューナー枠を1つ占有するので、視聴中のチューナーとは別に
@@ -218,6 +222,22 @@ async function setExclusive(row: JsonRecord, event: Event) {
   await api(`/client/${row.session_id}/controls`, {
     method: 'POST',
     body: JSON.stringify({ override_exclusive: value === '' ? null : value === 'true' }),
+  })
+  await store.refresh()
+}
+async function releaseLock(row: JsonRecord) {
+  if (!confirm(`セッション${String(row.session_id)}のロックを解除しますか？`)) return
+  await api(`/client/${row.session_id}/controls`, {
+    method: 'POST',
+    body: JSON.stringify({ override_exclusive: false }),
+  })
+  await store.refresh()
+}
+async function restoreLock(row: JsonRecord) {
+  if (!confirm(`セッション${String(row.session_id)}の排他設定を元に戻しますか？`)) return
+  await api(`/client/${row.session_id}/controls`, {
+    method: 'POST',
+    body: JSON.stringify({ override_exclusive: null }),
   })
   await store.refresh()
 }
@@ -319,6 +339,7 @@ onUnmounted(() => {
             <th v-for="column in visibleClientColumns" :key="column.key" v-text="column.label" />
             <th>優先度</th>
             <th>排他</th>
+            <th>ロック</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -345,6 +366,27 @@ onUnmounted(() => {
                 <option value="true">有効</option>
                 <option value="false">無効</option>
               </select>
+            </td>
+            <td data-label="ロック">
+              <span v-if="row.locked" class="badge badge-locked">🔒 ロック中</span>
+              <span v-else-if="row.lock_override" class="badge badge-unlocked">解除済み(override)</span>
+              <span v-else class="muted">—</span>
+              <div class="actions lock-actions">
+                <button
+                  v-if="row.locked"
+                  class="button small secondary"
+                  @click="releaseLock(row)"
+                >
+                  ロック解除
+                </button>
+                <button
+                  v-else-if="row.lock_override"
+                  class="button small secondary"
+                  @click="restoreLock(row)"
+                >
+                  元に戻す
+                </button>
+              </div>
             </td>
             <td data-label="操作">
               <div class="actions">

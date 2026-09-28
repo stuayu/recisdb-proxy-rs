@@ -1,4 +1,4 @@
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { extname, join, resolve } from 'node:path'
 import { chromium } from '@playwright/test'
@@ -63,7 +63,9 @@ let browser
 try {
   browser = await chromium.launch({ headless: true })
 } catch (error) {
-  const css = await readFile(join(root, 'assets/app.css'), 'utf8')
+  const cssAsset = (await readdir(join(root, 'assets'))).find((name) => name.endsWith('.css'))
+  if (!cssAsset) throw error
+  const css = await readFile(join(root, 'assets', cssAsset), 'utf8')
   const topology = await readFile(resolve(process.cwd(), 'src/components/nodes/NodeTopologyPreview.vue'), 'utf8')
   if (!/@media\s*\(max-width:\s*700px\)/.test(css)) throw error
   if (!topology.includes('.mobile-svg') || !topology.includes('width: 100%')) throw error

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS channels (
     -- Band and region classification (for auto-generated tuning spaces)
     band_type INTEGER,                   -- BandType enum (0=Terrestrial, 1=BS, 2=CS, 3=4K, 4=Other, 5=CATV, 6=SKY)
     region_id INTEGER,                   -- ARIB region ID (1-62 for terrestrial, NULL for others)
-    terrestrial_region TEXT,             -- Prefecture name for Terrestrial (e.g., "福島", "宮城")
+    terrestrial_region TEXT,             -- Prefecture name for Terrestrial (e.g., "大阪", "愛媛")
     -- State management
     is_enabled INTEGER DEFAULT 1,        -- Enabled/disabled flag
     scan_time INTEGER,                   -- Last scan timestamp

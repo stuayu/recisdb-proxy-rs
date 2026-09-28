@@ -1,6 +1,6 @@
 # チューナー選択の livelock と設計方針 (2026-08-17)
 
-本番機 `fuku-recisdb-web.stuayu.com` で「視聴・録画ができない」事象が発生した。
+本番環境で「視聴・録画ができない」事象が発生した。
 稼働中サーバーのログ API (`/api/logs`, `/api/clients`, `/api/tuners`,
 `/api/channels/export`) から実データを取得して原因を特定した記録と、その修正方針。
 
@@ -26,7 +26,7 @@
 
 **選局に成功したセッションの実質 100% が、直後に他のセッションによって
 退避されている。** 退避されたセッションは切断され、クライアント
-(BonDriverProxyEx、すべて `127.0.0.1` の同一ホスト `DESKTOP-CN518N1`) が
+(BonDriverProxyEx、すべて同一ホスト上のクライアント) が
 即座に再接続し、また誰かを退避する。毎秒約 2.2 セッションの再接続ストーム。
 
 ### 1.2 退避の実際の並び
@@ -91,7 +91,7 @@ P2b-3 のコメントは「`>=` をやめて `>` にしたので同順位では�
 
 これが livelock の直接原因。全員が全員を退避できるので、定常状態が存在しない。
 
-### 2.2 P1 — `exclusive` が無条件の切り札
+### 2.2 P1 — `exclusive` が無条件の切り札 (過去の問題)
 
 `may_evict` の `|| req.exclusive` により、**exclusive 要求は優先度を一切問わず
 退避できる**。優先度 1 の exclusive 要求が優先度 200 の録画を蹴り出せる。
@@ -100,7 +100,9 @@ P2b-3 のコメントは「`>=` をやめて `>` にしたので同順位では�
 接続しており (`/api/clients`)、この経路が実際に発火している
 (`priority=10 exclusive=true` の evict ログ)。
 
-exclusive 同士がぶつかった場合の規定もない。両者が互いを退避できる。
+これは修正済み。現行実装では要求側 `exclusive` は tie-breaker として残るが、
+既存 reader が live exclusive claim を持つ場合はロックとなり、要求の priority・用途に
+関係なく退避不可。手動解除は dashboard の `override_exclusive=false` で行う。
 
 ### 2.3 P2 — 保持直後のチューナーが即座に奪われる
 
@@ -130,8 +132,8 @@ exclusive 同士がぶつかった場合の規定もない。両者が互いを�
 `/api/clients` に以下が存在した:
 
 ```
-session 15  host DESKTOP-CN518N1  prio 9  excl false
-            tuner BonDriver_PX4-T1.dll  Space 0, Ch 2  ＮＨＫ総合１・福島
+session 15  host client-host  prio 9  excl false
+            tuner BonDriver_PX4-T1.dll  Space 0, Ch 2  ＮＨＫ総合１・地域A
             connected 4028s  is_streaming true  current_bitrate_mbps 0.0
 ```
 
@@ -199,6 +201,10 @@ NHK 系の ch1 / ch2 のみ。
 
 ### P1. `exclusive` をタイブレークに格下げする
 
+※ 現行実装 (2026-09) ではこの方針を更新した。要求側の `exclusive` は tie-breaker として
+残るが、既存 reader の live exclusive claim はロックであり、どの要求からも退避不可。
+dashboard の `override_exclusive=false` は購読中 claim を即時更新する。
+
 要求側・居座り側とも `(priority, exclusive)` の辞書式順序で比較し、
 **要求側が厳密に大きいときだけ退避を許す**。
 
@@ -211,6 +217,9 @@ fn may_evict(req: &TuneRequest, victim: &EntryState, victim_is_keep_alive: bool)
     if victim_is_keep_alive {
         return true; // keep-alive の残り火は最適化にすぎない。同順位でも譲る
     }
+    if victim.incumbent_exclusive {
+        return false; // live exclusive claim はロック
+    }
     claim_rank(req.priority, req.exclusive)
         > claim_rank(victim.priority, victim.incumbent_exclusive)
 }
@@ -221,6 +230,7 @@ fn may_evict(req: &TuneRequest, victim: &EntryState, victim_is_keep_alive: bool)
 - 同優先度で要求側だけ exclusive → 退避可 (「ハードウェアを寄越せ」の意図を尊重)。
 - 低優先度の exclusive が高優先度の録画を蹴る経路が消える。
 - exclusive 同士の相互退避が消える。
+- 既存 reader の live exclusive claim は全要求から保護される。
 
 `keep_alive` の分岐は現状のまま維持する (`policy.rs::may_evict` の
 既存コメントの理由がそのまま有効)。

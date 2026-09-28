@@ -31,7 +31,7 @@ function pushService(nid, sid, tsid, name, band, rck, region, withPrograms = tru
     id: channels.length + 1, bon_driver_id: 1, channel_name: name,
     nid, sid, tsid, band_type: band, service_type: 1,
     remote_control_key: rck, terrestrial_region: region,
-    prefecture_code: region === '東京' ? 13 : region === '福島' ? 7 : null,
+    prefecture_code: region === '大阪' ? 27 : region === '愛媛' ? 38 : null,
     priority: 10, is_enabled: true, bon_space: 0, bon_channel: 13,
   })
   if (!withPrograms) return
@@ -55,7 +55,7 @@ for (let i = 0; i < 12; i++) {
   pushService(0x7800 + i, 60000 + i * 8, 0x7800 + i, `受信不可局${i + 1}`, 0, (i % 12) + 1, '九州', false)
 }
 for (let i = 0; i < 30; i++) {
-  pushService(0x7880 + i, 1024 + i * 8, 0x7880 + i, `${CH_NAMES[i % 10]}${i < 10 ? '' : i}`, 0, ((15 - i) % 12) + 1, i < 15 ? '東京' : '福島')
+  pushService(0x7880 + i, 1024 + i * 8, 0x7880 + i, `${CH_NAMES[i % 10]}${i < 10 ? '' : i}`, 0, ((15 - i) % 12) + 1, i < 15 ? '大阪' : '愛媛')
 }
 for (let i = 0; i < 20; i++) pushService(4, 101 + i, 0x4000 + i, `BS局${i + 1}`, 1, null, null)
 for (let i = 0; i < 20; i++) pushService(6, 201 + i, 0x6000 + i, `CS局${i + 1}`, 2, null, null)
@@ -154,7 +154,7 @@ for (const vp of [
           }
         }
         if (url.pathname === '/api/guide-config') {
-          body = { success: true, default_region: null, regions: [{ name: '福島', prefecture_code: 7 }, { name: '東京', prefecture_code: 13 }] }
+          body = { success: true, default_region: null, regions: [{ name: '大阪', prefecture_code: 27 }, { name: '愛媛', prefecture_code: 38 }] }
         }
         if (url.pathname === '/api/programs') {
           const since = Number(url.searchParams.get('since') || 0)

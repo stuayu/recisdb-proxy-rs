@@ -114,6 +114,10 @@ pub(crate) struct AcquireRequest {
     /// `carried_permit` — the very permit that makes the switch possible —
     /// ever gets a chance to be used.
     pub own_key: Option<ChannelKey>,
+    /// Claim ID belonging to this requester's current subscription.  It is
+    /// excluded from the incumbent rank while switching away from a shared
+    /// reader; other subscribers remain eviction candidates.
+    pub own_claim_id: Option<u64>,
     pub own_key_will_free_slot: bool,
 }
 
@@ -164,6 +168,9 @@ pub(crate) enum AcquireError {
         lowest_idle_priority: Option<i32>,
         conflict: Option<AcquireConflict>,
     },
+    /// A live exclusive claim locks the candidate reader against eviction.
+    #[error("tuner is locked by an exclusive {conflict:?}")]
+    Locked { conflict: Option<AcquireConflict> },
     #[error("all tuner slots are still warming; retry after {}ms", retry_after.as_millis())]
     Warming { retry_after: std::time::Duration },
     /// Every snapshot→decide→act round lost a race
@@ -201,6 +208,7 @@ impl From<RejectReason> for AcquireError {
                 lowest_idle_priority,
                 conflict: None,
             },
+            RejectReason::Locked { .. } => AcquireError::Locked { conflict: None },
             RejectReason::Warming { retry_after } => AcquireError::Warming { retry_after },
         }
     }
@@ -236,6 +244,15 @@ async fn find_conflict(pool: &TunerPool, candidates: &[ChannelKey]) -> Option<Ac
         });
     }
     None
+}
+
+async fn find_locked_conflict(pool: &TunerPool, tuner_key: &ChannelKey) -> Option<AcquireConflict> {
+    let tuner = pool.get(tuner_key).await?;
+    let claim = tuner.locked_claim()?;
+    Some(AcquireConflict {
+        usage: claim.usage,
+        tuner: tuner_key.clone(),
+    })
 }
 
 /// Write one runtime-health observation for `tuner_path`, if the driver is
@@ -412,6 +429,16 @@ pub(crate) async fn snapshot(
     database: &DatabaseHandle,
     dll_paths: &[String],
 ) -> TunerSnapshot {
+    snapshot_excluding_claim(pool, database, dll_paths, None, None).await
+}
+
+pub(crate) async fn snapshot_excluding_claim(
+    pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    dll_paths: &[String],
+    own_key: Option<&ChannelKey>,
+    own_claim_id: Option<u64>,
+) -> TunerSnapshot {
     let dll_paths: Vec<String> = dll_paths
         .iter()
         .cloned()
@@ -457,7 +484,10 @@ pub(crate) async fn snapshot(
         // Read the incumbent rank atomically with respect to the claims
         // mutex. Calling incumbent_claim() twice can combine priority from one
         // subscription set with exclusive from a later one.
-        let incumbent = tuner.incumbent_claim();
+        // `incumbent_claim_excluding(None)` also folds every claim's
+        // exclusive flag into the lock state (any exclusive claim locks).
+        let excluded = if own_key == Some(&key) { own_claim_id } else { None };
+        let incumbent = tuner.incumbent_claim_excluding(excluded);
         raw_entries.push(RawEntry {
             key,
             state: tuner.state(),
@@ -648,7 +678,14 @@ pub(crate) async fn acquire(
     let mut last_start_failure: Option<AcquireError> = None;
 
     for attempt in 0..attempts {
-        let snap = snapshot(pool, database, &dll_paths).await;
+        let snap = snapshot_excluding_claim(
+            pool,
+            database,
+            &dll_paths,
+            request.own_key.as_ref(),
+            request.own_claim_id,
+        )
+        .await;
 
         // Drop drivers whose permit we already failed to get in this call.
         // Without this the retry is pointless under contention: every loser
@@ -722,6 +759,7 @@ pub(crate) async fn acquire(
                         ) =>
                     {
                         pool.reject_gate().clear(&gate_key);
+                        pool.lock_warn_gate().clear(&gate_key);
                         return Ok(AcquireOutcome {
                             tuner,
                             key,
@@ -747,6 +785,7 @@ pub(crate) async fn acquire(
             }
             Decision::Create { key, evict } => {
                 pool.reject_gate().clear(&gate_key);
+                pool.lock_warn_gate().clear(&gate_key);
                 for victim in &evict {
                     evict_tuner(pool, victim).await;
                 }
@@ -1042,7 +1081,33 @@ pub(crate) async fn acquire(
                         Instant::now(),
                     );
                 }
-                match AcquireError::from(reason) {
+                if let RejectReason::Locked { tuner } = &reason {
+                    let conflict = find_locked_conflict(pool, tuner).await;
+                    let now = Instant::now();
+                    let lock_log = match pool.lock_warn_gate().check(&gate_key, now) {
+                        None => {
+                            pool.lock_warn_gate().record(
+                                gate_key.clone(),
+                                reason.clone(),
+                                std::time::Duration::from_secs(60),
+                                now,
+                            );
+                            Some(0)
+                        }
+                        Some((_, suppressed)) => suppressed,
+                    };
+                    if let Some(suppressed) = lock_log {
+                        warn!(
+                            "[acquire] request host={} blocked by locked tuner {:?} usage={:?} ({} repeated requests suppressed)",
+                            request.client_host,
+                            tuner,
+                            conflict.as_ref().map(|item| item.usage),
+                            suppressed
+                        );
+                    }
+                    return Err(AcquireError::Locked { conflict });
+                }
+                match AcquireError::from(reason.clone()) {
                     AcquireError::AtCapacity {
                         lowest_idle_priority,
                         ..
@@ -1137,6 +1202,7 @@ mod tests {
             carried_permit: None,
             warm: None,
             own_key: None,
+            own_claim_id: None,
             own_key_will_free_slot: false,
         }
     }
@@ -1188,10 +1254,19 @@ mod tests {
 
     async fn running_snapshot_fixture(
     ) -> (Arc<TunerPool>, DatabaseHandle, Arc<SharedTuner>, ChannelKey) {
+        running_snapshot_fixture_with_max(3).await
+    }
+
+    async fn running_snapshot_fixture_with_max(
+        max_instances: i32,
+    ) -> (Arc<TunerPool>, DatabaseHandle, Arc<SharedTuner>, ChannelKey) {
         let pool = Arc::new(TunerPool::new(10));
-        let database = db_handle_with_driver("/dev/test", 3);
+        let database = db_handle_with_driver("/dev/test", max_instances);
         let key = ChannelKey::space_channel("/dev/test", 0, 5);
-        let permit = pool.acquire_slot("/dev/test", 3).await.unwrap();
+        let permit = pool
+            .acquire_slot("/dev/test", max_instances)
+            .await
+            .unwrap();
         let tuner = pool
             .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
@@ -1214,6 +1289,33 @@ mod tests {
         let priority = snap.entries[0].priority;
         tuner.stop_reader().await;
         assert_eq!(priority, 9);
+    }
+
+    #[tokio::test]
+    async fn repro_mirakurun_recording_claim_is_lost_before_bndp_preemption() {
+        let (pool, database, tuner, _) = running_snapshot_fixture_with_max(1).await;
+        // Mirrors the fixed Mirakurun path: the local BodyReceiver keeps the
+        // same priority that reached acquire.
+        let _sub = tuner.subscribe_with_claim_class(20, false, TunerUsage::Record);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+        let request = policy::TuneRequest {
+            candidates: vec![ChannelKey::space_channel("/dev/test", 0, 6)],
+            priority: 10,
+            exclusive: true,
+            min_hold: Duration::ZERO,
+            own_key: None,
+            own_key_will_free_slot: false,
+        };
+        let decision = policy::decide(&snap, &request);
+        tuner.stop_reader().await;
+
+        // Desired result if the recording's positive priority had survived
+        // subscription: a BNDP priority 10 request must not evict it.
+        assert!(
+            matches!(decision, policy::Decision::Reject { .. }),
+            "actual decision: {decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -1256,6 +1358,39 @@ mod tests {
 
         assert_eq!(snap.entries[0].priority, 10);
         assert!(snap.entries[0].incumbent_exclusive);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_locks_reader_when_a_lower_ranked_claim_is_exclusive() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _record = tuner.subscribe_with_claim_class(50, false, TunerUsage::Record);
+        let _share = tuner.subscribe_with_claim_class(10, true, TunerUsage::View);
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        assert_eq!(snap.entries[0].priority, 50);
+        assert!(snap.entries[0].incumbent_exclusive);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_requesters_claim_but_keeps_co_viewer_claim() {
+        let (pool, database, tuner, key) = running_snapshot_fixture().await;
+        let own = tuner.subscribe_with_claim_class(100, true, TunerUsage::Record);
+        let _other = tuner.subscribe_with_claim_class(20, false, TunerUsage::View);
+
+        let snap = snapshot_excluding_claim(
+            &pool,
+            &database,
+            &["/dev/test".to_string()],
+            Some(&key),
+            own.claim_id(),
+        )
+        .await;
+
+        assert_eq!(snap.entries[0].priority, 20);
+        assert!(!snap.entries[0].incumbent_exclusive);
         tuner.stop_reader().await;
     }
 

@@ -78,13 +78,13 @@ async function save() {
     <p class="muted">通常は変更不要。接続先や認証情報を手動管理する場合だけ使用。</p>
     <label class="field"
       ><span>Node ID</span
-      ><input v-model="nodeId" :disabled="!!entry" autocomplete="off" placeholder="tokyo"
+      ><input v-model="nodeId" :disabled="!!entry" autocomplete="off" placeholder="site-a"
     /></label>
     <label class="field"
-      ><span>表示名</span><input v-model="displayName" autocomplete="off" placeholder="東京"
+      ><span>表示名</span><input v-model="displayName" autocomplete="off" placeholder="拠点A"
     /></label>
     <label class="field"
-      ><span>受信拠点</span><input v-model="siteName" autocomplete="off" placeholder="東京都"
+      ><span>受信拠点</span><input v-model="siteName" autocomplete="off" placeholder="大阪"
     /></label>
     <label class="field"
       ><span>EndpointKind</span

@@ -42,7 +42,7 @@ bytes = "1.5"
 futures = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 futures-executor = "0.3"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "http2"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 

@@ -955,6 +955,7 @@ impl EpgScanScheduler {
                 carried_permit: None,
                 warm: None,
                 own_key: None,
+                own_claim_id: None,
                 own_key_will_free_slot: false,
             },
         )

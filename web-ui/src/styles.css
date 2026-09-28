@@ -2237,6 +2237,20 @@ textarea:focus-visible,
   color: #d08700;
 }
 
+.badge-locked {
+  border-color: #b42318;
+  color: #b42318;
+}
+
+.badge-unlocked {
+  border-color: #287d3c;
+  color: #287d3c;
+}
+
+.lock-actions {
+  margin-top: 6px;
+}
+
 .app.dark .badge-scanning {
   border-color: #f0b429;
   color: #f0b429;

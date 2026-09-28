@@ -368,6 +368,7 @@ pub struct TunerPool {
     /// exists to prevent).
     open_backoff: Arc<OpenFailureBackoff>,
     reject_gate: Arc<RejectGate>,
+    lock_warn_gate: Arc<RejectGate>,
 }
 
 struct IdleHandle {
@@ -393,6 +394,7 @@ impl TunerPool {
             scanning: Arc::new(std::sync::Mutex::new(HashMap::new())),
             open_backoff: Arc::new(OpenFailureBackoff::new()),
             reject_gate: Arc::new(RejectGate::new()),
+            lock_warn_gate: Arc::new(RejectGate::new()),
         }
     }
 
@@ -406,6 +408,10 @@ impl TunerPool {
 
     pub(crate) fn reject_gate(&self) -> &Arc<RejectGate> {
         &self.reject_gate
+    }
+
+    pub(crate) fn lock_warn_gate(&self) -> &Arc<RejectGate> {
+        &self.lock_warn_gate
     }
 
     /// Try to reserve one of `dll_path`'s `max_instances` slots.

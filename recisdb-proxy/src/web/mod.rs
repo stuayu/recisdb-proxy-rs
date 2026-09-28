@@ -376,8 +376,24 @@ fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
         router = router.nest("/mirakurun/api", build_mirakurun_router());
     }
 
+    // The node transport (`/node/v3/*`) is also served here, not only on its
+    // dedicated `listen port + 1` listener. A site that is reachable only
+    // through an HTTP tunnel for the dashboard (Cloudflare Tunnel public
+    // hostname) can then be paired and leased through that same hostname.
+    // Every node route except `/node/v3/pair` requires a node credential, and
+    // pairing needs a live one-time code behind a failure limiter.
+    let node_router = web_state
+        .node_transport
+        .clone()
+        .map(crate::node::transport::router);
+
+    let router = router.with_state(web_state);
+    let router = match node_router {
+        Some(node_router) => router.merge(node_router),
+        None => router,
+    };
+
     router
-        .with_state(web_state)
         // Compress only dashboard JSON/HTML/JS/CSS when the client accepts
         // gzip. TS (`video/mp2t`) and SSE (`text/event-stream`) are outside
         // this content-type allowlist, so live streams are never buffered or
@@ -514,6 +530,37 @@ mod tests {
             log_level,
             epg_events_tx,
         ))
+    }
+
+    /// A site reachable only through a dashboard tunnel must still expose the
+    /// node transport on that same port (Cloudflare Tunnel public hostname).
+    #[tokio::test]
+    async fn web_port_also_serves_node_transport() {
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
+        let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+        state.node_transport = Some(Arc::new(crate::node::NodeTransportState::new(
+            crate::node::NodeIdentity {
+                node_id: crate::node::NodeId::new("site-c").unwrap(),
+                display_name: "拠点C".into(),
+            },
+            Arc::new(crate::node::RemoteLeaseManager::new(Default::default())),
+        )));
+        let app = build_app(Arc::new(state), false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/node/v3/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Unauthenticated hello: routed to the node handler (401), not 404.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn sample_program(nid: u16, sid: u16, event_id: u16) -> crate::database::ProgramUpsert {

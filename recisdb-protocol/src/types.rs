@@ -547,7 +547,7 @@ pub struct ChannelInfo {
 
     /// Band type classification (0=Terrestrial, 1=BS, 2=CS, 3=4K, 4=Other)
     pub band_type: Option<u8>,
-    /// Terrestrial region name (e.g., "福島", "宮城") - for Terrestrial only
+    /// Terrestrial region name (e.g., "大阪", "愛媛") - for Terrestrial only
     pub terrestrial_region: Option<String>,
 }
 

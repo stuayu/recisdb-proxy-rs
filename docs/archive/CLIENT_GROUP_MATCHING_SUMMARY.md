@@ -61,7 +61,7 @@ impl BandType {
 ```sql
 -- channels テーブに追加
 ALTER TABLE channels ADD COLUMN band_type INTEGER;         -- 0-4
-ALTER TABLE channels ADD COLUMN terrestrial_region TEXT;   -- "福島", "宮城" など
+ALTER TABLE channels ADD COLUMN terrestrial_region TEXT;   -- "地域A", "地域B" など
 ```
 
 #### SpaceGenerator による自動生成
@@ -74,7 +74,7 @@ pub struct SpaceGenerator {
 
 pub struct SpaceMapping {
     pub virtual_space: u32,          // 仮想空間インデックス (0, 1, 2, ...)
-    pub display_name: String,        // "福島", "宮城", "BS", "CS"
+    pub display_name: String,        // "地域A", "地域B", "BS", "CS"
     pub band_type: BandType,
     pub region_name: Option<String>, // 地デジのみ
     pub actual_spaces: Vec<u32>,     // 実ボンドライバー空間番号
@@ -91,14 +91,14 @@ pub struct SpaceMapping {
 **例**:
 ```
 チャンネル一覧:
-- NID=0x7FE0, bon_space=0   → 福島 (band=Terrestrial)
-- NID=0x7FE4, bon_space=0   → 宮城 (band=Terrestrial)
+- NID=0x7FE0, bon_space=0   → 地域A (band=Terrestrial)
+- NID=0x7FE4, bon_space=0   → 地域B (band=Terrestrial)
 - NID=0x4011, bon_space=1   → BS (band=BS)
 - NID=0x6001, bon_space=2   → CS (band=CS)
 
 生成結果:
-- virtual_space=0: 福島 地上波
-- virtual_space=1: 宮城 地上波
+- virtual_space=0: 地域A 地上波
+- virtual_space=1: 地域B 地上波
 - virtual_space=2: BS衛星
 - virtual_space=3: CS衛星
 ```
@@ -109,8 +109,8 @@ NID 値レンジから地域を自動推測:
 fn infer_region_from_nid(nid: u16) -> String {
     match nid {
         0x7F80..=0x7F8F => "北海道",
-        0x7F50..=0x7F5F => "宮城",
-        0x7F20..=0x7F2F => "福島",
+        0x7F50..=0x7F5F => "地域B",
+        0x7F20..=0x7F2F => "地域A",
         0x7F00..=0x7F0F => "神奈川",
         ...
     }
@@ -127,9 +127,9 @@ fn infer_region_from_nid(nid: u16) -> String {
 
 **対応方法**:
 1. グループ内の各ドライバーに対して個別の `SpaceGenerator` を生成
-   - MLT1.dll: 福島地上波のみ → virtual_space={0: 福島}
-   - MLT2.dll: 福島+宮城地上波 → virtual_space={0: 福島, 1: 宮城}
-   - MLT3.dll: 福島+宮城+BS → virtual_space={0: 福島, 1: 宮城, 2: BS}
+   - MLT1.dll: 地域A地上波のみ → virtual_space={0: 地域A}
+   - MLT2.dll: 地域A+地域B地上波 → virtual_space={0: 地域A, 1: 地域B}
+   - MLT3.dll: 地域A+地域B+BS → virtual_space={0: 地域A, 1: 地域B, 2: BS}
 
 2. クライアント側から `space_idx` が指定されたとき:
    - グループ内のドライバーを順に調査
@@ -172,13 +172,13 @@ impl Session {
 
 | ドライバー | virtual_space=0 | virtual_space=1 | virtual_space=2 |
 |-----------|-----------------|-----------------|-----------------|
-| MLT1.dll  | ✅ 福島         | ❌ (スキップ)   | ❌              |
-| MLT2.dll  | ✅ 福島         | ✅ 宮城         | ❌              |
-| MLT3.dll  | ✅ 福島         | ✅ 宮城         | ✅ BS           |
+| MLT1.dll  | ✅ 地域A        | ❌ (スキップ)   | ❌              |
+| MLT2.dll  | ✅ 地域A        | ✅ 地域B        | ❌              |
+| MLT3.dll  | ✅ 地域A        | ✅ 地域B        | ✅ BS           |
 
-クライアントが `space_idx=1` (宮城) をリクエスト:
-1. MLT1.dll: ❌ 宮城チャンネルなし
-2. MLT2.dll: ✅ 宮城チャンネルあり → 選択
+クライアントが `space_idx=1` (地域B) をリクエスト:
+1. MLT1.dll: ❌ 地域Bチャンネルなし
+2. MLT2.dll: ✅ 地域Bチャンネルあり → 選択
 3. MLT3.dll: ✅ 但し優先度は MLT2 より低い
 
 ---

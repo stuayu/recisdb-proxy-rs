@@ -428,7 +428,7 @@ mod tests {
                 TomlValue::Str(r#"C:\DTV\recisdb.db"#.into()),
             ),
             ("mirakurun", "enabled", TomlValue::Bool(true)),
-            ("mirakurun", "home_region", TomlValue::Str("東京".into())),
+            ("mirakurun", "home_region", TomlValue::Str("大阪".into())),
             ("node", "display_name", TomlValue::Str("test".into())),
             (
                 "tsreplace",

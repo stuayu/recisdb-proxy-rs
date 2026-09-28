@@ -576,8 +576,8 @@ impl Database {
     /// driver within the group ("exclusive" channels).
     ///
     /// Used by group-mode driver selection to keep drivers that are the sole
-    /// receiver of some channel (e.g. a Tokyo-pointed tuner that alone gets
-    /// Tokyo MX) free for those channels: drivers with fewer exclusive
+    /// receiver of some channel (e.g. a dedicated tuner that alone gets
+    /// one service) free for those channels: drivers with fewer exclusive
     /// channels are preferred when a channel is receivable on several drivers.
     /// Every path in `group_paths` is present in the returned map (0 if the
     /// driver has no exclusive channels or no channels at all).
@@ -1518,37 +1518,37 @@ mod tests {
     #[test]
     fn test_get_exclusive_channel_counts() {
         let db = Database::open_in_memory().unwrap();
-        let tokyo = db.get_or_create_bon_driver("Tokyo.dll").unwrap();
-        let gunma = db.get_or_create_bon_driver("Gunma.dll").unwrap();
+        let site_a = db.get_or_create_bon_driver("SiteA.dll").unwrap();
+        let site_b = db.get_or_create_bon_driver("SiteB.dll").unwrap();
         let idle = db.get_or_create_bon_driver("Idle.dll").unwrap();
         let _ = idle;
 
-        // Tokyo MX: only the Tokyo tuner carries it.
-        db.insert_channel(tokyo, &create_test_channel(0x7FE6, 23608, 23608))
+        // A site-specific service: only the dedicated tuner carries it.
+        db.insert_channel(site_a, &create_test_channel(0x7FE6, 23608, 23608))
             .unwrap();
         // テレ東相当: carried by both tuners (same NID+TSID, different SIDs
         // must still count as ONE logical channel per driver).
-        db.insert_channel(tokyo, &create_test_channel(0x7FE8, 1024, 32736))
+        db.insert_channel(site_a, &create_test_channel(0x7FE8, 1024, 32736))
             .unwrap();
-        db.insert_channel(tokyo, &create_test_channel(0x7FE8, 1025, 32736))
+        db.insert_channel(site_a, &create_test_channel(0x7FE8, 1025, 32736))
             .unwrap();
-        db.insert_channel(gunma, &create_test_channel(0x7FE8, 1024, 32736))
+        db.insert_channel(site_b, &create_test_channel(0x7FE8, 1024, 32736))
             .unwrap();
-        // 群馬テレビ相当: only the Gunma tuner — but disabled, so it must
+        // Site-specific service: only the site-B tuner — but disabled, so it must
         // not count.
         let gtv = db
-            .insert_channel(gunma, &create_test_channel(0x7FD1, 3088, 30256))
+            .insert_channel(site_b, &create_test_channel(0x7FD1, 3088, 30256))
             .unwrap();
         db.disable_channel(gtv).unwrap();
 
         let group = vec![
-            "Tokyo.dll".to_string(),
-            "Gunma.dll".to_string(),
+            "SiteA.dll".to_string(),
+            "SiteB.dll".to_string(),
             "Idle.dll".to_string(),
         ];
         let counts = db.get_exclusive_channel_counts(&group).unwrap();
-        assert_eq!(counts.get("Tokyo.dll"), Some(&1)); // MX のみ
-        assert_eq!(counts.get("Gunma.dll"), Some(&0)); // 共通chと無効chのみ
+        assert_eq!(counts.get("SiteA.dll"), Some(&1)); // 専用chのみ
+        assert_eq!(counts.get("SiteB.dll"), Some(&0)); // 共通chと無効chのみ
         assert_eq!(counts.get("Idle.dll"), Some(&0)); // チャンネルなしでも0で存在
 
         // Empty group: empty map, no error.

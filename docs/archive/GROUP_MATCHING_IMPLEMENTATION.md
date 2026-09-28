@@ -149,8 +149,8 @@ impl SpaceGenerator {
         // 4. 存在しない帯域は詰める
         
         // 例出力:
-        // Space 0: 福島地上波 (NID 0x7FE0-0x7FE1)
-        // Space 1: 宮城地上波 (NID 0x7FE2-0x7FE3)
+        // Space 0: 地域A地上波 (NID 0x7FE0-0x7FE1)
+        // Space 1: 地域B地上波 (NID 0x7FE2-0x7FE3)
         // Space 2: BS衛星 (NID 0x4011-0x4013)
         // Space 3: CS衛星 (NID 0x4041-0x404D)
         // Space 4: その他
@@ -297,7 +297,7 @@ pub fn get_group_driver_paths(&self, group_name: &str) -> Result<Vec<String>> { 
 ```sql
 -- 帯域分類をキャッシュ（正規化）
 ALTER TABLE channels ADD COLUMN band_type INTEGER;  -- BandType enum
-ALTER TABLE channels ADD COLUMN terrestrial_region TEXT;  -- "福島", "宮城" など
+ALTER TABLE channels ADD COLUMN terrestrial_region TEXT;  -- "地域A", "地域B" など
 ```
 
 ---
@@ -377,7 +377,7 @@ pub enum ServerMessage {
 ## チャレンジと対策
 
 ### チャレンジ1: 複数DLLでの帯域・地域の一致性
-**問題**: MLT1.dll は福島地上波のみ、MLT2.dll は福島+宮城、MLT3.dll は福島+宮城+BS...
+**問題**: MLT1.dll は地域A地上波のみ、MLT2.dll は地域A+地域B、MLT3.dll は地域A+地域B+BS...
 
 **対策**:
 - グループ内でも各ドライバーのチャンネル可用性は異なることを許容
@@ -393,7 +393,7 @@ pub enum ServerMessage {
 - 個別ドライバーへのマッピング時に足りない場合は適切にエラー処理
 
 ### チャレンジ3: NID からの地域推定
-**問題**: NID 0x7FE0 が福島か宮城か不明
+**問題**: NID 0x7FE0 が地域Aか地域Bか不明
 
 **対策**:
 - `broadcast_region.rs` の NID マップを拡充

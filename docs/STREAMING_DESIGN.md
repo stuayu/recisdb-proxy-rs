@@ -154,7 +154,7 @@ budget_bytes = bitrate_bps / 8 × ts_queue_ms / 1000
   設定窓より大きい構成でストリームが永久に止まる。
 - mpsc のスロット数 (8192) は輸送層の保険であり、実際の「満杯」判定はバイト予算が行う。
 
-拠点間中継 (例: 宮城・福島 ↔ 東京) では、**バッファはジッタしか吸収できない**点に注意する。
+拠点間中継 (例: 拠点A ↔ 拠点B) では、**バッファはジッタしか吸収できない**点に注意する。
 実効帯域がストリームのビットレートを下回る場合は、いくら秒数を伸ばしても遅延が単調増加して
 最後に切れるだけなので、`ServiceFilter=single` かエンコード配信でレート自体を下げること。
 
@@ -303,6 +303,13 @@ GET /api/stream/channel/:type/:ch/service/:sid  Mirakurun 互換パス (§7)
 - 内部的には既存の Session/TunerPool/SharedEncoder を HTTP 用の薄いアダプタから呼ぶ
   (BNDP セッションと���じ選局・共有・優先度ロジックを再利用。二重実装しない)。
 - クラスは PREVIEW 既定。切断で参照カウント減。
+
+BNDPの3選局経路も、local acquire失敗時はHTTP/Mirakurunと同じtyped
+remote-fallback判定を使う。Sessionの配信源はlocal
+`TunerSubscription`またはremote `RemoteMuxStream`+`broadcast::Receiver`の
+排他的状態。remote sourceの`Lagged`はVIEW/PREVIEWでは再同期、RECORDでは
+`record_broadcast_lag`で切断する。remote中のGetSignalLevelはデータ到着中20 dB、
+無通信時0 dB。
 
 ### 6.4 プレビュー UI
 

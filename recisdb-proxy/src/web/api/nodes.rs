@@ -6,6 +6,7 @@
 //! dashboard bearer token.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -20,8 +21,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{
-    probe_endpoint, select_best_path, NodeCredential, NodeEndpoint, NodeId, NodeStore,
-    NodeTransportClient, PairingCode, PathPolicy, ProbeConfig, StoredNode, PAIRING_CODE_TTL,
+    discover_advertised_endpoints, probe_endpoint, select_best_path, NodeCredential, NodeEndpoint,
+    NodeId, NodeStore, NodeTransportClient, PairingCode, PathPolicy, ProbeConfig, StoredNode,
+    PAIRING_CODE_TTL,
 };
 use crate::web::state::WebState;
 
@@ -58,7 +60,7 @@ pub struct ProbeNodeRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct IssuePairingRequest {
-    /// Free-form note shown next to the pending code ("東京の受信機" etc.).
+    /// Free-form note shown next to the pending code ("大阪の受信機" etc.).
     pub label: Option<String>,
 }
 
@@ -75,7 +77,7 @@ pub struct UpdateNodeStateRequest {
 #[derive(Debug, Deserialize)]
 pub struct RedeemPairingRequest {
     /// Base URL of the *issuing* node's transport listener, e.g.
-    /// `http://tokyo.tailnet.ts.net:20773`.
+    /// `https://node-a.example.com:20773`.
     pub base_url: String,
     /// The one-time code shown on that node's dashboard.
     pub code: String,
@@ -107,6 +109,7 @@ pub struct RemoveRouteGroupMemberRequest {
 pub async fn get_nodes(
     State(web_state): State<Arc<WebState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let local_endpoints = local_advertised_endpoints(&web_state).await;
     let db = web_state.database.lock().await;
     let store = NodeStore::new(&db)?;
     let local = store.local_identity()?;
@@ -192,10 +195,15 @@ pub async fn get_nodes(
     // Only the expiry is knowable: the code itself was stored as a digest.
     let pending_pairings = store.pending_pairings()?;
 
-    let topology_local = local.clone();
+    let local_view = json!({
+        "node_id": local.node_id,
+        "display_name": local.display_name,
+        "endpoints": local_endpoints,
+    });
+    let topology_local = local_view.clone();
     Ok(Json(json!({
         "success": true,
-        "local": local,
+        "local": local_view,
         "nodes": entries,
         "route_groups": route_groups,
         "setup_status": setup_status,
@@ -338,6 +346,7 @@ pub async fn issue_pairing_code(
         store.create_pending_pairing(&code, label.as_deref(), expires_at_unix_ms)?;
         (store.local_identity()?, web_state.node_listen_addr.clone())
     };
+    let endpoints = local_advertised_endpoints(&web_state).await;
 
     Ok(Json(json!({
         "success": true,
@@ -348,7 +357,19 @@ pub async fn issue_pairing_code(
         "label": label,
         "local": local,
         "node_listen_addr": listen_hint,
+        "endpoints": endpoints,
     })))
+}
+
+async fn local_advertised_endpoints(web_state: &WebState) -> Vec<NodeEndpoint> {
+    let Some(listen_addr) = web_state
+        .node_listen_addr
+        .as_deref()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        return Vec::new();
+    };
+    discover_advertised_endpoints(listen_addr).await
 }
 
 /// Redeem a code issued by another node, establishing the shared credential.
@@ -369,6 +390,11 @@ pub async fn redeem_pairing_code(
     for endpoint in &payload.endpoints {
         if endpoint.address.trim().is_empty() {
             return Err(ApiError::bad_request("endpoint address must not be empty"));
+        }
+        if !endpoint.address.starts_with("http://") && !endpoint.address.starts_with("https://") {
+            return Err(ApiError::bad_request(
+                "endpoint address must start with http:// or https://",
+            ));
         }
     }
 

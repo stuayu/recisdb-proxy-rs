@@ -373,8 +373,8 @@ mod tests {
         });
         let lease = manager
             .create(
-                NodeId::new("fukushima").unwrap(),
-                "gunma-route".into(),
+                NodeId::new("site-a").unwrap(),
+                "site-b-route".into(),
                 LogicalMuxId { nid: 1, tsid: 1 },
                 Some(101),
                 StreamClass::Record,
@@ -415,8 +415,8 @@ mod tests {
         });
         let lease = manager
             .create(
-                NodeId::new("fukushima").unwrap(),
-                "gunma-route".into(),
+                NodeId::new("site-a").unwrap(),
+                "site-b-route".into(),
                 LogicalMuxId { nid: 1, tsid: 1 },
                 None,
                 StreamClass::Record,
@@ -461,8 +461,8 @@ mod tests {
         });
         let make = |class| {
             manager.create(
-                NodeId::new("fukushima").unwrap(),
-                "gunma-route".into(),
+                NodeId::new("site-a").unwrap(),
+                "site-b-route".into(),
                 LogicalMuxId { nid: 1, tsid: 1 },
                 None,
                 class,
@@ -497,8 +497,8 @@ mod tests {
         let manager = RemoteLeaseManager::new(LeasePolicy::default());
         let lease = manager
             .create(
-                NodeId::new("fukushima").unwrap(),
-                "gunma-route".into(),
+                NodeId::new("site-a").unwrap(),
+                "site-b-route".into(),
                 LogicalMuxId { nid: 1, tsid: 1 },
                 None,
                 StreamClass::Record,

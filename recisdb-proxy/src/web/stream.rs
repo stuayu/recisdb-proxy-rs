@@ -916,7 +916,15 @@ async fn stream_resolved(
     // preview mode (see below) — tokio broadcast receivers that are never
     // polled do not block the sender or other receivers, they simply lag
     // and get skipped, so this is safe and cheap.
-    let tuner_rx = tuner.subscribe();
+    let tuner_rx = tuner.subscribe_with_claim_class(
+        resolved.channel.priority,
+        false,
+        crate::tuner::shared::TunerUsage::from(StreamClass::View),
+    );
+    web_state
+        .session_registry
+        .bind_tuner_claim(session.id(), Arc::clone(&tuner), &tuner_rx)
+        .await;
 
     let profile = query.profile.as_deref().unwrap_or("");
 

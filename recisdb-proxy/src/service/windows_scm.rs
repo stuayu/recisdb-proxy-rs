@@ -439,7 +439,7 @@ define_windows_service!(ffi_service_main, service_main_entry);
 /// 停止要求を受けてからサーバ本体の終了を待つ上限。これを過ぎたら
 /// SCM に STOPPED を報告してからプロセスを落とす。
 ///
-/// 本番 (fukushima) で観測した不具合の再発防止:
+/// 本番環境で観測した不具合の再発防止:
 /// 停止要求は受理されるのにサーバが終了せず、サービスが RUNNING の
 /// まま「停止処理中」として SCM に滞留した。以後の制御要求はすべて
 /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (1061) で弾かれるため、

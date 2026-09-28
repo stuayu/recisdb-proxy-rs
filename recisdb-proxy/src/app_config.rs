@@ -68,7 +68,7 @@ pub struct MirakurunSection {
     /// KonomiTV — send none), so it is opt-in even though `web_listen`
     /// already defaults to loopback-only.
     pub enabled: Option<bool>,
-    /// Prefecture name (e.g. `"福島"`) whose terrestrial stations are the
+    /// Prefecture name (e.g. `"大阪"`) whose terrestrial stations are the
     /// *local* ones, reported as Mirakurun channel type `GR`. Every other
     /// terrestrial region is then reported as `NW1`..`NW40`
     /// (`web/mirakurun.rs::terrestrial_type_map`), which is how EPGStation's
@@ -82,7 +82,7 @@ pub struct MirakurunSection {
     ///
     /// Accepts a prefecture name as spelled by
     /// `recisdb_protocol::broadcast_region`; the wide-area Kanto network is
-    /// `"東京"`.
+    /// `"大阪"`.
     pub home_region: Option<String>,
 
     /// Smallest `X-Mirakurun-Priority` that makes `GET /services/:id/stream`
