@@ -101,9 +101,20 @@ dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の
 
 ## 障害診断ログ
 
-4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued/capacity` はstdin待ち行列、`dropped` は投入できず破棄したチャンク。`no_output_for` が30秒に達した場合は変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。
+4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued/capacity` はstdin待ち行列、`dropped` は投入できず破棄したチャンク。`no_output_for` は読者の初回TS猶予に従い、猶予超過時に変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。
 
 `GET /api/tuners` に `mmt_converter` 診断を載せる。`active=false` はそのBonDriverの実行中リーダーに変換器状態が無い、`output_bytes=0` かつ `input_bytes>0` は変換器が入力を受けたがTSを返していない状態を示す。ダッシュボードのBonDriver画面にも表示する。
+
+### 配信開始待ち
+
+4Kの選局後、`ReaderState::Running` へ移った後も「変換済みTSの初回broadcast前」は
+開始待ちとして扱う。`stream_format='mmttlv'`、チャンネル分類の`BandType::FourK`、または
+DBに蓄積したdriver runtime healthのfirst-TS EWMAから遅延開始を判定する。猶予は新しい固定秒数
+ではなく、既存の`tuner_config.no_data_timeout_secs`とEWMAから導出する。
+
+この間はreader watchdogのsoft stall / hard no-data判定を保留する。導出猶予を超えた場合、
+変換器エラー・BonDriverエラーと同じくreaderを停止し、従来の失敗経路へ進む。初回TSの計測点は
+MMT/TLV入力ではなく、変換後TSをbroadcastした時点。
 
 実機では次を実行し、スキャン対象の全BonDriver列挙とNHK BS4Kのログを保存する。
 

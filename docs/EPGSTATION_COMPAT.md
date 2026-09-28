@@ -566,6 +566,24 @@ EPGStation から見た差は無い (同じエンドポイント・同じレス�
 
 **未検証**: 実際に2ノード構成で録画を通したことはまだ無い。
 
+### 5.8 配信開始待ちのHTTPセマンティクス (2026-09-29)
+
+EPGStation側を再確認した。録画は `src/model/operator/recording/RecordingStreamCreator.ts:384-399`
+で `getProgramStream()` または `getServiceStream()` の戻り値をそのまま録画入力へ渡す。
+ライブ入力も `src/model/service/stream/manager/LiveStreamSourceManageModel.ts:83-96`
+で同じ `IncomingMessage` を保持する。
+
+同梱 `mirakurun` クライアントは `node_modules/mirakurun/lib/client.js:468-478` でHTTPレスポンスの
+ステータスを確認して `IncomingMessage` を返すだけで、ストリーム本体に一律のfirst-byte timeoutを
+設定しない。Mirakurun側のサービスstream実装も
+`node_modules/mirakurun/lib/Mirakurun/api/services/{id}/stream.js:77-96` でチューナー取得完了後に
+`200` と `Content-Type: video/MP2T` を設定し、接続を閉じずbodyを流し続ける契約になっている。
+
+recisdb-proxy は、選局・reader起動の受理後、最初のTSを待つ間もHTTP response headersを返し、
+`video/mp2t` bodyを接続したまま保持する。TS到着後だけbody chunkを流し、エラーまたは導出した
+first-TS猶予超過時は接続を終了する。開始待ちを示す独自chunkは送らない
+(EPGStation/録画入力へTS以外を混ぜないため)。
+
 ## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 / 2026-08-22 更新)
 
 `web/mirakurun.rs` / `web/mod.rs:126-136` を読んだ結果 + §5.2 の実起動確認。

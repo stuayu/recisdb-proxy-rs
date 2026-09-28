@@ -302,6 +302,15 @@ closes the lease loudly (`record_broadcast_lag`) rather than emitting a stream
 with an unannounced hole. VIEW/PREVIEW clear the carry buffer, set
 `DISCONTINUITY` on the next frame and continue.
 
+When the source is waiting for its first converted TS, the pump emits a
+zero-payload `STARTING` frame using the existing `NodeTsFrame` version. The
+frame is progress, not TS: the new consumer ignores it and extends the
+first-data deadline. A new `OpenLeaseReply.first_data_grace_ms` carries the
+supplier's derived deadline and is `#[serde(default)]`; an older reply omits it
+and the consumer keeps the legacy wait-until-close behavior. Older frame
+decoders already accept the existing version and zero-length payload, so an
+older peer neither needs the new JSON field nor sees fabricated TS packets.
+
 Consuming side (`RemoteMuxStream`):
 
 - Republishes into a plain `broadcast::Sender<Bytes>` — the same shape

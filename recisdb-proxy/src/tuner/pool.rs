@@ -979,6 +979,8 @@ mod tests {
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
             no_data_timeout_secs: 30,
+            first_data_grace_ms: 30_000,
+            slow_start: false,
             b25_enabled: true,
             mmt_converter: None,
         }

@@ -143,6 +143,11 @@ pub struct OpenLeaseReply {
     /// How long the lease survives without a renew. Clients must renew well
     /// inside this window; it is *not* tied to the transport connection.
     pub ttl_ms: u64,
+    /// First-TS deadline derived from the supplier's configured no-data
+    /// window and runtime health. Missing on older peers: the consumer then
+    /// keeps the legacy connection semantics and relies on lease expiry.
+    #[serde(default)]
+    pub first_data_grace_ms: Option<u64>,
     /// The context as this node saw it after `enter_node`, so the caller can
     /// see the remaining budget and hop count actually charged.
     pub context: RequestContext,
@@ -644,6 +649,7 @@ async fn open_lease(
             route_id: lease.route_id.clone(),
             stream_class: lease.stream_class,
             ttl_ms: state.leases.policy().ttl(lease.stream_class).as_millis() as u64,
+            first_data_grace_ms: Some(lease.startup_grace_ms()),
             context,
         })
         .into_response(),

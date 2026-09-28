@@ -152,11 +152,17 @@ responsive確認スクリプトはfile URLをPlaywright Chromiumで実測しま�
 - 登録されたすべてのBonDriverを表示
 - 各BonDriverの最大インスタンス数
 - 現在の使用インスタンス数
+- `GET /api/tuners` は既存フィールドを維持したまま `state`、`startup_state`、
+  `startup_elapsed_seconds`、`startup_grace_seconds`、`startup_slow` を返す。
+  初回TS待ちは「開始中」としてチューナー占有理由に表示する。
 
 **クライアント接続状況**
 - 接続中のセッション一覧
 - クライアントのIPアドレス
 - 現在のセッション状態
+- 初回TS待ちのセッションは「開始中（経過秒）」と表示する。`GET /api/clients` の
+  `startup_state`、`startup_elapsed_seconds`、`startup_grace_seconds`、`startup_slow` は追加フィールドで、
+  既存フィールドを変更しない。狭幅では既存のdata-tableカード表示へ落ちる。
 - 接続先チューナーと選択チャンネル
 - **接続方式** (`BonDriver` / `HTTP` / `Mirakurun`) — TVTest・EDCB のような BonDriver クライアントだけ
   でなく、ダッシュボードのプレビューと Mirakurun 互換 API 経由の視聴・録画 (EPGStation 等) も

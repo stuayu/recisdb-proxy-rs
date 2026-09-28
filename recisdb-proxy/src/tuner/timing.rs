@@ -70,6 +70,25 @@ pub(crate) fn reader_ready_timeout(set_channel_retry_timeout_ms: u64) -> Duratio
     Duration::from_millis(set_channel_retry_timeout_ms + READY_TIMEOUT_MARGIN_MS)
 }
 
+/// First-TS deadline. Slow sources get one configured no-data window beyond
+/// their measured latency; unknown slow sources get two configured windows.
+/// This keeps the policy derived from existing operator/health values instead
+/// of adding a second fixed 4K timeout.
+pub(crate) fn first_data_grace_ms(
+    no_data_timeout_secs: u64,
+    measured_first_ts_ms: Option<u64>,
+    slow_start: bool,
+) -> u64 {
+    let base = no_data_timeout_secs.saturating_mul(1_000);
+    if !slow_start {
+        return base;
+    }
+    measured_first_ts_ms
+        .map(|latency| latency.saturating_add(base))
+        .unwrap_or_else(|| base.saturating_mul(2))
+        .max(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +115,13 @@ mod tests {
             reader_ready_timeout(10_000),
             Duration::from_millis(10_000 + READY_TIMEOUT_MARGIN_MS)
         );
+    }
+
+    #[test]
+    fn first_data_grace_uses_health_and_configured_timeout() {
+        assert_eq!(first_data_grace_ms(30, None, false), 30_000);
+        assert_eq!(first_data_grace_ms(30, None, true), 60_000);
+        assert_eq!(first_data_grace_ms(30, Some(45_000), true), 75_000);
     }
 }
 

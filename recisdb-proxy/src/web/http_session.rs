@@ -44,6 +44,9 @@ pub struct HttpStreamSessionInfo {
     pub channel_info: Option<String>,
     pub nid: Option<u16>,
     pub sid: Option<u16>,
+    /// First-TS startup policy known when the source was selected.
+    pub startup_grace_ms: u64,
+    pub startup_slow: bool,
     /// Reliability class of this stream (STREAMING_DESIGN.md §2). Recording
     /// clients (`GET /programs/{id}/stream`) are `Record`; live viewing is
     /// `View`.
@@ -179,6 +182,9 @@ impl HttpStreamSession {
             .await;
         registry.update_channel_ids(id, info.nid, info.sid).await;
         registry.update_stream_class(id, info.stream_class).await;
+        registry
+            .update_startup_policy(id, info.startup_grace_ms, info.startup_slow)
+            .await;
         registry.update_streaming(id, true).await;
 
         info!(
@@ -230,6 +236,13 @@ impl HttpStreamSession {
     /// Account for a chunk sent to the client, flushing to the registry at
     /// most once a second (see [`HttpStreamStats`]).
     pub fn record_sent(&self, len: usize) {
+        if self.stats.total_bytes() == 0 {
+            let registry = Arc::clone(&self.registry);
+            let id = self.id;
+            tokio::spawn(async move {
+                registry.mark_first_data(id).await;
+            });
+        }
         let Some((packets_sent, mbps)) = self.stats.record(len) else {
             return;
         };
@@ -332,6 +345,8 @@ mod tests {
             channel_info: Some("GR 16".to_string()),
             nid: Some(32391),
             sid: Some(23608),
+            startup_grace_ms: 0,
+            startup_slow: false,
             stream_class: StreamClass::View,
         }
     }

@@ -19,6 +19,9 @@ impl FrameFlags {
     pub const DISCONTINUITY: u8 = 1 << 0;
     pub const REPLAY: u8 = 1 << 1;
     pub const END: u8 = 1 << 2;
+    /// Zero-payload startup progress frame. Older peers accept the existing
+    /// frame version and harmlessly forward an empty payload.
+    pub const STARTING: u8 = 1 << 3;
 
     pub const fn new(bits: u8) -> Self {
         Self(bits)
@@ -163,5 +166,21 @@ mod tests {
             payload: Bytes::from_static(b"not-ts"),
         };
         assert_eq!(frame.encode().unwrap_err(), FrameError::UnalignedPayload(6));
+    }
+
+    #[test]
+    fn starting_control_frame_is_zero_payload_and_legacy_decodable() {
+        let frame = NodeTsFrame {
+            generation: 1,
+            sequence: 1,
+            source_monotonic_ms: 2,
+            flags: FrameFlags::new(FrameFlags::STARTING),
+            payload: Bytes::new(),
+        };
+        let encoded = frame.encode().unwrap();
+        let (decoded, consumed) = NodeTsFrame::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(decoded.flags.contains(FrameFlags::STARTING));
+        assert!(decoded.payload.is_empty());
     }
 }

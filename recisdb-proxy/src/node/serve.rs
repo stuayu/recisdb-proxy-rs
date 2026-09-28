@@ -308,6 +308,7 @@ impl LocalMuxServer {
             context.claim.exclusive,
             usage,
         );
+        lease.set_startup_grace_ms(outcome.tuner.startup_grace_ms());
 
         let pump = LeasePump {
             lease: Arc::clone(&lease),
@@ -538,6 +539,7 @@ impl LeasePump {
         let mut sequence: u64 = 0;
         let mut carry: Vec<u8> = Vec::new();
         let mut discontinuity_pending = false;
+        let mut sent_data = false;
         let started = std::time::Instant::now();
 
         let reason = loop {
@@ -554,7 +556,22 @@ impl LeasePump {
             let data = match received {
                 // Timeout is not an error: it is the periodic chance to
                 // notice that the lease went away while the source was quiet.
-                Err(_elapsed) => continue,
+                Err(_elapsed) => {
+                    if !sent_data && self.lease.startup_grace_ms() > 0 {
+                        sequence = sequence.saturating_add(1);
+                        let _ = self
+                            .lease
+                            .publish(NodeTsFrame {
+                                generation: self.lease.generation,
+                                sequence,
+                                source_monotonic_ms: started.elapsed().as_millis() as u64,
+                                flags: FrameFlags::new(FrameFlags::STARTING),
+                                payload: bytes::Bytes::new(),
+                            })
+                            .await;
+                    }
+                    continue;
+                }
                 Ok(Ok(data)) => data,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break "source_closed",
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
@@ -600,6 +617,7 @@ impl LeasePump {
                     flags,
                     payload,
                 };
+                sent_data = true;
                 if let Err(e) = self.lease.publish(frame).await {
                     // `publish` only fails on a replay-history sequence gap,
                     // which would make a RECORD resume silently lossy.

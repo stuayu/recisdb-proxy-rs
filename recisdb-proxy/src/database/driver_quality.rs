@@ -181,6 +181,28 @@ impl Database {
         }
     }
 
+    /// Last measured first-TS latency for a driver. Used only to derive the
+    /// next startup grace window; no separate operator setting is needed.
+    pub fn get_driver_first_ts_latency_ms_by_path(
+        &self,
+        dll_path: &str,
+    ) -> Result<Option<u64>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT drh.first_ts_latency_ewma_ms
+                 FROM bon_drivers bd
+                 LEFT JOIN driver_runtime_health drh ON bd.id = drh.bon_driver_id
+                 WHERE bd.dll_path = ?1",
+                [dll_path],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .optional()?;
+        Ok(value.flatten().and_then(|ms| {
+            ms.is_finite().then_some(ms.max(0.0).round() as u64)
+        }))
+    }
+
     /// Get combined driver quality score by DLL path. Packet integrity and
     /// runtime health are both required: multiplication strongly demotes a
     /// path that is clean-but-slow or fast-but-corrupt without inventing a

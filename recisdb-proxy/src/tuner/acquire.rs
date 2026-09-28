@@ -53,7 +53,6 @@ use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::policy::{self, Decision, DriverState, EntryState, RejectReason, TunerSnapshot};
 use crate::tuner::pool::TunerPoolError;
 use crate::tuner::shared::{ReaderStartupConfig, ReaderState, StopReason, TunerUsage};
-#[cfg(unix)]
 use crate::tuner::timing;
 use crate::tuner::{
     CarriedSlotPermit, ChannelKey, SharedTuner, SlotPermit, TunerPool, WarmTunerHandle,
@@ -910,13 +909,21 @@ pub(crate) async fn acquire(
                 // Decided here rather than at each call site: `acquire` is the
                 // single choke point every tuning path goes through, and it is
                 // the only one that already holds the database handle.
-                let stream_format = {
+                let (stream_format, band_type, measured_first_ts_ms) = {
                     let db = database.lock().await;
+                    let band_type =
+                        db.band_type_for_bon_channel(&key.tuner_path, space, channel);
                     startup_config.b25_enabled = b25_enabled_for(
                         db.driver_disables_b25(&key.tuner_path),
-                        db.band_type_for_bon_channel(&key.tuner_path, space, channel),
+                        band_type,
                     );
-                    db.driver_stream_format(&key.tuner_path)
+                    (
+                        db.driver_stream_format(&key.tuner_path),
+                        band_type,
+                        db.get_driver_first_ts_latency_ms_by_path(&key.tuner_path)
+                            .ok()
+                            .flatten(),
+                    )
                 };
 
                 if stream_format.is_mmt_tlv() {
@@ -927,6 +934,20 @@ pub(crate) async fn acquire(
                     // in this path at all.
                     startup_config.b25_enabled = false;
                 }
+
+                let slow_start = stream_format.is_mmt_tlv()
+                    || band_type == Some(recisdb_protocol::BandType::FourK as i64)
+                    || measured_first_ts_ms
+                        .is_some_and(|latency| {
+                            latency
+                                > pool_config.no_data_timeout_secs.saturating_mul(1_000)
+                        });
+                startup_config.slow_start = slow_start;
+                startup_config.first_data_grace_ms = timing::first_data_grace_ms(
+                    pool_config.no_data_timeout_secs,
+                    measured_first_ts_ms,
+                    slow_start,
+                );
 
                 // Refuse to even try opening a DLL that has been failing to
                 // open repeatedly (tuner::open_backoff): otherwise a client
@@ -1197,6 +1218,8 @@ mod tests {
             signal_poll_interval_ms: 5,
             signal_wait_timeout_ms: 50,
             no_data_timeout_secs: 30,
+            first_data_grace_ms: 30_000,
+            slow_start: false,
             b25_enabled: true,
             mmt_converter: None,
         }

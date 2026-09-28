@@ -287,11 +287,23 @@ pub struct MmtPipe {
     from_child: std::sync::mpsc::Receiver<Vec<u8>>,
     status: Arc<ConverterStatus>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    no_output_error_after: Duration,
 }
 
 impl MmtPipe {
     /// Spawn the converter.
     pub fn new(config: &MmtConverterConfig) -> std::io::Result<Self> {
+        Self::new_with_first_data_grace(config, NO_OUTPUT_ERROR_AFTER)
+    }
+
+    /// Spawn the converter and use the reader's first-TS grace for the
+    /// converter's no-output failure boundary.  A slow converter must not be
+    /// killed by an older, shorter watchdog while the reader is still in its
+    /// explicit startup state.
+    pub fn new_with_first_data_grace(
+        config: &MmtConverterConfig,
+        first_data_grace: Duration,
+    ) -> std::io::Result<Self> {
         if config.command_path.trim().is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -299,7 +311,15 @@ impl MmtPipe {
             ));
         }
 
-        Self::spawn(&config.command_path, &build_args(config))
+        Self::spawn_with_no_output_timeout(
+            &config.command_path,
+            &build_args(config),
+            if first_data_grace.is_zero() {
+                NO_OUTPUT_ERROR_AFTER
+            } else {
+                first_data_grace
+            },
+        )
     }
 
     /// Spawn `command_path` with an explicit argument list.
@@ -307,6 +327,14 @@ impl MmtPipe {
     /// Split out from [`Self::new`] so the process plumbing can be exercised
     /// against a stand-in command whose options differ from the converter's.
     fn spawn(command_path: &str, args: &[String]) -> std::io::Result<Self> {
+        Self::spawn_with_no_output_timeout(command_path, args, NO_OUTPUT_ERROR_AFTER)
+    }
+
+    fn spawn_with_no_output_timeout(
+        command_path: &str,
+        args: &[String],
+        no_output_error_after: Duration,
+    ) -> std::io::Result<Self> {
         info!(
             "[MmtPipe] Starting converter: {} {}",
             command_path,
@@ -422,6 +450,7 @@ impl MmtPipe {
             from_child,
             status,
             workers,
+            no_output_error_after,
         })
     }
 
@@ -564,13 +593,13 @@ impl MmtPipe {
             && self
                 .status
                 .no_output_for()
-                .is_some_and(|d| d >= NO_OUTPUT_ERROR_AFTER)
+                .is_some_and(|d| d >= self.no_output_error_after)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "MMT/TLV converter produced no stdout for {}s",
-                    NO_OUTPUT_ERROR_AFTER.as_secs()
+                    self.no_output_error_after.as_secs()
                 ),
             ));
         }

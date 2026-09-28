@@ -1,7 +1,7 @@
 //! Shared tuner implementation with broadcast capability.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -297,6 +297,12 @@ pub struct ReaderStartupConfig {
     pub signal_poll_interval_ms: u64,
     pub signal_wait_timeout_ms: u64,
     pub no_data_timeout_secs: u64,
+    /// Deadline for the first converted TS chunk. Derived from the existing
+    /// no-data setting and runtime health; it is not a separate fixed 4K
+    /// timeout.
+    pub first_data_grace_ms: u64,
+    /// True when the driver/band/health data predicts a delayed first TS.
+    pub slow_start: bool,
     /// Whether to run the stream through libaribb25.
     ///
     /// `false` for sources that arrive already descrambled. 4K is the case
@@ -324,6 +330,8 @@ impl From<&TunerPoolConfig> for ReaderStartupConfig {
             signal_poll_interval_ms: cfg.signal_poll_interval_ms,
             signal_wait_timeout_ms: cfg.signal_wait_timeout_ms,
             no_data_timeout_secs: cfg.no_data_timeout_secs,
+            first_data_grace_ms: cfg.no_data_timeout_secs.saturating_mul(1_000),
+            slow_start: false,
             // Callers that know the source is pre-descrambled turn this off;
             // the pool config alone cannot tell.
             b25_enabled: true,
@@ -360,6 +368,9 @@ pub struct SharedTuner {
     /// Monotonic millis of the first TS chunk of the current reader, `0`
     /// while none has arrived yet.
     first_ts_at_ms: AtomicU64,
+    /// First-TS deadline and classification for the current reader.
+    startup_grace_ms: AtomicU64,
+    startup_slow: AtomicBool,
     /// Gaps long enough to be a stall but short of the hard no-data timeout.
     /// Soft and hard deadlines are counted separately on purpose: a stream
     /// that hiccups is not the same failure as one that died.
@@ -434,6 +445,8 @@ impl SharedTuner {
             last_data_at: AtomicU64::new(0),
             reader_started_at_ms: AtomicU64::new(0),
             first_ts_at_ms: AtomicU64::new(0),
+            startup_grace_ms: AtomicU64::new(0),
+            startup_slow: AtomicBool::new(false),
             stall_events: AtomicU64::new(0),
             no_data_timeouts: AtomicU64::new(0),
             reader_state: AtomicU8::new(ReaderState::Idle as u8),
@@ -542,6 +555,7 @@ impl SharedTuner {
     }
 
     fn mark_data_sent(&self) {
+        self.mark_first_ts();
         self.last_data_at
             .store(monotonic_millis(), Ordering::Release);
     }
@@ -550,10 +564,36 @@ impl SharedTuner {
     /// restart never inherits the previous reader's latencies or counters.
     pub(crate) fn begin_startup_metrics(&self) {
         self.reader_started_at_ms
-            .store(monotonic_millis(), Ordering::Release);
+            .store(monotonic_millis().max(1), Ordering::Release);
         self.first_ts_at_ms.store(0, Ordering::Release);
         self.stall_events.store(0, Ordering::Release);
         self.no_data_timeouts.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn configure_startup_policy(&self, grace_ms: u64, slow_start: bool) {
+        self.startup_grace_ms.store(grace_ms, Ordering::Release);
+        self.startup_slow.store(slow_start, Ordering::Release);
+    }
+
+    /// True until the first converted TS chunk is broadcast.
+    pub fn awaiting_first_ts(&self) -> bool {
+        self.occupies_slot()
+            && self.first_ts_at_ms.load(Ordering::Acquire) == 0
+            && self.reader_started_at_ms.load(Ordering::Acquire) > 0
+    }
+
+    pub fn startup_elapsed_ms(&self) -> Option<u64> {
+        self.awaiting_first_ts().then(|| {
+            monotonic_millis().saturating_sub(self.reader_started_at_ms.load(Ordering::Acquire))
+        })
+    }
+
+    pub fn startup_grace_ms(&self) -> u64 {
+        self.startup_grace_ms.load(Ordering::Acquire)
+    }
+
+    pub fn startup_slow(&self) -> bool {
+        self.startup_slow.load(Ordering::Acquire)
     }
 
     /// Record the arrival of the current reader's first TS chunk. Idempotent:
@@ -561,7 +601,7 @@ impl SharedTuner {
     pub(crate) fn mark_first_ts(&self) {
         let _ = self.first_ts_at_ms.compare_exchange(
             0,
-            monotonic_millis(),
+            monotonic_millis().max(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -1221,7 +1261,10 @@ impl SharedTuner {
         // Runs before everything else: the rest of this loop, the analyzer and
         // every subscriber assume MPEG-2 TS.
         let mut mmt = match startup_config.mmt_converter.as_ref() {
-            Some(cfg) => match crate::tuner::mmt_pipe::MmtPipe::new(cfg) {
+            Some(cfg) => match crate::tuner::mmt_pipe::MmtPipe::new_with_first_data_grace(
+                cfg,
+                Duration::from_millis(startup_config.first_data_grace_ms),
+            ) {
                 Ok(pipe) => {
                     *shared.mmt_status.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Arc::clone(pipe.status()));
@@ -1330,6 +1373,7 @@ impl SharedTuner {
             // what lets driver health tell "this driver hiccups" apart from
             // "this driver dies" (docs/DISTRIBUTED_TUNER_FABRIC.md §9).
             let stall_ms = timing::soft_stall_threshold_ms(timeout_secs);
+            let first_data_grace_ms = watchdog_shared.startup_grace_ms();
             let mut stall_counted_for_gap = false;
             loop {
                 interval.tick().await;
@@ -1338,6 +1382,28 @@ impl SharedTuner {
                 }
                 let last = watchdog_shared.last_data_at.load(Ordering::Acquire);
                 let gap_ms = monotonic_millis().saturating_sub(last);
+
+                // Starting a reader is a real state, even after SetChannel
+                // has completed: MMT/TLV converters and network drivers can
+                // produce no TS for the whole initial grace window. Do not
+                // turn that expected silence into a stall. Once the derived
+                // deadline expires, use the ordinary failure path.
+                if watchdog_shared.awaiting_first_ts() {
+                    let startup_gap_ms = watchdog_shared
+                        .startup_elapsed_ms()
+                        .unwrap_or(first_data_grace_ms);
+                    if first_data_grace_ms == 0 || startup_gap_ms < first_data_grace_ms {
+                        continue;
+                    }
+                    warn!(
+                        "[SharedTuner] first TS did not arrive within {}ms; stopping {:?}",
+                        first_data_grace_ms, watchdog_shared.key
+                    );
+                    watchdog_shared.note_no_data_timeout();
+                    watchdog_shared.set_stop_reason(StopReason::ReaderFailed);
+                    let _ = watchdog_shared.stop_reader().await;
+                    break;
+                }
 
                 if gap_ms >= stall_ms {
                     // Once per gap, not once per second: a 30 s outage is one
@@ -1502,7 +1568,10 @@ impl SharedTuner {
                             warn!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...",
                                   total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
                         }
-                        if reader_first_read && reader_start_time.elapsed().as_secs() < 30 {
+                        if reader_first_read
+                            && reader_start_time.elapsed().as_millis()
+                                < startup_config.first_data_grace_ms as u128
+                        {
                             if consecutive_empty % 100 == 1 && consecutive_empty > 1 {
                                 let signal = tuner.get_signal_level();
                                 debug!("[SharedTuner] Early startup: waiting for TS data ({} empty reads, {}s elapsed, signal={:.1}dB)",
@@ -1521,7 +1590,6 @@ impl SharedTuner {
                     if reader_first_read {
                         info!("[SharedTuner] FIRST_DATA_RECEIVED: {} bytes after {} empty reads, elapsed={}ms, STARTUP_SUCCESSFUL",
                               n, consecutive_empty, reader_start_time.elapsed().as_millis());
-                        shared.mark_first_ts();
                         reader_first_read = false;
                     } else if consecutive_empty > 0 {
                         debug!(
@@ -1842,6 +1910,10 @@ impl SharedTuner {
         self.set_state(ReaderState::Starting);
         // Fresh measurement window: a restart must never inherit the previous
         // reader's latencies or stall counts.
+        self.configure_startup_policy(
+            startup_config.first_data_grace_ms,
+            startup_config.slow_start,
+        );
         self.begin_startup_metrics();
 
         let ready_timeout =
@@ -2374,6 +2446,11 @@ impl SharedTuner {
         // (see that function's comment) — set before scheduling the blocking
         // task, not inside it.
         self.set_state(ReaderState::Starting);
+        self.configure_startup_policy(
+            startup_config.first_data_grace_ms,
+            startup_config.slow_start,
+        );
+        self.begin_startup_metrics();
 
         let shared = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -2401,6 +2478,8 @@ fn test_startup_config() -> ReaderStartupConfig {
         signal_poll_interval_ms: 5,
         signal_wait_timeout_ms: 50,
         no_data_timeout_secs: 30,
+        first_data_grace_ms: 30_000,
+        slow_start: false,
         b25_enabled: true,
         mmt_converter: None,
     }
@@ -2657,6 +2736,60 @@ mod tests {
         assert_eq!(shared.subscriber_count(), 0);
     }
 
+    #[test]
+    fn startup_wait_is_visible_until_a_broadcast_ts_chunk_arrives() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/startup", 1), 2);
+        shared.configure_startup_policy(60_000, true);
+        shared.set_state(ReaderState::Starting);
+        shared.begin_startup_metrics();
+        assert!(shared.awaiting_first_ts());
+        assert_eq!(shared.startup_grace_ms(), 60_000);
+        shared.set_state(ReaderState::Running);
+        assert!(shared.awaiting_first_ts());
+        shared.mark_data_sent();
+        assert!(!shared.awaiting_first_ts());
+    }
+
+    #[tokio::test]
+    async fn startup_grace_skips_stall_then_stops_after_deadline() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/slow-start", 1), 2);
+        let config = ReaderStartupConfig {
+            no_data_timeout_secs: 0,
+            first_data_grace_ms: 1_500,
+            slow_start: true,
+            b25_enabled: false,
+            ..test_startup_config()
+        };
+        let ready_rx = shared
+            .spawn_fake_reader(FakeTsSource::new(), 0, 1, config)
+            .await;
+        assert!(ready_rx.await.expect("ready channel closed").is_ok());
+        assert_eq!(shared.startup_grace_ms(), 1_500);
+        assert!(shared.awaiting_first_ts());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(shared.state(), ReaderState::Running);
+        assert_eq!(shared.stall_events(), 0);
+        assert_eq!(shared.no_data_timeouts(), 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while shared.state() != ReaderState::Stopped {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader did not stop: state={:?}, elapsed={:?}, awaiting={}, first_ts={:?}",
+                shared.state(),
+                shared.startup_elapsed_ms(),
+                shared.awaiting_first_ts(),
+                shared.first_ts_latency_ms()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(shared.stop_reason(), StopReason::ReaderFailed);
+        assert_eq!(shared.stall_events(), 0);
+        assert_eq!(shared.no_data_timeouts(), 1);
+        shared.stop_reader().await;
+    }
+
     #[tokio::test]
     async fn reader_state_goes_straight_to_stopped_on_set_channel_failure() {
         let key = ChannelKey::simple("/dev/test", 1);
@@ -2872,6 +3005,8 @@ mod tests {
             signal_poll_interval_ms: 500,
             signal_wait_timeout_ms: 10_000,
             no_data_timeout_secs: 30,
+            first_data_grace_ms: 30_000,
+            slow_start: false,
             b25_enabled: true,
             mmt_converter: None,
         };

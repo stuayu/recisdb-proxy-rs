@@ -6,6 +6,7 @@
 //! against the same lease/replay buffer over a different transport path.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -127,6 +128,7 @@ pub struct RemoteMuxLease {
     live_tx: broadcast::Sender<NodeTsFrame>,
     state: Arc<Mutex<LeaseTimes>>,
     _mux_lease: Option<MuxLeaseGuard>,
+    startup_grace_ms: AtomicU64,
 }
 
 struct LeaseTimes {
@@ -170,6 +172,7 @@ impl RemoteMuxLease {
                 expires_at: now + ttl,
             })),
             _mux_lease: mux_lease,
+            startup_grace_ms: AtomicU64::new(0),
         }
     }
 
@@ -183,6 +186,14 @@ impl RemoteMuxLease {
 
     pub fn subscribe_live(&self) -> broadcast::Receiver<NodeTsFrame> {
         self.live_tx.subscribe()
+    }
+
+    pub fn set_startup_grace_ms(&self, grace_ms: u64) {
+        self.startup_grace_ms.store(grace_ms, Ordering::Release);
+    }
+
+    pub fn startup_grace_ms(&self) -> u64 {
+        self.startup_grace_ms.load(Ordering::Acquire)
     }
 
     pub async fn renew(&self, ttl: Duration) {

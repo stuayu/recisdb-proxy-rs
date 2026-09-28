@@ -1142,6 +1142,10 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// mean a dead link, so the short timeout applies from then on.
 const FIRST_DATA_GRACE: Duration = Duration::from_secs(60);
 
+fn first_data_grace(read_timeout: Duration) -> Duration {
+    FIRST_DATA_GRACE.max(read_timeout.saturating_mul(2))
+}
+
 /// Minimum interval between failed StartStream requests from WaitTsStream.
 const START_STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1711,6 +1715,7 @@ async fn connection_loop(
     // Startup (and every channel switch) gets `FIRST_DATA_GRACE` instead of
     // `STREAM_IDLE_TIMEOUT` until the first TS chunk lands — see the constant.
     let mut awaiting_first_data = false;
+    let first_data_grace = first_data_grace(conn.config.read_timeout);
     let mut was_streaming = false;
     let exit = loop {
         // Only police silence while the client actually expects TS. An idle
@@ -1721,7 +1726,7 @@ async fn connection_loop(
             // StartStream just took effect: the server may still be opening
             // the driver / starting a converter.
             awaiting_first_data = true;
-            idle_deadline = tokio::time::Instant::now() + FIRST_DATA_GRACE;
+            idle_deadline = tokio::time::Instant::now() + first_data_grace;
         }
         was_streaming = expecting_data;
 
@@ -1742,7 +1747,7 @@ async fn connection_loop(
                                 | ClientMessage::SelectLogicalChannel { .. }
                         ) {
                             awaiting_first_data = true;
-                            idle_deadline = tokio::time::Instant::now() + FIRST_DATA_GRACE;
+                            idle_deadline = tokio::time::Instant::now() + first_data_grace;
                         }
                         file_log!(debug, "connection_loop: sending request {}", last_request);
                         // Unbounded send is synchronous — never stalls the reader.
@@ -1772,7 +1777,7 @@ async fn connection_loop(
 
             // --- Streaming went silent: treat as a dead link ---
             _ = tokio::time::sleep_until(idle_deadline), if expecting_data => {
-                let limit = if awaiting_first_data { FIRST_DATA_GRACE } else { STREAM_IDLE_TIMEOUT };
+                let limit = if awaiting_first_data { first_data_grace } else { STREAM_IDLE_TIMEOUT };
                 warn!("No TS data for {:?} while streaming; treating the link as dead", limit);
                 file_log!(warn, "No TS data for {:?} while streaming; reconnecting", limit);
                 break LoopExit::Dropped(format!("idle for {:?} while streaming", limit));
@@ -2006,6 +2011,15 @@ mod tests {
         assert!(
             result.is_err(),
             "must still be waiting for the first chunk, not reconnecting"
+        );
+    }
+
+    #[test]
+    fn first_data_grace_follows_configured_rpc_timeout() {
+        assert_eq!(first_data_grace(Duration::from_secs(30)), FIRST_DATA_GRACE);
+        assert_eq!(
+            first_data_grace(Duration::from_secs(45)),
+            Duration::from_secs(90)
         );
     }
 

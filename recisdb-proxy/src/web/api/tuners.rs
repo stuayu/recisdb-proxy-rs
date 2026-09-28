@@ -31,6 +31,17 @@ pub async fn get_tuners(
         .map(|d| {
             let runtime_tuner = runtime_by_path.get(&d.dll_path);
             let converter = runtime_tuner.and_then(|t| t.mmt_status());
+            let startup_waiting = runtime_tuner
+                .map(|t| t.awaiting_first_ts())
+                .unwrap_or(false);
+            let startup_active = startup_waiting
+                || runtime_tuner.is_some_and(|t| {
+                    matches!(
+                        t.state(),
+                        crate::tuner::shared::ReaderState::Reserved
+                            | crate::tuner::shared::ReaderState::Starting
+                    )
+                });
             json!({
             "id": d.id,
             "dll_path": d.dll_path,
@@ -38,6 +49,11 @@ pub async fn get_tuners(
             "group_name": d.group_name,
             "max_instances": d.max_instances,
             "stream_format": db.driver_stream_format(&d.dll_path).as_db_value(),
+                "state": runtime_tuner.map(|t| format!("{:?}", t.state())).unwrap_or_else(|| "Idle".to_string()),
+                "startup_state": if startup_active { "starting" } else if runtime_tuner.is_some() { "streaming" } else { "idle" },
+                "startup_elapsed_seconds": runtime_tuner.and_then(|t| t.startup_elapsed_ms()).map(|ms| ms / 1000).unwrap_or(0),
+                "startup_grace_seconds": runtime_tuner.map(|t| t.startup_grace_ms() / 1000).unwrap_or(0),
+                "startup_slow": runtime_tuner.map(|t| t.startup_slow()).unwrap_or(false),
                 "mmt_converter": converter.map(|s| json!({
                 "active": runtime_tuner.map(|t| matches!(t.state(), crate::tuner::shared::ReaderState::Starting | crate::tuner::shared::ReaderState::Running)).unwrap_or(false),
                 "input_bytes": s.received_bytes(),

@@ -847,6 +847,14 @@ pub(crate) fn session_info_for_source(
         ),
         (None, None) => (None, None),
     };
+    let (startup_grace_ms, startup_slow) = match (tuner, remote) {
+        (Some(tuner), _) => (tuner.startup_grace_ms(), tuner.startup_slow()),
+        (None, Some(remote)) => {
+            let grace = remote.lease().first_data_grace_ms.unwrap_or(0);
+            (grace, grace > 0)
+        }
+        (None, None) => (0, false),
+    };
 
     HttpStreamSessionInfo {
         protocol,
@@ -864,6 +872,8 @@ pub(crate) fn session_info_for_source(
         channel_info,
         nid: Some(channel.nid),
         sid: Some(channel.sid),
+        startup_grace_ms,
+        startup_slow,
         stream_class,
     }
 }

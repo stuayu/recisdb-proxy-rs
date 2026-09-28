@@ -352,6 +352,21 @@ GET /api/version /api/status          バージョン・状態
 
 ## 8. 可観測性 (デバッグ可能性)
 
+### 8.1 配信開始待ち
+
+readerの`Starting`はReserved（作成済み・未起動）と分ける。SetChannel完了後にreaderが
+`Running`でも、初回の変換後TSをbroadcastするまでは`awaiting_first_ts`として扱う。この状態は
+4K/MMT-TLV、4K NID分類、またはDBのfirst-TS EWMAから導出した猶予を持つ。
+
+初回TS前は無通信・soft stall・idle closeを適用しない。猶予超過、BonDriver/変換器エラー、明示的な
+停止は従来通り失敗扱いにする。first-TS計測とwatchdogはreaderの読取りループへ処理を追加せず、
+既存のbroadcast後の状態/監視側で行う。
+
+HTTP/Mirakurunは選局受理後に`video/mp2t`のresponse headersを返し、初回TSまでbodyを維持する。
+BNDPのwire messageは変更せず、新版client DLLは既存read timeoutを基にfirst-data graceを延長する。
+ノード間leaseだけは既存frame versionのゼロpayload `STARTING`制御frameを使い、旧peerでは空payload
+として無害に扱える。新peerは制御frameを受信するたび初回TS deadlineを延長する。
+
 - **per-PID / per-端点のロスカウンタ**を Prometheus + ダッシュボードに (§3.1)。
 - **バッファ占有率**(プリフィル量・現在の秒数換算)をセッション毎に出す → アンダーラン予兆が見える。
 - **エンコーダ稼働数 / 枠使用率 / エンコード遅延**を出す → tsreplace 詰まりが数値で分かる。

@@ -54,17 +54,15 @@ async function load() {
       api<unknown>('/tuners'),
     ])
     const tunerRows = unwrapArray(tunerResult, ['tuners'])
-    const converterByPath = new Map<string, JsonRecord | undefined>(
+    const runtimeByPath = new Map<string, JsonRecord>(
       tunerRows.map((row) => [
         String(row.dll_path ?? ''),
-        row.mmt_converter && typeof row.mmt_converter === 'object'
-          ? (row.mmt_converter as JsonRecord)
-          : undefined,
+        row,
       ]),
     )
     rows.value = unwrapArray(drivers, ['bondrivers']).map((row) => ({
       ...row,
-      mmt_converter: converterByPath.get(String(row.dll_path ?? '')),
+      ...(runtimeByPath.get(String(row.dll_path ?? '')) ?? {}),
     }))
     ranking.value = unwrapArray(rankingResult, ['items', 'ranking', 'data'])
     error.value = ''
@@ -242,6 +240,9 @@ onMounted(load)
                    占有されている理由が分からないと、視聴できない原因を
                    利用者が追えないため状態として出す。 -->
               <td v-if="listIsVisible('state')" data-label="状態">
+                <span v-if="row.startup_state === 'starting'" class="badge badge-scanning">
+                  開始中（{{ Number(row.startup_elapsed_seconds ?? 0) }}秒）
+                </span>
                 <span v-if="row.is_scanning" class="badge badge-scanning">スキャン中</span>
                 <!-- 「開けない」と「遅い」は別の障害。どちらも視聴できない
                      理由になり得るので、いつ再試行されるかまで出す。 -->
@@ -260,7 +261,7 @@ onMounted(load)
                   class="badge badge-degraded"
                   title="オープンには成功しますが、毎回時間がかかりすぎています"
                 >動作が遅い</span>
-                <span v-if="!row.is_scanning && (!row.breaker_state || row.breaker_state === 'healthy')">—</span>
+                <span v-if="row.startup_state !== 'starting' && !row.is_scanning && (!row.breaker_state || row.breaker_state === 'healthy')">—</span>
               </td>
               <td data-label="操作">
                 <div class="actions">

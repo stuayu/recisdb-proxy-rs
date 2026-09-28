@@ -107,6 +107,12 @@ pub struct SessionInfo {
     pub channel_sid: Option<u16>,
     /// Whether the session is streaming.
     pub is_streaming: bool,
+    /// `starting` while the selected reader has not emitted its first TS.
+    /// Added without changing the existing session fields.
+    pub startup_state: String,
+    pub startup_elapsed_seconds: u64,
+    pub startup_grace_seconds: u64,
+    pub startup_slow: bool,
     /// Connection time (seconds since connection).
     #[serde(skip)]
     pub connected_at: Instant,
@@ -274,6 +280,10 @@ impl SessionRegistry {
             channel_nid: None,
             channel_sid: None,
             is_streaming: false,
+            startup_state: "idle".to_string(),
+            startup_elapsed_seconds: 0,
+            startup_grace_seconds: 0,
+            startup_slow: false,
             connected_at: Instant::now(),
             signal_level: 0.0,
             packets_sent: 0,
@@ -364,6 +374,26 @@ impl SessionRegistry {
     pub async fn update_streaming(&self, id: u64, is_streaming: bool) {
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
             info.is_streaming = is_streaming;
+            if is_streaming && info.startup_state == "idle" {
+                info.startup_state = "starting".to_string();
+            } else if !is_streaming {
+                info.startup_state = "idle".to_string();
+                info.startup_elapsed_seconds = 0;
+            }
+        }
+    }
+
+    pub async fn update_startup_policy(&self, id: u64, grace_ms: u64, slow: bool) {
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.startup_grace_seconds = grace_ms / 1_000;
+            info.startup_slow = slow;
+        }
+    }
+
+    pub async fn mark_first_data(&self, id: u64) {
+        if let Some(info) = self.sessions.write().await.get_mut(&id) {
+            info.startup_state = "streaming".to_string();
+            info.startup_elapsed_seconds = 0;
         }
     }
 
@@ -502,7 +532,31 @@ impl SessionRegistry {
 
     /// Get all active sessions.
     pub async fn get_all(&self) -> Vec<SessionInfo> {
-        self.sessions.read().await.values().cloned().collect()
+        let bindings = self.claim_bindings.read().await;
+        let mut sessions = self.sessions.write().await;
+        for (id, info) in sessions.iter_mut() {
+            if let Some(binding) = bindings.get(id) {
+                if binding.tuner.awaiting_first_ts() {
+                    info.startup_state = "starting".to_string();
+                    info.startup_elapsed_seconds = binding
+                        .tuner
+                        .startup_elapsed_ms()
+                        .unwrap_or(0)
+                        / 1_000;
+                    info.startup_grace_seconds = binding.tuner.startup_grace_ms() / 1_000;
+                    info.startup_slow = binding.tuner.startup_slow();
+                } else if info.is_streaming && info.startup_state == "starting" {
+                    info.startup_state = "streaming".to_string();
+                    info.startup_elapsed_seconds = 0;
+                }
+            } else if info.is_streaming && info.startup_state == "starting" {
+                // Remote HTTP sessions do not have a local claim binding.
+                // Keep their visible elapsed time advancing from registration
+                // until the first body chunk marks them streaming.
+                info.startup_elapsed_seconds = info.connected_at.elapsed().as_secs();
+            }
+        }
+        sessions.values().cloned().collect()
     }
 
     /// Get session count.
@@ -764,6 +818,10 @@ mod tests {
             channel_nid: None,
             channel_sid: None,
             is_streaming: true,
+            startup_state: "streaming".to_string(),
+            startup_elapsed_seconds: 0,
+            startup_grace_seconds: 0,
+            startup_slow: false,
             connected_at: Instant::now(),
             signal_level: 10.0,
             packets_sent: 100,

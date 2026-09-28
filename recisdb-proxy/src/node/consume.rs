@@ -506,11 +506,39 @@ async fn pump_once(
     };
 
     let mut buffer = BytesMut::new();
+    // STARTING control frames consume sequence numbers too.  Resume state
+    // therefore cannot use `last_sequence` as proof that TS was received.
+    // Keep the first-data deadline active until an actual payload was handed
+    // downstream, including after a reconnect that followed only controls.
+    let mut first_data_received = last_data_at_ms.load(Ordering::Acquire) > 0;
     loop {
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|e| ConsumeError::Transport(e.to_string()))?;
+        let chunk = if !first_data_received {
+            match lease.first_data_grace_ms.filter(|ms| *ms > 0) {
+                Some(grace_ms) => tokio::time::timeout(
+                    Duration::from_millis(grace_ms),
+                    response.chunk(),
+                )
+                .await
+                .map_err(|_| {
+                    ConsumeError::Transport(format!(
+                        "first TS data timeout after {grace_ms}ms"
+                    ))
+                })?
+                .map_err(|e| ConsumeError::Transport(e.to_string()))?,
+                // Older peers do not send the optional deadline or startup
+                // control frames. Preserve their legacy wait-until-close
+                // behavior instead of inventing an incompatible timeout.
+                None => response
+                    .chunk()
+                    .await
+                    .map_err(|e| ConsumeError::Transport(e.to_string()))?,
+            }
+        } else {
+            response
+                .chunk()
+                .await
+                .map_err(|e| ConsumeError::Transport(e.to_string()))?
+        };
         let Some(chunk) = chunk else {
             // Server closed the body. The lease may well still be alive.
             return Ok(());
@@ -543,6 +571,14 @@ async fn pump_once(
             }
 
             last_sequence.store(frame.sequence, Ordering::Release);
+            if frame.flags.contains(FrameFlags::STARTING) || frame.payload.is_empty() {
+                // Startup control frames reset the timeout by causing the
+                // next `chunk()` deadline to start now. Empty frames from an
+                // older peer are equally harmless and must not reach TS
+                // consumers.
+                continue;
+            }
+            first_data_received = true;
             last_data_at_ms.store(unix_now_ms(), Ordering::Release);
             // A closed channel means every local consumer went away; there is
             // nothing left to feed, so stop rather than keep the peer's tuner.
@@ -676,6 +712,7 @@ mod tests {
                 route_id: "route".into(),
                 stream_class: StreamClass::View,
                 ttl_ms: 8_000,
+                first_data_grace_ms: Some(60_000),
                 context: RequestContext {
                     request_id: "request".into(),
                     trace_id: "trace".into(),

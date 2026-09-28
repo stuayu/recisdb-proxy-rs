@@ -97,6 +97,7 @@ const clientColumns: ClientColumn[] = [
   { key: 'address', label: 'クライアント' },
   { key: 'host', label: 'ホスト名' },
   { key: 'status', label: '状態' },
+  { key: 'startup', label: '開始待ち' },
   { key: 'tuner_path', label: '選択チューナー' },
   { key: 'channel', label: 'チャンネル' },
   { key: 'signal', label: '信号' },
@@ -162,6 +163,10 @@ function cellText(row: JsonRecord, key: string): string {
       )
     case 'status':
       return row.is_streaming ? '配信中' : '接続中'
+    case 'startup':
+      return row.startup_state === 'starting'
+        ? `開始中（${Number(row.startup_elapsed_seconds ?? 0)}秒）`
+        : '—'
     case 'channel':
       return String(row.channel_name ?? row.channel_info ?? '—')
     case 'signal':
