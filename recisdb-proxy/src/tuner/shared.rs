@@ -736,6 +736,18 @@ impl SharedTuner {
         Some(top)
     }
 
+    /// True when every live claim on this tuner is background work (EPG
+    /// active scan / background scan). A tuner with no claims is not
+    /// background-only (it may be starting for a client that has not
+    /// subscribed yet).
+    pub fn is_background_only(&self) -> bool {
+        let claims = self.claims.lock().unwrap();
+        !claims.is_empty()
+            && claims.values().all(|c| {
+                matches!(c.usage, TunerUsage::EpgActiveScan | TunerUsage::BackgroundScan)
+            })
+    }
+
     /// Update a live subscription claim immediately after dashboard control
     /// changes.  Returns false when the subscription already disappeared.
     pub fn update_claim(&self, claim_id: u64, priority: i32, exclusive: bool) -> bool {

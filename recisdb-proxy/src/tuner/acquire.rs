@@ -1378,6 +1378,22 @@ mod tests {
         tuner.stop_reader().await;
     }
 
+    #[test]
+    fn background_only_is_true_only_for_epg_or_scan_claims() {
+        let tuner = crate::tuner::SharedTuner::new(ChannelKey::simple("/dev/test", 1), 2);
+        assert!(!tuner.is_background_only(), "no claim: may be a starting client");
+        let epg = tuner.subscribe_with_claim_class(
+            -1000,
+            false,
+            crate::tuner::shared::TunerUsage::EpgActiveScan,
+        );
+        assert!(tuner.is_background_only());
+        let viewer = tuner.subscribe_with_claim_class(0, false, TunerUsage::View);
+        assert!(!tuner.is_background_only());
+        drop(viewer);
+        drop(epg);
+    }
+
     #[tokio::test]
     async fn epg_only_reader_keeps_its_low_claim_priority() {
         let (pool, database, tuner, _) = running_snapshot_fixture().await;

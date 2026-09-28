@@ -149,10 +149,9 @@ pub async fn build_local_advertisements(
     let now = chrono::Utc::now().timestamp_millis();
     let mut out = Vec::with_capacity(routes.len());
     for route in routes {
-        let running = crate::server::session_capacity::count_running_instances_on_driver(
+        let running = crate::server::session_capacity::count_client_held_instances_on_driver(
             tuner_pool,
             &route.dll_path,
-            None,
         )
         .await;
         let total_slots = route.max_instances.max(0) as u32;

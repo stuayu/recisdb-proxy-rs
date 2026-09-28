@@ -53,6 +53,29 @@ pub(crate) async fn count_running_instances_on_driver(
     running_instances
 }
 
+/// Like [`count_running_instances_on_driver`], but a reader held only by
+/// background work (EPG active scan / background scan) is not counted: any
+/// real viewer or peer lease can evict it (`EntryState::background_only`).
+/// Used for the free-slot count a node advertises to its peers; counting EPG
+/// readers made a peer skip this node entirely while it was scanning.
+pub(crate) async fn count_client_held_instances_on_driver(
+    tuner_pool: &Arc<TunerPool>,
+    tuner_path: &str,
+) -> i32 {
+    let mut held = 0i32;
+    for key in tuner_pool.keys().await {
+        if key.tuner_path != tuner_path {
+            continue;
+        }
+        if let Some(tuner) = tuner_pool.get(&key).await {
+            if tuner.occupies_slot() && !tuner.is_background_only() {
+                held += 1;
+            }
+        }
+    }
+    held
+}
+
 pub(super) async fn stop_and_remove_tuner(
     tuner_pool: &Arc<TunerPool>,
     key: &ChannelKey,
