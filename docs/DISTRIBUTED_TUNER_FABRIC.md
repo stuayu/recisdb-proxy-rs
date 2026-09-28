@@ -354,6 +354,11 @@ later instead of being deleted and rediscovered forever (§2).
 The stored picture is a **cache, not an authority**: a peer can still refuse
 the lease, and `available_slots` may already be stale when it is read.
 
+`available_slots` in an advertisement does not count readers held only by
+background work (EPG active scan / background scan): a viewer or a peer lease
+evicts those (`EntryState::background_only`), so counting them made a peer skip
+a node for as long as it was scanning.
+
 ### 4.4 Using a peer from HTTP/Mirakurun and BNDP paths
 
 `channel_resolve::start_source_for_service_with_claim` returns a
