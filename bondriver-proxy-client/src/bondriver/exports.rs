@@ -319,9 +319,15 @@ pub unsafe extern "system" fn wait_ts_stream(this: *mut c_void, timeout_ms: DWOR
 
     // ストリーミング開始（必要な時だけ）
     if connection.state() == ConnectionState::TunerOpen {
-        if !connection.start_stream() {
-            file_log!(warn, "WaitTsStream: start_stream failed");
-            return 0;
+        match connection.start_stream_attempt() {
+            crate::client::connection::StartStreamAttempt::Started
+            | crate::client::connection::StartStreamAttempt::AlreadyStreaming => {}
+            crate::client::connection::StartStreamAttempt::RetrySuppressed => {}
+            crate::client::connection::StartStreamAttempt::Failed => {
+                file_log!(warn, "WaitTsStream: start_stream failed");
+                return 0;
+            }
+            crate::client::connection::StartStreamAttempt::InvalidState => return 0,
         }
     }
 
@@ -904,6 +910,7 @@ pub unsafe extern "system" fn set_channel2(
         state.connection.clone()
     };
 
+    let was_streaming = connection.state() == ConnectionState::Streaming;
     file_log!(
         info,
         "SetChannel2: connection state before tuning={:?}",
@@ -934,10 +941,19 @@ pub unsafe extern "system" fn set_channel2(
         // ★切替時にバッファ破棄（任意だが推奨）
         connection.purge_stream();
 
-        // ★ここでストリーム開始（WaitTsStream に依存しない）
-        let started = connection.start_stream();
+        // SetChannelSpace is allowed while streaming and the server keeps the
+        // stream alive across the channel switch.  Calling StartStream again
+        // in that state is rejected by both client and server.
+        let started = was_streaming || connection.start_stream();
         if !started {
-            file_log!(error, "SetChannel2: StartStream failed after SetChannelSpace (space={}, channel={}, state={:?})", space, channel, connection.state());
+            file_log!(
+                error,
+                "SetChannel2: StartStream failed after SetChannelSpace (space={}, channel={}, state={:?})",
+                space,
+                channel,
+                connection.state()
+            );
+            return 0;
         }
 
         file_log!(
@@ -947,7 +963,10 @@ pub unsafe extern "system" fn set_channel2(
         );
         1
     } else {
-        file_log!(error, "SetChannel2: Failed");
+        // A false SetChannelSpace is expected while BonDriverProxyEx probes
+        // busy exclusive candidates.  The caller still receives failure; this
+        // is only a diagnostic, so keep it out of the WARN/ERROR flood.
+        file_log!(debug, "SetChannel2: Failed");
         0
     }
 }

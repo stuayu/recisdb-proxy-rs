@@ -3,7 +3,7 @@
 `BonDriver_NetworkProxy.dll` の実装を通しで精査した結果の指摘と対応状況。
 
 対象は多段構成 (上流 recisdb-proxy が本DLLを BonDriver として開く) と、
-拠点間WAN中継 (宮城・福島 ↔ 東京) の運用を前提とした評価。
+拠点間WAN中継を前提とした評価。
 ローカルLANの単段構成では顕在化しない指摘が多く含まれる。
 
 状態の凡例: **未対応** / **対応済み** / **見送り**(理由を併記)
@@ -234,3 +234,57 @@ ini を見失って既定値 (127.0.0.1) で動いてしまう。`logging.rs` �
   下回る拠点では、秒数を伸ばしても遅延が単調増加して最後に切れるだけ。
   `ServiceFilter = single` かエンコード配信でレート自体を下げること
   (`docs/STREAMING_DESIGN.md` §3.2 参照)。
+
+---
+
+## 2026-09-28 実運用ログ追補: 多段 BonDriverProxyEx 接続
+
+匿名化した実運用ログで同一メッセージを集計し、代表的な時系列を確認した。ログは旧版DLLの期間を含むため、旧版にしかない文言と現ソースを分けて判定する。
+
+### パターン別判定
+
+1. **Streaming中の `SetChannel2` — クライアントDLL不具合、対応済み**
+
+   匿名化ログで `SetChannelSpace` 後も `state=Streaming` なのに `StartStream` を再送し、`StartStream skipped` と対になっていた。旧実装の `bondriver-proxy-client/src/bondriver/exports.rs` の `set_channel2` が常に `start_stream()` を呼び、失敗しても `SetChannel2` を成功返却していた。現在はStreaming中の再送を抑止し、非Streaming時だけ開始する。開始失敗は0を返す (`exports.rs:913-957`, `connection.rs:926-991`)。
+
+2. **`CloseTuner` 後のEOF・再接続 — クライアントDLL不具合、対応済み**
+
+   複数の匿名化ログで `last_request=CloseTuner` の直後にEOFや `RPC CloseTuner interrupted` が発生した。現サーバーは `recisdb-proxy/src/server/session.rs:1552-1559` で cleanup後に `CloseTunerAck` を送るため、EOF自体は旧版/リンク断を含む切断事象であり、閉じたチューナーを復活させるべきではない。旧クライアントは close 中も `closing=false` のため supervisor が再接続した。現在は `CloseTuner` を明示的な接続境界として supervisor を止め、RPC後に transportも破棄する。CloseTuner待ちのリンク断とEOFは通常診断へ降格 (`connection.rs:652-669`, `connection.rs:781-793`, `connection.rs:1780-1783`)。
+
+3. **SetChannelSpace拒否後のrestoreループ — 一時的排他競合を考慮した無期限再試行へ修正**
+
+   `server rejected SetChannelSpace on reconnect` は、再接続はできたが排他選局を再取得できなかった状態。BonDriverProxyEx/TVTest/EDCBは途中で `OpenTuner` を呼び直さないため、サーバー再起動や録画による一時的競合でrestoreを打ち切るとストリームが恒久停止する。restore失敗時はsession contextを保持し、attemptをリセットせず既存の指数backoff（30秒上限）で無期限再試行する。WARNは1回目と連続失敗回数が2の冪（2,4,8...）だけに間引き、成功時は失敗回数をINFOで1行出す (`connection.rs:1084-1086`, `connection.rs:1525-1556`)。
+
+4. **`exclusive=true` の `SetChannelSpace`拒否 — 正常な候補探索/環境・設定起因、ログ対応済み**
+
+   `Priority=10`, `Exclusive=1` のINIで拒否が発生し、同一時刻に複数channelを順に試していた。BonDriverProxyEx が空きチューナーを探す過程の拒否と整合する。サーバーの `handle_set_channel_space` は `recisdb-proxy/src/server/session.rs:1937-2150` で単一の acquire経路へ渡し、候補不足/排他競合をfalse Ackにする契約。選局結果はfalseのまま維持し、クライアントの拒否診断だけ `debug` へ降格した (`connection.rs:858-889`, `exports.rs:963-970`)。
+
+5. **`last_request=none` のEOF・接続拒否 — 主因はWAN/サーバー停止など環境起因、ログ/再接続制御を対応**
+
+   `client_state=Connected` のEOFとWinSock 10061が続き、`last_request=GetSignalLevel` や `none` のEOFも短い間隔で発生した。旧実装にも500ms開始・30秒上限のbackoffはあったが、再接続に成功するたび `attempt=0` へ戻るため、すぐ落ちるフラップでは500ms周期へ戻った。現在は10秒以上安定した接続だけbackoffを初期化し、短時間フラップは指数backoffを継続する。server EOFのファイルログはERRORからWARNへ降格 (`connection.rs:1063-1089`, `connection.rs:1587-1595`, `connection.rs:1780-1783`)。
+
+6. **`WaitTsStream: start_stream failed` — クライアントDLLの再試行/ログ量産、対応済み**
+
+   クライアントPCのログで `RPC Hello timed out`、`initial connection failed` と同じ時間帯に、サーバー未接続/チューナー未準備中にWaitTsStreamがポーリングごとにStartStreamを送っていた。接続失敗自体は環境起因だが、毎回送信・WARN出力はクライアント側。現在はStreaming状態を冪等扱いし、StartStream失敗後1秒間はRPCとWARNを抑止する (`connection.rs:197-205`, `connection.rs:926-991`, `exports.rs:320-331`)。
+
+7. **`GetModuleHandleW ... trying NULL` — 旧版DLLのログレベル/実装問題、現ソース対応済み**
+
+   DLL名検索失敗後にNULLへフォールバックしている旧版ログがあった。NULLはホストEXEのベースを返し、RTTI RVA計算を壊すため安全なフォールバックではない。現ソースはDLL内アドレスから `GetModuleHandleExW` を引き、`UNCHANGED_REFCOUNT` も指定し、失敗時は0で停止する (`bondriver-proxy-client/src/bondriver/exports.rs:1264-1308`)。現ソースに旧文言はなく、ERRORを降格しない。旧版DLLの差し替えが必要。
+
+8. **`Buffer full, dropped` — 実データ欠損は環境/消費側、ログ量産はクライアント対応済み**
+
+   約100ms間隔で大きなTSチャンクを取りこぼしており、WARNの問題だけではなく、受信帯域・TVTest/上流Proxyの読み出し遅延・単一サービス化なし等の実運用条件でリングバッファが満杯になった実データ欠損。`TsRingBuffer::write` は欠損を正しく数えており、設定だけで復元できない。現在はドロップ累計を保持したまま、警告を1秒に1回へ集約する (`buffer.rs:94-113`, `connection.rs:1269-1278`)。
+
+### 変更と検証
+
+- `bondriver-proxy-client/src/client/connection.rs`: CloseTuner後の再接続抑止、restore無期限再試行・指数backoff・冪ログ、安定接続ベースのbackoff、StartStream冪等化/1秒再試行抑止、EOFログ降格。
+- `bondriver-proxy-client/src/bondriver/exports.rs`: Streaming中のSetChannel2でStartStreamを再送しない。StartStream失敗を成功返却しない。候補拒否とWaitTsStreamログの量を抑制。
+- `bondriver-proxy-client/src/client/buffer.rs`: ドロップ警告のインスタンス単位レート制限。
+- 単体テスト: restore失敗ログ間引き、安定接続backoff、Streaming中のStartStream冪等性、失敗後の再試行抑止を追加。
+- `cargo test -p bondriver-proxy-client`: 38 passed。
+
+### 未対応・運用作業
+
+- 実機DLL、BonDriverProxyEx、WAN断線を伴うWindows実動作は未検証。Windows向けリリースビルドと実機で `SetChannel2`、CloseTuner、再接続、TS欠損を確認する必要がある。
+- 旧DLLの該当ログを消すには、修正版 `BonDriver_NetworkProxy_*.dll` をクライアントへ差し替える。INI変更は不要。`Exclusive=1` は排他要求そのものなので、候補拒否をなくすにはサーバー側の空き容量確保、同時利用削減、または運用要件に応じた `Exclusive=0` の判断が必要。
+- 8番の欠損を直すには、実効帯域をTS bitrate以上にし、必要ならINIの `ServiceFilter=single`、中継段の `StreamClass=record`、またはエンコード配信を使う。ログレート制限は欠損自体を隠さない。

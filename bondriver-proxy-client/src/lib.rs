@@ -11,6 +11,10 @@ mod config;
 #[macro_use]
 pub mod logging;
 
+// Public for the cross-platform BNDP probe example. These are Rust APIs only;
+// adding an rlib target does not add or alter the Windows DLL exports.
+pub use client::{Connection, ConnectionConfig, ConnectionState};
+
 use std::sync::Once;
 
 use bondriver::interface::IBonDriver;

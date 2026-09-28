@@ -192,6 +192,16 @@ struct SessionContext {
     channel: Option<ChannelSel>,
 }
 
+/// Result of a StartStream request attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartStreamAttempt {
+    Started,
+    AlreadyStreaming,
+    RetrySuppressed,
+    Failed,
+    InvalidState,
+}
+
 /// Link status shared between the synchronous FFI callers and the async
 /// supervisor.  Distinct from the public `ConnectionState` (which is kept at a
 /// plausible "still open" value during an outage for the FFI surface): this
@@ -242,6 +252,9 @@ pub struct Connection {
     /// `link` module).  Lets `send_request_with_timeout` fail fast while the
     /// supervisor is reconnecting instead of blocking for the full timeout.
     link_status: AtomicU8,
+    /// Prevent every WaitTsStream poll from retrying a failed StartStream
+    /// request during a transient outage.
+    start_stream_retry_at: Mutex<Option<Instant>>,
 }
 
 impl Connection {
@@ -260,6 +273,7 @@ impl Connection {
             closing: AtomicBool::new(false),
             reconnect_notify: Notify::new(),
             link_status: AtomicU8::new(link::DOWN),
+            start_stream_retry_at: Mutex::new(None),
         })
     }
 
@@ -486,6 +500,7 @@ impl Connection {
         }
 
         *self.session.lock() = SessionContext::default();
+        *self.start_stream_retry_at.lock() = None;
         self.buffer.clear();
         *self.state.lock() = ConnectionState::Disconnected;
     }
@@ -637,12 +652,21 @@ impl Connection {
                     // waited, so we don't hold the lock for the full timeout.
                     if self.link_status.load(Ordering::Acquire) == link::DOWN {
                         debug!("[Connection] Link went down while waiting; failing request");
-                        file_log!(
-                            error,
-                            "RPC {} interrupted: link dropped while waiting (state={:?})",
-                            client_message_name(&msg),
-                            self.state()
-                        );
+                        if matches!(msg, ClientMessage::CloseTuner) {
+                            file_log!(
+                                debug,
+                                "RPC {} interrupted: link dropped while waiting (state={:?})",
+                                client_message_name(&msg),
+                                self.state()
+                            );
+                        } else {
+                            file_log!(
+                                error,
+                                "RPC {} interrupted: link dropped while waiting (state={:?})",
+                                client_message_name(&msg),
+                                self.state()
+                            );
+                        }
                         return None;
                     }
                     continue;
@@ -754,20 +778,19 @@ impl Connection {
 
     /// Close the tuner.
     pub fn close_tuner(&self) {
+        // CloseTuner is an explicit lifecycle boundary.  If the server closes
+        // the session after handling it, the supervisor must not resurrect the
+        // tuner in the background.
+        self.closing.store(true, Ordering::SeqCst);
         if self.state() == ConnectionState::Streaming {
             self.stop_stream();
         }
 
         let _ = self.send_request(ClientMessage::CloseTuner);
-        // Explicit tuner close: forget the restore context so a later reconnect
-        // does not silently reopen the tuner behind the app's back.
-        {
-            let mut ctx = self.session.lock();
-            ctx.tuner_open = false;
-            ctx.streaming = false;
-            ctx.channel = None;
-        }
-        *self.state.lock() = ConnectionState::Connected;
+        // Explicit tuner close: tear down the transport too.  A later
+        // OpenTuner starts a fresh connection instead of using stale session
+        // state.
+        self.disconnect();
     }
 
     /// Drop the cached signal level so the next `GetSignalLevel` refetches.
@@ -835,7 +858,7 @@ impl Connection {
                     });
                 } else {
                     file_log!(
-                        error,
+                        debug,
                         "SetChannelSpace rejected: space={} channel={} priority={} exclusive={}",
                         space,
                         channel,
@@ -847,7 +870,7 @@ impl Connection {
             }
             Some(other) => {
                 file_log!(
-                    error,
+                    debug,
                     "SetChannelSpace unexpected response: space={} channel={} response={:?}",
                     space,
                     channel,
@@ -857,7 +880,7 @@ impl Connection {
             }
             None => {
                 file_log!(
-                    error,
+                    debug,
                     "SetChannelSpace failed without response: space={} channel={} state={:?}",
                     space,
                     channel,
@@ -898,47 +921,74 @@ impl Connection {
         }
     }
 
-    /// Start streaming.
-    pub fn start_stream(&self) -> bool {
-        if self.state() != ConnectionState::TunerOpen {
-            file_log!(
-                error,
-                "StartStream skipped: invalid client state {:?}",
-                self.state()
-            );
-            return false;
+    /// Try to start streaming once.  Repeated WaitTsStream polls are
+    /// rate-limited after a failure so a dead link cannot create a log storm.
+    pub(crate) fn start_stream_attempt(&self) -> StartStreamAttempt {
+        match self.state() {
+            ConnectionState::TunerOpen => {}
+            ConnectionState::Streaming => return StartStreamAttempt::AlreadyStreaming,
+            state => {
+                file_log!(
+                    debug,
+                    "StartStream skipped: invalid client state {:?}",
+                    state
+                );
+                return StartStreamAttempt::InvalidState;
+            }
+        }
+
+        let now = Instant::now();
+        {
+            let mut retry_at = self.start_stream_retry_at.lock();
+            if retry_at.is_some_and(|deadline| deadline > now) {
+                return StartStreamAttempt::RetrySuppressed;
+            }
+            *retry_at = None;
         }
 
         let resp = self.send_request(ClientMessage::StartStream);
-
         match resp {
-            Some(ServerMessage::StartStreamAck { success, .. }) => {
-                if success {
-                    *self.state.lock() = ConnectionState::Streaming;
-                    self.session.lock().streaming = true;
-                }
-                if !success {
-                    file_log!(error, "StartStream rejected by server");
-                }
-                success
+            Some(ServerMessage::StartStreamAck { success, .. }) if success => {
+                *self.state.lock() = ConnectionState::Streaming;
+                self.session.lock().streaming = true;
+                *self.start_stream_retry_at.lock() = None;
+                StartStreamAttempt::Started
+            }
+            Some(ServerMessage::StartStreamAck { .. }) => {
+                file_log!(debug, "StartStream rejected by server");
+                *self.start_stream_retry_at.lock() =
+                    Some(Instant::now() + START_STREAM_RETRY_INTERVAL);
+                StartStreamAttempt::Failed
             }
             Some(other) => {
                 file_log!(
-                    error,
+                    debug,
                     "StartStream unexpected response: {:?}",
                     std::mem::discriminant(&other)
                 );
-                false
+                *self.start_stream_retry_at.lock() =
+                    Some(Instant::now() + START_STREAM_RETRY_INTERVAL);
+                StartStreamAttempt::Failed
             }
             None => {
                 file_log!(
-                    error,
+                    debug,
                     "StartStream failed without response: client_state={:?}",
                     self.state()
                 );
-                false
+                *self.start_stream_retry_at.lock() =
+                    Some(Instant::now() + START_STREAM_RETRY_INTERVAL);
+                StartStreamAttempt::Failed
             }
         }
+    }
+
+    /// Start streaming.  Kept as a boolean API for the FFI callers.
+    pub fn start_stream(&self) -> bool {
+        matches!(
+            self.start_stream_attempt(),
+            StartStreamAttempt::Started | StartStreamAttempt::AlreadyStreaming
+        )
     }
 
     /// Stop streaming.
@@ -1013,6 +1063,11 @@ const BACKOFF_INITIAL_MS: u64 = 500;
 /// Upper bound on the backoff delay.
 const BACKOFF_MAX_MS: u64 = 30_000;
 
+/// A connection must stay up this long before a later flap is considered a
+/// recovered connection.  This prevents a successful-but-immediately-dropped
+/// reconnect from resetting the delay to 500 ms forever.
+const STABLE_CONNECTION_DURATION: Duration = Duration::from_secs(10);
+
 /// Exponential backoff schedule (pure, deterministic — the jitter is added by
 /// the caller).  `attempt` is 0-based: 0 → 500 ms, 1 → 1 s, 2 → 2 s, … capped
 /// at 30 s.  Monotonically non-decreasing and saturating.
@@ -1020,6 +1075,14 @@ fn backoff_delay(attempt: u32) -> Duration {
     // Shift by at most 20 to avoid overflow; anything past the cap clamps anyway.
     let scaled = BACKOFF_INITIAL_MS.saturating_mul(1u64 << attempt.min(20));
     Duration::from_millis(scaled.min(BACKOFF_MAX_MS))
+}
+
+fn connection_was_stable(connected_at: Instant) -> bool {
+    connected_at.elapsed() >= STABLE_CONNECTION_DURATION
+}
+
+fn should_log_restore_failure(failures: u32) -> bool {
+    failures == 1 || failures.is_power_of_two()
 }
 
 /// Add a small (<= 20%) jitter to a backoff delay to avoid a thundering herd of
@@ -1078,6 +1141,9 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// a loop that never converges. Once TS has been seen, silence really does
 /// mean a dead link, so the short timeout applies from then on.
 const FIRST_DATA_GRACE: Duration = Duration::from_secs(60);
+
+/// Minimum interval between failed StartStream requests from WaitTsStream.
+const START_STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Turn on TCP keepalive.
 ///
@@ -1199,11 +1265,11 @@ fn process_frames(
                         );
                     }
 
-                    if written < ts_payload.len() {
+                    if written < ts_payload.len() && buffer.should_log_drop() {
                         crate::file_log!(
                             warn,
-                            "Buffer full, dropped {} bytes",
-                            ts_payload.len() - written
+                            "Buffer full, dropped TS data (total_dropped={} bytes)",
+                            buffer.dropped_bytes()
                         );
                     }
 
@@ -1418,6 +1484,7 @@ async fn connection_supervisor(
     buffer: Arc<TsRingBuffer>,
 ) {
     let mut attempt: u32 = 0;
+    let mut restore_failures: u32 = 0;
     let mut first = true;
 
     loop {
@@ -1434,14 +1501,28 @@ async fn connection_supervisor(
                     match restore_session(&conn, &config, &mut reader, &mut writer, &buffer).await {
                         Ok(()) => {
                             let st = conn.active_state();
+                            let previous_restore_failures = restore_failures;
                             *conn.state.lock() = st;
-                            attempt = 0;
-                            info!("Reconnected; session restored, state={:?}", st);
-                            file_log!(
-                                info,
-                                "supervisor: reconnected, session restored, state={:?}",
-                                st
-                            );
+                            restore_failures = 0;
+                            if previous_restore_failures > 0 {
+                                info!(
+                                    "Reconnected after {} restore failures; session restored, state={:?}",
+                                    previous_restore_failures, st
+                                );
+                                file_log!(
+                                    info,
+                                    "supervisor: reconnected after {} restore failures, session restored, state={:?}",
+                                    previous_restore_failures,
+                                    st
+                                );
+                            } else {
+                                info!("Reconnected; session restored, state={:?}", st);
+                                file_log!(
+                                    info,
+                                    "supervisor: reconnected, session restored, state={:?}",
+                                    st
+                                );
+                            }
                             // Drop any pre-drop leftovers still queued from
                             // before the outage so we do not replay stale
                             // commands or desync the response channel.  This runs
@@ -1452,8 +1533,19 @@ async fn connection_supervisor(
                             while req_rx.try_recv().is_ok() {}
                         }
                         Err(e) => {
-                            warn!("Session restore failed: {}", e);
-                            file_log!(warn, "supervisor: session restore failed: {}", e);
+                            restore_failures = restore_failures.saturating_add(1);
+                            if should_log_restore_failure(restore_failures) {
+                                warn!(
+                                    "Session restore failed (consecutive_failures={}): {}",
+                                    restore_failures, e
+                                );
+                                file_log!(
+                                    warn,
+                                    "supervisor: session restore failed (consecutive_failures={}): {}",
+                                    restore_failures,
+                                    e
+                                );
+                            }
                             let delay = jittered(backoff_delay(attempt));
                             attempt = attempt.saturating_add(1);
                             if backoff_wait(&conn, delay).await {
@@ -1464,6 +1556,7 @@ async fn connection_supervisor(
                     }
                 }
                 first = false;
+                let connected_at = Instant::now();
 
                 // Link is now pumping the socket: requests are processed normally.
                 conn.link_status.store(link::UP, Ordering::SeqCst);
@@ -1498,6 +1591,9 @@ async fn connection_supervisor(
                         } else {
                             st
                         };
+                        if connection_was_stable(connected_at) {
+                            attempt = 0;
+                        }
                         let delay = jittered(backoff_delay(attempt));
                         attempt = attempt.saturating_add(1);
                         if backoff_wait(&conn, delay).await {
@@ -1687,7 +1783,7 @@ async fn connection_loop(
                 match res {
                     Ok(0) => {
                         info!("Connection closed by server");
-                        file_log!(error, "connection_loop: server closed connection (last_request={}, client_state={:?})", last_request, conn.state());
+                        file_log!(warn, "connection_loop: server closed connection (last_request={}, client_state={:?})", last_request, conn.state());
                         break LoopExit::Dropped("server closed (EOF)".to_string());
                     }
                     Ok(_) => {
@@ -2135,6 +2231,44 @@ mod tests {
         }
         // Large attempt numbers must not panic (overflow) and stay clamped.
         assert_eq!(backoff_delay(u32::MAX), cap);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_a_stable_connection() {
+        let now = Instant::now();
+        assert!(!connection_was_stable(now));
+        assert!(connection_was_stable(now - STABLE_CONNECTION_DURATION));
+    }
+
+    #[test]
+    fn restore_failure_log_sampling_uses_powers_of_two() {
+        for failures in [1, 2, 4, 8, 16, 32] {
+            assert!(should_log_restore_failure(failures));
+        }
+        for failures in [0, 3, 5, 6, 7, 9, 10, 15] {
+            assert!(!should_log_restore_failure(failures));
+        }
+    }
+
+    #[test]
+    fn start_stream_is_idempotent_while_already_streaming() {
+        let conn = Connection::new(ConnectionConfig::default());
+        *conn.state.lock() = ConnectionState::Streaming;
+        assert_eq!(
+            conn.start_stream_attempt(),
+            StartStreamAttempt::AlreadyStreaming
+        );
+    }
+
+    #[test]
+    fn failed_start_stream_is_rate_limited() {
+        let conn = Connection::new(ConnectionConfig::default());
+        *conn.state.lock() = ConnectionState::TunerOpen;
+        assert_eq!(conn.start_stream_attempt(), StartStreamAttempt::Failed);
+        assert_eq!(
+            conn.start_stream_attempt(),
+            StartStreamAttempt::RetrySuppressed
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// TS packet size.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -49,6 +49,9 @@ pub struct TsRingBuffer {
     data_available: Condvar,
     /// Mutex paired with data_available (holds no meaningful state).
     data_mutex: Mutex<()>,
+    /// Last time an overflow warning was emitted.  The drop counter remains
+    /// exact; this only limits repeated diagnostics during sustained overflow.
+    drop_log_at: Mutex<Option<Instant>>,
 }
 
 #[allow(dead_code)]
@@ -64,6 +67,7 @@ impl TsRingBuffer {
             dropped_bytes: AtomicUsize::new(0),
             data_available: Condvar::new(),
             data_mutex: Mutex::new(()),
+            drop_log_at: Mutex::new(None),
         }
     }
 
@@ -88,6 +92,21 @@ impl TsRingBuffer {
     /// consumer is not draining fast enough and the TS stream has gaps.
     pub fn dropped_bytes(&self) -> usize {
         self.dropped_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Return true at most once per second for overflow diagnostics.
+    pub fn should_log_drop(&self) -> bool {
+        const INTERVAL: Duration = Duration::from_secs(1);
+        let now = Instant::now();
+        let mut last = match self.drop_log_at.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if last.is_some_and(|at| now.duration_since(at) < INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     /// Write data to the buffer.
@@ -354,6 +373,10 @@ impl TsRingBuffer {
         let write = self.write_pos.load(Ordering::Acquire);
         self.read_pos.store(write, Ordering::Release);
         self.dropped_bytes.store(0, Ordering::Relaxed);
+        match self.drop_log_at.lock() {
+            Ok(mut last) => *last = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
     }
 
     /// Check if the buffer is empty.
@@ -681,5 +704,14 @@ mod tests {
         buffer.clear();
         assert!(buffer.is_empty());
         assert_eq!(buffer.dropped_bytes(), 0, "clear resets the loss counter");
+    }
+
+    #[test]
+    fn overflow_warning_is_rate_limited_and_reset_by_clear() {
+        let buffer = TsRingBuffer::new();
+        assert!(buffer.should_log_drop());
+        assert!(!buffer.should_log_drop());
+        buffer.clear();
+        assert!(buffer.should_log_drop());
     }
 }
