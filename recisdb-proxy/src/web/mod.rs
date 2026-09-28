@@ -470,7 +470,7 @@ pub async fn start_web_server(
 
     let app = build_app(web_state, mirakurun_enabled);
 
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let listener = crate::server::listener::bind_with_retry(listen_addr).await?;
     log::info!("Web dashboard listening on http://{}", listen_addr);
 
     // `with_connect_info` makes the client's SocketAddr available to the

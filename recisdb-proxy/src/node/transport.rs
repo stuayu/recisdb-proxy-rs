@@ -429,7 +429,7 @@ async fn unpair_peer(State(state): State<Arc<NodeTransportState>>, headers: Head
 /// HTTP/2 prior-knowledge preface on cleartext connections. This mode is for
 /// encrypted overlays only; InternetDirect endpoints must use a TLS wrapper.
 pub async fn serve_h2c(addr: SocketAddr, state: Arc<NodeTransportState>) -> io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = crate::server::listener::bind_with_retry(addr).await?;
     log::info!(
         "Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)",
         addr

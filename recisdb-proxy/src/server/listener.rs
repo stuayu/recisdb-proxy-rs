@@ -82,7 +82,7 @@ impl Server {
 
     /// Run the server, accepting connections until shutdown.
     pub async fn run(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        let listener = bind_with_retry(self.config.listen_addr).await?;
         info!("Server listening on {}", self.config.listen_addr);
 
         loop {
@@ -371,6 +371,38 @@ async fn session_writer(
                     }
                 }
             }
+        }
+    }
+}
+
+/// How long a listener keeps retrying a port that is still held.
+const BIND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bind `addr`, retrying while the address is still in use.
+///
+/// A service restart (self-update watchdog, or a manual `sc stop` / `sc
+/// start`) can start the new process while the old one is still exiting and
+/// holding its sockets. Failing the bind immediately made the new process
+/// exit and left the service stopped (observed after a Windows self-update:
+/// `os error 10048` on the web and node ports). Only `AddrInUse` is retried;
+/// any other error is returned at once.
+pub async fn bind_with_retry(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let started = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && started.elapsed() < BIND_RETRY_WINDOW =>
+            {
+                if !warned {
+                    log::warn!("{addr} is still in use; retrying bind for up to {}s", BIND_RETRY_WINDOW.as_secs());
+                    warned = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e),
         }
     }
 }

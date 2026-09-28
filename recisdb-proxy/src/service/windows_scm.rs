@@ -369,6 +369,11 @@ pub fn run_restart_watchdog(name: &str) -> Result<(), ServiceError> {
     std::thread::sleep(Duration::from_secs(2));
 
     let current = service.query_status().map_err(to_windows_service_error)?;
+    // The service reports STOPPED to the SCM *before* it terminates itself
+    // (`terminate_process_now`), so STOPPED alone does not mean its sockets
+    // are released. Remember the PID and wait for the process to be gone,
+    // or the new instance races it for its ports (`os error 10048`) and exits.
+    let old_pid = current.process_id;
     if current.current_state != ServiceState::Stopped {
         // 停止要求は「すでに停止処理中」なら失敗しうる。その場合も
         // 待ちには入る (エラーで抜けない)。
@@ -377,6 +382,11 @@ pub fn run_restart_watchdog(name: &str) -> Result<(), ServiceError> {
         }
     }
     wait_for_state(&service, ServiceState::Stopped, RESTART_STOP_TIMEOUT)?;
+    if let Some(pid) = old_pid.filter(|pid| *pid != 0) {
+        if !wait_for_process_exit(pid, RESTART_STOP_TIMEOUT) {
+            eprintln!("restart watchdog: old process {pid} still alive; starting anyway");
+        }
+    }
 
     let mut last_error = String::new();
     for attempt in 1..=RESTART_START_ATTEMPTS {
@@ -408,6 +418,30 @@ pub fn run_restart_watchdog(name: &str) -> Result<(), ServiceError> {
         exit_code: None,
         stderr: last_error,
     })
+}
+
+/// Wait for a process to exit. Returns true when it has exited (or no longer
+/// exists), false on timeout.
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle == 0 {
+            // Already gone (or not ours to open): nothing to wait for.
+            return true;
+        }
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let result = WaitForSingleObject(handle, millis);
+        CloseHandle(handle);
+        result == WAIT_OBJECT_0
+    }
 }
 
 // ---------------------------------------------------------------------
