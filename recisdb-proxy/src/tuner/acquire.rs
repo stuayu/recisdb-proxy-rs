@@ -453,6 +453,7 @@ pub(crate) async fn snapshot_excluding_claim(
         subscribers: u32,
         priority: i32,
         incumbent_exclusive: bool,
+        background_only: bool,
         held_for: std::time::Duration,
         space: u32,
         channel: u32,
@@ -494,6 +495,13 @@ pub(crate) async fn snapshot_excluding_claim(
             subscribers: tuner.subscriber_count(),
             priority: incumbent.map(|c| c.priority).unwrap_or(0),
             incumbent_exclusive: incumbent.map(|c| c.exclusive).unwrap_or(false),
+            background_only: incumbent.is_some_and(|c| {
+                matches!(
+                    c.usage,
+                    crate::tuner::shared::TunerUsage::EpgActiveScan
+                        | crate::tuner::shared::TunerUsage::BackgroundScan
+                )
+            }),
             held_for: tuner.held_for(),
             space,
             channel,
@@ -538,8 +546,17 @@ pub(crate) async fn snapshot_excluding_claim(
             key: e.key,
             state: e.state,
             subscribers: e.subscribers,
-            priority: db_priority.max(e.priority),
+            // The DB channel priority is the floor for *client* readers. A
+            // reader held only by an EPG/background scan keeps its own low
+            // claim (-1000); raising it to the DB default (0) made every
+            // priority-0 viewer tie with, and fail to evict, an EPG scan.
+            priority: if e.background_only {
+                e.priority
+            } else {
+                db_priority.max(e.priority)
+            },
             incumbent_exclusive: e.incumbent_exclusive,
+            background_only: e.background_only,
             held_for: e.held_for,
         })
         .collect();
@@ -1358,6 +1375,24 @@ mod tests {
 
         assert_eq!(snap.entries[0].priority, 10);
         assert!(snap.entries[0].incumbent_exclusive);
+        tuner.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn epg_only_reader_keeps_its_low_claim_priority() {
+        let (pool, database, tuner, _) = running_snapshot_fixture().await;
+        let _epg = tuner.subscribe_with_claim_class(
+            -1000,
+            false,
+            crate::tuner::shared::TunerUsage::EpgActiveScan,
+        );
+
+        let snap = snapshot(&pool, &database, &["/dev/test".to_string()]).await;
+
+        // Not raised to the DB channel default (0): a priority-0 viewer
+        // must outrank an EPG scan.
+        assert_eq!(snap.entries[0].priority, -1000);
+        assert!(snap.entries[0].background_only);
         tuner.stop_reader().await;
     }
 

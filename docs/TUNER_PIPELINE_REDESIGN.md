@@ -7,6 +7,10 @@ EPG active scanはpriority `-1000` の低優先要求として
 `tuner/acquire.rs::acquire`へ渡す。scan schedulerがSlotPermitなしにBonDriverを開くことを
 禁止し、録画・視聴が先なら容量判定でEPGを延期する。readerの読み取りループへEPG専用処理を
 追加せず、subscription側で既存EpgCollectorへ接続する。
+EPG/バックグラウンドスキャンのclaimしか持たないreaderは、snapshotで優先度をDBの
+チャンネル既定値へ引き上げず(`-1000` のまま)、`min_hold` の保護も受けない
+(`EntryState::background_only`)。以前は既定値0へ引き上げられていたため、優先度0の
+視聴・ノード間leaseがEPGスキャンと同点になり、スキャン中のチューナーを奪えなかった。
 
 位置づけ: `docs/SYSTEM_REVIEW_2026-07.md` のリファクタリング・ロードマップ
 Phase 2 項目 **17 (SetChannel ポリシーエンジン抽出)** と **18 (Session 状態機械の

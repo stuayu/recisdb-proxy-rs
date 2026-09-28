@@ -249,6 +249,11 @@ pub struct EntryState {
     /// distinguishes a keep-alive leftover (takeable) from an entry whose
     /// caller has tuned it but not yet subscribed (not takeable).
     pub idle_close_pending: bool,
+    /// Every live claim on this entry is background work (EPG active scan /
+    /// background scan). Such a reader keeps its own low claim priority
+    /// (not raised to the channel's DB priority) and is not protected by
+    /// `min_hold`: a real viewer must always be able to take it.
+    pub background_only: bool,
 }
 
 impl EntryState {
@@ -571,7 +576,11 @@ fn may_evict(
         // taking that one away would break the request that created it.
         return true;
     }
-    if victim.has_subscribers() && victim.is_running() && victim.held_for < min_hold {
+    if victim.has_subscribers()
+        && victim.is_running()
+        && !victim.background_only
+        && victim.held_for < min_hold
+    {
         return false;
     }
     (req.priority, req.exclusive as u8) > (victim.priority, victim.incumbent_exclusive as u8)
@@ -978,6 +987,7 @@ mod tests {
             subscribers,
             priority,
             incumbent_exclusive: false,
+            background_only: false,
             held_for: Duration::from_secs(10),
             // Most tests are about live-vs-idle and priority; a
             // subscriber-less entry stands in for a keep-alive leftover
@@ -1632,6 +1642,7 @@ mod tests {
                 incumbent_exclusive: false,
                 held_for: Duration::from_secs(10),
                 idle_close_pending: true,
+                background_only: false,
             }],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
@@ -1665,6 +1676,7 @@ mod tests {
                 incumbent_exclusive: false,
                 held_for: Duration::from_secs(10),
                 idle_close_pending: true,
+                background_only: false,
             }],
         };
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
@@ -1712,6 +1724,23 @@ mod tests {
         req.own_key = Some(own_key);
 
         assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn viewer_evicts_a_freshly_started_epg_scan_reader() {
+        let mut epg = entry("A.dll", 0, 1, true, 1, -1000);
+        epg.background_only = true;
+        epg.held_for = Duration::from_secs(1); // inside min_hold
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![epg],
+        };
+        let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+
+        assert!(matches!(
+            decide(&snapshot, &req),
+            Decision::Create { ref evict, .. } if evict.len() == 1
+        ));
     }
 
     #[test]
@@ -1786,6 +1815,7 @@ mod tests {
             incumbent_exclusive: false,
             held_for: Duration::from_secs(30),
             idle_close_pending: false,
+            background_only: false,
         };
         assert!(stopping.occupies_slot());
         assert!(!stopping.is_joinable());
@@ -1817,6 +1847,7 @@ mod tests {
             incumbent_exclusive: false,
             held_for: Duration::ZERO,
             idle_close_pending: false,
+            background_only: false,
         };
         let snapshot = TunerSnapshot {
             drivers: vec![driver("A.dll", 1)],
