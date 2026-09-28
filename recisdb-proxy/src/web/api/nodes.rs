@@ -120,6 +120,7 @@ pub async fn get_nodes(
         // Both numbers: "12 routes, 0 usable" and "no routes at all" are
         // different problems and the operator has to tell them apart.
         let (routable_routes, total_routes) = store.remote_route_counts(&node.node_id)?;
+        let advertisement_summary = store.remote_advertisement_summary(&node.node_id)?;
         entries.push(json!({
             "node": node,
             "endpoints": endpoints,
@@ -127,6 +128,7 @@ pub async fn get_nodes(
             "paired": store.credential_for(&node.node_id)?.is_some(),
             "routable_routes": routable_routes,
             "total_routes": total_routes,
+            "advertisement_summary": advertisement_summary,
         }));
     }
     let route_groups = store
@@ -530,6 +532,14 @@ pub async fn probe_node(
     let mut paths = Vec::new();
     for endpoint in endpoints.into_iter().filter(|e| e.enabled) {
         paths.push(probe_endpoint(&client, endpoint, config.clone()).await);
+    }
+
+    {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        for path in &paths {
+            store.upsert_path_health(&node_id, &path.endpoint, &path.health)?;
+        }
     }
 
     let bitrate = payload.bitrate_bps.unwrap_or(20_000_000);

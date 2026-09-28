@@ -17,6 +17,7 @@
 //! - **The end-to-end budget is shared.** Reconnects spend from the same
 //!   `RequestContext.remaining_ms`; a hop never restarts a full timeout.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +32,8 @@ use crate::tuner::EffectiveClaim;
 use super::frame::{FrameFlags, NodeTsFrame, NODE_TS_HEADER_LEN};
 use super::identity::NodeIdentity;
 use super::store::NodeStore;
+use super::route::{rank_remote_routes, RemoteRouteCandidate};
+use super::path::{score_path, PathHealth, PathPolicy, TransportPath};
 use super::transport::{LeaseStreamError, NodeTransportClient, OpenLeaseReply, OpenLeaseRequest};
 use super::types::{EndpointKind, LogicalMuxId, NodeEndpoint, RequestContext};
 
@@ -160,26 +163,55 @@ impl RemoteMuxStream {
                 .remote_routes_for(mux)
                 .map_err(|e| ConsumeError::Transport(e.to_string()))?;
 
-            // One entry per node, keeping the route ordering the store applied.
-            let mut peers: Vec<(super::types::NodeId, Vec<NodeEndpoint>)> = Vec::new();
-            for route in routes {
-                if peers.iter().any(|(id, _)| id == &route.node_id) {
-                    continue;
-                }
+            let mut peer_data: HashMap<super::types::NodeId, (Vec<NodeEndpoint>, HashMap<String, PathHealth>)> = HashMap::new();
+            for route in &routes {
                 let Ok(Some(_credential)) = store.credential_for(&route.node_id) else {
                     continue;
                 };
                 let endpoints = store.endpoints(&route.node_id).unwrap_or_default();
-                peers.push((route.node_id, endpoints));
+                let health = endpoints
+                    .iter()
+                    .filter_map(|endpoint| {
+                        store
+                            .path_health(&route.node_id, endpoint)
+                            .ok()
+                            .flatten()
+                            .map(|health| (endpoint.address.clone(), health))
+                    })
+                    .collect();
+                peer_data.entry(route.node_id.clone()).or_insert((endpoints, health));
             }
-            peers
+            let mut ranked: Vec<RemoteRouteCandidate> = routes
+                .into_iter()
+                .filter(|route| peer_data.contains_key(&route.node_id))
+                .map(|route| {
+                    let (endpoints, health) = peer_data.get(&route.node_id).expect("peer data");
+                    RemoteRouteCandidate {
+                        transport_quality: best_transport_quality(endpoints, health, class),
+                        route,
+                    }
+                })
+                .collect();
+            rank_remote_routes(&mut ranked, claim);
+            let mut seen = HashSet::new();
+            ranked
+                .into_iter()
+                .filter_map(|candidate| {
+                    seen.insert(candidate.route.node_id.clone()).then(|| {
+                        let (endpoints, health) = peer_data
+                            .get(&candidate.route.node_id)
+                            .expect("peer data");
+                        (candidate.route.node_id, endpoints.clone(), health.clone())
+                    })
+                })
+                .collect::<Vec<_>>()
         };
         if peers.is_empty() {
             return Err(ConsumeError::NoPath);
         }
 
         let mut last_error = None;
-        for (node_id, endpoints) in peers {
+        for (node_id, endpoints, health) in peers {
             let credential = {
                 let db = database.lock().await;
                 let store =
@@ -198,7 +230,7 @@ impl RemoteMuxStream {
                 }
             };
 
-            for endpoint in usable_endpoints(&endpoints, class) {
+            for endpoint in usable_endpoints_with_health(&endpoints, &health, class) {
                 let spent_ms = started.elapsed().as_millis() as u64;
                 if spent_ms >= budget_ms {
                     return Err(last_error.unwrap_or(ConsumeError::NoPath));
@@ -217,16 +249,32 @@ impl RemoteMuxStream {
                     max_hops: 3,
                 };
 
-                match Self::open(
-                    Arc::clone(&client),
-                    endpoint.address.clone(),
-                    context,
-                    mux,
-                    sid,
-                    spent_ms,
+                // Only the overall search budget bounds an attempt. A lease
+                // open includes the peer's tune and reader start (seconds on a
+                // cold tuner, far longer for 4K), so a short per-attempt cap
+                // failed every cold start and orphaned the peer's lease. Fast
+                // refusals (409) return at once, and an unreachable peer is
+                // bounded by the client's connect timeout, so ordering (not a
+                // per-attempt cap) is what keeps the search fast.
+                let attempt_budget =
+                    Duration::from_millis(budget_ms.saturating_sub(spent_ms));
+                let open = tokio::time::timeout(
+                    attempt_budget,
+                    Self::open(
+                        Arc::clone(&client),
+                        endpoint.address.clone(),
+                        context,
+                        mux,
+                        sid,
+                        spent_ms,
+                    ),
                 )
-                .await
-                {
+                .await;
+                let result = match open {
+                    Ok(result) => result,
+                    Err(_) => Err(ConsumeError::Transport("remote lease attempt timed out".into())),
+                };
+                match result {
                     Ok(stream) => {
                         log::info!(
                             "[node] opened remote {:?} lease for NID=0x{:04X} TSID=0x{:04X} on {} via {}",
@@ -505,13 +553,9 @@ async fn pump_once(
     }
 }
 
-/// Endpoints worth trying for `class`, best first.
-///
-/// This is a static ordering by endpoint *kind*, not a measured one: probing
-/// costs a round trip per path and this runs on the request path. Measured
-/// scoring (`node::path::score_path`) is applied by the dashboard's explicit
-/// probe, and will move here once `node_path_health` is populated
-/// continuously.
+/// Endpoints worth trying for `class`, best first. Stored probe health breaks
+/// ties between reception candidates and keeps stale/unknown paths usable as a
+/// fallback.
 ///
 /// Two rules that are not just preference:
 /// - RECORD only ever uses endpoints the operator marked `record_allowed`.
@@ -520,6 +564,7 @@ async fn pump_once(
 /// - RECORD refuses `CloudflarePublic` outright: a general-purpose HTTP proxy
 ///   is a bootstrap and fallback path, not a sustained recording path
 ///   (`docs/DISTRIBUTED_TUNER_FABRIC.md` §4).
+#[cfg(test)]
 fn usable_endpoints(endpoints: &[NodeEndpoint], class: StreamClass) -> Vec<&NodeEndpoint> {
     let mut usable: Vec<&NodeEndpoint> = endpoints
         .iter()
@@ -531,6 +576,66 @@ fn usable_endpoints(endpoints: &[NodeEndpoint], class: StreamClass) -> Vec<&Node
         .collect();
     usable.sort_by_key(|e| (kind_rank(e.kind), -e.user_priority));
     usable
+}
+
+fn usable_endpoints_with_health<'a>(
+    endpoints: &'a [NodeEndpoint],
+    health: &HashMap<String, PathHealth>,
+    class: StreamClass,
+) -> Vec<&'a NodeEndpoint> {
+    let mut usable: Vec<&NodeEndpoint> = endpoints
+        .iter()
+        .filter(|e| e.enabled)
+        .filter(|e| match class {
+            StreamClass::Record => e.record_allowed && e.kind != EndpointKind::CloudflarePublic,
+            _ => true,
+        })
+        .collect();
+    usable.sort_by(|a, b| {
+        let score = |endpoint: &NodeEndpoint| {
+            score_path(
+                &TransportPath {
+                    id: endpoint.address.clone(),
+                    endpoint: endpoint.clone(),
+                    health: health.get(&endpoint.address).cloned().unwrap_or_default(),
+                },
+                class,
+                0,
+                PathPolicy::default(),
+            )
+            .score
+        };
+        score(b)
+            .total_cmp(&score(a))
+            .then_with(|| kind_rank(a.kind).cmp(&kind_rank(b.kind)))
+            .then_with(|| b.user_priority.cmp(&a.user_priority))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    usable
+}
+
+fn best_transport_quality(
+    endpoints: &[NodeEndpoint],
+    health: &HashMap<String, PathHealth>,
+    class: StreamClass,
+) -> f64 {
+    usable_endpoints_with_health(endpoints, health, class)
+        .into_iter()
+        .map(|endpoint| {
+            score_path(
+                &TransportPath {
+                    id: endpoint.address.clone(),
+                    endpoint: endpoint.clone(),
+                    health: health.get(&endpoint.address).cloned().unwrap_or_default(),
+                },
+                class,
+                0,
+                PathPolicy::default(),
+            )
+            .score
+        })
+        .max_by(f64::total_cmp)
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Lower is preferred. LAN beats an overlay, an overlay beats the open

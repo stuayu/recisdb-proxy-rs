@@ -44,7 +44,7 @@ pub use qualification::{
     QualificationResult, ReceptionObservation, RouteQualifier,
 };
 pub use replay::{ReplayBudget, ReplayBuffer, ReplayError};
-pub use route::{select_route, ReceptionCandidate, RouteDecision};
+pub use route::{capacity_class, rank_remote_routes, RemoteRouteCandidate, RouteCapacityClass};
 pub use serve::{LocalMuxServer, RemoteEpgMetadataOutcome, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteRoute};
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};

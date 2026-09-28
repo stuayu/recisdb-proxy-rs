@@ -14,6 +14,7 @@
 //! A BS mux received over CATV stays logically BS. Collapsing the two is what
 //! makes a fabric pick a bad route and call it the right one.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use recisdb_protocol::BandType;
@@ -21,6 +22,8 @@ use recisdb_protocol::BandType;
 use crate::database::Database;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::TunerPool;
+use crate::tuner::channel_key::ChannelKeySpec;
+use crate::tuner::shared::ReaderState;
 
 use super::store::NodeStore;
 use super::types::{
@@ -36,6 +39,52 @@ struct LocalRoute {
     bon_space: u32,
     bon_channel: u32,
     max_instances: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DriverOccupancy {
+    occupied: u32,
+    background: u32,
+    locked: u32,
+    lowest_evictable_priority: Option<i32>,
+    running_routes: HashSet<(u32, u32)>,
+}
+
+async fn occupancy_by_driver(tuner_pool: &Arc<TunerPool>) -> HashMap<String, DriverOccupancy> {
+    let mut out: HashMap<String, DriverOccupancy> = HashMap::new();
+    for key in tuner_pool.keys().await {
+        let Some(tuner) = tuner_pool.get(&key).await else {
+            continue;
+        };
+        if !tuner.occupies_slot() {
+            continue;
+        }
+        let entry = out.entry(key.tuner_path.clone()).or_default();
+        entry.occupied = entry.occupied.saturating_add(1);
+        let route = match key.channel {
+            ChannelKeySpec::SpaceChannel { space, channel } => Some((space, channel)),
+            ChannelKeySpec::Simple(channel) => Some((0, channel as u32)),
+        };
+        if tuner.state() == ReaderState::Running {
+            if let Some(route) = route {
+                entry.running_routes.insert(route);
+            }
+        }
+        if tuner.is_background_only() {
+            entry.background = entry.background.saturating_add(1);
+            continue;
+        }
+        if tuner.locked_claim().is_some() {
+            entry.locked = entry.locked.saturating_add(1);
+        } else if let Some(priority) = tuner.incumbent_claim().map(|claim| claim.priority) {
+            entry.lowest_evictable_priority = Some(
+                entry
+                    .lowest_evictable_priority
+                    .map_or(priority, |current| current.min(priority)),
+            );
+        }
+    }
+    out
 }
 
 /// Enumerate the distinct (mux, driver, tuning) triples this node can receive.
@@ -147,15 +196,19 @@ pub async fn build_local_advertisements(
     };
 
     let now = chrono::Utc::now().timestamp_millis();
+    let occupancy = occupancy_by_driver(tuner_pool).await;
     let mut out = Vec::with_capacity(routes.len());
     for route in routes {
-        let running = crate::server::session_capacity::count_client_held_instances_on_driver(
-            tuner_pool,
-            &route.dll_path,
-        )
-        .await;
         let total_slots = route.max_instances.max(0) as u32;
-        let available_slots = total_slots.saturating_sub(running.max(0) as u32);
+        let driver = occupancy.get(&route.dll_path).cloned().unwrap_or_default();
+        let free_slots = total_slots.saturating_sub(driver.occupied);
+        // Keep the legacy meaning: free slots plus slots held only by
+        // background work. Reserved/starting entries remain unavailable.
+        let available_slots = total_slots
+            .saturating_sub(driver.occupied.saturating_sub(driver.background));
+        let running = driver
+            .running_routes
+            .contains(&(route.bon_space, route.bon_channel));
 
         out.push(ReceptionRouteAdvertisement {
             route_id: route_id(&route.dll_path, route.bon_space, route.bon_channel),
@@ -169,6 +222,12 @@ pub async fn build_local_advertisements(
             // Preferred/Degraded is `node::qualification`'s job once real
             // observations exist.
             state: ReceptionRouteState::Usable,
+            running,
+            free_slots,
+            background_slots: driver.background,
+            lowest_client_priority: driver.lowest_evictable_priority,
+            locked_slots: driver.locked,
+            capacity_info_known: true,
             available_slots,
             total_slots,
             // Nothing measures tune latency per route yet; 0 means "unknown",

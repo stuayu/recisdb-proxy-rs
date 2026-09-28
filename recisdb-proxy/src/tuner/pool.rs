@@ -369,6 +369,7 @@ pub struct TunerPool {
     open_backoff: Arc<OpenFailureBackoff>,
     reject_gate: Arc<RejectGate>,
     lock_warn_gate: Arc<RejectGate>,
+    route_change_notify: Arc<tokio::sync::Notify>,
 }
 
 struct IdleHandle {
@@ -395,7 +396,12 @@ impl TunerPool {
             open_backoff: Arc::new(OpenFailureBackoff::new()),
             reject_gate: Arc::new(RejectGate::new()),
             lock_warn_gate: Arc::new(RejectGate::new()),
+            route_change_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    pub fn route_change_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.route_change_notify)
     }
 
     /// Per-DLL open-failure cooldown/log-throttle tracker (see
@@ -837,12 +843,17 @@ impl TunerPool {
         // retrieve it again via `SharedTuner::take_slot_permit` and pass it to
         // `start_bondriver_reader`/`WarmTunerHandle::activate`, which is what
         // makes starting a reader without holding a permit a type error.
-        let shared = SharedTuner::new(key.clone(), bondriver_version);
+        let shared = SharedTuner::new_with_route_change_notify(
+            key.clone(),
+            bondriver_version,
+            Some(Arc::clone(&self.route_change_notify)),
+        );
         shared.set_state(crate::tuner::shared::ReaderState::Reserved);
         shared.set_slot_permit(permit);
         info!("Created new shared tuner for {:?}", key);
 
         tuners.insert(key, Arc::clone(&shared));
+        self.route_change_notify.notify_one();
         Ok(shared)
     }
 
@@ -852,6 +863,7 @@ impl TunerPool {
         let removed = tuners.remove(key);
         if removed.is_some() {
             info!("Removed tuner {:?} from pool", key);
+            self.route_change_notify.notify_one();
         }
         removed
     }

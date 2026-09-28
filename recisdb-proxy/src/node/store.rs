@@ -9,6 +9,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{NodeCredential, NodeIdentity, PairingCode};
+use super::path::PathHealth;
 use super::types::{
     DeliveryType, LogicalBroadcastType, LogicalMuxId, NodeEndpoint, NodeId,
     ReceptionRouteAdvertisement, ReceptionRouteState,
@@ -37,9 +38,26 @@ pub struct StoredRemoteRoute {
     pub ingress_delivery: DeliveryType,
     pub ultimate_delivery: DeliveryType,
     pub state: ReceptionRouteState,
+    pub configured_priority: i32,
     pub source_quality: f64,
     pub confidence: f64,
+    pub running: bool,
+    pub available_slots: u32,
+    pub total_slots: u32,
+    pub free_slots: u32,
+    pub background_slots: u32,
+    pub lowest_client_priority: Option<i32>,
+    pub locked_slots: u32,
+    pub capacity_info_known: bool,
     pub last_seen_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAdvertisementSummary {
+    pub running_muxes: u32,
+    pub free_slots: u32,
+    pub background_slots: u32,
+    pub locked_slots: u32,
 }
 
 /// An outstanding pairing code, as far as the dashboard may know about it.
@@ -148,6 +166,14 @@ impl<'a> NodeStore<'a> {
                 configured_priority INTEGER NOT NULL DEFAULT 0,
                 source_quality REAL NOT NULL DEFAULT 0.0,
                 confidence REAL NOT NULL DEFAULT 0.0,
+                running INTEGER NOT NULL DEFAULT 0,
+                available_slots INTEGER NOT NULL DEFAULT 0,
+                total_slots INTEGER NOT NULL DEFAULT 0,
+                free_slots INTEGER NOT NULL DEFAULT 0,
+                background_slots INTEGER NOT NULL DEFAULT 0,
+                lowest_client_priority INTEGER,
+                locked_slots INTEGER NOT NULL DEFAULT 0,
+                capacity_info_known INTEGER NOT NULL DEFAULT 0,
                 last_seen_unix_ms INTEGER,
                 last_qualified_unix_ms INTEGER,
                 FOREIGN KEY(mux_id) REFERENCES logical_muxes(id) ON DELETE CASCADE,
@@ -181,6 +207,7 @@ impl<'a> NodeStore<'a> {
                 node_id TEXT NOT NULL,
                 endpoint_id INTEGER NOT NULL,
                 state TEXT NOT NULL,
+                connect_success_rate REAL,
                 rtt_p50_ms REAL,
                 rtt_p95_ms REAL,
                 throughput_down_p10_bps INTEGER,
@@ -211,6 +238,24 @@ impl<'a> NodeStore<'a> {
             CREATE INDEX IF NOT EXISTS idx_route_observations_route_time ON route_observations(route_id, observed_at_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_node_endpoints_node ON node_endpoints(node_id);
             "#,
+        )?;
+        for (name, definition) in [
+            ("running", "INTEGER NOT NULL DEFAULT 0"),
+            ("available_slots", "INTEGER NOT NULL DEFAULT 0"),
+            ("total_slots", "INTEGER NOT NULL DEFAULT 0"),
+            ("free_slots", "INTEGER NOT NULL DEFAULT 0"),
+            ("background_slots", "INTEGER NOT NULL DEFAULT 0"),
+            ("lowest_client_priority", "INTEGER"),
+            ("locked_slots", "INTEGER NOT NULL DEFAULT 0"),
+            ("capacity_info_known", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            ensure_column(self.db, "reception_routes", name, definition)?;
+        }
+        ensure_column(
+            self.db,
+            "node_path_health",
+            "connect_success_rate",
+            "REAL",
         )?;
         Ok(())
     }
@@ -520,8 +565,12 @@ impl<'a> NodeStore<'a> {
                 conn.execute(
                     "INSERT OR REPLACE INTO reception_routes (
                         route_id, mux_id, node_id, ingress_delivery, ultimate_delivery,
-                        routing_state, source_quality, confidence, last_seen_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        routing_state, configured_priority, source_quality, confidence,
+                        running, available_slots, total_slots, free_slots, background_slots,
+                        lowest_client_priority, locked_slots, capacity_info_known,
+                        last_seen_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                               ?13, ?14, ?15, ?16, ?17, ?18)",
                     params![
                         // Namespaced by peer: two nodes can legitimately use
                         // the same local route id (same DLL path/tuning).
@@ -531,8 +580,17 @@ impl<'a> NodeStore<'a> {
                         enum_str(advertisement.ingress_delivery),
                         enum_str(advertisement.ultimate_delivery),
                         enum_str(advertisement.state),
+                        0,
                         advertisement.source_quality,
                         advertisement.confidence,
+                        advertisement.running as i64,
+                        advertisement.available_slots as i64,
+                        advertisement.total_slots as i64,
+                        advertisement.free_slots as i64,
+                        advertisement.background_slots as i64,
+                        advertisement.lowest_client_priority,
+                        advertisement.locked_slots as i64,
+                        advertisement.capacity_info_known as i64,
                         advertisement.observed_at_unix_ms,
                     ],
                 )?;
@@ -560,7 +618,10 @@ impl<'a> NodeStore<'a> {
         let conn = self.db.connection();
         let mut stmt = conn.prepare(
             "SELECT r.route_id, r.node_id, r.ingress_delivery, r.ultimate_delivery,
-                    r.routing_state, r.source_quality, r.confidence, r.last_seen_unix_ms,
+                    r.routing_state, r.configured_priority, r.source_quality, r.confidence,
+                    r.running, r.available_slots, r.total_slots, r.free_slots,
+                    r.background_slots, r.lowest_client_priority, r.locked_slots,
+                    r.capacity_info_known, r.last_seen_unix_ms,
                     m.logical_broadcast
              FROM reception_routes r
              JOIN logical_muxes m ON r.mux_id = m.id
@@ -575,7 +636,7 @@ impl<'a> NodeStore<'a> {
                     route_id: row.get(0)?,
                     node_id: NodeId::new(node_id).unwrap_or_else(|_| NodeId::random()),
                     mux,
-                    logical_broadcast: parse_enum(&row.get::<_, String>(8)?)
+                    logical_broadcast: parse_enum(&row.get::<_, String>(17)?)
                         .unwrap_or(LogicalBroadcastType::Unknown),
                     ingress_delivery: parse_enum(&row.get::<_, String>(2)?)
                         .unwrap_or(DeliveryType::Unknown),
@@ -583,9 +644,18 @@ impl<'a> NodeStore<'a> {
                         .unwrap_or(DeliveryType::Unknown),
                     state: parse_enum(&row.get::<_, String>(4)?)
                         .unwrap_or(ReceptionRouteState::Discovered),
-                    source_quality: row.get(5)?,
-                    confidence: row.get(6)?,
-                    last_seen_unix_ms: row.get(7)?,
+                    configured_priority: row.get(5)?,
+                    source_quality: row.get(6)?,
+                    confidence: row.get(7)?,
+                    running: row.get::<_, i64>(8)? != 0,
+                    available_slots: row.get::<_, i64>(9)?.max(0) as u32,
+                    total_slots: row.get::<_, i64>(10)?.max(0) as u32,
+                    free_slots: row.get::<_, i64>(11)?.max(0) as u32,
+                    background_slots: row.get::<_, i64>(12)?.max(0) as u32,
+                    lowest_client_priority: row.get(13)?,
+                    locked_slots: row.get::<_, i64>(14)?.max(0) as u32,
+                    capacity_info_known: row.get::<_, i64>(15)? != 0,
+                    last_seen_unix_ms: row.get(16)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -609,6 +679,142 @@ impl<'a> NodeStore<'a> {
             |row| row.get(0),
         )?;
         Ok((routable, total))
+    }
+
+    pub fn remote_advertisement_summary(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RemoteAdvertisementSummary> {
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT nid, tsid, running, free_slots, background_slots, locked_slots
+             FROM reception_routes r
+             JOIN logical_muxes m ON r.mux_id = m.id
+             WHERE r.node_id = ?1",
+        )?;
+        let mut seen_muxes = std::collections::HashSet::new();
+        let mut summary = RemoteAdvertisementSummary::default();
+        for row in stmt.query_map(params![node_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u16,
+                row.get::<_, i64>(1)? as u16,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)?.max(0) as u32,
+                row.get::<_, i64>(4)?.max(0) as u32,
+                row.get::<_, i64>(5)?.max(0) as u32,
+            ))
+        })? {
+            let (nid, tsid, running, free, background, locked) = row?;
+            if running && seen_muxes.insert((nid, tsid)) {
+                summary.running_muxes = summary.running_muxes.saturating_add(1);
+            }
+            summary.free_slots = summary.free_slots.saturating_add(free);
+            summary.background_slots = summary.background_slots.saturating_add(background);
+            summary.locked_slots = summary.locked_slots.saturating_add(locked);
+        }
+        Ok(summary)
+    }
+
+    pub fn path_health(
+        &self,
+        node_id: &NodeId,
+        endpoint: &NodeEndpoint,
+    ) -> Result<Option<PathHealth>> {
+        let endpoint_json = serde_json::to_string(endpoint)
+            .map_err(|e| DatabaseError::MigrationFailed(e.to_string()))?;
+        let row = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT h.state, h.connect_success_rate, h.rtt_p50_ms, h.rtt_p95_ms,
+                        h.throughput_down_p10_bps, h.throughput_down_ewma_bps,
+                        h.jitter_ms, h.stall_rate, h.reconnect_rate, h.confidence,
+                        h.tailscale_path, h.measured_at_unix_ms
+                 FROM node_path_health h
+                 JOIN node_endpoints e ON e.id = h.endpoint_id
+                 WHERE h.node_id = ?1 AND e.endpoint_json = ?2",
+                params![node_id.as_str(), endpoint_json],
+                |row| {
+                    Ok(PathHealth {
+                        state: parse_enum(&row.get::<_, String>(0)?)
+                            .unwrap_or(super::path::PathState::Unknown),
+                        connect_success_rate: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                        rtt_p50_ms: row.get::<_, Option<f64>>(2)?.unwrap_or(f64::INFINITY),
+                        rtt_p95_ms: row.get::<_, Option<f64>>(3)?.unwrap_or(f64::INFINITY),
+                        throughput_down_p10_bps: row
+                            .get::<_, Option<i64>>(4)?
+                            .unwrap_or(0)
+                            .max(0) as u64,
+                        throughput_down_ewma_bps: row
+                            .get::<_, Option<i64>>(5)?
+                            .unwrap_or(0)
+                            .max(0) as u64,
+                        jitter_ms: row.get::<_, Option<f64>>(6)?.unwrap_or(f64::INFINITY),
+                        stall_rate: row.get::<_, Option<f64>>(7)?.unwrap_or(1.0),
+                        reconnect_rate: row.get::<_, Option<f64>>(8)?.unwrap_or(1.0),
+                        confidence: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                        tailscale_path: parse_enum(&row.get::<_, Option<String>>(10)?.unwrap_or_default()),
+                        measured_at_unix_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn upsert_path_health(
+        &self,
+        node_id: &NodeId,
+        endpoint: &NodeEndpoint,
+        health: &PathHealth,
+    ) -> Result<()> {
+        let endpoint_json = serde_json::to_string(endpoint)
+            .map_err(|e| DatabaseError::MigrationFailed(e.to_string()))?;
+        let Some(endpoint_id) = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT id FROM node_endpoints WHERE node_id = ?1 AND endpoint_json = ?2",
+                params![node_id.as_str(), endpoint_json],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        self.db.connection().execute(
+            "INSERT INTO node_path_health (
+                node_id, endpoint_id, state, connect_success_rate, rtt_p50_ms, rtt_p95_ms,
+                throughput_down_p10_bps, throughput_down_ewma_bps, jitter_ms, stall_rate,
+                reconnect_rate, confidence, tailscale_path, measured_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(node_id, endpoint_id) DO UPDATE SET
+                state=excluded.state, connect_success_rate=excluded.connect_success_rate,
+                rtt_p50_ms=excluded.rtt_p50_ms, rtt_p95_ms=excluded.rtt_p95_ms,
+                throughput_down_p10_bps=excluded.throughput_down_p10_bps,
+                throughput_down_ewma_bps=excluded.throughput_down_ewma_bps,
+                jitter_ms=excluded.jitter_ms, stall_rate=excluded.stall_rate,
+                reconnect_rate=excluded.reconnect_rate, confidence=excluded.confidence,
+                tailscale_path=excluded.tailscale_path,
+                measured_at_unix_ms=excluded.measured_at_unix_ms",
+            params![
+                node_id.as_str(),
+                endpoint_id,
+                enum_str(health.state),
+                health.connect_success_rate,
+                health.rtt_p50_ms,
+                health.rtt_p95_ms,
+                health.throughput_down_p10_bps as i64,
+                health.throughput_down_ewma_bps as i64,
+                health.jitter_ms,
+                health.stall_rate,
+                health.reconnect_rate,
+                health.confidence,
+                health.tailscale_path.map(enum_str),
+                health.measured_at_unix_ms,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Record a pairing code this node just issued. Only its digest is kept.
@@ -926,6 +1132,12 @@ mod tests {
             ultimate_delivery: DeliveryType::IsdbSDirect,
             path: Vec::new(),
             state,
+            running: false,
+            free_slots: 1,
+            background_slots: 0,
+            lowest_client_priority: None,
+            locked_slots: 0,
+            capacity_info_known: true,
             available_slots: 1,
             total_slots: 2,
             predicted_ready_ms: 0,
@@ -1135,4 +1347,26 @@ fn enum_str<T: Serialize>(value: T) -> String {
 
 fn parse_enum<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+}
+
+fn ensure_column(
+    db: &Database,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists = db
+        .connection()
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == column);
+    if !exists {
+        db.connection().execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }

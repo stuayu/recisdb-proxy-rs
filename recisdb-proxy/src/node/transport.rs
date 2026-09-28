@@ -24,7 +24,7 @@ use axum::{Json, Router};
 use futures::stream::{self, StreamExt};
 use recisdb_protocol::StreamClass;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use super::frame::{FrameFlags, NodeTsFrame};
 use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
@@ -125,6 +125,12 @@ pub struct OpenLeaseRequest {
     /// from `context.remaining_ms`; a hop never restarts a full timeout.
     #[serde(default)]
     pub spent_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RouteChangedNotice {
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +278,7 @@ pub struct NodeTransportState {
     /// absent (unit tests), `/node/v3/pair` answers 503 instead of pairing
     /// against nothing.
     pub database: Option<DatabaseHandle>,
+    pub route_sync_notify: Arc<Notify>,
     pairing_attempts: Arc<std::sync::Mutex<PairingAttempts>>,
 }
 
@@ -288,6 +295,7 @@ impl NodeTransportState {
             leases,
             mux_server: None,
             database: None,
+            route_sync_notify: Arc::new(Notify::new()),
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttempts::default())),
         }
     }
@@ -303,6 +311,12 @@ impl NodeTransportState {
     /// Update the display name advertised by this process immediately.
     pub async fn set_display_name(&self, display_name: String) {
         *self.display_name.write().await = display_name;
+    }
+
+    pub fn request_route_sync(&self) {
+        // notify_one stores a permit: a change that arrives while the sync
+        // loop is busy is not lost (notify_waiters would drop it).
+        self.route_sync_notify.notify_one();
     }
 
     /// Attach the database so this node can accept pairing requests.
@@ -390,6 +404,7 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/peer", delete(unpair_peer))
         .route("/node/v3/hello", get(hello))
         .route("/node/v3/routes", get(routes))
+        .route("/node/v3/routes/changed", post(routes_changed))
         .route("/node/v3/probe/ping", get(probe_ping))
         .route("/node/v3/probe/download", get(probe_download))
         .route("/node/v3/lease", post(open_lease))
@@ -550,6 +565,18 @@ async fn routes(State(state): State<Arc<NodeTransportState>>, headers: HeaderMap
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(state.routes.read().await.clone()).into_response()
+}
+
+async fn routes_changed(
+    State(state): State<Arc<NodeTransportState>>,
+    headers: HeaderMap,
+    Json(_notice): Json<RouteChangedNotice>,
+) -> Response {
+    if state.authorize(&headers).await.is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.request_route_sync();
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn probe_ping(
@@ -871,14 +898,15 @@ pub struct NodeTransportClient {
 }
 
 /// TCP connect bound for node-to-node requests (see `NodeTransportClient::new`).
-const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl NodeTransportClient {
     pub fn new(identity: NodeId, credential: NodeCredential) -> Result<Self, reqwest::Error> {
         // Without a connect timeout an unreachable endpoint (e.g. an IPv6
         // Tailscale address on a peer listening on 0.0.0.0) blocks each probe
         // request for the OS SYN timeout (~21s on Windows); a 5-sample probe
-        // then took ~100s. Streams are long-lived, so only connect is bounded.
+        // then took ~100s. Streams are long-lived, so only connect is bounded;
+        // lease attempts also have the request-side end-to-end budget.
         let https = reqwest::Client::builder()
             .connect_timeout(NODE_CONNECT_TIMEOUT)
             .tcp_keepalive(std::time::Duration::from_secs(30))
@@ -1088,6 +1116,22 @@ impl NodeTransportClient {
         .error_for_status()?
         .json()
         .await
+    }
+
+    pub async fn notify_routes_changed(
+        &self,
+        base: &str,
+        notice: &RouteChangedNotice,
+    ) -> Result<(), reqwest::Error> {
+        self.request(
+            reqwest::Method::POST,
+            format!("{}/node/v3/routes/changed", base.trim_end_matches('/')),
+        )
+        .json(notice)
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
     }
 
     pub async fn ping(&self, base: &str, nonce: &str) -> Result<ProbeReply, reqwest::Error> {

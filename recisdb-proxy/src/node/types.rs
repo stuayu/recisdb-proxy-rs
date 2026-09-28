@@ -244,6 +244,28 @@ pub struct ReceptionRouteAdvertisement {
     #[serde(default)]
     pub path: Vec<NodeId>,
     pub state: ReceptionRouteState,
+    /// True when this exact physical route is currently carrying `mux`.
+    /// Older peers omit it and deserialize it as false.
+    #[serde(default)]
+    pub running: bool,
+    /// Slots with no occupying reader. The remaining capacity fields explain
+    /// why a slot can be made available without a fresh reader.
+    #[serde(default)]
+    pub free_slots: u32,
+    /// Occupied only by background work that a client may evict.
+    #[serde(default)]
+    pub background_slots: u32,
+    /// Lowest non-locked client priority that can be evicted by a strictly
+    /// higher claim. None means no such slot is known.
+    #[serde(default)]
+    pub lowest_client_priority: Option<i32>,
+    /// Occupied slots protected by at least one exclusive claim.
+    #[serde(default)]
+    pub locked_slots: u32,
+    /// False means this advertisement came from an older peer and its live
+    /// capacity picture is unknown.
+    #[serde(default)]
+    pub capacity_info_known: bool,
     pub available_slots: u32,
     pub total_slots: u32,
     pub predicted_ready_ms: u64,
@@ -294,5 +316,56 @@ mod tests {
         let delivery = DeliveryType::CatvTsmf;
         assert_eq!(logical, LogicalBroadcastType::Bs);
         assert!(delivery.preference_tier() > DeliveryType::IsdbSDirect.preference_tier());
+    }
+
+    #[test]
+    fn route_capacity_fields_round_trip_and_old_ads_deserialize() {
+        let ad = ReceptionRouteAdvertisement {
+            route_id: "route".into(),
+            origin_node: NodeId::new("site-a").unwrap(),
+            mux: LogicalMuxId { nid: 1, tsid: 2 },
+            logical_broadcast: LogicalBroadcastType::Terrestrial,
+            ingress_delivery: DeliveryType::IsdbTDirect,
+            ultimate_delivery: DeliveryType::IsdbTDirect,
+            path: vec![],
+            state: ReceptionRouteState::Usable,
+            running: true,
+            free_slots: 1,
+            background_slots: 2,
+            lowest_client_priority: Some(4),
+            locked_slots: 1,
+            capacity_info_known: true,
+            available_slots: 3,
+            total_slots: 4,
+            predicted_ready_ms: 0,
+            source_quality: 0.5,
+            confidence: 0.5,
+            generation: 1,
+            observed_at_unix_ms: 0,
+        };
+        let json = serde_json::to_value(&ad).unwrap();
+        let decoded: ReceptionRouteAdvertisement = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.running, true);
+        assert_eq!(decoded.lowest_client_priority, Some(4));
+
+        let old = serde_json::json!({
+            "route_id": "legacy",
+            "origin_node": "site-b",
+            "mux": { "nid": 1, "tsid": 2 },
+            "logical_broadcast": "terrestrial",
+            "ingress_delivery": "isdb_t_direct",
+            "ultimate_delivery": "isdb_t_direct",
+            "state": "usable",
+            "available_slots": 1,
+            "total_slots": 1,
+            "predicted_ready_ms": 0,
+            "source_quality": 0.0,
+            "confidence": 0.0,
+            "generation": 1,
+            "observed_at_unix_ms": 0
+        });
+        let legacy: ReceptionRouteAdvertisement = serde_json::from_value(old).unwrap();
+        assert!(!legacy.capacity_info_known);
+        assert!(!legacy.running);
     }
 }

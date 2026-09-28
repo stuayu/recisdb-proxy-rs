@@ -297,6 +297,10 @@ impl Database {
             "036_guide_display_config",
             Database::migration_036_guide_display_config,
         ),
+        (
+            "037_node_route_capacity_advertisements",
+            Database::migration_037_node_route_capacity_advertisements,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -445,6 +449,44 @@ impl Database {
             );
             INSERT OR IGNORE INTO guide_display_config (id, default_region) VALUES (1, NULL);",
         )?;
+        Ok(())
+    }
+
+    /// Migration 037: retain live node-route capacity details when the node
+    /// tables already exist. Fresh node tables create these columns directly;
+    /// the guards keep pre-ledger databases idempotent.
+    fn migration_037_node_route_capacity_advertisements(&self) -> Result<()> {
+        let route_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='reception_routes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if route_table {
+            for (column, definition) in [
+                ("running", "INTEGER NOT NULL DEFAULT 0"),
+                ("available_slots", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_slots", "INTEGER NOT NULL DEFAULT 0"),
+                ("free_slots", "INTEGER NOT NULL DEFAULT 0"),
+                ("background_slots", "INTEGER NOT NULL DEFAULT 0"),
+                ("lowest_client_priority", "INTEGER"),
+                ("locked_slots", "INTEGER NOT NULL DEFAULT 0"),
+                ("capacity_info_known", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                self.add_column_if_not_exists("reception_routes", column, definition)?;
+            }
+        }
+        let health_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_path_health')",
+            [],
+            |row| row.get(0),
+        )?;
+        if health_table {
+            self.add_column_if_not_exists(
+                "node_path_health",
+                "connect_success_rate",
+                "REAL",
+            )?;
+        }
         Ok(())
     }
 

@@ -402,11 +402,20 @@ pub struct SharedTuner {
     /// handed to `start_bondriver_reader`/`WarmTunerHandle::activate`, which
     /// store it back here for the reader's lifetime.
     slot: std::sync::Mutex<Option<SlotPermit>>,
+    route_change_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl SharedTuner {
     /// Create a new shared tuner with the given key.
     pub fn new(key: ChannelKey, bondriver_version: u8) -> Arc<Self> {
+        Self::new_with_route_change_notify(key, bondriver_version, None)
+    }
+
+    pub(crate) fn new_with_route_change_notify(
+        key: ChannelKey,
+        bondriver_version: u8,
+        route_change_notify: Option<Arc<tokio::sync::Notify>>,
+    ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (channel_change_tx, _) = broadcast::channel(1); // Only need to notify once
         Arc::new(Self {
@@ -437,7 +446,14 @@ impl SharedTuner {
             packets_received: AtomicU64::new(0),
             mmt_status: std::sync::Mutex::new(None),
             slot: std::sync::Mutex::new(None),
+            route_change_notify,
         })
+    }
+
+    fn notify_route_change(&self) {
+        if let Some(notify) = &self.route_change_notify {
+            notify.notify_one();
+        }
     }
 
     pub fn epg_progress(&self) -> Arc<EpgProgress> {
@@ -651,6 +667,7 @@ impl SharedTuner {
             },
         );
         self.subscriber_count.fetch_add(1, Ordering::SeqCst);
+        self.notify_route_change();
         debug!(
             "New subscriber for {:?}, total: {}",
             self.key,
@@ -793,6 +810,7 @@ impl SharedTuner {
     /// Transition the reader lifecycle state and publish it to watchers.
     pub(crate) fn set_state(&self, state: ReaderState) {
         self.reader_state.store(state as u8, Ordering::Release);
+        self.notify_route_change();
         if state == ReaderState::Running {
             *self.running_since.lock().unwrap() = Some(std::time::Instant::now());
             self.last_data_at
@@ -2266,6 +2284,7 @@ impl Drop for TunerSubscription {
         // increment in `subscribe()`, so underflow cannot happen here by
         // construction — no `fetch_update`/wraparound guard needed.
         let prev = self.tuner.subscriber_count.fetch_sub(1, Ordering::SeqCst);
+        self.tuner.notify_route_change();
         debug!(
             "Subscriber removed from {:?}, remaining: {}",
             self.tuner.key,
@@ -2390,6 +2409,27 @@ fn test_startup_config() -> ReaderStartupConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn route_change_notifier_fires_for_subscription_and_reader_state() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let tuner = SharedTuner::new_with_route_change_notify(
+            ChannelKey::simple("test-driver", 1),
+            1,
+            Some(Arc::clone(&notify)),
+        );
+        let subscription_changed = notify.notified();
+        let _subscription = tuner.subscribe_with_claim(1, false);
+        tokio::time::timeout(Duration::from_secs(1), subscription_changed)
+            .await
+            .expect("subscription changes must wake route advertisement refresh");
+
+        let state_changed = notify.notified();
+        tuner.set_state(ReaderState::Starting);
+        tokio::time::timeout(Duration::from_secs(1), state_changed)
+            .await
+            .expect("reader state changes must wake route advertisement refresh");
+    }
 
     #[test]
     fn typed_claim_preserves_competing_usage() {

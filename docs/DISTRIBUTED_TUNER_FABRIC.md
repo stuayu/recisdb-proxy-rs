@@ -326,8 +326,11 @@ sessions; the serving side remains local-only by construction.
 
 ### 4.3 Route advertisement sync (`GET /node/v3/routes`)
 
-`node/advertise.rs` builds what this node offers; `node/sync.rs` exchanges it
-on a 60-second tick.
+`node/advertise.rs` builds what this node offers. `node/sync.rs` keeps the
+60-second tick as a recovery path, but occupancy changes also refresh the local
+advertisement immediately and send an authenticated, best-effort change notice
+to paired peers. A notice only wakes the receiver to pull `GET /routes`; it does
+not carry route data and an older peer simply continues with the periodic tick.
 
 Outbound, one advertisement per (mux, driver, tuning) triple from the enabled
 `channels` rows. Three fields that are easy to get wrong:
@@ -339,7 +342,12 @@ Outbound, one advertisement per (mux, driver, tuning) triple from the enabled
   family. A BS mux arriving over CATV is `logical_broadcast: bs` with a CATV
   delivery, never "a CATV channel".
 - `available_slots = 0` is still advertised. "Busy" and "cannot receive this"
-  are different answers, and a peer needs to tell them apart.
+  are different answers, and a peer needs to tell them apart. The field keeps
+  its legacy meaning: truly free slots plus slots held only by background work.
+  New peers also receive `running`, `free_slots`, `background_slots`,
+  `lowest_client_priority`, `locked_slots`, and `capacity_info_known`. The last
+  field distinguishes a real zero from an old advertisement that omitted the
+  live-capacity fields.
 
 Inbound, each peer's list replaces that peer's rows in `reception_routes`
 wholesale — a route it stopped advertising must stop being a candidate. Route
@@ -354,10 +362,14 @@ later instead of being deleted and rediscovered forever (§2).
 The stored picture is a **cache, not an authority**: a peer can still refuse
 the lease, and `available_slots` may already be stale when it is read.
 
-`available_slots` in an advertisement does not count readers held only by
-background work (EPG active scan / background scan): a viewer or a peer lease
-evicts those (`EntryState::background_only`), so counting them made a peer skip
-a node for as long as it was scanning.
+`available_slots` in an advertisement includes readers held only by background
+work (EPG active scan / background scan): a viewer or a peer lease evicts those
+(`EntryState::background_only`). `free_slots` counts slots with no occupying
+reader; `background_slots` counts occupied background-only readers;
+`lowest_client_priority` ignores locked slots; and `locked_slots` counts slots
+with an exclusive claim. All added wire fields use serde defaults. An older
+peer is treated as capacity-unknown and tried in the ordinary available tier,
+preserving compatibility while retaining the cached-route caveat.
 
 ### 4.4 Using a peer from HTTP/Mirakurun and BNDP paths
 
@@ -389,22 +401,37 @@ no local tuner could serve the request. A locally receivable channel is never
 sent over the network just because a peer also has it — the local path has no
 transport failure domain at all.
 
-Peer selection walks the stored advertisements (§4.3) node by node, and within
-a node walks endpoints in a static order: LAN, Tailscale, Cloudflare private,
-static, direct Internet, Cloudflare public. Two of those rules are not mere
-preference:
+Peer selection uses a pure requester-side policy (`node::route::rank_remote_routes`):
+
+1. the exact mux is already running on the advertised route;
+2. a truly free or background-only slot exists;
+3. a non-locked client slot has a lower priority than the requester's claim;
+4. the advertisement reports only locked or higher-priority occupied slots.
+   A legacy peer that omits the new fields is treated as tier 2 (ordinary
+   available) for compatibility.
+
+Within a tier, configured route priority, reception confidence, source quality,
+and the best known transport-path score are compared in that order. The lease
+endpoint remains authoritative, so a stale tier-1/2 result can still return
+409/503 and is skipped immediately. The request has one end-to-end budget; each
+endpoint attempt is additionally capped at 2 seconds, and the transport connect
+bound is 1.5 seconds.
+
+Within a selected peer, endpoints are ordered by measured path health when a
+dashboard probe has persisted it, then by the existing fallback order: LAN,
+Tailscale, Cloudflare private, static, direct Internet, Cloudflare public. Two
+of those rules are not mere preference:
 
 - RECORD only uses endpoints the operator marked `record_allowed`.
 - RECORD refuses `CloudflarePublic` outright — a general-purpose HTTP proxy is
   a bootstrap and fallback path, not a sustained recording path (§4).
 
 The whole search shares one `REMOTE_SEARCH_BUDGET_MS` budget across every peer
-and endpoint tried; it is never reset per attempt.
-
-The ordering is static rather than measured because probing costs a round trip
-per path and this runs on the request path. `node::path::score_path` is
-currently applied only by the dashboard's explicit probe, and moves here once
-`node_path_health` is populated continuously.
+and endpoint tried; it is never reset per attempt. Parallel hedging is
+intentionally not used: opening two leases temporarily consumes two tuner
+slots, and cancelling the loser races with the winner becoming visible. The
+advertised priority tiers already avoid avoidable 409 attempts without that
+capacity spike.
 
 Downstream is unchanged: `BodyReceiver::Remote` is just a
 `broadcast::Receiver<Bytes>`, so service filtering, the EIT gate and the
