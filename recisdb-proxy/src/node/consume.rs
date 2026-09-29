@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -31,9 +32,9 @@ use crate::tuner::EffectiveClaim;
 
 use super::frame::{FrameFlags, NodeTsFrame, NODE_TS_HEADER_LEN};
 use super::identity::NodeIdentity;
-use super::store::NodeStore;
-use super::route::{rank_remote_routes, RemoteRouteCandidate};
 use super::path::{score_path, PathHealth, PathPolicy, TransportPath};
+use super::route::{rank_remote_routes, RemoteRouteCandidate};
+use super::store::NodeStore;
 use super::transport::{LeaseStreamError, NodeTransportClient, OpenLeaseReply, OpenLeaseRequest};
 use super::types::{EndpointKind, LogicalMuxId, NodeEndpoint, RequestContext};
 
@@ -68,14 +69,48 @@ pub enum ConsumeError {
 pub struct RemoteMuxStream {
     lease: OpenLeaseReply,
     base_url: String,
-    tx: broadcast::Sender<Bytes>,
+    sender: Arc<StdMutex<Option<broadcast::Sender<Bytes>>>>,
     /// Highest source sequence handed downstream, used for resume.
     last_sequence: Arc<AtomicU64>,
     /// Wall-clock timestamp of the last frame handed to local consumers.
     /// Used only for the BonDriver signal-level compatibility value.
     last_data_at_ms: Arc<AtomicU64>,
     /// Ends the pump/renew tasks when this handle drops.
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: Arc<ShutdownState>,
+}
+
+/// Persistent cancellation state. A bare `Notify` loses a notification sent
+/// while the renew request is in flight.
+struct ShutdownState {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownState {
+    fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl RemoteMuxStream {
@@ -106,12 +141,13 @@ impl RemoteMuxStream {
         let (tx, _) = broadcast::channel(REPUBLISH_CAPACITY);
         let last_sequence = Arc::new(AtomicU64::new(0));
         let last_data_at_ms = Arc::new(AtomicU64::new(0));
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(ShutdownState::new());
+        let sender = Arc::new(StdMutex::new(Some(tx)));
 
         let stream = Self {
             lease: lease.clone(),
             base_url: base_url.clone(),
-            tx: tx.clone(),
+            sender: Arc::clone(&sender),
             last_sequence: Arc::clone(&last_sequence),
             last_data_at_ms: Arc::clone(&last_data_at_ms),
             shutdown: Arc::clone(&shutdown),
@@ -127,7 +163,7 @@ impl RemoteMuxStream {
             client,
             base_url,
             lease,
-            tx,
+            Arc::clone(&sender),
             last_sequence,
             last_data_at_ms,
             shutdown,
@@ -163,7 +199,10 @@ impl RemoteMuxStream {
                 .remote_routes_for(mux)
                 .map_err(|e| ConsumeError::Transport(e.to_string()))?;
 
-            let mut peer_data: HashMap<super::types::NodeId, (Vec<NodeEndpoint>, HashMap<String, PathHealth>)> = HashMap::new();
+            let mut peer_data: HashMap<
+                super::types::NodeId,
+                (Vec<NodeEndpoint>, HashMap<String, PathHealth>),
+            > = HashMap::new();
             for route in &routes {
                 let Ok(Some(_credential)) = store.credential_for(&route.node_id) else {
                     continue;
@@ -179,7 +218,9 @@ impl RemoteMuxStream {
                             .map(|health| (endpoint.address.clone(), health))
                     })
                     .collect();
-                peer_data.entry(route.node_id.clone()).or_insert((endpoints, health));
+                peer_data
+                    .entry(route.node_id.clone())
+                    .or_insert((endpoints, health));
             }
             let mut ranked: Vec<RemoteRouteCandidate> = routes
                 .into_iter()
@@ -198,9 +239,8 @@ impl RemoteMuxStream {
                 .into_iter()
                 .filter_map(|candidate| {
                     seen.insert(candidate.route.node_id.clone()).then(|| {
-                        let (endpoints, health) = peer_data
-                            .get(&candidate.route.node_id)
-                            .expect("peer data");
+                        let (endpoints, health) =
+                            peer_data.get(&candidate.route.node_id).expect("peer data");
                         (candidate.route.node_id, endpoints.clone(), health.clone())
                     })
                 })
@@ -256,8 +296,7 @@ impl RemoteMuxStream {
                 // refusals (409) return at once, and an unreachable peer is
                 // bounded by the client's connect timeout, so ordering (not a
                 // per-attempt cap) is what keeps the search fast.
-                let attempt_budget =
-                    Duration::from_millis(budget_ms.saturating_sub(spent_ms));
+                let attempt_budget = Duration::from_millis(budget_ms.saturating_sub(spent_ms));
                 let open = tokio::time::timeout(
                     attempt_budget,
                     Self::open(
@@ -272,7 +311,9 @@ impl RemoteMuxStream {
                 .await;
                 let result = match open {
                     Ok(result) => result,
-                    Err(_) => Err(ConsumeError::Transport("remote lease attempt timed out".into())),
+                    Err(_) => Err(ConsumeError::Transport(
+                        "remote lease attempt timed out".into(),
+                    )),
                 };
                 match result {
                     Ok(stream) => {
@@ -305,7 +346,14 @@ impl RemoteMuxStream {
 
     /// Subscribe to the republished TS, exactly like `SharedTuner::subscribe`.
     pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
-        self.tx.subscribe()
+        let sender = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+        match sender.as_ref() {
+            Some(sender) => sender.subscribe(),
+            None => {
+                let (_sender, receiver) = broadcast::channel(1);
+                receiver
+            }
+        }
     }
 
     pub fn lease(&self) -> &OpenLeaseReply {
@@ -353,7 +401,7 @@ impl Drop for RemoteMuxStream {
     fn drop(&mut self) {
         // Stops the pump and renew loops. The peer's lease then expires on its
         // own TTL even if the release request never lands.
-        self.shutdown.notify_waiters();
+        self.shutdown.cancel();
     }
 }
 
@@ -361,13 +409,13 @@ fn spawn_renew_loop(
     client: Arc<NodeTransportClient>,
     base_url: String,
     lease: OpenLeaseReply,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: Arc<ShutdownState>,
 ) {
     let interval = Duration::from_millis((lease.ttl_ms / RENEW_FRACTION as u64).max(500));
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown.notified() => {
+                _ = shutdown.cancelled() => {
                     // Best-effort explicit release so the peer frees its
                     // tuner immediately rather than after the TTL.
                     let _ = client.release_lease(&base_url, &lease.lease_id).await;
@@ -375,7 +423,18 @@ fn spawn_renew_loop(
                 }
                 _ = tokio::time::sleep(interval) => {}
             }
-            match client.renew_lease(&base_url, &lease.lease_id).await {
+            let renewed = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    let _ = client.release_lease(&base_url, &lease.lease_id).await;
+                    return;
+                }
+                result = client.renew_lease(&base_url, &lease.lease_id) => result,
+            };
+            if shutdown.is_cancelled() {
+                let _ = client.release_lease(&base_url, &lease.lease_id).await;
+                return;
+            }
+            match renewed {
                 Ok(true) => {}
                 Ok(false) => {
                     log::warn!(
@@ -400,10 +459,10 @@ fn spawn_pump(
     client: Arc<NodeTransportClient>,
     base_url: String,
     lease: OpenLeaseReply,
-    tx: broadcast::Sender<Bytes>,
+    sender: Arc<StdMutex<Option<broadcast::Sender<Bytes>>>>,
     last_sequence: Arc<AtomicU64>,
     last_data_at_ms: Arc<AtomicU64>,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: Arc<ShutdownState>,
 ) {
     let is_record = lease.stream_class == StreamClass::Record;
     tokio::spawn(async move {
@@ -414,12 +473,12 @@ fn spawn_pump(
             };
 
             let outcome = tokio::select! {
-                _ = shutdown.notified() => return,
+                _ = shutdown.cancelled() => return,
                 outcome = pump_once(
                     &client,
                     &base_url,
                     &lease,
-                    &tx,
+                    &sender,
                     &last_sequence,
                     &last_data_at_ms,
                     resume_from,
@@ -430,7 +489,7 @@ fn spawn_pump(
                 // The connection ended cleanly; for a lease that is still
                 // alive this is a transport event, so reconnect and resume.
                 Ok(()) => {}
-                Err(ConsumeError::LeaseGone) if tx.receiver_count() == 0 => {
+                Err(ConsumeError::LeaseGone) if sender_receiver_count(&sender) == 0 => {
                     // Every local consumer is gone, so this node released the
                     // lease itself (channel change / close). A normal end,
                     // not a failure worth an ERROR line.
@@ -442,9 +501,10 @@ fn spawn_pump(
                     return;
                 }
                 Err(ConsumeError::RecordGap) | Err(ConsumeError::LeaseGone) => {
-                    // Terminal. Dropping the sender closes every subscriber's
-                    // receiver, which downstream reports as a failed stream
-                    // rather than a silently truncated one.
+                    // Terminal. Take the sole sender owner. Dropping only the
+                    // pump clone cannot close subscribers while the stream
+                    // handle still exists.
+                    close_sender(&sender);
                     log::error!(
                         "[node] lease {} on {} cannot continue without a gap; ending the stream",
                         lease.lease_id,
@@ -473,11 +533,23 @@ fn spawn_pump(
             }
 
             tokio::select! {
-                _ = shutdown.notified() => return,
+                _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(RECONNECT_BACKOFF) => {}
             }
         }
     });
+}
+
+fn sender_receiver_count(sender: &Arc<StdMutex<Option<broadcast::Sender<Bytes>>>>) -> usize {
+    sender
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, broadcast::Sender::receiver_count)
+}
+
+fn close_sender(sender: &Arc<StdMutex<Option<broadcast::Sender<Bytes>>>>) {
+    sender.lock().unwrap_or_else(|e| e.into_inner()).take();
 }
 
 /// One connection's worth of streaming. Returns `Ok(())` when the connection
@@ -486,7 +558,7 @@ async fn pump_once(
     client: &NodeTransportClient,
     base_url: &str,
     lease: &OpenLeaseReply,
-    tx: &broadcast::Sender<Bytes>,
+    sender: &Arc<StdMutex<Option<broadcast::Sender<Bytes>>>>,
     last_sequence: &AtomicU64,
     last_data_at_ms: &AtomicU64,
     resume_from: Option<u64>,
@@ -525,17 +597,16 @@ async fn pump_once(
     loop {
         let chunk = if !first_data_received {
             match lease.first_data_grace_ms.filter(|ms| *ms > 0) {
-                Some(grace_ms) => tokio::time::timeout(
-                    Duration::from_millis(grace_ms),
-                    response.chunk(),
-                )
-                .await
-                .map_err(|_| {
-                    ConsumeError::Transport(format!(
-                        "first TS data timeout after {grace_ms}ms"
-                    ))
-                })?
-                .map_err(|e| ConsumeError::Transport(e.to_string()))?,
+                Some(grace_ms) => {
+                    tokio::time::timeout(Duration::from_millis(grace_ms), response.chunk())
+                        .await
+                        .map_err(|_| {
+                            ConsumeError::Transport(format!(
+                                "first TS data timeout after {grace_ms}ms"
+                            ))
+                        })?
+                        .map_err(|e| ConsumeError::Transport(e.to_string()))?
+                }
                 // Older peers do not send the optional deadline or startup
                 // control frames. Preserve their legacy wait-until-close
                 // behavior instead of inventing an incompatible timeout.
@@ -593,7 +664,14 @@ async fn pump_once(
             last_data_at_ms.store(unix_now_ms(), Ordering::Release);
             // A closed channel means every local consumer went away; there is
             // nothing left to feed, so stop rather than keep the peer's tuner.
-            if tx.send(frame.payload).is_err() && tx.receiver_count() == 0 {
+            let (sent, receivers) = {
+                let sender = sender.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(sender) = sender.as_ref() else {
+                    return Err(ConsumeError::LeaseGone);
+                };
+                (sender.send(frame.payload).is_ok(), sender.receiver_count())
+            };
+            if !sent && receivers == 0 {
                 return Err(ConsumeError::LeaseGone);
             }
         }
@@ -711,9 +789,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_remote_stream_notifies_lease_tasks_for_release() {
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let notified = shutdown.notified();
+    async fn dropping_remote_stream_persists_cancellation_state() {
+        let shutdown = Arc::new(ShutdownState::new());
         let (tx, _) = broadcast::channel(1);
         let stream = RemoteMuxStream {
             lease: OpenLeaseReply {
@@ -737,15 +814,31 @@ mod tests {
                 },
             },
             base_url: "http://127.0.0.1".into(),
-            tx,
+            sender: Arc::new(StdMutex::new(Some(tx))),
             last_sequence: Arc::new(AtomicU64::new(0)),
             last_data_at_ms: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::clone(&shutdown),
         };
+        let shutdown_for_test = Arc::clone(&shutdown);
         drop(stream);
-        tokio::time::timeout(Duration::from_secs(1), notified)
+        tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
             .await
             .expect("drop must wake renew/pump tasks");
+        assert!(shutdown_for_test.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .expect("cancellation must remain observable after the first waiter");
+    }
+
+    #[tokio::test]
+    async fn terminal_sender_close_unblocks_downstream_receiver() {
+        let (tx, mut receiver) = broadcast::channel(1);
+        let sender = Arc::new(StdMutex::new(Some(tx)));
+        close_sender(&sender);
+        assert!(matches!(
+            receiver.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     fn context(class: StreamClass) -> RequestContext {

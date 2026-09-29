@@ -161,7 +161,10 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // EPG (program guide) API
         .route("/programs", get(api::get_programs))
         .route("/programs/services", get(api::get_program_services))
-        .route("/guide-config", get(api::get_guide_config).post(api::update_guide_config))
+        .route(
+            "/guide-config",
+            get(api::get_guide_config).post(api::update_guide_config),
+        )
         .route("/epg/events", get(api::get_epg_events))
         // Alert API
         .route("/alerts", get(api::get_alerts))
@@ -360,6 +363,14 @@ fn is_dashboard_poll(method: &axum::http::Method, path_and_query: &str) -> bool 
 ///   (and is never accidentally covered by the auth `route_layer` bound to)
 ///   `/api/*` — see `build_mirakurun_router` and `web/mirakurun.rs`.
 fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
+    build_app_with_node(web_state, mirakurun_enabled, false)
+}
+
+fn build_app_with_node(
+    web_state: Arc<WebState>,
+    mirakurun_enabled: bool,
+    node_serve_on_web: bool,
+) -> Router {
     let api_router = build_api_router().route_layer(axum::middleware::from_fn_with_state(
         web_state.clone(),
         auth::require_auth,
@@ -376,15 +387,15 @@ fn build_app(web_state: Arc<WebState>, mirakurun_enabled: bool) -> Router {
         router = router.nest("/mirakurun/api", build_mirakurun_router());
     }
 
-    // The node transport (`/node/v3/*`) is also served here, not only on its
+    // The node transport (`/node/v3/*`) is optionally served here, not only on its
     // dedicated `listen port + 1` listener. A site that is reachable only
     // through an HTTP tunnel for the dashboard (Cloudflare Tunnel public
     // hostname) can then be paired and leased through that same hostname.
     // Every node route except `/node/v3/pair` requires a node credential, and
     // pairing needs a live one-time code behind a failure limiter.
-    let node_router = web_state
-        .node_transport
-        .clone()
+    let node_router = node_serve_on_web
+        .then(|| web_state.node_transport.clone())
+        .flatten()
         .map(crate::node::transport::router);
 
     let router = router.with_state(web_state);
@@ -433,6 +444,7 @@ pub async fn start_web_server(
     epg_events_tx: tokio::sync::broadcast::Sender<crate::database::ProgramUpsert>,
     node_transport: Option<Arc<crate::node::NodeTransportState>>,
     node_listen_addr: Option<String>,
+    node_serve_on_web: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(
         database,
@@ -468,7 +480,13 @@ pub async fn start_web_server(
         );
     }
 
-    let app = build_app(web_state, mirakurun_enabled);
+    if node_serve_on_web {
+        log::warn!(
+            "Node transport is also exposed on the Web listener ([node] serve_on_web = true); h2c is plaintext"
+        );
+    }
+
+    let app = build_app_with_node(web_state, mirakurun_enabled, node_serve_on_web);
 
     let listener = crate::server::listener::bind_with_retry(listen_addr).await?;
     log::info!("Web dashboard listening on http://{}", listen_addr);
@@ -548,7 +566,7 @@ mod tests {
             },
             Arc::new(crate::node::RemoteLeaseManager::new(Default::default())),
         )));
-        let app = build_app(Arc::new(state), false);
+        let app = build_app_with_node(Arc::new(state), false, true);
 
         let response = app
             .oneshot(
@@ -561,6 +579,32 @@ mod tests {
             .unwrap();
         // Unauthenticated hello: routed to the node handler (401), not 404.
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn web_port_does_not_serve_node_transport_by_default() {
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
+        let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+        state.node_transport = Some(Arc::new(crate::node::NodeTransportState::new(
+            crate::node::NodeIdentity {
+                node_id: crate::node::NodeId::new("site-c").unwrap(),
+                display_name: "拠点C".into(),
+            },
+            Arc::new(crate::node::RemoteLeaseManager::new(Default::default())),
+        )));
+        let response = build_app(Arc::new(state), false)
+            .oneshot(
+                Request::builder()
+                    .uri("/node/v3/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     fn sample_program(nid: u16, sid: u16, event_id: u16) -> crate::database::ProgramUpsert {
@@ -1515,24 +1559,67 @@ mod tests {
 
     #[tokio::test]
     async fn guide_config_api_get_post_and_reject_invalid_region() {
-        let state = test_web_state(AuthConfig { enabled: false, token: String::new() });
+        let state = test_web_state(AuthConfig {
+            enabled: false,
+            token: String::new(),
+        });
         let app = build_app(Arc::clone(&state), false);
-        let response = app.clone().oneshot(Request::builder().uri("/api/guide-config").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/guide-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["default_region"], serde_json::Value::Null);
         assert!(json["regions"].is_array());
 
-        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/guide-config")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::json!({"default_region": "*"}).to_string())).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/guide-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"default_region": "*"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(state.database.lock().await.get_guide_display_config().unwrap(), Some("*".to_string()));
+        assert_eq!(
+            state
+                .database
+                .lock()
+                .await
+                .get_guide_display_config()
+                .unwrap(),
+            Some("*".to_string())
+        );
 
-        let response = app.oneshot(Request::builder().method("POST").uri("/api/guide-config")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::json!({"default_region": "存在しない県"}).to_string())).unwrap()).await.unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/guide-config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"default_region": "存在しない県"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

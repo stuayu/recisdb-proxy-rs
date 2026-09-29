@@ -60,7 +60,7 @@ pub async fn discover_tailscale_endpoint(node_port: u16) -> Option<NodeEndpoint>
 /// Discover every local address that Tailscale reports for this node.
 /// `tailscale status --json` is optional; an absent CLI simply produces no
 /// overlay-specific candidates and interface discovery still runs.
-async fn discover_tailscale_ips() -> Option<Vec<IpAddr>> {
+pub async fn discover_tailscale_ips() -> Option<Vec<IpAddr>> {
     let output = tokio::time::timeout(
         Duration::from_secs(2),
         Command::new("tailscale")
@@ -131,6 +131,28 @@ pub fn build_advertised_endpoints(
     endpoints
 }
 
+/// Build advertisements from addresses this process actually bound. Unlike
+/// wildcard discovery, this never emits an address from an interface that is
+/// outside the listener's bind set.
+pub fn build_bound_advertised_endpoints(
+    bound_addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<NodeEndpoint> {
+    let mut endpoints = Vec::new();
+    for address in bound_addresses {
+        if address.ip().is_unspecified() {
+            continue;
+        }
+        endpoints.extend(build_advertised_endpoints(address, std::iter::empty()));
+    }
+    endpoints.sort_by(|a, b| {
+        endpoint_rank(a.kind)
+            .cmp(&endpoint_rank(b.kind))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    endpoints.dedup_by(|a, b| a.address == b.address);
+    endpoints
+}
+
 /// Discover interface addresses using commands already present on the host.
 /// This avoids adding a platform-specific interface crate to the proxy.
 pub async fn discover_advertised_endpoints(listen_addr: SocketAddr) -> Vec<NodeEndpoint> {
@@ -183,11 +205,19 @@ async fn discover_interface_addresses() -> Vec<IpAddr> {
 /// yields the Tailscale IP when Tailscale is up; the public ones yield the
 /// default-route LAN address.
 fn route_source_addresses() -> Vec<IpAddr> {
-    const TARGETS: [&str; 3] = ["100.100.100.100:53", "8.8.8.8:53", "[2001:4860:4860::8888]:53"];
+    const TARGETS: [&str; 3] = [
+        "100.100.100.100:53",
+        "8.8.8.8:53",
+        "[2001:4860:4860::8888]:53",
+    ];
     TARGETS
         .iter()
         .filter_map(|target| {
-            let bind = if target.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
+            let bind = if target.starts_with('[') {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             let socket = std::net::UdpSocket::bind(bind).ok()?;
             socket.connect(target).ok()?;
             socket.local_addr().ok().map(|addr| addr.ip())
@@ -269,7 +299,7 @@ fn is_link_local(ip: IpAddr) -> bool {
     }
 }
 
-fn is_tailscale(ip: IpAddr) -> bool {
+pub fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -290,7 +320,7 @@ fn is_private_lan(ip: IpAddr) -> bool {
 }
 
 fn endpoint_kind(ip: IpAddr) -> EndpointKind {
-    if is_tailscale(ip) {
+    if is_tailscale_ip(ip) {
         EndpointKind::Tailscale
     } else if is_private_lan(ip) {
         EndpointKind::Lan
@@ -372,7 +402,11 @@ pub async fn probe_endpoint(
     let mut throughputs = Vec::new();
     // No ping got through: the endpoint is unreachable, and downloads would
     // only add more connect timeouts.
-    let download_samples = if successful_pings == 0 { 0 } else { config.download_samples };
+    let download_samples = if successful_pings == 0 {
+        0
+    } else {
+        config.download_samples
+    };
     for _ in 0..download_samples {
         if let Ok((bytes, elapsed)) = client
             .probe_download(&endpoint.address, config.download_bytes)

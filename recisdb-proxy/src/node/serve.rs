@@ -38,6 +38,7 @@ use super::frame::{FrameFlags, NodeTsFrame, MAX_NODE_TS_PAYLOAD};
 use super::identity::NodeIdentity;
 use super::lease::{MuxLeaseManager, RemoteLeaseManager, RemoteMuxLease};
 use super::transport::RemoteEpgDwell;
+use super::types::NodeId;
 use super::types::{HopError, LogicalMuxId, RequestContext};
 
 /// TS packets per node frame. 188 * 1000 ≈ 188 KB, comfortably under
@@ -240,6 +241,7 @@ impl LocalMuxServer {
         mux: LogicalMuxId,
         sid: Option<u16>,
         spent_ms: u64,
+        requester_node: NodeId,
     ) -> Result<Arc<RemoteMuxLease>, ServeError> {
         // Supply-side invariant: this endpoint is the terminal hop.  It may
         // acquire only this node's physical candidates; calling the
@@ -281,8 +283,9 @@ impl LocalMuxServer {
 
         let lease = self
             .leases
-            .create_with_mux_lease(
+            .create_with_mux_lease_for_requester(
                 self.identity.node_id.clone(),
+                requester_node,
                 route_id_for(&outcome.key),
                 mux,
                 sid,
@@ -741,6 +744,7 @@ mod tests {
                 },
                 None,
                 0,
+                super::super::types::NodeId::new("requester-node").unwrap(),
             )
             .await
         {

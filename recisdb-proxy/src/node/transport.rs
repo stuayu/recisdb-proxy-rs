@@ -272,6 +272,9 @@ pub struct NodeTransportState {
     /// Listener address used to derive fresh peer-reachable advertisements.
     /// `None` is retained for unit-test states that do not serve a listener.
     pub node_listen_addr: Option<SocketAddr>,
+    /// Exact addresses successfully bound by the node listener. This keeps
+    /// endpoint advertisements consistent with the actual bind set.
+    pub bound_node_addresses: Arc<RwLock<Vec<SocketAddr>>>,
     pub routes: Arc<RwLock<Vec<ReceptionRouteAdvertisement>>>,
     pub peers: Arc<RwLock<HashMap<NodeId, NodeCredential>>>,
     pub leases: Arc<RemoteLeaseManager>,
@@ -295,6 +298,7 @@ impl NodeTransportState {
             capabilities: NodeCapabilities::default(),
             endpoints: Arc::new(RwLock::new(Vec::new())),
             node_listen_addr: None,
+            bound_node_addresses: Arc::new(RwLock::new(Vec::new())),
             routes: Arc::new(RwLock::new(Vec::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             leases,
@@ -337,7 +341,22 @@ impl NodeTransportState {
         self
     }
 
+    pub async fn set_bound_node_addresses(&self, addresses: Vec<SocketAddr>) {
+        *self.bound_node_addresses.write().await = addresses;
+    }
+
+    pub async fn add_bound_node_address(&self, address: SocketAddr) {
+        let mut addresses = self.bound_node_addresses.write().await;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+
     pub async fn advertised_endpoints(&self) -> Vec<NodeEndpoint> {
+        let bound = self.bound_node_addresses.read().await.clone();
+        if !bound.is_empty() && !bound.iter().any(|addr| addr.ip().is_unspecified()) {
+            return super::discovery::build_bound_advertised_endpoints(bound);
+        }
         if let Some(listen_addr) = self.node_listen_addr {
             return super::discovery::discover_advertised_endpoints(listen_addr).await;
         }
@@ -377,6 +396,39 @@ impl NodeTransportState {
             peers.insert(node_id, credential);
         }
         Ok(count)
+    }
+
+    /// Synchronize one peer's live admission state from the DB source of
+    /// truth. All dashboard mutation paths use this so disable/rotation is
+    /// effective without a restart.
+    pub async fn reload_peer(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<(), crate::database::DatabaseError> {
+        let Some(database) = self.database.as_ref() else {
+            self.peers.write().await.remove(node_id);
+            return Ok(());
+        };
+        let admission = {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db)?;
+            let enabled = store
+                .list_nodes()?
+                .into_iter()
+                .find(|node| node.node_id == *node_id)
+                .is_some_and(|node| node.enabled);
+            if enabled {
+                store.credential_for(node_id)?
+            } else {
+                None
+            }
+        };
+        if let Some(credential) = admission {
+            self.trust_peer(node_id.clone(), credential).await;
+        } else {
+            self.peers.write().await.remove(node_id);
+        }
+        Ok(())
     }
 
     pub async fn trust_peer(&self, node_id: NodeId, credential: NodeCredential) {
@@ -449,12 +501,94 @@ async fn unpair_peer(State(state): State<Arc<NodeTransportState>>, headers: Head
 /// HTTP/2 prior-knowledge preface on cleartext connections. This mode is for
 /// encrypted overlays only; InternetDirect endpoints must use a TLS wrapper.
 pub async fn serve_h2c(addr: SocketAddr, state: Arc<NodeTransportState>) -> io::Result<()> {
-    let listener = crate::server::listener::bind_with_retry(addr).await?;
-    log::info!(
-        "Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)",
-        addr
-    );
-    axum::serve(listener, router(state)).await
+    serve_h2c_on_addresses(vec![addr], state, false, true).await
+}
+
+/// Serve one or more h2c listeners. The default configuration passes
+/// `rediscover_tailscale = true`, so a Tailscale address appearing after
+/// startup gets its own listener without widening the bind set.
+pub async fn serve_h2c_on_addresses(
+    addresses: Vec<SocketAddr>,
+    state: Arc<NodeTransportState>,
+    rediscover_tailscale: bool,
+    strict: bool,
+) -> io::Result<()> {
+    let port = addresses
+        .first()
+        .map(|address| address.port())
+        .unwrap_or(20773);
+    let mut listeners = Vec::new();
+    for address in addresses {
+        match crate::server::listener::bind_with_retry(address).await {
+            Ok(listener) => {
+                state.add_bound_node_address(address).await;
+                listeners.push((address, listener));
+            }
+            Err(error) if !strict => {
+                log::warn!("Node transport could not bind {}: {}", address, error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "node transport has no bound listener",
+        ));
+    }
+    for (address, listener) in listeners {
+        let serve_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            log::info!(
+                "Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)",
+                address
+            );
+            if let Err(error) = axum::serve(listener, router(serve_state)).await {
+                log::error!("Node transport listener {} stopped: {}", address, error);
+            }
+        });
+    }
+
+    if !rediscover_tailscale {
+        std::future::pending::<()>().await;
+    }
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        ticker.tick().await;
+        let Some(ips) = super::discovery::discover_tailscale_ips().await else {
+            continue;
+        };
+        for ip in ips {
+            if !super::discovery::is_tailscale_ip(ip) {
+                continue;
+            }
+            let address = SocketAddr::new(ip, port);
+            if state.bound_node_addresses.read().await.contains(&address) {
+                continue;
+            }
+            match crate::server::listener::bind_with_retry(address).await {
+                Ok(listener) => {
+                    state.add_bound_node_address(address).await;
+                    let serve_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        log::info!(
+                            "Node transport added Tailscale listener {} (HTTP/2 prior-knowledge / trusted overlay)",
+                            address
+                        );
+                        if let Err(error) = axum::serve(listener, router(serve_state)).await {
+                            log::error!("Node transport listener {} stopped: {}", address, error);
+                        }
+                    });
+                }
+                Err(error) => log::warn!(
+                    "Node transport could not add Tailscale listener {}: {}",
+                    address,
+                    error
+                ),
+            }
+        }
+    }
 }
 
 /// Redeem a one-time pairing code.
@@ -639,7 +773,13 @@ async fn open_lease(
 
     let mut context = payload.context;
     match server
-        .open_lease(&mut context, payload.mux, payload.sid, payload.spent_ms)
+        .open_lease(
+            &mut context,
+            payload.mux,
+            payload.sid,
+            payload.spent_ms,
+            peer.clone(),
+        )
         .await
     {
         Ok(lease) => Json(OpenLeaseReply {
@@ -729,13 +869,13 @@ async fn renew_lease(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if state.authorize(&headers).await.is_err() {
+    let Ok(peer) = state.authorize(&headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let Ok(id) = RemoteLeaseId::parse(id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let ok = state.leases.renew(&id).await;
+    let ok = state.leases.renew_for(&id, &peer).await;
     (
         if ok {
             StatusCode::OK
@@ -752,13 +892,13 @@ async fn release_lease(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if state.authorize(&headers).await.is_err() {
+    let Ok(peer) = state.authorize(&headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let Ok(id) = RemoteLeaseId::parse(id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let ok = state.leases.release(&id).await.is_some();
+    let ok = state.leases.release_for(&id, &peer).await.is_some();
     (
         if ok {
             StatusCode::OK
@@ -776,15 +916,18 @@ async fn stream_lease(
     Path(id): Path<String>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
-    if state.authorize(&headers).await.is_err() {
+    let Ok(peer) = state.authorize(&headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let Ok(id) = RemoteLeaseId::parse(id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(lease) = state.leases.get(&id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if lease.requester_node != peer {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     let live = lease.subscribe_live();
     let mut replay_frames = Vec::new();
@@ -891,6 +1034,8 @@ pub enum LeaseStreamError {
     LeaseGone,
     #[error("unexpected status {0}")]
     Status(u16),
+    #[error("timed out waiting for lease stream headers")]
+    Timeout,
 }
 
 /// Minimal client used by discovery/path-probe code. HTTPS endpoints use
@@ -905,6 +1050,12 @@ pub struct NodeTransportClient {
 
 /// TCP connect bound for node-to-node requests (see `NodeTransportClient::new`).
 const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const NODE_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const NODE_STREAM_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn context_timeout(remaining_ms: u64, spent_ms: u64) -> Duration {
+    Duration::from_millis(remaining_ms.saturating_sub(spent_ms).max(1))
+}
 
 impl NodeTransportClient {
     pub fn new(identity: NodeId, credential: NodeCredential) -> Result<Self, reqwest::Error> {
@@ -964,10 +1115,12 @@ impl NodeTransportClient {
             reqwest::Client::builder()
                 .http2_prior_knowledge()
                 .connect_timeout(NODE_CONNECT_TIMEOUT)
+                .timeout(NODE_OPERATION_TIMEOUT)
                 .build()?
         } else {
             reqwest::Client::builder()
                 .connect_timeout(NODE_CONNECT_TIMEOUT)
+                .timeout(NODE_OPERATION_TIMEOUT)
                 .build()?
         };
         client
@@ -995,6 +1148,10 @@ impl NodeTransportClient {
             format!("{}/node/v3/lease", base.trim_end_matches('/')),
         )
         .json(request)
+        .timeout(context_timeout(
+            request.context.remaining_ms,
+            request.spent_ms,
+        ))
         .send()
         .await?
         .error_for_status()?
@@ -1014,6 +1171,10 @@ impl NodeTransportClient {
             format!("{}/node/v3/epg/metadata", base.trim_end_matches('/')),
         )
         .json(request)
+        .timeout(context_timeout(
+            request.context.remaining_ms,
+            request.spent_ms,
+        ))
         .send()
         .await?
         .error_for_status()?
@@ -1034,6 +1195,7 @@ impl NodeTransportClient {
                     lease_id
                 ),
             )
+            .timeout(NODE_OPERATION_TIMEOUT)
             .send()
             .await?;
         Ok(response.status().is_success())
@@ -1044,6 +1206,7 @@ impl NodeTransportClient {
             reqwest::Method::DELETE,
             format!("{}/node/v3/lease/{}", base.trim_end_matches('/'), lease_id),
         )
+        .timeout(NODE_OPERATION_TIMEOUT)
         .send()
         .await?;
         Ok(())
@@ -1055,6 +1218,7 @@ impl NodeTransportClient {
             reqwest::Method::DELETE,
             format!("{}/node/v3/peer", base.trim_end_matches('/')),
         )
+        .timeout(NODE_OPERATION_TIMEOUT)
         .send()
         .await?
         .error_for_status()?;
@@ -1081,10 +1245,10 @@ impl NodeTransportClient {
                 url.push_str(&format!("&generation={generation}"));
             }
         }
-        let response = self
-            .request(reqwest::Method::GET, url)
-            .send()
+        let response = self.request(reqwest::Method::GET, url).send();
+        let response = tokio::time::timeout(NODE_STREAM_HEADERS_TIMEOUT, response)
             .await
+            .map_err(|_| LeaseStreamError::Timeout)?
             .map_err(LeaseStreamError::Transport)?;
         // `reqwest` (http 0.2) and `axum` (http 1.x) have distinct
         // `StatusCode` types, so compare numerically rather than importing
@@ -1102,6 +1266,7 @@ impl NodeTransportClient {
             reqwest::Method::GET,
             format!("{}/node/v3/hello", base.trim_end_matches('/')),
         )
+        .timeout(NODE_OPERATION_TIMEOUT)
         .send()
         .await?
         .error_for_status()?
@@ -1117,6 +1282,7 @@ impl NodeTransportClient {
             reqwest::Method::GET,
             format!("{}/node/v3/routes", base.trim_end_matches('/')),
         )
+        .timeout(NODE_OPERATION_TIMEOUT)
         .send()
         .await?
         .error_for_status()?
@@ -1134,6 +1300,7 @@ impl NodeTransportClient {
             format!("{}/node/v3/routes/changed", base.trim_end_matches('/')),
         )
         .json(notice)
+        .timeout(NODE_OPERATION_TIMEOUT)
         .send()
         .await?
         .error_for_status()?;
@@ -1147,6 +1314,7 @@ impl NodeTransportClient {
             nonce
         );
         self.request(reqwest::Method::GET, url)
+            .timeout(NODE_OPERATION_TIMEOUT)
             .send()
             .await?
             .error_for_status()?
@@ -1167,6 +1335,7 @@ impl NodeTransportClient {
         let started = std::time::Instant::now();
         let body = self
             .request(reqwest::Method::GET, url)
+            .timeout(NODE_OPERATION_TIMEOUT)
             .send()
             .await?
             .error_for_status()?
@@ -1179,6 +1348,22 @@ impl NodeTransportClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_request_timeout_uses_remaining_end_to_end_budget() {
+        assert_eq!(
+            context_timeout(10_000, 2_500),
+            std::time::Duration::from_millis(7_500)
+        );
+        assert_eq!(
+            context_timeout(1_000, 1_000),
+            std::time::Duration::from_millis(1)
+        );
+        assert_eq!(
+            context_timeout(0, 10_000),
+            std::time::Duration::from_millis(1)
+        );
+    }
 
     #[test]
     fn remote_epg_dwell_round_trips_through_epg_dwell_config() {
@@ -1234,6 +1419,74 @@ mod tests {
             state.authorize(&headers).await,
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[tokio::test]
+    async fn lease_object_operations_hide_a_different_authenticated_peer() {
+        let state = Arc::new(NodeTransportState::new(
+            NodeIdentity {
+                node_id: NodeId::new("site-a").unwrap(),
+                display_name: "node".into(),
+            },
+            Arc::new(RemoteLeaseManager::new(LeasePolicy::default())),
+        ));
+        let peer_a = NodeId::new("site-b").unwrap();
+        let peer_b = NodeId::new("site-c").unwrap();
+        let credential_a = NodeCredential::random();
+        let credential_b = NodeCredential::random();
+        state.trust_peer(peer_a.clone(), credential_a.clone()).await;
+        state.trust_peer(peer_b.clone(), credential_b.clone()).await;
+        let lease = state
+            .leases
+            .create_with_mux_lease_for_requester(
+                state.identity.node_id.clone(),
+                peer_a.clone(),
+                "route".into(),
+                LogicalMuxId { nid: 1, tsid: 2 },
+                None,
+                StreamClass::Record,
+                EffectiveClaim::new(2, false),
+                1,
+                None,
+            )
+            .await;
+
+        let headers = |peer: &NodeId, credential: &NodeCredential| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-recisdb-node-id", peer.as_str().parse().unwrap());
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {}", credential.expose()).parse().unwrap(),
+            );
+            headers
+        };
+        let renew_other = renew_lease(
+            State(Arc::clone(&state)),
+            headers(&peer_b, &credential_b),
+            Path(lease.id.as_str().to_owned()),
+        )
+        .await;
+        assert_eq!(renew_other.status(), StatusCode::NOT_FOUND);
+
+        let renew_owner = renew_lease(
+            State(Arc::clone(&state)),
+            headers(&peer_a, &credential_a),
+            Path(lease.id.as_str().to_owned()),
+        )
+        .await;
+        assert_eq!(renew_owner.status(), StatusCode::OK);
+
+        let stream_other = stream_lease(
+            State(Arc::clone(&state)),
+            headers(&peer_b, &credential_b),
+            Path(lease.id.as_str().to_owned()),
+            Query(StreamQuery {
+                generation: None,
+                from_seq: None,
+            }),
+        )
+        .await;
+        assert_eq!(stream_other.status(), StatusCode::NOT_FOUND);
     }
 
     /// The client speaks HTTP/2 prior-knowledge; the listener must accept it
@@ -1553,6 +1806,65 @@ mod tests {
             .with_database(database),
         );
         assert_eq!(restarted.reload_peers().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reload_peer_applies_disable_and_credential_rotation_immediately() {
+        let (state, database) = test_state_with_db();
+        let peer = NodeId::new("site-c").unwrap();
+        let old = NodeCredential::random();
+        let new = NodeCredential::random();
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .upsert_node(
+                    &StoredNode {
+                        node_id: peer.clone(),
+                        display_name: "peer".into(),
+                        site_name: None,
+                        enabled: true,
+                        allow_transit: false,
+                        auto_connect: true,
+                        last_seen_unix_ms: None,
+                    },
+                    Some(&old),
+                )
+                .unwrap();
+        }
+        state.reload_peer(&peer).await.unwrap();
+        assert_eq!(state.peers.read().await.get(&peer), Some(&old));
+
+        {
+            let db = database.lock().await;
+            let store = NodeStore::new(&db).unwrap();
+            store
+                .upsert_node(
+                    &StoredNode {
+                        node_id: peer.clone(),
+                        display_name: "peer".into(),
+                        site_name: None,
+                        enabled: true,
+                        allow_transit: false,
+                        auto_connect: true,
+                        last_seen_unix_ms: None,
+                    },
+                    Some(&new),
+                )
+                .unwrap();
+        }
+        state.reload_peer(&peer).await.unwrap();
+        assert_eq!(state.peers.read().await.get(&peer), Some(&new));
+
+        {
+            let db = database.lock().await;
+            NodeStore::new(&db)
+                .unwrap()
+                .set_node_enabled(&peer, false)
+                .unwrap();
+        }
+        state.reload_peer(&peer).await.unwrap();
+        assert!(!state.peers.read().await.contains_key(&peer));
     }
 
     #[tokio::test]

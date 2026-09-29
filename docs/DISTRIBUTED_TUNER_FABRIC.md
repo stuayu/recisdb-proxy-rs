@@ -249,14 +249,21 @@ Rules that must not be relaxed:
 - On startup `NodeTransportState::reload_peers()` repopulates the in-memory
   credential map from `remote_nodes`, so pairings survive restarts.
 
-The node listener is derived automatically from `[server] listen`: it uses the
-same IP and the next port (the standard `0.0.0.0:40070` becomes
-`0.0.0.0:40071`). If the proxy uses port 65535, the node listener uses the safe
-fallback port 20773. The old `[node] enabled` and `[node] listen` keys are
-accepted for configuration-file compatibility but ignored. Restrict the
-resulting h2c listener with a firewall or trusted overlay. The display name can
-be changed at runtime from the dashboard's 「分散ノード」 screen, so a new
-installation needs no TOML editing.
+The node listener is enabled by default, but its default bind is deliberately
+narrow: loopback plus the local Tailscale addresses (`100.64.0.0/10` and
+`fd7a:115c:a1e0::/48`) on the next port after `[server] listen`. Thus the
+standard `0.0.0.0:40070` proxy listener does **not** imply a
+`0.0.0.0:40071` node listener. If the proxy uses port 65535, the node listener
+uses the safe fallback port 20773. Tailscale addresses are rechecked
+periodically, so a node started before Tailscale still adds its listener later.
+
+`[node] enabled = false` disables the node listener and the Web-router merge.
+`[node] listen` accepts one address or an array and is the explicit opt-in for
+LAN, wildcard, or Internet binds. A non-loopback, non-Tailscale bind logs a
+warning because the transport is plaintext h2c. `[node] serve_on_web = true`
+also mounts `/node/v3/*` on the Web port and logs a warning; its default is
+false. The display name can be changed at runtime from the dashboard's
+「分散ノード」 screen.
 
 #### Endpoint advertisement
 
@@ -422,9 +429,11 @@ Peer selection uses a pure requester-side policy (`node::route::rank_remote_rout
 Within a tier, configured route priority, reception confidence, source quality,
 and the best known transport-path score are compared in that order. The lease
 endpoint remains authoritative, so a stale tier-1/2 result can still return
-409/503 and is skipped immediately. The request has one end-to-end budget; each
-endpoint attempt is additionally capped at 2 seconds, and the transport connect
-bound is 1.5 seconds.
+409/503 and is skipped immediately. The request has one end-to-end real-time
+deadline. Lease-open HTTP requests use the remaining request budget, including
+slow local tune/reader startup; control, probe, and lease-maintenance requests
+have bounded operation timeouts. Stream open bounds only response headers; its
+body remains long-lived.
 
 Within a selected peer, endpoints are ordered by measured path health when a
 dashboard probe has persisted it, then by the existing fallback order: LAN,
@@ -506,6 +515,11 @@ A network connection is not tuner ownership.
 Physical tuner -> RemoteMuxLease -> ReplayBuffer -> TransportPath
 ```
 
+Each lease stores the authenticated requester NodeId separately from the
+supplying `owner_node`. Renew, release, and stream operations require the same
+requester; another paired peer receives a not-found response. Lease IDs are
+therefore not the object-level authorization boundary.
+
 If the active Tailscale path dies, the source node keeps the tuner lease alive
 for a bounded grace period while continuing to append RECORD data to its replay
 window. The consumer may reconnect to the same lease through Cloudflare/direct
@@ -533,7 +547,15 @@ rather than an empty success that would resume at the live edge with an
 unannounced hole.
 
 Replay limits are both time- and byte-bounded; message count is not a memory
-budget.
+budget. A RECORD replay gap or lease loss takes the sole local broadcast sender
+ownership and closes all downstream receivers; pump termination alone is not a
+channel-close guarantee. VIEW/PREVIEW transport interruptions still reconnect
+and resume when replay permits it.
+
+Remote stream lifecycle uses persistent cancellation state shared by pump and
+renew tasks. Drop sets the state before notifying waiters, and an in-flight
+renew request is raced against cancellation, so a dropped stream cannot start
+another renewal after the request returns.
 
 A generation change means a different source epoch. RECORD must not silently
 stitch a different reception route merely because NID/TSID matches. Seamless

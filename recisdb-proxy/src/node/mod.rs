@@ -27,8 +27,9 @@ pub mod types;
 
 pub use consume::{ConsumeError, RemoteMuxStream};
 pub use discovery::{
-    build_advertised_endpoints, classify_tailscale_ping, discover_advertised_endpoints,
-    discover_tailscale_endpoint, inspect_tailscale_path, parse_interface_addresses, probe_endpoint,
+    build_advertised_endpoints, build_bound_advertised_endpoints, classify_tailscale_ping,
+    discover_advertised_endpoints, discover_tailscale_endpoint, discover_tailscale_ips,
+    inspect_tailscale_path, is_tailscale_ip, parse_interface_addresses, probe_endpoint,
     ProbeConfig,
 };
 pub use frame::{FrameFlags, NodeTsFrame};
@@ -49,8 +50,8 @@ pub use serve::{LocalMuxServer, RemoteEpgMetadataOutcome, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteRoute};
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};
 pub use transport::{
-    serve_h2c, LeaseStreamError, NodeCapabilities, NodeHello, NodeTransportClient,
-    NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgDwell, RemoteEpgMetadataRequest,
-    PAIRING_CODE_TTL,
+    serve_h2c, serve_h2c_on_addresses, LeaseStreamError, NodeCapabilities, NodeHello,
+    NodeTransportClient, NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgDwell,
+    RemoteEpgMetadataRequest, PAIRING_CODE_TTL,
 };
 pub use types::*;

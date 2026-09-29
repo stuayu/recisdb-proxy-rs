@@ -118,6 +118,9 @@ impl RemoteLeaseId {
 pub struct RemoteMuxLease {
     pub id: RemoteLeaseId,
     pub owner_node: NodeId,
+    /// Authenticated peer that created this lease. `owner_node` is the
+    /// supplying node and is not an authorization identity.
+    pub requester_node: NodeId,
     pub route_id: String,
     pub mux: LogicalMuxId,
     pub sid: Option<u16>,
@@ -140,6 +143,7 @@ struct LeaseTimes {
 impl RemoteMuxLease {
     fn new(
         owner_node: NodeId,
+        requester_node: NodeId,
         route_id: String,
         mux: LogicalMuxId,
         sid: Option<u16>,
@@ -155,6 +159,7 @@ impl RemoteMuxLease {
         Self {
             id: RemoteLeaseId::random(),
             owner_node,
+            requester_node,
             route_id,
             mux,
             sid,
@@ -289,8 +294,35 @@ impl RemoteLeaseManager {
         generation: u32,
         mux_lease: Option<MuxLeaseGuard>,
     ) -> Arc<RemoteMuxLease> {
+        self.create_with_mux_lease_for_requester(
+            owner_node.clone(),
+            owner_node,
+            route_id,
+            mux,
+            sid,
+            stream_class,
+            claim,
+            generation,
+            mux_lease,
+        )
+        .await
+    }
+
+    pub async fn create_with_mux_lease_for_requester(
+        &self,
+        owner_node: NodeId,
+        requester_node: NodeId,
+        route_id: String,
+        mux: LogicalMuxId,
+        sid: Option<u16>,
+        stream_class: StreamClass,
+        claim: EffectiveClaim,
+        generation: u32,
+        mux_lease: Option<MuxLeaseGuard>,
+    ) -> Arc<RemoteMuxLease> {
         let lease = Arc::new(RemoteMuxLease::new(
             owner_node,
+            requester_node,
             route_id,
             mux,
             sid,
@@ -329,7 +361,30 @@ impl RemoteLeaseManager {
         true
     }
 
+    pub async fn renew_for(&self, id: &RemoteLeaseId, requester: &NodeId) -> bool {
+        let Some(lease) = self.get(id).await else {
+            return false;
+        };
+        if &lease.requester_node != requester {
+            return false;
+        }
+        lease.renew(self.policy.ttl(lease.stream_class)).await;
+        true
+    }
+
     pub async fn release(&self, id: &RemoteLeaseId) -> Option<Arc<RemoteMuxLease>> {
+        self.leases.write().await.remove(id)
+    }
+
+    pub async fn release_for(
+        &self,
+        id: &RemoteLeaseId,
+        requester: &NodeId,
+    ) -> Option<Arc<RemoteMuxLease>> {
+        let lease = self.get(id).await?;
+        if &lease.requester_node != requester {
+            return None;
+        }
         self.leases.write().await.remove(id)
     }
 
@@ -406,6 +461,32 @@ mod tests {
             .replay_from(1, 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_operations_are_scoped_to_requester_peer() {
+        let manager = RemoteLeaseManager::new(LeasePolicy::default());
+        let owner = NodeId::new("site-a").unwrap();
+        let requester = NodeId::new("site-b").unwrap();
+        let other = NodeId::new("site-c").unwrap();
+        let lease = manager
+            .create_with_mux_lease_for_requester(
+                owner,
+                requester.clone(),
+                "route".into(),
+                LogicalMuxId { nid: 1, tsid: 2 },
+                None,
+                StreamClass::Record,
+                EffectiveClaim::new(2, false),
+                1,
+                None,
+            )
+            .await;
+        assert!(!manager.renew_for(&lease.id, &other).await);
+        assert!(manager.get(&lease.id).await.is_some());
+        assert!(manager.renew_for(&lease.id, &requester).await);
+        assert!(manager.release_for(&lease.id, &other).await.is_none());
+        assert!(manager.release_for(&lease.id, &requester).await.is_some());
     }
 
     /// A consumer that crashes never sends its release. The lease TTL is the

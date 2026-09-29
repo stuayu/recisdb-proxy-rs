@@ -246,7 +246,7 @@ pub async fn update_node_state(
     Json(payload): Json<UpdateNodeStateRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let node_id = NodeId::new(node_id).map_err(ApiError::bad_request)?;
-    let credential = {
+    {
         let db = web_state.database.lock().await;
         let store = NodeStore::new(&db)?;
         if !store
@@ -257,21 +257,10 @@ pub async fn update_node_state(
             return Err(ApiError::not_found(format!("node {node_id} not found")));
         }
         store.set_node_enabled(&node_id, payload.enabled)?;
-        if payload.enabled {
-            store.credential_for(&node_id)?
-        } else {
-            None
-        }
-    };
-    // `enabled` is an admission control switch, not just a display flag:
-    // remove disabled peers from the live authorization map so inbound lease
-    // requests stop immediately. Reinsert the persisted credential on enable.
+    }
+    // `enabled` is an admission control switch, not just a display flag.
     if let Some(state) = web_state.node_transport.as_ref() {
-        if let Some(credential) = credential {
-            state.trust_peer(node_id.clone(), credential).await;
-        } else if !payload.enabled {
-            state.peers.write().await.remove(&node_id);
-        }
+        state.reload_peer(&node_id).await?;
     }
     Ok(Json(
         json!({ "success": true, "node_id": node_id, "enabled": payload.enabled }),
@@ -364,6 +353,9 @@ pub async fn issue_pairing_code(
 }
 
 async fn local_advertised_endpoints(web_state: &WebState) -> Vec<NodeEndpoint> {
+    if let Some(state) = web_state.node_transport.as_ref() {
+        return state.advertised_endpoints().await;
+    }
     let Some(listen_addr) = web_state
         .node_listen_addr
         .as_deref()
@@ -484,10 +476,15 @@ pub async fn upsert_node(
         last_seen_unix_ms: None,
     };
 
-    let db = web_state.database.lock().await;
-    let store = NodeStore::new(&db)?;
-    store.upsert_node(&node, credential.as_ref())?;
-    store.replace_endpoints(&node_id, &payload.endpoints)?;
+    {
+        let db = web_state.database.lock().await;
+        let store = NodeStore::new(&db)?;
+        store.upsert_node(&node, credential.as_ref())?;
+        store.replace_endpoints(&node_id, &payload.endpoints)?;
+    }
+    if let Some(state) = web_state.node_transport.as_ref() {
+        state.reload_peer(&node_id).await?;
+    }
 
     Ok(Json(json!({ "success": true, "node": node })))
 }

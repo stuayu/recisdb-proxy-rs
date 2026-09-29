@@ -168,8 +168,10 @@ pub struct PreviewSection {
 
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct ServerSection {
-    pub listen: Option<String>,
-    pub web_listen: Option<String>,
+    /// Keep explicit values as TOML so invalid values can fail closed with
+    /// the key and original value in the error.
+    pub listen: Option<toml::Value>,
+    pub web_listen: Option<toml::Value>,
     pub tuner: Option<String>,
     pub max_connections: Option<usize>,
 }
@@ -186,15 +188,13 @@ pub struct DatabaseSection {
 /// share a connection pool or failure domain with UI polling.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct NodeSection {
-    /// Legacy compatibility field. Node transport is always started now;
-    /// this value is accepted from old TOML files and deliberately ignored.
-    /// Keeping it deserializable makes upgrading an existing installation
-    /// safe without preserving the old ON/OFF behaviour.
+    /// Defaults to true. False disables both the dedicated listener and the
+    /// Web listener merge.
     pub enabled: Option<bool>,
-    /// Legacy per-node listener override. Accepted so old TOML remains
-    /// readable, but ignored: the node listener follows `[server] listen`
-    /// using the next port.
-    pub listen: Option<String>,
+    /// One socket address or an array of socket addresses.
+    pub listen: Option<toml::Value>,
+    /// Expose `/node/v3/*` on the Web listener. Defaults to false.
+    pub serve_on_web: Option<bool>,
     /// Name shown to peers instead of the generated node id.
     pub display_name: Option<String>,
 }
@@ -274,6 +274,7 @@ pub fn resolve_log_dir(args: &Args) -> PathBuf {
 
 /// Everything resolved by [`load`] besides logging (which must be up before
 /// `load` runs, since TLS resolution logs via `info!`/`error!`).
+#[derive(Debug)]
 pub struct ResolvedConfig {
     pub listen_addr: SocketAddr,
     pub web_listen_addr: SocketAddr,
@@ -290,10 +291,11 @@ pub struct ResolvedConfig {
     pub mirakurun_home_regions: Vec<u8>,
     /// `[mirakurun] record_priority_threshold`, defaulted to `1`.
     pub mirakurun_record_priority_threshold: i32,
-    /// Node listener derived from the resolved BonDriver proxy listener:
-    /// same IP, port + 1. The transport is always available, even when no
-    /// peer has been paired yet.
-    pub node_listen_addr: SocketAddr,
+    /// Node transport settings. Default bind addresses are selected after
+    /// startup Tailscale discovery.
+    pub node_enabled: bool,
+    pub node_listen_addrs: Option<Vec<SocketAddr>>,
+    pub node_serve_on_web: bool,
     /// `[node] display_name`, applied to this node's stored identity.
     pub node_display_name: Option<String>,
     #[cfg(feature = "tls")]
@@ -307,16 +309,14 @@ pub fn load(
     args: &Args,
     file_config: &ConfigFile,
 ) -> Result<ResolvedConfig, Box<dyn std::error::Error>> {
-    let listen_addr = if let Some(addr_str) = &file_config.server.listen {
-        addr_str.parse::<SocketAddr>().unwrap_or(args.listen)
-    } else {
-        args.listen
-    };
-    let web_listen_addr = if let Some(addr_str) = &file_config.server.web_listen {
-        addr_str.parse::<SocketAddr>().unwrap_or(args.web_listen)
-    } else {
-        args.web_listen
-    };
+    let listen_addr =
+        parse_explicit_socket_addr(file_config.server.listen.as_ref(), "[server] listen")?
+            .unwrap_or(args.listen);
+    let web_listen_addr = parse_explicit_socket_addr(
+        file_config.server.web_listen.as_ref(),
+        "[server] web_listen",
+    )?
+    .unwrap_or(args.web_listen);
     let default_tuner = args
         .tuner
         .clone()
@@ -352,16 +352,14 @@ pub fn load(
         }
     };
 
-    // The node transport is always started. `enabled = false` and `listen`
-    // from older configs are intentionally ignored: an unpaired node only
-    // waits for pairing and does not offer any remote tuner until paired.
-    if file_config.node.enabled.is_some() {
-        warn!("[node] enabled is deprecated and ignored; node transport is always available");
-    }
-    if file_config.node.listen.is_some() {
-        warn!("[node] listen is deprecated and ignored; using server.listen port + 1");
-    }
-    let node_listen_addr = derive_node_listen_addr(listen_addr);
+    let node_enabled = file_config.node.enabled.unwrap_or(true);
+    let node_listen_addrs = file_config
+        .node
+        .listen
+        .as_ref()
+        .map(parse_node_listen)
+        .transpose()?;
+    let node_serve_on_web = file_config.node.serve_on_web.unwrap_or(false);
     let node_display_name = file_config
         .node
         .display_name
@@ -436,17 +434,17 @@ pub fn load(
         mirakurun_enabled,
         mirakurun_home_regions,
         mirakurun_record_priority_threshold,
-        node_listen_addr,
+        node_enabled,
+        node_listen_addrs,
+        node_serve_on_web,
         node_display_name,
         #[cfg(feature = "tls")]
         tls_config,
     })
 }
 
-/// Derive the node transport address from the main BonDriver proxy listener.
-/// Keeping the same bind IP makes loopback/LAN/overlay deployments behave the
-/// same for both listeners, while the adjacent port avoids another setting.
-pub(crate) fn derive_node_listen_addr(server_listen_addr: SocketAddr) -> SocketAddr {
+/// Derive the node transport port from the main BonDriver proxy listener.
+pub(crate) fn derive_node_listen_port(server_listen_addr: SocketAddr) -> u16 {
     const FALLBACK_NODE_PORT: u16 = 20773;
     let port = server_listen_addr
         .port()
@@ -458,7 +456,79 @@ pub(crate) fn derive_node_listen_addr(server_listen_addr: SocketAddr) -> SocketA
             FALLBACK_NODE_PORT
         );
     }
-    SocketAddr::new(server_listen_addr.ip(), port)
+    port
+}
+
+/// Default node binds: loopback plus the local Tailscale addresses. A
+/// wildcard, LAN, or Internet bind requires explicit `[node] listen`.
+pub(crate) fn default_node_bind_addresses(
+    server_listen_addr: SocketAddr,
+    tailscale_ips: impl IntoIterator<Item = std::net::IpAddr>,
+) -> Vec<SocketAddr> {
+    let port = derive_node_listen_port(server_listen_addr);
+    let mut addresses = vec![
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+    ];
+    for ip in tailscale_ips {
+        let is_tailscale = match ip {
+            std::net::IpAddr::V4(ip) => {
+                let octets = ip.octets();
+                octets[0] == 100 && (64..=127).contains(&octets[1])
+            }
+            std::net::IpAddr::V6(ip) => {
+                let segments = ip.segments();
+                segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+            }
+        };
+        let addr = SocketAddr::new(ip, port);
+        if is_tailscale && !addresses.contains(&addr) {
+            addresses.push(addr);
+        }
+    }
+    addresses
+}
+
+fn parse_explicit_socket_addr(
+    value: Option<&toml::Value>,
+    key: &str,
+) -> Result<Option<SocketAddr>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(raw) = value.as_str() else {
+        return Err(format!(
+            "invalid {key} value {value}: expected a socket address string"
+        ));
+    };
+    raw.parse::<SocketAddr>()
+        .map(Some)
+        .map_err(|e| format!("invalid {key} value {raw:?}: {e}"))
+}
+
+fn parse_node_listen(value: &toml::Value) -> Result<Vec<SocketAddr>, String> {
+    let values: Vec<&toml::Value> = match value {
+        toml::Value::String(_) => vec![value],
+        toml::Value::Array(values) => values.iter().collect(),
+        _ => {
+            return Err(format!(
+                "invalid [node] listen value {value}: expected a socket address string or array"
+            ));
+        }
+    };
+    if values.is_empty() {
+        return Err("invalid [node] listen value []: at least one address is required".into());
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let Some(raw) = value.as_str() else {
+                return Err(format!(
+                    "invalid [node] listen value {value}: expected socket address strings"
+                ));
+            };
+            raw.parse::<SocketAddr>()
+                .map_err(|e| format!("invalid [node] listen value {raw:?}: {e}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -536,36 +606,67 @@ mod tests {
     }
 
     #[test]
-    fn node_transport_is_on_and_follows_proxy_listener() {
+    fn node_transport_defaults_to_enabled_with_narrow_bind_candidates() {
         let args = default_args();
-        let mut file_config = ConfigFile::default();
-        file_config.node.enabled = Some(false);
+        let file_config = ConfigFile::default();
 
         let resolved = load(&args, &file_config).expect("load should succeed");
-        assert_eq!(
-            resolved.node_listen_addr,
-            "0.0.0.0:40071".parse::<SocketAddr>().unwrap()
+        assert!(resolved.node_enabled);
+        assert_eq!(resolved.node_listen_addrs, None);
+        let binds = default_node_bind_addresses(
+            args.listen,
+            ["100.64.0.2".parse().unwrap(), "192.0.2.10".parse().unwrap()],
         );
+        assert_eq!(binds[0], "127.0.0.1:40071".parse().unwrap());
+        assert_eq!(binds[1], "[::1]:40071".parse().unwrap());
+        assert!(binds.contains(&"100.64.0.2:40071".parse().unwrap()));
+        assert!(!binds
+            .iter()
+            .any(|addr| addr.ip().to_string() == "192.0.2.10"));
     }
 
     #[test]
     fn node_listener_port_overflow_uses_safe_fallback() {
         assert_eq!(
-            derive_node_listen_addr("127.0.0.1:65535".parse().unwrap()),
-            "127.0.0.1:20773".parse::<SocketAddr>().unwrap()
+            derive_node_listen_port("127.0.0.1:65535".parse().unwrap()),
+            20773
         );
     }
 
     #[test]
-    fn legacy_node_listen_is_ignored() {
+    fn explicit_node_listen_is_used_and_enabled_can_disable() {
         let args = default_args();
         let mut file_config = ConfigFile::default();
-        file_config.node.listen = Some("127.0.0.1:9999".into());
+        file_config.node.listen = Some(toml::Value::String("127.0.0.1:9999".into()));
+        file_config.node.enabled = Some(false);
 
         let resolved = load(&args, &file_config).expect("load should succeed");
+        assert!(!resolved.node_enabled);
         assert_eq!(
-            resolved.node_listen_addr,
-            "0.0.0.0:40071".parse::<SocketAddr>().unwrap()
+            resolved.node_listen_addrs,
+            Some(vec!["127.0.0.1:9999".parse().unwrap()])
         );
+    }
+
+    #[test]
+    fn invalid_explicit_listen_values_fail_closed_with_key_and_value() {
+        let args = default_args();
+        let mut file_config = ConfigFile::default();
+        file_config.server.listen = Some(toml::Value::String("127.0.0.1:not-a-port".into()));
+        let error = load(&args, &file_config).unwrap_err().to_string();
+        assert!(error.contains("[server] listen"));
+        assert!(error.contains("127.0.0.1:not-a-port"));
+
+        let mut file_config = ConfigFile::default();
+        file_config.server.web_listen = Some(toml::Value::String("[::1]:not-a-port".into()));
+        let error = load(&args, &file_config).unwrap_err().to_string();
+        assert!(error.contains("[server] web_listen"));
+        assert!(error.contains("[::1]:not-a-port"));
+
+        let mut file_config = ConfigFile::default();
+        file_config.node.listen = Some(toml::Value::String("not-a-socket".into()));
+        let error = load(&args, &file_config).unwrap_err().to_string();
+        assert!(error.contains("[node] listen"));
+        assert!(error.contains("not-a-socket"));
     }
 }
