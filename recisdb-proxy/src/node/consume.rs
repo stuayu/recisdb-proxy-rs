@@ -430,6 +430,17 @@ fn spawn_pump(
                 // The connection ended cleanly; for a lease that is still
                 // alive this is a transport event, so reconnect and resume.
                 Ok(()) => {}
+                Err(ConsumeError::LeaseGone) if tx.receiver_count() == 0 => {
+                    // Every local consumer is gone, so this node released the
+                    // lease itself (channel change / close). A normal end,
+                    // not a failure worth an ERROR line.
+                    log::info!(
+                        "[node] lease {} on {} ended after local release",
+                        lease.lease_id,
+                        base_url
+                    );
+                    return;
+                }
                 Err(ConsumeError::RecordGap) | Err(ConsumeError::LeaseGone) => {
                     // Terminal. Dropping the sender closes every subscriber's
                     // receiver, which downstream reports as a failed stream
