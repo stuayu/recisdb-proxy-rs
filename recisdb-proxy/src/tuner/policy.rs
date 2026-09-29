@@ -546,6 +546,10 @@ pub fn decide(snapshot: &TunerSnapshot, req: &TuneRequest) -> Decision {
     )
 }
 
+/// A running reader with no subscriber for this long is treated as orphaned
+/// and evictable even without a keep-alive timer (see [`may_evict`]).
+const ORPHAN_GRACE: Duration = Duration::from_secs(30);
+
 /// May `req` take the slot currently held by this incumbent?
 ///
 /// Two different questions, depending on whether anyone is actually watching
@@ -564,6 +568,13 @@ fn may_evict(
 ) -> bool {
     if victim.incumbent_exclusive {
         return false;
+    }
+    // Safety net for readers left running with no subscriber and no
+    // keep-alive timer (a caller that forgot to schedule idle close). The
+    // "just tuned, not yet subscribed" window this protects is seconds long;
+    // past ORPHAN_GRACE nobody is coming back for it.
+    if !victim.has_subscribers() && victim.is_running() && victim.held_for >= ORPHAN_GRACE {
+        return true;
     }
     if victim_is_keep_alive {
         // Nobody is watching it and its keep-alive timer is already running.
@@ -1723,6 +1734,26 @@ mod tests {
         req.priority = 10;
         req.own_key = Some(own_key);
 
+        assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
+    }
+
+    #[test]
+    fn orphaned_unsubscribed_reader_is_evictable_but_a_just_tuned_one_is_not() {
+        let mut orphan = entry("A.dll", 0, 1, true, 0, 0);
+        orphan.idle_close_pending = false;
+        orphan.held_for = Duration::from_secs(120);
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![orphan.clone()],
+        };
+        let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
+        assert!(matches!(decide(&snapshot, &req), Decision::Create { ref evict, .. } if evict.len() == 1));
+
+        orphan.held_for = Duration::from_secs(2);
+        let snapshot = TunerSnapshot {
+            drivers: vec![driver("A.dll", 1)],
+            entries: vec![orphan],
+        };
         assert!(matches!(decide(&snapshot, &req), Decision::Reject { .. }));
     }
 

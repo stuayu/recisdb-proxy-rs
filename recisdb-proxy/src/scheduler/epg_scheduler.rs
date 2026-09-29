@@ -1031,6 +1031,17 @@ impl EpgScanScheduler {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         };
+        // Release the tuner the same way a finished lease does: drop the
+        // subscription first so the count has decremented, then hand an
+        // unwatched reader to the pool's keep-alive. Without this the reader
+        // kept running with no subscriber and no idle-close timer, holding
+        // its slot until something of higher priority evicted it.
+        drop(subscription);
+        if !outcome.tuner.has_subscribers() {
+            self.pool
+                .schedule_idle_close(outcome.tuner.key.clone(), Arc::clone(&outcome.tuner))
+                .await;
+        }
         let now = chrono::Utc::now().timestamp();
         self.persist_progress(&progress, now).await;
         let mux = progress.mux_completion(network_id, tsid);
