@@ -10,7 +10,7 @@
 //!
 //! - **control** (`/tmp/px4_ctrl_pipe.sock`) — fixed-layout command structs,
 //!   request/response, one receiver per connection
-//! - **data** (`/tmp/px4_data_pipe.sock`) — raw TS, after the client claims a
+//! - **data** (`/tmp/px4_data_pipe.sock`) — raw TS or TLV, after the client claims a
 //!   `data_id` handed out by `OPEN`
 //!
 //! The wire format is the C++ `px4::command` structs from px4_drv
@@ -26,10 +26,21 @@
 //!
 //! ```text
 //! connect(ctrl) → GET_VERSION → OPEN{systems, index} ─→ data_id
-//!   → SET_PARAMS{system, freq_kHz} → TUNE{timeout} → SET_CAPTURE{true}
-//!   → connect(data) → SET_DATA_ID{data_id} → read TS …
+//!   → connect(data) → SET_DATA_ID{data_id}
+//!   → SET_PARAMS{system, freq_kHz} → TUNE{timeout} → PURGE
+//!   → SET_CAPTURE{true} → read TS or TLV …
 //! teardown: SET_CAPTURE{false} → CLOSE
 //! ```
+//!
+//! # CATV / raw TLV
+//!
+//! Space 3 is CATV C13–C63 (ISDB-C). Receiver suffixes `+tsmf=0..14`,
+//! `+tlv`, `+qam=64|256`, and `+coffset=<signed kHz>` may be combined
+//! with `+lnb` in any order, before an optional `@<ctrl_sock>`.
+//! `+tlv` implies TSMF relative stream 0 unless explicitly selected.
+//! Register raw TLV drivers with `bon_drivers.stream_format='mmttlv'`;
+//! the reader must run dantto4k before TS parsing or broadcast. Raw TLV
+//! cannot pass through processing that assumes 188-byte TS boundaries.
 //!
 //! # Prerequisite
 //!
@@ -66,6 +77,7 @@ mod cmd {
     pub const OPEN: u32 = 8;
     pub const CLOSE: u32 = 9;
     pub const SET_CAPTURE: u32 = 11;
+    pub const GET_PARAMS: u32 = 16;
     pub const SET_PARAMS: u32 = 17;
     pub const TUNE: u32 = 19;
     pub const CHECK_LOCK: u32 = 20;
@@ -86,6 +98,7 @@ mod data_cmd {
 mod system {
     pub const ISDB_T: u32 = 0x10;
     pub const ISDB_S: u32 = 0x20;
+    pub const ISDB_C: u32 = 0x40;
 }
 
 /// Sentinel for "no `data_id` yet"; outside the `u32` range the wire uses.
@@ -119,7 +132,7 @@ const DATA_CMD_SIZE: usize = 8;
 /// receivable at all — a channel scan walks every UHF channel plus BS/CS
 /// whether or not an antenna is attached — and there the timeout is pure
 /// dead time. A real lock completes well inside a second; 5 s leaves ample
-/// margin for a weak signal while keeping a 74-channel scan minutes rather
+/// margin for a weak signal while keeping a full-band scan minutes rather
 /// than half an hour.
 const TUNE_TIMEOUT_MS: u32 = 5_000;
 
@@ -148,13 +161,92 @@ fn header(cmd: u32) -> [u8; HEADER_SIZE] {
 // Channel → frequency
 // ---------------------------------------------------------------------
 
+// Source: px4_drv/winusb/pkg/BonDriver_PX4/BonDriver_PX4-C.ChSet.txt,
+// CATV space, seventh column (kHz), C13..C63. These are defaults; operators
+// can replace them with +coffset for a different cable network.
+const CATV_OFFSETS_KHZ: [i32; 51] = [
+    -200, -225, -225, -250, -250, -250, -250, -250, -275, -275, -350, -350, -350, -350, -375, -375,
+    -375, -400, -400, -400, -400, -425, -425, -425, -425, -450, -450, -450, -475, -475, -475, -475,
+    -500, -500, -500, -500, -525, -525, -525, -525, -525, -525, -550, -550, -550, -550, -575, -575,
+    -575, -600, -600,
+];
+
+fn catv_frequency(channel: u32, offset: Option<i32>) -> Result<u32, io::Error> {
+    let default = CATV_OFFSETS_KHZ.get(channel as usize).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CATV channel out of range (0-50)",
+        )
+    })?;
+    let physical = if channel <= 9 {
+        channel + 3
+    } else {
+        channel + 12
+    };
+    let center = 93_000i64 + i64::from(physical) * 6_000 + if physical == 12 { 2_000 } else { 0 };
+    let frequency = center + i64::from(offset.unwrap_or(*default));
+    if frequency <= 0 || frequency > i64::from(u32::MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "adjusted CATV frequency out of range",
+        ));
+    }
+    Ok(frequency as u32)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReceiverOptions {
+    lnb: bool,
+    tsmf: Option<u32>,
+    tlv: bool,
+    qam: Option<u32>,
+    coffset: Option<i32>,
+}
+
+// ParameterType values from px4_drv/winusb/src/common/command.hpp.
+fn params_command(code: u32, sys: u32, freq: u32, params: &[(u32, u32)]) -> Vec<u8> {
+    // ParameterSet contains params[1] even when num=0. Additional entries
+    // extend CtrlParamsCmd by 8 bytes each, without trailing padding.
+    let mut buf = vec![0; PARAMS_CMD_SIZE + params.len().saturating_sub(1) * 8];
+    buf[..HEADER_SIZE].copy_from_slice(&header(code));
+    put_u32(&mut buf, 8, sys);
+    put_u32(&mut buf, 12, freq);
+    put_u32(&mut buf, 16, params.len() as u32);
+    for (i, &(kind, value)) in params.iter().enumerate() {
+        put_u32(&mut buf, 20 + i * 8, kind);
+        put_u32(&mut buf, 24 + i * 8, value);
+    }
+    buf
+}
+
+fn tuning_params(
+    sys: u32,
+    options: &ReceiverOptions,
+    modulation: u32,
+    probe: bool,
+) -> Vec<(u32, u32)> {
+    if sys != system::ISDB_C {
+        return Vec::new();
+    }
+    let mut params = vec![(1, 6), (2, 5274), (3, modulation)];
+    if !probe {
+        if let Some(relative) = options.tsmf.or(options.tlv.then_some(0)) {
+            params.extend([(4, 1), (5, relative), (6, 0)]);
+            if options.tlv {
+                params.push((7, 1));
+            }
+        }
+    }
+    params
+}
+
 /// Convert this crate's `(space, channel)` indices to the daemon's
 /// `(system, freq_kHz)`.
 ///
 /// The space/channel convention is the same one
 /// [`super::unix::CharDevTuner`] uses, so a `channels` row scanned on Linux
 /// addresses the same physical channel here:
-/// space 0 = GR (channel 0..49 → UHF 13..62), 1 = BS, 2 = CS110.
+/// space 0 = GR (channel 0..49 → UHF 13..62), 1 = BS, 2 = CS110, 3 = CATV (channel 0..50 → C13..C63).
 ///
 /// The frequency formulas are px4_drv's own (`px4rec.cpp`).
 pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u32), io::Error> {
@@ -187,6 +279,7 @@ pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u3
             }
             Ok((system::ISDB_S, 1_613_000 + 40_000 * channel))
         }
+        3 => Ok((system::ISDB_C, catv_frequency(channel, None)?)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown tuning space {}", space),
@@ -196,7 +289,7 @@ pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u3
 
 /// Parse `px4daemon:<index>` (or `px4daemon:any`), optionally followed by
 /// `@<ctrl_sock>` for a non-default socket path.
-fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
+fn parse_path(path: &str) -> Result<(i32, ReceiverOptions, String, String), io::Error> {
     let rest = path.strip_prefix(PATH_PREFIX).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -209,15 +302,44 @@ fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
         None => (rest, DEFAULT_CTRL_SOCK.to_string()),
     };
 
-    // `+lnb` opts this receiver into supplying LNB power on satellite
-    // channels. Opt-in for the same reason px4_drv's own BonDriver keeps it
-    // behind an `LNBPower` setting: feeding voltage onto a line that another
-    // device already powers is not something to do by default. Without it,
-    // BS/CS simply never lock on a setup that has no other power injector.
-    let (index_part, lnb_power) = match index_part.strip_suffix("+lnb") {
-        Some(stripped) => (stripped, true),
-        None => (index_part, false),
-    };
+    let mut parts = index_part.split('+');
+    let index_part = parts.next().unwrap_or_default();
+    let mut options = ReceiverOptions::default();
+    let mut seen = std::collections::HashSet::new();
+    for suffix in parts {
+        let key = suffix.split('=').next().unwrap_or_default();
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid or duplicate px4daemon suffix '{suffix}'"),
+            )
+        };
+        if !seen.insert(key) {
+            return Err(invalid());
+        }
+        match suffix {
+            "lnb" => options.lnb = true,
+            "tlv" => options.tlv = true,
+            _ if suffix.starts_with("tsmf=") => {
+                let value = suffix[5..].parse::<u32>().map_err(|_| invalid())?;
+                if value > 14 {
+                    return Err(invalid());
+                }
+                options.tsmf = Some(value);
+            }
+            _ if suffix.starts_with("qam=") => {
+                let value = suffix[4..].parse::<u32>().map_err(|_| invalid())?;
+                if value != 64 && value != 256 {
+                    return Err(invalid());
+                }
+                options.qam = Some(value);
+            }
+            _ if suffix.starts_with("coffset=") => {
+                options.coffset = Some(suffix[8..].parse::<i32>().map_err(|_| invalid())?);
+            }
+            _ => return Err(invalid()),
+        }
+    }
 
     let index = if index_part.eq_ignore_ascii_case("any") || index_part.is_empty() {
         -1
@@ -238,7 +360,7 @@ fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
         ctrl_sock.replace("ctrl", "data")
     };
 
-    Ok((index, lnb_power, ctrl_sock, data_sock))
+    Ok((index, options, ctrl_sock, data_sock))
 }
 
 // ---------------------------------------------------------------------
@@ -248,14 +370,15 @@ fn parse_path(path: &str) -> Result<(i32, bool, String, String), io::Error> {
 /// One receiver claimed from the daemon.
 pub struct Px4DaemonTuner {
     ctrl: Mutex<UnixStream>,
-    /// Connected and given its `data_id` once capture starts.
+    /// Connected and given its `data_id` before capture starts.
     data: Mutex<Option<UnixStream>>,
     data_sock_path: String,
     /// Receiver index requested (-1 = any).
     index: i32,
-    /// Whether this receiver may supply LNB power for satellite channels
-    /// (`+lnb` in the path).
-    lnb_power: bool,
+    /// Per-receiver path options; CATV options apply only to space 3.
+    options: ReceiverOptions,
+    /// QAM is a channel property; cache successful disposable probes.
+    catv_modulations: Mutex<std::collections::HashMap<u32, u32>>,
     /// Whether we currently have LNB power switched on. The daemon
     /// reference-counts it and asserts the on/off calls balance, so this must
     /// track our own state exactly — including on drop.
@@ -270,7 +393,7 @@ pub struct Px4DaemonTuner {
     /// whether an id happens to be large is pure luck).
     data_id: AtomicU64,
     /// Which `SystemType` the current `OPEN` was made for. Switching between
-    /// terrestrial and satellite needs a fresh `OPEN`.
+    /// terrestrial, satellite and CATV needs a fresh `OPEN`.
     opened_system: AtomicI32,
     capturing: AtomicBool,
     current_space: AtomicI32,
@@ -278,7 +401,7 @@ pub struct Px4DaemonTuner {
 
 impl Px4DaemonTuner {
     pub fn new(path: &str) -> Result<Self, io::Error> {
-        let (index, lnb_power, ctrl_sock, data_sock) = parse_path(path)?;
+        let (index, options, ctrl_sock, data_sock) = parse_path(path)?;
 
         let ctrl = UnixStream::connect(&ctrl_sock).map_err(|e| {
             io::Error::new(
@@ -298,7 +421,8 @@ impl Px4DaemonTuner {
             data: Mutex::new(None),
             data_sock_path: data_sock,
             index,
-            lnb_power,
+            options,
+            catv_modulations: Mutex::new(std::collections::HashMap::new()),
             lnb_on: AtomicBool::new(false),
             data_id: AtomicU64::new(NO_DATA_ID),
             opened_system: AtomicI32::new(0),
@@ -323,8 +447,8 @@ impl Px4DaemonTuner {
 
     /// Send a command and read the same-sized response in place.
     ///
-    /// Every control command is a fixed-size struct that the daemon mutates
-    /// and echoes back, so request and response share one buffer.
+    /// The daemon mutates and echoes the command at the same size. Params
+    /// commands extend the base struct by 8 bytes per extra parameter.
     fn transact(&self, buf: &mut [u8]) -> Result<(), io::Error> {
         let mut ctrl = self
             .ctrl
@@ -376,14 +500,14 @@ impl Px4DaemonTuner {
         Ok(())
     }
 
-    fn close_receiver(&self) {
+    fn close_receiver(&self) -> Result<(), io::Error> {
         let mut buf = vec![0u8; CLOSE_CMD_SIZE];
         buf[..HEADER_SIZE].copy_from_slice(&header(cmd::CLOSE));
-        if let Err(e) = self.transact(&mut buf) {
-            warn!("[px4daemon] CLOSE failed: {}", e);
-        }
+        self.transact_checked(&mut buf, "CLOSE")?;
         self.opened_system.store(0, Ordering::Release);
         self.data_id.store(NO_DATA_ID, Ordering::Release);
+        self.capturing.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn set_capture(&self, on: bool) -> Result<(), io::Error> {
@@ -405,7 +529,7 @@ impl Px4DaemonTuner {
     /// Switch LNB power to match `sys`: 15 V for satellite, off otherwise.
     /// Mirrors px4_drv's own BonDriver (`bon_driver.cpp`).
     fn apply_lnb_power(&self, sys: u32) -> Result<(), io::Error> {
-        if !self.lnb_power {
+        if !self.options.lnb {
             return Ok(());
         }
         let want = sys == system::ISDB_S;
@@ -425,13 +549,55 @@ impl Px4DaemonTuner {
         Ok(())
     }
 
-    fn set_params(&self, sys: u32, freq_khz: u32) -> Result<(), io::Error> {
-        let mut buf = vec![0u8; PARAMS_CMD_SIZE];
-        buf[..HEADER_SIZE].copy_from_slice(&header(cmd::SET_PARAMS));
-        put_u32(&mut buf, 8, sys); // param_set.system
-        put_u32(&mut buf, 12, freq_khz); // param_set.freq
-        put_u32(&mut buf, 16, 0); // param_set.num (no extra Parameters)
+    fn set_params(
+        &self,
+        sys: u32,
+        freq_khz: u32,
+        modulation: u32,
+        probe: bool,
+    ) -> Result<(), io::Error> {
+        let params = tuning_params(sys, &self.options, modulation, probe);
+        let mut buf = params_command(cmd::SET_PARAMS, sys, freq_khz, &params);
         self.transact_checked(&mut buf, "SET_PARAMS")
+    }
+
+    fn probe_catv_modulation(&self, freq_khz: u32) -> Result<u32, io::Error> {
+        // Auto QAM needs USB input packets, hence capture before TUNE. Such
+        // a tune leaks old data even after PURGE. Use a disposable receiver
+        // with no data connection, then CLOSE and OPEN the production stream
+        // with fixed QAM. No old data thread can later StopRequest() the new
+        // stream. Input counting precedes TSMF selection, so probing needs
+        // neither TSMF nor TLV. Unlike px4rec, no probe data socket is needed:
+        // StreamBuffer::Write counts input before ring writes, and
+        // PxMltReceiver::SetCapture starts USB capture independently of readers.
+        // This reader-free probe still needs verification on real hardware.
+        // Never toggle capture on a live data connection.
+        self.open_receiver(system::ISDB_C)?;
+        let result = (|| {
+            self.set_capture(true)?;
+            self.set_params(system::ISDB_C, freq_khz, 0, true)?;
+            self.tune()?;
+            let mut buf = params_command(cmd::GET_PARAMS, 0, 0, &[(3, 0)]);
+            self.transact_checked(&mut buf, "GET_PARAMS")?;
+            let modulation = get_u32(&buf, 24);
+            if modulation != 64 && modulation != 256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid detected QAM: {modulation}"),
+                ));
+            }
+            Ok(modulation)
+        })();
+        let stopped = if self.capturing.load(Ordering::Acquire) {
+            self.set_capture(false)
+        } else {
+            Ok(())
+        };
+        let closed = self.close_receiver();
+        closed?;
+        let modulation = result?;
+        stopped?;
+        Ok(modulation)
     }
 
     fn tune(&self) -> Result<(), io::Error> {
@@ -486,12 +652,52 @@ impl Px4DaemonTuner {
         }
     }
 
+    fn release_receiver(&self) -> Result<(), io::Error> {
+        if self.opened_system.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        self.apply_lnb_power(system::ISDB_T)?;
+        let stopped = if self.capturing.load(Ordering::Acquire) {
+            self.set_capture(false)
+        } else {
+            Ok(())
+        };
+        self.drop_data_socket();
+        self.close_receiver()?;
+        stopped
+    }
+
     // -----------------------------------------------------------------
     // BonDriverTuner-shaped API
     // -----------------------------------------------------------------
 
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
-        let (sys, freq_khz) = space_channel_to_freq(space, channel)?;
+        let (sys, default_freq) = space_channel_to_freq(space, channel)?;
+        let freq_khz = if sys == system::ISDB_C {
+            catv_frequency(channel, self.options.coffset)?
+        } else {
+            default_freq
+        };
+        let mut modulation = self.options.qam.unwrap_or(0);
+        if sys == system::ISDB_C && modulation == 0 {
+            modulation = self
+                .catv_modulations
+                .lock()
+                .map_err(|_| io::Error::other("px4daemon QAM cache lock poisoned"))?
+                .get(&channel)
+                .copied()
+                .unwrap_or(0);
+            if modulation == 0 {
+                // Release the current receiver before the disposable probe.
+                // Cached channels subsequently retain the live retune path.
+                self.release_receiver()?;
+                modulation = self.probe_catv_modulation(freq_khz)?;
+                self.catv_modulations
+                    .lock()
+                    .map_err(|_| io::Error::other("px4daemon QAM cache lock poisoned"))?
+                    .insert(channel, modulation);
+            }
+        }
 
         // Deliberately *not* stopping capture here when the receiver stays
         // open. Capture toggling is what makes re-tuning fragile on this
@@ -514,38 +720,27 @@ impl Px4DaemonTuner {
         // a BonDriver `SetChannel` does anyway.
 
         // A receiver is opened for one system at a time; crossing between
-        // terrestrial and satellite means re-opening it, and that *does*
+        // terrestrial, satellite and CATV means re-opening it, and that *does*
         // invalidate the data socket (a new `OPEN` yields a new `data_id`).
         let opened = self.opened_system.load(Ordering::Acquire) as u32;
         if opened != sys {
-            if opened != 0 {
-                if self.capturing.load(Ordering::Acquire) {
-                    let _ = self.set_capture(false);
-                }
-                self.drop_data_socket();
-                self.close_receiver();
-            }
+            self.release_receiver()?;
             self.open_receiver(sys)?;
         }
 
         self.apply_lnb_power(sys)?;
-        self.set_params(sys, freq_khz)?;
+        let needs_data = self.data.lock().map(|g| g.is_none()).unwrap_or(true);
+        if needs_data {
+            // Attach before capture: doing this afterwards loses the first
+            // daemon-buffer-sized chunk during simultaneous tuner startup.
+            self.attach_data_socket()?;
+        }
+        self.set_params(sys, freq_khz, modulation, false)?;
         self.tune()?;
+        self.purge_ts_stream();
         if !self.capturing.load(Ordering::Acquire) {
             self.set_capture(true)?;
         }
-
-        // Always reconnect when we do not already hold a socket — which,
-        // after the capture stop above, is every re-tune. See that comment
-        // for why an existing socket cannot be reused across a capture stop.
-        let needs_data = self.data.lock().map(|g| g.is_none()).unwrap_or(true);
-        if needs_data {
-            self.attach_data_socket()?;
-        }
-
-        // Drop whatever the previous channel left in the daemon's ring so the
-        // caller does not start the new channel by reading the old one.
-        self.purge_ts_stream();
 
         self.current_space.store(space as i32, Ordering::Release);
         info!(
@@ -605,7 +800,8 @@ impl Px4DaemonTuner {
         }
     }
 
-    /// Read TS. Returns `(bytes_read, remaining)`; the daemon does not report
+    /// Read raw TS or TLV without packet alignment or truncation.
+    /// Returns `(bytes_read, remaining)`; the daemon does not report
     /// a backlog, so `remaining` is always 0.
     pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
         let mut guard = self
@@ -658,6 +854,7 @@ impl Px4DaemonTuner {
             0 => Some("GR".to_string()),
             1 => Some("BS".to_string()),
             2 => Some("CS".to_string()),
+            3 => Some("CATV".to_string()),
             _ => None,
         }
     }
@@ -667,6 +864,7 @@ impl Px4DaemonTuner {
             0 if channel <= 49 => Some(format!("GR{}", channel + 13)),
             1 if channel <= 11 => Some(format!("BS{}", channel * 2 + 1)),
             2 if channel <= 11 => Some(format!("CS{}", channel * 2 + 2)),
+            3 if channel <= 50 => Some(format!("C{}", channel + 13)),
             _ => None,
         }
     }
@@ -704,7 +902,9 @@ impl Drop for Px4DaemonTuner {
             let _ = self.apply_lnb_power(system::ISDB_T);
         }
         if self.opened_system.load(Ordering::Acquire) != 0 {
-            self.close_receiver();
+            if let Err(e) = self.close_receiver() {
+                warn!("[px4daemon] CLOSE failed: {e}");
+            }
         }
         debug!("[px4daemon] receiver index {} released", self.index);
     }
@@ -720,7 +920,7 @@ mod tests {
             parse_path("px4daemon:3").unwrap(),
             (
                 3,
-                false,
+                ReceiverOptions::default(),
                 DEFAULT_CTRL_SOCK.to_string(),
                 DEFAULT_DATA_SOCK.to_string()
             )
@@ -730,8 +930,8 @@ mod tests {
 
         // LNB power is opt-in per receiver.
         let (idx, lnb, _, _) = parse_path("px4daemon:2+lnb").unwrap();
-        assert_eq!((idx, lnb), (2, true));
-        assert!(!parse_path("px4daemon:2").unwrap().1);
+        assert_eq!((idx, lnb.lnb), (2, true));
+        assert!(!parse_path("px4daemon:2").unwrap().1.lnb);
 
         let (idx, _, ctrl, data) = parse_path("px4daemon:1@/run/px4_ctrl.sock").unwrap();
         assert_eq!(idx, 1);
@@ -778,6 +978,220 @@ mod tests {
         assert_eq!(
             space_channel_to_freq(2, 11).unwrap(),
             (system::ISDB_S, 2_053_000)
+        );
+    }
+
+    #[test]
+    fn catv_frequencies_include_chset_corrections_and_override() {
+        assert_eq!(
+            space_channel_to_freq(3, 0).unwrap(),
+            (system::ISDB_C, 110_800)
+        );
+        assert_eq!(
+            space_channel_to_freq(3, 9).unwrap(),
+            (system::ISDB_C, 166_725)
+        );
+        assert_eq!(
+            space_channel_to_freq(3, 10).unwrap(),
+            (system::ISDB_C, 224_650)
+        );
+        assert_eq!(
+            space_channel_to_freq(3, 50).unwrap(),
+            (system::ISDB_C, 464_400)
+        );
+        for channel in 0..51 {
+            let physical = if channel < 10 {
+                channel + 3
+            } else {
+                channel + 12
+            };
+            assert_eq!(
+                catv_frequency(channel, Some(0)).unwrap(),
+                93_000 + physical * 6_000 + if physical == 12 { 2_000 } else { 0 }
+            );
+        }
+        assert_eq!(catv_frequency(0, Some(-600)).unwrap(), 110_400);
+        assert!(catv_frequency(0, Some(i32::MIN)).is_err());
+        assert!(catv_frequency(51, None).is_err());
+    }
+
+    #[test]
+    fn parses_catv_suffixes_in_any_order_and_rejects_invalid_values() {
+        let (_, options, ctrl, _) =
+            parse_path("px4daemon:any+tlv+coffset=-275+qam=256+lnb+tsmf=14@/run/px4_ctrl.sock")
+                .unwrap();
+        assert_eq!(
+            options,
+            ReceiverOptions {
+                lnb: true,
+                tlv: true,
+                tsmf: Some(14),
+                qam: Some(256),
+                coffset: Some(-275)
+            }
+        );
+        assert_eq!(ctrl, "/run/px4_ctrl.sock");
+        assert_eq!(
+            parse_path("px4daemon:0+tsmf=0+qam=64+coffset=0")
+                .unwrap()
+                .1
+                .qam,
+            Some(64)
+        );
+        let (_, options, _, _) = parse_path("px4daemon:any+tlv").unwrap();
+        assert_eq!(
+            tuning_params(system::ISDB_C, &options, 256, false)[4],
+            (5, 0)
+        );
+        for suffix in [
+            "tsmf=15",
+            "tsmf=-1",
+            "tsmf=",
+            "qam=0",
+            "qam=128",
+            "qam=x",
+            "coffset=2147483648",
+            "coffset=",
+            "unknown",
+            "lnb=1",
+            "tlv=1",
+            "",
+            "lnb+lnb",
+        ] {
+            assert!(
+                parse_path(&format!("px4daemon:0+{suffix}")).is_err(),
+                "{suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_length_params_match_cpp_wire_layout() {
+        let plain = params_command(cmd::SET_PARAMS, system::ISDB_T, 473_143, &[]);
+        assert_eq!(plain.len(), 28);
+        assert_eq!(get_u32(&plain, 16), 0);
+        let options = ReceiverOptions {
+            tsmf: Some(14),
+            tlv: true,
+            ..Default::default()
+        };
+        let params = tuning_params(system::ISDB_C, &options, 256, false);
+        let wire = params_command(cmd::SET_PARAMS, system::ISDB_C, 166_725, &params);
+        let words: Vec<u32> = wire
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            vec![17, 0, 0x40, 166_725, 7, 1, 6, 2, 5274, 3, 256, 4, 1, 5, 14, 6, 0, 7, 1]
+        );
+        assert_eq!(wire.len(), 76);
+        let normal = tuning_params(system::ISDB_C, &ReceiverOptions::default(), 64, false);
+        assert_eq!(normal, vec![(1, 6), (2, 5274), (3, 64)]);
+        assert_eq!(
+            params_command(cmd::SET_PARAMS, system::ISDB_C, 110_800, &normal).len(),
+            44
+        );
+        assert_eq!(
+            tuning_params(system::ISDB_C, &options, 0, true),
+            vec![(1, 6), (2, 5274), (3, 0)]
+        );
+        assert!(tuning_params(system::ISDB_S, &options, 256, false).is_empty());
+        let tsmf = ReceiverOptions {
+            tsmf: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            params_command(
+                cmd::SET_PARAMS,
+                system::ISDB_C,
+                166_725,
+                &tuning_params(system::ISDB_C, &tsmf, 256, false)
+            )
+            .len(),
+            68
+        );
+        let get = params_command(cmd::GET_PARAMS, 0, 0, &[(3, 0)]);
+        assert_eq!(
+            (get.len(), get_u32(&get, 0), get_u32(&get, 20)),
+            (28, 16, 3)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running DriverHost_PX4 and ISDB-C CATV signal"]
+    fn hardware_catv_c13_streams_ts() {
+        let path =
+            std::env::var("PX4_TEST_CATV_RECEIVER").unwrap_or_else(|_| "px4daemon:any".to_string());
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+        tuner.set_channel(3, 0).expect("tune C13");
+        assert!(tuner.check_lock());
+        let mut bytes = Vec::new();
+        let mut buf = vec![0; 65536];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bytes.len() < 188 * 1000 && std::time::Instant::now() < deadline {
+            if tuner.wait_ts_stream(200) {
+                match tuner.get_ts_stream(&mut buf) {
+                    Ok((n, _)) => bytes.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("C13 read failed: {e}"),
+                }
+            }
+        }
+        assert!(
+            bytes.len() >= 188 * 1000,
+            "insufficient TS: {} bytes",
+            bytes.len()
+        );
+        for packet in bytes.chunks_exact(188) {
+            assert_eq!(packet[0], 0x47);
+            assert_eq!(packet[1] & 0x80, 0, "TS transport error");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a running DriverHost_PX4 and C22 TSMF/TLV CATV signal"]
+    fn hardware_catv_c22_streams_contiguous_tlv() {
+        let path = std::env::var("PX4_TEST_TLV_RECEIVER")
+            .unwrap_or_else(|_| "px4daemon:any+tlv".to_string());
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+        tuner.set_channel(3, 9).expect("tune C22");
+        assert!(tuner.check_lock());
+        let mut pending = Vec::new();
+        let mut buf = vec![0; 65536];
+        let mut packets = 0;
+        let mut total = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while packets < 1000 && std::time::Instant::now() < deadline {
+            if !tuner.wait_ts_stream(200) {
+                continue;
+            }
+            match tuner.get_ts_stream(&mut buf) {
+                Ok((n, _)) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    total += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("C22 read failed: {e}"),
+            }
+            // TLV: sync/type/big-endian payload length. Preserve incomplete
+            // packets between reads; never resynchronize by skipping bytes.
+            let mut consumed = 0;
+            while pending.len() - consumed >= 4 {
+                let header = &pending[consumed..consumed + 4];
+                assert_eq!(header[0], 0x7f, "lost TLV boundary at packet {packets}");
+                let size = 4 + usize::from(u16::from_be_bytes([header[2], header[3]]));
+                if pending.len() - consumed < size {
+                    break;
+                }
+                consumed += size;
+                packets += 1;
+            }
+            pending.drain(..consumed);
+        }
+        assert!(
+            packets >= 1000,
+            "only {packets} TLV packets / {total} bytes"
         );
     }
 
@@ -962,6 +1376,7 @@ mod tests {
         assert!(space_channel_to_freq(0, 50).is_err());
         assert!(space_channel_to_freq(1, 12).is_err());
         assert!(space_channel_to_freq(2, 12).is_err());
-        assert!(space_channel_to_freq(3, 0).is_err());
+        assert!(space_channel_to_freq(3, 51).is_err());
+        assert!(space_channel_to_freq(4, 0).is_err());
     }
 }

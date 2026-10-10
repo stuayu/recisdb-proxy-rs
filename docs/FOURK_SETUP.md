@@ -565,3 +565,63 @@ table_idをそれぞれ `0x4E`、`0x50..0x5F`へ写す。よって `epg_collecto
 
 Rust での再実装は MMT/TLV 逆多重化・MPU/MFU 再構成・MMT-SI→PSI/SI 変換・
 ACAS (AES)・ARIB B24 変換を全部書くことになり、得るものに対して割に合わない。
+
+## macOS の CATV トラモジ (ISDB-C / TSMF / 生TLV)
+
+`px4daemon:` バックエンドは DriverHost_PX4 の ISDB-C 対応を利用できます。
+物理チューニング空間 3 は `CATV`、channel 0〜50 は C13〜C63 です。
+既存の空間 0 (GR)、1 (BS)、2 (CS) の番号は変更しません。
+C13〜C22 は物理 ch 3〜12、C23〜C63 は物理 ch 22〜62 に対応します。
+中心周波数は `93000 + 物理ch × 6000` kHz (物理 ch 12 のみ +2000 kHz) に、
+px4_drv の `winusb/pkg/BonDriver_PX4/BonDriver_PX4-C.ChSet.txt` の CATV 空間の
+第7項目を既定の補正として加えます。回線に合わせて `+coffset` で上書きできます。
+
+パスは `px4daemon:<受信機index|any>[+接尾辞…][@制御ソケット]` です。
+接尾辞は順不同で併用でき、未知の接尾辞・不正値・重複指定はエラーになります。
+
+| 接尾辞 | 意味 |
+|---|---|
+| `+lnb` | ISDB-S 選局時だけ LNB 給電を有効化 |
+| `+tsmf=0`〜`+tsmf=14` | CATV 選局で TSMF の Relative stream を選択 (slot offset は 0) |
+| `+tlv` | TSMF の生TLV出力。`+tsmf` がなければ Relative stream 0 |
+| `+qam=64` / `+qam=256` | CATV の変調方式を固定。省略時は自動判定 |
+| `+coffset=-275` | CATV 全チャンネルで使う固定周波数補正 (符号付き kHz) |
+
+例: `px4daemon:any+tlv+qam=256` を `stream_format='mmttlv'` で登録すると、
+C22 は space=3/channel=9、C23 は space=3/channel=10 で選局できます。
+**`+tlv` は生TLVを返すため、必ず `bon_drivers.stream_format='mmttlv'` で登録します。**
+188バイト TS 境界を前提にした B25・同期整列・SI解析へ直接渡せません。
+既存の `tuner/mmt_pipe.rs` が dantto4k へ渡し、TS 変換・復号後に broadcast します。
+
+変調方式の自動判定は、使い捨ての受信機セッションで capture を開始してから
+SET_PARAMS (MODULATION=0) → TUNE → GET_PARAMS を実行し、確定した64/256QAMを読みます。
+そのセッションを停止・CLOSE して、本番用に OPEN し直して固定QAMで選局します。
+判定結果はチャンネルごとに保持します。USB 入力パケット数を確認するために capture が
+必要ですが、capture 中の選局では PURGE 後も旧データが漏れるため、この二段階に分けます。
+判定用セッションは px4rec と異なりデータソケットを接続しません。
+ReceiverBase::StreamBuffer::Write の入力計数はリング書込みより前で、
+PxMltReceiver::SetCapture(true) が受信を開始するため、データ購読は不要です。
+旧データ接続の終了処理が本番ストリームを停止する競合も避けられます。
+この購読なしの判定手順はコード上の確認に留まり、recisdb-proxy での実機検証は未実施です。
+
+初回の本番選局はデータ接続・SET_DATA_ID → SET_PARAMS → TUNE → PURGE → capture開始です。
+既知のQAMへの再選局は従来どおり capture を止めず SET_PARAMS → TUNE → PURGE とします。
+ISDB-T/S/C の系統を跨ぐ選局では OPEN し直します。
+
+CATV スキャンは C13〜C63 の全51チャンネルを対象とします。
+物理空間 0〜2 の番号は保持されますが、スキャンで DB に局が増えると、
+クライアント向け仮想インデックスが変わる場合があります。
+スキャン後は TVTest の `.ch2` / EDCB の ChSet を再生成してください。
+
+実機テストは通常の `cargo test` では実行されません。CATV 信号とデーモンがある環境で、
+対象だけを明示して実行してください。
+
+```bash
+cargo test -p recisdb-proxy hardware_catv_c13_streams_ts -- --ignored --nocapture
+cargo test -p recisdb-proxy hardware_catv_c22_streams_contiguous_tlv -- --ignored --nocapture
+```
+
+`PX4_TEST_CATV_RECEIVER` (既定 `px4daemon:any`) と `PX4_TEST_TLV_RECEIVER`
+(既定 `px4daemon:any+tlv`) で受信機パスを変更できます。
+C13 テストは TS の同期と TEI、C22 テストは 0x7F 同期と長さフィールドを使い、
+読み取りチャンクを跨いでも連続した TLV パケット境界が保たれることを確認します。

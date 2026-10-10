@@ -529,6 +529,18 @@ fn enumerate_spaces_and_channels_blocking(
     Ok(plans)
 }
 
+fn px4_catv_requires_complete_scan(dll_path: &str, space: u32) -> bool {
+    #[cfg(unix)]
+    {
+        space == 3 && dll_path.starts_with(crate::bondriver::PX4_DAEMON_PATH_PREFIX)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dll_path, space);
+        false
+    }
+}
+
 /// Scan channels in a space by enumerating BonDriver's channel list.
 /// This runs in a blocking thread to avoid Send/Sync issues with raw pointers.
 fn scan_space_blocking(
@@ -552,6 +564,10 @@ fn scan_space_blocking(
         channels.len()
     );
 
+    // CATV allocations can contain long empty ranges (e.g. C48-C55), with
+    // receivable carriers beyond them. Keep scanning the complete enumerated
+    // CATV space instead of treating consecutive no-lock results as its end.
+    let scan_complete_space = px4_catv_requires_complete_scan(dll_path, space);
     let mut results = Vec::new();
     let mut consecutive_set_channel_failures: u32 = 0;
     let mut consecutive_eagain: u32 = 0;
@@ -603,7 +619,7 @@ fn scan_space_blocking(
             // the same way — skip the rest to avoid 5s × N channel delays.
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 consecutive_eagain += 1;
-                if consecutive_eagain >= MAX_CONSECUTIVE_EAGAIN {
+                if !scan_complete_space && consecutive_eagain >= MAX_CONSECUTIVE_EAGAIN {
                     warn!(
                         "scan_space_blocking: {} consecutive EAGAIN on space {} — satellite signal unavailable (no dish/LNB?), skipping space",
                         consecutive_eagain, space
@@ -617,7 +633,8 @@ fn scan_space_blocking(
             consecutive_set_channel_failures += 1;
             total_set_channel_failures += 1;
 
-            if results.is_empty()
+            if !scan_complete_space
+                && results.is_empty()
                 && total_set_channel_failures >= MAX_SET_CHANNEL_FAILURES_WITHOUT_SUCCESS
             {
                 warn!(
@@ -628,7 +645,9 @@ fn scan_space_blocking(
                 break;
             }
 
-            if consecutive_set_channel_failures >= MAX_CONSECUTIVE_SET_CHANNEL_FAILURES {
+            if !scan_complete_space
+                && consecutive_set_channel_failures >= MAX_CONSECUTIVE_SET_CHANNEL_FAILURES
+            {
                 warn!(
                     "scan_space_blocking: Aborting space {} after {} consecutive SetChannel failures",
                     space,
@@ -1355,6 +1374,16 @@ async fn perform_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn px4_catv_scans_beyond_empty_carrier_ranges() {
+        assert!(px4_catv_requires_complete_scan("px4daemon:any+tlv", 3));
+        assert!(px4_catv_requires_complete_scan("px4daemon:0", 3));
+        assert!(!px4_catv_requires_complete_scan("px4daemon:0", 0));
+        assert!(!px4_catv_requires_complete_scan("px4daemon:0", 2));
+        assert!(!px4_catv_requires_complete_scan("/dev/px4video0", 3));
+    }
 
     // uhf_channel_from_frequency のテストは定義元
     // (`ts_analyzer/nit.rs`) へ移動した。
