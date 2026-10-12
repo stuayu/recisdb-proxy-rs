@@ -158,6 +158,11 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 - 書き込みは `EpgWriter`(`main.rs` で1度だけ spawn)経由のみ:
   - メモリ上で `(nid, sid, tsid, event_id)` デデュープ後、**10秒間隔 or 500件到達**でフラッシュ
     (1トランザクションで一括UPSERT)。
+    デデュープは**置き換えではなく統合**で行う(`merge_batched`)。scheduleは基本情報(番組名・
+    概要・ジャンル、table 0x50系)と拡張記述(table 0x58系)が別sectionで届き、同じキーになる。
+    新しい方で丸ごと置き換えると、同じ窓に両方届いたとき片方が捨てられ、番組名の無い行が残る。
+    同じversionのsectionは再送されてもcollectorが捨てるため、次にversionが変わるまで埋まらない
+    (実機のDBで主要TVサービスの未来番組6414行中3970行が番組名NULLだった、2026-10)。
   - UPSERT は `WHERE excluded.updated_at >= programs.updated_at` 付きで、
     古いバッチが新しい行を上書きしない。
   - **prune**: 30フラッシュごと(≒5分)に、終了時刻が現在より24時間以上前の行を削除。

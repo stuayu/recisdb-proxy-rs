@@ -102,9 +102,7 @@ impl EpgWriter {
                             let key = (record.nid, record.sid, record.tsid, record.event_id, record.source as u8);
                             match batch.entry(key) {
                                 Entry::Occupied(mut e) => {
-                                    if record.updated_at >= e.get().updated_at {
-                                        e.insert(record);
-                                    }
+                                    merge_batched(e.get_mut(), record);
                                 }
                                 Entry::Vacant(e) => {
                                     e.insert(record);
@@ -193,5 +191,129 @@ impl EpgWriter {
                 warn!("[EpgWriter] failed to refresh coverage after prune: {}", e);
             }
         }
+    }
+}
+
+/// 同じ番組・同じ系統(p/f / schedule)の行がフラッシュ前に重なったときの統合。
+///
+/// schedule は基本情報(番組名・概要・ジャンル = table 0x50 系)と拡張記述
+/// (table 0x58 系)が**別の section** で届き、どちらも同じキーになる。新しい方で
+/// 丸ごと置き換えると、10秒のフラッシュ窓に両方届いたとき片方が捨てられ、
+/// 番組名の無い行や詳細の無い行が残る(同じ version の section は再送されても
+/// collector が捨てるので、次に version が変わるまで埋まらない)。
+/// DB の UPSERT と同じく、記述子の系統ごとに新しい方を採る。
+fn merge_batched(existing: &mut ProgramUpsert, incoming: ProgramUpsert) {
+    if incoming.updated_at >= existing.updated_at {
+        existing.start_at = incoming.start_at;
+        existing.duration_secs = incoming.duration_secs;
+        existing.free_ca_mode = incoming.free_ca_mode;
+        existing.updated_at = incoming.updated_at;
+    }
+    if incoming.basic_updated_at.is_some() && incoming.basic_updated_at >= existing.basic_updated_at
+    {
+        // UPSERT と同じく、基本記述子の中で欠けている項目は既存値を残す。
+        existing.name = incoming.name.or(existing.name.take());
+        existing.description = incoming.description.or(existing.description.take());
+        existing.genre = incoming.genre.or(existing.genre);
+        existing.basic_updated_at = incoming.basic_updated_at;
+    }
+    if incoming.extended_updated_at.is_some()
+        && incoming.extended_updated_at >= existing.extended_updated_at
+    {
+        existing.extended = incoming.extended.or(existing.extended.take());
+        existing.extended_updated_at = incoming.extended_updated_at;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::EpgSource;
+
+    fn row(updated_at: i64) -> ProgramUpsert {
+        ProgramUpsert {
+            nid: 1,
+            sid: 2,
+            tsid: 3,
+            event_id: 4,
+            start_at: 1000,
+            duration_secs: 600,
+            free_ca_mode: false,
+            name: None,
+            description: None,
+            extended: None,
+            genre: None,
+            updated_at,
+            source: EpgSource::Schedule,
+            basic_updated_at: None,
+            extended_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn schedule_basic_and_extended_in_one_batch_keep_both() {
+        // table 0x50 (番組名) のあとに table 0x58 (拡張記述) が同じ窓で届く。
+        let mut batched = ProgramUpsert {
+            name: Some("番組".into()),
+            description: Some("概要".into()),
+            genre: Some(0x21),
+            basic_updated_at: Some(10),
+            ..row(10)
+        };
+        merge_batched(
+            &mut batched,
+            ProgramUpsert {
+                extended: Some("出演者: A".into()),
+                extended_updated_at: Some(11),
+                ..row(11)
+            },
+        );
+        assert_eq!(batched.name.as_deref(), Some("番組"));
+        assert_eq!(batched.description.as_deref(), Some("概要"));
+        assert_eq!(batched.genre, Some(0x21));
+        assert_eq!(batched.extended.as_deref(), Some("出演者: A"));
+        assert_eq!(batched.updated_at, 11);
+        assert_eq!(batched.basic_updated_at, Some(10));
+        assert_eq!(batched.extended_updated_at, Some(11));
+    }
+
+    #[test]
+    fn extended_then_basic_in_one_batch_keep_both() {
+        let mut batched = ProgramUpsert {
+            extended: Some("出演者: A".into()),
+            extended_updated_at: Some(10),
+            ..row(10)
+        };
+        merge_batched(
+            &mut batched,
+            ProgramUpsert {
+                name: Some("番組".into()),
+                basic_updated_at: Some(10),
+                ..row(10)
+            },
+        );
+        assert_eq!(batched.name.as_deref(), Some("番組"));
+        assert_eq!(batched.extended.as_deref(), Some("出演者: A"));
+    }
+
+    #[test]
+    fn older_row_does_not_replace_newer_timing_or_text() {
+        let mut batched = ProgramUpsert {
+            name: Some("新".into()),
+            basic_updated_at: Some(20),
+            start_at: 2000,
+            ..row(20)
+        };
+        merge_batched(
+            &mut batched,
+            ProgramUpsert {
+                name: Some("旧".into()),
+                basic_updated_at: Some(10),
+                ..row(10)
+            },
+        );
+        assert_eq!(batched.name.as_deref(), Some("新"));
+        assert_eq!(batched.start_at, 2000);
+        assert_eq!(batched.updated_at, 20);
     }
 }
