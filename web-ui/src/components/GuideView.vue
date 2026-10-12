@@ -718,13 +718,13 @@ const services = computed<Service[]>(() => {
       remoteControlKey: Number.isFinite(remote) ? remote : null,
       region: row.terrestrial_region == null ? null : String(row.terrestrial_region),
       prefectureCode: row.prefecture_code == null ? null : Number(row.prefecture_code),
+      wideAreaPrefectures: Array.isArray(row.wide_area_prefectures)
+        ? row.wide_area_prefectures.map(String)
+        : [],
     })
   }
   return sortServices([...seen.values()])
 })
-      wideAreaPrefectures: Array.isArray(row.wide_area_prefectures)
-        ? row.wide_area_prefectures.map(String)
-        : [],
 const mainSidByGroup = computed(() => {
   const result = new Map<string, number>()
   for (const service of mainGuideServices(services.value)) {
