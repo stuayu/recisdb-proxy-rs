@@ -313,6 +313,10 @@ impl Database {
             "040_programs_event_group_sharing",
             Database::migration_040_programs_event_group_sharing,
         ),
+        (
+            "041_boncaslink_settings",
+            Database::migration_041_boncaslink_settings,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -331,6 +335,66 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_programs_nid_tsid_start_at
              ON programs(nid, tsid, start_at)",
         )?;
+        Ok(())
+    }
+
+    fn migration_041_boncaslink_settings(&self) -> Result<()> {
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS boncaslink_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS boncaslink_network_readers (nid INTEGER PRIMARY KEY, reader TEXT NOT NULL);")?;
+        Ok(())
+    }
+
+    pub fn get_boncaslink_setting(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM boncaslink_settings WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn get_boncaslink_network_readers(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT nid, reader FROM boncaslink_network_readers ORDER BY nid")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((format!("{:04X}", r.get::<_, u16>(0)?), r.get(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_boncaslink_settings(
+        &self,
+        b25: &Option<String>,
+        fourk: &Option<String>,
+        readers: &std::collections::HashMap<u16, String>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (key, value) in [("b25", b25), ("mmttlv", fourk)] {
+            match value {
+                Some(value) => {
+                    tx.execute("INSERT INTO boncaslink_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![key,value])?;
+                }
+                None => {
+                    tx.execute("DELETE FROM boncaslink_settings WHERE key=?1", [key])?;
+                }
+            }
+        }
+        tx.execute("DELETE FROM boncaslink_network_readers", [])?;
+        for (nid, reader) in readers {
+            tx.execute(
+                "INSERT INTO boncaslink_network_readers(nid,reader) VALUES(?1,?2)",
+                rusqlite::params![nid, reader],
+            )?;
+        }
+        tx.execute("INSERT INTO boncaslink_settings(key,value) VALUES('network_readers','1') ON CONFLICT(key) DO UPDATE SET value='1'", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -511,11 +575,7 @@ impl Database {
             |row| row.get(0),
         )?;
         if health_table {
-            self.add_column_if_not_exists(
-                "node_path_health",
-                "connect_success_rate",
-                "REAL",
-            )?;
+            self.add_column_if_not_exists("node_path_health", "connect_success_rate", "REAL")?;
         }
         Ok(())
     }
@@ -550,7 +610,8 @@ impl Database {
     pub fn get_guide_display_config(&self) -> Result<Option<String>> {
         Ok(self.conn.query_row(
             "SELECT default_region FROM guide_display_config WHERE id = 1",
-            [], |row| row.get(0),
+            [],
+            |row| row.get(0),
         )?)
     }
 
@@ -568,20 +629,28 @@ impl Database {
             "SELECT DISTINCT nid, terrestrial_region FROM channels
              WHERE terrestrial_region IS NOT NULL",
         )?;
-        let mut values = stmt.query_map([], |row| {
-            Ok((row.get::<_, i32>(0)? as u16, row.get::<_, String>(1)?))
-        })?
+        let mut values = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i32>(0)? as u16, row.get::<_, String>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         values.retain(|(nid, name)| {
-            matches!(recisdb_protocol::broadcast_region::classify_nid(*nid).0, recisdb_protocol::types::BroadcastType::Terrestrial)
-                && recisdb_protocol::broadcast_region::prefecture_code(name).is_some()
+            matches!(
+                recisdb_protocol::broadcast_region::classify_nid(*nid).0,
+                recisdb_protocol::types::BroadcastType::Terrestrial
+            ) && recisdb_protocol::broadcast_region::prefecture_code(name).is_some()
         });
-        values.sort_by_key(|(_, name)| recisdb_protocol::broadcast_region::prefecture_code(name).unwrap_or(u8::MAX));
+        values.sort_by_key(|(_, name)| {
+            recisdb_protocol::broadcast_region::prefecture_code(name).unwrap_or(u8::MAX)
+        });
         let mut names = values.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
         names.dedup();
-        Ok(names.into_iter().filter_map(|name| {
-            recisdb_protocol::broadcast_region::prefecture_code(&name).map(|code| (name, code))
-        }).collect())
+        Ok(names
+            .into_iter()
+            .filter_map(|name| {
+                recisdb_protocol::broadcast_region::prefecture_code(&name).map(|code| (name, code))
+            })
+            .collect())
     }
 
     /// Migration 024: BonDriver runtime health (startup latency, stalls,
@@ -860,6 +929,19 @@ impl Database {
                 |row| row.get::<_, i64>(0),
             )
             .ok()
+    }
+
+    /// Network ID of a scanned BonDriver channel, when known.
+    pub fn nid_for_bon_channel(&self, dll_path: &str, space: u32, channel: u32) -> Option<u16> {
+        self.conn
+            .query_row(
+                "SELECT c.nid FROM channels c JOIN bon_drivers d ON d.id=c.bon_driver_id
+                 WHERE d.dll_path=?1 AND c.bon_space=?2 AND c.bon_channel=?3 LIMIT 1",
+                rusqlite::params![dll_path, space, channel],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|nid| u16::try_from(nid).ok())
     }
 
     /// Set the per-driver B25 override.

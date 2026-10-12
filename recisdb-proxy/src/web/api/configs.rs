@@ -940,6 +940,191 @@ pub async fn update_card_reader(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BonCasLinkUpdate {
+    pub b25_server: String,
+    pub mmttlv_server: String,
+    pub network_readers: Vec<BonCasLinkNetworkReader>,
+}
+#[derive(Debug, Deserialize)]
+pub struct BonCasLinkNetworkReader {
+    pub nid: String,
+    pub reader: String,
+}
+#[derive(Debug, Deserialize)]
+pub struct BonCasLinkTestRequest {
+    pub address: String,
+}
+
+fn valid_boncas_address(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let addr = raw.strip_prefix("boncaslink://").unwrap_or(raw);
+    b25_sys::normalize_boncaslink_address(addr)
+}
+
+pub async fn get_boncaslink(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db = state.database.lock().await;
+    let b25 = db.get_boncaslink_setting("b25")?;
+    let mmttlv = db.get_boncaslink_setting("mmttlv")?;
+    let has_readers = db.get_boncaslink_setting("network_readers")?.is_some();
+    let configured = db.get_boncaslink_network_readers()?;
+    drop(db);
+    let pcsc = tokio::task::spawn_blocking(b25_sys::list_card_readers)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let toml = &state.boncaslink_toml;
+    let resolved_b25 = crate::resolve_boncaslink_value(b25, toml.0.clone());
+    let resolved_mmttlv = crate::resolve_boncaslink_value(mmttlv, toml.1.clone());
+    let readers = if has_readers {
+        configured
+    } else {
+        toml.2.clone()
+    };
+    let nids = readers.iter().map(|(nid,value)| json!({"nid":u16::from_str_radix(nid,16).unwrap_or(0),"value":value,"source":if has_readers{"db"}else{"toml"}})).collect::<Vec<_>>();
+    Ok(Json(
+        json!({"success":true,"b25":{"value":resolved_b25.value,"source":resolved_b25.source},"mmttlv":{"value":resolved_mmttlv.value,"source":resolved_mmttlv.source},"network_readers":nids,"readers":pcsc}),
+    ))
+}
+
+pub async fn update_boncaslink(
+    State(state): State<Arc<WebState>>,
+    Json(payload): Json<BonCasLinkUpdate>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let b25 = if payload.b25_server.trim().is_empty() {
+        String::new()
+    } else {
+        valid_boncas_address(&payload.b25_server)
+            .map_err(|e| ApiError::bad_request(format!("b25_server: {e}")))?
+    };
+    let fourk = if payload.mmttlv_server.trim().is_empty() {
+        String::new()
+    } else {
+        valid_boncas_address(&payload.mmttlv_server)
+            .map_err(|e| ApiError::bad_request(format!("mmttlv_server: {e}")))?
+    };
+    let mut rows = std::collections::HashMap::new();
+    for row in payload.network_readers {
+        let digits = row
+            .nid
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        let nid = u16::from_str_radix(digits, 16).map_err(|_| {
+            ApiError::bad_request(format!(
+                "network_readers nid {:?} must be hexadecimal u16",
+                row.nid
+            ))
+        })?;
+        if digits.is_empty() || digits.len() > 4 {
+            return Err(ApiError::bad_request(format!("network_readers nid {:?} must contain 1 to 4 hexadecimal digits", row.nid)));
+        }
+        let reader = row.reader.trim();
+        if reader.is_empty() || reader.chars().count() >= 1024 || reader.as_bytes().contains(&0) {
+            return Err(ApiError::bad_request(format!("network_readers {:04X}: reader must be non-empty, under 1024 bytes, and contain no NUL",nid)));
+        }
+        let reader = if let Some(addr) = reader.strip_prefix("boncaslink://") {
+            format!(
+                "boncaslink://{}",
+                valid_boncas_address(addr).map_err(|e| ApiError::bad_request(format!(
+                    "network_readers {:04X}: {e}",
+                    nid
+                )))?
+            )
+        } else {
+            reader.to_owned()
+        };
+        if rows.insert(nid, reader).is_some() {
+            return Err(ApiError::bad_request(format!(
+                "duplicate network_readers NID {:04X}",
+                nid
+            )));
+        }
+    }
+    {
+        let db = state.database.lock().await;
+        db.set_boncaslink_settings(&Some(b25.clone()), &Some(fourk.clone()), &rows)?;
+    }
+    b25_sys::set_boncaslink_server(if b25.is_empty() { None } else { Some(&b25) })
+        .map_err(|e| ApiError::bad_request(e))?;
+    let string_rows = rows
+        .iter()
+        .map(|(n, r)| (format!("{:04X}", n), r.clone()))
+        .collect();
+    crate::apply_network_card_reader_selections(&string_rows);
+    state
+        .tuner_pool
+        .set_mmt_boncaslink_server(if fourk.is_empty() { None } else { Some(fourk) })
+        .await;
+    Ok(Json(
+        json!({"success":true,"message":"Saved; settings apply when the next tuner starts."}),
+    ))
+}
+
+pub async fn test_boncaslink(
+    Json(payload): Json<BonCasLinkTestRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let address = valid_boncas_address(&payload.address)
+        .map_err(|e| ApiError::bad_request(format!("address: {e}")))?;
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || boncaslink_tcp_connect(&address)),
+    )
+    .await
+    {
+        Ok(joined) => joined.map_err(|e| ApiError::internal(e.to_string()))?,
+        Err(_) => Err("connection test timed out after 3 seconds".to_owned()),
+    };
+    Ok(Json(match result {
+        Ok(()) => json!({"success":true,"ok":true}),
+        Err(error) => json!({"success":true,"ok":false,"error":error}),
+    }))
+}
+
+fn boncaslink_tcp_connect(address: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let endpoints = address
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err("address resolved to no endpoints".to_owned());
+    }
+    let mut last = String::new();
+    for endpoint in endpoints {
+        match std::net::TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(3)) {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
+#[cfg(test)]
+mod boncaslink_connection_tests {
+    use super::boncaslink_tcp_connect;
+    use std::net::TcpListener;
+
+    #[test]
+    fn connects_to_a_mock_tcp_listener_without_sending_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        boncaslink_tcp_connect(&address).unwrap();
+        let (mut stream, _) = accept.join().unwrap();
+        use std::io::Read;
+        stream.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        let result = stream.read(&mut byte);
+        assert!(match result {
+            Ok(0) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+            _ => false,
+        });
+    }
+}
+
 // ============================================================================
 // Browser-preview auto-setup (`POST /api/preview-config/auto-setup`)
 // ============================================================================

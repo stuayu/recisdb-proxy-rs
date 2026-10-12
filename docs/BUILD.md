@@ -76,6 +76,35 @@ Linux/macOS ビルドは PC/SC を**リンクしない**。`b25-sys/src/pcsc_shi
 
 注意: システムに共有 `libaribb25.so` がインストールされていると build.rs はそちらを優先リンクし、その .so 自身が libpcsclite に依存するためシムは効かない。実行時切り替えを使う場合は同梱ビルド(静的 aribb25)にすること。
 
+### BonCasLink 経由のカードリーダー
+
+`recisdb-proxy.toml` の `[b25] boncaslink_server = "host:port"` を初期値として使う。ダッシュボードの「設定 > B-CASカードリーダー > BonCasLink」からも変更でき、保存後は次にチューナーを起動した時点で反映される。
+Linux/macOS/Windows の B25 用 PC/SC 一覧の先頭に `BonCasLink Client Card Reader` を追加する。
+ポート省略時は 6900。接続設定は TOML 専用で Web API から変更できない。
+この項目は地デジ/BS/CS の libaribb25 に使われる。4K の dantto4k 設定は
+`[mmttlv] boncaslink_server` はダッシュボードで設定されていない場合の初期値。
+
+PC/SC シムは BonCasLink の length-prefix APDU プロトコルを使う。カード接続は3秒、
+APDUの送受信は5秒でタイムアウトする。BonCasLink サーバーが無い環境でも、通常の
+ローカル PC/SC リーダーは従来どおり利用できる。
+
+ネットワーク ID ごとにリーダーを固定する場合は、同じファイルの
+`[b25.network_readers]` に NID (16進数) と PC/SC リーダー名、または
+`boncaslink://host:port` を記述する。例:
+
+```toml
+[b25]
+boncaslink_server = "192.168.1.10:6900"
+
+[b25.network_readers]
+"FFFE" = "boncaslink://192.168.1.10:6902"
+"0004" = "SCM Microsystems Inc. SCR33x USB Smart Card Reader 0"
+```
+
+`0x` 接頭辞とキーの大小文字は任意。不正なキー・値は警告して無視する。
+設定表にない NID は Web UI の選択リーダーを使い、未選択なら全リーダーを試す。
+設定は起動時のみ読み込み、Web API では変更できない。
+
 ## クロスビルド: macOS → Linux amd64
 
 macOS (Apple Silicon) 上で `x86_64-unknown-linux-gnu` バイナリを作る手順。2026-07 に検証済み。

@@ -262,10 +262,25 @@ fn b25_known_available() -> bool {
     )
 }
 
-fn init_b25_with_deadline(opt: DecoderOptions) -> Option<B25Pipe> {
+fn init_b25_with_deadline(opt: DecoderOptions, card_reader: Option<&str>) -> Option<B25Pipe> {
+    // The startup probe only tests the Web UI's default reader. A NID-specific
+    // reader may contain a different card (or be the only remote reader), so
+    // it must be tried independently of that cached result.
+    if let Some(card_reader) = card_reader {
+        return match B25Pipe::with_card_reader(opt, Some(card_reader)) {
+            Ok(decoder) => {
+                info!("[SharedTuner] B25 decoder enabled with network-specific reader");
+                Some(decoder)
+            }
+            Err(error) => {
+                error!("[SharedTuner] Failed to init B25 decoder with network-specific reader: {error}");
+                None
+            }
+        };
+    }
     let known = *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
     match known {
-        Some(true) => match B25Pipe::new(opt) {
+        Some(true) => match B25Pipe::with_card_reader(opt, card_reader) {
             Ok(decoder) => {
                 info!("[SharedTuner] B25 decoder enabled");
                 Some(decoder)
@@ -313,6 +328,8 @@ pub struct ReaderStartupConfig {
     /// one card outage away from deleting the video instead of merely wasting
     /// work.
     pub b25_enabled: bool,
+    /// Reader selected for this stream's known network ID, if configured.
+    pub b25_card_reader: Option<String>,
     /// External MMT/TLV→TS converter to run in front of everything else.
     ///
     /// `Some` only for drivers registered as `stream_format = 'mmttlv'` (4K
@@ -335,6 +352,7 @@ impl From<&TunerPoolConfig> for ReaderStartupConfig {
             // Callers that know the source is pre-descrambled turn this off;
             // the pool config alone cannot tell.
             b25_enabled: true,
+            b25_card_reader: None,
             // Set by callers that know the driver delivers MMT/TLV.
             mmt_converter: None,
         }
@@ -801,7 +819,10 @@ impl SharedTuner {
         let claims = self.claims.lock().unwrap();
         !claims.is_empty()
             && claims.values().all(|c| {
-                matches!(c.usage, TunerUsage::EpgActiveScan | TunerUsage::BackgroundScan)
+                matches!(
+                    c.usage,
+                    TunerUsage::EpgActiveScan | TunerUsage::BackgroundScan
+                )
             })
     }
 
@@ -1291,7 +1312,7 @@ impl SharedTuner {
         };
 
         let mut b25 = if startup_config.b25_enabled {
-            init_b25_with_deadline(b25_opt)
+            init_b25_with_deadline(b25_opt, startup_config.b25_card_reader.as_deref())
         } else {
             info!(
                 "[SharedTuner] B25 disabled for {:?} (source is already descrambled)",
@@ -1645,13 +1666,16 @@ impl SharedTuner {
                         && b25_known_available()
                     {
                         b25_init_retried = true;
-                        b25 = init_b25_with_deadline(DecoderOptions {
-                            strip: true,
-                            emm: true,
-                            simd: true,
-                            round: 4,
-                            enable_working_key: false,
-                        });
+                        b25 = init_b25_with_deadline(
+                            DecoderOptions {
+                                strip: true,
+                                emm: true,
+                                simd: true,
+                                round: 4,
+                                enable_working_key: false,
+                            },
+                            startup_config.b25_card_reader.as_deref(),
+                        );
                     }
 
                     // Data validation before B25 decode (log only on first packet)
@@ -2481,6 +2505,7 @@ fn test_startup_config() -> ReaderStartupConfig {
         first_data_grace_ms: 30_000,
         slow_start: false,
         b25_enabled: true,
+        b25_card_reader: None,
         mmt_converter: None,
     }
 }
@@ -3008,6 +3033,7 @@ mod tests {
             first_data_grace_ms: 30_000,
             slow_start: false,
             b25_enabled: true,
+            b25_card_reader: None,
             mmt_converter: None,
         };
         assert_eq!(

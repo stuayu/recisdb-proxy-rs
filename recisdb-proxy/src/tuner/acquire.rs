@@ -486,7 +486,11 @@ pub(crate) async fn snapshot_excluding_claim(
         // subscription set with exclusive from a later one.
         // `incumbent_claim_excluding(None)` also folds every claim's
         // exclusive flag into the lock state (any exclusive claim locks).
-        let excluded = if own_key == Some(&key) { own_claim_id } else { None };
+        let excluded = if own_key == Some(&key) {
+            own_claim_id
+        } else {
+            None
+        };
         let incumbent = tuner.incumbent_claim_excluding(excluded);
         raw_entries.push(RawEntry {
             key,
@@ -911,12 +915,11 @@ pub(crate) async fn acquire(
                 // the only one that already holds the database handle.
                 let (stream_format, band_type, measured_first_ts_ms) = {
                     let db = database.lock().await;
-                    let band_type =
-                        db.band_type_for_bon_channel(&key.tuner_path, space, channel);
-                    startup_config.b25_enabled = b25_enabled_for(
-                        db.driver_disables_b25(&key.tuner_path),
-                        band_type,
-                    );
+                    let band_type = db.band_type_for_bon_channel(&key.tuner_path, space, channel);
+                    let nid = db.nid_for_bon_channel(&key.tuner_path, space, channel);
+                    startup_config.b25_card_reader = crate::network_card_reader(nid);
+                    startup_config.b25_enabled =
+                        b25_enabled_for(db.driver_disables_b25(&key.tuner_path), band_type);
                     (
                         db.driver_stream_format(&key.tuner_path),
                         band_type,
@@ -937,11 +940,9 @@ pub(crate) async fn acquire(
 
                 let slow_start = stream_format.is_mmt_tlv()
                     || band_type == Some(recisdb_protocol::BandType::FourK as i64)
-                    || measured_first_ts_ms
-                        .is_some_and(|latency| {
-                            latency
-                                > pool_config.no_data_timeout_secs.saturating_mul(1_000)
-                        });
+                    || measured_first_ts_ms.is_some_and(|latency| {
+                        latency > pool_config.no_data_timeout_secs.saturating_mul(1_000)
+                    });
                 startup_config.slow_start = slow_start;
                 startup_config.first_data_grace_ms = timing::first_data_grace_ms(
                     pool_config.no_data_timeout_secs,
@@ -1221,6 +1222,7 @@ mod tests {
             first_data_grace_ms: 30_000,
             slow_start: false,
             b25_enabled: true,
+            b25_card_reader: None,
             mmt_converter: None,
         }
     }
@@ -1303,10 +1305,7 @@ mod tests {
         let pool = Arc::new(TunerPool::new(10));
         let database = db_handle_with_driver("/dev/test", max_instances);
         let key = ChannelKey::space_channel("/dev/test", 0, 5);
-        let permit = pool
-            .acquire_slot("/dev/test", max_instances)
-            .await
-            .unwrap();
+        let permit = pool.acquire_slot("/dev/test", max_instances).await.unwrap();
         let tuner = pool
             .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
             .await
@@ -1404,7 +1403,10 @@ mod tests {
     #[test]
     fn background_only_is_true_only_for_epg_or_scan_claims() {
         let tuner = crate::tuner::SharedTuner::new(ChannelKey::simple("/dev/test", 1), 2);
-        assert!(!tuner.is_background_only(), "no claim: may be a starting client");
+        assert!(
+            !tuner.is_background_only(),
+            "no claim: may be a starting client"
+        );
         let epg = tuner.subscribe_with_claim_class(
             -1000,
             false,

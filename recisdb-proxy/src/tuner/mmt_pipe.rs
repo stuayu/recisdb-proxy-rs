@@ -73,6 +73,8 @@ const STALLED_DROP_LIMIT: u64 = 64;
 pub struct MmtConverterConfig {
     /// Path to the `dantto4k` executable.
     pub command_path: String,
+    /// `--bonCasLinkServer <addr>`: descramble through a BonCasLink server.
+    pub boncaslink_server: Option<String>,
     /// `--casProxyServer <addr>`: descramble through a CasProxyServer.
     pub cas_proxy_server: Option<String>,
     /// `--smartCardReaderName <name>`: descramble with a local PC/SC reader.
@@ -103,6 +105,15 @@ pub struct MmtConverterConfig {
 pub fn build_args(config: &MmtConverterConfig) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
+    if let Some(addr) = config
+        .boncaslink_server
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--bonCasLinkServer".to_string());
+        args.push(addr.to_string());
+    }
     if let Some(addr) = config
         .cas_proxy_server
         .as_ref()
@@ -157,6 +168,8 @@ pub fn classify_stderr_line(line: &str) -> Option<ConverterProblem> {
     let lower = line.to_ascii_lowercase();
     if lower.contains("no smart card readers are available")
         || lower.contains("smart card reader not found")
+        || lower.contains("failed to connect to boncaslink server")
+        || lower.contains("boncaslink server")
     {
         return Some(ConverterProblem::NoDescrambler);
     }
@@ -256,8 +269,8 @@ impl ConverterStatus {
                 if n == 1 || n % 100 == 0 {
                     error!(
                         "[MmtPipe] 4K descrambling is not working ({}回目): {}. \
-                         出力TSは復号されていない。CasProxyServerの起動と \
-                         --smartCardReaderName / --casProxyServer の設定を確認",
+                         出力TSは復号されていない。カードサーバーの起動と \
+                         --smartCardReaderName / --casProxyServer / --bonCasLinkServer の設定を確認",
                         n, line
                     );
                 }
@@ -654,6 +667,17 @@ mod tests {
     }
 
     #[test]
+    fn boncaslink_option_is_passed_through() {
+        let args = build_args(&MmtConverterConfig {
+            command_path: "dantto4k".to_string(),
+            boncaslink_server: Some("  192.168.1.10:6900  ".to_string()),
+            ..Default::default()
+        });
+        let pos = args.iter().position(|a| a == "--bonCasLinkServer").unwrap();
+        assert_eq!(args[pos + 1], "192.168.1.10:6900");
+    }
+
+    #[test]
     fn frontend_descrambled_is_opt_in() {
         let default_args = build_args(&MmtConverterConfig {
             command_path: "dantto4k".to_string(),
@@ -685,6 +709,11 @@ mod tests {
         });
         assert!(!args.contains(&"--casProxyServer".to_string()));
         assert!(!args.contains(&"--smartCardReaderName".to_string()));
+        let args = build_args(&MmtConverterConfig {
+            boncaslink_server: Some(" ".into()),
+            ..Default::default()
+        });
+        assert!(!args.contains(&"--bonCasLinkServer".to_string()));
     }
 
     /// The converter exits successfully and writes a full-size TS even when it
@@ -699,6 +728,14 @@ mod tests {
         // Case and surrounding text must not matter.
         assert_eq!(
             classify_stderr_line("  ERROR: no smart card readers are available  "),
+            Some(ConverterProblem::NoDescrambler)
+        );
+        assert_eq!(
+            classify_stderr_line("Failed to connect to BonCasLink server"),
+            Some(ConverterProblem::NoDescrambler)
+        );
+        assert_eq!(
+            classify_stderr_line("BonCasLink server communication failed"),
             Some(ConverterProblem::NoDescrambler)
         );
         // Anything else is just logged.

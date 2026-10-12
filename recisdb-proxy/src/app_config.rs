@@ -22,6 +22,7 @@ use log::{error, info};
 
 use crate::Args;
 
+
 /// Configuration file format.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct ConfigFile {
@@ -37,6 +38,8 @@ pub struct ConfigFile {
     pub preview: PreviewSection,
     #[serde(default)]
     pub mmttlv: MmtTlvSection,
+    #[serde(default)]
+    pub b25: B25Section,
     #[serde(default)]
     pub mirakurun: MirakurunSection,
     #[serde(default)]
@@ -134,6 +137,8 @@ pub struct TsreplaceSection {
 pub struct MmtTlvSection {
     /// Path to the `dantto4k` executable.
     pub command_path: Option<String>,
+    /// `--bonCasLinkServer`: address of BonCasLink, e.g. `192.168.1.10:6900`.
+    pub boncaslink_server: Option<String>,
     /// `--casProxyServer`: address of a running CasProxyServer, e.g.
     /// `127.0.0.1:24000`. The converter falls back to local PC/SC when it
     /// cannot reach this, so a wrong address looks like "no card reader".
@@ -151,6 +156,17 @@ pub struct MmtTlvSection {
     /// `--customWinscardDLL <path>`, …).
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+/// B25 smart-card transport settings. BonCasLink address and network reader
+/// overrides are TOML fallbacks; database values set in the dashboard win.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct B25Section {
+    /// BonCasLink server address (`host[:port]`, default port 6900).
+    pub boncaslink_server: Option<String>,
+    /// Per-network PC/SC reader name or boncaslink://host:port. Keys are NIDs.
+    #[serde(default)]
+    pub network_readers: std::collections::HashMap<String, String>,
 }
 
 /// Browser-preview (`?profile=preview`) encoder configuration that must only
@@ -543,6 +559,37 @@ mod tests {
     }
 
     #[test]
+    fn boncaslink_servers_parse_from_their_toml_sections() {
+        let config: ConfigFile = toml::from_str(
+            "[b25]\nboncaslink_server = 'cards.example'\n\n[mmttlv]\nboncaslink_server = 'acas.example:6900'\n",
+        )
+        .expect("BonCasLink TOML should parse");
+        assert_eq!(
+            config.b25.boncaslink_server.as_deref(),
+            Some("cards.example")
+        );
+        assert_eq!(
+            config.mmttlv.boncaslink_server.as_deref(),
+            Some("acas.example:6900")
+        );
+    }
+
+    #[test]
+    fn b25_network_reader_table_parses_hex_keys_and_values() {
+        let config: ConfigFile = toml::from_str(
+            "[b25.network_readers]\n'FFFE' = 'boncaslink://cards.example:6902'\n'0x0004' = 'USB Reader'\n",
+        ).expect("network reader table should parse");
+        assert_eq!(
+            config.b25.network_readers.get("FFFE").map(String::as_str),
+            Some("boncaslink://cards.example:6902")
+        );
+        assert_eq!(
+            config.b25.network_readers.get("0x0004").map(String::as_str),
+            Some("USB Reader")
+        );
+    }
+
+    #[test]
     fn max_connections_prefers_toml_over_arg_default() {
         let args = default_args();
         assert_eq!(args.max_connections, 64);
@@ -668,5 +715,12 @@ mod tests {
         let error = load(&args, &file_config).unwrap_err().to_string();
         assert!(error.contains("[node] listen"));
         assert!(error.contains("not-a-socket"));
+    }
+
+    #[test]
+    fn boncaslink_resolution_prefers_db_and_supports_explicit_disable() {
+        assert_eq!(recisdb_proxy::resolve_boncaslink_value(None, Some("toml:6900".into())), recisdb_proxy::ResolvedBonCasLinkValue { value: Some("toml:6900".into()), source: "toml" });
+        assert_eq!(recisdb_proxy::resolve_boncaslink_value(Some(String::new()), Some("toml:6900".into())), recisdb_proxy::ResolvedBonCasLinkValue { value: None, source: "db" });
+        assert_eq!(recisdb_proxy::resolve_boncaslink_value(None, None), recisdb_proxy::ResolvedBonCasLinkValue { value: None, source: "none" });
     }
 }

@@ -209,6 +209,11 @@ fn build_api_router() -> Router<Arc<WebState>> {
         // fully separate from tsreplace-config)
         .route("/card-reader", get(api::get_card_readers))
         .route("/card-reader", post(api::update_card_reader))
+        .route(
+            "/boncaslink",
+            get(api::get_boncaslink).post(api::update_boncaslink),
+        )
+        .route("/boncaslink/test", post(api::test_boncaslink))
         .route("/preview-config", get(api::get_preview_config))
         .route("/preview-config", post(api::update_preview_config))
         .route("/preview-config/auto-setup", post(api::auto_setup_preview))
@@ -445,6 +450,11 @@ pub async fn start_web_server(
     node_transport: Option<Arc<crate::node::NodeTransportState>>,
     node_listen_addr: Option<String>,
     node_serve_on_web: bool,
+    boncaslink_toml: (
+        Option<String>,
+        Option<String>,
+        std::collections::HashMap<String, String>,
+    ),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut web_state = WebState::new(
         database,
@@ -458,6 +468,7 @@ pub async fn start_web_server(
         epg_events_tx,
     );
     web_state.proxy_listen_addr = proxy_listen_addr;
+    web_state.boncaslink_toml = boncaslink_toml;
     web_state.config_path = config_path;
     web_state.mirakurun_home_regions = mirakurun_home_regions;
     web_state.mirakurun_record_priority_threshold = mirakurun_record_priority_threshold;

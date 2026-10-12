@@ -473,6 +473,11 @@ impl TunerPool {
         }
     }
 
+    /// Change the converter BonCasLink target used by the next 4K reader start.
+    pub async fn set_mmt_boncaslink_server(&self, address: Option<String>) {
+        self.config.write().await.mmt_converter.boncaslink_server = address;
+    }
+
     /// Get current tuner optimization configuration.
     pub async fn config(&self) -> TunerPoolConfig {
         self.config.read().await.clone()
@@ -982,6 +987,7 @@ mod tests {
             first_data_grace_ms: 30_000,
             slow_start: false,
             b25_enabled: true,
+            b25_card_reader: None,
             mmt_converter: None,
         }
     }

@@ -594,6 +594,7 @@ pub enum UpdateStatus {
 
 /// Shared state for the web server.
 pub struct WebState {
+    pub boncaslink_toml: (Option<String>, Option<String>, std::collections::HashMap<String, String>),
     /// Monotonic process start time used by the dashboard uptime statistic.
     pub started_at: Instant,
     /// Database handle.
@@ -689,6 +690,7 @@ impl WebState {
         epg_events_tx: broadcast::Sender<ProgramUpsert>,
     ) -> Self {
         Self {
+            boncaslink_toml: (None, None, Default::default()),
             started_at: Instant::now(),
             database,
             tuner_pool,

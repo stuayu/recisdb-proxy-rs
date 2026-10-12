@@ -132,7 +132,8 @@ curl -sS http://<host>/api/logs?limit=1000
 ```toml
 [mmttlv]
 command_path = "C:\\DTV\\BonDriver\\dantto4k.exe"
-cas_proxy_server = "127.0.0.1:24000"   # または smart_card_reader_name
+cas_proxy_server = "127.0.0.1:24000"   # または smart_card_reader_name / boncaslink_server
+boncaslink_server = "192.168.1.10:6900" # BonCasLinkを使う場合
 ```
 
 4. 4Kチューナーの BonDriver を登録し、**MMT/TLV を出すことを明示する**:
@@ -148,6 +149,10 @@ UPDATE bon_drivers SET stream_format = 'mmttlv' WHERE dll_path = '...';
 
 `stream_format = 'mmttlv'` のドライバでは B25 (libaribb25) を無条件で切る。
 復号は変換器の担当なので、TS 用の復号器を通す意味がない。
+
+BonCasLink を使う場合は `[mmttlv] boncaslink_server = "host:port"` を初期値として指定できる。ダッシュボードの BonCasLink 設定からも変更でき、次の4Kチューナー起動時に反映される。
+dantto4k に `--bonCasLinkServer` として渡す。優先順位は BonCasLink、CasProxyServer、
+ローカル PC/SC。セットアップ GUI でも ACAS の接続先として選べる。
 
 ### スキャンも同じ変換器を通る
 

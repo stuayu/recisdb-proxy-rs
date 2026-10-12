@@ -39,14 +39,23 @@ fn find_ts_sync_offset(buf: &[u8]) -> Option<usize> {
 
 pub struct B25Pipe {
     dec: StreamDecoder,
+    card_reader: Option<String>,
     stash: Vec<u8>,
     tmp: Vec<u8>,
 }
 
 impl B25Pipe {
     pub fn new(opt: DecoderOptions) -> io::Result<Self> {
+        Self::with_card_reader(opt, None)
+    }
+
+    pub fn with_card_reader(opt: DecoderOptions, card_reader: Option<&str>) -> io::Result<Self> {
         Ok(Self {
-            dec: StreamDecoder::new(opt)?,
+            dec: match card_reader {
+                Some(name) => StreamDecoder::with_card_reader(opt, Some(name))?,
+                None => StreamDecoder::new(opt)?,
+            },
+            card_reader: card_reader.map(str::to_owned),
             stash: Vec::with_capacity(TS_PACKET_SIZE * 32),
             // Output buffer for decoder drain. Larger buffer to handle bursts.
             // B25 decoder can output more than 262KB in one session, so use 1MB.
@@ -55,7 +64,7 @@ impl B25Pipe {
     }
 
     pub fn reset(&mut self, opt: DecoderOptions) -> io::Result<()> {
-        *self = Self::new(opt)?;
+        *self = Self::with_card_reader(opt, self.card_reader.as_deref())?;
         Ok(())
     }
 

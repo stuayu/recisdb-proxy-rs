@@ -312,6 +312,7 @@ mod tests {
             first_data_grace_ms: 30_000,
             slow_start: false,
             b25_enabled: true,
+            b25_card_reader: None,
             mmt_converter: None,
         }
     }

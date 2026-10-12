@@ -65,10 +65,22 @@ fn patched_libaribb25_dir() -> PathBuf {
         "libaribb25 の pattern 宣言が想定と違う。build.rs のパッチを更新すること。"
     );
     patched = patched.replace(const_pattern, "static TCHAR pattern[1024]");
+    // Empty pattern means libaribb25's documented automatic reader selection.
+    // Permit restoring that state after a decoder-specific override.
+    let nonempty_guard = "if (_tcslen(name) > 0 && _tcslen(name) < 1024)";
+    assert!(
+        patched.contains(nonempty_guard),
+        "libaribb25 override pattern validation changed; update build.rs patch"
+    );
+    patched = patched.replace(nonempty_guard, "if (_tcslen(name) < 1024)");
     // 引数側も const のままだと _tcscpy の第1引数で型が合わなくなるため、
     // 代入先だけ書き換える (関数シグネチャの const は入力側なので触らない)。
 
     std::fs::write(&target, patched).expect("failed to write the patched b_cas_card.c");
+
+    if var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
+        patch_windows_pcsc_calls(&target);
+    }
 
     // 3. Windows ARM64 (aarch64-pc-windows-msvc) では multi2_simd.{h,c} が
     //    `__m128i`/`__m256i`/SSE2 intrinsic を無条件 (SIMD 無効時でも) に使っており
@@ -86,6 +98,46 @@ fn patched_libaribb25_dir() -> PathBuf {
 
     println!("cargo:rerun-if-changed=externals/libaribb25");
     dst
+}
+
+/// Route libaribb25's Windows PC/SC calls through the Rust shim so it can add
+/// the virtual reader while forwarding ordinary readers to winscard.dll.
+fn patch_windows_pcsc_calls(path: &Path) {
+    let original = std::fs::read_to_string(path).expect("failed to read patched b_cas_card.c");
+    let mut patched = original.clone();
+    for (symbol, minimum) in [
+        ("SCardEstablishContext", 1),
+        ("SCardReleaseContext", 1),
+        ("SCardListReaders", 2),
+        ("SCardConnect", 1),
+        ("SCardDisconnect", 2),
+        ("SCardTransmit", 8),
+    ] {
+        let count = patched.matches(symbol).count();
+        assert!(
+            count >= minimum,
+            "libaribb25 Windows {symbol} calls changed (found {count}); update the PC/SC shim patch"
+        );
+        patched = patched.replace(symbol, &format!("b25shim_{symbol}"));
+    }
+    assert_ne!(
+        patched, original,
+        "Windows PC/SC shim patch made no changes"
+    );
+    let include = "#include <winscard.h>";
+    assert!(
+        patched.contains(include),
+        "libaribb25 no longer includes winscard.h; update the PC/SC shim declarations"
+    );
+    let prototypes = "#include <winscard.h>\n\
+LONG WINAPI b25shim_SCardEstablishContext(DWORD, LPCVOID, LPCVOID, LPSCARDCONTEXT);\n\
+LONG WINAPI b25shim_SCardReleaseContext(SCARDCONTEXT);\n\
+LONG WINAPI b25shim_SCardListReaders(SCARDCONTEXT, LPCWSTR, LPWSTR, LPDWORD);\n\
+LONG WINAPI b25shim_SCardConnect(SCARDCONTEXT, LPCWSTR, DWORD, DWORD, LPSCARDHANDLE, LPDWORD);\n\
+LONG WINAPI b25shim_SCardDisconnect(SCARDHANDLE, DWORD);\n\
+LONG WINAPI b25shim_SCardTransmit(SCARDHANDLE, LPCSCARD_IO_REQUEST, LPCBYTE, DWORD, LPSCARD_IO_REQUEST, LPBYTE, LPDWORD);";
+    patched = patched.replacen(include, prototypes, 1);
+    std::fs::write(path, patched).expect("failed to write Windows PC/SC shim patch");
 }
 
 /// Windows ARM64 専用パッチ。x86 SIMD 型 (`__m128i`/`__m256i`) と SSE2 intrinsic
@@ -339,7 +391,21 @@ fn main() {
     let mut pc = pkg_config::Config::new();
     pc.statik(false);
     if cx.win {
-        let res = prep_cmake(cx).build();
+        // The upstream install target also links standalone Windows CLI/DLL
+        // targets that cannot resolve our Rust PC/SC shim. b25-sys only needs
+        // the static archive, so build that target directly.
+        let mut cmake = prep_cmake(cx);
+        cmake.build_target("aribb25-static");
+        let res = cmake.build();
+        println!("cargo:rustc-link-search=native={}/build", res.display());
+        println!(
+            "cargo:rustc-link-search=native={}/build/Debug",
+            res.display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}/build/Release",
+            res.display()
+        );
         println!("cargo:rustc-link-search=native={}/lib", res.display());
         println!("cargo:rustc-link-search=native={}/lib64", res.display());
         println!("cargo:rustc-link-lib=dylib=winscard");

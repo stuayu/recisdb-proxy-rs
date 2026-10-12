@@ -1,18 +1,32 @@
 use log::info;
 use std::cell::Cell;
 use std::io::{Error, Read, Write};
-use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::bindings::InnerDecoder;
 
 #[cfg(feature = "block00cbc")]
 mod access_control;
 mod bindings;
+mod boncaslink;
 #[cfg(unix)]
 mod pcsc_shim;
+#[cfg(windows)]
+mod pcsc_windows;
 
 static KEY0: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static KEY1: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static DECODER_CREATION: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(feature = "prioritized_card_reader")]
+static DEFAULT_CARD_READER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn decoder_creation_lock() -> MutexGuard<'static, ()> {
+    DECODER_CREATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// Set keys so that ECM/EMM could be interpreted by StreamDecoder.
 pub fn set_keys(key0: Vec<u64>, key1: Vec<u64>) {
@@ -31,7 +45,8 @@ pub fn set_keys(key0: Vec<u64>, key1: Vec<u64>) {
 /// one. Pass a name from [`list_card_readers`] to skip straight to it.
 ///
 /// The name must match what PC/SC reports exactly; `false` means libaribb25
-/// rejected it (empty, or 1024 characters or longer).
+/// rejected it (1024 characters or longer). An empty name restores automatic
+/// probing across all readers.
 ///
 /// Takes `&str` but hands C a NUL-terminated copy — the C side runs `strlen`
 /// on it, and a bare `str::as_ptr()` is not NUL-terminated. An interior NUL
@@ -41,11 +56,45 @@ pub fn set_card_reader_name(name: &str) -> bool {
     let Ok(name) = std::ffi::CString::new(name) else {
         return false;
     };
-    unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr() as *const _) == 0 }
+    let _guard = decoder_creation_lock();
+    if unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr() as *const _) } != 0
+    {
+        return false;
+    }
+    let value = name.to_string_lossy().into_owned();
+    *DEFAULT_CARD_READER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = if value.is_empty() { None } else { Some(value) };
+    true
+}
+
+#[cfg(not(feature = "prioritized_card_reader"))]
+pub fn set_card_reader_name(_name: &str) -> bool {
+    false
 }
 
 pub use crate::pcsc_readers::list_card_readers;
 mod pcsc_readers;
+
+/// Name exposed for the BonCasLink virtual card reader.
+pub const BONCASLINK_READER_NAME: &str = boncaslink::BONCASLINK_READER_NAME;
+
+/// Configure the BonCasLink smart-card server used by the virtual PC/SC reader.
+/// An empty address or `None` disables the virtual reader; an omitted port uses 6900.
+pub fn set_boncaslink_server(addr: Option<&str>) -> Result<(), String> {
+    boncaslink::set_server(addr)
+}
+
+/// Validate and normalize a BonCasLink server address.
+pub fn normalize_boncaslink_address(addr: &str) -> Result<String, String> {
+    boncaslink::normalize_address(addr)
+}
+
+/// Register an address-specific virtual reader and return its PC/SC reader name.
+pub fn register_boncaslink_reader(addr: &str) -> Result<String, String> {
+    boncaslink::register_reader(addr)
+}
 
 /// Decode ARIB-STD-B25 stream with libaribb25. Both `Read` and `Write` are implemented.
 pub struct StreamDecoder {
@@ -85,24 +134,99 @@ impl Default for DecoderOptions {
 
 impl StreamDecoder {
     pub fn new(opt: DecoderOptions) -> Result<Self, Error> {
-        let inner = unsafe {
-            let inner = InnerDecoder::new(opt.enable_working_key)?;
-            // Set options to the decoder
-            inner.dec.as_ref().set_multi2_round(opt.round);
-            inner.dec.as_ref().set_strip(if opt.strip { 1 } else { 0 });
-            inner.dec.as_ref().set_emm_proc(if opt.emm { 1 } else { 0 });
-            inner
-                .dec
-                .as_ref()
-                .set_simd_mode(if opt.simd { 3 } else { 0 });
-            inner
+        Self::with_card_reader(opt, None)
+    }
+
+    /// Construct a decoder using a reader name only for this decoder instance.
+    /// libaribb25 connects during `InnerDecoder::new`, while the temporary
+    /// process-global pattern is protected by `DECODER_CREATION`.
+    pub fn with_card_reader(opt: DecoderOptions, reader: Option<&str>) -> Result<Self, Error> {
+        let _guard = decoder_creation_lock();
+        #[cfg(feature = "prioritized_card_reader")]
+        let default = DEFAULT_CARD_READER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        #[cfg(feature = "prioritized_card_reader")]
+        {
+            let selected = reader.or(default.as_deref()).unwrap_or("");
+            let name = std::ffi::CString::new(selected).map_err(|_| {
+                Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "card reader name contains NUL",
+                )
+            })?;
+            if unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr()) } != 0 {
+                return Err(Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid card reader name",
+                ));
+            }
+        }
+        #[cfg(not(feature = "prioritized_card_reader"))]
+        if reader.is_some() {
+            return Err(Error::new(
+                std::io::ErrorKind::Unsupported,
+                "b25-sys built without prioritized_card_reader feature",
+            ));
+        }
+        let inner_result = unsafe {
+            InnerDecoder::new(opt.enable_working_key).map(|inner| {
+                // Set options to the decoder
+                inner.dec.as_ref().set_multi2_round(opt.round);
+                inner.dec.as_ref().set_strip(if opt.strip { 1 } else { 0 });
+                inner.dec.as_ref().set_emm_proc(if opt.emm { 1 } else { 0 });
+                inner
+                    .dec
+                    .as_ref()
+                    .set_simd_mode(if opt.simd { 3 } else { 0 });
+                inner
+            })
         };
+
+        // Restore the process default immediately after construction. The
+        // decoder retains its connected card; libaribb25 has no later reconnect
+        // path (the only other connect_card calls are disabled legacy code).
+        #[cfg(feature = "prioritized_card_reader")]
+        {
+            let selected = default.as_deref().unwrap_or("");
+            if let Ok(name) = std::ffi::CString::new(selected) {
+                let _ =
+                    unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr()) };
+            }
+        }
+        let inner = inner_result?;
 
         Ok(Self {
             received: Cell::new(0),
             sent: Cell::new(0),
             inner: Mutex::new(inner),
         })
+    }
+}
+
+#[cfg(test)]
+mod decoder_creation_tests {
+    use super::decoder_creation_lock;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn decoder_creation_lock_serializes_pattern_scopes_without_a_card() {
+        let guard = decoder_creation_lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = decoder_creation_lock();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        other.join().unwrap();
     }
 }
 

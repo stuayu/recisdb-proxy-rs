@@ -16,6 +16,7 @@ pub enum AcasSelection {
     Automatic,
     SmartCardReader(String),
     CasProxyServer(String),
+    BonCasLinkServer(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,7 @@ pub fn update_dantto_ini(
             "[acas]".to_owned(),
             "smartCardReaderName=".to_owned(),
             "casProxyServer=".to_owned(),
+            "bonCasLinkServer=".to_owned(),
             "".to_owned(),
             "[audio]".to_owned(),
             "disableADTSConversion=false".to_owned(),
@@ -122,13 +124,15 @@ pub fn update_dantto_ini(
     }
 
     set_ini_key(&mut lines, "bondriver", "bondriverPath", bondriver_path);
-    let (reader, proxy) = match acas {
-        AcasSelection::Automatic => ("", ""),
-        AcasSelection::SmartCardReader(value) => (value.trim(), ""),
-        AcasSelection::CasProxyServer(value) => ("", value.trim()),
+    let (reader, proxy, boncaslink) = match acas {
+        AcasSelection::Automatic => ("", "", ""),
+        AcasSelection::SmartCardReader(value) => (value.trim(), "", ""),
+        AcasSelection::CasProxyServer(value) => ("", value.trim(), ""),
+        AcasSelection::BonCasLinkServer(value) => ("", "", value.trim()),
     };
     set_ini_key(&mut lines, "acas", "smartCardReaderName", reader);
     set_ini_key(&mut lines, "acas", "casProxyServer", proxy);
+    set_ini_key(&mut lines, "acas", "bonCasLinkServer", boncaslink);
 
     let mut result = lines.join("\r\n");
     result.push_str("\r\n");
@@ -489,6 +493,18 @@ mod tests {
         assert!(result.contains("custom=x"));
         assert!(result.contains("casProxyServer=127.0.0.1:24000"));
         assert!(result.contains("smartCardReaderName="));
+    }
+
+    #[test]
+    fn ini_writes_boncaslink_and_clears_other_acas_sources() {
+        let result = update_dantto_ini(
+            None,
+            "base.dll",
+            &AcasSelection::BonCasLinkServer("192.168.1.10:6900".into()),
+        );
+        assert!(result.contains("bonCasLinkServer=192.168.1.10:6900"));
+        assert!(result.contains("smartCardReaderName=\r\n"));
+        assert!(result.contains("casProxyServer=\r\n"));
     }
 
     #[test]

@@ -49,18 +49,18 @@ const SCARD_S_SUCCESS: Long = 0;
 const SCARD_SCOPE_USER: Dword = 0;
 
 extern "system" {
+    #[cfg_attr(windows, link_name = "b25shim_SCardEstablishContext")]
     fn SCardEstablishContext(
         dw_scope: Dword,
         reserved1: *const std::ffi::c_void,
         reserved2: *const std::ffi::c_void,
         context: *mut ScardContext,
     ) -> Long;
+    #[cfg_attr(windows, link_name = "b25shim_SCardReleaseContext")]
     fn SCardReleaseContext(context: ScardContext) -> Long;
-    // Windows の winscard.h では `SCardListReaders` はマクロで、実体は
-    // `SCardListReadersA` / `SCardListReadersW` しか export されていない。
-    // プレーン名で宣言すると unresolved external になるので ANSI 版へ張る
-    // (返る名前は表示用なので ANSI で十分)。
-    #[cfg_attr(windows, link_name = "SCardListReadersA")]
+    // Windows の一覧も Rust shim を経由させる。UI向けの reader name は
+    // ANSI バイト列で受け、shim が winscard の ANSI API へ転送する。
+    #[cfg_attr(windows, link_name = "b25shim_SCardListReadersA")]
     fn SCardListReaders(
         context: ScardContext,
         groups: *const u8,

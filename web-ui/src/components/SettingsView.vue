@@ -8,6 +8,7 @@ const endpoints = [
   ['開発版に更新', '/__development'],
   ['ブラウザプレビュー', '/__preview'],
   ['B-CASカードリーダー', '/__card-reader'],
+  ['BonCasLink', '/__boncaslink'],
   ['EPG自動取得', '/settings/epg'],
   ['スキャンスケジューラー', '/scan-config'],
   ['チューナー最適化', '/tuner-config'],
@@ -581,6 +582,99 @@ const cardReaderMessage = ref('')
 const cardReaderError = ref('')
 const cardReaderBusy = ref(false)
 
+// BonCasLink設定は有効値と出所をAPIから受け取り、継承判断はサーバーに任せる。
+type BonCaslinkEntry = { nid: number; value: string; source: 'db' | 'toml' | 'none' }
+type BonCaslinkResponse = {
+  b25: { value: string | null; source: 'db' | 'toml' | 'none' }
+  mmttlv: { value: string | null; source: 'db' | 'toml' | 'none' }
+  network_readers: BonCaslinkEntry[]
+  readers: string[]
+}
+type BonCaslinkEdit = { nid: string; reader: string; custom: boolean; source: 'db' | 'toml' | 'none' }
+const boncaslink = ref<BonCaslinkResponse | null>(null)
+const boncaslinkB25 = ref('')
+const boncaslinkMmttlv = ref('')
+const boncaslinkRows = ref<BonCaslinkEdit[]>([])
+const boncaslinkBusy = ref(false)
+const boncaslinkMessage = ref('')
+const boncaslinkError = ref('')
+const boncaslinkTestMessage = ref<Record<string, string>>({})
+
+function sourceLabel(source: 'db' | 'toml' | 'none') {
+  return source === 'db' ? 'ダッシュボード保存値' : source === 'toml' ? '設定ファイル由来' : '未設定'
+}
+
+function editBonCaslinkRow(row: BonCaslinkEntry): BonCaslinkEdit {
+  const isAddress = row.value.startsWith('boncaslink://')
+  return { nid: row.nid.toString(16).toUpperCase().padStart(4, '0'), reader: row.value, custom: isAddress || !boncaslink.value?.readers.includes(row.value), source: row.source }
+}
+
+async function loadBonCaslink() {
+  boncaslinkBusy.value = true
+  try {
+    const response = await api<BonCaslinkResponse>('/boncaslink')
+    boncaslink.value = response
+    boncaslinkB25.value = response.b25.value ?? ''
+    boncaslinkMmttlv.value = response.mmttlv.value ?? ''
+    boncaslinkRows.value = response.network_readers.map(editBonCaslinkRow)
+    boncaslinkError.value = ''
+  } catch (cause) {
+    boncaslinkError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    boncaslinkBusy.value = false
+  }
+}
+
+function addBonCaslinkRow() {
+  boncaslinkRows.value.push({ nid: '', reader: '', custom: false, source: 'none' })
+}
+
+async function testBonCaslink(key: string, address: string) {
+  boncaslinkTestMessage.value[key] = '接続確認中…'
+  try {
+    const result = await api<{ ok?: boolean; connected?: boolean; message?: string; error?: string }>('/boncaslink/test', {
+      method: 'POST', body: JSON.stringify({ address }),
+    })
+    const connected = result.ok ?? result.connected ?? false
+    boncaslinkTestMessage.value[key] = result.message ?? result.error ?? (connected ? '接続できました。' : '接続できませんでした。')
+  } catch (cause) {
+    boncaslinkTestMessage.value[key] = cause instanceof Error ? cause.message : String(cause)
+  }
+}
+
+async function saveBonCaslink() {
+  boncaslinkBusy.value = true
+  boncaslinkError.value = ''
+  boncaslinkMessage.value = ''
+  try {
+    for (const [index, row] of boncaslinkRows.value.entries()) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(row.nid.trim())) {
+        throw new Error(`${index + 1}行目のNIDは16進数1〜4桁で入力してください。`)
+      }
+      if (!row.reader.trim()) {
+        throw new Error(`${index + 1}行目のリーダーを選択してください。`)
+      }
+    }
+    await api('/boncaslink', {
+      method: 'POST',
+      body: JSON.stringify({
+        b25_server: boncaslinkB25.value,
+        mmttlv_server: boncaslinkMmttlv.value,
+        network_readers: boncaslinkRows.value.map((row) => ({
+          nid: Number.parseInt(row.nid.trim(), 16),
+          reader: row.custom ? `boncaslink://${row.reader.replace(/^boncaslink:\/\//, '')}` : row.reader,
+        })),
+      }),
+    })
+    boncaslinkMessage.value = '保存しました。次にチューナーを起動したときから反映されます。'
+    await loadBonCaslink()
+  } catch (cause) {
+    boncaslinkError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    boncaslinkBusy.value = false
+  }
+}
+
 async function loadCardReaders() {
   cardReaderBusy.value = true
   try {
@@ -622,6 +716,7 @@ onMounted(() => {
   void load()
   void loadService()
   void loadCardReaders()
+  void loadBonCaslink()
   void loadTokenStatus()
 })
 </script>
@@ -823,6 +918,43 @@ onMounted(() => {
       </div>
       <p class="muted">変更は次にチューナーを開いたときから反映されます。</p>
     </div>
+    <div v-if="selected === '/__boncaslink'" class="panel boncaslink-panel">
+      <h3>BonCasLink</h3>
+      <p class="muted">接続先やリーダー名を設定します。空欄で保存すると無効になります。変更は次にチューナーを起動したときから反映されます。</p>
+      <p v-if="boncaslinkError" class="notice error" role="alert" v-text="boncaslinkError" />
+      <p v-if="boncaslinkMessage" class="notice success" role="status" v-text="boncaslinkMessage" />
+      <template v-if="boncaslink">
+        <div class="boncaslink-addresses">
+          <section class="boncaslink-address-card">
+            <h4>B25（地デジ / BS / CS）</h4>
+            <p class="boncaslink-source">現在値: {{ boncaslink.b25.value || '無効' }} · {{ sourceLabel(boncaslink.b25.source) }}</p>
+            <label class="field"><span>BonCasLink サーバー host[:port]</span><input v-model="boncaslinkB25" type="text" placeholder="例: 192.168.1.20:6900" autocomplete="off" /></label>
+            <div class="actions"><button class="button secondary" type="button" :disabled="boncaslinkBusy || !boncaslinkB25.trim()" @click="testBonCaslink('b25', boncaslinkB25)">接続テスト</button><span v-if="boncaslinkTestMessage.b25" class="muted" role="status">{{ boncaslinkTestMessage.b25 }}</span></div>
+          </section>
+          <section class="boncaslink-address-card">
+            <h4>4K（dantto4k）</h4>
+            <p class="boncaslink-source">現在値: {{ boncaslink.mmttlv.value || '無効' }} · {{ sourceLabel(boncaslink.mmttlv.source) }}</p>
+            <label class="field"><span>BonCasLink サーバー host[:port]</span><input v-model="boncaslinkMmttlv" type="text" placeholder="例: 192.168.1.20:6900" autocomplete="off" /></label>
+            <div class="actions"><button class="button secondary" type="button" :disabled="boncaslinkBusy || !boncaslinkMmttlv.trim()" @click="testBonCaslink('mmttlv', boncaslinkMmttlv)">接続テスト</button><span v-if="boncaslinkTestMessage.mmttlv" class="muted" role="status">{{ boncaslinkTestMessage.mmttlv }}</span></div>
+          </section>
+        </div>
+        <section class="boncaslink-network-readers">
+          <h4>ネットワーク別カードリーダー</h4>
+          <p class="muted">CATV など B-CAS 以外のカードを使う場合、該当する NID を別の BonCasLink ポートへ割り当てられます。</p>
+          <p v-if="!boncaslinkRows.length" class="muted">個別設定はありません。</p>
+          <div v-for="(row, index) in boncaslinkRows" :key="index" class="boncaslink-row">
+            <span class="boncaslink-row-source">{{ sourceLabel(row.source) }}</span>
+            <label class="field"><span>NID（16進数）</span><input v-model="row.nid" type="text" inputmode="text" maxlength="4" placeholder="例: 0004" autocomplete="off" /></label>
+            <label class="field"><span>リーダー種別</span><select v-model="row.custom"><option :value="false">PC/SC リーダー</option><option :value="true">BonCasLink アドレス</option></select></label>
+            <label v-if="!row.custom" class="field"><span>PC/SC リーダー</span><select v-model="row.reader"><option value="">選択してください</option><option v-for="reader in boncaslink.readers" :key="reader" :value="reader">{{ reader }}</option></select></label>
+            <label v-else class="field"><span>host[:port]</span><input v-model="row.reader" type="text" placeholder="例: 192.168.1.20:6902" autocomplete="off" /></label>
+            <button class="button secondary boncaslink-remove" type="button" :disabled="boncaslinkBusy" :aria-label="'NID ' + (row.nid || '未入力') + ' の設定を削除'" @click="boncaslinkRows.splice(index, 1)">削除</button>
+          </div>
+          <div class="actions"><button class="button secondary" type="button" :disabled="boncaslinkBusy" @click="addBonCaslinkRow">NID設定を追加</button></div>
+        </section>
+        <div class="actions"><button class="button" type="button" :disabled="boncaslinkBusy" @click="saveBonCaslink">{{ boncaslinkBusy ? '保存中…' : '保存' }}</button></div>
+      </template>
+    </div>
     <p v-if="message" class="notice success" v-text="message" />
     <p v-if="error" class="notice error" role="alert" v-text="error" />
     <form v-if="!isStandaloneCategory" class="panel settings-form" @submit.prevent="save">
@@ -984,6 +1116,78 @@ onMounted(() => {
 
 .epg-reason-networks span:not(:last-child)::after {
   content: ',';
+}
+
+.boncaslink-addresses {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.boncaslink-address-card,
+.boncaslink-network-readers {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.boncaslink-address-card h4,
+.boncaslink-network-readers h4 {
+  margin: 0 0 8px;
+}
+
+.boncaslink-source {
+  min-height: 1.5em;
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.boncaslink-row {
+  display: grid;
+  grid-template-columns: max-content minmax(5rem, 0.7fr) minmax(9rem, 1fr) minmax(0, 2fr) auto;
+  align-items: end;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.boncaslink-row-source {
+  align-self: center;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.boncaslink-row .field {
+  min-width: 0;
+  margin: 4px 0;
+}
+
+.boncaslink-row select,
+.boncaslink-row input {
+  width: 100%;
+  min-width: 0;
+}
+
+.boncaslink-remove {
+  margin-bottom: 4px;
+}
+
+@media (max-width: 700px) {
+  .boncaslink-addresses {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .boncaslink-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0 8px;
+  }
+
+  .boncaslink-remove {
+    justify-self: start;
+    min-height: 44px;
+  }
 }
 
 </style>

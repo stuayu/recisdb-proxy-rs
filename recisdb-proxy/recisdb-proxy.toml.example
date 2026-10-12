@@ -207,8 +207,8 @@ preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.e
 #  なるため)
 # command_path = "C:\\DTV\\BonDriver\\dantto4k.exe"
 #
-# --- ACAS 復号の設定 (どちらか一方が必須) ---
-# 変換器がスクランブル解除まで行います。どちらも設定しないと、変換自体は
+# --- ACAS 復号の設定 (いずれか1つ) ---
+# 変換器がスクランブル解除まで行います。いずれも設定しないと、変換自体は
 # 成功するのに復号されていない TS が出力され、「変換は通るのに再生できない」
 # 状態になります。この場合サーバーログに警告が出ます。
 #
@@ -216,6 +216,9 @@ preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.e
 # 指定しても実際にサーバーが起動していないと、変換器はローカルの PC/SC に
 # フォールバックし "No smart card readers are available" を出します
 # cas_proxy_server = "127.0.0.1:24000"
+# BonCasLink サーバーを使う場合はこちらを指定します。
+# BonCasLink の優先順位は CasProxyServer とローカル PC/SC より上です。
+# boncaslink_server = "192.168.1.10:6900"
 #
 # A-CAS カードを読む PC/SC リーダー名
 # 正確な名前は `dantto4k.exe --listSmartCardReader` で確認できます
@@ -229,3 +232,13 @@ preprocessor_path = "C:\\DTV\\KonomiTV\\server\\thirdparty\\tsreadex\\tsreadex.e
 #
 # その他の引数をそのまま渡します
 # extra_args = ["--disableADTSConversion"]
+
+# B25 (地デジ/BS/CS) のカードリーダー共有。
+# BonCasLink の仮想リーダーがリーダー一覧の先頭に追加されます。
+# 「自動」選択では先に試されます。Web API からは変更できません。
+# [b25]
+# boncaslink_server = "192.168.1.10:6900"  # ポート省略時は 6900
+# [b25.network_readers]
+# "FFFE" = "boncaslink://192.168.1.10:6902" # NIDごとの固定接続先
+# "0004" = "SCM Microsystems Inc. SCR33x USB Smart Card Reader 0"
+# NIDキーは16進数。大文字小文字と0x接頭辞を許容。

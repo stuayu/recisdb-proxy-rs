@@ -433,6 +433,41 @@ async fn run_server(
         }
     }
 
+    // Resolve runtime BonCasLink settings: database value (including empty) wins over TOML.
+    let (b25_boncaslink, network_readers) = {
+        let db_guard = db.lock().await;
+        let b25_db = db_guard
+            .get_boncaslink_setting("b25")
+            .ok()
+            .flatten();
+        let b25 = recisdb_proxy::resolve_boncaslink_value(b25_db, file_config.b25.boncaslink_server.clone()).value;
+        let readers = if db_guard
+            .get_boncaslink_setting("network_readers")
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            db_guard
+                .get_boncaslink_network_readers()
+                .unwrap_or_default()
+        } else {
+            file_config.b25.network_readers.clone()
+        };
+        (b25, readers)
+    };
+    match b25_sys::set_boncaslink_server(b25_boncaslink.as_deref()) {
+        Ok(()) => {
+            if let Some(address) = b25_boncaslink
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                info!("B25 BonCasLink server configured: {address}");
+            }
+        }
+        Err(error) => warn!("Invalid B25 BonCasLink server address; using local PC/SC: {error}"),
+    }
+    recisdb_proxy::apply_network_card_reader_selections(&network_readers);
+
     // 使用する B-CAS カードリーダーの指定。未選択 (空文字列) なら libaribb25 の
     // 既定動作のまま、見つかったリーダーへ順に接続を試す。B-CAS 以外のリーダーが
     // 挿さっている環境では、その1台につきリーダー起動が十数秒待たされ、しかも
@@ -586,8 +621,14 @@ async fn run_server(
     // one of them.
     let tuner_config = {
         let mut cfg = tuner_config;
+        let db_mmt_boncaslink = {
+            let db_guard = db.lock().await;
+            db_guard.get_boncaslink_setting("mmttlv").ok().flatten()
+        };
+        let mmt_boncaslink = recisdb_proxy::resolve_boncaslink_value(db_mmt_boncaslink, file_config.mmttlv.boncaslink_server.clone()).value;
         cfg.mmt_converter = recisdb_proxy::tuner::mmt_pipe::MmtConverterConfig {
             command_path: file_config.mmttlv.command_path.clone().unwrap_or_default(),
+            boncaslink_server: mmt_boncaslink,
             cas_proxy_server: file_config.mmttlv.cas_proxy_server.clone(),
             smart_card_reader_name: file_config.mmttlv.smart_card_reader_name.clone(),
             frontend_descrambled: file_config.mmttlv.frontend_descrambled,
@@ -595,8 +636,9 @@ async fn run_server(
         };
         if !cfg.mmt_converter.command_path.is_empty() {
             info!(
-                "  MMT/TLV converter: {} (casProxy={:?}, reader={:?}, frontendDescrambled={})",
+                "  MMT/TLV converter: {} (bonCasLink={:?}, casProxy={:?}, reader={:?}, frontendDescrambled={})",
                 cfg.mmt_converter.command_path,
+                cfg.mmt_converter.boncaslink_server,
                 cfg.mmt_converter.cas_proxy_server,
                 cfg.mmt_converter.smart_card_reader_name,
                 cfg.mmt_converter.frontend_descrambled,
@@ -914,11 +956,8 @@ async fn run_server(
                         Arc::clone(server.tuner_pool()),
                     )
                     .spawn();
-                    recisdb_proxy::node::EpgProgramSync::new(
-                        Arc::clone(&state),
-                        db.clone(),
-                    )
-                    .spawn();
+                    recisdb_proxy::node::EpgProgramSync::new(Arc::clone(&state), db.clone())
+                        .spawn();
 
                     let serve_state = Arc::clone(&state);
                     let dynamic_tailscale = resolved.node_listen_addrs.is_none();
@@ -966,6 +1005,11 @@ async fn run_server(
             node_transport_for_web,
             node_listen_display,
             resolved.node_serve_on_web,
+            (
+                file_config.b25.boncaslink_server.clone(),
+                file_config.mmttlv.boncaslink_server.clone(),
+                file_config.b25.network_readers.clone(),
+            ),
         )
         .await
         {

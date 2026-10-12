@@ -1227,15 +1227,18 @@ impl SetupJob {
 
         if let Some(command_path) = self.setup_config.tsreplace_command_path.as_deref() {
             db.set_tsreplace_command_path(command_path)
-                .map_err(|error| format!("tsreplaceの実行ファイルパス保存に失敗しました: {error}"))?;
+                .map_err(|error| {
+                    format!("tsreplaceの実行ファイルパス保存に失敗しました: {error}")
+                })?;
             let preprocessor_path = self
                 .setup_config
                 .tsreplace_preprocessor_path
                 .as_deref()
                 .unwrap_or_default();
-            db.set_tsreplace_preprocessor_path(preprocessor_path).map_err(|error| {
-                format!("tsreplace前処理の実行ファイルパス保存に失敗しました: {error}")
-            })?;
+            db.set_tsreplace_preprocessor_path(preprocessor_path)
+                .map_err(|error| {
+                    format!("tsreplace前処理の実行ファイルパス保存に失敗しました: {error}")
+                })?;
         }
 
         if self.setup_tsreplace {
@@ -1278,7 +1281,10 @@ impl SetupJob {
                     )),
                 }
             } else {
-                emit("tsreplace本体が準備できなかったため、エンコード設定を変更しませんでした。".to_owned());
+                emit(
+                    "tsreplace本体が準備できなかったため、エンコード設定を変更しませんでした。"
+                        .to_owned(),
+                );
             }
         }
 
@@ -2460,6 +2466,19 @@ impl SetupApp {
                     if let AcasSelection::CasProxyServer(address) = &mut self.fourk_acas {
                         ui.text_edit_singleline(address);
                         hint(ui, "別PCまたは同じPCのCasProxyServerへ接続します。既定は127.0.0.1:24000です。");
+                    }
+                    let boncas_mode = matches!(self.fourk_acas, AcasSelection::BonCasLinkServer(_));
+                    if ui.radio(boncas_mode, "BonCasLinkサーバーを使う").clicked() && !boncas_mode
+                    {
+                        self.fourk_acas =
+                            AcasSelection::BonCasLinkServer("127.0.0.1:6900".to_owned());
+                    }
+                    if let AcasSelection::BonCasLinkServer(address) = &mut self.fourk_acas {
+                        ui.text_edit_singleline(address);
+                        hint(
+                            ui,
+                            "BonCasLinkサーバーの host:port を指定します。既定ポートは6900です。",
+                        );
                     }
                     hint(ui, "選んだDLLは通常チューナーとして登録せず、ラッパーだけをBS4K用に登録します。");
                 }
