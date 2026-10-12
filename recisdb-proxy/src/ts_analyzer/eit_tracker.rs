@@ -289,11 +289,7 @@ fn range_complete(
     first <= last
         && (first..=last).all(|id| {
             tables.get(&id).is_some_and(|sub| {
-                if id == first {
-                    schedule_subtable_complete(sub, current_segment)
-                } else {
-                    subtable_complete(sub)
-                }
+                schedule_subtable_complete(sub, if id == first { current_segment } else { 0 })
             })
         })
 }
@@ -313,14 +309,18 @@ fn segment_complete(sub: &SubTableState, segment: usize) -> bool {
             .all(|number| sub.received[number / 64] & (1u64 << (number % 64)) != 0)
 }
 
-fn schedule_subtable_complete(sub: &SubTableState, current_segment: usize) -> bool {
-    let current_first = current_segment * 8;
+/// schedule の sub-table が `first_segment` 以降そろっているか。
+///
+/// schedule EIT の section 番号は segment ごとに 8 つずつ割り当てられ、
+/// 各 segment は `segment_last_section_number` までしか送出されない
+/// (番組が少ない segment は 1 section だけ)。その先の番号は欠番なので、
+/// `0..=last_section_number` の全ビットを要求すると永久に完成しない。
+/// segment 単位で「segment_last までの section を受信したか」を見る。
+fn schedule_subtable_complete(sub: &SubTableState, first_segment: usize) -> bool {
+    let last_segment = sub.last_section_number as usize / 8;
     // A table without a section for the current segment cannot be complete.
-    sub.last_section_number as usize >= current_first
-        && (0..=sub.last_section_number as usize).all(|number| {
-            number < current_first
-                || sub.received[number / 64] & (1u64 << (number % 64)) != 0
-        })
+    first_segment <= last_segment
+        && (first_segment..=last_segment).all(|segment| segment_complete(sub, segment))
 }
 
 fn coverage_until(service: &ServiceState, base: u8, last: u8, now: Option<i64>) -> Option<i64> {
@@ -651,6 +651,31 @@ mod tests {
         assert_eq!(
             completion.schedule_coverage_until,
             Some(jst_midnight(now) + 18 * 3600)
+        );
+    }
+
+    #[test]
+    fn sparse_segments_complete_without_the_unused_section_numbers() {
+        // 各 segment が 1 section しか持たない (segment_last = 先頭 section)。
+        // 8 の倍数以外の番号は欠番で、永久に届かない。
+        let mut tracker = EpgSectionTracker::new();
+        let now = jst_midnight(1_725_168_000) + 15 * 3600;
+        for segment in 5u8..=7 {
+            let number = segment * 8;
+            let bytes = section_bytes(0x50, 1, number, 56, number, true);
+            tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        }
+        let key = EitServiceKey {
+            pid: pid::EIT,
+            original_network_id: 0x5678,
+            transport_stream_id: 0x1234,
+            service_id: 0x9ABC,
+        };
+        let completion = tracker.completion(&key).unwrap();
+        assert!(completion.schedule_basic_complete);
+        assert_eq!(
+            completion.schedule_coverage_until,
+            Some(jst_midnight(now) + 24 * 3600)
         );
     }
 

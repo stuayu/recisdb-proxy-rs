@@ -207,6 +207,10 @@ scheduleは当日00:00 JSTを基準にsegmentを対応付け、受信済みsecti
 として扱う。現在segment自体は受信sectionを要求し、現在segment以降と2番目以降のtableは従来どおり
 sectionの完成度を要求する。返す時刻は従来どおり当日00:00 JSTからの連続segment数で計算する。
 この扱いはschedule basic/extendedの完成判定にも適用し、p/fの完成判定は変更しない。
+schedule sub-tableの完成はsegment単位で判定する。section番号はsegmentごとに8つ割り当てられるが、
+各segmentは `segment_last_section_number` までしか送出されず、その先は欠番である。
+`0..=last_section_number` の全section受信を要求すると、番組の少ないsegmentを持つsub-tableは
+永久に完成せず `last_complete_at` が立たない(実機で確認)。
 
 mux単位では番組表対象サービス（`sid != 0` かつ `tsid != 0`）のうち、
 `channels.service_type` が1または2のサービスを常に対象とし、NULLのサービスは
