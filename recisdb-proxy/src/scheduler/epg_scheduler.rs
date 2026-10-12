@@ -1165,7 +1165,10 @@ fn append_epg_target(
     states: &[EpgScanState],
     target_muxes: &HashSet<(u16, u16)>,
 ) {
-    if !is_real_broadcast_service(channel.sid, channel.tsid)
+    // original_network_id = 0 の行は、過去のスキャンが NID を確定できないまま
+    // 登録したもの。放送として存在しない mux なので選局しても何も取れない。
+    if channel.nid == 0
+        || !is_real_broadcast_service(channel.sid, channel.tsid)
         // service_type が未判明の行は、EIT を一度受信するまで coverage の母数に
         // 入らない。ここで候補からも外すと、そのmuxは永久にスキャンされない。
         || !(target_muxes.contains(&(channel.nid, channel.tsid)) || channel.service_type.is_none())
@@ -1802,6 +1805,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, 2)]
         );
+    }
+
+    #[test]
+    fn scheduler_target_list_excludes_rows_without_a_network_id() {
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let driver = db.get_or_create_bon_driver("test.dll").unwrap();
+        let mut info = recisdb_protocol::ChannelInfo::new(0, 151, 16400);
+        info.bon_space = Some(3);
+        info.bon_channel = Some(47);
+        info.service_type = Some(1);
+        db.insert_channel(driver, &info).unwrap();
+
+        let channels = db.get_enabled_channels_by_bon_driver(driver).unwrap();
+        let target_muxes = db
+            .get_epg_mux_coverage()
+            .unwrap()
+            .into_iter()
+            .map(|coverage| (coverage.network_id, coverage.tsid))
+            .collect::<HashSet<_>>();
+        let mut targets = Vec::new();
+        for channel in &channels {
+            append_epg_target(&mut targets, channel, &[], &target_muxes);
+        }
+        assert!(targets.is_empty());
     }
 
     #[test]

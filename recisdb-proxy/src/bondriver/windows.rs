@@ -475,6 +475,12 @@ impl BonDriverTuner {
         None
     }
 
+    /// BonDriver DLL は「測れない」と「信号なし」を区別して返せない
+    /// (どちらも GetSignalLevel が 0)。区別できるのは px4daemon バックエンドだけ。
+    pub fn signal_measurement_unsupported(&self) -> bool {
+        false
+    }
+
     /// Wait for TS stream data to become available.
     /// Returns true if data is available, false on timeout.
     pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {

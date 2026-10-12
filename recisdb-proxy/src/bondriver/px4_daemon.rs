@@ -395,6 +395,9 @@ pub struct Px4DaemonTuner {
     /// Which `SystemType` the current `OPEN` was made for. Switching between
     /// terrestrial, satellite and CATV needs a fresh `OPEN`.
     opened_system: AtomicI32,
+    /// 直近の READ_STATS(CNR) を daemon が「未対応」で断ったか。
+    /// [`Self::signal_measurement_unsupported`] を参照。
+    cnr_unsupported: AtomicBool,
     capturing: AtomicBool,
     current_space: AtomicI32,
 }
@@ -426,6 +429,7 @@ impl Px4DaemonTuner {
             lnb_on: AtomicBool::new(false),
             data_id: AtomicU64::new(NO_DATA_ID),
             opened_system: AtomicI32::new(0),
+            cnr_unsupported: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             current_space: AtomicI32::new(0),
         };
@@ -756,12 +760,33 @@ impl Px4DaemonTuner {
         buf[..HEADER_SIZE].copy_from_slice(&header(cmd::READ_STATS));
         put_u32(&mut buf, 8, 1); // stat_set.num
         put_u32(&mut buf, 12, STAT_CNR); // stat_set.data[0].type
-        if self.transact(&mut buf).is_err() || get_u32(&buf, 4) != status::SUCCEEDED {
+        if self.transact(&mut buf).is_err() {
+            return 0.0;
+        }
+        // 通信は成立したのに daemon が統計を断った = その受信方式では C/N を
+        // 出せない。0.0 を「信号なし」と区別できるよう覚えておく。
+        let refused = get_u32(&buf, 4) != status::SUCCEEDED;
+        self.cnr_unsupported.store(refused, Ordering::Release);
+        if refused {
             return 0.0;
         }
         // px4_drv reports CNR in millibels (×1000 dB), same as the Linux
         // driver's PTX_GET_CNR.
         get_i32(&buf, 16) as f32 / 1000.0
+    }
+
+    /// ロックしているのに C/N を取得できない状態か。
+    ///
+    /// px4_drv は実験的な J.83 Annex B モード (`ExperimentalJ83B=true`) で
+    /// C/N の換算式を持たず、READ_STATS(CNR) を意図的に失敗させる。
+    /// [`Self::get_signal_level`] はそのとき 0.0 を返すので、呼び出し側が
+    /// 「信号なし」と取り違えるとロック済みのチャンネルを全部捨ててしまう
+    /// (チャンネルスキャンが 1 局も登録できない)。直近の C/N 取得が断られ、
+    /// かつ復調器がロックを報告しているときだけ true。
+    ///
+    /// J.83B の信号がある環境では未検証 (px4_drv 側の実装からの判断)。
+    pub fn signal_measurement_unsupported(&self) -> bool {
+        self.cnr_unsupported.load(Ordering::Acquire) && self.check_lock()
     }
 
     /// Whether the demodulator currently reports lock.
@@ -1116,6 +1141,74 @@ mod tests {
             (get.len(), get_u32(&get, 0), get_u32(&get, 20)),
             (28, 16, 3)
         );
+    }
+
+    /// 診断用。CATV 全 51 チャンネルを順に選局し、選局結果・ロック・C/N・
+    /// 2 秒間の受信量と PID の内訳を出す。失敗させない (回線ごとに中身が違う)。
+    /// `PX4_TEST_SWEEP_RECEIVER` (既定 `px4daemon:any`)、
+    /// `PX4_TEST_SWEEP_CHANNELS` (例 `7,16,17,18`) で対象を変えられる。
+    #[test]
+    #[ignore = "requires a running DriverHost_PX4 and a CATV feed"]
+    fn hardware_catv_sweep_reports_lock_cnr_and_bytes() {
+        let path = std::env::var("PX4_TEST_SWEEP_RECEIVER")
+            .unwrap_or_else(|_| "px4daemon:any".to_string());
+        let channels: Vec<u32> = match std::env::var("PX4_TEST_SWEEP_CHANNELS") {
+            Ok(list) => list.split(',').filter_map(|c| c.trim().parse().ok()).collect(),
+            Err(_) => (0..51).collect(),
+        };
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+        let mut buf = vec![0; 65536];
+        for channel in channels {
+            let tune = tuner.set_channel(3, channel);
+            let lock = tuner.check_lock();
+            let cnr = tuner.get_signal_level();
+            let unsupported = tuner.signal_measurement_unsupported();
+            let mut bytes = Vec::new();
+            if tune.is_ok() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if tuner.wait_ts_stream(200) {
+                        if let Ok((n, _)) = tuner.get_ts_stream(&mut buf) {
+                            bytes.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                }
+            }
+            let mut pids = std::collections::BTreeMap::<u16, usize>::new();
+            let mut offset = bytes.iter().position(|&b| b == 0x47).unwrap_or(bytes.len());
+            while offset + 188 <= bytes.len() {
+                if bytes[offset] != 0x47 {
+                    offset += 1;
+                    continue;
+                }
+                let pid = (u16::from(bytes[offset + 1] & 0x1F) << 8) | u16::from(bytes[offset + 2]);
+                *pids.entry(pid).or_default() += 1;
+                offset += 188;
+            }
+            let mut top: Vec<_> = pids.iter().collect();
+            top.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = top
+                .iter()
+                .take(4)
+                .map(|(pid, n)| format!("0x{pid:04X}x{n}"))
+                .collect();
+            println!(
+                "C{:<2} ch={:<2} tune={} lock={} cnr={:.2}dB cnr_unsupported={} bytes={} ({} kbps) pat={} top=[{}]",
+                channel + 13,
+                channel,
+                match &tune {
+                    Ok(()) => "ok".to_string(),
+                    Err(error) => format!("ERR({error})"),
+                },
+                lock,
+                cnr,
+                unsupported,
+                bytes.len(),
+                bytes.len() * 8 / 2000,
+                pids.contains_key(&0x0000),
+                top.join(" "),
+            );
+        }
     }
 
     #[test]

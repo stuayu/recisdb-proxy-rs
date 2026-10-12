@@ -383,6 +383,25 @@ const SIGNAL_SAMPLE_WARMUP_BUDGET_MS: u64 = 45000;
 ///   budget lasts: the long window, so a cold driver's first tune is not
 ///   mistaken for an empty channel
 /// - otherwise: the ordinary window
+/// 信号強度を測れないバックエンド状態で、弱信号の判定を素通りさせるか。
+fn signal_passes_without_measurement(signal_level: f32, measurement_unsupported: bool) -> bool {
+    measurement_unsupported && signal_level < MIN_SIGNAL_LEVEL
+}
+
+/// スキャン結果のうち DB へ登録してよい TSID とサービス。
+/// NID が未確定 (None または 0) なら、どちらも登録しない。
+fn services_for_registration<T>(
+    network_id: Option<u16>,
+    transport_stream_id: Option<u16>,
+    services: Vec<T>,
+) -> (Option<u16>, Vec<T>) {
+    if network_id.is_some_and(|nid| nid != 0) {
+        (transport_stream_id, services)
+    } else {
+        (None, Vec::new())
+    }
+}
+
 fn signal_sample_window_ms(
     may_be_receivable: bool,
     saw_usable_signal: bool,
@@ -693,7 +712,11 @@ fn scan_space_blocking(
             signal_sample_window_ms(may_be_receivable, saw_usable_signal, warmup_spent_ms);
         let mut signal_level = tuner.get_signal_level();
         let mut sampled_ms = 0u64;
-        while signal_level < MIN_SIGNAL_LEVEL && sampled_ms < sample_window_ms {
+        while signal_level < MIN_SIGNAL_LEVEL
+            && sampled_ms < sample_window_ms
+            // 測れないバックエンド状態なら、待っても値は変わらない。
+            && !tuner.signal_measurement_unsupported()
+        {
             std::thread::sleep(std::time::Duration::from_millis(SIGNAL_SAMPLE_INTERVAL_MS));
             sampled_ms += SIGNAL_SAMPLE_INTERVAL_MS;
             let level = tuner.get_signal_level();
@@ -718,7 +741,19 @@ fn scan_space_blocking(
             signal_level, sampled_ms, sample_window_ms
         );
 
-        if signal_level < MIN_SIGNAL_LEVEL {
+        // ロック済みだが信号強度を測れない (px4_drv の実験的 J.83B モードなど)。
+        // 0.0 dB を「弱すぎる」と扱うと全チャンネルを捨てるので、TS の解析へ進める。
+        let unmeasurable = signal_passes_without_measurement(
+            signal_level,
+            tuner.signal_measurement_unsupported(),
+        );
+        if unmeasurable {
+            info!(
+                "scan_space_blocking: Space={} CH={} Name=\"{}\" - locked, but this receiver mode cannot report signal level; continuing without it",
+                space, channel, channel_name
+            );
+        }
+        if signal_level < MIN_SIGNAL_LEVEL && !unmeasurable {
             if may_be_receivable {
                 // Info, not debug: a channel that locked and was then dropped
                 // here is exactly the "the scan missed a channel I can watch"
@@ -863,17 +898,32 @@ fn scan_space_blocking(
             }
         };
 
+        // NID を確定できなかった搬送波は、サービスを登録しない。NID なしの行は
+        // DB では nid=0 になり、放送種別の分類も EPG の突き合わせもできず、
+        // EPG スケジューラが存在しない mux (nid=0) を選局しに行く。
+        // TSMF 多重の搬送波を `+tsmf` なしで読んだときに起きる (複数 TS の
+        // PSI が混ざり NIT が組み上がらない)。物理チャンネルの行だけ残す。
+        let detected_tsid = analysis.transport_stream_id;
+        let (transport_stream_id, services) =
+            services_for_registration(analysis.network_id, detected_tsid, analysis.services);
+        if transport_stream_id.is_none() && detected_tsid.is_some() {
+            warn!(
+                "scan_space_blocking: Space={} CH={} Name=\"{}\" - network_id could not be determined; not registering its services (a TSMF carrier needs a `+tsmf=N` receiver path)",
+                space, channel, channel_name
+            );
+        }
+
         results.push(ScanChannelResult {
             space,
             channel,
             channel_name: channel_name.clone(),
             signal_level,
             network_id: analysis.network_id,
-            transport_stream_id: analysis.transport_stream_id,
+            transport_stream_id,
             network_name: analysis.network_name,
             remote_control_key: analysis.remote_control_key,
             physical_ch: analysis.physical_ch,
-            services: analysis.services,
+            services,
         });
     }
 
@@ -1374,6 +1424,33 @@ async fn perform_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmeasurable_signal_passes_only_when_the_backend_says_so() {
+        // px4_drv の実験的 J.83B モード: ロック済みだが C/N は 0.0。
+        assert!(signal_passes_without_measurement(0.0, true));
+        // 測れるバックエンドの 0.0 は従来どおり「信号なし」。
+        assert!(!signal_passes_without_measurement(0.0, false));
+        // 測れているなら素通りの扱いにしない (通常の判定に任せる)。
+        assert!(!signal_passes_without_measurement(25.0, true));
+    }
+
+    #[test]
+    fn services_are_not_registered_without_a_network_id() {
+        assert_eq!(
+            services_for_registration(Some(4), Some(0x4010), vec![151u16, 152]),
+            (Some(0x4010), vec![151, 152])
+        );
+        assert_eq!(
+            services_for_registration(None, Some(0x4124), vec![95u16]),
+            (None, Vec::new())
+        );
+        assert_eq!(
+            services_for_registration(Some(0), Some(0x4010), vec![151u16]),
+            (None, Vec::new())
+        );
+    }
+
 
     #[cfg(unix)]
     #[test]

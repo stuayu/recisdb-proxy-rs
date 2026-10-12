@@ -111,6 +111,17 @@ mod dispatch {
             }
         }
 
+        /// ロックしているのに信号強度を測れないバックエンド状態か。
+        /// true のとき `get_signal_level()` の 0.0 は「信号なし」ではない。
+        pub fn signal_measurement_unsupported(&self) -> bool {
+            match self {
+                BonDriverTuner::CharDev(_) => false,
+                BonDriverTuner::Px4Daemon(t) => t.signal_measurement_unsupported(),
+                #[cfg(target_os = "linux")]
+                BonDriverTuner::DvbV5(_) => false,
+            }
+        }
+
         pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {
             match self {
                 BonDriverTuner::CharDev(t) => t.wait_ts_stream(timeout_ms),
@@ -210,6 +221,10 @@ mod stub {
 
         pub fn last_channel_locked(&self) -> Option<bool> {
             None
+        }
+
+        pub fn signal_measurement_unsupported(&self) -> bool {
+            false
         }
 
         pub fn wait_ts_stream(&self, _timeout_ms: u32) -> bool {
