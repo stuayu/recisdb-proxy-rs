@@ -301,6 +301,14 @@ impl Database {
             "037_node_route_capacity_advertisements",
             Database::migration_037_node_route_capacity_advertisements,
         ),
+        (
+            "038_epg_dwell_defaults",
+            Database::migration_038_epg_dwell_defaults,
+        ),
+        (
+            "039_programs_node_sync_keyset",
+            Database::migration_039_programs_node_sync_keyset,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -320,6 +328,14 @@ impl Database {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_programs_epg_coverage
              ON programs(nid, tsid, start_at, duration_secs)",
+        )?;
+        Ok(())
+    }
+
+    fn migration_039_programs_node_sync_keyset(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_programs_node_sync
+             ON programs(updated_at, id, start_at, duration_secs)",
         )?;
         Ok(())
     }
@@ -487,6 +503,33 @@ impl Database {
                 "REAL",
             )?;
         }
+        Ok(())
+    }
+
+    /// Migration 038: extend EPG dwell defaults for schedule EIT repetition
+    /// intervals. Only untouched old defaults are migrated; explicit user
+    /// values remain unchanged.
+    fn migration_038_epg_dwell_defaults(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "UPDATE epg_global_settings
+             SET normal_dwell_secs = 180
+             WHERE normal_dwell_secs = 90;
+             UPDATE epg_global_settings
+             SET max_dwell_secs = 600
+             WHERE max_dwell_secs = 180;
+             UPDATE epg_global_settings
+             SET idle_section_timeout_secs = 90
+             WHERE idle_section_timeout_secs = 20;
+             UPDATE epg_scan_presets
+             SET normal_dwell_secs = 180
+             WHERE is_system = 1 AND normal_dwell_secs = 90;
+             UPDATE epg_scan_presets
+             SET max_dwell_secs = 600
+             WHERE is_system = 1 AND max_dwell_secs = 180;
+             UPDATE epg_scan_presets
+             SET idle_section_timeout_secs = 90
+             WHERE is_system = 1 AND idle_section_timeout_secs = 20;",
+        )?;
         Ok(())
     }
 

@@ -96,22 +96,40 @@ pub struct RemoteEpgMetadataOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramUpsertWire {
+    #[serde(default)]
     pub nid: u16,
+    #[serde(default)]
     pub sid: u16,
+    #[serde(default)]
     pub tsid: u16,
+    #[serde(default)]
     pub event_id: u16,
+    #[serde(default)]
     pub start_at: i64,
+    #[serde(default)]
     pub duration_secs: i64,
+    #[serde(default)]
     pub free_ca_mode: bool,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub extended: Option<String>,
+    #[serde(default)]
     pub genre: Option<i64>,
+    #[serde(default)]
     pub updated_at: i64,
     #[serde(default)]
     pub source: u8,
+    #[serde(default)]
     pub basic_updated_at: Option<i64>,
+    #[serde(default)]
     pub extended_updated_at: Option<i64>,
+    #[serde(default)]
+    pub pf_updated_at: Option<i64>,
+    #[serde(default)]
+    pub schedule_updated_at: Option<i64>,
 }
 
 impl From<ProgramUpsert> for ProgramUpsertWire {
@@ -132,6 +150,8 @@ impl From<ProgramUpsert> for ProgramUpsertWire {
             source: value.source as u8,
             basic_updated_at: value.basic_updated_at,
             extended_updated_at: value.extended_updated_at,
+            pf_updated_at: None,
+            schedule_updated_at: None,
         }
     }
 }

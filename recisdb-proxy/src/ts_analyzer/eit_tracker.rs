@@ -183,9 +183,19 @@ impl EpgSectionTracker {
                     .keys()
                     .any(|&id| id >= ext_base && id <= ext_cap)
                     && ext_last >= ext_base
-                    && range_complete(&service.sub_tables, ext_base, ext_last);
+                    && range_complete(
+                        &service.sub_tables,
+                        ext_base,
+                        ext_last,
+                        self.last_now,
+                    );
                 (
-                    range_complete(&service.sub_tables, basic_base, basic_last),
+                    range_complete(
+                        &service.sub_tables,
+                        basic_base,
+                        basic_last,
+                        self.last_now,
+                    ),
                     extended,
                     coverage_until(service, basic_base, basic_last, self.last_now),
                 )
@@ -267,8 +277,25 @@ fn schedule_last(tables: &BTreeMap<u8, SubTableState>, base: u8, cap: u8) -> u8 
         .unwrap_or(base.saturating_sub(1))
 }
 
-fn range_complete(tables: &BTreeMap<u8, SubTableState>, first: u8, last: u8) -> bool {
-    first <= last && (first..=last).all(|id| tables.get(&id).is_some_and(subtable_complete))
+fn range_complete(
+    tables: &BTreeMap<u8, SubTableState>,
+    first: u8,
+    last: u8,
+    now: Option<i64>,
+) -> bool {
+    let Some(current_segment) = current_segment(now) else {
+        return false;
+    };
+    first <= last
+        && (first..=last).all(|id| {
+            tables.get(&id).is_some_and(|sub| {
+                if id == first {
+                    schedule_subtable_complete(sub, current_segment)
+                } else {
+                    subtable_complete(sub)
+                }
+            })
+        })
 }
 
 fn subtable_complete(sub: &SubTableState) -> bool {
@@ -286,21 +313,44 @@ fn segment_complete(sub: &SubTableState, segment: usize) -> bool {
             .all(|number| sub.received[number / 64] & (1u64 << (number % 64)) != 0)
 }
 
+fn schedule_subtable_complete(sub: &SubTableState, current_segment: usize) -> bool {
+    let current_first = current_segment * 8;
+    // A table without a section for the current segment cannot be complete.
+    sub.last_section_number as usize >= current_first
+        && (0..=sub.last_section_number as usize).all(|number| {
+            number < current_first
+                || sub.received[number / 64] & (1u64 << (number % 64)) != 0
+        })
+}
+
 fn coverage_until(service: &ServiceState, base: u8, last: u8, now: Option<i64>) -> Option<i64> {
     let midnight = jst_midnight(now?);
+    let current_segment = current_segment(now)?;
     let mut segments = 0i64;
     for id in base..=last {
         let Some(sub) = service.sub_tables.get(&id) else {
             return (segments > 0).then_some(midnight + segments * 3 * 3600);
         };
         for segment in 0..32 {
+            if id == base && segment < current_segment {
+                segments += 1;
+                continue;
+            }
             if !segment_complete(sub, segment) {
+                if id == base && segment == current_segment {
+                    return None;
+                }
                 return (segments > 0).then_some(midnight + segments * 3 * 3600);
             }
             segments += 1;
         }
     }
     (segments > 0).then_some(midnight + segments * 3 * 3600)
+}
+
+fn current_segment(now: Option<i64>) -> Option<usize> {
+    let now = now?;
+    Some((((now - jst_midnight(now)).div_euclid(3 * 3600)).clamp(0, 7)) as usize)
 }
 
 fn jst_midnight(now: i64) -> i64 {
@@ -380,7 +430,7 @@ mod tests {
         for n in [0, 2] {
             let b = section_bytes(0x50, 1, n, 2, 2, true);
             let s = parse_section(&b);
-            t.observe(pid::EIT, &s, 0);
+            t.observe(pid::EIT, &s, jst_midnight(1_725_168_000));
         }
         let key = EitServiceKey {
             pid: pid::EIT,
@@ -393,7 +443,7 @@ mod tests {
             .is_some_and(|completion| !completion.schedule_basic_complete));
         let b = section_bytes(0x50, 1, 1, 2, 2, true);
         let s = parse_section(&b);
-        t.observe(pid::EIT, &s, 0);
+        t.observe(pid::EIT, &s, jst_midnight(1_725_168_000));
         assert!(t
             .completion(&key)
             .is_some_and(|completion| completion.schedule_basic_complete));
@@ -461,14 +511,14 @@ mod tests {
             let b = section_bytes(0x50, 1, n, 15, 7, true);
             let s = parse_section(&b);
             assert_eq!(
-                t.observe(pid::EIT, &s, 1_725_168_000),
+                t.observe(pid::EIT, &s, jst_midnight(1_725_168_000)),
                 ObserveOutcome::Recorded
             );
         }
         for n in 8..=15 {
             let b = section_bytes(0x50, 1, n, 15, 15, true);
             let s = parse_section(&b);
-            t.observe(pid::EIT, &s, 1_725_168_000);
+            t.observe(pid::EIT, &s, jst_midnight(1_725_168_000));
         }
         let key = EitServiceKey {
             pid: pid::EIT,
@@ -510,7 +560,11 @@ mod tests {
         for n in 0..=7 {
             let b = section_bytes(0x50, 1, n, 7, 7, true);
             assert_eq!(
-                tracker.observe(pid::EIT, &parse_section(&b), 0),
+                tracker.observe(
+                    pid::EIT,
+                    &parse_section(&b),
+                    jst_midnight(1_725_168_000),
+                ),
                 ObserveOutcome::Recorded
             );
         }
@@ -558,11 +612,11 @@ mod tests {
         let mut tracker = EpgSectionTracker::new();
         for n in 0..=7 {
             let b = section_bytes(0x50, 1, n, 15, 7, true);
-            tracker.observe(pid::EIT, &parse_section(&b), 1_725_168_000);
+            tracker.observe(pid::EIT, &parse_section(&b), jst_midnight(1_725_168_000));
         }
         for n in [8, 10, 11, 12, 13, 14, 15] {
             let b = section_bytes(0x50, 1, n, 15, 15, true);
-            tracker.observe(pid::EIT, &parse_section(&b), 1_725_168_000);
+            tracker.observe(pid::EIT, &parse_section(&b), jst_midnight(1_725_168_000));
         }
         let key = EitServiceKey {
             pid: pid::EIT,
@@ -579,11 +633,89 @@ mod tests {
     }
 
     #[test]
+    fn past_segments_are_implicitly_complete_for_first_schedule_table() {
+        let mut tracker = EpgSectionTracker::new();
+        let now = jst_midnight(1_725_168_000) + 15 * 3600;
+        for number in 40..=47 {
+            let bytes = section_bytes(0x50, 1, number, 47, 47, true);
+            tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        }
+        let key = EitServiceKey {
+            pid: pid::EIT,
+            original_network_id: 0x5678,
+            transport_stream_id: 0x1234,
+            service_id: 0x9ABC,
+        };
+        let completion = tracker.completion(&key).unwrap();
+        assert!(completion.schedule_basic_complete);
+        assert_eq!(
+            completion.schedule_coverage_until,
+            Some(jst_midnight(now) + 18 * 3600)
+        );
+    }
+
+    #[test]
+    fn missing_current_segment_has_no_coverage() {
+        let mut tracker = EpgSectionTracker::new();
+        let now = jst_midnight(1_725_168_000) + 15 * 3600;
+        for number in 48..=55 {
+            let bytes = section_bytes(0x50, 1, number, 55, 55, true);
+            tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        }
+        let key = EitServiceKey {
+            pid: pid::EIT,
+            original_network_id: 0x5678,
+            transport_stream_id: 0x1234,
+            service_id: 0x9ABC,
+        };
+        assert_eq!(tracker.completion(&key).unwrap().schedule_coverage_until, None);
+    }
+
+    #[test]
+    fn early_day_still_requires_first_segment() {
+        let mut tracker = EpgSectionTracker::new();
+        let now = jst_midnight(1_725_168_000) + 3600;
+        let bytes = section_bytes(0x50, 1, 8, 15, 15, true);
+        tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        let key = EitServiceKey {
+            pid: pid::EIT,
+            original_network_id: 0x5678,
+            transport_stream_id: 0x1234,
+            service_id: 0x9ABC,
+        };
+        assert!(!tracker.completion(&key).unwrap().schedule_basic_complete);
+        assert_eq!(tracker.completion(&key).unwrap().schedule_coverage_until, None);
+    }
+
+    #[test]
+    fn later_schedule_table_still_requires_its_first_segment() {
+        let mut tracker = EpgSectionTracker::new();
+        let now = jst_midnight(1_725_168_000) + 15 * 3600;
+        for number in 40..=47 {
+            let bytes = section_bytes(0x50, 1, number, 47, 47, true);
+            tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        }
+        let bytes = section_bytes(0x51, 1, 8, 15, 15, true);
+        tracker.observe(pid::EIT, &parse_section(&bytes), now);
+        let key = EitServiceKey {
+            pid: pid::EIT,
+            original_network_id: 0x5678,
+            transport_stream_id: 0x1234,
+            service_id: 0x9ABC,
+        };
+        assert!(!tracker.completion(&key).unwrap().schedule_basic_complete);
+        assert_eq!(
+            tracker.completion(&key).unwrap().schedule_coverage_until,
+            Some(jst_midnight(now) + 18 * 3600)
+        );
+    }
+
+    #[test]
     fn coverage_survives_missing_later_sub_table() {
         let mut tracker = EpgSectionTracker::new();
         for n in 0..=7 {
             let b = section_bytes_with_last_table(0x50, 1, n, 7, 7, true, 0x51);
-            tracker.observe(pid::EIT, &parse_section(&b), 1_725_168_000);
+            tracker.observe(pid::EIT, &parse_section(&b), jst_midnight(1_725_168_000));
         }
         let key = EitServiceKey {
             pid: pid::EIT,

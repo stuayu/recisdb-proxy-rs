@@ -9,6 +9,24 @@
 別の `MuxLeaseManager` で `(network_id, tsid)` を排他し、TTLまたはguard dropで解放する。
 `remote_allow_ts_transport` が無効でも、このmetadata経路はTS転送を行わない。
 
+### EPG番組行の定期同期
+
+ペアリング済み・有効なノードから、チューナーを使わずに番組行を取得する。供給側の
+`POST /node/v3/epg/programs` は `network_ids`、`cursor_updated_at`、`cursor_id`、`limit` を受け取り、
+終了していない行を `(updated_at, id)` のkeyset順で返す。`limit` は1〜2000に丸める（既定1000）。
+初回ページ（カーソル0,0）または要求側が `include_coverage=true` を付けたページでは `epg_scan_states` の
+mux単位section coverageも返す。要求側は周期ごとの最初のページで `include_coverage` を立てるので、
+coverageは周期ごとに更新される。p/f・scheduleの更新時計も失わない。
+
+同期タスクはノード機能有効時だけ起動し、起動60秒後、その後600秒ごとに実行する。DBの実効設定で
+`enabled` と `allow_remote` が有効なときだけ、ローカルの有効チャンネルから得たNIDを要求する。
+ノードごとにカーソルをメモリ保持し、1周期100ページまで、受信行はEpgWriterのキューを通さず
+1ページ単位でDBへ書き込む。未知NIDは破棄し、coverageは各時刻の大きい値へマージする。接続先は
+route syncと同じ有効endpointの先頭応答を使う。供給側のEpgWriterは受信から最大10秒遅れて書き込むため、
+読んだ時点のカーソルより古い `updated_at` の行があとから現れる。周期を完走したらカーソルを120秒
+巻き戻して保存し、重複分はUPSERTに吸収させる。多段中継では上流の古い`updated_at`行がカーソルより
+前に入り得るため、完全な履歴再同期を保証しない。旧ノードの404/405は互換性上のdebug扱いとする。
+
 `POST /node/v3/epg/metadata` の `RemoteEpgMetadataRequest` は、従来の固定滞在時間
 `dwell_secs` に加えて `dwell: Option<RemoteEpgDwell>` を持つ。`RemoteEpgDwell` のフィールドは
 `min_dwell_secs`、`normal_dwell_secs`、`max_dwell_secs`、`idle_section_timeout_secs`、

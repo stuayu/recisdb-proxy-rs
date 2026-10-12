@@ -469,7 +469,54 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/lease/:id", delete(release_lease))
         .route("/node/v3/stream/:id", get(stream_lease))
         .route("/node/v3/epg/metadata", post(epg_metadata))
+        .route("/node/v3/epg/programs", post(epg_programs))
         .with_state(state)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpgProgramsRequest {
+    #[serde(default)]
+    pub network_ids: Vec<u16>,
+    #[serde(default)]
+    pub cursor_updated_at: i64,
+    #[serde(default)]
+    pub cursor_id: i64,
+    #[serde(default = "default_program_page_limit")]
+    pub limit: u32,
+    /// 初回ページ以外でも mux coverage を返してほしいとき true。
+    /// 要求側は周期ごとの最初のページで立てる。
+    #[serde(default)]
+    pub include_coverage: bool,
+}
+
+fn default_program_page_limit() -> u32 { 1000 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpgProgramCoverageWire {
+    #[serde(default)]
+    pub network_id: u16,
+    #[serde(default)]
+    pub tsid: u16,
+    #[serde(default)]
+    pub section_coverage_until: Option<i64>,
+    #[serde(default)]
+    pub last_eit_received_at: Option<i64>,
+    #[serde(default)]
+    pub last_complete_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpgProgramsReply {
+    #[serde(default)]
+    pub programs: Vec<ProgramUpsertWire>,
+    #[serde(default)]
+    pub next_cursor_updated_at: i64,
+    #[serde(default)]
+    pub next_cursor_id: i64,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub coverage: Vec<EpgProgramCoverageWire>,
 }
 
 /// Remove the authenticated caller from this node's persisted peer list.
@@ -864,6 +911,92 @@ async fn epg_metadata(
     }
 }
 
+async fn epg_programs(
+    State(state): State<Arc<NodeTransportState>>,
+    headers: HeaderMap,
+    Json(payload): Json<EpgProgramsRequest>,
+) -> Response {
+    if state.authorize(&headers).await.is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(database) = state.database.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let limit = payload.limit.clamp(1, 2000);
+    let now = chrono::Utc::now().timestamp();
+    let result = {
+        let db = database.lock().await;
+        let page = db.get_programs_for_node_page(
+            &payload.network_ids,
+            payload.cursor_updated_at,
+            payload.cursor_id,
+            now,
+            limit,
+        );
+        let coverage = if payload.include_coverage
+            || (payload.cursor_updated_at == 0 && payload.cursor_id == 0)
+        {
+            db.get_epg_scan_states().map(|states| {
+                states
+                    .into_iter()
+                    .filter(|state| payload.network_ids.is_empty() || payload.network_ids.contains(&state.network_id))
+                    .map(|state| EpgProgramCoverageWire {
+                        network_id: state.network_id,
+                        tsid: state.tsid,
+                        section_coverage_until: state.section_coverage_until,
+                        last_eit_received_at: state.last_eit_received_at,
+                        last_complete_at: state.last_complete_at,
+                    })
+                    .collect()
+            })
+        } else {
+            Ok(Vec::new())
+        };
+        page.and_then(|(rows, has_more)| coverage.map(|coverage| (rows, has_more, coverage)))
+    };
+    match result {
+        Ok((rows, has_more, coverage)) => {
+            let (next_updated_at, next_id) = rows
+                .last()
+                .map(|row| (row.program.updated_at, row.id))
+                .unwrap_or((payload.cursor_updated_at, payload.cursor_id));
+            Json(EpgProgramsReply {
+                programs: rows
+                    .into_iter()
+                    .map(|row| ProgramUpsertWire {
+                        nid: row.program.nid,
+                        sid: row.program.sid,
+                        tsid: row.program.tsid,
+                        event_id: row.program.event_id,
+                        start_at: row.program.start_at,
+                        duration_secs: row.program.duration_secs,
+                        free_ca_mode: row.program.free_ca_mode,
+                        name: row.program.name,
+                        description: row.program.description,
+                        extended: row.program.extended,
+                        genre: row.program.genre,
+                        updated_at: row.program.updated_at,
+                        source: row.program.source as u8,
+                        basic_updated_at: row.program.basic_updated_at,
+                        extended_updated_at: row.program.extended_updated_at,
+                        pf_updated_at: row.pf_updated_at,
+                        schedule_updated_at: row.schedule_updated_at,
+                    })
+                    .collect(),
+                next_cursor_updated_at: next_updated_at,
+                next_cursor_id: next_id,
+                has_more,
+                coverage,
+            })
+            .into_response()
+        }
+        Err(error) => {
+            log::warn!("[node] EPG programs request failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn renew_lease(
     State(state): State<Arc<NodeTransportState>>,
     headers: HeaderMap,
@@ -1182,6 +1315,24 @@ impl NodeTransportClient {
         .await
     }
 
+    pub async fn fetch_epg_programs(
+        &self,
+        base: &str,
+        request: &EpgProgramsRequest,
+    ) -> Result<EpgProgramsReply, reqwest::Error> {
+        self.request(
+            reqwest::Method::POST,
+            format!("{}/node/v3/epg/programs", base.trim_end_matches('/')),
+        )
+        .json(request)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+    }
+
     /// Keep a lease alive. Returns `false` when the peer no longer has it —
     /// the lease is gone and a RECORD consumer must treat that as failure,
     /// not as something to keep retrying against.
@@ -1391,6 +1542,15 @@ mod tests {
         let request: RemoteEpgMetadataRequest = serde_json::from_value(json).unwrap();
         assert_eq!(request.dwell, None);
         assert_eq!(request.dwell_secs, 30);
+    }
+
+    #[test]
+    fn epg_program_sync_wire_defaults_old_empty_payload() {
+        let request: EpgProgramsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.limit, 1000);
+        let reply: EpgProgramsReply = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(reply.programs.is_empty());
+        assert!(reply.coverage.is_empty());
     }
     use crate::node::{LeasePolicy, LogicalMuxId};
     use crate::tuner::EffectiveClaim;

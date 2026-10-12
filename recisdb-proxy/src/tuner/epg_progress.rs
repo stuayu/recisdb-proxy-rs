@@ -222,11 +222,16 @@ mod tests {
                     if number < 8 { 1 } else { 9 },
                     true,
                 );
-                observe(&progress, &bytes, pid::EIT, 1_725_168_000);
+                observe(
+                    &progress,
+                    &bytes,
+                    pid::EIT,
+                    ((1_725_168_000_i64 + 9 * 3600).div_euclid(86400) * 86400) - 9 * 3600,
+                );
             }
         }
         let completion = progress.mux_completion(20, 10);
-        let now: i64 = 1_725_168_000;
+        let now: i64 = ((1_725_168_000_i64 + 9 * 3600).div_euclid(86400) * 86400) - 9 * 3600;
         let midnight = ((now + 9 * 3600).div_euclid(86400) * 86400) - 9 * 3600;
         assert_eq!(completion.coverage_until, Some(midnight + 3 * 3600));
     }

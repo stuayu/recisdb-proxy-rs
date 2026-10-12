@@ -914,6 +914,11 @@ async fn run_server(
                         Arc::clone(server.tuner_pool()),
                     )
                     .spawn();
+                    recisdb_proxy::node::EpgProgramSync::new(
+                        Arc::clone(&state),
+                        db.clone(),
+                    )
+                    .spawn();
 
                     let serve_state = Arc::clone(&state);
                     let dynamic_tailscale = resolved.node_listen_addrs.is_none();

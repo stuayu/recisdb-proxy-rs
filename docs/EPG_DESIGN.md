@@ -203,8 +203,14 @@ section/TSが自ノードへ来ないため、返却されたcoverageをmuxのsc
 
 判定用coverageは、EIT sectionからサービスごとに作る `schedule_coverage_until` である。
 scheduleは当日00:00 JSTを基準にsegmentを対応付け、受信済みsectionの連続範囲から終了時刻を
-求める。mux単位では番組表対象サービス（`channels.service_type` が1、2、またはNULL、かつ
-`sid != 0` かつ `tsid != 0`）の
+求める。過去segmentは放送で再送されないため、先頭schedule tableの現在segmentより前は受信済み
+として扱う。現在segment自体は受信sectionを要求し、現在segment以降と2番目以降のtableは従来どおり
+sectionの完成度を要求する。返す時刻は従来どおり当日00:00 JSTからの連続segment数で計算する。
+この扱いはschedule basic/extendedの完成判定にも適用し、p/fの完成判定は変更しない。
+
+mux単位では番組表対象サービス（`sid != 0` かつ `tsid != 0`）のうち、
+`channels.service_type` が1または2のサービスを常に対象とし、NULLのサービスは
+`epg_service_coverage` に受信済み行がある場合だけ対象にする。対象サービスの
 母数を使い、サービスごとのcoverageの **MIN** を採用する。対象サービスが1つでも未取得なら
 muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux全体の完了とはみなさない。
 `sid=0` はPAT上でNITを指す予約値、`tsid=0` は物理チャンネルだけを登録した仮行なので、
@@ -222,7 +228,8 @@ muxのcoverageはNULLであり、追跡できたサービスだけのMINをmux�
 候補の判定はsection coverageを基準に、全帯域で `needs_scan = !covered || stale || hard_stale`
 を使う。`target_refresh_secs` はsoft stale（更新候補へ戻す時刻）、`max_stale_secs` はhard
 stale（これ以上古いEITを許さない時刻）であり、意味を分離する。候補の優先順位は
-`min_future_coverage_hours` 未達、目標coverage未達、stale、failure_count、
+`min_future_coverage_hours` 未達、目標coverage未達、stale、最後にスキャンを開始した時刻（古い順、
+未実施優先）、failure_count、
 `section_coverage_until`、TSIDの順である。`min_future_coverage_hours` はcoverageの下限、
 `target_future_coverage_hours` は到達させたい目標であり、前者は「やるかやらないか」を
 決める条件ではなく、「どの候補を先にやるか」を決める最優先階層である。BS/CSはother-TS EITで
@@ -234,6 +241,15 @@ EITにother-TS情報がないため、TS単位で独立して扱う。
 `ActiveScanGuard` と `InFlightGuard` はDrop時にカウンタとin-flight集合を解放し、
 `MuxLeaseGuard` は各スキャンタスクが所有する。プロセス内in-flight集合に加え、TTL付き
 `MuxLeaseManager` でも重複を防ぐ二重防御とする。
+
+Partialで終了したmuxは `min(target_refresh_secs, 1800)` 秒後まで再スキャン対象にしない。
+NoData/失敗はfailure_countに応じて60秒から指数的に延長し、最大3600秒のbackoffを使う。
+Completeも同じく `min(target_refresh_secs, 1800)` 秒は再スキャンしない。dwell側の完了判定は
+trackerが見たサービスだけを母数にするため、`channels` 側の母数で未完了のままだとstale判定が
+立ち続け、間隔なしでは同じmuxを連続で取り直すからである。それ以降は既存のstale判定に任せる。
+候補muxの列挙は coverage の母数と同じ規則を使うが、`service_type` がNULLの行は候補に残す
+（EITを一度受信するまで母数に入らないので、候補から外すと永久にスキャンされない）。dwellの既定値はmin 30秒、normal 180秒、max 600秒、
+section idle timeout 90秒である。
 
 内部wakeは5秒、full evaluation周期は `scheduler_interval_secs` として分離する。
 起動時は `startup_delay_secs` に `startup_jitter_secs`（最低1秒）を加える。
@@ -247,7 +263,8 @@ Migration 034 `epg_service_coverage` は `(network_id, tsid, service_id)` を主
 `sections_seen`、`last_section_at`、`last_complete_at`、`updated_at`を保持する。
 `upsert_epg_service_coverage` / `get_epg_service_coverage` がサービス単位を扱い、
 `get_epg_mux_coverage` / `refresh_epg_section_coverage` がchannelsの対象サービスを母数に
-mux集約する。
+mux集約する。muxの `last_complete_at` は対象サービスがすべてschedule basic completeに
+なった場合だけ集約し、1サービスでも未完了ならNULLにする。
 
 同じMigration 034で `epg_scan_states` に `section_coverage_until`、`services_total`、
 `services_complete`、`last_complete_at`、`last_scan_status` を追加する。
@@ -292,6 +309,18 @@ broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報
 `remote_prefer_metadata_execution=false` かつ `remote_allow_ts_transport=true` の場合は、
 既存の `RemoteMuxStream` を broadcast 購読し、こちら側の `EpgCollector` で解析する。
 remote TS 収集も metadata 収集も同じ dwell・lease・失敗時local fallbackを使う。
+
+別経路として、ペアリング済みノードのDBから `POST /node/v3/epg/programs` で終了していない
+番組行をkeysetページング同期する。これはチューナーを使わず、`enabled && allow_remote` だけを
+ゲートにし、`auto_tuner_scan_enabled` は見ない。ハブで下流の局をノード間lease視聴しても、
+ハブ側では受動収集は動かない。番組表はこの同期経路で入る。供給側のsection coverageは
+`epg_scan_states`へ大きい値を採って反映し、`epg_service_coverage` のローカルsectionは偽造しない。
+`refresh_epg_section_coverage` はローカルでEIT sectionを一度も受信していないmuxについて、
+ペアノード由来の `section_coverage_until` / `last_complete_at` をNULLで上書きしない。
+
+番組行同期は起動60秒後に初回、その後600秒周期、1周期100ページまで実行する。ノードごとに
+`(updated_at,id)`カーソルを持ち、再起動時は先頭から取り直す。多段中継では上流の古い
+`updated_at`行がカーソルより前に入り得るため、同期だけで全履歴の完全な収束は保証しない。
 
 スキャン状態は各物理TSを表す `(network_id, tsid)` ごとに保持する。サービス単位のsection
 coverageを更新した後、対象サービスの最小値を `section_coverage_until` へ反映する。

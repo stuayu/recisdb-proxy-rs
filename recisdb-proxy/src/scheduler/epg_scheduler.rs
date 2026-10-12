@@ -36,6 +36,17 @@ pub struct EpgScanOutcome {
     pub coverage_after: Option<i64>,
 }
 
+fn history_status(status: EpgScanStatus) -> &'static str {
+    match status {
+        EpgScanStatus::Complete => "completed",
+        EpgScanStatus::Partial => "partial",
+        EpgScanStatus::NoData => "no_data",
+        EpgScanStatus::Preempted => "preempted",
+        EpgScanStatus::CpuAborted => "failed",
+        EpgScanStatus::Failed => "failed",
+    }
+}
+
 fn startup_wait_secs(delay_secs: i64, jitter_secs: i64, random_value: u32) -> u64 {
     let base = delay_secs.max(1) as u64;
     let jitter = jitter_secs.max(0) as u64;
@@ -311,10 +322,19 @@ impl EpgScanScheduler {
         }
     }
     async fn evaluate(self: &Arc<Self>) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let (config, states) = {
+        let (config, states, target_muxes) = {
             let db = self.database.lock().await;
             db.refresh_epg_coverage()?;
-            (db.get_epg_global_settings()?, db.get_epg_scan_states()?)
+            let target_muxes = db
+                .get_epg_mux_coverage()?
+                .into_iter()
+                .map(|coverage| (coverage.network_id, coverage.tsid))
+                .collect::<HashSet<_>>();
+            (
+                db.get_epg_global_settings()?,
+                db.get_epg_scan_states()?,
+                target_muxes,
+            )
         };
         let now = chrono::Utc::now().timestamp();
         let candidates = {
@@ -323,7 +343,7 @@ impl EpgScanScheduler {
             let mut targets = Vec::new();
             for driver in &drivers {
                 for channel in db.get_enabled_channels_by_bon_driver(driver.id)? {
-                    append_epg_target(&mut targets, &channel, &states);
+                    append_epg_target(&mut targets, &channel, &states, &target_muxes);
                 }
             }
             rank_targets(&targets, now, &config)
@@ -496,7 +516,14 @@ impl EpgScanScheduler {
                 _ = stopped.changed() => {
                     let now = chrono::Utc::now().timestamp();
                     let db = self.database.lock().await;
-                    let _ = db.epg_scan_finished(history, "preempted", channel.nid, channel.tsid, None);
+                    let _ = db.epg_scan_finished(
+                        history,
+                        "preempted",
+                        channel.nid,
+                        channel.tsid,
+                        None,
+                        config.target_refresh_secs,
+                    );
                     let _ = db.set_epg_scan_status(channel.nid, channel.tsid, EpgScanStatus::Preempted, now);
                     return Ok(());
                 }
@@ -518,20 +545,12 @@ impl EpgScanScheduler {
                     channel.nid,
                     channel.tsid,
                     Some(&reason),
+                    config.target_refresh_secs,
                 );
                 let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
             } else {
                 let outcome = metadata_result.unwrap();
-                let status = if matches!(
-                    outcome.status,
-                    EpgScanStatus::Complete | EpgScanStatus::Partial
-                ) {
-                    "completed"
-                } else if outcome.status == EpgScanStatus::Preempted {
-                    "preempted"
-                } else {
-                    "failed"
-                };
+                let status = history_status(outcome.status);
                 log::info!("EPG scan nid={} tsid={} path=remote_metadata status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
                 let db = self.database.lock().await;
                 let details = outcome_details(&outcome);
@@ -545,6 +564,7 @@ impl EpgScanScheduler {
                     } else {
                         Some(&details)
                     },
+                    config.target_refresh_secs,
                 );
                 let _ = db.refresh_epg_coverage();
                 return Ok(());
@@ -571,20 +591,12 @@ impl EpgScanScheduler {
                     channel.nid,
                     channel.tsid,
                     Some(&reason),
+                    config.target_refresh_secs,
                 );
                 let _ = db.record_epg_deferred(channel.nid, channel.tsid, &reason, true);
             } else {
                 let outcome = remote_ts_result.unwrap();
-                let status = if matches!(
-                    outcome.status,
-                    EpgScanStatus::Complete | EpgScanStatus::Partial
-                ) {
-                    "completed"
-                } else if outcome.status == EpgScanStatus::Preempted {
-                    "preempted"
-                } else {
-                    "failed"
-                };
+                let status = history_status(outcome.status);
                 log::info!("EPG scan nid={} tsid={} path=remote_ts status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
                 let db = self.database.lock().await;
                 let details = outcome_details(&outcome);
@@ -598,6 +610,7 @@ impl EpgScanScheduler {
                     } else {
                         Some(&details)
                     },
+                    config.target_refresh_secs,
                 );
                 let _ = db.refresh_epg_coverage();
                 return Ok(());
@@ -606,7 +619,14 @@ impl EpgScanScheduler {
         if *stopped.borrow() {
             let now = chrono::Utc::now().timestamp();
             let db = self.database.lock().await;
-            let _ = db.epg_scan_finished(history, "preempted", channel.nid, channel.tsid, None);
+            let _ = db.epg_scan_finished(
+                history,
+                "preempted",
+                channel.nid,
+                channel.tsid,
+                None,
+                config.target_refresh_secs,
+            );
             let _ =
                 db.set_epg_scan_status(channel.nid, channel.tsid, EpgScanStatus::Preempted, now);
             return Ok(());
@@ -627,16 +647,7 @@ impl EpgScanScheduler {
         let db = self.database.lock().await;
         match result {
             Ok(outcome) => {
-                let status = if matches!(
-                    outcome.status,
-                    EpgScanStatus::Complete | EpgScanStatus::Partial
-                ) {
-                    "completed"
-                } else if outcome.status == EpgScanStatus::Preempted {
-                    "preempted"
-                } else {
-                    "failed"
-                };
+                let status = history_status(outcome.status);
                 let details = outcome_details(&outcome);
                 log::info!("EPG scan nid={} tsid={} path=local status={} elapsed={}s sections={} services={}/{} coverage={:?}->{:?}", channel.nid, channel.tsid, outcome.status.as_str(), outcome.elapsed_secs, outcome.sections_seen, outcome.services_complete, outcome.services_total, outcome.coverage_before, outcome.coverage_after);
                 let _ = db.epg_scan_finished(
@@ -649,6 +660,7 @@ impl EpgScanScheduler {
                     } else {
                         Some(&details)
                     },
+                    config.target_refresh_secs,
                 );
             }
             Err(e) => {
@@ -688,6 +700,7 @@ impl EpgScanScheduler {
                     channel.nid,
                     channel.tsid,
                     Some(&reason),
+                    config.target_refresh_secs,
                 );
             }
         }
@@ -1110,6 +1123,7 @@ struct EpgTarget {
     program_coverage_until: Option<i64>,
     last_eit_received_at: Option<i64>,
     last_complete_at: Option<i64>,
+    last_scan_started_at: Option<i64>,
     next_eligible_at: Option<i64>,
     failure_count: i64,
 }
@@ -1124,6 +1138,7 @@ impl EpgTarget {
             program_coverage_until: state.and_then(|s| s.coverage_until),
             last_eit_received_at: state.and_then(|s| s.last_eit_received_at),
             last_complete_at: state.and_then(|s| s.last_complete_at),
+            last_scan_started_at: state.and_then(|s| s.last_scan_started_at),
             next_eligible_at: state.and_then(|s| s.next_eligible_at),
             failure_count: state.map_or(0, |s| s.failure_count),
         }
@@ -1134,8 +1149,12 @@ fn append_epg_target(
     targets: &mut Vec<EpgTarget>,
     channel: &ChannelRecord,
     states: &[EpgScanState],
+    target_muxes: &HashSet<(u16, u16)>,
 ) {
     if !is_real_broadcast_service(channel.sid, channel.tsid)
+        // service_type が未判明の行は、EIT を一度受信するまで coverage の母数に
+        // 入らない。ここで候補からも外すと、そのmuxは永久にスキャンされない。
+        || !(target_muxes.contains(&(channel.nid, channel.tsid)) || channel.service_type.is_none())
         || targets
             .iter()
             .any(|target| target.network_id == channel.nid && target.tsid == channel.tsid)
@@ -1202,6 +1221,7 @@ fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> 
             !min_coverage_missing,
             !coverage_missing,
             !stale,
+            target.last_scan_started_at.unwrap_or(i64::MIN),
             target.failure_count,
             target.section_coverage_until.unwrap_or(i64::MIN),
             target.tsid,
@@ -1222,7 +1242,7 @@ fn target_needs_scan(target: &EpgTarget, now: i64, config: &EpgGlobalSettings) -
     let hard_stale = target
         .last_eit_received_at
         .is_none_or(|at| at + config.max_stale_secs <= now);
-    !covered || stale || hard_stale
+    !target.next_eligible_at.is_some_and(|at| at > now) && (!covered || stale || hard_stale)
 }
 
 /// 同じ network_id の衛星ターゲット群から、選局する代表を1つ選ぶ。
@@ -1247,6 +1267,7 @@ fn choose_satellite_representative(
         .filter(|target| target_needs_scan(target, now, config))
         .min_by_key(|target| {
             (
+                target.last_scan_started_at.unwrap_or(i64::MIN),
                 target.failure_count,
                 target.section_coverage_until.unwrap_or(i64::MIN),
                 target.tsid,
@@ -1422,6 +1443,7 @@ mod tests {
                 program_coverage_until: None,
                 last_eit_received_at: Some(10),
                 last_complete_at: Some(10),
+                last_scan_started_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1433,6 +1455,7 @@ mod tests {
                 program_coverage_until: None,
                 last_eit_received_at: None,
                 last_complete_at: None,
+                last_scan_started_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1444,6 +1467,7 @@ mod tests {
                 program_coverage_until: None,
                 last_eit_received_at: None,
                 last_complete_at: None,
+                last_scan_started_at: None,
                 next_eligible_at: Some(100),
                 failure_count: 0,
             },
@@ -1463,6 +1487,7 @@ mod tests {
                 program_coverage_until: None,
                 last_eit_received_at: Some(10),
                 last_complete_at: Some(10),
+                last_scan_started_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1474,6 +1499,7 @@ mod tests {
                 program_coverage_until: None,
                 last_eit_received_at: None,
                 last_complete_at: None,
+                last_scan_started_at: None,
                 next_eligible_at: None,
                 failure_count: 0,
             },
@@ -1491,6 +1517,7 @@ mod tests {
             program_coverage_until: None,
             last_eit_received_at: Some(100),
             last_complete_at: Some(100),
+            last_scan_started_at: None,
             next_eligible_at: None,
             failure_count: 0,
         };
@@ -1508,6 +1535,7 @@ mod tests {
             program_coverage_until: None,
             last_eit_received_at: None,
             last_complete_at: None,
+            last_scan_started_at: None,
             next_eligible_at: None,
             failure_count: 0,
         };
@@ -1530,6 +1558,7 @@ mod tests {
             program_coverage_until: None,
             last_eit_received_at,
             last_complete_at,
+            last_scan_started_at: None,
             next_eligible_at: None,
             failure_count: 0,
         }
@@ -1558,6 +1587,20 @@ mod tests {
         assert_eq!(
             ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
             [3, 4, 2, 1]
+        );
+    }
+
+    #[test]
+    fn rank_targets_prefers_never_started_then_oldest_scan() {
+        let mut first = target(1, 1, BroadcastType::Terrestrial, None, None, None);
+        first.last_scan_started_at = Some(20);
+        let mut second = target(1, 2, BroadcastType::Terrestrial, None, None, None);
+        second.last_scan_started_at = Some(10);
+        let never = target(1, 3, BroadcastType::Terrestrial, None, None, None);
+        let ranked = rank_targets(&[first, second, never], 10, &config());
+        assert_eq!(
+            ranked.iter().map(|target| target.tsid).collect::<Vec<_>>(),
+            [3, 2, 1]
         );
     }
 
@@ -1681,13 +1724,22 @@ mod tests {
             let mut info = recisdb_protocol::ChannelInfo::new(1, sid, tsid);
             info.bon_space = Some(0);
             info.bon_channel = Some(1);
+            if sid == 100 && tsid == 2 {
+                info.service_type = Some(1);
+            }
             db.insert_channel(driver, &info).unwrap();
         }
 
         let channels = db.get_enabled_channels_by_bon_driver(driver).unwrap();
+        let target_muxes = db
+            .get_epg_mux_coverage()
+            .unwrap()
+            .into_iter()
+            .map(|coverage| (coverage.network_id, coverage.tsid))
+            .collect::<HashSet<_>>();
         let mut targets = Vec::new();
         for channel in &channels {
-            append_epg_target(&mut targets, channel, &[]);
+            append_epg_target(&mut targets, channel, &[], &target_muxes);
         }
 
         assert_eq!(

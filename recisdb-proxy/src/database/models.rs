@@ -350,6 +350,15 @@ pub struct ProgramUpsert {
     pub extended_updated_at: Option<i64>,
 }
 
+/// Stored program row with both independent EIT source clocks.
+#[derive(Debug, Clone)]
+pub struct ProgramUpsertWithClocks {
+    pub id: i64,
+    pub program: ProgramUpsert,
+    pub pf_updated_at: Option<i64>,
+    pub schedule_updated_at: Option<i64>,
+}
+
 /// A stored `programs` row (dashboard `GET /api/programs`, Mirakurun-
 /// compatible `GET /programs`).
 #[derive(Debug, Clone, Serialize)]

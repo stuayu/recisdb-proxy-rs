@@ -96,7 +96,14 @@ impl Database {
                  -- Keep this in sync with
                  -- recisdb_protocol::broadcast_region::is_real_broadcast_service:
                  -- sid != 0 AND tsid != 0.
-                 WHERE (service_type IS NULL OR service_type IN (1, 2))
+                 WHERE (service_type IN (1, 2)
+                        OR (service_type IS NULL AND EXISTS (
+                            SELECT 1
+                            FROM epg_service_coverage received
+                            WHERE received.network_id = channels.nid
+                              AND received.tsid = channels.tsid
+                              AND received.service_id = channels.sid
+                        )))
                    AND sid != 0 AND tsid != 0
                  GROUP BY nid, tsid, sid
              ), joined AS (
@@ -126,7 +133,13 @@ impl Database {
                               OR SUM(CASE WHEN coverage_until IS NULL
                                           THEN 1 ELSE 0 END) != 0
                          THEN NULL ELSE MIN(coverage_until) END,
-                    MAX(last_section_at), MAX(last_complete_at)
+                    MAX(last_section_at),
+                    CASE WHEN COUNT(service_id) > 0
+                               AND SUM(CASE WHEN schedule_basic_complete = 1
+                                                  AND coverage_until IS NOT NULL
+                                             THEN 1 ELSE 0 END) = COUNT(service_id)
+                         THEN MAX(last_complete_at)
+                         ELSE NULL END
              FROM joined
              GROUP BY network_id, tsid
              ORDER BY network_id, tsid",
@@ -157,12 +170,24 @@ impl Database {
                     network_id, tsid, section_coverage_until, services_total,
                     services_complete, last_complete_at, last_eit_received_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                -- ローカルで EIT section を一度も受信していない mux
+                -- (excluded.last_eit_received_at IS NULL) は、ペアノードから
+                -- 受け取った coverage (set_epg_remote_coverage /
+                -- merge_epg_remote_coverage) を NULL で潰さない。
                 ON CONFLICT(network_id, tsid) DO UPDATE SET
-                    section_coverage_until = excluded.section_coverage_until,
+                    section_coverage_until = CASE
+                        WHEN excluded.last_eit_received_at IS NULL
+                        THEN epg_scan_states.section_coverage_until
+                        ELSE excluded.section_coverage_until END,
                     services_total = excluded.services_total,
                     services_complete = excluded.services_complete,
-                    last_complete_at = excluded.last_complete_at,
-                    last_eit_received_at = excluded.last_eit_received_at",
+                    last_complete_at = CASE
+                        WHEN excluded.last_eit_received_at IS NULL
+                        THEN epg_scan_states.last_complete_at
+                        ELSE excluded.last_complete_at END,
+                    last_eit_received_at = COALESCE(
+                        excluded.last_eit_received_at,
+                        epg_scan_states.last_eit_received_at)",
                 params![
                     row.network_id,
                     row.tsid,
@@ -216,6 +241,28 @@ impl Database {
                  last_complete_at = excluded.last_complete_at,
                  last_eit_received_at = excluded.last_eit_received_at",
             params![network_id, tsid, coverage_until, at],
+        )?;
+        Ok(())
+    }
+
+    /// Merge peer coverage without allowing a stale peer response to regress
+    /// locally observed section progress.
+    pub fn merge_epg_remote_coverage(
+        &self,
+        network_id: u16,
+        tsid: u16,
+        section_coverage_until: Option<i64>,
+        last_eit_received_at: Option<i64>,
+        last_complete_at: Option<i64>,
+    ) -> Result<()> {
+        self.connection().execute(
+            "INSERT INTO epg_scan_states(network_id,tsid,section_coverage_until,last_eit_received_at,last_complete_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(network_id,tsid) DO UPDATE SET
+               section_coverage_until = CASE WHEN excluded.section_coverage_until IS NULL THEN epg_scan_states.section_coverage_until ELSE MAX(COALESCE(epg_scan_states.section_coverage_until, 0), excluded.section_coverage_until) END,
+               last_eit_received_at = CASE WHEN excluded.last_eit_received_at IS NULL THEN epg_scan_states.last_eit_received_at ELSE MAX(COALESCE(epg_scan_states.last_eit_received_at, 0), excluded.last_eit_received_at) END,
+               last_complete_at = CASE WHEN excluded.last_complete_at IS NULL THEN epg_scan_states.last_complete_at ELSE MAX(COALESCE(epg_scan_states.last_complete_at, 0), excluded.last_complete_at) END",
+            params![network_id, tsid, section_coverage_until, last_eit_received_at, last_complete_at],
         )?;
         Ok(())
     }
@@ -335,7 +382,48 @@ mod tests {
             coverage(1, 2, 11, None, false),
         ])
         .unwrap();
-        assert_eq!(db.get_epg_mux_coverage().unwrap()[0].coverage_until, None);
+        let mux = &db.get_epg_mux_coverage().unwrap()[0];
+        assert_eq!(mux.coverage_until, None);
+        assert_eq!(mux.last_complete_at, None);
+    }
+
+    #[test]
+    fn null_service_type_without_coverage_is_not_a_target() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 10, None);
+        assert!(db.get_epg_mux_coverage().unwrap().is_empty());
+    }
+
+    #[test]
+    fn refresh_keeps_peer_coverage_for_mux_without_local_sections() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 10, Some(1));
+        db.merge_epg_remote_coverage(1, 2, Some(500), Some(400), Some(400))
+            .unwrap();
+        db.refresh_epg_section_coverage().unwrap();
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| state.network_id == 1 && state.tsid == 2)
+            .unwrap();
+        assert_eq!(state.section_coverage_until, Some(500));
+        assert_eq!(state.last_complete_at, Some(400));
+        assert_eq!(state.last_eit_received_at, Some(400));
+    }
+
+    #[test]
+    fn null_service_type_with_coverage_is_a_target() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 10, None);
+        db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(100), true)])
+            .unwrap();
+        let mux = &db.get_epg_mux_coverage().unwrap()[0];
+        assert_eq!(mux.services_total, 1);
+        assert_eq!(mux.coverage_until, Some(100));
     }
 
     #[test]

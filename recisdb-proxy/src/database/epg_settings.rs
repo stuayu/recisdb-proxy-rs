@@ -22,8 +22,8 @@ CREATE TABLE IF NOT EXISTS epg_global_settings (
  max_stale_secs INTEGER NOT NULL DEFAULT 43200, min_future_coverage_hours INTEGER NOT NULL DEFAULT 24,
  target_future_coverage_hours INTEGER NOT NULL DEFAULT 168, startup_delay_secs INTEGER NOT NULL DEFAULT 30,
  startup_jitter_secs INTEGER NOT NULL DEFAULT 30, min_dwell_secs INTEGER NOT NULL DEFAULT 30,
- normal_dwell_secs INTEGER NOT NULL DEFAULT 90, max_dwell_secs INTEGER NOT NULL DEFAULT 180,
- idle_section_timeout_secs INTEGER NOT NULL DEFAULT 20, max_concurrent_scans INTEGER NOT NULL DEFAULT 1,
+ normal_dwell_secs INTEGER NOT NULL DEFAULT 180, max_dwell_secs INTEGER NOT NULL DEFAULT 600,
+ idle_section_timeout_secs INTEGER NOT NULL DEFAULT 90, max_concurrent_scans INTEGER NOT NULL DEFAULT 1,
  reserve_tuners INTEGER NOT NULL DEFAULT 0, prefer_local INTEGER NOT NULL DEFAULT 1,
  allow_remote INTEGER NOT NULL DEFAULT 0, preemptible INTEGER NOT NULL DEFAULT 1,
  cpu_soft_limit_percent INTEGER NOT NULL DEFAULT 70, cpu_hard_limit_percent INTEGER NOT NULL DEFAULT 90,
@@ -284,14 +284,57 @@ impl Database {
         network_id: u16,
         tsid: u16,
         error: Option<&str>,
+        target_refresh_secs: i64,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.connection().execute(
             "UPDATE epg_scan_history SET finished_at=?1,status=?2,reason=COALESCE(?3,reason),error=?3 WHERE id=?4",
             params![now, status, error, history_id],
         )?;
-        let failure = if status == "completed" { 0 } else { 1 };
-        self.connection().execute("UPDATE epg_scan_states SET last_scan_completed_at=?1,failure_count=CASE WHEN ?2=0 THEN 0 ELSE failure_count+1 END,last_failure_reason=?3,next_eligible_at=?1+60 WHERE network_id=?4 AND tsid=?5",params![now,failure,error,network_id,tsid])?;
+        let previous_failure_count: i64 = self
+            .connection()
+            .query_row(
+                "SELECT failure_count FROM epg_scan_states
+                 WHERE network_id=?1 AND tsid=?2",
+                params![network_id, tsid],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let (failure_count, next_eligible_at): (i64, i64) = match status {
+            // Complete も Partial と同じ間隔を空ける。dwell 側の完了判定は tracker が
+            // 見たサービスだけを母数にするので、channels 側の母数で未完了のままだと
+            // stale 判定が立ち続け、間隔なしでは同じ mux を連続で取り直してしまう。
+            "completed" => (0, now + target_refresh_secs.max(0).min(1800)),
+            "partial" => (
+                previous_failure_count,
+                now + target_refresh_secs.max(0).min(1800),
+            ),
+            _ => {
+                let failure_count = previous_failure_count.saturating_add(1);
+                let shift = failure_count.saturating_sub(1).min(6) as u32;
+                (
+                    failure_count,
+                    now + (60_i64.saturating_mul(1_i64 << shift)).min(3600),
+                )
+            }
+        };
+        self.connection().execute(
+            "UPDATE epg_scan_states
+             SET last_scan_completed_at=?1,
+                 failure_count=?2,
+                 last_failure_reason=?3,
+                 next_eligible_at=?4
+             WHERE network_id=?5 AND tsid=?6",
+            params![
+                now,
+                failure_count,
+                error,
+                next_eligible_at,
+                network_id,
+                tsid,
+            ],
+        )?;
         self.connection().execute("DELETE FROM epg_scan_history WHERE id NOT IN (SELECT id FROM epg_scan_history ORDER BY started_at DESC LIMIT (SELECT max_rows FROM epg_scan_retention WHERE id=1)) OR started_at < ?1-(SELECT max_age_days FROM epg_scan_retention WHERE id=1)*86400",[now])?;
         Ok(())
     }
@@ -531,7 +574,104 @@ mod tests {
         let global = db.get_epg_global_settings().unwrap();
         assert!(global.enabled);
         assert_eq!(global.target_refresh_secs, 21_600);
+        assert_eq!(global.min_dwell_secs, 30);
+        assert_eq!(global.normal_dwell_secs, 180);
+        assert_eq!(global.max_dwell_secs, 600);
+        assert_eq!(global.idle_section_timeout_secs, 90);
         assert_eq!(db.list_epg_presets().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn dwell_default_migration_updates_only_old_defaults_and_is_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        db.connection()
+            .execute(
+                "UPDATE epg_global_settings
+                 SET normal_dwell_secs=90, max_dwell_secs=180,
+                     idle_section_timeout_secs=20",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE epg_scan_presets
+                 SET normal_dwell_secs=90, max_dwell_secs=180,
+                     idle_section_timeout_secs=20
+                 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO epg_scan_presets
+                 (name, description, is_system, normal_dwell_secs,
+                  max_dwell_secs, idle_section_timeout_secs)
+                 VALUES ('custom-old', '', 0, 90, 180, 20)",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute("UPDATE epg_global_settings SET normal_dwell_secs=123", [])
+            .unwrap();
+        db.connection()
+            .execute_batch("PRAGMA user_version = 37")
+            .unwrap();
+        db.apply_migrations().unwrap();
+
+        let global = db.get_epg_global_settings().unwrap();
+        assert_eq!(global.normal_dwell_secs, 123);
+        assert_eq!(global.max_dwell_secs, 600);
+        assert_eq!(global.idle_section_timeout_secs, 90);
+        let preset = db.list_epg_presets().unwrap().into_iter().next().unwrap();
+        assert_eq!(preset.normal_dwell_secs, Some(180));
+        assert_eq!(preset.max_dwell_secs, Some(600));
+        assert_eq!(preset.idle_section_timeout_secs, Some(90));
+        let custom = db
+            .list_epg_presets()
+            .unwrap()
+            .into_iter()
+            .find(|preset| preset.name == "custom-old")
+            .unwrap();
+        assert_eq!(custom.normal_dwell_secs, Some(90));
+        assert_eq!(custom.max_dwell_secs, Some(180));
+        assert_eq!(custom.idle_section_timeout_secs, Some(20));
+
+        db.apply_migrations().unwrap();
+        assert_eq!(db.get_epg_global_settings().unwrap().normal_dwell_secs, 123);
+    }
+
+    #[test]
+    fn scan_finished_uses_partial_delay_and_exponential_failure_backoff() {
+        let db = Database::open_in_memory().unwrap();
+        let history = db.epg_scan_started(1, 1, 2, "test").unwrap();
+        db.epg_scan_finished(history, "partial", 1, 2, None, 7200)
+            .unwrap();
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| state.network_id == 1 && state.tsid == 2)
+            .unwrap();
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(
+            state.next_eligible_at.unwrap() - state.last_scan_completed_at.unwrap(),
+            1800
+        );
+
+        let history = db.epg_scan_started(1, 1, 2, "test").unwrap();
+        db.epg_scan_finished(history, "failed", 1, 2, None, 7200)
+            .unwrap();
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| state.network_id == 1 && state.tsid == 2)
+            .unwrap();
+        assert_eq!(state.failure_count, 1);
+        assert_eq!(
+            state.next_eligible_at.unwrap() - state.last_scan_completed_at.unwrap(),
+            60
+        );
     }
 
     /// Round-trips every global setting through UPDATE and SELECT. The two

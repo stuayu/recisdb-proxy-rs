@@ -5,7 +5,9 @@
 //! the dashboard API (`web/api/programs.rs`) and the Mirakurun-compatible
 //! API (`web/mirakurun.rs::get_programs`).
 
-use super::{Database, EpgSource, ProgramRecord, ProgramUpsert, Result};
+use super::{
+    Database, EpgSource, ProgramRecord, ProgramUpsert, ProgramUpsertWithClocks, Result,
+};
 use crate::guide_services::{self, ProgramNameAt, ServiceMeta, SubchannelInfo};
 use rusqlite::params;
 
@@ -32,6 +34,15 @@ fn sanitize_duration(duration_secs: i64) -> i64 {
 }
 
 impl Database {
+    pub fn get_enabled_network_ids(&self) -> Result<Vec<u16>> {
+        let mut stmt = self.connection().prepare(
+            "SELECT DISTINCT nid FROM channels WHERE is_enabled = 1 ORDER BY nid",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u16))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Batch UPSERT program rows in a single transaction.
     ///
     /// Dedupe key is `(nid, sid, tsid, event_id)` (the table's UNIQUE
@@ -41,6 +52,14 @@ impl Database {
     /// a batch is flushed periodically, and a slightly stale duplicate must
     /// never clobber a newer row written by an earlier flush.
     pub fn upsert_programs(&mut self, programs: &[ProgramUpsert]) -> Result<usize> {
+        self.upsert_programs_inner(programs, None)
+    }
+
+    fn upsert_programs_inner(
+        &mut self,
+        programs: &[ProgramUpsert],
+        clocks: Option<&[ProgramUpsertWithClocks]>,
+    ) -> Result<usize> {
         if programs.is_empty() {
             return Ok(0);
         }
@@ -122,9 +141,103 @@ impl Database {
                 ])?;
             }
         }
+        if let Some(rows) = clocks {
+            let mut clock_stmt = tx.prepare(
+                "UPDATE programs SET
+                    pf_updated_at = NULLIF(MAX(COALESCE(pf_updated_at, 0), COALESCE(?1, 0)), 0),
+                    schedule_updated_at = NULLIF(MAX(COALESCE(schedule_updated_at, 0), COALESCE(?2, 0)), 0)
+                 WHERE nid=?3 AND sid=?4 AND tsid=?5 AND event_id=?6",
+            )?;
+            for row in rows {
+                clock_stmt.execute(params![
+                    row.pf_updated_at,
+                    row.schedule_updated_at,
+                    row.program.nid as i32,
+                    row.program.sid as i32,
+                    row.program.tsid as i32,
+                    row.program.event_id as i32,
+                ])?;
+            }
+        }
         tx.commit()?;
 
         Ok(programs.len())
+    }
+
+    /// Apply rows received from a peer while retaining the independent p/f
+    /// and schedule update clocks stored in the supplier database.
+    pub fn upsert_programs_with_clocks(
+        &mut self,
+        rows: &[ProgramUpsertWithClocks],
+    ) -> Result<usize> {
+        let programs: Vec<_> = rows.iter().map(|row| row.program.clone()).collect();
+        self.upsert_programs_inner(&programs, Some(rows))
+    }
+
+    /// Read one ordered, resumable page for node-to-node EPG synchronization.
+    pub fn get_programs_for_node_page(
+        &self,
+        network_ids: &[u16],
+        cursor_updated_at: i64,
+        cursor_id: i64,
+        now: i64,
+        limit: u32,
+    ) -> Result<(Vec<ProgramUpsertWithClocks>, bool)> {
+        let mut sql = String::from(
+            "SELECT id,nid,sid,tsid,event_id,start_at,duration_secs,free_ca_mode,
+                    name,description,extended,genre,updated_at,source,
+                    basic_updated_at,extended_updated_at,pf_updated_at,schedule_updated_at
+             FROM programs
+             WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
+               AND start_at + duration_secs > ?3",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(cursor_updated_at),
+            Box::new(cursor_id),
+            Box::new(now),
+        ];
+        if !network_ids.is_empty() {
+            sql.push_str(" AND nid IN (");
+            sql.push_str(&std::iter::repeat("?").take(network_ids.len()).collect::<Vec<_>>().join(","));
+            sql.push(')');
+            values.extend(network_ids.iter().map(|nid| Box::new(*nid as i32) as Box<dyn rusqlite::ToSql>));
+        }
+        sql.push_str(" ORDER BY updated_at ASC, id ASC LIMIT ?");
+        values.push(Box::new(limit.saturating_add(1) as i64));
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = self.connection().prepare(&sql)?;
+        let rows = stmt.query_map(bound.as_slice(), |r| {
+            Ok(ProgramUpsertWithClocks {
+                id: r.get(0)?,
+                program: ProgramUpsert {
+                    nid: r.get::<_, i64>(1)? as u16,
+                    sid: r.get::<_, i64>(2)? as u16,
+                    tsid: r.get::<_, i64>(3)? as u16,
+                    event_id: r.get::<_, i64>(4)? as u16,
+                    start_at: r.get(5)?,
+                    duration_secs: r.get(6)?,
+                    free_ca_mode: r.get::<_, i64>(7)? != 0,
+                    name: r.get(8)?,
+                    description: r.get(9)?,
+                    extended: r.get(10)?,
+                    genre: r.get(11)?,
+                    updated_at: r.get(12)?,
+                    source: if r.get::<_, i64>(13)? == EpgSource::Schedule as i64 {
+                        EpgSource::Schedule
+                    } else {
+                        EpgSource::PresentFollowing
+                    },
+                    basic_updated_at: r.get(14)?,
+                    extended_updated_at: r.get(15)?,
+                },
+                pf_updated_at: r.get(16)?,
+                schedule_updated_at: r.get(17)?,
+            })
+        })?;
+        let mut rows: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        Ok((rows, has_more))
     }
 
     /// Query programs whose `[start_at, start_at + duration_secs)` interval
@@ -361,6 +474,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_id, 1);
         assert_eq!(rows[0].sid, 200);
+    }
+
+    #[test]
+    fn node_page_uses_keyset_filters_network_and_ended_rows() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[
+            sample(1, 100, 1, 10_000, 10),
+            sample(1, 100, 2, 10_000, 20),
+            sample(2, 100, 3, 10_000, 30),
+            sample(1, 100, 4, -10_000, 40),
+        ]).unwrap();
+        let (first, more) = db.get_programs_for_node_page(&[1], 0, 0, 100, 1).unwrap();
+        assert!(more);
+        assert_eq!(first.len(), 1);
+        let (second, more) = db.get_programs_for_node_page(
+            &[1], first[0].program.updated_at, first[0].id, 100, 10,
+        ).unwrap();
+        assert!(!more);
+        assert_eq!(second.len(), 1);
+        assert!(second.iter().all(|row| row.program.nid == 1));
+        assert!(second.iter().all(|row| row.program.start_at > 1));
     }
 
     #[test]

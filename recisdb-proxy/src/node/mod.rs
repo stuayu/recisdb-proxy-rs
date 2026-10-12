@@ -12,6 +12,7 @@
 pub mod advertise;
 pub mod consume;
 pub mod discovery;
+pub mod epg_sync;
 pub mod frame;
 pub mod identity;
 pub mod lease;
@@ -49,6 +50,7 @@ pub use route::{capacity_class, rank_remote_routes, RemoteRouteCandidate, RouteC
 pub use serve::{LocalMuxServer, RemoteEpgMetadataOutcome, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteRoute};
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};
+pub use epg_sync::EpgProgramSync;
 pub use transport::{
     serve_h2c, serve_h2c_on_addresses, LeaseStreamError, NodeCapabilities, NodeHello,
     NodeTransportClient, NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgDwell,
