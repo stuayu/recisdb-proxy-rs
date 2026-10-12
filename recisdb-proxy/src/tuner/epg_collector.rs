@@ -348,6 +348,12 @@ impl EpgCollector {
                 .then_some(event.genre)
                 .flatten()
                 .map(|g| g as i64);
+            let shared = event
+                .shared_events
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != (eit.service_id, event.event_id))
+                .min_by_key(|(sid, event_id)| (*sid, *event_id));
             let record = ProgramUpsert {
                 nid: eit.original_network_id,
                 sid: eit.service_id,
@@ -368,6 +374,8 @@ impl EpgCollector {
                     None
                 },
                 extended_updated_at: extended.as_ref().map(|_| now),
+                shared_sid: shared.map(|(sid, _)| sid),
+                shared_event_id: shared.map(|(_, event_id)| event_id),
             };
             if self.metadata_only {
                 self.metadata_records.push(record);
@@ -440,6 +448,42 @@ mod tests {
         section.push(0);
         section.extend_from_slice(&[0, 0, 0, 0]);
         section
+    }
+
+    fn metadata_section_with_descriptors(
+        table_id: u8,
+        running_status: u8,
+        duration: [u8; 3],
+        descriptors: &[u8],
+    ) -> Vec<u8> {
+        let mut section = metadata_section(table_id, running_status, duration);
+        let section_length = 27 + descriptors.len();
+        section[1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
+        section[2] = section_length as u8;
+        section.truncate(section.len() - 4);
+        section[25] = descriptors.len() as u8;
+        section.extend_from_slice(descriptors);
+        section.extend_from_slice(&[0, 0, 0, 0]);
+        section
+    }
+
+    #[test]
+    fn event_group_is_forwarded_to_program_upsert() {
+        let group_data = [0x12, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
+        let mut descriptors = vec![crate::ts_analyzer::descriptor_tag::EVENT_GROUP, group_data.len() as u8];
+        descriptors.extend_from_slice(&group_data);
+        let section = metadata_section_with_descriptors(
+            table_id::EIT_PF_ACTUAL,
+            4,
+            [0, 30, 0],
+            &descriptors,
+        );
+        let mut collector = EpgCollector::new_metadata();
+        collector.process_section(pid::EIT, &section);
+        let records = collector.drain_metadata_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].shared_sid, Some(0x0010));
+        assert_eq!(records[0].shared_event_id, Some(0x0020));
     }
 
     #[test]
@@ -692,6 +736,8 @@ mod tests {
             source: EpgSource::Schedule,
             basic_updated_at: None,
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
         };
         assert!(try_send_program(&tx, row()));
         let before = dropped_program_rows();

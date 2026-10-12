@@ -348,6 +348,8 @@ pub struct ProgramUpsert {
     pub source: EpgSource,
     pub basic_updated_at: Option<i64>,
     pub extended_updated_at: Option<i64>,
+    pub shared_sid: Option<u16>,
+    pub shared_event_id: Option<u16>,
 }
 
 /// Stored program row with both independent EIT source clocks.

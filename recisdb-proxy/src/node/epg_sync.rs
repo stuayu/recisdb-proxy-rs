@@ -250,6 +250,8 @@ mod tests {
                 source: EpgSource::PresentFollowing,
                 basic_updated_at: Some(100),
                 extended_updated_at: None,
+                shared_sid: None,
+                shared_event_id: None,
             }])
             .unwrap();
             db.merge_epg_remote_coverage(1, 3, Some(1000), Some(1000), Some(1000))
@@ -271,6 +273,8 @@ mod tests {
             source: 0,
             basic_updated_at: Some(50),
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
             pf_updated_at: Some(50),
             schedule_updated_at: Some(50),
         };

@@ -309,6 +309,10 @@ impl Database {
             "039_programs_node_sync_keyset",
             Database::migration_039_programs_node_sync_keyset,
         ),
+        (
+            "040_programs_event_group_sharing",
+            Database::migration_040_programs_event_group_sharing,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -317,6 +321,16 @@ impl Database {
     fn migration_027_epg_runtime_settings(&self) -> Result<()> {
         self.conn.execute_batch(epg_settings::EPG_SCHEMA_SQL)?;
         epg_settings::seed_defaults(&self.conn)?;
+        Ok(())
+    }
+
+    fn migration_040_programs_event_group_sharing(&self) -> Result<()> {
+        self.add_column_if_not_exists("programs", "shared_sid", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "shared_event_id", "INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_programs_nid_tsid_start_at
+             ON programs(nid, tsid, start_at)",
+        )?;
         Ok(())
     }
 

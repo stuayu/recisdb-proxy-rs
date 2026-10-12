@@ -33,6 +33,30 @@ fn sanitize_duration(duration_secs: i64) -> i64 {
     duration_secs
 }
 
+// 共有イベントは読み出し時だけ解決する。旧データは参照列がないため、
+// 同一 mux・開始時刻の主サービス名を移行措置として併用する。
+const PROGRAM_READ_JOINS: &str = r#"
+ LEFT JOIN programs shared
+   ON shared.nid = p.nid AND shared.tsid = p.tsid
+  AND shared.sid = p.shared_sid AND shared.event_id = p.shared_event_id
+ LEFT JOIN programs legacy
+   ON legacy.id = CASE WHEN p.shared_sid IS NULL AND p.name IS NULL THEN (
+        SELECT q.id FROM programs q
+         WHERE q.nid = p.nid AND q.tsid = p.tsid
+           AND q.start_at = p.start_at AND q.duration_secs = p.duration_secs
+           AND q.name IS NOT NULL
+         ORDER BY q.sid, q.id LIMIT 1
+      ) END
+"#;
+
+const PROGRAM_READ_COLUMNS: &str = "SELECT p.id, p.nid, p.sid, p.tsid, p.event_id,
+    p.start_at, p.duration_secs,
+    COALESCE(p.name, shared.name, legacy.name) AS name,
+    COALESCE(p.description, shared.description, legacy.description) AS description,
+    COALESCE(p.extended, shared.extended, legacy.extended) AS extended,
+    COALESCE(p.genre, shared.genre, legacy.genre) AS genre,
+    p.free_ca_mode, p.updated_at";
+
 impl Database {
     pub fn get_enabled_network_ids(&self) -> Result<Vec<u16>> {
         let mut stmt = self.connection().prepare(
@@ -71,9 +95,9 @@ impl Database {
                     nid, sid, tsid, event_id, start_at, duration_secs,
                     name, description, extended, genre, free_ca_mode, updated_at,
                     source, pf_updated_at, schedule_updated_at,
-                    basic_updated_at, extended_updated_at
+                    basic_updated_at, extended_updated_at, shared_sid, shared_event_id
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                          ?13, ?14, ?15, ?16, ?17)
+                          ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT(nid, sid, tsid, event_id) DO UPDATE SET
                     tsid = excluded.tsid,
                     start_at = CASE WHEN (excluded.source = 0 AND
@@ -108,7 +132,9 @@ impl Database {
                     pf_updated_at = CASE WHEN excluded.source = 0 THEN MAX(COALESCE(programs.pf_updated_at, 0), excluded.updated_at) ELSE programs.pf_updated_at END,
                     schedule_updated_at = CASE WHEN excluded.source = 1 THEN MAX(COALESCE(programs.schedule_updated_at, 0), excluded.updated_at) ELSE programs.schedule_updated_at END,
                     basic_updated_at = CASE WHEN excluded.basic_updated_at IS NOT NULL THEN MAX(COALESCE(programs.basic_updated_at, 0), excluded.basic_updated_at) ELSE programs.basic_updated_at END,
-                    extended_updated_at = CASE WHEN excluded.extended_updated_at IS NOT NULL THEN MAX(COALESCE(programs.extended_updated_at, 0), excluded.extended_updated_at) ELSE programs.extended_updated_at END",
+                    extended_updated_at = CASE WHEN excluded.extended_updated_at IS NOT NULL THEN MAX(COALESCE(programs.extended_updated_at, 0), excluded.extended_updated_at) ELSE programs.extended_updated_at END,
+                    shared_sid = CASE WHEN excluded.shared_sid IS NOT NULL THEN excluded.shared_sid ELSE programs.shared_sid END,
+                    shared_event_id = CASE WHEN excluded.shared_sid IS NOT NULL THEN excluded.shared_event_id ELSE programs.shared_event_id END",
             )?;
 
             for p in programs {
@@ -138,6 +164,8 @@ impl Database {
                     },
                     p.basic_updated_at,
                     p.extended_updated_at,
+                    p.shared_sid.map(i32::from),
+                    p.shared_event_id.map(i32::from),
                 ])?;
             }
         }
@@ -186,7 +214,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT id,nid,sid,tsid,event_id,start_at,duration_secs,free_ca_mode,
                     name,description,extended,genre,updated_at,source,
-                    basic_updated_at,extended_updated_at,pf_updated_at,schedule_updated_at
+                    basic_updated_at,extended_updated_at,shared_sid,shared_event_id,pf_updated_at,schedule_updated_at
              FROM programs
              WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
                AND start_at + duration_secs > ?3",
@@ -229,9 +257,11 @@ impl Database {
                     },
                     basic_updated_at: r.get(14)?,
                     extended_updated_at: r.get(15)?,
+                    shared_sid: r.get::<_, Option<i64>>(16)?.map(|v| v as u16),
+                    shared_event_id: r.get::<_, Option<i64>>(17)?.map(|v| v as u16),
                 },
-                pf_updated_at: r.get(16)?,
-                schedule_updated_at: r.get(17)?,
+                pf_updated_at: r.get(18)?,
+                schedule_updated_at: r.get(19)?,
             })
         })?;
         let mut rows: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -250,23 +280,18 @@ impl Database {
         nid: Option<u16>,
         sid: Option<u16>,
     ) -> Result<Vec<ProgramRecord>> {
-        let mut sql = String::from(
-            "SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
-                    name, description, extended, genre, free_ca_mode, updated_at
-             FROM programs
-             WHERE start_at < ? AND (start_at + duration_secs) > ?",
-        );
+        let mut sql = format!("{} FROM programs p {} WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?", PROGRAM_READ_COLUMNS, PROGRAM_READ_JOINS);
 
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until), Box::new(since)];
         if let Some(n) = nid {
-            sql.push_str(" AND nid = ?");
+            sql.push_str(" AND p.nid = ?");
             values.push(Box::new(n as i32));
         }
         if let Some(s) = sid {
-            sql.push_str(" AND sid = ?");
+            sql.push_str(" AND p.sid = ?");
             values.push(Box::new(s as i32));
         }
-        sql.push_str(" ORDER BY start_at ASC");
+        sql.push_str(" ORDER BY p.start_at ASC");
 
         let mut stmt = self.connection().prepare(&sql)?;
         let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
@@ -286,18 +311,18 @@ impl Database {
         offset: u32,
     ) -> Result<(Vec<ProgramRecord>, u64)> {
         let mut where_sql =
-            String::from(" FROM programs WHERE start_at < ? AND (start_at + duration_secs) > ?");
+            String::from(" FROM programs p WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?");
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until), Box::new(since)];
         if let Some(n) = nid {
-            where_sql.push_str(" AND nid = ?");
+            where_sql.push_str(" AND p.nid = ?");
             values.push(Box::new(n as i32));
         }
         if let Some(s) = sid {
-            where_sql.push_str(" AND sid = ?");
+            where_sql.push_str(" AND p.sid = ?");
             values.push(Box::new(s as i32));
         }
         if !services.is_empty() {
-            where_sql.push_str(" AND (nid, sid) IN (");
+            where_sql.push_str(" AND (p.nid, p.sid) IN (");
             where_sql.push_str(
                 &std::iter::repeat("(?, ?)")
                     .take(services.len())
@@ -316,11 +341,14 @@ impl Database {
             .connection()
             .query_row(&count_sql, bound.as_slice(), |row| row.get::<_, i64>(0))?
             as u64;
+        let read_where = where_sql.replacen(
+            " FROM programs p",
+            &format!(" FROM programs p {}", PROGRAM_READ_JOINS),
+            1,
+        );
         let sql = format!(
-            "SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
-                    name, description, extended, genre, free_ca_mode, updated_at
-             {} ORDER BY start_at ASC, id ASC LIMIT ? OFFSET ?",
-            where_sql
+            "{}{} ORDER BY p.start_at ASC, p.id ASC LIMIT ? OFFSET ?",
+            PROGRAM_READ_COLUMNS, read_where
         );
         values.push(Box::new(limit as i64));
         values.push(Box::new(offset as i64));
@@ -357,6 +385,8 @@ impl Database {
         since: i64,
         until: i64,
     ) -> Result<(Vec<(u16, u16)>, Vec<SubchannelInfo>)> {
+        // Keep this query raw: distinct must inspect the subchannel's own
+        // name, before event-sharing metadata is resolved for program reads.
         let mut programs_stmt = self.connection().prepare(
             "SELECT DISTINCT nid, sid, start_at, name FROM programs
              WHERE start_at < ?1 AND (start_at + duration_secs) > ?2",
@@ -445,6 +475,8 @@ mod tests {
             source: EpgSource::PresentFollowing,
             basic_updated_at: Some(updated_at),
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
         }
     }
 
@@ -474,6 +506,107 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_id, 1);
         assert_eq!(rows[0].sid, 200);
+    }
+
+    #[test]
+    fn shared_program_metadata_is_resolved_at_read_time() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut main = sample(1, 100, 7, 1_000, 1);
+        main.description = Some("main description".into());
+        main.extended = Some("main extended".into());
+        main.genre = Some(0x21);
+        let mut sub = sample(1, 200, 8, 1_000, 1);
+        sub.name = None;
+        sub.description = None;
+        sub.extended = None;
+        sub.genre = None;
+        sub.basic_updated_at = None;
+        sub.shared_sid = Some(100);
+        sub.shared_event_id = Some(7);
+        db.upsert_programs(&[main.clone(), sub]).unwrap();
+
+        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        assert_eq!(row.name.as_deref(), Some("Event 7"));
+        assert_eq!(row.description.as_deref(), Some("main description"));
+        assert_eq!(row.extended.as_deref(), Some("main extended"));
+        assert_eq!(row.genre, Some(0x21));
+
+        main.name = Some("updated main".into());
+        main.description = Some("updated description".into());
+        main.updated_at = 2;
+        main.basic_updated_at = Some(2);
+        db.upsert_programs(&[main]).unwrap();
+        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        assert_eq!(row.name.as_deref(), Some("updated main"));
+        assert_eq!(row.description.as_deref(), Some("updated description"));
+    }
+
+    #[test]
+    fn shared_program_missing_target_stays_null_and_legacy_rows_are_rescued() {
+        let mut db = Database::open_in_memory().unwrap();
+        let mut missing = sample(1, 200, 8, 1_000, 1);
+        missing.name = None;
+        missing.description = None;
+        missing.extended = None;
+        missing.genre = None;
+        missing.basic_updated_at = None;
+        missing.shared_sid = Some(100);
+        missing.shared_event_id = Some(7);
+        db.upsert_programs(&[missing]).unwrap();
+        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        assert!(row.name.is_none());
+
+        let mut legacy_sub = sample(2, 200, 9, 2_000, 1);
+        legacy_sub.name = None;
+        legacy_sub.description = None;
+        legacy_sub.extended = None;
+        legacy_sub.genre = None;
+        legacy_sub.basic_updated_at = None;
+        db.upsert_programs(&[legacy_sub]).unwrap();
+        let main = sample(2, 100, 10, 2_000, 1);
+        db.upsert_programs(&[main]).unwrap();
+        let row = db.get_programs(0, 10_000, Some(2), Some(200)).unwrap().remove(0);
+        assert_eq!(row.name.as_deref(), Some("Event 10"));
+    }
+
+    #[test]
+    fn shared_read_does_not_overwrite_own_metadata() {
+        let mut db = Database::open_in_memory().unwrap();
+        let main = sample(1, 100, 7, 1_000, 1);
+        let mut sub = sample(1, 200, 8, 1_000, 1);
+        sub.name = Some("sub-specific".into());
+        sub.shared_sid = Some(100);
+        sub.shared_event_id = Some(7);
+        db.upsert_programs(&[main, sub]).unwrap();
+        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        assert_eq!(row.name.as_deref(), Some("sub-specific"));
+    }
+
+    #[test]
+    fn subchannel_distinct_uses_raw_name_before_shared_resolution() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.connection()
+            .execute_batch(
+                "INSERT INTO bon_drivers(id,dll_path) VALUES (1,'test.dll');
+                 INSERT INTO channels(bon_driver_id,nid,sid,tsid,service_type)
+                 VALUES (1,32744,1024,1,1),(1,32744,1025,1,1);",
+            )
+            .unwrap();
+        let mut parent = sample(32744, 1024, 1, 1_000, 1);
+        parent.name = Some("主番組".into());
+        let mut sub = sample(32744, 1025, 2, 1_000, 1);
+        sub.name = None;
+        sub.description = None;
+        sub.genre = None;
+        sub.basic_updated_at = None;
+        sub.shared_sid = Some(1024);
+        sub.shared_event_id = Some(1);
+        db.upsert_programs(&[parent, sub]).unwrap();
+        let (_, subchannels) = db
+            .get_program_services_with_subchannels(0, 10_000)
+            .unwrap();
+        assert_eq!(subchannels.len(), 1);
+        assert!(!subchannels[0].distinct);
     }
 
     #[test]

@@ -203,6 +203,12 @@ impl EpgWriter {
 /// collector が捨てるので、次に version が変わるまで埋まらない)。
 /// DB の UPSERT と同じく、記述子の系統ごとに新しい方を採る。
 fn merge_batched(existing: &mut ProgramUpsert, incoming: ProgramUpsert) {
+    if let (Some(shared_sid), Some(shared_event_id)) =
+        (incoming.shared_sid, incoming.shared_event_id)
+    {
+        existing.shared_sid = Some(shared_sid);
+        existing.shared_event_id = Some(shared_event_id);
+    }
     if incoming.updated_at >= existing.updated_at {
         existing.start_at = incoming.start_at;
         existing.duration_secs = incoming.duration_secs;
@@ -247,6 +253,8 @@ mod tests {
             source: EpgSource::Schedule,
             basic_updated_at: None,
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
         }
     }
 
@@ -315,5 +323,16 @@ mod tests {
         assert_eq!(batched.name.as_deref(), Some("新"));
         assert_eq!(batched.start_at, 2000);
         assert_eq!(batched.updated_at, 20);
+    }
+
+    #[test]
+    fn shared_reference_is_kept_when_metadata_arrives_in_a_later_section() {
+        let mut batched = row(10);
+        let mut incoming = row(11);
+        incoming.shared_sid = Some(100);
+        incoming.shared_event_id = Some(7);
+        merge_batched(&mut batched, incoming);
+        assert_eq!(batched.shared_sid, Some(100));
+        assert_eq!(batched.shared_event_id, Some(7));
     }
 }

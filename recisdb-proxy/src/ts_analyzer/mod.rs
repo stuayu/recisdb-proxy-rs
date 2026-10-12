@@ -143,6 +143,8 @@ pub mod descriptor_tag {
     pub const SHORT_EVENT: u8 = 0x4D;
     /// Extended event descriptor (0x4E).
     pub const EXTENDED_EVENT: u8 = 0x4E;
+    /// Event group descriptor (0xD6).
+    pub const EVENT_GROUP: u8 = 0xD6;
     /// Content descriptor (0x54).
     pub const CONTENT: u8 = 0x54;
 }

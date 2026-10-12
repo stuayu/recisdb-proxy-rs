@@ -275,6 +275,8 @@ mod tests {
             source: crate::database::EpgSource::PresentFollowing,
             basic_updated_at: Some(1_700_000_000),
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
         }
     }
 

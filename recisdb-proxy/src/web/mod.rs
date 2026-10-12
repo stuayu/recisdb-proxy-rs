@@ -624,6 +624,8 @@ mod tests {
             source: crate::database::EpgSource::Schedule,
             basic_updated_at: Some(1),
             extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
         }
     }
 

@@ -36,6 +36,8 @@ pub struct EitEvent {
     /// `(content_nibble_level_1 << 4) | content_nibble_level_2` of the
     /// first content_descriptor genre entry, if present.
     pub genre: Option<u8>,
+    /// Shared events listed by event_group_descriptor(group_type=1).
+    pub shared_events: Vec<(u16, u16)>,
 }
 
 /// Parsed EIT section.
@@ -115,6 +117,7 @@ impl EitTable {
             let (name, description) = parse_short_event(descriptors);
             let extended = parse_extended_event(descriptors);
             let genre = parse_genre(descriptors);
+            let shared_events = parse_shared_events(descriptors);
 
             events.push(EitEvent {
                 event_id,
@@ -126,6 +129,7 @@ impl EitTable {
                 description,
                 extended,
                 genre,
+                shared_events,
             });
         }
 
@@ -142,6 +146,34 @@ impl EitTable {
             events,
         })
     }
+}
+
+/// Parse event_group_descriptor(0xD6) for event sharing only.
+///
+/// The descriptor's first byte contains group_type and event_count.  A
+/// malformed descriptor is ignored as a whole so a truncated event list can
+/// never produce a partial reference.
+fn parse_shared_events(descriptors: &[u8]) -> Vec<(u16, u16)> {
+    for (tag, data) in parse_descriptor_loop(descriptors) {
+        if tag != descriptor_tag::EVENT_GROUP || data.first().map(|b| b >> 4) != Some(1) {
+            continue;
+        }
+        let event_count = (data[0] & 0x0F) as usize;
+        let required = 1usize.saturating_add(event_count.saturating_mul(4));
+        if data.len() < required {
+            return Vec::new();
+        }
+        return (0..event_count)
+            .map(|index| {
+                let offset = 1 + index * 4;
+                (
+                    u16::from_be_bytes([data[offset], data[offset + 1]]),
+                    u16::from_be_bytes([data[offset + 2], data[offset + 3]]),
+                )
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Convert a Modified Julian Date to (year, month, day), per ETSI EN 300 468
@@ -447,6 +479,27 @@ mod tests {
 
         assert_eq!(parse_genre(&descriptors), Some(0x21));
         assert_eq!(parse_genre(&[]), None);
+    }
+
+    #[test]
+    fn event_group_shared_events_are_parsed_only_for_group_type_one() {
+        let data = [0x12, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
+        let mut descriptors = vec![descriptor_tag::EVENT_GROUP, data.len() as u8];
+        descriptors.extend_from_slice(&data);
+        assert_eq!(parse_shared_events(&descriptors), vec![(0x0010, 0x0020), (0x0030, 0x0040)]);
+
+        let group_type_two = [0x22, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
+        let mut descriptors = vec![descriptor_tag::EVENT_GROUP, group_type_two.len() as u8];
+        descriptors.extend_from_slice(&group_type_two);
+        assert!(parse_shared_events(&descriptors).is_empty());
+    }
+
+    #[test]
+    fn truncated_event_group_is_ignored() {
+        let data = [0x12, 0x00, 0x10, 0x00, 0x20];
+        let mut descriptors = vec![descriptor_tag::EVENT_GROUP, data.len() as u8];
+        descriptors.extend_from_slice(&data);
+        assert!(parse_shared_events(&descriptors).is_empty());
     }
 
     /// extended_event_descriptor を1つ組み立てる。items は (項目名, 本文) の列。

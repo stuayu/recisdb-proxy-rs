@@ -152,7 +152,8 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 
 ## 保存
 
-- スキーマ: `programs` テーブル(Migration 015/025/026、`database/mod.rs` の台帳)。
+- スキーマ: `programs` テーブル(Migration 015/025/026/040、`database/mod.rs` の台帳)。Migration 040 は
+  `shared_sid`、`shared_event_id` と旧データ救済用の `(nid, tsid, start_at)` インデックスを追加する。
   UNIQUE `(nid, sid, tsid, event_id)`。service_id/event_id はTS内の識別なのでTSIDを含める。
   `free_ca_mode` はEITのfree_CA_modeを保持し、Mirakurunの`isFree`へ反映する。
 - 書き込みは `EpgWriter`(`main.rs` で1度だけ spawn)経由のみ:
@@ -162,7 +163,8 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
     概要・ジャンル、table 0x50系)と拡張記述(table 0x58系)が別sectionで届き、同じキーになる。
     新しい方で丸ごと置き換えると、同じ窓に両方届いたとき片方が捨てられ、番組名の無い行が残る。
     同じversionのsectionは再送されてもcollectorが捨てるため、次にversionが変わるまで埋まらない
-    (実機のDBで主要TVサービスの未来番組6414行中3970行が番組名NULLだった、2026-10)。
+    (置き換えで落ちるのは同じ窓に両系統が届いた行だけ。実機で多数見つかった番組名NULLの行は
+    これが原因ではなく、サブチャンネルのイベント共有だった。下記「イベント共有」を参照。)
   - UPSERT は `WHERE excluded.updated_at >= programs.updated_at` 付きで、
     古いバッチが新しい行を上書きしない。
   - **prune**: 30フラッシュごと(≒5分)に、終了時刻が現在より24時間以上前の行を削除。
@@ -174,6 +176,23 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
   別々に更新する(Migration 032)。
   Migration 032は既存のNULL番組を削除しない。次回basic記述子を受信したとき、非NULL項目だけを
   補完するため、収集再開で壊れた行を回復できる。
+
+### イベント共有
+
+ARIB のイベントグループ記述子(`event_group_descriptor`, tag `0xD6`)で
+`group_type=1`(イベント共有)を受信したイベントは、列挙された
+`(service_id, event_id)`のうち自分自身を除き、`service_id`が最小の1件を
+`shared_sid` / `shared_event_id`へ保存する。`group_type`が1以外、または列挙が
+記述子長に収まらない場合は無視する。参照先は同じNID・TSID内とする。
+
+番組名・概要・拡張記述・ジャンルはDBへ書き戻さず、読み出し時に参照先から
+`COALESCE`で補う。参照先が無い場合はNULLのまま。`shared_sid`が無い旧データで
+名前がNULLの行は、同じNID・TSID・開始時刻・durationの名前あり行からsid最小の
+1件を移行措置として補う。参照先の更新は次回読み出しへ反映する。
+
+`/api/programs/services` のサブチャンネル `distinct` 判定は、共有解決前の
+自身の名前を使う。共有イベントしかないサブチャンネルを既定で隠す挙動を維持する。
+ノード同期は解決前の生の番組値と共有参照フィールドを送る。
 
 ## 読み出し
 
@@ -259,7 +278,10 @@ stale（これ以上古いEITを許さない時刻）であり、意味を分離
 `section_coverage_until`、TSIDの順である。`min_future_coverage_hours` はcoverageの下限、
 `target_future_coverage_hours` は到達させたい目標であり、前者は「やるかやらないか」を
 決める条件ではなく、「どの候補を先にやるか」を決める最優先階層である。BS/CSはother-TS EITで
-複数muxを埋められるため、NIDごとに代表muxを1つだけ候補にする。4Kはdantto4k変換後のTS
+複数muxを埋められるため、NIDごとに代表muxを1つだけ候補にする。衛星の待機(`next_eligible_at`)と
+順位(最終スキャン開始時刻)はネットワーク単位で扱い、ネットワーク内のどれかを直近にスキャン
+したならネットワーク全体がそれを引き継ぐ。TSごとに見ると、受信不良でどのTSも完成しない
+ネットワークが代表を入れ替えながらTS数ぶん連続で順番を取り、地デジが数時間止まる。4Kはdantto4k変換後のTS
 EITにother-TS情報がないため、TS単位で独立して扱う。
 
 `evaluate()` は `rank_targets()` が作った順位付き候補を受け、空きスロット分を

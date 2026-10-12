@@ -979,6 +979,8 @@ async fn epg_programs(
                         source: row.program.source as u8,
                         basic_updated_at: row.program.basic_updated_at,
                         extended_updated_at: row.program.extended_updated_at,
+                        shared_sid: row.program.shared_sid,
+                        shared_event_id: row.program.shared_event_id,
                         pf_updated_at: row.pf_updated_at,
                         schedule_updated_at: row.schedule_updated_at,
                     })

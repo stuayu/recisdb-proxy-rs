@@ -127,6 +127,10 @@ pub struct ProgramUpsertWire {
     #[serde(default)]
     pub extended_updated_at: Option<i64>,
     #[serde(default)]
+    pub shared_sid: Option<u16>,
+    #[serde(default)]
+    pub shared_event_id: Option<u16>,
+    #[serde(default)]
     pub pf_updated_at: Option<i64>,
     #[serde(default)]
     pub schedule_updated_at: Option<i64>,
@@ -150,6 +154,8 @@ impl From<ProgramUpsert> for ProgramUpsertWire {
             source: value.source as u8,
             basic_updated_at: value.basic_updated_at,
             extended_updated_at: value.extended_updated_at,
+            shared_sid: value.shared_sid,
+            shared_event_id: value.shared_event_id,
             pf_updated_at: None,
             schedule_updated_at: None,
         }
@@ -185,6 +191,8 @@ impl From<ProgramUpsertWire> for ProgramUpsert {
             },
             basic_updated_at,
             extended_updated_at,
+            shared_sid: value.shared_sid,
+            shared_event_id: value.shared_event_id,
         }
     }
 }
