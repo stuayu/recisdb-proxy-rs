@@ -201,6 +201,29 @@ struct ReceiverOptions {
     tlv: bool,
     qam: Option<u32>,
     coffset: Option<i32>,
+    /// 空間 3 を J.83 Annex B の周波数配置として扱う (`+j83b`)。
+    j83b: bool,
+}
+
+/// J.83 Annex B (スカパー!プレミアムサービス光) の搬送波数。
+/// 93.25 MHz から 6.5 MHz 間隔で 587.25 MHz まで。
+const J83B_CHANNELS: u32 = 77;
+
+/// `+j83b` の空間 3 のチャンネル番号 (0..77) を中心周波数 kHz へ。
+///
+/// CATV の C チャンネル (6 MHz 間隔) とは配置が違い、px4_drv の J.83B は
+/// ISDB-C 用の周波数補正も使わない。配置は利用者の受信報告 (2026-10、東京) と
+/// px4_drv 同梱の `BonDriver_PX4-C.ChSet.SPHD-J83B.txt` に合わせてある。
+/// daemon 側で `ExperimentalJ83B=true` にしていないと、ISDB-C として選局され
+/// ロックしない。J.83B の信号がある環境では未検証。
+fn j83b_frequency(channel: u32) -> Result<u32, io::Error> {
+    if channel >= J83B_CHANNELS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("J.83B channel {} out of range (0-{})", channel, J83B_CHANNELS - 1),
+        ));
+    }
+    Ok(93_250 + 6_500 * channel)
 }
 
 // ParameterType values from px4_drv/winusb/src/common/command.hpp.
@@ -320,6 +343,7 @@ fn parse_path(path: &str) -> Result<(i32, ReceiverOptions, String, String), io::
         match suffix {
             "lnb" => options.lnb = true,
             "tlv" => options.tlv = true,
+            "j83b" => options.j83b = true,
             _ if suffix.starts_with("tsmf=") => {
                 let value = suffix[5..].parse::<u32>().map_err(|_| invalid())?;
                 if value > 14 {
@@ -339,6 +363,17 @@ fn parse_path(path: &str) -> Result<(i32, ReceiverOptions, String, String), io::
             }
             _ => return Err(invalid()),
         }
+    }
+
+    // J.83B は TSMF を使わず、256QAM 固定で、ISDB-C 用の周波数補正も掛けない。
+    // px4_drv は TSMF 指定つきの選局を拒否するので、選局時ではなくここで断る。
+    if options.j83b
+        && (options.tsmf.is_some() || options.tlv || options.qam.is_some() || options.coffset.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "px4daemon suffix '+j83b' cannot be combined with +tsmf, +tlv, +qam or +coffset",
+        ));
     }
 
     let index = if index_part.eq_ignore_ascii_case("any") || index_part.is_empty() {
@@ -676,13 +711,20 @@ impl Px4DaemonTuner {
     // -----------------------------------------------------------------
 
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
-        let (sys, default_freq) = space_channel_to_freq(space, channel)?;
-        let freq_khz = if sys == system::ISDB_C {
+        let j83b = space == 3 && self.options.j83b;
+        let (sys, default_freq) = if j83b {
+            (system::ISDB_C, j83b_frequency(channel)?)
+        } else {
+            space_channel_to_freq(space, channel)?
+        };
+        let freq_khz = if sys == system::ISDB_C && !j83b {
             catv_frequency(channel, self.options.coffset)?
         } else {
             default_freq
         };
-        let mut modulation = self.options.qam.unwrap_or(0);
+        // J.83B は daemon が 256QAM へ固定する。64/256 の自動判定 (使い捨ての
+        // 受信機セッション) は意味がなく、77 波ぶんの時間だけ掛かる。
+        let mut modulation = if j83b { 256 } else { self.options.qam.unwrap_or(0) };
         if sys == system::ISDB_C && modulation == 0 {
             modulation = self
                 .catv_modulations
@@ -879,6 +921,7 @@ impl Px4DaemonTuner {
             0 => Some("GR".to_string()),
             1 => Some("BS".to_string()),
             2 => Some("CS".to_string()),
+            3 if self.options.j83b => Some("J.83B".to_string()),
             3 => Some("CATV".to_string()),
             _ => None,
         }
@@ -889,6 +932,9 @@ impl Px4DaemonTuner {
             0 if channel <= 49 => Some(format!("GR{}", channel + 13)),
             1 if channel <= 11 => Some(format!("BS{}", channel * 2 + 1)),
             2 if channel <= 11 => Some(format!("CS{}", channel * 2 + 2)),
+            3 if self.options.j83b => {
+                (channel < J83B_CHANNELS).then(|| format!("H{:02}", channel + 1))
+            }
             3 if channel <= 50 => Some(format!("C{}", channel + 13)),
             _ => None,
         }
@@ -970,6 +1016,18 @@ mod tests {
     #[test]
     fn rejects_paths_for_other_backends() {
         assert!(parse_path("/dev/px4video0").is_err());
+
+        // J.83B: 単独か +lnb とだけ併用できる。
+        assert!(parse_path("px4daemon:3+j83b").unwrap().1.j83b);
+        assert!(parse_path("px4daemon:any+lnb+j83b").unwrap().1.j83b);
+        for bad in ["+j83b+tsmf=0", "+tlv+j83b", "+j83b+qam=256", "+j83b+coffset=0", "+j83b+j83b"] {
+            assert!(parse_path(&format!("px4daemon:0{bad}")).is_err(), "{bad}");
+        }
+        // 93.25 MHz から 6.5 MHz 間隔で 77 波。
+        assert_eq!(j83b_frequency(0).unwrap(), 93_250);
+        assert_eq!(j83b_frequency(1).unwrap(), 99_750);
+        assert_eq!(j83b_frequency(76).unwrap(), 587_250);
+        assert!(j83b_frequency(77).is_err());
         assert!(parse_path("px4daemon:x").is_err());
     }
 
@@ -1052,7 +1110,8 @@ mod tests {
                 tlv: true,
                 tsmf: Some(14),
                 qam: Some(256),
-                coffset: Some(-275)
+                coffset: Some(-275),
+                j83b: false,
             }
         );
         assert_eq!(ctrl, "/run/px4_ctrl.sock");

@@ -591,6 +591,7 @@ px4_drv の `winusb/pkg/BonDriver_PX4/BonDriver_PX4-C.ChSet.txt` の CATV 空間
 | `+tlv` | TSMF の生TLV出力。`+tsmf` がなければ Relative stream 0 |
 | `+qam=64` / `+qam=256` | CATV の変調方式を固定。省略時は自動判定 |
 | `+coffset=-275` | CATV 全チャンネルで使う固定周波数補正 (符号付き kHz) |
+| `+j83b` | 空間 3 を J.83 Annex B の配置 (93.25 MHz から 6.5 MHz 間隔、77 波) にする。実験的・未検証 |
 
 例: `px4daemon:any+tlv+qam=256` を `stream_format='mmttlv'` で登録すると、
 C22 は space=3/channel=9、C23 は space=3/channel=10 で選局できます。
@@ -663,7 +664,12 @@ px4_drv は `DriverHost_PX4.ini` の `ExperimentalJ83B=true` で、ISDB-C の選
 - **搬送波は C チャンネル(6 MHz 間隔)に乗りません。** スカパー!プレミアムサービス光は
   93.25 MHz から 6.5 MHz 間隔で、`px4daemon:` の CATV 空間(C13〜C63 固定)では選局できません。
   Windows の BonDriver は ChSet に中心周波数を直接書けます(px4_drv に定義ファイルを同梱)。
-  `px4daemon:` 経路での J.83B の周波数指定は未対応です。
+  `px4daemon:` では受信機パスに `+j83b` を付けると、空間 3 が CATV ではなく J.83B の配置
+  (`H01`〜`H77`、channel 0〜76 = 93250 + 6500 × channel kHz)になります。
+  例: `px4daemon:3+j83b`。`+lnb` 以外の接尾辞(`+tsmf` / `+tlv` / `+qam` / `+coffset`)とは
+  併用できません。デーモン側で `ExperimentalJ83B=true` にしていないと、ISDB-C として選局され
+  ロックしません。周波数がデーモンへ正しく渡ることは実機で確認していますが、J.83B の信号での
+  ロックは未検証です。
 - **`+tsmf=N` / `+tlv` は使えません。** J.83B は TSMF を使わないので、px4_drv は TSMF 指定つきの
   選局を拒否します(選局エラーになります)。`+tsmf` なしの系統で登録してください。
 

@@ -249,6 +249,7 @@ cd /path/to/px4_drv/macos/build
 | `px4daemon:any+tsmf=0` | CATV の TSMF Relative stream 0 を選択 |
 | `px4daemon:any+tlv` | CATV の生TLVを出力 (`stream_format='mmttlv'` 必須) |
 | `px4daemon:0+qam=256+coffset=-275` | CATV のQAMと周波数補正 (kHz) を固定 |
+| `px4daemon:0+j83b` | 空間 3 を J.83 Annex B の配置にする (実験的。デーモン側の `ExperimentalJ83B=true` が必要) |
 | `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更 (データソケットは `ctrl`→`data` 置換で導出) |
 
 接尾辞は `@` より前に順不同で併用できます。不明な接尾辞・不正値・重複はエラーです。
