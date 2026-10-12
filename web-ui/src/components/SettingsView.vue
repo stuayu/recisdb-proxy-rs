@@ -56,6 +56,10 @@ const epgReasonLabels: Record<string, string> = {
   cpu_hard_limit: 'CPU負荷が高いため取得を中断しました', backoff: '前回の失敗後の待機中です',
   preempted_by_record: '録画を優先して取得を延期しました', preempted_by_view: '視聴を優先して取得を延期しました',
   no_compatible_tuner: '対応する受信帯域のチューナーがありません',
+  auto_tuner_scan_disabled: 'チューナーの自動起動がOFFのため、視聴・録画中とペアノードからの同期でだけ更新します',
+  mux_lease_unavailable: '他のノードが同じ系統を取得中です',
+  remote_metadata_failed: 'リモートノードでの取得に失敗しました',
+  remote_ts_failed: 'リモートノードからのTS取得に失敗しました',
 }
 function epgReasonLabel(value: unknown): string {
   if (value && typeof value === 'object') {

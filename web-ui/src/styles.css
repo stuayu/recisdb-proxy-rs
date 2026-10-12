@@ -2435,6 +2435,14 @@ textarea:focus-visible,
 /* EPGプリセット比較表。狭幅ではdata-table共通ルールで縦積みにする。 */
 .epg-preset-table-region {
   margin-top: 12px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* fieldset の既定は min-inline-size: min-content。中の表(min-width: 1050px)に
+   合わせてカードの外まで広がり、右端の操作列が切れる。 */
+fieldset:has(> .epg-preset-table-region) {
+  min-inline-size: 0;
 }
 
 .epg-preset-table {
