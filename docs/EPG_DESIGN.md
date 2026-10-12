@@ -298,6 +298,10 @@ EITにother-TS情報がないため、TS単位で独立して扱う。
 
 Partialで終了したmuxは `min(target_refresh_secs, 1800)` 秒後まで再スキャン対象にしない。
 NoData/失敗はfailure_countに応じて60秒から指数的に延長し、最大3600秒のbackoffを使う。
+CPU上限による中断(`cpu_aborted`)と視聴・録画による割り込み(`preempted`)は失敗に数えず、
+`failure_count` を据え置いて60秒後に再試行する。muxの落ち度ではないので、失敗に数えると負荷の
+高いホストでは全muxが指数backoffで遠ざかり、空いた時間帯にも取りに行かなくなる。
+`original_network_id = 0` の行(過去のスキャンがNIDを確定できないまま登録したもの)は候補にしない。
 Completeも同じく `min(target_refresh_secs, 1800)` 秒は再スキャンしない。dwell側の完了判定は
 trackerが見たサービスだけを母数にするため、`channels` 側の母数で未完了のままだとstale判定が
 立ち続け、間隔なしでは同じmuxを連続で取り直すからである。それ以降は既存のstale判定に任せる。
