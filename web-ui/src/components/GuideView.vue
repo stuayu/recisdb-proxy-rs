@@ -251,6 +251,7 @@ const pendingProgramWindows = new Map<string, ProgramWindow[]>()
 let programGeneration = 0
 let initialProgramsReady = false
 let scrollResizeObserver: ResizeObserver | null = null
+let resizeFrame: number | null = null
 let detailLoadTimer: number | null = null
 
 const pxPerMin = computed(() => Math.max(1, (viewportHeight.value - headerHeight.value) / (displayHours.value * 60)))
@@ -685,8 +686,14 @@ function sortServices(all: Service[]): Service[] {
     else byNid.set(service.nid, [service])
   }
   const numbers = new Map(all.map((service) => [service.key, guideChannelNumber(service, byNid.get(service.nid) ?? [])]))
+  // BS4K (NID 0x000B/0x000C) は SID が BS と同じ番号帯なので、番号だけで並べると
+  // BS 局の間に挟まる。4K は全体の末尾に置く (CLAUDE.md: 地デジ→BS→CS→BS4K)。
+  // 4K は帯域としては「BS」に入るので、帯域順より先に判定しないと
+  // 「すべて」表示で CS の前に来てしまう。
+  const isFourK = (service: Service) => service.nid === 0x000b || service.nid === 0x000c
   return all.sort((a, b) =>
-    BAND_ORDER[a.band] - BAND_ORDER[b.band]
+    Number(isFourK(a)) - Number(isFourK(b))
+    || BAND_ORDER[a.band] - BAND_ORDER[b.band]
     || (a.band === '地上' ? (a.prefectureCode ?? 255) - (b.prefectureCode ?? 255) : 0)
     || (numbers.get(a.key) ?? 0) - (numbers.get(b.key) ?? 0)
     || a.nid - b.nid || a.sid - b.sid)
@@ -1218,7 +1225,15 @@ onMounted(() => {
   loadDensity()
   narrowMedia = window.matchMedia(NARROW_MEDIA_QUERY)
   narrowMedia.addEventListener('change', resizeGrid)
-  scrollResizeObserver = new ResizeObserver(() => resizeGrid())
+  // 観測コールバック内で直接レイアウトを変えると WebKit が
+  // "ResizeObserver loop completed with undelivered notifications" を投げる。次フレームへ逃がす。
+  scrollResizeObserver = new ResizeObserver(() => {
+    if (resizeFrame !== null) return
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = null
+      resizeGrid()
+    })
+  })
   void refresh()
   void loadEpgStatus()
   epgEvents.start()
@@ -1240,6 +1255,8 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   scrollResizeObserver?.disconnect()
   scrollResizeObserver = null
+  if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
+  resizeFrame = null
   if (scrollAnimationId !== null) cancelAnimationFrame(scrollAnimationId)
   if (programMergeTimer !== null) window.clearTimeout(programMergeTimer)
   programMergeTimer = null
