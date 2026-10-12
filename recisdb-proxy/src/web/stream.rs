@@ -813,6 +813,27 @@ pub(crate) fn session_info_for(
     session_info_for_source(protocol, peer, resolved, Some(tuner), None, stream_class)
 }
 
+/// セッションへ渡す信号強度の取得元 (`HttpStreamSession::set_signal_source`)。
+pub(crate) fn signal_source_for(
+    source: &channel_resolve::StreamSource,
+) -> crate::web::http_session::SignalSource {
+    match source {
+        channel_resolve::StreamSource::Local { tuner, .. } => tuner_signal_source(tuner),
+        channel_resolve::StreamSource::Remote(remote) => {
+            let remote = Arc::clone(remote);
+            Arc::new(move || remote.signal_level())
+        }
+    }
+}
+
+/// ローカルチューナーの信号強度の取得元。リーダーが5秒ごとに更新する値を読む。
+pub(crate) fn tuner_signal_source(
+    tuner: &Arc<SharedTuner>,
+) -> crate::web::http_session::SignalSource {
+    let tuner = Arc::clone(tuner);
+    Arc::new(move || tuner.signal_level())
+}
+
 /// Same, for a stream that may be fed by a peer instead of a local tuner.
 ///
 /// The dashboard must always show *why* a tuner is busy (CLAUDE.md, Web
@@ -912,6 +933,7 @@ async fn stream_resolved(
         ),
     )
     .await;
+    session.set_signal_source(tuner_signal_source(&tuner));
 
     // Tracked subscription: keeps the tuner counted as "in use" for as long
     // as this HTTP response body is alive, exactly like a BNDP session's

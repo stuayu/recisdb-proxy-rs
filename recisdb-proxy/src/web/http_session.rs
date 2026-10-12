@@ -124,6 +124,10 @@ impl HttpStreamStats {
 /// recording that dies has to leave a reason behind, the same way a BNDP
 /// recording session does (`server/session.rs`'s `disconnect_reason`).
 /// Without it a failed recording is indistinguishable from a clean one.
+/// 配信元の信号強度 (dB) を読む関数。ローカルなら `SharedTuner`、ノード間なら
+/// `RemoteMuxStream` が定期的に更新している値を返す。
+pub type SignalSource = Arc<dyn Fn() -> f32 + Send + Sync>;
+
 pub struct HttpStreamSession {
     registry: Arc<SessionRegistry>,
     database: DatabaseHandle,
@@ -139,6 +143,8 @@ pub struct HttpStreamSession {
     /// Why this stream ended. Set by the body stream before it yields its
     /// final item; `None` means an ordinary client-side disconnect.
     disconnect_reason: Arc<Mutex<Option<String>>>,
+    /// 配信元の信号強度の取得元。登録後に [`Self::set_signal_source`] で渡す。
+    signal_source: Arc<std::sync::OnceLock<SignalSource>>,
 }
 
 impl HttpStreamSession {
@@ -206,12 +212,22 @@ impl HttpStreamSession {
             channel_name: info.channel_name,
             stream_class: info.stream_class,
             disconnect_reason: Arc::new(Mutex::new(None)),
+            signal_source: Arc::new(std::sync::OnceLock::new()),
         };
         (session, shutdown_rx)
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 配信元の信号強度の取得元を登録する。
+    ///
+    /// これが無いと、HTTP / Mirakurun 互換のセッションはダッシュボードの
+    /// 信号強度が常に 0.0 dB になる (チューナーは正しく読めているのに、
+    /// セッションの統計へ渡す経路が無かった)。2回目以降の呼び出しは無視する。
+    pub fn set_signal_source(&self, source: SignalSource) {
+        let _ = self.signal_source.set(source);
     }
 
     /// Record why this stream is ending, for `session_history`.
@@ -249,16 +265,17 @@ impl HttpStreamSession {
 
         let registry = Arc::clone(&self.registry);
         let id = self.id;
+        let signal = self.signal_source.get().map_or(0.0, |source| source());
         tokio::spawn(async move {
-            // Signal level and the loss counters stay at their defaults:
-            // an HTTP stream reads an already-shared broadcast, so the
-            // per-client drop accounting the BNDP session does (its own
-            // bounded write queue) has no equivalent here.
+            // The loss counters stay at their defaults: an HTTP stream reads
+            // an already-shared broadcast, so the per-client drop accounting
+            // the BNDP session does (its own bounded write queue) has no
+            // equivalent here. Signal level comes from the stream's source.
             registry
-                .update_stats(id, 0.0, packets_sent, 0, 0, 0, mbps, 0, 0, 0, Vec::new())
+                .update_stats(id, signal, packets_sent, 0, 0, 0, mbps, 0, 0, 0, Vec::new())
                 .await;
             registry
-                .push_metrics_sample(id, chrono::Utc::now().timestamp_millis(), mbps, 0.0, 0.0)
+                .push_metrics_sample(id, chrono::Utc::now().timestamp_millis(), mbps, 0.0, signal)
                 .await;
         });
     }
@@ -390,6 +407,29 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("session was not unregistered after the guard was dropped");
+    }
+
+    #[tokio::test]
+    async fn signal_level_comes_from_the_stream_source() {
+        let registry = Arc::new(SessionRegistry::new());
+        let (session, _shutdown_rx) = HttpStreamSession::register(
+            Arc::clone(&registry),
+            test_db(),
+            session_info(SessionProtocol::Mirakurun),
+        )
+        .await;
+        session.set_signal_source(Arc::new(|| 31.5));
+
+        // 統計の反映は 1 秒に 1 回。1 秒以上あけてから送信を記録する。
+        tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+        session.record_sent(TS_PACKET_SIZE * 100);
+        for _ in 0..100 {
+            if registry.get_all().await[0].signal_level > 0.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(registry.get_all().await[0].signal_level, 31.5);
     }
 
     #[tokio::test]

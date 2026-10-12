@@ -1199,6 +1199,7 @@ pub async fn stream_service_by_mirakurun_id(
         info,
     )
     .await;
+    session.set_signal_source(crate::web::stream::signal_source_for(&source));
     if let BodyReceiver::Tuner(sub) = &rx {
         web_state
             .session_registry
@@ -1300,6 +1301,7 @@ pub async fn stream_channel_by_type(
         ),
     )
     .await;
+    session.set_signal_source(crate::web::stream::tuner_signal_source(&tuner));
 
     let tuner_rx = tuner.subscribe_with_claim_class(
         resolved.channel.priority,
@@ -1586,6 +1588,7 @@ pub async fn stream_program_by_mirakurun_id(
         info,
     )
     .await;
+    session.set_signal_source(crate::web::stream::signal_source_for(&source));
     if let BodyReceiver::Tuner(sub) = &rx {
         web_state
             .session_registry
