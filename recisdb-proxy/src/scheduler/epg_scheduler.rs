@@ -349,17 +349,36 @@ impl EpgScanScheduler {
             rank_targets(&targets, now, &config)
                 .into_iter()
                 .filter_map(|target| {
-                    drivers.iter().find_map(|driver| {
-                        db.get_enabled_channels_by_bon_driver(driver.id)
-                            .ok()?
-                            .into_iter()
-                            .find(|channel| {
-                                channel.nid == target.network_id
-                                    && channel.tsid == target.tsid
-                                    && is_real_broadcast_service(channel.sid, channel.tsid)
-                            })
-                            .map(|channel| (driver.clone(), channel))
-                    })
+                    // 同じ mux を複数のドライバが受信できることがある (県境の局、
+                    // 同じ地域の別拠点)。先頭の1本に固定すると、そのドライバだけが
+                    // 受信不良のとき、他で取れる mux の番組表が永久に埋まらない。
+                    let mut carriers = drivers
+                        .iter()
+                        .filter_map(|driver| {
+                            db.get_enabled_channels_by_bon_driver(driver.id)
+                                .ok()?
+                                .into_iter()
+                                .find(|channel| {
+                                    channel.nid == target.network_id
+                                        && channel.tsid == target.tsid
+                                        && is_real_broadcast_service(channel.sid, channel.tsid)
+                                })
+                                .map(|channel| (driver.clone(), channel))
+                        })
+                        .collect::<Vec<_>>();
+                    let state = states.iter().find(|state| {
+                        state.network_id == target.network_id && state.tsid == target.tsid
+                    });
+                    let carrier_ids = carriers
+                        .iter()
+                        .map(|(driver, _)| driver.id)
+                        .collect::<Vec<_>>();
+                    let index = choose_scan_driver_index(
+                        &carrier_ids,
+                        state.and_then(|s| s.last_tuner_id),
+                        state.map_or(0, |s| s.failure_count),
+                    )?;
+                    Some(carriers.swap_remove(index))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1184,6 +1203,28 @@ fn append_epg_target(
     targets.push(EpgTarget::from_state(channel.nid, channel.tsid, state));
 }
 
+/// 同じ mux を受信できるドライバ群から、今回のスキャンに使う1本の添字を返す。
+///
+/// 前回までのスキャンが完了していない (`failure_count > 0`) あいだは、前回使った
+/// ドライバの次へ順送りする。完了すると `failure_count` は 0 に戻るので、取れている
+/// mux は同じドライバを使い続ける。前回のドライバが候補から消えていたら先頭に戻す。
+fn choose_scan_driver_index(
+    carrier_ids: &[i64],
+    last_tuner_id: Option<i64>,
+    failure_count: i64,
+) -> Option<usize> {
+    if carrier_ids.is_empty() {
+        return None;
+    }
+    if failure_count <= 0 {
+        return Some(0);
+    }
+    let next = last_tuner_id
+        .and_then(|last| carrier_ids.iter().position(|id| *id == last))
+        .map_or(0, |position| (position + 1) % carrier_ids.len());
+    Some(next)
+}
+
 fn select_next_target(
     targets: &[EpgTarget],
     now: i64,
@@ -1333,6 +1374,30 @@ pub fn cpu_limit_source() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_driver_stays_on_the_first_carrier_while_scans_complete() {
+        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(26), 0), Some(0));
+        assert_eq!(choose_scan_driver_index(&[26, 29, 30], None, 0), Some(0));
+    }
+
+    #[test]
+    fn scan_driver_rotates_to_the_next_carrier_after_a_failure() {
+        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(26), 1), Some(1));
+        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(29), 90), Some(2));
+        // 末尾まで試したら先頭へ戻る。
+        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(30), 3), Some(0));
+    }
+
+    #[test]
+    fn scan_driver_falls_back_to_the_first_carrier_when_the_last_one_is_gone() {
+        // 前回のドライバが無効化・削除されている、またはまだ一度も選局していない。
+        assert_eq!(choose_scan_driver_index(&[26, 29], Some(99), 5), Some(0));
+        assert_eq!(choose_scan_driver_index(&[26, 29], None, 5), Some(0));
+        // 受信できるドライバが1本だけなら、失敗していても同じものを使う。
+        assert_eq!(choose_scan_driver_index(&[37], Some(37), 90), Some(0));
+        assert_eq!(choose_scan_driver_index(&[], Some(37), 90), None);
+    }
 
     #[test]
     fn remote_metadata_outcome_without_status_is_partial_when_rows_returned() {

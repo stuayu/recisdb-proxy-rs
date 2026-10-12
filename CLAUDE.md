@@ -68,6 +68,11 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - 巡回対象の判定は帯域で分ける(`broadcast_region::classify_nid` を使い、NIDをベタ書きしない)。
   地デジは物理TSごとに独立。**BS/CSはOther-TS EITで供給済みの系統を選局しない**
   (全TS無条件巡回は禁止)。
+- **同じmuxを受信できるドライバが複数あるとき、スキャンに使うドライバを先頭の1本に固定しない。**
+  未完了(`failure_count > 0`)のあいだは前回のドライバの次へ順送りする
+  (`choose_scan_driver_index`)。固定すると、その1本だけが受信不良のmuxは、他のドライバで
+  取れるのに番組表が埋まらない(実測: 福岡経由で失敗し続けたKBC・RKBは長崎経由で、岐阜経由で
+  no_dataだった東海テレビは愛知・静岡経由で受信できた)。
 - 延期・失敗理由は `EpgReasonCode` のenumだけから生む。文字列リテラルをその場で書かない。
   `not_due` は state にだけ残し履歴に積まない(毎ループ1行増やさない)。
 - **CPU soft/hard limit の使用率は `metrics::system::cpu_usage_percent()`(sysinfo)だけを見る。
