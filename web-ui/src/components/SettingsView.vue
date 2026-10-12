@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api, type JsonRecord } from '../api'
+import { latestScanCompletedAt } from '../composables/useEpgEvents'
 
 const endpoints = [
+  ['サーバー', '/__server'],
+  ['開発版に更新', '/__development'],
+  ['ブラウザプレビュー', '/__preview'],
+  ['B-CASカードリーダー', '/__card-reader'],
   ['EPG自動取得', '/settings/epg'],
   ['スキャンスケジューラー', '/scan-config'],
   ['チューナー最適化', '/tuner-config'],
@@ -11,13 +16,14 @@ const endpoints = [
   ['番組表', '/guide-config'],
   ['ログ出力', '/log-config'],
 ] as const
-const selected = ref<string>(endpoints[0][1])
+const selected = ref<string>('/settings/epg')
 const config = ref<JsonRecord>({})
 const message = ref('')
 const error = ref('')
 const label = computed(() => endpoints.find((item) => item[1] === selected.value)?.[0] ?? '設定')
 const isEpg = computed(() => selected.value === '/settings/epg')
 const isGuide = computed(() => selected.value === '/guide-config')
+const isStandaloneCategory = computed(() => selected.value.startsWith('/__'))
 const guideDefaultRegion = ref<string | null>(null)
 const guideRegions = ref<JsonRecord[]>([])
 const epgPresets = ref<JsonRecord[]>([])
@@ -141,6 +147,11 @@ function displayName(key: string) {
   return names[key] ?? key
 }
 async function load() {
+  if (isStandaloneCategory.value) {
+    message.value = ''
+    error.value = ''
+    return
+  }
   try {
     const response = await api<JsonRecord>(selected.value)
     const value = response.config
@@ -176,6 +187,7 @@ function onEpgPresetToggle(id: number, event: Event) {
   toggleEpgPreset(id, (event.target as HTMLInputElement).checked)
 }
 async function save() {
+  if (isStandaloneCategory.value) return
   try {
     if (isGuide.value) {
       await api('/guide-config', { method: 'POST', body: JSON.stringify({ default_region: guideDefaultRegion.value }) })
@@ -620,7 +632,7 @@ onMounted(() => {
       </div>
       <div class="actions">
         <button class="button secondary" @click="load">再読み込み</button
-        ><button class="button" @click="save">保存</button>
+        ><button v-if="!isStandaloneCategory" class="button" @click="save">保存</button>
       </div>
     </div>
     <label class="field"
@@ -633,7 +645,7 @@ onMounted(() => {
           v-text="item[0]"
         /></select
     ></label>
-    <div class="panel">
+    <div v-if="selected === '/__server'" class="panel">
       <h3>サーバー</h3>
       <p v-if="serviceError" class="notice error" role="alert" v-text="serviceError" />
       <dl v-if="service" class="service-status">
@@ -660,7 +672,7 @@ onMounted(() => {
         {{ restarting ? '再起動中…' : 'サーバーを再起動' }}
       </button>
     </div>
-    <div class="panel">
+    <div v-if="selected === '/__development'" class="panel">
       <h3>開発版に更新</h3>
       <p class="hint">
         GitHub Actions がビルドした最新の開発版に更新します。リリース版より新しい代わりに、
@@ -728,7 +740,7 @@ onMounted(() => {
         </table>
       </div>
     </div>
-    <div class="panel">
+    <div v-if="selected === '/__preview'" class="panel">
       <h3>ブラウザプレビュー</h3>
       <p class="muted">
         ブラウザで映像を確認するには、エンコーダー（ffmpeg）と前段処理（tsreadex）が必要です。
@@ -768,7 +780,7 @@ onMounted(() => {
         }}
       </button>
     </div>
-    <div class="panel">
+    <div v-if="selected === '/__card-reader'" class="panel">
       <h3>B-CASカードリーダー</h3>
       <p class="muted">
         カードリーダーが複数つながっている場合は、B-CASカードを挿しているものを選んでください。
@@ -809,13 +821,13 @@ onMounted(() => {
     </div>
     <p v-if="message" class="notice success" v-text="message" />
     <p v-if="error" class="notice error" role="alert" v-text="error" />
-    <form class="panel settings-form" @submit.prevent="save">
+    <form v-if="!isStandaloneCategory" class="panel settings-form" @submit.prevent="save">
       <h3 v-text="label" />
       <template v-if="isEpg">
         <section class="panel epg-status" aria-labelledby="epg-status-title">
           <h4 id="epg-status-title">EPG状態 <span>{{ epgStatus?.active ? '取得中' : '待機中' }}</span></h4>
           <div v-if="epgReasonGroups.length" class="muted" role="status"><p>取得を延期・終了した理由</p><ul><li v-for="group in epgReasonGroups" :key="group.code"><span class="epg-reason-main">{{ epgReasonLabel(group.reasons[0]) }}</span><span class="epg-reason-networks"><span v-for="(reason, index) in group.reasons" :key="index">{{ epgReasonNetworkText(reason) }}</span><span v-if="group.count > group.reasons.length">ほか{{ group.count - group.reasons.length }}系統</span></span></li></ul></div>
-          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(epgStateValue('lastScanCompletedAt')) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd></dl>
+          <dl v-if="epgStatus?.state && typeof epgStatus.state === 'object'" class="service-status"><dt>最終取得</dt><dd>{{ formatEpoch(latestScanCompletedAt(epgStatus.states)) }}</dd><dt>番組情報</dt><dd>{{ formatEpoch(epgStateValue('coverageUntil')) }}</dd></dl>
         </section>
         <p class="hint">番組表を自動更新します。録画・視聴を優先し、設定変更は次回の判定から反映されます。</p>
         <label class="check"><input v-model="config.enabled" type="checkbox" /><span>EPG自動取得を有効にする</span></label>
@@ -878,7 +890,7 @@ onMounted(() => {
           <label class="field"><span>起動ばらつき(秒)</span><input v-model.number="config.startup_jitter_secs" type="number" min="0" /></label>
         </div>
         <details><summary>エキスパート設定</summary>
-          <p class="muted">秒単位の値。推奨: 最小30秒 / 通常90秒 / 最大180秒。</p>
+          <p class="muted">秒単位の値。推奨: 最小30秒 / 通常180秒 / 最大600秒 / 無受信タイムアウト90秒。</p>
           <div class="epg-friendly-grid"><label class="field"><span>最小滞在(秒)</span><input v-model.number="config.min_dwell_secs" type="number" min="1" /></label><label class="field"><span>通常滞在(秒)</span><input v-model.number="config.normal_dwell_secs" type="number" min="1" /></label><label class="field"><span>最大滞在(秒)</span><input v-model.number="config.max_dwell_secs" type="number" min="1" /></label><label class="field"><span>CPU上限(%)</span><input v-model.number="config.cpu_hard_limit_percent" type="number" min="1" max="100" /></label></div>
         </details>
         <p class="muted">この設定では、録画と視聴を優先し、最大{{ config.max_concurrent_scans }}台の取得チューナーを使います。</p>

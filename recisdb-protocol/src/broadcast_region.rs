@@ -427,6 +427,20 @@ pub fn get_prefecture_name(nid: u16) -> Option<&'static str> {
     get_region_id_from_nid(nid).and_then(get_prefecture_name_from_region_id)
 }
 
+/// Return the prefectures covered by a wide-area terrestrial broadcaster.
+///
+/// The terrestrial NID's region ID identifies the wide-area allocation itself;
+/// prefecture-level allocations in the same geographic region return an empty
+/// list. Names use the same spelling as [`get_prefecture_name`].
+pub fn wide_area_prefectures(nid: u16) -> Vec<&'static str> {
+    match get_region_id_from_nid(nid) {
+        Some(1) => vec!["茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川"],
+        Some(2) => vec!["滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山"],
+        Some(3) => vec!["岐阜", "愛知", "三重"],
+        _ => Vec::new(),
+    }
+}
+
 /// Return whether a channel row can represent a real broadcast service.
 ///
 /// `service_id = 0` is the PAT-reserved NIT entry, and `transport_stream_id = 0`
@@ -478,6 +492,17 @@ mod tests {
         let (btype, region) = classify_nid(0x7FC1);
         assert_eq!(btype, BroadcastType::Terrestrial);
         assert_eq!(region, Some(TerrestrialRegion::Tokai));
+    }
+
+    #[test]
+    fn test_wide_area_prefectures() {
+        assert_eq!(
+            wide_area_prefectures(0x7FE0),
+            vec!["茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川"]
+        );
+        assert_eq!(wide_area_prefectures(0x7FD1), vec!["滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山"]);
+        assert_eq!(wide_area_prefectures(0x7FC1), vec!["岐阜", "愛知", "三重"]);
+        assert!(wide_area_prefectures(0x7E70).is_empty());
     }
 
     #[test]

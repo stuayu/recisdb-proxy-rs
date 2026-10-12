@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices, type GuideServiceGroupFields } from './useGuideServices.ts'
+import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices, matchesGuideRegion, type GuideServiceGroupFields } from './useGuideServices.ts'
 
 type TestService = GuideServiceGroupFields & { name: string }
 
@@ -82,4 +82,10 @@ test('placeholder names match server-side rules', () => {
   assert.equal(isPlaceholderProgramName(null), true)
   assert.equal(isPlaceholderProgramName('この時間は０４１ｃｈをご覧ください。'), true)
   assert.equal(isPlaceholderProgramName('ＭＸショッピング'), false)
+})
+
+test('wide-area services match a selected member prefecture', () => {
+  assert.equal(matchesGuideRegion('東京', ['茨城', '群馬', '東京'], '群馬'), true)
+  assert.equal(matchesGuideRegion('群馬', [], '群馬'), true)
+  assert.equal(matchesGuideRegion('東京', ['茨城', '栃木'], '群馬'), false)
 })

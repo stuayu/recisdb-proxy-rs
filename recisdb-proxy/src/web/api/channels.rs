@@ -11,7 +11,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::web::state::WebState;
-use recisdb_protocol::broadcast_region::prefecture_code;
+use recisdb_protocol::broadcast_region::{prefecture_code, wide_area_prefectures};
 
 use super::error::ApiError;
 
@@ -39,6 +39,7 @@ pub struct ChannelInfoApi {
     pub region_id: Option<u8>,
     pub terrestrial_region: Option<String>,
     pub prefecture_code: Option<u8>,
+    pub wide_area_prefectures: Vec<String>,
     pub is_enabled: bool,
     pub priority: i32,
     pub failure_count: i32,
@@ -125,6 +126,7 @@ pub async fn get_channels(
                 region_id: c.region_id,
                 prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                 terrestrial_region: c.terrestrial_region,
+                wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
                 is_enabled: c.is_enabled,
                 priority: c.priority,
                 failure_count: c.failure_count,
@@ -171,6 +173,7 @@ pub async fn get_channels(
                         region_id: c.region_id,
                         prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                         terrestrial_region: c.terrestrial_region,
+                        wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
                         is_enabled: c.is_enabled,
                         priority: c.priority,
                         failure_count: c.failure_count,
@@ -251,6 +254,7 @@ pub async fn get_channels(
                                     region_id: c.region_id,
                                     prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                                     terrestrial_region: c.terrestrial_region.clone(),
+                                    wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
                                     is_enabled: c.is_enabled,
                                     priority: c.priority,
                                     failure_count: c.failure_count,
@@ -310,6 +314,7 @@ pub async fn get_channels(
                             region_id: c.region_id,
                             prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                             terrestrial_region: c.terrestrial_region,
+                            wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
                             is_enabled: c.is_enabled,
                             priority: c.priority,
                             failure_count: c.failure_count,

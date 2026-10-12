@@ -23,6 +23,7 @@ const mockJson = {
         is_enabled: true,
         bon_space: 0,
         bon_channel: 13,
+        wide_area_prefectures: [],
       },
       {
         id: 2,
@@ -35,6 +36,7 @@ const mockJson = {
         is_enabled: false,
         bon_space: 0,
         bon_channel: 13,
+        wide_area_prefectures: [],
       },
     ],
   },

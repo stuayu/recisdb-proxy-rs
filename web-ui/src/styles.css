@@ -110,7 +110,7 @@ textarea {
 }
 
 .topbar {
-  height: 64px;
+  min-height: 64px;
   padding: 0 24px;
   display: flex;
   align-items: center;
@@ -118,11 +118,13 @@ textarea {
   background: var(--nav);
   color: #fff;
   border-bottom: 3px solid #e7a62a;
+  flex-wrap: wrap;
 }
 
 .topbar h1 {
   margin: 0;
   font-size: 1.1rem;
+  word-break: keep-all;
 }
 
 .topbar p {
@@ -136,6 +138,14 @@ textarea {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.topbar > div:first-child {
+  min-width: 0;
+}
+
+.topbar .top-actions {
+  flex: 0 0 auto;
 }
 
 .icon-button,
@@ -539,6 +549,18 @@ textarea:focus-visible,
     min-height: 56px;
     gap: 8px;
     padding: 6px 12px;
+  }
+
+  .update-notices {
+    order: 3;
+    flex: 1 0 100%;
+    width: 100%;
+  }
+
+  .update-notice {
+    width: 100%;
+    border-radius: 6px;
+    flex-wrap: wrap;
   }
 
   .topbar > div:first-child {
@@ -1786,6 +1808,7 @@ textarea:focus-visible,
   border: 1px solid var(--border);
   border-radius: 999px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .update-check-btn:hover:not(:disabled) {
@@ -1825,6 +1848,7 @@ textarea:focus-visible,
   background: rgb(255 255 255 / 10%);
   border: 1px solid var(--accent);
   border-radius: 999px;
+  word-break: keep-all;
 }
 
 .update-notice a {
@@ -1906,7 +1930,7 @@ textarea:focus-visible,
 }
 
 .settings-form {
-  max-width: 780px;
+  max-width: none;
 }
 
 /* EPG program guide */
@@ -2510,8 +2534,16 @@ textarea:focus-visible,
     align-items: center;
   }
 
+  .epg-preset-table td:first-child .epg-preset-name {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    width: 100%;
+  }
+
   .epg-preset-table td:first-child .epg-toggle {
     margin-left: auto;
+    grid-column: 2;
+    grid-row: 1 / span 2;
   }
 
   .epg-preset-table td .epg-preset-actions {

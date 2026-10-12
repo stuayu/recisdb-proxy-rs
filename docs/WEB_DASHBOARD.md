@@ -57,7 +57,9 @@ Linux/macOSではPATHから検出する。Windowsの7z自動展開に必要な�
 
 ### EPG自動取得
 
-「設定 > EPG自動取得」でDB管理のglobal設定を変更できる。更新頻度と保持日数は人間向けの
+「設定 > EPG自動取得」でDB管理のglobal設定を変更できる。設定カテゴリは選択中の
+セクションだけを表示し、サーバー・開発版更新・ブラウザプレビュー・B-CASカード
+リーダーも独立カテゴリとして選べる。更新頻度と保持日数は人間向けの
 選択肢、秒単位の滞在時間とCPU上限はエキスパート設定に分離している。保存結果は再起動不要で
 次回判定から反映される。プリセット一覧は同じ画面に説明付きで表示され、system presetは
 削除不可。effective値の表示・physical tuner override・状態/history画面はAPI基盤追加後に
@@ -272,7 +274,9 @@ TVTest / EDCB 側の設定を画面の指示どおりに進められるガイド
 を先に呼び、番組のある `nid:sid` との積集合を列にします (EDCB の EpgTimer が
 `EpgViewBase.cs` で「表示対象サービス ∩ EPG データのあるサービス」を列にするのと同じ)。
 収集中に初めて番組が届いた局は、SSE の番組イベントで列に加わります。
-地域プルダウンの選択肢も番組のある地域だけになります。
+地域プルダウンの選択肢も番組のある `terrestrial_region` だけになります。広域局の
+所属都道府県は選択肢へ追加せず、選択された都道府県が `wide_area_prefectures` に
+含まれる場合だけ表示対象にします。
 
 列の並びは、地上波・BS・CS・その他の順です。地上波は都道府県コード、EDCBと同じ
 チャンネル番号、NID、SIDの順で並びます。地上波のチャンネル番号はリモコン番号が
@@ -493,7 +497,9 @@ tsid, manual_sheet, raw_name, channel_name, physical_ch, remote_control_key,
 service_type, network_name, bon_space, bon_channel, band_type, region_id,
 terrestrial_region, is_enabled, priority, failure_count, scan_time, last_seen,
 created_at, updated_at` (タイムスタンプは UNIX 秒。`group_logical=true` では
-created_at は最古、updated_at は最新をマージ)。
+created_at は最古、updated_at は最新をマージ)。地上波の広域局には
+`wide_area_prefectures` (関東・近畿・中京の所属都道府県名配列、県域局は空配列)
+も付く。
 
 ### GET /api/client-view/targets
 

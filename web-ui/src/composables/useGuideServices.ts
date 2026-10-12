@@ -53,3 +53,12 @@ export function isPlaceholderProgramName(name: unknown): boolean {
   if (typeof name !== 'string' || name.trim() === '') return true
   return ['ご覧ください', '番組未定', '放送休止', '休止中'].some((marker) => name.trim().includes(marker))
 }
+
+/** 地域フィルタは県域名または広域圏の所属都道府県で一致させる。 */
+export function matchesGuideRegion(
+  region: string | null,
+  wideAreaPrefectures: readonly string[],
+  selectedRegion: string,
+): boolean {
+  return selectedRegion === 'すべて' || region === selectedRegion || wideAreaPrefectures.includes(selectedRegion)
+}

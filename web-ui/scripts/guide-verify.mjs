@@ -31,6 +31,7 @@ function pushService(nid, sid, tsid, name, band, rck, region, withPrograms = tru
     id: channels.length + 1, bon_driver_id: 1, channel_name: name,
     nid, sid, tsid, band_type: band, service_type: 1,
     remote_control_key: rck, terrestrial_region: region,
+    wide_area_prefectures: [],
     prefecture_code: region === '大阪' ? 27 : region === '愛媛' ? 38 : null,
     priority: 10, is_enabled: true, bon_space: 0, bon_channel: 13,
   })

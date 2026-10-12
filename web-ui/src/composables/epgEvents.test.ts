@@ -4,6 +4,7 @@ import {
   buildProgramIndex,
   epgStatusPresentation,
   isStableConnection,
+  latestScanCompletedAt,
   mergeProgramEvent,
   programEventKey,
   type EpgScanState,
@@ -106,4 +107,13 @@ test('a connection that dies immediately does not reset the backoff', () => {
   assert.equal(isStableConnection(0, 30, false), false)
   assert.equal(isStableConnection(0, 30, true), true)
   assert.equal(isStableConnection(0, 5000, false), true)
+})
+
+test('latest scan completion uses the newest mux state', () => {
+  assert.equal(latestScanCompletedAt([
+    { lastScanCompletedAt: 100 },
+    { lastScanCompletedAt: 250 },
+    { lastScanCompletedAt: null },
+  ]), 250)
+  assert.equal(latestScanCompletedAt([]), null)
 })

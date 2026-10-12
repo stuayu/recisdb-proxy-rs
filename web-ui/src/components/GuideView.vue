@@ -13,7 +13,7 @@ import {
 } from '../composables/useEpgEvents'
 import { broadcastDateInput } from '../composables/useGuideDate'
 import { calculateGuideProgramWindow } from '../composables/useGuideProgramWindow'
-import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices } from '../composables/useGuideServices'
+import { guideChannelNumber, guideServiceGroupKey, isPlaceholderProgramName, isRealGuideService, mainGuideServices, matchesGuideRegion } from '../composables/useGuideServices'
 import PreviewPlayer from './PreviewPlayer.vue'
 
 const GRID_START_HOUR = 6
@@ -84,6 +84,7 @@ type Service = {
   remoteControlKey: number | null
   region: string | null
   prefectureCode: number | null
+  wideAreaPrefectures: string[]
 }
 type SubchannelInfo = { service: string; parent: string; distinct: boolean }
 type Program = {
@@ -721,6 +722,9 @@ const services = computed<Service[]>(() => {
   }
   return sortServices([...seen.values()])
 })
+      wideAreaPrefectures: Array.isArray(row.wide_area_prefectures)
+        ? row.wide_area_prefectures.map(String)
+        : [],
 const mainSidByGroup = computed(() => {
   const result = new Map<string, number>()
   for (const service of mainGuideServices(services.value)) {
@@ -781,7 +785,7 @@ const filteredServices = computed(() => {
   return services.value.filter(
     (service) =>
       (bandFilter.value === 'すべて' || service.band === bandFilter.value) &&
-      (regionFilter.value === 'すべて' || service.region === regionFilter.value) &&
+      matchesGuideRegion(service.region, service.wideAreaPrefectures, regionFilter.value) &&
       (!query ||
         service.name.toLowerCase().includes(query) ||
         String(service.nid).includes(query) ||

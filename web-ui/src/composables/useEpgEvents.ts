@@ -42,6 +42,15 @@ export function buildProgramIndex(rows: JsonRecord[]): Map<string, number> {
   return index
 }
 
+/** `/epg/status` の全 mux から直近スキャン終了時刻を求める。 */
+export function latestScanCompletedAt(states: unknown): number | null {
+  if (!Array.isArray(states)) return null
+  const values = states
+    .map((state) => state && typeof state === 'object' ? Number((state as JsonRecord).lastScanCompletedAt) : NaN)
+    .filter((value) => Number.isFinite(value))
+  return values.length ? Math.max(...values) : null
+}
+
 /** Map の索引で1イベントを処理する。戻り値は配列変更の有無。 */
 export function mergeProgramEvent(
   rows: JsonRecord[],
