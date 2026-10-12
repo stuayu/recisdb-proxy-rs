@@ -336,8 +336,10 @@ remote TS 収集も metadata 収集も同じ dwell・lease・失敗時local fall
 ゲートにし、`auto_tuner_scan_enabled` は見ない。ハブで下流の局をノード間lease視聴しても、
 ハブ側では受動収集は動かない。番組表はこの同期経路で入る。供給側のsection coverageは
 `epg_scan_states`へ大きい値を採って反映し、`epg_service_coverage` のローカルsectionは偽造しない。
-`refresh_epg_section_coverage` はローカルでEIT sectionを一度も受信していないmuxについて、
-ペアノード由来の `section_coverage_until` / `last_complete_at` をNULLで上書きしない。
+`refresh_epg_section_coverage` はペアノード由来の値をローカル集計で後退させない。まだ未来を
+指している `section_coverage_until` は、より大きいローカル値が出たときだけ置き換え、
+`last_complete_at` / `last_eit_received_at` は新しい方を採る(ローカルにsectionが無いmuxだけで
+なく、以前ローカルで受信したことがあるmuxも古い値で潰さない)。
 
 番組行同期は起動60秒後に初回、その後600秒周期、1周期100ページまで実行する。ノードごとに
 `(updated_at,id)`カーソルを持ち、再起動時は先頭から取り直す。多段中継では上流の古い

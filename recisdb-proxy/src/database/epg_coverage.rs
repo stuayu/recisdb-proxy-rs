@@ -184,24 +184,33 @@ impl Database {
                     network_id, tsid, section_coverage_until, services_total,
                     services_complete, last_complete_at, last_eit_received_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                -- ローカルで EIT section を一度も受信していない mux
-                -- (excluded.last_eit_received_at IS NULL) は、ペアノードから
-                -- 受け取った coverage (set_epg_remote_coverage /
-                -- merge_epg_remote_coverage) を NULL で潰さない。
+                -- ペアノードから受け取った coverage (set_epg_remote_coverage /
+                -- merge_epg_remote_coverage) を、ローカル集計で後退させない。
+                -- ローカルに section が無い mux は NULL になるし、以前ローカルで
+                -- 受信したことがある mux も古い値になる。まだ未来を指している
+                -- 既存値は、より大きいローカル値が出たときだけ置き換える。
                 ON CONFLICT(network_id, tsid) DO UPDATE SET
                     section_coverage_until = CASE
-                        WHEN excluded.last_eit_received_at IS NULL
+                        WHEN epg_scan_states.section_coverage_until IS NOT NULL
+                             AND epg_scan_states.section_coverage_until
+                                 > CAST(strftime('%s', 'now') AS INTEGER)
+                             AND (excluded.section_coverage_until IS NULL
+                                  OR excluded.section_coverage_until
+                                     < epg_scan_states.section_coverage_until)
                         THEN epg_scan_states.section_coverage_until
                         ELSE excluded.section_coverage_until END,
                     services_total = excluded.services_total,
                     services_complete = excluded.services_complete,
                     last_complete_at = CASE
-                        WHEN excluded.last_eit_received_at IS NULL
+                        WHEN excluded.last_complete_at IS NULL
                         THEN epg_scan_states.last_complete_at
-                        ELSE excluded.last_complete_at END,
-                    last_eit_received_at = COALESCE(
-                        excluded.last_eit_received_at,
-                        epg_scan_states.last_eit_received_at)",
+                        ELSE MAX(COALESCE(epg_scan_states.last_complete_at, 0),
+                                 excluded.last_complete_at) END,
+                    last_eit_received_at = CASE
+                        WHEN excluded.last_eit_received_at IS NULL
+                        THEN epg_scan_states.last_eit_received_at
+                        ELSE MAX(COALESCE(epg_scan_states.last_eit_received_at, 0),
+                                 excluded.last_eit_received_at) END",
                 params![
                     row.network_id,
                     row.tsid,
@@ -414,6 +423,37 @@ mod tests {
         let db = db();
         let driver = driver_id(&db);
         channel(&db, driver, 1, 2, 10, Some(1));
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        db.merge_epg_remote_coverage(1, 2, Some(future), Some(400), Some(400))
+            .unwrap();
+        db.refresh_epg_section_coverage().unwrap();
+        let find = |db: &Database| {
+            db.get_epg_scan_states()
+                .unwrap()
+                .into_iter()
+                .find(|state| state.network_id == 1 && state.tsid == 2)
+                .unwrap()
+        };
+        let state = find(&db);
+        assert_eq!(state.section_coverage_until, Some(future));
+        assert_eq!(state.last_complete_at, Some(400));
+        assert_eq!(state.last_eit_received_at, Some(400));
+
+        // 以前ローカルで受信したことがある mux でも、古いローカル値で後退させない。
+        db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(100), true)])
+            .unwrap();
+        db.refresh_epg_section_coverage().unwrap();
+        let state = find(&db);
+        assert_eq!(state.section_coverage_until, Some(future));
+        assert_eq!(state.last_complete_at, Some(400));
+        assert_eq!(state.last_eit_received_at, Some(400));
+    }
+
+    #[test]
+    fn refresh_drops_peer_coverage_once_it_is_in_the_past() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 10, Some(1));
         db.merge_epg_remote_coverage(1, 2, Some(500), Some(400), Some(400))
             .unwrap();
         db.refresh_epg_section_coverage().unwrap();
@@ -423,9 +463,7 @@ mod tests {
             .into_iter()
             .find(|state| state.network_id == 1 && state.tsid == 2)
             .unwrap();
-        assert_eq!(state.section_coverage_until, Some(500));
-        assert_eq!(state.last_complete_at, Some(400));
-        assert_eq!(state.last_eit_received_at, Some(400));
+        assert_eq!(state.section_coverage_until, None);
     }
 
     #[test]
