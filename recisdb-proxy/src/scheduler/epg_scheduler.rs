@@ -42,7 +42,7 @@ fn history_status(status: EpgScanStatus) -> &'static str {
         EpgScanStatus::Partial => "partial",
         EpgScanStatus::NoData => "no_data",
         EpgScanStatus::Preempted => "preempted",
-        EpgScanStatus::CpuAborted => "failed",
+        EpgScanStatus::CpuAborted => "cpu_aborted",
         EpgScanStatus::Failed => "failed",
     }
 }

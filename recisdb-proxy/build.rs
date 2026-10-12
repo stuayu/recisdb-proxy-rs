@@ -40,6 +40,15 @@ fn emit_version() {
     // picked up by `git describe` triggers a rebuild. Best-effort: harmless
     // if `.git` doesn't exist (e.g. building from a source tarball).
     println!("cargo:rerun-if-changed=../.git/HEAD");
+    // ブランチ上のコミットでは `.git/HEAD` の中身 (`ref: refs/heads/…`) は
+    // 変わらない。指している ref 自体と packed-refs も見ないと、コミットを
+    // 重ねても埋め込まれた版が最初のビルド時のまま残る。
+    if let Ok(head) = std::fs::read_to_string("../.git/HEAD") {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=../.git/{reference}");
+        }
+    }
+    println!("cargo:rerun-if-changed=../.git/packed-refs");
 
     if let Some(v) = git_describe() {
         emit_version_str(&v);

@@ -310,6 +310,10 @@ impl Database {
                 previous_failure_count,
                 now + target_refresh_secs.max(0).min(1800),
             ),
+            // CPU 上限や視聴・録画の割り込みで打ち切られたのは mux の落ち度ではない。
+            // 失敗に数えると、負荷の高いホストでは全 mux が指数 backoff で最大1時間
+            // ずつ遠ざかり、空いた時間帯にも取りに行かなくなる。短く空けて再試行する。
+            "cpu_aborted" | "preempted" => (previous_failure_count, now + 60),
             _ => {
                 let failure_count = previous_failure_count.saturating_add(1);
                 let shift = failure_count.saturating_sub(1).min(6) as u32;
@@ -638,6 +642,27 @@ mod tests {
 
         db.apply_migrations().unwrap();
         assert_eq!(db.get_epg_global_settings().unwrap().normal_dwell_secs, 123);
+    }
+
+    #[test]
+    fn interrupted_scans_are_not_counted_as_failures() {
+        let db = Database::open_in_memory().unwrap();
+        for status in ["cpu_aborted", "preempted", "cpu_aborted"] {
+            let history = db.epg_scan_started(1, 1, 2, "test").unwrap();
+            db.epg_scan_finished(history, status, 1, 2, None, 7200)
+                .unwrap();
+        }
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| state.network_id == 1 && state.tsid == 2)
+            .unwrap();
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(
+            state.next_eligible_at.unwrap() - state.last_scan_completed_at.unwrap(),
+            60
+        );
     }
 
     #[test]

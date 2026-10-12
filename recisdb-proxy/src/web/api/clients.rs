@@ -98,7 +98,8 @@ pub async fn get_clients(State(web_state): State<Arc<WebState>>) -> impl IntoRes
                 "sid": s.channel_sid,
                 "is_streaming": s.is_streaming,
                 "connected_seconds": s.connected_seconds(),
-                "signal_level": (s.signal_level * 10.0).round() / 10.0,
+                // f64 で丸める。f32 のまま丸めると JSON で 31.899999618530273 のように出る。
+                "signal_level": (f64::from(s.signal_level) * 10.0).round() / 10.0,
                 "packets_sent": s.packets_sent,
                 "packets_dropped": s.packets_dropped,
                 "packets_scrambled": s.packets_scrambled,
