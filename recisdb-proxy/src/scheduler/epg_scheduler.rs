@@ -1210,7 +1210,21 @@ fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> 
             .copied()
             .filter(|target| target.network_id == network_id)
             .collect::<Vec<_>>();
-        if let Some(representative) = choose_satellite_representative(&group, now, config) {
+        // 衛星はネットワーク単位で1回と数える。代表は毎回入れ替わるので、TSごとの
+        // 時刻で並べると、受信不良でどのTSも完成しないネットワークが「まだ一度も
+        // スキャンしていないTS」を出し続け、TS数ぶん連続で順番を取ってしまう
+        // (BS 26 TS × max dwell が地デジを数時間止める)。直近にどれか1つを
+        // スキャンしたなら、ネットワーク全体がその待機と順位を引き継ぐ。
+        let network = targets
+            .iter()
+            .filter(|target| target.network_id == network_id);
+        let network_next_eligible = network.clone().filter_map(|t| t.next_eligible_at).max();
+        if network_next_eligible.is_some_and(|at| at > now) {
+            continue;
+        }
+        let network_last_started = network.filter_map(|t| t.last_scan_started_at).max();
+        if let Some(mut representative) = choose_satellite_representative(&group, now, config) {
+            representative.last_scan_started_at = network_last_started;
             representatives.push(representative);
         }
     }
@@ -1714,6 +1728,31 @@ mod tests {
                 .filter(|target| target.network_id == 4)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn satellite_network_waits_and_ranks_as_one_unit() {
+        // BS の TS 1 は直近にスキャンして待機中、TS 2 は未スキャン。
+        let mut scanned = target(4, 1, BroadcastType::BS, None, None, None);
+        scanned.last_scan_started_at = Some(100);
+        scanned.next_eligible_at = Some(2_000);
+        let never = target(4, 2, BroadcastType::BS, None, None, None);
+        let mut terrestrial = target(0x7FE0, 9, BroadcastType::Terrestrial, None, None, None);
+        terrestrial.last_scan_started_at = Some(50);
+
+        // 待機中はネットワークごと候補から外れる(未スキャンの TS 2 も出ない)。
+        let ranked = rank_targets(&[scanned, never, terrestrial], 1_000, &config());
+        assert_eq!(
+            ranked.iter().map(|t| (t.network_id, t.tsid)).collect::<Vec<_>>(),
+            [(0x7FE0, 9)]
+        );
+
+        // 待機が明けても、直近にスキャンしたネットワークは古い地デジより後。
+        let ranked = rank_targets(&[scanned, never, terrestrial], 3_000, &config());
+        assert_eq!(
+            ranked.iter().map(|t| t.network_id).collect::<Vec<_>>(),
+            [0x7FE0, 4]
         );
     }
 
