@@ -138,6 +138,11 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
 - back-to-back の複数セクション、パケット境界をまたぐ3バイトヘッダにも対応。
 - table_id 0xFF(スタッフィング)で停止、`section_length > 4093` は破棄。
 - **emit 前に CRC32 検証**を行い、壊れたセクションは番組表に入らない。
+- 拡張形式イベント記述子(0x4E)の本文は、**項目の続きを全部つないでから1回だけ**ARIB文字列として
+  デコードする。1項目の本文は複数のitem・複数の記述子に分割され(`item_description_length=0` の
+  itemは直前の項目の続き)、分割位置は2バイト文字の途中や符号集合を切り替えた後にも来る。断片ごとに
+  デコードしたり断片の間へ改行を挟むと、出演者欄などが文字化けする(実機で確認、2026-10)。
+  組み立て方はEDCBの `CEpgDBUtil::AddExtEvent` に合わせている。
 - TS入力チャンクが188バイト境界で分割されても、`EpgCollector` が未完了バイトを次回へ保持する。
 - `current_next_indicator=0` は次回版なので破棄し、現行sub-tableのversion_numberを5-bit moduloで管理する。
 

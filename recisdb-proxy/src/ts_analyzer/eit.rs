@@ -237,13 +237,20 @@ fn parse_short_event(descriptors: &[u8]) -> (String, String) {
     (name, text)
 }
 
-/// Concatenate every extended_event_descriptor (0x4E) attached to an event,
-/// in descriptor_number order, each rendered as its item pairs followed by
-/// its trailing text. A single long description is split by the broadcaster
-/// across several of these descriptors (`descriptor_number`/
-/// `last_descriptor_number`), so they must be joined in order to recover it.
+/// Render every extended_event_descriptor (0x4E) attached to an event as
+/// `項目名: 本文` lines.
+///
+/// 1つの項目の本文は、放送側で複数の item・複数の記述子にまたがって分割される
+/// (TR-B14 第四編: item_description_length が 0 の item は直前の項目の続き)。
+/// 分割位置は文字境界とは限らず、2バイト文字の途中や、ESC で符号集合を
+/// 切り替えた後でも切れる。したがって本文は **続きを全部つないでから**
+/// 1回だけデコードする。断片ごとにデコードしたり、断片の間に改行を挟んだり
+/// すると、切れ目の文字と、それ以降の符号集合の解釈が壊れる(出演者欄などが
+/// 文字化けする)。EDCB の CEpgDBUtil::AddExtEvent と同じ組み立て方。
+/// 項目名は項目ごとに独立した文字列としてデコードする。
 fn parse_extended_event(descriptors: &[u8]) -> String {
-    let mut parts: Vec<(u8, String)> = Vec::new();
+    // (descriptor_number, [(item_description, item)], trailing text)
+    let mut parsed: Vec<(u8, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> = Vec::new();
 
     for (tag, data) in parse_descriptor_loop(descriptors) {
         if tag != descriptor_tag::EXTENDED_EVENT {
@@ -261,11 +268,7 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
         }
         let items = &data[5..5 + items_length];
 
-        // Decode all item descriptions/values and trailing text as one
-        // 8-bit-code stream. An ESC designation may legally occur only in
-        // the first item; decoding each field independently would reset
-        // GL/GR and corrupt the following fields.
-        let mut fields: Vec<(bool, Vec<u8>)> = Vec::new();
+        let mut pairs = Vec::new();
         let mut off = 0usize;
         while off < items.len() {
             let item_desc_len = items[off] as usize;
@@ -273,9 +276,7 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
             if off + item_desc_len > items.len() {
                 break;
             }
-            if item_desc_len != 0 {
-                fields.push((true, items[off..off + item_desc_len].to_vec()));
-            }
+            let description = items[off..off + item_desc_len].to_vec();
             off += item_desc_len;
 
             if off >= items.len() {
@@ -286,60 +287,67 @@ fn parse_extended_event(descriptors: &[u8]) -> String {
             if off + item_len > items.len() {
                 break;
             }
-            if item_len != 0 {
-                fields.push((false, items[off..off + item_len].to_vec()));
-            }
+            pairs.push((description, items[off..off + item_len].to_vec()));
             off += item_len;
         }
 
+        let mut text = Vec::new();
         let text_offset = 5 + items_length;
         if text_offset < data.len() {
             let text_len = data[text_offset] as usize;
             if data.len() >= text_offset + 1 + text_len {
-                if text_len != 0 {
-                    fields.push((
-                        false,
-                        data[text_offset + 1..text_offset + 1 + text_len].to_vec(),
-                    ));
-                }
+                text.extend_from_slice(&data[text_offset + 1..text_offset + 1 + text_len]);
             }
         }
-
-        let mut encoded = Vec::new();
-        for (index, (_, field)) in fields.iter().enumerate() {
-            if index != 0 {
-                encoded.push(0x0D);
-            }
-            encoded.extend_from_slice(field);
-        }
-        let decoded = decode_arib_string(&encoded);
-        let mut buf = String::new();
-        let mut rendered = decoded.split('\n');
-        let mut pending_description: Option<&str> = None;
-        for (is_description, _) in &fields {
-            let value = rendered.next().unwrap_or("");
-            if *is_description {
-                pending_description = Some(value);
-            } else {
-                if let Some(description) = pending_description.take() {
-                    if !description.is_empty() {
-                        buf.push_str(description);
-                        buf.push_str(": ");
-                    }
-                }
-                buf.push_str(value);
-                buf.push('\n');
-            }
-        }
-        parts.push((descriptor_number, buf));
+        parsed.push((descriptor_number, pairs, text));
     }
 
-    parts.sort_by_key(|(n, _)| *n);
-    parts
-        .into_iter()
-        .map(|(_, s)| s)
-        .collect::<Vec<_>>()
-        .join("")
+    // 安定ソート。同じ番号は受信順を保つ。
+    parsed.sort_by_key(|(number, _, _)| *number);
+
+    fn flush(out: &mut String, description: &Option<String>, item: &[u8]) {
+        if let Some(description) = description {
+            if !description.is_empty() {
+                out.push_str(description);
+                out.push_str(": ");
+            }
+        }
+        out.push_str(&decode_arib_string(item));
+        out.push('\n');
+    }
+
+    let mut out = String::new();
+    let mut description: Option<String> = None;
+    let mut item: Vec<u8> = Vec::new();
+    let mut open = false;
+    let mut trailing: Vec<u8> = Vec::new();
+    for (_, pairs, text) in &parsed {
+        for (item_description, item_bytes) in pairs {
+            if !item_description.is_empty() {
+                // 新しい項目の開始。直前の項目を確定する。
+                if open {
+                    flush(&mut out, &description, &item);
+                }
+                description = Some(decode_arib_string(item_description));
+                item.clear();
+                open = true;
+            } else if !open {
+                // 項目名なしで始まる本文。
+                description = None;
+                open = true;
+            }
+            item.extend_from_slice(item_bytes);
+        }
+        trailing.extend_from_slice(text);
+    }
+    if open {
+        flush(&mut out, &description, &item);
+    }
+    if !trailing.is_empty() {
+        out.push_str(&decode_arib_string(&trailing));
+        out.push('\n');
+    }
+    out
 }
 
 /// Extract the genre byte from the first content_descriptor (0x54) entry,
@@ -441,24 +449,47 @@ mod tests {
         assert_eq!(parse_genre(&[]), None);
     }
 
-    #[test]
-    fn extended_event_keeps_code_set_across_item_fields() {
-        // The second item has no repeated ESC designation. It must still be
-        // decoded as alphanumeric because the 8-bit-code state is continuous
-        // across the descriptor's item loop (STD-B24 Vol. 1 Part 3 §7.1.1).
-        let first = arib(b"A");
-        let second = b"B";
-        let mut data = vec![0x00, 0x00, 0x00, 0x00, 0x07]; // number + "jpn" + items length
-        data.extend_from_slice(&[0x00, first.len() as u8]);
-        data.extend_from_slice(&first);
-        data.push(0x00);
-        data.push(second.len() as u8);
-        data.extend_from_slice(second);
+    /// extended_event_descriptor を1つ組み立てる。items は (項目名, 本文) の列。
+    fn extended_descriptor(number: u8, last: u8, items: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (description, item) in items {
+            body.push(description.len() as u8);
+            body.extend_from_slice(description);
+            body.push(item.len() as u8);
+            body.extend_from_slice(item);
+        }
+        let mut data = vec![(number << 4) | last, b'j', b'p', b'n', body.len() as u8];
+        data.extend_from_slice(&body);
         data.push(0x00); // empty trailing text
+        let mut descriptor = vec![descriptor_tag::EXTENDED_EVENT, data.len() as u8];
+        descriptor.extend_from_slice(&data);
+        descriptor
+    }
 
-        let mut descriptors = vec![descriptor_tag::EXTENDED_EVENT, data.len() as u8];
-        descriptors.extend_from_slice(&data);
-        assert_eq!(parse_extended_event(&descriptors), "Ａ\nＢ\n");
+    #[test]
+    fn extended_event_joins_continuation_items_before_decoding() {
+        // 項目名が空の item は直前の項目の続き。符号集合の指定は先頭の断片にしか
+        // 無いので、つないでから1回でデコードしないと後半が化ける。
+        let first = arib(b"A");
+        let descriptors = extended_descriptor(0, 0, &[(b"", &first), (b"", b"B")]);
+        assert_eq!(parse_extended_event(&descriptors), "ＡＢ\n");
+    }
+
+    #[test]
+    fn extended_event_item_split_across_descriptors_and_inside_a_character() {
+        // 2バイト文字「あ」(JIS 0x2422) の途中で記述子が切れる。
+        let name = arib(b"N");
+        let mut descriptors = extended_descriptor(0, 1, &[(&name, &[0x24])]);
+        descriptors.extend(extended_descriptor(1, 1, &[(b"", &[0x22, 0x24, 0x24])]));
+        assert_eq!(parse_extended_event(&descriptors), "Ｎ: あい\n");
+    }
+
+    #[test]
+    fn extended_event_starts_a_new_line_for_each_named_item() {
+        let (a, b) = (arib(b"A"), arib(b"B"));
+        let (x, y) = (arib(b"X"), arib(b"Y"));
+        let descriptors = extended_descriptor(0, 0, &[(&a, &x), (&b, &y)]);
+        assert_eq!(parse_extended_event(&descriptors), "Ａ: Ｘ\nＢ: Ｙ\n");
     }
 
     #[test]

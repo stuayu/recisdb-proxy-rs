@@ -115,7 +115,10 @@ async function inspect(page, screen, shot, viewportName) {
     record.metrics.epg_text = result.epgText
     const epgFile = join(outDir, currentViewport, `${slug(screen)}-epg-status.png`)
     const epg = page.locator('.epg-status, .guide-epg-status-notice, .guide-epg-status').first()
-    if (await epg.count()) { await epg.screenshot({ path: epgFile }); record.screenshots.push(epgFile) }
+    if (await epg.count()) {
+      // SSE 更新で要素が差し替わることがある。撮れなくても監査全体は止めない。
+      await epg.screenshot({ path: epgFile, timeout: 5000 }).then(() => record.screenshots.push(epgFile)).catch(() => {})
+    }
   }
   return result
 }
@@ -239,6 +242,7 @@ async function main() {
       await page.goto(base.href, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch((error) => issue('startup', 'high', '初期表示失敗', clean(error.message)))
       for (const [id, label] of tabs) {
         currentScreen = id; currentActionCount = 0; screenshotIndex = 0
+        try {
         await page.evaluate((tab) => { location.hash = tab }, id)
         await waitForScreen(page)
         const screen = ensureRecord(currentViewport, id, label)
@@ -250,6 +254,10 @@ async function main() {
         else { await tableInteractions(page, id); await commonInteractions(page, id) }
         aborted.splice(0)
         if (consoleErrors.length) { screen.metrics.console_errors = [...consoleErrors]; issue(id, 'high', 'コンソールエラー', consoleErrors.join('\n'), initial); consoleErrors.length = 0 }
+        } catch (error) {
+          // 1 画面の失敗で残りの画面・ビューポートを落とさない。
+          issue(id, 'high', '監査スクリプト例外', clean(error?.message || error))
+        }
       }
       await page.close()
     }
