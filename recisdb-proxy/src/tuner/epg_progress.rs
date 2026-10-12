@@ -119,6 +119,32 @@ impl EpgProgress {
         result
     }
 
+    /// 診断用。指定 mux の H-EIT で schedule basic が未完成のサービスと最初の穴。
+    pub fn schedule_gaps(
+        &self,
+        original_network_id: u16,
+        transport_stream_id: u16,
+    ) -> Vec<(u16, crate::ts_analyzer::ScheduleGap)> {
+        let tracker = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        tracker
+            .snapshot()
+            .into_iter()
+            .filter(|completion| {
+                completion.key.pid == crate::ts_analyzer::pid::EIT
+                    && completion.key.original_network_id == original_network_id
+                    && completion.key.transport_stream_id == transport_stream_id
+            })
+            .filter_map(|completion| {
+                tracker
+                    .first_schedule_gap(&completion.key)
+                    .map(|gap| (completion.key.service_id, gap))
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Vec<EitServiceCompletion> {
         self.tracker
             .lock()

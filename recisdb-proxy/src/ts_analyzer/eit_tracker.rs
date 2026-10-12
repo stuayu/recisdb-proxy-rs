@@ -49,6 +49,21 @@ pub struct EitServiceCompletion {
     pub last_section_at: i64,
 }
 
+/// 診断用。schedule basic で最初に未完成だった segment の受信状況。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleGap {
+    pub table_id: u8,
+    /// sub-table 内の segment 番号 (0..32)。
+    pub segment: u8,
+    /// その segment で受信した section のビット (bit n = segment 内 n 番目)。
+    pub received: u8,
+    /// その segment で受信した section が申告した segment_last_section_number。
+    pub segment_last: Option<u8>,
+    pub last_section_number: u8,
+    /// sub-table 自体を一度も受信していない。
+    pub table_missing: bool,
+}
+
 struct SubTableState {
     version: u8,
     last_section_number: u8,
@@ -213,6 +228,42 @@ impl EpgSectionTracker {
             sections_seen: service.sections_seen,
             last_section_at: service.last_section_at,
         })
+    }
+
+    /// 診断用。schedule basic が未完成のサービスについて、最初の穴を返す。
+    /// 完了判定には使わない (判定は `completion` だけが行う)。
+    pub fn first_schedule_gap(&self, key: &EitServiceKey) -> Option<ScheduleGap> {
+        let service = self.services.get(key)?;
+        let base = schedule_base(&service.sub_tables)?;
+        let last = schedule_last(&service.sub_tables, base, base + 7);
+        let current = current_segment(self.last_now)?;
+        for id in base..=last {
+            let Some(sub) = service.sub_tables.get(&id) else {
+                return Some(ScheduleGap {
+                    table_id: id,
+                    segment: 0,
+                    received: 0,
+                    segment_last: None,
+                    last_section_number: 0,
+                    table_missing: true,
+                });
+            };
+            let first = if id == base { current } else { 0 };
+            for segment in first..=(sub.last_section_number as usize / 8) {
+                if !segment_complete(sub, segment) {
+                    let bits = (sub.received[segment / 8] >> ((segment % 8) * 8)) & 0xFF;
+                    return Some(ScheduleGap {
+                        table_id: id,
+                        segment: segment as u8,
+                        received: bits as u8,
+                        segment_last: sub.segment_last[segment],
+                        last_section_number: sub.last_section_number,
+                        table_missing: false,
+                    });
+                }
+            }
+        }
+        None
     }
 
     pub fn snapshot(&self) -> Vec<EitServiceCompletion> {

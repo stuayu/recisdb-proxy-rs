@@ -193,6 +193,18 @@ scheduleのsectionに番組イベントがない場合も、sectionを受信し�
 完成サービス数、scan前後のcoverageを併せて保存する。dwellの判定は
 `scheduler/epg_dwell.rs::evaluate_dwell` に集約し、CPU hard limit、max dwell、min dwell、
 目標coverage、stream closed、idle timeout、normal dwellの順で評価する。
+idle timeout（新規sectionが `idle_section_timeout_secs` 来ない）で止めるのは、sectionを1つも
+受信していないmux（`NoData`）か、`normal_dwell_secs` を過ぎたmux（`Partial`）だけである。
+サブチャンネルは数十秒で全sectionがそろい、そこで新規sectionが途切れる。主サービスの先の日付は
+再送周期が長いので、idleだけで切ると主サービスが毎回未完になる。「normal dwell到達かつ
+1サービス完成で打ち切る」規則は同じ理由で廃止した（完了判定が正しく動くようになった時点で、
+サブチャンネルの完成が主サービスの取得を打ち切っていた）。
+
+スキャンのたびにtrackerは作り直されるため、途中で打ち切ったスキャンは前回より狭い範囲しか
+見ていない。`upsert_epg_service_coverage` は、まだ未来を指している前回の `coverage_until` を
+狭い値やNULLで上書きしない。muxの `last_complete_at` は「全対象サービスが一度は完成した」ときの
+最も古い完成時刻とし、直近スキャンのフラグでは判定しない。未完で終わったスキャンは、サービス
+ごとの最初の穴（table_id・segment・受信ビット）を `EPG scan gap` としてINFOログへ残す。
 
 local、remote metadata、remote TSの3経路はこの同じ完了判定を使う。remote metadataは
 section/TSが自ノードへ来ないため、返却されたcoverageをmuxのscan stateへ保存するが、

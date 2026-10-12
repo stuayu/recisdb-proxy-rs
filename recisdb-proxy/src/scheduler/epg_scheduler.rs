@@ -1058,6 +1058,20 @@ impl EpgScanScheduler {
         let now = chrono::Utc::now().timestamp();
         self.persist_progress(&progress, now).await;
         let mux = progress.mux_completion(network_id, tsid);
+        if status != EpgScanStatus::Complete {
+            // 未完で終わった理由を追えるよう、サービスごとの最初の穴を残す。
+            for (service_id, gap) in progress.schedule_gaps(network_id, tsid) {
+                log::info!(
+                    "EPG scan gap nid={network_id} tsid={tsid} sid={service_id} table=0x{:02X} segment={} received={:08b} segment_last={:?} last_section={} table_missing={}",
+                    gap.table_id,
+                    gap.segment,
+                    gap.received,
+                    gap.segment_last,
+                    gap.last_section_number,
+                    gap.table_missing,
+                );
+            }
+        }
         let coverage_after = self.coverage_until(network_id, tsid).await;
         {
             let db = self.database.lock().await;

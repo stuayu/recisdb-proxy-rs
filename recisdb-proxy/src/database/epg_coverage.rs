@@ -26,7 +26,17 @@ impl Database {
                     pf_complete = excluded.pf_complete,
                     schedule_basic_complete = excluded.schedule_basic_complete,
                     schedule_extended_complete = excluded.schedule_extended_complete,
-                    coverage_until = excluded.coverage_until,
+                    -- スキャンのたびに tracker は作り直される。途中で打ち切った
+                    -- スキャンは前回より狭い範囲しか見ていないので、まだ未来を
+                    -- 指している前回値を狭い値や NULL で潰さない。
+                    coverage_until = CASE
+                        WHEN epg_service_coverage.coverage_until IS NOT NULL
+                             AND epg_service_coverage.coverage_until > excluded.updated_at
+                             AND (excluded.coverage_until IS NULL
+                                  OR excluded.coverage_until
+                                     < epg_service_coverage.coverage_until)
+                        THEN epg_service_coverage.coverage_until
+                        ELSE excluded.coverage_until END,
                     sections_seen = excluded.sections_seen,
                     last_section_at = excluded.last_section_at,
                     updated_at = excluded.updated_at,
@@ -127,18 +137,22 @@ impl Database {
              )
              SELECT network_id, tsid,
                     COUNT(service_id),
-                    COALESCE(SUM(CASE WHEN schedule_basic_complete = 1
+                    COALESCE(SUM(CASE WHEN last_complete_at IS NOT NULL
+                                           AND coverage_until IS NOT NULL
                                       THEN 1 ELSE 0 END), 0),
                     CASE WHEN COUNT(service_id) = 0
                               OR SUM(CASE WHEN coverage_until IS NULL
                                           THEN 1 ELSE 0 END) != 0
                          THEN NULL ELSE MIN(coverage_until) END,
                     MAX(last_section_at),
+                    -- mux の完了時刻は「全対象サービスが一度は完成した」ときの
+                    -- 最も古い完成時刻。直近スキャンのフラグで見ると、途中で
+                    -- 打ち切ったスキャン1回で完了済みの mux が未完了へ戻る。
                     CASE WHEN COUNT(service_id) > 0
-                               AND SUM(CASE WHEN schedule_basic_complete = 1
+                               AND SUM(CASE WHEN last_complete_at IS NOT NULL
                                                   AND coverage_until IS NOT NULL
                                              THEN 1 ELSE 0 END) = COUNT(service_id)
-                         THEN MAX(last_complete_at)
+                         THEN MIN(last_complete_at)
                          ELSE NULL END
              FROM joined
              GROUP BY network_id, tsid
@@ -493,6 +507,28 @@ mod tests {
             db.get_epg_service_coverage(1, 2).unwrap()[0].last_complete_at,
             Some(30)
         );
+    }
+
+    #[test]
+    fn partial_rescan_does_not_regress_coverage_that_is_still_in_the_future() {
+        let db = db();
+        let driver = driver_id(&db);
+        channel(&db, driver, 1, 2, 10, Some(1));
+        db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(1000), true)])
+            .unwrap();
+        // 途中で打ち切ったスキャン: coverage が取れず、完成もしていない。
+        let mut partial = coverage(1, 2, 10, None, false);
+        partial.updated_at = 500;
+        db.upsert_epg_service_coverage(&[partial]).unwrap();
+        let mux = &db.get_epg_mux_coverage().unwrap()[0];
+        assert_eq!(mux.coverage_until, Some(1000));
+        assert_eq!(mux.last_complete_at, Some(20));
+        assert_eq!(mux.services_complete, 1);
+
+        // 前回値が過去になったら、もう守らない。
+        partial.updated_at = 1500;
+        db.upsert_epg_service_coverage(&[partial]).unwrap();
+        assert_eq!(db.get_epg_mux_coverage().unwrap()[0].coverage_until, None);
     }
 
     #[test]

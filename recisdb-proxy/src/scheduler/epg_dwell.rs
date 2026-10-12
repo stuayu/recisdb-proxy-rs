@@ -74,14 +74,16 @@ pub fn evaluate_dwell(config: &EpgDwellConfig, observation: &DwellObservation) -
         });
     }
     if observation.since_progress >= config.idle_section_timeout {
-        return DwellVerdict::Stop(if observation.any_sections {
-            EpgScanStatus::Partial
-        } else {
-            EpgScanStatus::NoData
-        });
-    }
-    if observation.elapsed >= config.normal_dwell && observation.any_service_complete {
-        return DwellVerdict::Stop(EpgScanStatus::Partial);
+        // EIT が 1 つも来ない mux は idle だけで見切る。
+        if !observation.any_sections {
+            return DwellVerdict::Stop(EpgScanStatus::NoData);
+        }
+        // section が来ている mux は normal_dwell までは聴き続ける。サブチャンネルは
+        // 数十秒で全 section がそろい、そこで新規 section が途切れる。主サービスの
+        // 先の日付は再送周期が長いので、idle だけで切ると主サービスが毎回未完になる。
+        if observation.elapsed >= config.normal_dwell {
+            return DwellVerdict::Stop(EpgScanStatus::Partial);
+        }
     }
     DwellVerdict::Continue
 }
@@ -186,7 +188,7 @@ mod tests {
         );
     }
     #[test]
-    fn idle_section_timeout_stops_as_partial() {
+    fn idle_section_timeout_stops_as_partial_only_after_normal_dwell() {
         assert_eq!(
             evaluate_dwell(
                 &config(),
@@ -195,11 +197,36 @@ mod tests {
                     ..obs(12)
                 }
             ),
+            DwellVerdict::Continue
+        );
+        assert_eq!(
+            evaluate_dwell(
+                &config(),
+                &DwellObservation {
+                    since_progress: Duration::from_secs(5),
+                    ..obs(20)
+                }
+            ),
             DwellVerdict::Stop(EpgScanStatus::Partial)
         );
     }
     #[test]
-    fn normal_dwell_stops_only_when_some_service_is_complete() {
+    fn idle_without_any_section_stops_as_no_data_before_normal_dwell() {
+        assert_eq!(
+            evaluate_dwell(
+                &config(),
+                &DwellObservation {
+                    since_progress: Duration::from_secs(5),
+                    any_sections: false,
+                    ..obs(12)
+                }
+            ),
+            DwellVerdict::Stop(EpgScanStatus::NoData)
+        );
+    }
+    #[test]
+    fn one_complete_service_does_not_end_the_scan_while_sections_still_arrive() {
+        // サブチャンネルが先に完成しても、主サービスの section が届き続けている間は切らない。
         assert_eq!(
             evaluate_dwell(
                 &config(),
@@ -209,7 +236,7 @@ mod tests {
                     ..obs(20)
                 }
             ),
-            DwellVerdict::Stop(EpgScanStatus::Partial)
+            DwellVerdict::Continue
         );
         assert_eq!(
             evaluate_dwell(
