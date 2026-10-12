@@ -144,6 +144,12 @@ EIT PID はセクションが隙間なく詰まって流れるため、`SectionC
   デコードしたり断片の間へ改行を挟むと、出演者欄などが文字化けする(実機で確認、2026-10)。
   組み立て方はEDCBの `CEpgDBUtil::AddExtEvent` に合わせている。
 - TS入力チャンクが188バイト境界で分割されても、`EpgCollector` が未完了バイトを次回へ保持する。
+- **section再組み立て器はPIDごとに持つ。** H-EIT(0x0012)・M-EIT(0x0026)・L-EIT(0x0027)は
+  continuity_counterもsectionのバイト列もPIDごとに独立している。1つの再組み立て器へ混ぜると、
+  複数パケットにまたがるH-EIT sectionの途中にL-EITのパケットが挟まるたびに連続性エラー扱いになり、
+  組み立て中のsectionを捨てる。番組の多い主サービスのsectionほど大きいので落ちやすく、
+  「主サービスだけ特定segmentが届かずスキャンが完了しない」という形で現れた(2026-10。実機のTSを
+  採取して、放送側は全segmentを欠けなく送っていることを確認した)。
 - `current_next_indicator=0` は次回版なので破棄し、現行sub-tableのversion_numberを5-bit moduloで管理する。
 
 かつてはこの3点に欠陥があり、視聴中でも EIT セクションの大半を取りこぼして

@@ -135,7 +135,12 @@ fn accepts_table_id(pid: u16, table_id: u8) -> bool {
 
 /// Collects EIT sections from a live TS stream and forwards parsed events.
 pub struct EpgCollector {
-    collector: SectionCollector,
+    /// PID ごとの section 再組み立て器。H-EIT (0x0012)・M-EIT (0x0026)・
+    /// L-EIT (0x0027) は別々の PID で、continuity_counter も section の
+    /// バイト列も PID ごとに独立している。1つの再組み立て器へ混ぜると、
+    /// 複数パケットにまたがる H-EIT section の途中に L-EIT のパケットが
+    /// 挟まるたびに連続性エラー扱いになり、組み立て中の section を捨てる。
+    collectors: HashMap<u16, SectionCollector>,
     /// Last accepted current version per EIT sub-table identity.
     versions: HashMap<(u16, u8, u16, u16, u16), u8>,
     /// TS bytes carried across calls. Reader chunks are not required to end
@@ -155,7 +160,7 @@ impl EpgCollector {
 
     pub fn with_progress(progress: std::sync::Arc<EpgProgress>) -> Self {
         Self {
-            collector: SectionCollector::new(),
+            collectors: HashMap::new(),
             versions: HashMap::new(),
             pending_ts: Vec::new(),
             metadata_only: false,
@@ -250,7 +255,11 @@ impl EpgCollector {
             return;
         }
 
-        let sections = self.collector.add_data(
+        let sections = self
+            .collectors
+            .entry(packet.header.pid)
+            .or_insert_with(SectionCollector::new)
+            .add_data(
             packet.payload,
             packet.header.continuity_counter,
             packet.header.payload_unit_start,
@@ -611,6 +620,77 @@ mod tests {
             packets.extend_from_slice(&packet);
         }
         packets
+    }
+
+    /// 複数パケットにまたがる H-EIT section (event_id=1) を 2 パケットで返す。
+    fn two_packet_h_eit() -> (Vec<u8>, Vec<u8>) {
+        let mut section = vec![
+            table_id::EIT_PF_ACTUAL,
+            0xB1,
+            0x01, // section_length = 257
+            0x12,
+            0x34, // service_id
+            0x03, // version 1, current_next=1
+            0x00,
+            0x00,
+            0x00,
+            0x01, // transport_stream_id
+            0x00,
+            0x0B, // original_network_id
+            0x00,
+            table_id::EIT_PF_ACTUAL,
+            0x00,
+            0x01, // event_id
+            0xEB,
+            0x5E,
+            0x12,
+            0x34,
+            0x56,
+            0x01,
+            0x00,
+            0x00,
+            0x80,
+            0xE6, // running_status=4, descriptors_loop_length = 230
+            0x42,
+            0xE4, // stuffing_descriptor, 228 bytes
+        ];
+        section.extend(std::iter::repeat(0x00).take(228));
+        let crc = crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(section.len(), 260);
+
+        let packet = |pusi: bool, cc: u8, payload: &[u8]| {
+            let mut packet = vec![0xFF; TS_PACKET_SIZE];
+            packet[0] = 0x47;
+            packet[1] = if pusi { 0x40 } else { 0x00 } | ((pid::EIT >> 8) as u8 & 0x1F);
+            packet[2] = pid::EIT as u8;
+            packet[3] = 0x10 | cc;
+            packet[4..4 + payload.len()].copy_from_slice(payload);
+            packet
+        };
+        let mut first = vec![0x00];
+        first.extend_from_slice(&section[..183]);
+        (packet(true, 0, &first), packet(false, 1, &section[183..]))
+    }
+
+    #[test]
+    fn l_eit_packet_between_h_eit_packets_does_not_drop_the_h_eit_section() {
+        let (first, second) = two_packet_h_eit();
+        // 部分受信向け L-EIT (PID 0x0027) の、無関係な continuity_counter のパケット。
+        let mut l_eit = vec![0xFF; TS_PACKET_SIZE];
+        l_eit[0] = 0x47;
+        l_eit[1] = 0x40 | ((pid::EIT_PARTIAL_RECEPTION >> 8) as u8 & 0x1F);
+        l_eit[2] = pid::EIT_PARTIAL_RECEPTION as u8;
+        l_eit[3] = 0x10 | 0x09;
+        l_eit[4] = 0x00; // pointer_field, 以降はスタッフィング
+
+        let mut input = first;
+        input.extend_from_slice(&l_eit);
+        input.extend_from_slice(&second);
+
+        let mut collector = EpgCollector::new();
+        collector.process_ts_chunk(&input);
+        assert_eq!(collector.parsed_events, vec![1]);
     }
 
     #[test]
