@@ -355,13 +355,13 @@ impl Database {
     /// `refresh_epg_section_coverage` and `epg_scan_states.section_coverage_until`.
     /// Called after writer flushes, never from the reader loop.
     pub fn refresh_epg_coverage(&self) -> Result<Option<i64>> {
-        let coverage: Option<i64> = self.connection().query_row(
+        let tx = self.connection().unchecked_transaction()?;
+        let coverage: Option<i64> = tx.query_row(
             "SELECT MAX(start_at + duration_secs) FROM programs",
             [],
             |r| r.get(0),
         )?;
-        let configured: Vec<(i64, i64)> = self
-            .connection()
+        let configured: Vec<(i64, i64)> = tx
             .prepare(
                 "SELECT DISTINCT nid,tsid FROM channels
                  -- Keep this in sync with
@@ -372,16 +372,17 @@ impl Database {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (nid, tsid) in configured {
-            self.connection().execute(
+            tx.execute(
                 "INSERT INTO epg_scan_states(network_id,tsid) VALUES(?1,?2) ON CONFLICT(network_id,tsid) DO NOTHING",
                 params![nid, tsid],
             )?;
         }
-        let grouped: Vec<_> = self.connection().prepare("SELECT nid,tsid,MAX(start_at + duration_secs),MAX(updated_at) FROM programs WHERE sid != 0 AND tsid != 0 GROUP BY nid,tsid")?.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<i64>>(2)?, r.get::<_,Option<i64>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let grouped: Vec<_> = tx.prepare("SELECT nid,tsid,MAX(start_at + duration_secs),MAX(updated_at) FROM programs WHERE sid != 0 AND tsid != 0 GROUP BY nid,tsid")?.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<i64>>(2)?, r.get::<_,Option<i64>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (nid, tsid, until, updated) in grouped {
-            self.connection().execute("INSERT INTO epg_scan_states(network_id,tsid,coverage_until,last_eit_received_at) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,tsid) DO UPDATE SET coverage_until=?3,last_eit_received_at=?4", params![nid,tsid,until,updated])?;
+            tx.execute("INSERT INTO epg_scan_states(network_id,tsid,coverage_until,last_eit_received_at) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,tsid) DO UPDATE SET coverage_until=?3,last_eit_received_at=CASE WHEN ?4 IS NULL THEN epg_scan_states.last_eit_received_at ELSE MAX(COALESCE(epg_scan_states.last_eit_received_at,0),?4) END", params![nid,tsid,until,updated])?;
         }
-        self.connection().execute("UPDATE epg_scan_states SET coverage_until=NULL,last_eit_received_at=NULL WHERE NOT EXISTS (SELECT 1 FROM programs p WHERE p.nid=epg_scan_states.network_id AND p.tsid=epg_scan_states.tsid)", [])?;
+        tx.execute("UPDATE epg_scan_states SET coverage_until=NULL,last_eit_received_at=NULL WHERE NOT EXISTS (SELECT 1 FROM programs p WHERE p.nid=epg_scan_states.network_id AND p.tsid=epg_scan_states.tsid)", [])?;
+        tx.commit()?;
         Ok(coverage)
     }
     pub fn get_epg_scan_states(&self) -> Result<Vec<EpgScanState>> {

@@ -143,6 +143,9 @@ pub struct EpgCollector {
     collectors: HashMap<u16, SectionCollector>,
     /// Last accepted current version per EIT sub-table identity.
     versions: HashMap<(u16, u8, u16, u16, u16), u8>,
+    /// Version already emitted for each individual section. The sub-table
+    /// map above still rejects stale versions across section numbers.
+    section_versions: HashMap<(u16, u8, u16, u16, u16, u8), u8>,
     /// TS bytes carried across calls. Reader chunks are not required to end
     /// on a 188-byte packet boundary.
     pending_ts: Vec<u8>,
@@ -162,6 +165,7 @@ impl EpgCollector {
         Self {
             collectors: HashMap::new(),
             versions: HashMap::new(),
+            section_versions: HashMap::new(),
             pending_ts: Vec::new(),
             metadata_only: false,
             metadata_records: Vec::new(),
@@ -260,16 +264,30 @@ impl EpgCollector {
             .entry(packet.header.pid)
             .or_insert_with(SectionCollector::new)
             .add_data(
-            packet.payload,
-            packet.header.continuity_counter,
-            packet.header.payload_unit_start,
-        );
+                packet.payload,
+                packet.header.continuity_counter,
+                packet.header.payload_unit_start,
+            );
         for section_data in &sections {
             self.process_section(packet.header.pid, section_data);
         }
     }
 
     fn process_section(&mut self, pid: u16, section_data: &[u8]) {
+        let tx = if self.metadata_only {
+            None
+        } else {
+            global_sender()
+        };
+        self.process_section_with_sender(pid, section_data, tx);
+    }
+
+    fn process_section_with_sender(
+        &mut self,
+        pid: u16,
+        section_data: &[u8],
+        sender: Option<&mpsc::Sender<ProgramUpsert>>,
+    ) {
         let Ok(section) = PsiSection::parse(section_data) else {
             return;
         };
@@ -295,6 +313,14 @@ impl EpgCollector {
             section.data.get(2).copied().unwrap_or(0) as u16 * 256
                 + section.data.get(3).copied().unwrap_or(0) as u16,
         );
+        let section_key = (
+            key.0,
+            key.1,
+            key.2,
+            key.3,
+            key.4,
+            section.header.section_number,
+        );
         if let Some(previous) = self.versions.get(&key).copied() {
             if previous != section.header.version_number
                 && !is_newer_version(previous, section.header.version_number)
@@ -302,18 +328,22 @@ impl EpgCollector {
                 return;
             }
         }
-        self.versions.insert(key, section.header.version_number);
+        if self.section_versions.get(&section_key) == Some(&section.header.version_number) {
+            return;
+        }
         let Ok(eit) = EitTable::parse(&section) else {
             return;
         };
         if eit.events.is_empty() {
+            self.versions.insert(key, section.header.version_number);
+            self.section_versions
+                .insert(section_key, section.header.version_number);
             return;
         }
         #[cfg(test)]
         self.parsed_events
             .extend(eit.events.iter().map(|event| event.event_id));
 
-        let tx = global_sender();
         let event_count = eit.events.len();
 
         // Which logical store this section feeds, following EDCB's split in
@@ -330,8 +360,12 @@ impl EpgCollector {
             None
         };
         let Some(source) = source else {
+            self.versions.insert(key, section.header.version_number);
+            self.section_versions
+                .insert(section_key, section.header.version_number);
             return;
         };
+        let mut complete = true;
         for event in eit.events {
             // EDCB discards non-running and stopped events.
             if event.running_status == 1 || event.running_status == 3 {
@@ -390,17 +424,24 @@ impl EpgCollector {
                 self.metadata_records.push(record);
                 continue;
             }
-            let Some(tx) = tx else {
+            let Some(tx) = sender else {
                 trace!(
                     "[EpgCollector] no writer installed, dropping {} event(s) for sid={}",
                     event_count,
                     eit.service_id
                 );
+                complete = false;
                 break;
             };
             if !try_send_program(tx, record) {
+                complete = false;
                 break;
             }
+        }
+        if complete {
+            self.versions.insert(key, section.header.version_number);
+            self.section_versions
+                .insert(section_key, section.header.version_number);
         }
     }
 }
@@ -479,20 +520,78 @@ mod tests {
     #[test]
     fn event_group_is_forwarded_to_program_upsert() {
         let group_data = [0x12, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
-        let mut descriptors = vec![crate::ts_analyzer::descriptor_tag::EVENT_GROUP, group_data.len() as u8];
+        let mut descriptors = vec![
+            crate::ts_analyzer::descriptor_tag::EVENT_GROUP,
+            group_data.len() as u8,
+        ];
         descriptors.extend_from_slice(&group_data);
-        let section = metadata_section_with_descriptors(
-            table_id::EIT_PF_ACTUAL,
-            4,
-            [0, 30, 0],
-            &descriptors,
-        );
+        let section =
+            metadata_section_with_descriptors(table_id::EIT_PF_ACTUAL, 4, [0, 30, 0], &descriptors);
         let mut collector = EpgCollector::new_metadata();
         collector.process_section(pid::EIT, &section);
         let records = collector.drain_metadata_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].shared_sid, Some(0x0010));
         assert_eq!(records[0].shared_event_id, Some(0x0020));
+    }
+
+    #[tokio::test]
+    async fn identical_section_is_suppressed_but_new_version_is_processed() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut collector = EpgCollector::new();
+        let section = metadata_section(table_id::EIT_PF_ACTUAL, 4, [0, 30, 0]);
+        collector.process_section_with_sender(pid::EIT, &section, Some(&tx));
+        assert!(rx.try_recv().is_ok());
+        collector.process_section_with_sender(pid::EIT, &section, Some(&tx));
+        assert!(rx.try_recv().is_err());
+        let mut newer = section;
+        newer[5] = (2 << 1) | 1;
+        collector.process_section_with_sender(pid::EIT, &newer, Some(&tx));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_queue_leaves_section_retryable() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(ProgramUpsert {
+            nid: 1,
+            sid: 2,
+            tsid: 3,
+            event_id: 4,
+            start_at: 100,
+            duration_secs: 30,
+            free_ca_mode: false,
+            name: Some("occupied".into()),
+            description: None,
+            extended: None,
+            genre: None,
+            updated_at: 1,
+            source: EpgSource::PresentFollowing,
+            basic_updated_at: None,
+            extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
+        })
+        .unwrap();
+        let mut collector = EpgCollector::new();
+        let section = metadata_section(table_id::EIT_PF_ACTUAL, 4, [0, 30, 0]);
+        collector.process_section_with_sender(pid::EIT, &section, Some(&tx));
+        let _ = rx.recv().await;
+        collector.process_section_with_sender(pid::EIT, &section, Some(&tx));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn duplicate_section_still_advances_progress_persistence_counter() {
+        let progress = EpgProgress::new();
+        let mut collector = EpgCollector::with_progress(progress.clone());
+        let section = metadata_section(table_id::EIT_PF_ACTUAL, 4, [0, 30, 0]);
+        collector.process_section_with_sender(pid::EIT, &section, None);
+        let first = progress.reception_counter();
+        let first_progress = progress.progress_counter();
+        collector.process_section_with_sender(pid::EIT, &section, None);
+        assert!(progress.reception_counter() > first);
+        assert_eq!(progress.progress_counter(), first_progress);
     }
 
     #[test]

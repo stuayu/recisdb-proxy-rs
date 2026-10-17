@@ -10,11 +10,14 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
   └─ 生TS (B25デコード前) を毎チャンク EpgCollector に渡す
        EpgCollector (tuner/epg_collector.rs)
          ├─ PID 0x0012/0x0026/0x0027 の EIT パケットを SectionCollector で再組み立て
+         ├─ section単位のversion記録で同じEITの再送をparse前に除外
          ├─ EitTable::parse (ts_analyzer/eit.rs) でイベント抽出
          └─ ProgramUpsert をプロセス全域 mpsc チャネルへ送信
              EpgWriter (epg_writer.rs, tokioタスク)
                ├─ (nid, sid, tsid, event_id) でメモリ上デデュープ
                ├─ 10秒 or 500件ごとに programs テーブルへ一括UPSERT
+               ├─ Mirakurunイベントは内容が変わった番組だけ配信
+               ├─ programs由来coverageは成功upsertがある場合に最大60秒ごと更新
                └─ 約5分ごとに終了後24時間経過した行を削除
                    programs テーブル (database/program.rs, Migration 015/025/026)
                      ├─ GET /api/programs        (web/api/programs.rs, ダッシュボード)
@@ -24,6 +27,20 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
 収集状況は `EpgProgress` (`tuner/epg_progress.rs`) を介して `spawn_si_collector` と
 EPG schedulerで共有する。reader起動ごとに `reset()` し、collectorが受信したEIT sectionを
 `EpgSectionTracker` (`ts_analyzer/eit_tracker.rs`)へ記録する。
+
+同じ section の同じ version は `(PID, table_id, service_id, TSID, ONID, section_number)`
+で記録し、イベント行のparseとwriter送信を省く。sub-table単位のversion記録は別に残し、
+古いversionを拒否する。writer queueが満杯で行を1つでも送れなかったsectionは記録せず、
+再送で再試行する。metadata-only collectorも同じcollector寿命内で重複を除く。metadata行は
+同じdwell中にメモリへ蓄積してから一括送信するため、送信失敗時の個別巻き戻しは行わない。
+空sectionは正常な受信として処理済みにする。`EpgProgress.observe` は重複sectionでも受信時刻を
+更新し、coverage flusherが `last_eit_received_at` に反映する。flusherが見るのは重複も数える
+`reception_counter` で、dwell判定の `progress_counter` は新しいsection・新versionでしか進めない
+(重複で進めると「進捗が止まった」検出が効かず、スキャンが上限時間まで居座る)。
+
+`refresh_epg_coverage` は補助指標の全program集計なので、writerでは成功upsertがあり、前回から
+60秒経過したときだけ実行する(初回flushは即時可)。書き込み群は1 transaction。prune後は
+間隔に関係なく更新する。section completion/coverageの正は引き続き `section_coverage_until`。
 ```
 
 ## 収集(受動収集)

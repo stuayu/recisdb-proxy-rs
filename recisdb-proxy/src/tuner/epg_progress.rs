@@ -9,7 +9,12 @@ use crate::ts_analyzer::{EitServiceCompletion, EpgSectionTracker, ObserveOutcome
 /// EPG スケジューラが読む。ロックは1セクションごとに極短時間しか握らない。
 pub struct EpgProgress {
     tracker: Mutex<EpgSectionTracker>,
+    /// 新しい section (または新バージョン) を受けたときだけ進む。dwell 判定の
+    /// 「進捗が止まった」検出に使うので、重複受信で進めてはならない。
     progress_counter: AtomicU64,
+    /// 重複を含め EIT section を受信するたびに進む。受動収集の鮮度
+    /// (`last_eit_received_at`) を永続化するかどうかの判定専用。
+    reception_counter: AtomicU64,
 }
 
 /// mux (original_network_id, transport_stream_id) 単位の集計。
@@ -40,6 +45,7 @@ impl EpgProgress {
         Arc::new(Self {
             tracker: Mutex::new(EpgSectionTracker::new()),
             progress_counter: AtomicU64::new(0),
+            reception_counter: AtomicU64::new(0),
         })
     }
 
@@ -58,11 +64,15 @@ impl EpgProgress {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .observe(pid, section, now);
-        if matches!(
-            outcome,
-            ObserveOutcome::Recorded | ObserveOutcome::VersionChanged
-        ) {
-            self.progress_counter.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            ObserveOutcome::Recorded | ObserveOutcome::VersionChanged => {
+                self.progress_counter.fetch_add(1, Ordering::Relaxed);
+                self.reception_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            ObserveOutcome::Duplicate => {
+                self.reception_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
         outcome
     }
@@ -161,6 +171,11 @@ impl EpgProgress {
 
     pub fn progress_counter(&self) -> u64 {
         self.progress_counter.load(Ordering::Relaxed)
+    }
+
+    /// 重複を含む EIT section の受信回数。鮮度の永続化判定に使う。
+    pub fn reception_counter(&self) -> u64 {
+        self.reception_counter.load(Ordering::Relaxed)
     }
 }
 
@@ -285,11 +300,13 @@ mod tests {
     }
 
     #[test]
-    fn progress_counter_advances_only_on_new_sections() {
+    fn duplicate_reception_advances_only_the_reception_counter() {
         let progress = EpgProgress::new();
         let bytes = section_bytes(0x4E, 1, 10, 20, 1, 0, 0, 0, true);
         observe(&progress, &bytes, pid::EIT, 1);
         observe(&progress, &bytes, pid::EIT, 1);
+        // dwell の「進捗停止」検出が重複受信で無効にならないこと。
         assert_eq!(progress.progress_counter(), 1);
+        assert_eq!(progress.reception_counter(), 2);
     }
 }

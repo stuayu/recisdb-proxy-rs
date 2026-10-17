@@ -5,11 +5,10 @@
 //! the dashboard API (`web/api/programs.rs`) and the Mirakurun-compatible
 //! API (`web/mirakurun.rs::get_programs`).
 
-use super::{
-    Database, EpgSource, ProgramRecord, ProgramUpsert, ProgramUpsertWithClocks, Result,
-};
+use super::{Database, EpgSource, ProgramRecord, ProgramUpsert, ProgramUpsertWithClocks, Result};
 use crate::guide_services::{self, ProgramNameAt, ServiceMeta, SubchannelInfo};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
+use std::collections::HashMap;
 
 /// Upper bound for a stored event duration, in seconds.
 ///
@@ -59,9 +58,9 @@ const PROGRAM_READ_COLUMNS: &str = "SELECT p.id, p.nid, p.sid, p.tsid, p.event_i
 
 impl Database {
     pub fn get_enabled_network_ids(&self) -> Result<Vec<u16>> {
-        let mut stmt = self.connection().prepare(
-            "SELECT DISTINCT nid FROM channels WHERE is_enabled = 1 ORDER BY nid",
-        )?;
+        let mut stmt = self
+            .connection()
+            .prepare("SELECT DISTINCT nid FROM channels WHERE is_enabled = 1 ORDER BY nid")?;
         let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u16))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -77,6 +76,57 @@ impl Database {
     /// never clobber a newer row written by an earlier flush.
     pub fn upsert_programs(&mut self, programs: &[ProgramUpsert]) -> Result<usize> {
         self.upsert_programs_inner(programs, None)
+    }
+
+    /// Persist a batch and return only rows whose Mirakurun-visible fields changed.
+    pub fn upsert_programs_changed(
+        &mut self,
+        programs: &[ProgramUpsert],
+    ) -> Result<Vec<ProgramUpsert>> {
+        let mut before = HashMap::new();
+        for p in programs {
+            let snapshot = self.connection().query_row(
+                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
+                params![p.nid as i32,p.sid as i32,p.tsid as i32,p.event_id as i32],
+                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?)),
+            ).optional()?;
+            before.insert((p.nid, p.sid, p.tsid, p.event_id), snapshot);
+        }
+        self.upsert_programs(programs)?;
+        let mut changed = HashMap::new();
+        for p in programs {
+            let after = self.connection().query_row(
+                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
+                params![p.nid as i32,p.sid as i32,p.tsid as i32,p.event_id as i32],
+                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?)),
+            ).optional()?;
+            let key = (p.nid, p.sid, p.tsid, p.event_id);
+            if before.get(&key) != Some(&after) {
+                if let Some((
+                    start_at,
+                    duration,
+                    name,
+                    description,
+                    extended,
+                    genre,
+                    free_ca_mode,
+                )) = after
+                {
+                    let mut visible = p.clone();
+                    visible.start_at = start_at;
+                    visible.duration_secs = duration;
+                    visible.name = name;
+                    visible.description = description;
+                    visible.extended = extended;
+                    visible.genre = genre;
+                    visible.free_ca_mode = free_ca_mode;
+                    changed.insert(key, visible);
+                }
+            }
+        }
+        // A flush may contain p/f and schedule inputs for one DB row. Emit at
+        // most one event, preferring a named payload (the client drops unnamed).
+        Ok(changed.into_values().filter(|p| p.name.is_some()).collect())
     }
 
     fn upsert_programs_inner(
@@ -226,9 +276,18 @@ impl Database {
         ];
         if !network_ids.is_empty() {
             sql.push_str(" AND nid IN (");
-            sql.push_str(&std::iter::repeat("?").take(network_ids.len()).collect::<Vec<_>>().join(","));
+            sql.push_str(
+                &std::iter::repeat("?")
+                    .take(network_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             sql.push(')');
-            values.extend(network_ids.iter().map(|nid| Box::new(*nid as i32) as Box<dyn rusqlite::ToSql>));
+            values.extend(
+                network_ids
+                    .iter()
+                    .map(|nid| Box::new(*nid as i32) as Box<dyn rusqlite::ToSql>),
+            );
         }
         sql.push_str(" ORDER BY updated_at ASC, id ASC LIMIT ?");
         values.push(Box::new(limit.saturating_add(1) as i64));
@@ -280,7 +339,10 @@ impl Database {
         nid: Option<u16>,
         sid: Option<u16>,
     ) -> Result<Vec<ProgramRecord>> {
-        let mut sql = format!("{} FROM programs p {} WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?", PROGRAM_READ_COLUMNS, PROGRAM_READ_JOINS);
+        let mut sql = format!(
+            "{} FROM programs p {} WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?",
+            PROGRAM_READ_COLUMNS, PROGRAM_READ_JOINS
+        );
 
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until), Box::new(since)];
         if let Some(n) = nid {
@@ -310,8 +372,9 @@ impl Database {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<ProgramRecord>, u64)> {
-        let mut where_sql =
-            String::from(" FROM programs p WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?");
+        let mut where_sql = String::from(
+            " FROM programs p WHERE p.start_at < ? AND (p.start_at + p.duration_secs) > ?",
+        );
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until), Box::new(since)];
         if let Some(n) = nid {
             where_sql.push_str(" AND p.nid = ?");
@@ -391,14 +454,16 @@ impl Database {
             "SELECT DISTINCT nid, sid, start_at, name FROM programs
              WHERE start_at < ?1 AND (start_at + duration_secs) > ?2",
         )?;
-        let programs = programs_stmt.query_map(params![until, since], |row| {
-            Ok(ProgramNameAt {
-                nid: row.get::<_, i32>(0)? as u16,
-                sid: row.get::<_, i32>(1)? as u16,
-                start_at: row.get(2)?,
-                name: row.get(3)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let programs = programs_stmt
+            .query_map(params![until, since], |row| {
+                Ok(ProgramNameAt {
+                    nid: row.get::<_, i32>(0)? as u16,
+                    sid: row.get::<_, i32>(1)? as u16,
+                    start_at: row.get(2)?,
+                    name: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut services = programs.iter().map(|p| (p.nid, p.sid)).collect::<Vec<_>>();
         services.sort_unstable();
         services.dedup();
@@ -409,13 +474,15 @@ impl Database {
             "SELECT DISTINCT nid, sid, service_type FROM channels
              WHERE sid <> 0 AND tsid <> 0",
         )?;
-        let channels = channels_stmt.query_map([], |row| {
-            Ok(ServiceMeta {
-                nid: row.get::<_, i32>(0)? as u16,
-                sid: row.get::<_, i32>(1)? as u16,
-                service_type: row.get::<_, Option<i32>>(2)?.map(|v| v as u8),
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let channels = channels_stmt
+            .query_map([], |row| {
+                Ok(ServiceMeta {
+                    nid: row.get::<_, i32>(0)? as u16,
+                    sid: row.get::<_, i32>(1)? as u16,
+                    service_type: row.get::<_, Option<i32>>(2)?.map(|v| v as u8),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let subchannels = guide_services::subchannels(&channels, &programs)
             .into_iter()
             .filter(|item| services.contains(&item.service))
@@ -481,6 +548,31 @@ mod tests {
     }
 
     #[test]
+    fn changed_upsert_ignores_clocks_but_detects_visible_name_change() {
+        let mut db = Database::open_in_memory().unwrap();
+        let original = sample(1, 2, 3, 10_000, 100);
+        assert_eq!(
+            db.upsert_programs_changed(&[original.clone()])
+                .unwrap()
+                .len(),
+            1
+        );
+        let duplicate = ProgramUpsert {
+            updated_at: 200,
+            basic_updated_at: Some(200),
+            ..original.clone()
+        };
+        assert!(db.upsert_programs_changed(&[duplicate]).unwrap().is_empty());
+        let changed = ProgramUpsert {
+            name: Some("Renamed".into()),
+            updated_at: 300,
+            basic_updated_at: Some(300),
+            ..original
+        };
+        assert_eq!(db.upsert_programs_changed(&[changed]).unwrap().len(), 1);
+    }
+
+    #[test]
     fn test_upsert_and_get_programs() {
         let mut db = Database::open_in_memory().unwrap();
 
@@ -525,7 +617,10 @@ mod tests {
         sub.shared_event_id = Some(7);
         db.upsert_programs(&[main.clone(), sub]).unwrap();
 
-        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        let row = db
+            .get_programs(0, 10_000, Some(1), Some(200))
+            .unwrap()
+            .remove(0);
         assert_eq!(row.name.as_deref(), Some("Event 7"));
         assert_eq!(row.description.as_deref(), Some("main description"));
         assert_eq!(row.extended.as_deref(), Some("main extended"));
@@ -536,7 +631,10 @@ mod tests {
         main.updated_at = 2;
         main.basic_updated_at = Some(2);
         db.upsert_programs(&[main]).unwrap();
-        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        let row = db
+            .get_programs(0, 10_000, Some(1), Some(200))
+            .unwrap()
+            .remove(0);
         assert_eq!(row.name.as_deref(), Some("updated main"));
         assert_eq!(row.description.as_deref(), Some("updated description"));
     }
@@ -553,7 +651,10 @@ mod tests {
         missing.shared_sid = Some(100);
         missing.shared_event_id = Some(7);
         db.upsert_programs(&[missing]).unwrap();
-        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        let row = db
+            .get_programs(0, 10_000, Some(1), Some(200))
+            .unwrap()
+            .remove(0);
         assert!(row.name.is_none());
 
         let mut legacy_sub = sample(2, 200, 9, 2_000, 1);
@@ -565,7 +666,10 @@ mod tests {
         db.upsert_programs(&[legacy_sub]).unwrap();
         let main = sample(2, 100, 10, 2_000, 1);
         db.upsert_programs(&[main]).unwrap();
-        let row = db.get_programs(0, 10_000, Some(2), Some(200)).unwrap().remove(0);
+        let row = db
+            .get_programs(0, 10_000, Some(2), Some(200))
+            .unwrap()
+            .remove(0);
         assert_eq!(row.name.as_deref(), Some("Event 10"));
     }
 
@@ -578,7 +682,10 @@ mod tests {
         sub.shared_sid = Some(100);
         sub.shared_event_id = Some(7);
         db.upsert_programs(&[main, sub]).unwrap();
-        let row = db.get_programs(0, 10_000, Some(1), Some(200)).unwrap().remove(0);
+        let row = db
+            .get_programs(0, 10_000, Some(1), Some(200))
+            .unwrap()
+            .remove(0);
         assert_eq!(row.name.as_deref(), Some("sub-specific"));
     }
 
@@ -602,9 +709,7 @@ mod tests {
         sub.shared_sid = Some(1024);
         sub.shared_event_id = Some(1);
         db.upsert_programs(&[parent, sub]).unwrap();
-        let (_, subchannels) = db
-            .get_program_services_with_subchannels(0, 10_000)
-            .unwrap();
+        let (_, subchannels) = db.get_program_services_with_subchannels(0, 10_000).unwrap();
         assert_eq!(subchannels.len(), 1);
         assert!(!subchannels[0].distinct);
     }
@@ -617,13 +722,14 @@ mod tests {
             sample(1, 100, 2, 10_000, 20),
             sample(2, 100, 3, 10_000, 30),
             sample(1, 100, 4, -10_000, 40),
-        ]).unwrap();
+        ])
+        .unwrap();
         let (first, more) = db.get_programs_for_node_page(&[1], 0, 0, 100, 1).unwrap();
         assert!(more);
         assert_eq!(first.len(), 1);
-        let (second, more) = db.get_programs_for_node_page(
-            &[1], first[0].program.updated_at, first[0].id, 100, 10,
-        ).unwrap();
+        let (second, more) = db
+            .get_programs_for_node_page(&[1], first[0].program.updated_at, first[0].id, 100, 10)
+            .unwrap();
         assert!(!more);
         assert_eq!(second.len(), 1);
         assert!(second.iter().all(|row| row.program.nid == 1));
@@ -661,7 +767,10 @@ mod tests {
             db.get_program_services(0, 10_000).unwrap(),
             vec![(1, 100), (2, 200)]
         );
-        assert!(db.get_program_services(100_000, 200_000).unwrap().is_empty());
+        assert!(db
+            .get_program_services(100_000, 200_000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

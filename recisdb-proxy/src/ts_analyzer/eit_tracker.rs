@@ -171,6 +171,10 @@ impl EpgSectionTracker {
             sub.segment_last = [None; 32];
             outcome = ObserveOutcome::VersionChanged;
         } else if sub.received[word] & bit != 0 {
+            // Repeated sections still prove that the mux is alive. Refresh
+            // reception time so passive freshness survives row deduplication.
+            sub.updated_at = now;
+            service.last_section_at = now;
             return ObserveOutcome::Duplicate;
         }
 
@@ -198,19 +202,9 @@ impl EpgSectionTracker {
                     .keys()
                     .any(|&id| id >= ext_base && id <= ext_cap)
                     && ext_last >= ext_base
-                    && range_complete(
-                        &service.sub_tables,
-                        ext_base,
-                        ext_last,
-                        self.last_now,
-                    );
+                    && range_complete(&service.sub_tables, ext_base, ext_last, self.last_now);
                 (
-                    range_complete(
-                        &service.sub_tables,
-                        basic_base,
-                        basic_last,
-                        self.last_now,
-                    ),
+                    range_complete(&service.sub_tables, basic_base, basic_last, self.last_now),
                     extended,
                     coverage_until(service, basic_base, basic_last, self.last_now),
                 )
@@ -611,11 +605,7 @@ mod tests {
         for n in 0..=7 {
             let b = section_bytes(0x50, 1, n, 7, 7, true);
             assert_eq!(
-                tracker.observe(
-                    pid::EIT,
-                    &parse_section(&b),
-                    jst_midnight(1_725_168_000),
-                ),
+                tracker.observe(pid::EIT, &parse_section(&b), jst_midnight(1_725_168_000),),
                 ObserveOutcome::Recorded
             );
         }
@@ -744,7 +734,10 @@ mod tests {
             transport_stream_id: 0x1234,
             service_id: 0x9ABC,
         };
-        assert_eq!(tracker.completion(&key).unwrap().schedule_coverage_until, None);
+        assert_eq!(
+            tracker.completion(&key).unwrap().schedule_coverage_until,
+            None
+        );
     }
 
     #[test]
@@ -760,7 +753,10 @@ mod tests {
             service_id: 0x9ABC,
         };
         assert!(!tracker.completion(&key).unwrap().schedule_basic_complete);
-        assert_eq!(tracker.completion(&key).unwrap().schedule_coverage_until, None);
+        assert_eq!(
+            tracker.completion(&key).unwrap().schedule_coverage_until,
+            None
+        );
     }
 
     #[test]

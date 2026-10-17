@@ -90,7 +90,7 @@ pub async fn run(database: DatabaseHandle) {
         let now = chrono::Utc::now().timestamp();
         for progress in live_progresses() {
             let key = Arc::as_ptr(&progress) as usize;
-            let current = progress.progress_counter();
+            let current = progress.reception_counter();
             if !progress_advanced(last_counters.get(&key).copied(), current) {
                 continue;
             }

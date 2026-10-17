@@ -18,6 +18,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use log::{debug, error, info, warn};
 use tokio::sync::{broadcast, mpsc};
@@ -40,6 +41,9 @@ const FLUSH_BATCH_SIZE: usize = 500;
 /// ... WHERE` full-table scan does not need to run on every 10s flush).
 /// 30 flushes at the default 10s interval is ~5 minutes.
 const PRUNE_EVERY_N_FLUSHES: u32 = 30;
+/// Coverage is auxiliary and expensive to derive from all program rows.
+/// Passive writes arrive continuously, so refresh at most once per minute.
+const COVERAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// EPG batching/UPSERT task. See module doc comment.
 pub struct EpgWriter {
@@ -93,6 +97,7 @@ impl EpgWriter {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut flush_count: u32 = 0;
+        let mut last_coverage_refresh = None;
 
         loop {
             tokio::select! {
@@ -109,21 +114,21 @@ impl EpgWriter {
                                 }
                             }
                             if batch.len() >= FLUSH_BATCH_SIZE {
-                                self.flush(&mut batch, &mut flush_count).await;
+                                self.flush(&mut batch, &mut flush_count, &mut last_coverage_refresh).await;
                             }
                         }
                         None => {
                             // The static sender lives for the process
                             // lifetime, so this should not normally happen.
                             // Flush what we have and stop rather than spin.
-                            self.flush(&mut batch, &mut flush_count).await;
+                            self.flush(&mut batch, &mut flush_count, &mut last_coverage_refresh).await;
                             info!("[EpgWriter] channel closed, stopping");
                             return;
                         }
                     }
                 }
                 _ = ticker.tick() => {
-                    self.flush(&mut batch, &mut flush_count).await;
+                    self.flush(&mut batch, &mut flush_count, &mut last_coverage_refresh).await;
                 }
             }
         }
@@ -133,6 +138,7 @@ impl EpgWriter {
         &self,
         batch: &mut HashMap<(u16, u16, u16, u16, u8), ProgramUpsert>,
         flush_count: &mut u32,
+        last_coverage_refresh: &mut Option<Instant>,
     ) {
         if batch.is_empty() {
             return;
@@ -141,15 +147,20 @@ impl EpgWriter {
         let count = records.len();
 
         let mut db = self.database.lock().await;
-        match db.upsert_programs(&records) {
-            Ok(_) => {
+        match db.upsert_programs_changed(&records) {
+            Ok(changed) => {
                 debug!(
                     "[EpgWriter] flushed {} program row(s); dropped_program_rows={}",
                     count,
                     epg_collector::dropped_program_rows()
                 );
-                if let Err(e) = db.refresh_epg_coverage() {
-                    warn!("[EpgWriter] failed to refresh coverage: {}", e);
+                let now = Instant::now();
+                if coverage_refresh_due(*last_coverage_refresh, now, true) {
+                    if let Err(e) = db.refresh_epg_coverage() {
+                        warn!("[EpgWriter] failed to refresh coverage: {}", e);
+                    } else {
+                        *last_coverage_refresh = Some(now);
+                    }
                 }
                 // Fan out to `/mirakurun/api/events/stream` subscribers only
                 // *after* the UPSERT actually succeeded — a subscriber must
@@ -167,7 +178,7 @@ impl EpgWriter {
                 // subscribers (nobody has opened `/events/stream`); that is
                 // the common case, not a failure, so the `Result` is
                 // deliberately ignored.
-                for record in &records {
+                for record in &changed {
                     if record.name.is_some() {
                         let _ = self.events_tx.send(record.clone());
                     }
@@ -189,8 +200,36 @@ impl EpgWriter {
             }
             if let Err(e) = db.refresh_epg_coverage() {
                 warn!("[EpgWriter] failed to refresh coverage after prune: {}", e);
+            } else {
+                *last_coverage_refresh = Some(Instant::now());
             }
         }
+    }
+}
+
+fn coverage_refresh_due(last: Option<Instant>, now: Instant, has_upserts: bool) -> bool {
+    has_upserts && last.is_none_or(|last| now.duration_since(last) >= COVERAGE_REFRESH_INTERVAL)
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn coverage_refresh_is_throttled_and_requires_upserts() {
+        let start = Instant::now();
+        assert!(coverage_refresh_due(None, start, true));
+        assert!(!coverage_refresh_due(
+            Some(start),
+            start + Duration::from_secs(59),
+            true
+        ));
+        assert!(coverage_refresh_due(
+            Some(start),
+            start + Duration::from_secs(60),
+            true
+        ));
+        assert!(!coverage_refresh_due(None, start, false));
     }
 }
 
