@@ -28,6 +28,27 @@ fn decoder_creation_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Hand a reader-name pattern to libaribb25.
+///
+/// The C side takes `const TCHAR *`. libaribb25 is built with `UNICODE` on
+/// Windows, so there `TCHAR` is `wchar_t` and the name must be UTF-16. Passing
+/// an 8-bit string makes C read past its end: an empty name turns into
+/// trailing heap bytes, no reader matches that garbage, and every decoder fails
+/// with `ALL_READERS_CONNECTION_FAILED`.
+///
+/// Returns `false` for an interior NUL or a name libaribb25 rejects.
+#[cfg(feature = "prioritized_card_reader")]
+fn override_reader_pattern(name: &str) -> bool {
+    if name.contains('\0') {
+        return false;
+    }
+    #[cfg(windows)]
+    let encoded: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    #[cfg(not(windows))]
+    let encoded: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    unsafe { crate::bindings::override_card_reader_name_pattern(encoded.as_ptr().cast()) == 0 }
+}
+
 /// Set keys so that ECM/EMM could be interpreted by StreamDecoder.
 pub fn set_keys(key0: Vec<u64>, key1: Vec<u64>) {
     KEY0.lock().unwrap().clear();
@@ -53,15 +74,11 @@ pub fn set_keys(key0: Vec<u64>, key1: Vec<u64>) {
 /// makes this return `false` rather than silently truncating.
 #[cfg(feature = "prioritized_card_reader")]
 pub fn set_card_reader_name(name: &str) -> bool {
-    let Ok(name) = std::ffi::CString::new(name) else {
-        return false;
-    };
     let _guard = decoder_creation_lock();
-    if unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr() as *const _) } != 0
-    {
+    if !override_reader_pattern(name) {
         return false;
     }
-    let value = name.to_string_lossy().into_owned();
+    let value = name.to_owned();
     *DEFAULT_CARD_READER
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -151,13 +168,7 @@ impl StreamDecoder {
         #[cfg(feature = "prioritized_card_reader")]
         {
             let selected = reader.or(default.as_deref()).unwrap_or("");
-            let name = std::ffi::CString::new(selected).map_err(|_| {
-                Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "card reader name contains NUL",
-                )
-            })?;
-            if unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr()) } != 0 {
+            if !override_reader_pattern(selected) {
                 return Err(Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "invalid card reader name",
@@ -190,11 +201,7 @@ impl StreamDecoder {
         // path (the only other connect_card calls are disabled legacy code).
         #[cfg(feature = "prioritized_card_reader")]
         {
-            let selected = default.as_deref().unwrap_or("");
-            if let Ok(name) = std::ffi::CString::new(selected) {
-                let _ =
-                    unsafe { crate::bindings::override_card_reader_name_pattern(name.as_ptr()) };
-            }
+            let _ = override_reader_pattern(default.as_deref().unwrap_or(""));
         }
         let inner = inner_result?;
 
