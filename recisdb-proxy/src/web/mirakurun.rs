@@ -650,7 +650,7 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
 /// (`api.d.ts:53`). Bump this together with the contract it describes, not
 /// with our own releases; this crate's version is still reported by the
 /// project's own `/api/*` endpoints.
-const MIRAKURUN_COMPAT_VERSION: &str = "4.3.0-stuayu";
+pub(super) const MIRAKURUN_COMPAT_VERSION: &str = "4.3.0-stuayu";
 
 /// `GET /mirakurun/api/version`.
 pub async fn get_version() -> impl IntoResponse {

@@ -584,7 +584,7 @@ recisdb-proxy は、選局・reader起動の受理後、最初のTSを待つ間�
 first-TS猶予超過時は接続を終了する。開始待ちを示す独自chunkは送らない
 (EPGStation/録画入力へTS以外を混ぜないため)。
 
-## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 / 2026-08-22 更新)
+## 6. 現状の実装との差分 (2026-08-09 時点、2026-08-12 / 2026-08-22 / 2026-10-18 更新)
 
 `web/mirakurun.rs` / `web/mod.rs:126-136` を読んだ結果 + §5.2 の実起動確認。
 
@@ -597,6 +597,7 @@ first-TS猶予超過時は接続を終了する。開始待ちを示す独自chu
 | `GET /config/server` | 実装済み (2026-08-09) | `api.d.ts` の `ConfigServer` のうち必須の `allowOrigins` / `allowPNA` のみ実値。EPGStation の `tunerServerType: auto` 判定を通すことが目的 |
 | `GET /tuners` | 実装済み (2026-08-09、`types` は 2026-08-12) | `bon_drivers` 1 行 = 1 tuner。`isUsing`/`isFree` は `TunerPool` の実行状態から算出。`types` はスキャン済みチャンネルの band から算出 (`channel_types_by_driver`)。`pid`/`users`/`isRemote`/`isFault` は既定値 (理由はハンドラの doc コメントに記載) |
 | `GET /status` | 実装済み (`tunerCount` は 2026-08-12 修正) | `tunerCount` は `bon_drivers` の行数 (旧実装は `TunerPool` のキー数を数えており、14 台のサーバーが 1 を返していた)。§5.2-4 |
+| `Server` レスポンスヘッダー | 実装済み (2026-10-18) | Mirakurun 互換ルーターの全応答に `Server: Mirakurun/4.3.0-stuayu` を付与。`/version` の `current` / `latest` と共通定数を使う。KonomiTV の起動時 URL 判定にも必要 (`docs/KONOMITV_COMPAT.md` §2)。 |
 | `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12修正、`/programs` filter は 2026-09-04追加、イベント共有解決は 2026-10-12追加) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`/programs` は `networkId` / `serviceId` の単独・併用filterと無指定全件をDB queryで処理する。`remoteControlKeyId` は地上波のみ。共有イベントのサブチャンネル行は、読み出し時に主サービスの名前・概要・拡張記述・ジャンルを補う。§1・§5.2-1/2/3 |
 | `GET /services/{id}/stream` | 実装済み (2026-08-12 にサービスフィルタ追加、2026-08 に複数候補対応) | `TsServiceFilter` で対象サービスのみへ絞る (旧実装は multiplex 全体)。§5.2-5/6。**実起動で確認した事実**: `channels` テーブルは (BonDriver, サービス) ごとに1行なので同じサービスが複数ドライバに載ることがある。修正前は先頭行 1件だけを `tuner::acquire::acquire` に渡していたため、先頭行のドライバが満杯だと**他ドライバで既に配信中でも** 503 になっていた。`resolve_service_by_sid`/`resolve_service_by_nid_sid` が全 enabled 行を候補として渡すよう修正し、この経路で `/services/{id}/stream` 経由の EPGStation 録画・視聴が同じ恩恵を受ける (満杯ドライバでも別ドライバに相乗りして 200 が返るようになった)。詳細: `docs/STREAMING_DESIGN.md` P6「複数候補への対応」節、`docs/TUNER_PIPELINE_REDESIGN.md` |
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |

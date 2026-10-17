@@ -14,7 +14,7 @@ pub mod stream;
 use axum::{
     body::HttpBody,
     extract::{ConnectInfo, Request},
-    middleware::Next,
+    middleware::{from_fn, Next},
     response::Response,
     routing::{delete, get, post, put},
     Router,
@@ -269,6 +269,22 @@ fn build_mirakurun_router() -> Router<Arc<WebState>> {
         // Incremental EPG update stream — see `mirakurun_events.rs` module
         // doc comment for the wire format EPGStation requires.
         .route("/events/stream", get(mirakurun_events::stream_events))
+        .route_layer(from_fn(add_mirakurun_server_header))
+}
+
+/// Identify the compatibility server on every Mirakurun API response.
+///
+/// KonomiTV reads the product name and version from this header when it
+/// validates `mirakurun_url` at startup, and refuses the URL without it.
+async fn add_mirakurun_server_header(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let value = format!("Mirakurun/{}", mirakurun::MIRAKURUN_COMPAT_VERSION);
+    if let Ok(value) = value.parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SERVER, value);
+    }
+    response
 }
 
 /// HTTP access-log middleware, layered over the whole router in
@@ -1263,6 +1279,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mirakurun_responses_identify_compat_version_and_tuners_are_array() {
+        let state = test_web_state(AuthConfig {
+            enabled: true,
+            token: "secret-token".to_string(),
+        });
+        let app = build_app(state, true);
+
+        for path in ["/mirakurun/api/version", "/mirakurun/api/tuners"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::SERVER],
+                format!("Mirakurun/{}", mirakurun::MIRAKURUN_COMPAT_VERSION)
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if path.ends_with("/tuners") {
+                assert!(json.is_array(), "KonomiTV expects /api/tuners to be an array");
+            } else {
+                assert_eq!(json["current"], mirakurun::MIRAKURUN_COMPAT_VERSION);
+            }
+        }
     }
 
     #[tokio::test]

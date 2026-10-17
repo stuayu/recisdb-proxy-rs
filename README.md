@@ -111,7 +111,7 @@ BonDriverProxy / BonDriverProxy-EX と同じく「BonDriver をネットワー�
 - **チューナーグループ**: 同種チューナーの自動選択・負荷分散
 - **チャンネルスキャン**: 自動 / 手動によるチャンネルスキャン・パッシブスキャン
 - **番組表 (EPG)**: EIT を収集して DB に保存し、API で配信
-- **Mirakurun 互換 API**: EPGStation 等の BonDriver 以外のクライアントからも利用可能
+- **Mirakurun 互換 API**: EPGStation・KonomiTV 等の BonDriver 以外のクライアントから利用可能。KonomiTV は `backend: Mirakurun`、`mirakurun_url: http://<host>:40080/mirakurun` で接続
 - **サーバー側 B25 デコード**: クライアント機に B-CAS カードリーダーが不要
 - **マルチプラットフォーム**: Windows / Linux / macOS。Linux・macOS では px4_drv 系チューナーを直接利用
 - **アラート**: ドロップ率やビットレート等のメトリクスしきい値でアラート通知 (Webhook 対応)
