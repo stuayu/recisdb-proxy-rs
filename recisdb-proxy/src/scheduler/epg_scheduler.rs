@@ -1275,7 +1275,7 @@ fn rank_targets(targets: &[EpgTarget], now: i64, config: &EpgGlobalSettings) -> 
     candidates.retain(|target| {
         matches!(
             target.broadcast_type,
-            BroadcastType::Terrestrial | BroadcastType::FourK
+            BroadcastType::Terrestrial | BroadcastType::FourK | BroadcastType::Sky
         )
     });
     candidates.extend(representatives);
@@ -2019,6 +2019,16 @@ mod tests {
         let targets = [
             target(0x000b, 1, BroadcastType::FourK, None, None, None),
             target(0x000b, 2, BroadcastType::FourK, None, None, None),
+        ];
+        assert_eq!(select_next_target(&targets, 10, &config()).unwrap().tsid, 1);
+        assert!(target_needs_scan(&targets[1], 10, &config()));
+    }
+
+    #[test]
+    fn sky_targets_are_not_grouped_by_other_ts_eit() {
+        let targets = [
+            target(0x000A, 1, BroadcastType::Sky, None, None, None),
+            target(0x000A, 2, BroadcastType::Sky, None, None, None),
         ];
         assert_eq!(select_next_target(&targets, 10, &config()).unwrap().tsid, 1);
         assert!(target_needs_scan(&targets[1], 10, &config()));

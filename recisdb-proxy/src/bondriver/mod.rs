@@ -30,7 +30,7 @@ pub use windows::*;
 #[cfg(target_os = "linux")]
 mod dvbv5;
 #[cfg(unix)]
-mod px4_daemon;
+pub(crate) mod px4_daemon;
 #[cfg(unix)]
 mod unix;
 

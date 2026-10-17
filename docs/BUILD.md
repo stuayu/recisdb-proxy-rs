@@ -252,8 +252,11 @@ cd /path/to/px4_drv/macos/build
 | `px4daemon:0+j83b` | 空間 3 を J.83 Annex B の配置にする (実験的。デーモン側の `ExperimentalJ83B=true` が必要) |
 | `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更 (データソケットは `ctrl`→`data` 置換で導出) |
 
-接尾辞は `@` より前に順不同で併用できます。不明な接尾辞・不正値・重複はエラーです。
-CATV は物理空間 3 / channel 0〜50 (C13〜C63) です。`+qam` 省略時は自動判定します。
+接尾辞は `@` より前に順不同で併用できます。ただし `+j83b` は例外で、`+tsmf` / `+tlv` /
+`+qam` / `+coffset` と併用できません。不明な接尾辞・不正値・重複もエラーです。
+通常 CATV は物理空間 3 / channel 0〜50 (C13〜C63) です。`+qam` 省略時は自動判定します。
+`+j83b` の場合、空間3は H01〜H77 の77波になります。daemon の `ExperimentalJ83B=true` は
+デバイス全体の ISDB-C 選局へ効くため、J.83B 専用 PX-MLT デバイスを分けてください。
 TSMF・生TLVの設定、選局手順と実機テストは [FOURK_SETUP.md](FOURK_SETUP.md#macos-の-catv-トラモジ-isdb-c--tsmf--生tlv) を参照してください。
 
 `+lnb` は opt-in。px4_drv 自身の BonDriver も `LNBPower` 設定の裏に置いており、

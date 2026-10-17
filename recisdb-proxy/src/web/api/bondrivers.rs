@@ -305,8 +305,27 @@ pub async fn update_bondriver(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
+        let old_path = db
+            .get_bon_driver(id)
+            .map_err(|e| ApiError::internal(format!("Failed to read BonDriver: {}", e)))?
+            .ok_or_else(|| ApiError::not_found("BonDriver not found"))?
+            .dll_path;
         db.update_bon_driver_path(id, path)
             .map_err(|e| ApiError::internal(format!("Failed to update dll_path: {}", e)))?;
+        #[cfg(unix)]
+        let plan_changed = crate::bondriver::px4_daemon::space_channel_plan(&old_path)
+            != crate::bondriver::px4_daemon::space_channel_plan(path);
+        #[cfg(unix)]
+        if plan_changed {
+            db.disable_space3_channels(id).map_err(|e| {
+                ApiError::internal(format!("Failed to disable stale space-3 channels: {}", e))
+            })?;
+            db.request_immediate_scan(id).map_err(|e| {
+                ApiError::internal(format!("Failed to schedule BonDriver rescan: {}", e))
+            })?;
+        }
+        #[cfg(not(unix))]
+        let _ = old_path;
     }
 
     // Update individual fields

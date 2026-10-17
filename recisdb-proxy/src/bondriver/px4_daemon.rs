@@ -34,9 +34,11 @@
 //!
 //! # CATV / raw TLV
 //!
-//! Space 3 is CATV C13–C63 (ISDB-C). Receiver suffixes `+tsmf=0..14`,
-//! `+tlv`, `+qam=64|256`, and `+coffset=<signed kHz>` may be combined
-//! with `+lnb` in any order, before an optional `@<ctrl_sock>`.
+//! Space 3 is CATV C13–C63 (ISDB-C), or J.83B H01–H77 with `+j83b`.
+//! Receiver suffixes `+tsmf=0..14`, `+tlv`, `+qam=64|256`, and
+//! `+coffset=<signed kHz>` may be combined with `+lnb` in any order.
+//! `+j83b` is exclusive of those suffixes other than `+lnb` and requires
+//! daemon-wide `ExperimentalJ83B=true`.
 //! `+tlv` implies TSMF relative stream 0 unless explicitly selected.
 //! Register raw TLV drivers with `bon_drivers.stream_format='mmttlv'`;
 //! the reader must run dantto4k before TS parsing or broadcast. Raw TLV
@@ -209,6 +211,72 @@ struct ReceiverOptions {
 /// 93.25 MHz から 6.5 MHz 間隔で 587.25 MHz まで。
 const J83B_CHANNELS: u32 = 77;
 
+/// Space 3 frequency layout selected by a px4daemon path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space3Plan {
+    Catv,
+    J83b,
+}
+
+/// Return the configured space 3 layout for a px4daemon path.
+///
+/// Parsing the full path keeps this platform-independent and ensures invalid
+/// suffix combinations do not accidentally trigger a channel-table reset.
+pub fn space_channel_plan(path: &str) -> Option<Space3Plan> {
+    let (_, options, _, _) = parse_path(path).ok()?;
+    Some(if options.j83b {
+        Space3Plan::J83b
+    } else {
+        Space3Plan::Catv
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TuneTarget {
+    system: u32,
+    freq_khz: u32,
+    modulation: u32,
+}
+
+/// Resolve all channel bounds and tuning parameters from one pure plan.
+fn tune_target(
+    space: u32,
+    channel: u32,
+    options: &ReceiverOptions,
+) -> Result<TuneTarget, io::Error> {
+    let (sys, freq_khz, modulation) = if space == 3 {
+        let (freq_khz, modulation) = if options.j83b {
+            (j83b_frequency(channel)?, 256)
+        } else {
+            (
+                catv_frequency(channel, options.coffset)?,
+                options.qam.unwrap_or(0),
+            )
+        };
+        (system::ISDB_C, freq_khz, modulation)
+    } else {
+        let (sys, freq) = space_channel_to_freq(space, channel)?;
+        (sys, freq, options.qam.unwrap_or(0))
+    };
+    Ok(TuneTarget {
+        system: sys,
+        freq_khz,
+        modulation,
+    })
+}
+
+fn channel_name(space: u32, channel: u32, options: &ReceiverOptions) -> Option<String> {
+    tune_target(space, channel, options).ok()?;
+    match space {
+        0 => Some(format!("GR{}", channel + 13)),
+        1 => Some(format!("BS{}", channel * 2 + 1)),
+        2 => Some(format!("CS{}", channel * 2 + 2)),
+        3 if options.j83b => Some(format!("H{:02}", channel + 1)),
+        3 => Some(format!("C{}", channel + 13)),
+        _ => None,
+    }
+}
+
 /// `+j83b` の空間 3 のチャンネル番号 (0..77) を中心周波数 kHz へ。
 ///
 /// CATV の C チャンネル (6 MHz 間隔) とは配置が違い、px4_drv の J.83B は
@@ -220,7 +288,11 @@ fn j83b_frequency(channel: u32) -> Result<u32, io::Error> {
     if channel >= J83B_CHANNELS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("J.83B channel {} out of range (0-{})", channel, J83B_CHANNELS - 1),
+            format!(
+                "J.83B channel {} out of range (0-{})",
+                channel,
+                J83B_CHANNELS - 1
+            ),
         ));
     }
     Ok(93_250 + 6_500 * channel)
@@ -368,7 +440,10 @@ fn parse_path(path: &str) -> Result<(i32, ReceiverOptions, String, String), io::
     // J.83B は TSMF を使わず、256QAM 固定で、ISDB-C 用の周波数補正も掛けない。
     // px4_drv は TSMF 指定つきの選局を拒否するので、選局時ではなくここで断る。
     if options.j83b
-        && (options.tsmf.is_some() || options.tlv || options.qam.is_some() || options.coffset.is_some())
+        && (options.tsmf.is_some()
+            || options.tlv
+            || options.qam.is_some()
+            || options.coffset.is_some())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -711,20 +786,13 @@ impl Px4DaemonTuner {
     // -----------------------------------------------------------------
 
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
+        let target = tune_target(space, channel, &self.options)?;
+        let sys = target.system;
+        let freq_khz = target.freq_khz;
         let j83b = space == 3 && self.options.j83b;
-        let (sys, default_freq) = if j83b {
-            (system::ISDB_C, j83b_frequency(channel)?)
-        } else {
-            space_channel_to_freq(space, channel)?
-        };
-        let freq_khz = if sys == system::ISDB_C && !j83b {
-            catv_frequency(channel, self.options.coffset)?
-        } else {
-            default_freq
-        };
         // J.83B は daemon が 256QAM へ固定する。64/256 の自動判定 (使い捨ての
         // 受信機セッション) は意味がなく、77 波ぶんの時間だけ掛かる。
-        let mut modulation = if j83b { 256 } else { self.options.qam.unwrap_or(0) };
+        let mut modulation = target.modulation;
         if sys == system::ISDB_C && modulation == 0 {
             modulation = self
                 .catv_modulations
@@ -782,7 +850,17 @@ impl Px4DaemonTuner {
             self.attach_data_socket()?;
         }
         self.set_params(sys, freq_khz, modulation, false)?;
-        self.tune()?;
+        if let Err(error) = self.tune() {
+            if j83b && error.kind() == io::ErrorKind::AddrNotAvailable {
+                // ISDB-C tuning parameters intentionally retain symbol rate 5274;
+                // the daemon must override it globally for J.83B operation.
+                return Err(io::Error::new(
+                    error.kind(),
+                    "px4daemon J.83B TUNE failed (no lock); daemon ExperimentalJ83B=true is required and applies to the entire device",
+                ));
+            }
+            return Err(error);
+        }
         self.purge_ts_stream();
         if !self.capturing.load(Ordering::Acquire) {
             self.set_capture(true)?;
@@ -917,6 +995,8 @@ impl Px4DaemonTuner {
     }
 
     pub fn enum_tuning_space(&self, space: u32) -> Option<String> {
+        // Use the plan's range validation so enumeration and SetChannel agree.
+        tune_target(space, 0, &self.options).ok()?;
         match space {
             0 => Some("GR".to_string()),
             1 => Some("BS".to_string()),
@@ -928,16 +1008,7 @@ impl Px4DaemonTuner {
     }
 
     pub fn enum_channel_name(&self, space: u32, channel: u32) -> Option<String> {
-        match space {
-            0 if channel <= 49 => Some(format!("GR{}", channel + 13)),
-            1 if channel <= 11 => Some(format!("BS{}", channel * 2 + 1)),
-            2 if channel <= 11 => Some(format!("CS{}", channel * 2 + 2)),
-            3 if self.options.j83b => {
-                (channel < J83B_CHANNELS).then(|| format!("H{:02}", channel + 1))
-            }
-            3 if channel <= 50 => Some(format!("C{}", channel + 13)),
-            _ => None,
-        }
+        channel_name(space, channel, &self.options)
     }
 
     pub fn version(&self) -> u8 {
@@ -1016,19 +1087,70 @@ mod tests {
     #[test]
     fn rejects_paths_for_other_backends() {
         assert!(parse_path("/dev/px4video0").is_err());
+        assert!(parse_path("px4daemon:x").is_err());
+    }
 
-        // J.83B: 単独か +lnb とだけ併用できる。
+    #[test]
+    fn j83b_suffix_is_independent_and_rejects_incompatible_options() {
         assert!(parse_path("px4daemon:3+j83b").unwrap().1.j83b);
         assert!(parse_path("px4daemon:any+lnb+j83b").unwrap().1.j83b);
-        for bad in ["+j83b+tsmf=0", "+tlv+j83b", "+j83b+qam=256", "+j83b+coffset=0", "+j83b+j83b"] {
+        for bad in [
+            "+j83b+tsmf=0",
+            "+tlv+j83b",
+            "+j83b+qam=256",
+            "+j83b+coffset=0",
+            "+j83b+j83b",
+        ] {
             assert!(parse_path(&format!("px4daemon:0{bad}")).is_err(), "{bad}");
         }
-        // 93.25 MHz から 6.5 MHz 間隔で 77 波。
-        assert_eq!(j83b_frequency(0).unwrap(), 93_250);
+        assert_eq!(
+            space_channel_plan("px4daemon:0+j83b"),
+            Some(Space3Plan::J83b)
+        );
+        assert_eq!(
+            space_channel_plan("px4daemon:0+lnb"),
+            Some(Space3Plan::Catv)
+        );
+        assert_eq!(space_channel_plan("/dev/px4video0"), None);
+    }
+
+    #[test]
+    fn j83b_tune_plan_and_names_cover_h01_through_h77() {
+        let (_, options, _, _) = parse_path("px4daemon:0+j83b").unwrap();
+        assert_eq!(
+            tune_target(3, 0, &options).unwrap(),
+            TuneTarget {
+                system: system::ISDB_C,
+                freq_khz: 93_250,
+                modulation: 256
+            }
+        );
+        assert_eq!(channel_name(3, 0, &options).as_deref(), Some("H01"));
         assert_eq!(j83b_frequency(1).unwrap(), 99_750);
-        assert_eq!(j83b_frequency(76).unwrap(), 587_250);
-        assert!(j83b_frequency(77).is_err());
-        assert!(parse_path("px4daemon:x").is_err());
+        assert_eq!(
+            tune_target(3, 76, &options).unwrap(),
+            TuneTarget {
+                system: system::ISDB_C,
+                freq_khz: 587_250,
+                modulation: 256
+            }
+        );
+        assert_eq!(channel_name(3, 76, &options).as_deref(), Some("H77"));
+        assert!(tune_target(3, 77, &options).is_err());
+        assert_eq!(channel_name(3, 77, &options), None);
+    }
+
+    #[test]
+    fn non_j83b_space_three_keeps_catv_channel_plan() {
+        let options = ReceiverOptions::default();
+        for channel in [0, 9, 10, 50] {
+            assert_eq!(
+                tune_target(3, channel, &options).unwrap().freq_khz,
+                space_channel_to_freq(3, channel).unwrap().1
+            );
+        }
+        assert_eq!(channel_name(3, 0, &options).as_deref(), Some("C13"));
+        assert_eq!(channel_name(3, 50, &options).as_deref(), Some("C63"));
     }
 
     /// The frequency formulas are px4_drv's (`px4rec.cpp`); these pin the two
@@ -1212,7 +1334,10 @@ mod tests {
         let path = std::env::var("PX4_TEST_SWEEP_RECEIVER")
             .unwrap_or_else(|_| "px4daemon:any".to_string());
         let channels: Vec<u32> = match std::env::var("PX4_TEST_SWEEP_CHANNELS") {
-            Ok(list) => list.split(',').filter_map(|c| c.trim().parse().ok()).collect(),
+            Ok(list) => list
+                .split(',')
+                .filter_map(|c| c.trim().parse().ok())
+                .collect(),
             Err(_) => (0..51).collect(),
         };
         let tuner = Px4DaemonTuner::new(&path).expect("open receiver");

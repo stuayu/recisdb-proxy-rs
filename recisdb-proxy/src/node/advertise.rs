@@ -131,11 +131,12 @@ pub fn logical_broadcast_for(mux: LogicalMuxId, band_type: Option<u8>) -> Logica
     use recisdb_protocol::broadcast_region::classify_nid;
     use recisdb_protocol::BroadcastType;
 
-    // NID first: `classify_nid` is the single source of truth for 4K
-    // (0x000B/0x000C), and getting that wrong is what makes B25 run over an
-    // already-descrambled 4K stream (CLAUDE.md, docs/FOURK_SETUP.md).
-    if matches!(classify_nid(mux.nid).0, BroadcastType::FourK) {
-        return LogicalBroadcastType::Bs4k;
+    // NID first: scanned band metadata can be absent on older rows.
+    match classify_nid(mux.nid).0 {
+        // Getting 4K wrong makes B25 run over an already-descrambled stream.
+        BroadcastType::FourK => return LogicalBroadcastType::Bs4k,
+        BroadcastType::Sky => return LogicalBroadcastType::Sky,
+        _ => {}
     }
     match band_type.and_then(band_from_u8) {
         Some(BandType::Terrestrial) => LogicalBroadcastType::Terrestrial,
@@ -143,6 +144,7 @@ pub fn logical_broadcast_for(mux: LogicalMuxId, band_type: Option<u8>) -> Logica
         Some(BandType::CS) => LogicalBroadcastType::Cs110,
         Some(BandType::FourK) => LogicalBroadcastType::Bs4k,
         Some(BandType::CATV) => LogicalBroadcastType::CatvOriginal,
+        Some(BandType::SKY) => LogicalBroadcastType::Sky,
         _ => LogicalBroadcastType::Unknown,
     }
 }
@@ -313,6 +315,19 @@ mod tests {
         assert_eq!(
             logical_broadcast_for(four_k, Some(BandType::BS as u8)),
             LogicalBroadcastType::Bs4k
+        );
+    }
+
+    #[test]
+    fn sky_is_classified_by_nid_even_without_band_metadata() {
+        let sky = LogicalMuxId {
+            nid: 0x000A,
+            tsid: 0x0001,
+        };
+        assert_eq!(logical_broadcast_for(sky, None), LogicalBroadcastType::Sky);
+        assert_eq!(
+            logical_broadcast_for(sky, Some(BandType::SKY as u8)),
+            LogicalBroadcastType::Sky
         );
     }
 

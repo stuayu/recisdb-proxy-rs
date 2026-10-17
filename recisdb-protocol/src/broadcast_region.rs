@@ -300,7 +300,9 @@ impl TerrestrialRegion {
 ///
 /// # NID Allocation (ARIB TR-B14/TR-B15)
 /// - BS: NID = 4
-/// - CS: NID = 6, 7, 10
+/// - CS: NID = 6, 7
+/// - SKY (124/128-degree CS premium): NID = 0x000A, 0x0001, 0x0003
+/// - BS4K: NID = 0x000B, 0x000C
 /// - Terrestrial: NID = 0x7F00-0x7FFF (varies by region)
 ///
 /// # Example
@@ -313,6 +315,10 @@ impl TerrestrialRegion {
 /// assert_eq!(btype, BroadcastType::BS);
 /// assert!(region.is_none());
 ///
+/// // 110-degree CS and SKY premium are separate broadcast types.
+/// assert_eq!(classify_nid(6).0, BroadcastType::CS);
+/// assert_eq!(classify_nid(0x000A).0, BroadcastType::Sky);
+///
 /// // Kanto terrestrial
 /// let (btype, region) = classify_nid(0x7FE8);
 /// assert_eq!(btype, BroadcastType::Terrestrial);
@@ -323,11 +329,11 @@ pub fn classify_nid(nid: u16) -> (BroadcastType, Option<TerrestrialRegion>) {
         // BS (NID = 4)
         4 => (BroadcastType::BS, None),
 
-        // CS (NID = 6, 7, 10)
-        // 6: SKY PerfecTV! (CS1)
-        // 7: SKY PerfecTV! (CS2)
-        // 10: SKY PerfecTV! Premium Service
-        6 | 7 | 10 => (BroadcastType::CS, None),
+        // 110-degree CS.
+        6 | 7 => (BroadcastType::CS, None),
+
+        // SKY premium (SPHD and legacy premium services).
+        0x000A | 0x0001 | 0x0003 => (BroadcastType::Sky, None),
 
         // Advanced BS/CS (BS4K). 0x000B = 高度BS, 0x000C = 高度110度CS
         // (operation ended). Must be matched before the terrestrial
@@ -367,6 +373,7 @@ pub fn broadcast_type_name(btype: BroadcastType) -> &'static str {
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
         BroadcastType::FourK => "BS4K",
+        BroadcastType::Sky => "SKY",
     }
 }
 
@@ -377,6 +384,7 @@ pub fn broadcast_type_name_en(btype: BroadcastType) -> &'static str {
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
         BroadcastType::FourK => "BS4K",
+        BroadcastType::Sky => "SKY",
     }
 }
 
@@ -398,6 +406,7 @@ pub fn generate_space_name(btype: BroadcastType, region: Option<TerrestrialRegio
         BroadcastType::BS => "BS".to_string(),
         BroadcastType::CS => "CS".to_string(),
         BroadcastType::FourK => "BS4K".to_string(),
+        BroadcastType::Sky => "SKY".to_string(),
         BroadcastType::Terrestrial => {
             if let Some(r) = region {
                 format!("地デジ ({})", r.display_name())
@@ -463,11 +472,24 @@ mod tests {
 
     #[test]
     fn test_cs_classification() {
-        for nid in [6, 7, 10] {
+        for nid in [6, 7] {
             let (btype, region) = classify_nid(nid);
             assert_eq!(btype, BroadcastType::CS);
             assert!(region.is_none());
         }
+    }
+
+    #[test]
+    fn sky_premium_nids_classify_separately_from_110_degree_cs() {
+        for nid in [0x000A, 0x0001, 0x0003] {
+            assert_eq!(classify_nid(nid), (BroadcastType::Sky, None));
+            assert_eq!(crate::types::BandType::from_nid(nid), crate::types::BandType::SKY);
+        }
+        assert_eq!(classify_nid(6).0, BroadcastType::CS);
+        assert_eq!(classify_nid(7).0, BroadcastType::CS);
+        assert_eq!(broadcast_type_name(BroadcastType::Sky), "SKY");
+        assert_eq!(broadcast_type_name_en(BroadcastType::Sky), "SKY");
+        assert_eq!(generate_space_name(BroadcastType::Sky, None), "SKY");
     }
 
     #[test]
@@ -542,7 +564,6 @@ mod tests {
         assert!(matches!(region, Some(TerrestrialRegion::Unknown(0x1000))));
     }
 
-    #[test]
     /// NID 0x000B (高度BS) is far below the terrestrial NID range, so before
     /// it was matched explicitly it fell through to `classify_terrestrial_nid`
     /// and came back as `Terrestrial(Unknown(11))`. `BandType::from_nid` has

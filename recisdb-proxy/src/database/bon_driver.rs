@@ -335,6 +335,15 @@ impl Database {
         Ok(())
     }
 
+    /// Disable stale physical-space-3 rows after the backend's channel plan changes.
+    pub fn disable_space3_channels(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE channels SET is_enabled = 0, updated_at = strftime('%s', 'now') WHERE bon_driver_id = ?1 AND bon_space = 3",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// Get all BonDrivers in a group by group_name.
     pub fn get_group_drivers(&self, group_name: &str) -> Result<Vec<BonDriverRecord>> {
         let mut stmt = self.conn.prepare(
@@ -519,6 +528,63 @@ mod tests {
         let future = chrono::Utc::now().timestamp() + 24 * 3600;
         db.update_next_scan(id, Some(future)).unwrap();
         assert!(db.get_due_bon_drivers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalidating_space_three_preserves_other_spaces_and_requests_scan() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .insert_bon_driver(&NewBonDriver::new("px4daemon:0+j83b"))
+            .unwrap();
+        for (space, nid) in [(0, 0x7FE8), (3, 0x000A)] {
+            db.conn.execute(
+                "INSERT INTO channels (bon_driver_id,nid,sid,tsid,bon_space,bon_channel,is_enabled) VALUES (?1,?2,1,1,?3,0,1)",
+                rusqlite::params![id, nid, space],
+            ).unwrap();
+        }
+        db.update_bon_driver_path(id, "px4daemon:0").unwrap();
+        db.disable_space3_channels(id).unwrap();
+        db.request_immediate_scan(id).unwrap();
+        let enabled_spaces: Vec<i64> = db.conn.prepare(
+            "SELECT bon_space FROM channels WHERE bon_driver_id=?1 AND is_enabled=1 ORDER BY bon_space"
+        ).unwrap().query_map([id], |row| row.get(0)).unwrap().map(|row| row.unwrap()).collect();
+        assert_eq!(enabled_spaces, vec![0]);
+        assert_eq!(
+            db.get_bon_driver(id).unwrap().unwrap().next_scan_at,
+            Some(0)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adding_lnb_does_not_invalidate_space_three_channels() {
+        let db = Database::open_in_memory().unwrap();
+        let old_path = "px4daemon:0+j83b";
+        let new_path = "px4daemon:0+lnb+j83b";
+        let id = db.insert_bon_driver(&NewBonDriver::new(old_path)).unwrap();
+        db.conn.execute(
+            "INSERT INTO channels (bon_driver_id,nid,sid,tsid,bon_space,bon_channel,is_enabled) VALUES (?1,10,1,1,3,0,1)",
+            [id],
+        ).unwrap();
+
+        let plan_changed = crate::bondriver::px4_daemon::space_channel_plan(old_path)
+            != crate::bondriver::px4_daemon::space_channel_plan(new_path);
+        db.update_bon_driver_path(id, new_path).unwrap();
+        if plan_changed {
+            db.disable_space3_channels(id).unwrap();
+            db.request_immediate_scan(id).unwrap();
+        }
+
+        let enabled: i64 = db
+            .conn
+            .query_row(
+                "SELECT is_enabled FROM channels WHERE bon_driver_id=?1 AND bon_space=3",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+        assert_eq!(db.get_bon_driver(id).unwrap().unwrap().next_scan_at, None);
     }
 
     #[test]

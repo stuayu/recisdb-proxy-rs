@@ -686,6 +686,8 @@ pub enum BroadcastType {
     /// not the 4K-specific 0xAD, so nothing else in the stream distinguishes
     /// them.
     FourK,
+    /// 124/128-degree CS premium service (スカパー!プレミアム). NID 0x000A / 0x0001 / 0x0003.
+    Sky,
 }
 
 /// Channel key for identifying removed channels in updates.

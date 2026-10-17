@@ -406,6 +406,7 @@ fn encode_channel_filter(buf: &mut BytesMut, filter: &ChannelFilter) {
                 BroadcastType::BS => 1,
                 BroadcastType::CS => 2,
                 BroadcastType::FourK => 3,
+                BroadcastType::Sky => 4,
             });
         }
         None => {
@@ -434,6 +435,7 @@ fn decode_channel_filter(buf: &mut Bytes) -> Result<ChannelFilter, ProtocolError
             0 => BroadcastType::Terrestrial,
             1 => BroadcastType::BS,
             3 => BroadcastType::FourK,
+            4 => BroadcastType::Sky,
             // 2 and anything unknown: CS is the historical fallback. A peer
             // that predates FourK encodes/decodes 3 as CS; both ends ship
             // together, so this only matters for a mixed-version pair.
@@ -1199,6 +1201,25 @@ mod tests {
         let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
         let decoded = decode_client_message(header.message_type, payload).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn channel_filter_round_trips_sky_broadcast_type() {
+        let msg = ClientMessage::GetChannelList {
+            filter: Some(ChannelFilter {
+                nid: Some(0x000A),
+                tsid: None,
+                broadcast_type: Some(BroadcastType::Sky),
+                enabled_only: false,
+            }),
+        };
+        let encoded = encode_client_message(&msg).unwrap();
+        let header = decode_header(&encoded).unwrap().unwrap();
+        let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
+        assert_eq!(
+            decode_client_message(header.message_type, payload).unwrap(),
+            msg
+        );
     }
 
     #[test]

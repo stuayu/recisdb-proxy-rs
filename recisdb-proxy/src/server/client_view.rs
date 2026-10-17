@@ -89,6 +89,7 @@ pub fn region_key_for_nid(nid: u16) -> &'static str {
     match btype {
         BroadcastType::BS => "BS",
         BroadcastType::CS => "CS",
+        BroadcastType::Sky => "SKY",
         BroadcastType::FourK => "BS4K",
         BroadcastType::Terrestrial => match terrestrial_region {
             Some(TerrestrialRegion::Unknown(_)) | None => "Unknown",
@@ -163,17 +164,16 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
         );
     }
 
-    // Order: terrestrial regions (sorted by region key), then BS, then CS,
-    // then BS4K.
+    // Order: terrestrial regions, BS, CS, BS4K, then SKY.
     //
-    // BS4K goes last on purpose. The space index is the client's addressing
-    // scheme (.ch2 / ChSet5), so inserting a space anywhere but the end
-    // renumbers everything after it and silently repoints existing presets.
-    // Appended last, a setup with no 4K channels keeps every index it had.
+    // BS4K and SKY are appended last in that order. The space index is the
+    // client's addressing scheme (.ch2 / ChSet5); appending SKY after BS4K
+    // preserves every existing index, including the BS4K index.
     let mut terrestrial: Vec<SpaceEntry> = Vec::new();
     let mut bs: Option<SpaceEntry> = None;
     let mut cs: Option<SpaceEntry> = None;
     let mut four_k: Option<SpaceEntry> = None;
+    let mut sky: Option<SpaceEntry> = None;
 
     for (region_key, (actual_space, display_name)) in space_region_names {
         let entry = SpaceEntry {
@@ -185,6 +185,7 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
             "BS" => bs = Some(entry),
             "CS" => cs = Some(entry),
             "BS4K" => four_k = Some(entry),
+            "SKY" => sky = Some(entry),
             _ => terrestrial.push(entry),
         }
     }
@@ -194,6 +195,7 @@ pub fn build_space_list<F: Fn(&str) -> bool>(
     spaces.extend(bs);
     spaces.extend(cs);
     spaces.extend(four_k);
+    spaces.extend(sky);
 
     SpaceListResult {
         spaces,
@@ -431,6 +433,24 @@ mod tests {
             "existing spaces must keep their indices when 4K appears"
         );
         assert_eq!(result.spaces[3].display_name, "BS4K");
+    }
+
+    #[test]
+    fn sky_is_after_four_k_without_shifting_four_k_index() {
+        let d = driver(1, "BonDriver_A.dll", None);
+        let base = vec![
+            row(&d, 0x0004, 0x4010, 101, Some("BS朝日"), 1, 0, true),
+            row(&d, 0x7FE8, 0x7FE8, 1024, Some("NHK総合"), 0, 27, true),
+            row(&d, 0x0006, 0x6020, 100, Some("CS100"), 2, 0, true),
+            row(&d, 0x000B, 0xB070, 0x97, Some("4K"), 3, 0, true),
+        ];
+        let before = build_space_list(&base, |_| true).spaces;
+        let mut with_sky = base;
+        with_sky.push(row(&d, 0x000A, 0x1000, 1, Some("SPHD"), 3, 0, true));
+        let after = build_space_list(&with_sky, |_| true).spaces;
+        assert_eq!(before[3].region_key, "BS4K");
+        assert_eq!(after[3].region_key, "BS4K");
+        assert_eq!(after[4].region_key, "SKY");
     }
 
     /// Before 4K was classified, NID 0x000B fell through to the terrestrial

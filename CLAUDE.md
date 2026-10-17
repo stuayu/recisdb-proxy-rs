@@ -86,7 +86,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - クライアントに見せる space/channel は**仮想インデックス**(`server/client_view.rs`)。space=放送地域(地デジ広域圏→BS→CS)、channel=(NID,TSID)で重複排除し (NID,TSID) 昇順。
 - 関東広域(NHK等)と県域局(テレ玉等)は**同じ「関東」スペース**に入り、県域局のNIDの方が小さいので先頭側に並ぶ。
 - インデックスはDBの channels テーブルの内容から導出されるため、**スキャンでDBが変わると既存クライアント(.ch2/TVTestスキャン結果)のインデックスとズレる**。チャンネル列挙順に影響する変更をしたら .ch2/ChSet の再生成が必要な旨を必ず告知すること。
-- 空間の並びは **地デジ→BS→CS→BS4K**。4Kは必ず末尾に置く(途中に挿すと以降のインデックスが全部ずれる)。
+- 空間の並びは **地デジ→BS→CS→BS4K→SKY**。新しい空間は必ず末尾へ足す(途中に挿すと以降のインデックスが全部ずれる)。SKY(スカパー!プレミアム, NID 0x000A等)は110°CSとは別の `BroadcastType::Sky` で、BS4Kの番号を保つためその後ろに置く。
 - **Mirakurun互換API(`/mirakurun/api/*`)は channels テーブルをそのまま出さない**。テーブルは (BonDriver, サービス) ごとに1行なので、同じサービスが複数行ある(本番で 770行=307サービス)。`/services`・`/channels` は `unique_services()` で (NID,SID) ごとに1行へ畳んでから返す。**Mirakurun の `/services` は1サービス1件、`(type, channel)` は1つのmultiplexを指す**のが契約で、崩すとEPGStation側で「最後の行が勝つ」ため放送局名やチャンネルが不定になる(`docs/EPGSTATION_COMPAT.md` §5.2)。
 - 地上波の `(type, channel)` は `physical_ch` だけでは一意にならない(複数地域を束ねる構成では物理15chに7つのNIDが乗る)。`assign_channel_strings()` が衝突したものだけ `15_32416` 形式へ振り分ける。地元以外を `NW1`〜`NW40` へ分ける設定(`[mirakurun] home_region`)を使うと地域ごとに名前空間が分かれるので衝突自体が減る。**`NWn` の番号は地域IDの昇順**で、受信地域が増えると後ろの番号がずれる(放送局IDは変わらないのでEPGStationの予約・録画は維持される)。
 
