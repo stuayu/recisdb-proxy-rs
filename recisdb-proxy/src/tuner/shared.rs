@@ -187,11 +187,94 @@ const MAX_TS_READ_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 /// 「視聴できない」に格上げしてはいけない。
 const B25_INIT_BUDGET: Duration = Duration::from_secs(3);
 
-/// B25 デコーダが使えるかどうかの判定結果。
-///
-/// `None` = まだ調べていない。判定は [`probe_b25_availability`] が別スレッドで
-/// 行い、ここに書き戻す。
-static B25_AVAILABLE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+/// 一時的なカードサービス/DLL準備失敗から回復するための再判定間隔。
+const B25_PROBE_INITIAL_BACKOFF: Duration = Duration::from_secs(15);
+const B25_PROBE_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// デコーダ生成はカードI/Oを伴うため、読み取りループではこの間隔でのみ再試行する。
+const B25_DECODER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// 生TSで流している間の状態確認間隔。起動直後の判定完了を待っていたリーダーが、
+/// 判定成功から数秒で復号に切り替わるようにする (Mutexを取るだけでカードI/Oはしない)。
+const B25_STATE_POLL_WHILE_RAW: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B25Availability {
+    Unknown,
+    Probing {
+        failures: u32,
+        was_unavailable: bool,
+    },
+    Available,
+    Unavailable {
+        checked_at: std::time::Instant,
+        failures: u32,
+    },
+}
+
+static B25_AVAILABLE: std::sync::Mutex<B25Availability> =
+    std::sync::Mutex::new(B25Availability::Unknown);
+
+fn probe_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(31);
+    B25_PROBE_INITIAL_BACKOFF
+        .checked_mul(1u32 << shift)
+        .unwrap_or(B25_PROBE_MAX_BACKOFF)
+        .min(B25_PROBE_MAX_BACKOFF)
+}
+
+/// Pure state transition: reserve at most one probe once unknown or expired.
+fn begin_probe(state: &mut B25Availability, now: std::time::Instant) -> bool {
+    let (failures, was_unavailable) = match *state {
+        B25Availability::Unknown => (0, false),
+        B25Availability::Unavailable {
+            checked_at,
+            failures,
+        } if now.saturating_duration_since(checked_at) >= probe_backoff(failures) => {
+            (failures, true)
+        }
+        B25Availability::Probing { .. }
+        | B25Availability::Available
+        | B25Availability::Unavailable { .. } => return false,
+    };
+    *state = B25Availability::Probing {
+        failures,
+        was_unavailable,
+    };
+    true
+}
+
+fn finish_probe(state: &mut B25Availability, now: std::time::Instant, available: bool) -> bool {
+    let (failures, was_unavailable) = match *state {
+        B25Availability::Probing {
+            failures,
+            was_unavailable,
+        } => (failures, was_unavailable),
+        _ => return false,
+    };
+    if available {
+        *state = B25Availability::Available;
+        was_unavailable
+    } else {
+        *state = B25Availability::Unavailable {
+            checked_at: now,
+            failures: failures.saturating_add(1),
+        };
+        false
+    }
+}
+
+fn decoder_retry_allowed(
+    enabled: bool,
+    has_specific_reader: bool,
+    available: bool,
+    last_attempt: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    enabled
+        && (has_specific_reader || available)
+        && last_attempt.map_or(true, |last| {
+            now.saturating_duration_since(last) >= B25_DECODER_RETRY_INTERVAL
+        })
+}
 
 /// B25 デコーダが使えるかを別スレッドで調べ、結果を [`B25_AVAILABLE`] に残す。
 ///
@@ -202,10 +285,10 @@ static B25_AVAILABLE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(Non
 /// 起動時に一度呼んでおけば、最初の視聴要求が来るころには答えが出ている。
 /// 判定にかかる時間はカードリーダー次第で、応答しないカードだと十数秒かかる。
 pub fn probe_b25_availability() {
-    // 既に判定済み、または判定中なら何もしない。
+    // 状態を Probing にしてから spawn するため、同時要求でもスレッドは1本だけ。
     {
-        let guard = B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
+        let mut guard = B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if !begin_probe(&mut guard, std::time::Instant::now()) {
             return;
         }
     }
@@ -222,7 +305,7 @@ pub fn probe_b25_availability() {
         let available = match B25Pipe::new(opt) {
             Ok(_decoder) => true, // ここで drop され、カードとの接続も閉じる
             Err(e) => {
-                error!("[B25] デコーダを初期化できませんでした: {}", e);
+                warn!("[B25] デコーダを初期化できませんでした: {}", e);
                 false
             }
         };
@@ -239,7 +322,14 @@ pub fn probe_b25_availability() {
             warn!("[B25] スクランブル解除なしで配信します (生TS)");
         }
 
-        *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(available);
+        let recovered = finish_probe(
+            &mut B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()),
+            std::time::Instant::now(),
+            available,
+        );
+        if recovered {
+            info!("[B25] カードリーダーが利用可能になり、スクランブル解除を再開します");
+        }
     });
 }
 
@@ -253,15 +343,6 @@ pub fn probe_b25_availability() {
 ///
 /// そのため、判定が済んでいなければこの回は生TSで配信し、判定を裏で走らせる。
 /// 次のリーダー起動からは答えが出ている。
-/// 判定が済んでいて、かつ「使える」だったか。読み取りループが作り直しの
-/// 要否を判断するのに使う。
-fn b25_known_available() -> bool {
-    matches!(
-        *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()),
-        Some(true)
-    )
-}
-
 fn init_b25_with_deadline(opt: DecoderOptions, card_reader: Option<&str>) -> Option<B25Pipe> {
     // The startup probe only tests the Web UI's default reader. A NID-specific
     // reader may contain a different card (or be the only remote reader), so
@@ -280,7 +361,7 @@ fn init_b25_with_deadline(opt: DecoderOptions, card_reader: Option<&str>) -> Opt
     }
     let known = *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
     match known {
-        Some(true) => match B25Pipe::with_card_reader(opt, card_reader) {
+        B25Availability::Available => match B25Pipe::with_card_reader(opt, card_reader) {
             Ok(decoder) => {
                 info!("[SharedTuner] B25 decoder enabled");
                 Some(decoder)
@@ -288,12 +369,25 @@ fn init_b25_with_deadline(opt: DecoderOptions, card_reader: Option<&str>) -> Opt
             Err(e) => {
                 // 判定後にカードが抜かれた等。次回の判定をやり直させる。
                 error!("[SharedTuner] Failed to init B25 decoder: {}", e);
-                *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) =
+                    B25Availability::Unavailable {
+                        checked_at: std::time::Instant::now(),
+                        failures: 1,
+                    };
                 None
             }
         },
-        Some(false) => None,
-        None => {
+        B25Availability::Unavailable {
+            checked_at,
+            failures,
+        } if std::time::Instant::now().saturating_duration_since(checked_at)
+            >= probe_backoff(failures) =>
+        {
+            probe_b25_availability();
+            None
+        }
+        B25Availability::Unavailable { .. } | B25Availability::Probing { .. } => None,
+        B25Availability::Unknown => {
             warn!(
                 "[SharedTuner] B25デコーダの可否を判定中です。この配信は生TS \
                  (スクランブル解除なし) になります"
@@ -1320,9 +1414,13 @@ impl SharedTuner {
             );
             None
         };
-        // 判定中に起動した場合の作り直しは1回だけ。毎チャンク試すと、
-        // カードが遅い環境で読み取りループが止まり続ける。
-        let mut b25_init_retried = false;
+        // 状態確認はTSチャンクごとではなく間隔を空けて行い、カードI/Oは30秒ごとに限る。
+        // 起動時に判定待ちで作らなかった場合は試行扱いにしない。判定が済みしだい
+        // (次の状態確認で) すぐ作れるようにするため。
+        let mut b25_last_attempt = (startup_config.b25_enabled
+            && (b25.is_some() || startup_config.b25_card_reader.is_some()))
+        .then(std::time::Instant::now);
+        let mut b25_last_check = std::time::Instant::now();
 
         // Track decoder state
         let mut b25_needs_reset = false;
@@ -1655,27 +1753,50 @@ impl SharedTuner {
                         None => &buf[..n],
                     };
 
-                    // 起動時はB25の可否がまだ分かっていないことがある
-                    // (`init_b25_with_deadline` 参照)。判定が「使える」で
-                    // 確定したら、ここで一度だけデコーダを作る。これをやらないと、
-                    // 判定中に始まったリーダーは以後ずっとスクランブルされたままの
-                    // TSを流し続ける (視聴者には「映像が出ない」としか見えない)。
+                    // 起動時失敗や後発のカード準備完了から復帰できるよう、
+                    // Mutex確認とデコーダ生成を30秒間隔に制限する。
+                    let now = std::time::Instant::now();
+                    let check_interval = if b25.is_none() {
+                        B25_STATE_POLL_WHILE_RAW
+                    } else {
+                        B25_DECODER_RETRY_INTERVAL
+                    };
                     if startup_config.b25_enabled
-                        && b25.is_none()
-                        && !b25_init_retried
-                        && b25_known_available()
+                        && now.saturating_duration_since(b25_last_check) >= check_interval
                     {
-                        b25_init_retried = true;
-                        b25 = init_b25_with_deadline(
-                            DecoderOptions {
-                                strip: true,
-                                emm: true,
-                                simd: true,
-                                round: 4,
-                                enable_working_key: false,
-                            },
-                            startup_config.b25_card_reader.as_deref(),
-                        );
+                        b25_last_check = now;
+                        let state = *B25_AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
+                        if let B25Availability::Unavailable {
+                            checked_at,
+                            failures,
+                        } = state
+                        {
+                            if now.saturating_duration_since(checked_at) >= probe_backoff(failures)
+                            {
+                                probe_b25_availability();
+                            }
+                        }
+                        if b25.is_none()
+                            && decoder_retry_allowed(
+                                startup_config.b25_enabled,
+                                startup_config.b25_card_reader.is_some(),
+                                matches!(state, B25Availability::Available),
+                                b25_last_attempt,
+                                now,
+                            )
+                        {
+                            b25_last_attempt = Some(now);
+                            b25 = init_b25_with_deadline(
+                                DecoderOptions {
+                                    strip: true,
+                                    emm: true,
+                                    simd: true,
+                                    round: 4,
+                                    enable_working_key: false,
+                                },
+                                startup_config.b25_card_reader.as_deref(),
+                            );
+                        }
                     }
 
                     // Data validation before B25 decode (log only on first packet)
@@ -3283,5 +3404,60 @@ mod scramble_watch_tests {
         let key = ChannelKey::simple("/dev/test", 1);
         watch.observe(&key, &vec![0u8; 188 * 4]);
         assert_eq!(watch.scrambled + watch.clear, 0);
+    }
+
+    #[test]
+    fn unavailable_probe_waits_for_backoff_then_can_restart() {
+        let now = std::time::Instant::now();
+        let mut state = B25Availability::Unknown;
+        assert!(begin_probe(&mut state, now));
+        assert!(!begin_probe(&mut state, now));
+        assert!(!finish_probe(&mut state, now, false));
+        assert!(matches!(
+            state,
+            B25Availability::Unavailable { failures: 1, .. }
+        ));
+        assert!(!begin_probe(&mut state, now + Duration::from_secs(14)));
+        assert!(begin_probe(&mut state, now + Duration::from_secs(15)));
+        assert!(!begin_probe(&mut state, now + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn probe_backoff_grows_and_caps_at_five_minutes() {
+        assert_eq!(probe_backoff(1), Duration::from_secs(15));
+        assert_eq!(probe_backoff(2), Duration::from_secs(30));
+        assert_eq!(probe_backoff(3), Duration::from_secs(60));
+        assert_eq!(probe_backoff(20), B25_PROBE_MAX_BACKOFF);
+        assert_eq!(probe_backoff(u32::MAX), B25_PROBE_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn probe_success_resets_failure_history_and_reports_recovery() {
+        let now = std::time::Instant::now();
+        let mut state = B25Availability::Unavailable {
+            checked_at: now - probe_backoff(7),
+            failures: 7,
+        };
+        assert!(begin_probe(&mut state, now));
+        assert!(finish_probe(&mut state, now, true));
+        assert_eq!(state, B25Availability::Available);
+        assert!(!begin_probe(&mut state, now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn decoder_retry_requires_interval_availability_and_enabled_source() {
+        let now = std::time::Instant::now();
+        let previous = Some(now);
+        assert!(!decoder_retry_allowed(true, false, true, previous, now));
+        assert!(decoder_retry_allowed(
+            true,
+            false,
+            true,
+            previous,
+            now + B25_DECODER_RETRY_INTERVAL
+        ));
+        // NID-specific reader does not depend on the process-wide default probe.
+        assert!(decoder_retry_allowed(true, true, false, None, now));
+        assert!(!decoder_retry_allowed(false, true, true, None, now));
     }
 }
