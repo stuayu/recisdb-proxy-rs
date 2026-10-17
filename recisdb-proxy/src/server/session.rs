@@ -946,6 +946,14 @@ impl Session {
             ),
         )
         .await
+        .map_err(|e| {
+            // Without this the caller only reports the local AtCapacity, so a
+            // fallback that never reaches the peer is invisible.
+            warn!(
+                "[Session {}] remote fallback for NID 0x{:04X} TSID 0x{:04X} failed: {}",
+                self.id, nid, tsid, e
+            );
+        })
         .ok()
     }
 
