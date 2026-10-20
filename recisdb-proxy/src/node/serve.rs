@@ -131,6 +131,10 @@ pub struct ProgramUpsertWire {
     #[serde(default)]
     pub shared_event_id: Option<u16>,
     #[serde(default)]
+    pub audios: Option<Vec<crate::ts_analyzer::EitAudioComponent>>,
+    #[serde(default)]
+    pub video: Option<crate::ts_analyzer::EitVideoComponent>,
+    #[serde(default)]
     pub pf_updated_at: Option<i64>,
     #[serde(default)]
     pub schedule_updated_at: Option<i64>,
@@ -156,6 +160,8 @@ impl From<ProgramUpsert> for ProgramUpsertWire {
             extended_updated_at: value.extended_updated_at,
             shared_sid: value.shared_sid,
             shared_event_id: value.shared_event_id,
+            audios: value.audios,
+            video: value.video,
             pf_updated_at: None,
             schedule_updated_at: None,
         }
@@ -193,6 +199,8 @@ impl From<ProgramUpsertWire> for ProgramUpsert {
             extended_updated_at,
             shared_sid: value.shared_sid,
             shared_event_id: value.shared_event_id,
+            audios: value.audios,
+            video: value.video,
         }
     }
 }

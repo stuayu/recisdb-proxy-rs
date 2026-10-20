@@ -177,6 +177,8 @@ mod tests {
             description: Some("description".into()),
             extended: None,
             genre: Some(7),
+            audios: None,
+            video: None,
             updated_at: 8,
             source: crate::database::EpgSource::Schedule,
             basic_updated_at: Some(8),

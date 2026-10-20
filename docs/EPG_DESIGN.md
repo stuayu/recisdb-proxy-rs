@@ -19,7 +19,7 @@ recisdb-proxy の番組表データがどこから来て、どう保存され、
                ├─ Mirakurunイベントは内容が変わった番組だけ配信
                ├─ programs由来coverageは成功upsertがある場合に最大60秒ごと更新
                └─ 約5分ごとに終了後24時間経過した行を削除
-                   programs テーブル (database/program.rs, Migration 015/025/026)
+                   programs テーブル (database/program.rs, Migration 015/025/026/042)
                      ├─ GET /api/programs        (web/api/programs.rs, ダッシュボード)
                      ├─ GET /api/programs/services (同上, 番組表の列=番組のあるサービス)
                      └─ GET /api/programs (Mirakurun互換, web/mirakurun.rs)
@@ -42,6 +42,26 @@ EPG schedulerで共有する。reader起動ごとに `reset()` し、collector�
 60秒経過したときだけ実行する(初回flushは即時可)。書き込み群は1 transaction。prune後は
 間隔に関係なく更新する。section completion/coverageの正は引き続き `section_coverage_until`。
 ```
+
+## 映像・音声コンポーネント
+
+`EitTable::parse` はイベント記述子ループから `component_descriptor` (0x50) と
+`audio_component_descriptor` (0xC4) を解析する。映像は `streamContent` / `componentType` から
+Mirakurun形式の `type` / `resolution` を導出し、元の `streamContent` / `componentType` も保持する。
+音声は `componentType` / `componentTag` / `isMain` / `samplingRate` / `langs` を保持する。
+未知の音声サンプルレートは `-1`、未知・不正な言語コードはMirakurun互換の `etc` とする。
+
+`ProgramUpsert` はEpgWriter経由で `programs.audios` / `programs.video` にJSONとして保存する
+(Migration 042)。記述子の無い入力は既存値をNULLで上書きしない。ノード間EPG同期とMirakurun
+イベント配信にも同じコンポーネント値を含める。旧DB行は新列NULLのまま保持し、次に記述子を
+含むEITを受信した時点で情報を保存する。
+
+Mirakurun互換 `/mirakurun/api/programs` は情報がある場合 `audios` 配列と `video` オブジェクトを
+返す。音声情報が無い番組では `audios` を省き、KonomiTVの旧形式音声参照向けに
+`audio: { componentType: 0, samplingRate: 0 }` を返す。KonomiTVは `Program.py:403-408` で
+`audios[0]` と `langs[0]` を無条件参照し、`audios` が無い場合は `Program.py:433-439` で
+`audio` を必須参照するため。空の `audios` 配列は安全な代替にならない。映像情報が無い場合は
+`video` を省く。
 
 ## 収集(受動収集)
 

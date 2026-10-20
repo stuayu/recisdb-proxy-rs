@@ -270,6 +270,8 @@ mod tests {
             description: Some("desc".to_string()),
             extended: None,
             genre: Some(0x71),
+            audios: None,
+            video: None,
             free_ca_mode: false,
             updated_at: 1_700_000_000,
             source: crate::database::EpgSource::PresentFollowing,

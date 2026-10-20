@@ -242,6 +242,12 @@ mod coverage_tests {
 /// collector が捨てるので、次に version が変わるまで埋まらない)。
 /// DB の UPSERT と同じく、記述子の系統ごとに新しい方を採る。
 fn merge_batched(existing: &mut ProgramUpsert, incoming: ProgramUpsert) {
+    if let Some(audios) = incoming.audios.filter(|items| !items.is_empty()) {
+        existing.audios = Some(audios);
+    }
+    if incoming.video.is_some() {
+        existing.video = incoming.video;
+    }
     if let (Some(shared_sid), Some(shared_event_id)) =
         (incoming.shared_sid, incoming.shared_event_id)
     {
@@ -288,6 +294,8 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            audios: None,
+            video: None,
             updated_at,
             source: EpgSource::Schedule,
             basic_updated_at: None,
@@ -322,6 +330,33 @@ mod tests {
         assert_eq!(batched.updated_at, 11);
         assert_eq!(batched.basic_updated_at, Some(10));
         assert_eq!(batched.extended_updated_at, Some(11));
+    }
+
+    #[test]
+    fn batched_events_keep_audio_video_metadata_from_either_section() {
+        let mut existing = row(10);
+        let incoming = ProgramUpsert {
+            audios: Some(vec![crate::ts_analyzer::EitAudioComponent {
+                component_type: 3,
+                component_tag: 1,
+                is_main: true,
+                sampling_rate: 48_000,
+                langs: vec!["jpn".into()],
+            }]),
+            video: Some(crate::ts_analyzer::EitVideoComponent {
+                video_type: Some("h.264".into()),
+                resolution: Some("1080i".into()),
+                stream_content: 5,
+                component_type: 0xB1,
+            }),
+            ..row(11)
+        };
+        merge_batched(&mut existing, incoming);
+        assert_eq!(existing.audios.as_ref().unwrap()[0].langs, ["jpn"]);
+        assert_eq!(
+            existing.video.as_ref().unwrap().resolution.as_deref(),
+            Some("1080i")
+        );
     }
 
     #[test]

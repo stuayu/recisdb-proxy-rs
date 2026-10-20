@@ -10,6 +10,29 @@ use super::descriptor_tag;
 use super::descriptors::{find_descriptor, parse_descriptor_loop};
 use super::psi::PsiSection;
 use crate::aribb24::decode_arib_string;
+use serde::{Deserialize, Serialize};
+
+/// Audio fields exposed by Mirakurun's ProgramAudio shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EitAudioComponent {
+    pub component_type: u8,
+    pub component_tag: u8,
+    pub is_main: bool,
+    pub sampling_rate: i32,
+    pub langs: Vec<String>,
+}
+
+/// Video fields exposed by Mirakurun's ProgramVideo shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EitVideoComponent {
+    #[serde(rename = "type")]
+    pub video_type: Option<String>,
+    pub resolution: Option<String>,
+    pub stream_content: u8,
+    pub component_type: u8,
+}
 
 /// One event (programme) entry from an EIT event loop.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +59,10 @@ pub struct EitEvent {
     /// `(content_nibble_level_1 << 4) | content_nibble_level_2` of the
     /// first content_descriptor genre entry, if present.
     pub genre: Option<u8>,
+    /// Audio components from audio_component_descriptor (0xC4).
+    pub audios: Vec<EitAudioComponent>,
+    /// Video component from component_descriptor (0x50).
+    pub video: Option<EitVideoComponent>,
     /// Shared events listed by event_group_descriptor(group_type=1).
     pub shared_events: Vec<(u16, u16)>,
 }
@@ -117,6 +144,8 @@ impl EitTable {
             let (name, description) = parse_short_event(descriptors);
             let extended = parse_extended_event(descriptors);
             let genre = parse_genre(descriptors);
+            let audios = parse_audio_components(descriptors);
+            let video = parse_video_component(descriptors);
             let shared_events = parse_shared_events(descriptors);
 
             events.push(EitEvent {
@@ -129,6 +158,8 @@ impl EitTable {
                 description,
                 extended,
                 genre,
+                audios,
+                video,
                 shared_events,
             });
         }
@@ -145,6 +176,87 @@ impl EitTable {
             last_table_id,
             events,
         })
+    }
+}
+
+fn parse_video_component(descriptors: &[u8]) -> Option<EitVideoComponent> {
+    let data = find_descriptor(descriptors, 0x50)?;
+    if data.len() < 6 {
+        return None;
+    }
+    let stream_content = data[0] & 0x0F;
+    let component_type = data[1];
+    let video_type = match stream_content {
+        1 => Some("mpeg2"),
+        5 => Some("h.264"),
+        9 => Some("h.265"),
+        _ => None,
+    }
+    .map(str::to_owned);
+    let resolution = match component_type {
+        0x01..=0x04 => Some("480i"),
+        0x83 => Some("4320p"),
+        0x91..=0x94 => Some("2160p"),
+        0xA1..=0xA4 => Some("480p"),
+        0xB1..=0xB4 => Some("1080i"),
+        0xC1..=0xC4 => Some("720p"),
+        0xD1..=0xD4 => Some("240p"),
+        0xE1..=0xE4 => Some("1080p"),
+        0xF1..=0xF4 => Some("180p"),
+        _ => None,
+    }
+    .map(str::to_owned);
+    Some(EitVideoComponent {
+        video_type,
+        resolution,
+        stream_content,
+        component_type,
+    })
+}
+
+fn parse_audio_components(descriptors: &[u8]) -> Vec<EitAudioComponent> {
+    parse_descriptor_loop(descriptors)
+        .into_iter()
+        .filter_map(|(tag, data)| {
+            if tag != 0xC4 || data.len() < 9 {
+                return None;
+            }
+            let flags = data[5];
+            let multilingual = flags & 0x80 != 0;
+            let sampling_rate = match (flags >> 1) & 0x07 {
+                1 => 16_000,
+                2 => 22_050,
+                3 => 24_000,
+                5 => 32_000,
+                6 => 44_100,
+                7 => 48_000,
+                _ => -1,
+            };
+            let mut langs = vec![parse_iso639_language(&data[6..9])];
+            if multilingual && data.len() >= 12 {
+                langs.push(parse_iso639_language(&data[9..12]));
+            } else if multilingual {
+                // Malformed multi-lingual metadata must still satisfy clients
+                // that unconditionally read the first two language slots.
+                langs.push("etc".to_string());
+            }
+            Some(EitAudioComponent {
+                component_type: data[1],
+                component_tag: data[2],
+                is_main: flags & 0x40 != 0,
+                sampling_rate,
+                langs,
+            })
+        })
+        .collect()
+}
+
+fn parse_iso639_language(bytes: &[u8]) -> String {
+    let code = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    // Match Mirakurun EPG.ts getLangCode's recognized ISO_639 set.
+    match code.as_str() {
+        "jpn" | "eng" | "deu" | "fra" | "ita" | "rus" | "zho" | "kor" | "spa" | "etc" => code,
+        _ => "etc".to_string(),
     }
 }
 
@@ -415,6 +527,39 @@ mod tests {
         assert_eq!(bcd_byte_to_u32(0x09), Some(9));
         assert_eq!(bcd_byte_to_u32(0x23), Some(23));
         assert_eq!(bcd_byte_to_u32(0x59), Some(59));
+    }
+
+    #[test]
+    fn parses_video_and_audio_component_descriptors() {
+        let descriptors = [
+            0x50, 6, 0x05, 0xB1, 0x10, b'j', b'p', b'n', 0xC4, 9, 0x02, 0x03, 0x21, 0x02, 0x00,
+            0x5F, b'j', b'p', b'n',
+        ];
+        let video = parse_video_component(&descriptors).unwrap();
+        assert_eq!(video.video_type.as_deref(), Some("h.264"));
+        assert_eq!(video.resolution.as_deref(), Some("1080i"));
+        assert_eq!((video.stream_content, video.component_type), (5, 0xB1));
+
+        let audios = parse_audio_components(&descriptors);
+        assert_eq!(audios.len(), 1);
+        assert_eq!(audios[0].component_type, 3);
+        assert_eq!(audios[0].component_tag, 0x21);
+        assert!(audios[0].is_main);
+        assert_eq!(audios[0].sampling_rate, 48_000);
+        assert_eq!(audios[0].langs, ["jpn"]);
+
+        let other_rate = [0xC4, 9, 0x02, 0x03, 0x21, 0x02, 0x00, 0x5B, b'e', b'n', b'g'];
+        let audio = parse_audio_components(&other_rate).remove(0);
+        assert_eq!(audio.sampling_rate, 32_000);
+        assert_eq!(audio.langs, ["eng"]);
+    }
+
+    #[test]
+    fn malformed_audio_language_is_normalized_and_multilingual_stays_nonempty() {
+        let descriptors = [0xC4, 12, 0x02, 0x02, 0x01, 0x02, 0x00, 0xFF, 0xFF, b'p', b'n', b'e', b'n', b'g'];
+        let audio = parse_audio_components(&descriptors).remove(0);
+        assert_eq!(audio.langs, ["etc", "eng"]);
+        assert_eq!(audio.sampling_rate, 48_000);
     }
 
     #[test]

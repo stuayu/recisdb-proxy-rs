@@ -67,6 +67,8 @@ pub enum DatabaseError {
 
     #[error("Migration failed: {0}")]
     MigrationFailed(String),
+    #[error("JSON encoding failed: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -317,6 +319,10 @@ impl Database {
             "041_boncaslink_settings",
             Database::migration_041_boncaslink_settings,
         ),
+        (
+            "042_programs_audio_video_components",
+            Database::migration_042_programs_audio_video_components,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -341,6 +347,11 @@ impl Database {
     fn migration_041_boncaslink_settings(&self) -> Result<()> {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS boncaslink_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS boncaslink_network_readers (nid INTEGER PRIMARY KEY, reader TEXT NOT NULL);")?;
         Ok(())
+    }
+
+    fn migration_042_programs_audio_video_components(&self) -> Result<()> {
+        self.add_column_if_not_exists("programs", "audios", "TEXT")?;
+        self.add_column_if_not_exists("programs", "video", "TEXT")
     }
 
     pub fn get_boncaslink_setting(&self, key: &str) -> Result<Option<String>> {
@@ -2564,6 +2575,37 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(final_version, target);
+    }
+
+    #[test]
+    fn migration_042_adds_component_columns_idempotently() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE programs (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO programs(id,name) VALUES (7,'legacy');",
+        )
+        .unwrap();
+        let db = Database { conn };
+        db.migration_042_programs_audio_video_components().unwrap();
+        db.migration_042_programs_audio_video_components().unwrap();
+        let columns: Vec<String> = db
+            .connection()
+            .prepare("PRAGMA table_info(programs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "audios"));
+        assert!(columns.iter().any(|name| name == "video"));
+        let legacy: (String, Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT name,audios,video FROM programs WHERE id=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, ("legacy".into(), None, None));
     }
 
     #[test]

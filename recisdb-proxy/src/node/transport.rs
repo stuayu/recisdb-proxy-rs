@@ -981,6 +981,8 @@ async fn epg_programs(
                         extended_updated_at: row.program.extended_updated_at,
                         shared_sid: row.program.shared_sid,
                         shared_event_id: row.program.shared_event_id,
+                        audios: row.program.audios,
+                        video: row.program.video,
                         pf_updated_at: row.pf_updated_at,
                         schedule_updated_at: row.schedule_updated_at,
                     })

@@ -142,6 +142,7 @@ use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
 use crate::tuner::logo_collector::{collected_logo_keys, logo_path};
 use crate::tuner::EffectiveClaim;
+use crate::ts_analyzer::{EitAudioComponent, EitVideoComponent};
 use crate::web::http_session::HttpStreamSession;
 use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
@@ -519,6 +520,20 @@ pub struct MirakurunProgram {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extended: Option<BTreeMap<String, String>>,
     pub genres: Vec<MirakurunGenre>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<EitVideoComponent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audios: Option<Vec<EitAudioComponent>>,
+    /// Mirakurun 3.8 compatibility fallback. See `build_mirakurun_program`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<MirakurunLegacyAudio>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirakurunLegacyAudio {
+    pub component_type: u8,
+    pub sampling_rate: i32,
 }
 
 /// A single genre entry in [`MirakurunProgram::genres`]. Real Mirakurun's
@@ -571,6 +586,8 @@ fn build_mirakurun_program(
     extended: Option<String>,
     genre: Option<i64>,
     free_ca_mode: bool,
+    audios: Option<Vec<EitAudioComponent>>,
+    video: Option<EitVideoComponent>,
 ) -> MirakurunProgram {
     let genres = genre
         .map(|g| {
@@ -581,6 +598,25 @@ fn build_mirakurun_program(
             }]
         })
         .unwrap_or_default();
+
+    let audios = audios.filter(|items| !items.is_empty()).map(|mut items| {
+        for item in &mut items {
+            if item.langs.is_empty() {
+                item.langs.push("etc".to_string());
+            }
+        }
+        items
+    });
+    // KonomiTV checks `audios` at Program.py:403-408, then requires `audio`
+    // at Program.py:433-439. Its 3.9 branch indexes audios[0] and langs[0]
+    // unconditionally. For old rows or EIT events without 0xC4, omit
+    // `audios` and provide neutral legacy fields so the fallback avoids
+    // KeyError; component type 0 and sampling rate 0 are unknown sentinels,
+    // not values inferred from the broadcast.
+    let audio = audios.is_none().then_some(MirakurunLegacyAudio {
+        component_type: 0,
+        sampling_rate: 0,
+    });
 
     MirakurunProgram {
         id: mirakurun_program_id(nid, sid, event_id),
@@ -597,6 +633,9 @@ fn build_mirakurun_program(
             .filter(|text| !text.is_empty())
             .map(|text| BTreeMap::from([("番組詳細".to_string(), text)])),
         genres,
+        video,
+        audios,
+        audio,
     }
 }
 
@@ -613,6 +652,8 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
         r.extended,
         r.genre,
         r.free_ca_mode,
+        r.audios,
+        r.video,
     )
 }
 
@@ -633,6 +674,8 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
         u.extended.clone(),
         u.genre,
         u.free_ca_mode,
+        u.audios.clone(),
+        u.video.clone(),
     )
 }
 
@@ -1604,6 +1647,56 @@ pub async fn stream_program_by_mirakurun_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_json_includes_component_shapes_and_safe_audio_fallback() {
+        let audio = EitAudioComponent {
+            component_type: 3,
+            component_tag: 7,
+            is_main: true,
+            sampling_rate: 48_000,
+            langs: vec!["jpn".into()],
+        };
+        let video = EitVideoComponent {
+            video_type: Some("h.264".into()),
+            resolution: Some("1080i".into()),
+            stream_content: 5,
+            component_type: 0xB1,
+        };
+        let program = build_mirakurun_program(
+            1,
+            2,
+            3,
+            4,
+            100,
+            30,
+            Some("title".into()),
+            None,
+            None,
+            None,
+            false,
+            Some(vec![audio]),
+            Some(video),
+        );
+        let json = serde_json::to_value(program).unwrap();
+        assert_eq!(json["audios"][0]["componentType"], 3);
+        assert_eq!(json["audios"][0]["componentTag"], 7);
+        assert_eq!(json["audios"][0]["isMain"], true);
+        assert_eq!(json["audios"][0]["samplingRate"], 48_000);
+        assert_eq!(json["audios"][0]["langs"][0], "jpn");
+        assert_eq!(json["video"]["type"], "h.264");
+        assert_eq!(json["video"]["resolution"], "1080i");
+        assert!(json.get("audio").is_none());
+
+        let old_row = build_mirakurun_program(
+            1, 2, 3, 5, 100, 30, None, None, None, None, false, None, None,
+        );
+        let json = serde_json::to_value(old_row).unwrap();
+        assert!(json.get("audios").is_none());
+        assert!(json.get("video").is_none());
+        assert_eq!(json["audio"]["componentType"], 0);
+        assert_eq!(json["audio"]["samplingRate"], 0);
+    }
 
     #[test]
     fn usable_channels_excludes_physical_channel_placeholders() {

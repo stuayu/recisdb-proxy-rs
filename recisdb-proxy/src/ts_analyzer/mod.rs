@@ -35,7 +35,7 @@ pub mod service_filter;
 
 pub use analyzer::{AnalyzerConfig, AnalyzerResult, TsAnalyzer};
 pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliveryDescriptor};
-pub use eit::{EitEvent, EitTable};
+pub use eit::{EitAudioComponent, EitEvent, EitTable, EitVideoComponent};
 pub use eit_tracker::{
     eit_kind, EitKind, EitServiceCompletion, EitServiceKey, EpgSectionTracker, ObserveOutcome,
     DEFAULT_MAX_SERVICES, ScheduleGap};

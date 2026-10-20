@@ -344,6 +344,10 @@ pub struct ProgramUpsert {
     /// `(content_nibble_level_1 << 4) | content_nibble_level_2` of the
     /// first content_descriptor genre entry, if present.
     pub genre: Option<i64>,
+    /// Parsed audio_component_descriptor (0xC4) entries.
+    pub audios: Option<Vec<crate::ts_analyzer::EitAudioComponent>>,
+    /// Parsed component_descriptor (0x50).
+    pub video: Option<crate::ts_analyzer::EitVideoComponent>,
     pub updated_at: i64,
     pub source: EpgSource,
     pub basic_updated_at: Option<i64>,
@@ -377,6 +381,8 @@ pub struct ProgramRecord {
     pub description: Option<String>,
     pub extended: Option<String>,
     pub genre: Option<i64>,
+    pub audios: Option<Vec<crate::ts_analyzer::EitAudioComponent>>,
+    pub video: Option<crate::ts_analyzer::EitVideoComponent>,
     pub updated_at: i64,
 }
 

@@ -900,6 +900,8 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            audios: None,
+            video: None,
             updated_at: 9_000,
             source: crate::database::EpgSource::PresentFollowing,
             basic_updated_at: Some(9_000),

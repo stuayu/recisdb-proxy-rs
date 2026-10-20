@@ -647,6 +647,8 @@ mod tests {
             description: None,
             extended: Some(format!("extended-{event_id}")),
             genre: None,
+            audios: None,
+            video: None,
             updated_at: 1,
             source: crate::database::EpgSource::Schedule,
             basic_updated_at: Some(1),

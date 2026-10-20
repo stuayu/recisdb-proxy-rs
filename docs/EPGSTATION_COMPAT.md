@@ -245,7 +245,8 @@ DB 挿入用データへ変換するループを 1 つ回すが、このルー�
   `web/mirakurun.rs::build_mirakurun_program` で `!free_ca_mode` として返す
   (Migration 026, 2026-08-31)。
 - `name` / `description` / `extended` / `genres`
-- `video` / `audio` (または `audios`) — 録画時のメタデータに入る
+- `video` / `audios` — Mirakurun形式の映像・音声コンポーネントを返す。EITの `component_descriptor` (0x50) / `audio_component_descriptor` (0xC4) から取得し、DBへ保存する。KonomiTV は `KonomiTV/server/app/models/Program.py:381-392` で `video` を任意参照し、同 `:403-408` で `audios[0]` と `langs[0]` を参照する。
+- 音声記述子が無い番組 — `audios` を省略し、旧形式 `audio: { componentType: 0, samplingRate: 0 }` を返す。KonomiTV は `KonomiTV/server/app/models/Program.py:433-439` で `audios` が無い場合に `audio` を必須参照する。`audios: []` は `audios[0]` で失敗するため返さない。映像記述子が無い場合は `video` を省略する。
 - `relatedItems` — **イベントリレー処理で参照する** (`EPGUpdateManageModel.ts:145-171`)
 
 **放送時間未定の番組**: ARIB の `duration = 0xFFFFFF` を本家 Mirakurun は `duration: 1` として返す。
@@ -607,7 +608,8 @@ first-TS猶予超過時は接続を終了する。開始待ちを示す独自chu
 | `X-Mirakurun-Priority` | 実装済み (2026-08-22、閾値設定を 2026-08-23 追加、claim購読を 2026-09-28 追加) | `/services/{id}/stream` と `/programs/{id}/stream` の両方で、ヘッダ値を `EffectiveClaim.priority` として `tuner::acquire::acquire` へ渡し、同じ priority/usage の claim 付き購読を作る (`channel_resolve::start_source_for_service_with_claim`)。**DB のチャンネル優先度を置き換えるのではなく、明示指定が無いときだけ DB 既定値へフォールバックする**。既存 reader の live exclusive claim はロックで、録画要求でも退避できない。録画判定の閾値は `[mirakurun] record_priority_threshold` (既定 1)。§5.6 |
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` | 実装済み (2026-09-04) | DB保存済みextended文字列を、型定義どおり `{ [description: string]: string }` として返す (`node_modules/mirakurun/api.d.ts:86-88`)。保存時点でARIB item境界を連結済みのため、復元を装わず単一の「番組詳細」項目に格納する。EPGStationは全key/valueを結合して詳細へ保存する (`src/model/db/ProgramDB.ts:274-288,325-340`) |
-| `Program.video` / `audio` / `relatedItems` | 無し | 映像・音声メタデータが埋まらず、イベントリレー不可。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が「未定義なら true」を返すため無害 |
+| `Program.video` / `audios` | 実装済み (2026-10-21) | EIT 0x50 / 0xC4 から取り込み、Migration 042で保存。情報がある場合のみMirakurun形式の `video` / `audios` を返す。記述子無しはKonomiTVの `Program.py:433-439` が必須参照する旧形式 `audio` に中立値を返す。§1 / `docs/EPG_DESIGN.md` |
+| `Program.relatedItems` | 無し | EPGStation のイベントリレーに未対応。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が未定義ならtrueを返すため、番組の通常取り込みには影響しない |
 | `isFree` | 常に `true` 固定 | 無料/有料の判別ができない |
 | 放送時間未定 (`duration: 1`) | 未確認 | 番組表・予約が壊れうる |
 | 衛星の `channel` 文字列 (`BS15_0` 形式) | 簡略化 | 表示のみ。実害は小さい |
@@ -624,7 +626,7 @@ first-TS猶予超過時は接続を終了する。開始待ちを示す独自chu
    `GET /programs/{id}/stream` の EIT[p/f] ゲートが実際の放送波で開閉するかは、EPGStation から
    予約を通して初めて確認できる (§7)
 2. ~~`X-Mirakurun-Priority` をチューナー競合ポリシーへ反映する~~ — 2026-08-22 実装 (§5.6)。実起動での競合検証は未実施
-3. `Program.video` / `audio` / `relatedItems`、放送時間未定 (`duration: 1`) — `programs` テーブルまたは収集モデルの拡張が前提
+3. `Program.relatedItems`、放送時間未定 (`duration: 1`) — `relatedItems` はイベントリレー実装が前提。放送時間未定は別途収集モデルの拡張が前提
 4. ~~`NW1`〜`NW40` (県外地上波)~~ — 2026-08-12 実装 (§5.3)。衛星の `channel` 文字列 (`BS15_0` 形式) は未対応のまま
 
 ## 7. 未確認事項
