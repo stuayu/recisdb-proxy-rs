@@ -323,6 +323,10 @@ impl Database {
             "042_programs_audio_video_components",
             Database::migration_042_programs_audio_video_components,
         ),
+        (
+            "043_programs_content_genres",
+            Database::migration_043_programs_content_genres,
+        ),
     ];
 
     /// EPG automatic collection is runtime state. Keep it in SQLite so a
@@ -352,6 +356,10 @@ impl Database {
     fn migration_042_programs_audio_video_components(&self) -> Result<()> {
         self.add_column_if_not_exists("programs", "audios", "TEXT")?;
         self.add_column_if_not_exists("programs", "video", "TEXT")
+    }
+
+    fn migration_043_programs_content_genres(&self) -> Result<()> {
+        self.add_column_if_not_exists("programs", "genres", "TEXT")
     }
 
     pub fn get_boncaslink_setting(&self, key: &str) -> Result<Option<String>> {

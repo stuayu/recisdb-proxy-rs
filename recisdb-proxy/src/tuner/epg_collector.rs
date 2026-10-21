@@ -409,6 +409,9 @@ impl EpgCollector {
                 description: description.clone(),
                 extended: extended.clone(),
                 genre,
+                genres: basic_allowed
+                    .then_some(event.genres.clone())
+                    .filter(|items| !items.is_empty()),
                 audios: (!event.audios.is_empty()).then_some(event.audios.clone()),
                 video: event.video.clone(),
                 updated_at: now,
@@ -567,6 +570,7 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            genres: None,
             audios: None,
             video: None,
             updated_at: 1,
@@ -915,6 +919,7 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            genres: None,
             audios: None,
             video: None,
             updated_at: 6,

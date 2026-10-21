@@ -177,6 +177,7 @@ mod tests {
             description: Some("description".into()),
             extended: None,
             genre: Some(7),
+            genres: None,
             audios: None,
             video: None,
             updated_at: 8,

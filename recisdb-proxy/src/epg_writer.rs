@@ -266,6 +266,9 @@ fn merge_batched(existing: &mut ProgramUpsert, incoming: ProgramUpsert) {
         existing.name = incoming.name.or(existing.name.take());
         existing.description = incoming.description.or(existing.description.take());
         existing.genre = incoming.genre.or(existing.genre);
+        if incoming.genres.is_some() {
+            existing.genres = incoming.genres;
+        }
         existing.basic_updated_at = incoming.basic_updated_at;
     }
     if incoming.extended_updated_at.is_some()
@@ -294,6 +297,7 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            genres: None,
             audios: None,
             video: None,
             updated_at,

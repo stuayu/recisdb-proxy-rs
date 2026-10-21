@@ -900,6 +900,7 @@ mod tests {
             description: None,
             extended: None,
             genre: None,
+            genres: None,
             audios: None,
             video: None,
             updated_at: 9_000,

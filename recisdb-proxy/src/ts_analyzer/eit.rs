@@ -34,6 +34,15 @@ pub struct EitVideoComponent {
     pub component_type: u8,
 }
 
+/// One content_descriptor (0x54) entry, including ARIB user nibbles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EitGenre {
+    pub lv1: u8,
+    pub lv2: u8,
+    pub un1: u8,
+    pub un2: u8,
+}
+
 /// One event (programme) entry from an EIT event loop.
 #[derive(Debug, Clone, Default)]
 pub struct EitEvent {
@@ -59,6 +68,8 @@ pub struct EitEvent {
     /// `(content_nibble_level_1 << 4) | content_nibble_level_2` of the
     /// first content_descriptor genre entry, if present.
     pub genre: Option<u8>,
+    /// Every entry from content_descriptor (0x54), in broadcast order.
+    pub genres: Vec<EitGenre>,
     /// Audio components from audio_component_descriptor (0xC4).
     pub audios: Vec<EitAudioComponent>,
     /// Video component from component_descriptor (0x50).
@@ -144,6 +155,7 @@ impl EitTable {
             let (name, description) = parse_short_event(descriptors);
             let extended = parse_extended_event(descriptors);
             let genre = parse_genre(descriptors);
+            let genres = parse_genres(descriptors);
             let audios = parse_audio_components(descriptors);
             let video = parse_video_component(descriptors);
             let shared_events = parse_shared_events(descriptors);
@@ -158,6 +170,7 @@ impl EitTable {
                 description,
                 extended,
                 genre,
+                genres,
                 audios,
                 video,
                 shared_events,
@@ -501,6 +514,24 @@ fn parse_genre(descriptors: &[u8]) -> Option<u8> {
     data.first().copied()
 }
 
+/// Extract all two-byte content_descriptor entries. Each entry packs
+/// level-1, level-2, user-1, user-2 as four consecutive nibbles.
+fn parse_genres(descriptors: &[u8]) -> Vec<EitGenre> {
+    let mut genres = Vec::new();
+    for (tag, data) in parse_descriptor_loop(descriptors) {
+        if tag != 0x54 {
+            continue;
+        }
+        genres.extend(data.chunks_exact(2).map(|entry| EitGenre {
+            lv1: entry[0] >> 4,
+            lv2: entry[0] & 0x0F,
+            un1: entry[1] >> 4,
+            un2: entry[1] & 0x0F,
+        }));
+    }
+    genres
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +655,18 @@ mod tests {
 
         assert_eq!(parse_genre(&descriptors), Some(0x21));
         assert_eq!(parse_genre(&[]), None);
+    }
+
+    #[test]
+    fn parses_all_content_descriptor_entries_and_user_nibbles() {
+        let descriptors = [0x54, 4, 0xE1, 0x23, 0x21, 0xAB];
+        assert_eq!(
+            parse_genres(&descriptors),
+            vec![
+                EitGenre { lv1: 0xE, lv2: 1, un1: 2, un2: 3 },
+                EitGenre { lv1: 2, lv2: 1, un1: 0xA, un2: 0xB },
+            ]
+        );
     }
 
     #[test]

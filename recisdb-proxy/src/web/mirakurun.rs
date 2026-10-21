@@ -544,6 +544,8 @@ pub struct MirakurunLegacyAudio {
 pub struct MirakurunGenre {
     pub lv1: u8,
     pub lv2: u8,
+    pub un1: u8,
+    pub un2: u8,
 }
 
 /// `(networkId * 100000 + serviceId) * 100000 + eventId` — see
@@ -585,19 +587,37 @@ fn build_mirakurun_program(
     description: Option<String>,
     extended: Option<String>,
     genre: Option<i64>,
+    genres: Option<Vec<crate::ts_analyzer::EitGenre>>,
     free_ca_mode: bool,
     audios: Option<Vec<EitAudioComponent>>,
     video: Option<EitVideoComponent>,
 ) -> MirakurunProgram {
-    let genres = genre
-        .map(|g| {
-            let g = g as u8;
-            vec![MirakurunGenre {
-                lv1: (g >> 4) & 0x0F,
-                lv2: g & 0x0F,
-            }]
+    let genres = genres
+        .filter(|items| !items.is_empty())
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| MirakurunGenre {
+                    lv1: item.lv1,
+                    lv2: item.lv2,
+                    un1: item.un1,
+                    un2: item.un2,
+                })
+                .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            genre
+                .map(|g| {
+                    let g = g as u8;
+                    vec![MirakurunGenre {
+                        lv1: (g >> 4) & 0x0F,
+                        lv2: g & 0x0F,
+                        un1: 0,
+                        un2: 0,
+                    }]
+                })
+                .unwrap_or_default()
+        });
 
     let audios = audios.filter(|items| !items.is_empty()).map(|mut items| {
         for item in &mut items {
@@ -651,6 +671,7 @@ fn program_record_to_mirakurun(r: ProgramRecord) -> MirakurunProgram {
         r.description,
         r.extended,
         r.genre,
+        r.genres,
         r.free_ca_mode,
         r.audios,
         r.video,
@@ -673,6 +694,7 @@ pub(crate) fn program_upsert_to_mirakurun(u: &ProgramUpsert) -> MirakurunProgram
         u.description.clone(),
         u.extended.clone(),
         u.genre,
+        u.genres.clone(),
         u.free_ca_mode,
         u.audios.clone(),
         u.video.clone(),
@@ -1674,6 +1696,12 @@ mod tests {
             None,
             None,
             None,
+            Some(vec![crate::ts_analyzer::EitGenre {
+                lv1: 0xE,
+                lv2: 1,
+                un1: 2,
+                un2: 3,
+            }]),
             false,
             Some(vec![audio]),
             Some(video),
@@ -1686,16 +1714,25 @@ mod tests {
         assert_eq!(json["audios"][0]["langs"][0], "jpn");
         assert_eq!(json["video"]["type"], "h.264");
         assert_eq!(json["video"]["resolution"], "1080i");
+        assert_eq!(json["genres"][0], serde_json::json!({
+            "lv1": 14, "lv2": 1, "un1": 2, "un2": 3
+        }));
         assert!(json.get("audio").is_none());
 
         let old_row = build_mirakurun_program(
-            1, 2, 3, 5, 100, 30, None, None, None, None, false, None, None,
+            1, 2, 3, 5, 100, 30, None, None, None, Some(0xE1), None, false, None, None,
         );
         let json = serde_json::to_value(old_row).unwrap();
         assert!(json.get("audios").is_none());
         assert!(json.get("video").is_none());
         assert_eq!(json["audio"]["componentType"], 0);
         assert_eq!(json["audio"]["samplingRate"], 0);
+        assert_eq!(json["genres"][0], serde_json::json!({
+            "lv1": 14, "lv2": 1, "un1": 0, "un2": 0
+        }));
+        for key in ["lv1", "lv2", "un1", "un2"] {
+            assert!(json["genres"][0].get(key).is_some());
+        }
     }
 
     #[test]

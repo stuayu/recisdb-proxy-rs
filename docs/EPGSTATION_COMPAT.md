@@ -245,7 +245,8 @@ DB 挿入用データへ変換するループを 1 つ回すが、このルー�
   `web/mirakurun.rs::build_mirakurun_program` で `!free_ca_mode` として返す
   (Migration 026, 2026-08-31)。
 - `name` / `description` / `extended` / `genres`
-- `video` / `audios` — Mirakurun形式の映像・音声コンポーネントを返す。EITの `component_descriptor` (0x50) / `audio_component_descriptor` (0xC4) から取得し、DBへ保存する。KonomiTV は `KonomiTV/server/app/models/Program.py:381-392` で `video` を任意参照し、同 `:403-408` で `audios[0]` と `langs[0]` を参照する。
+- `genres` — EIT `content_descriptor` (0x54) の全エントリを放送順に返す。各要素は `lv1` / `lv2` / `un1` / `un2` を含む。既存 `programs.genre` は維持し、新列がNULLの旧行は従来の1件へ `un1: 0` / `un2: 0` を補う。KonomiTV は `Program.py:354-379` で拡張ジャンルの一部について `un1` / `un2` を無条件参照する。
+- `video` / `audios` — Mirakurun形式の映像・音声コンポーネントを返す。EITの `component_descriptor` (0x50) / `audio_component_descriptor` (0xC4) から取得し、DBへ保存する。KonomiTV は `KonomiTV/server/app/models/Program.py:385-392` で `video` を任意参照し、同 `:403-420` で `audios[0]` と `langs[0]` を参照する。
 - 音声記述子が無い番組 — `audios` を省略し、旧形式 `audio: { componentType: 0, samplingRate: 0 }` を返す。KonomiTV は `KonomiTV/server/app/models/Program.py:433-439` で `audios` が無い場合に `audio` を必須参照する。`audios: []` は `audios[0]` で失敗するため返さない。映像記述子が無い場合は `video` を省略する。
 - `relatedItems` — **イベントリレー処理で参照する** (`EPGUpdateManageModel.ts:145-171`)
 
@@ -609,6 +610,7 @@ first-TS猶予超過時は接続を終了する。開始待ちを示す独自chu
 | `NW1`〜`NW40` | 実装済み (2026-08-12) | `[mirakurun] home_region` に地元の都道府県名を設定すると、その地域の地上波だけ `GR`、他は地域ID昇順で `NW1`〜`NW40` (`web/mirakurun.rs::terrestrial_type_map`)。未設定なら従来どおり全地上波が `GR`。§5.3 |
 | `Program.extended` | 実装済み (2026-09-04) | DB保存済みextended文字列を、型定義どおり `{ [description: string]: string }` として返す (`node_modules/mirakurun/api.d.ts:86-88`)。保存時点でARIB item境界を連結済みのため、復元を装わず単一の「番組詳細」項目に格納する。EPGStationは全key/valueを結合して詳細へ保存する (`src/model/db/ProgramDB.ts:274-288,325-340`) |
 | `Program.video` / `audios` | 実装済み (2026-10-21) | EIT 0x50 / 0xC4 から取り込み、Migration 042で保存。情報がある場合のみMirakurun形式の `video` / `audios` を返す。記述子無しはKonomiTVの `Program.py:433-439` が必須参照する旧形式 `audio` に中立値を返す。§1 / `docs/EPG_DESIGN.md` |
+| `Program.genres[*].lv1/lv2/un1/un2` | 実装済み (2026-10-21) | EIT 0x54 の全エントリを Migration 043 で保存し、番組API / イベント配信 / ノード同期へ流す。KonomiTV の `Program.py:355-375` が拡張ジャンルで参照する `un1` / `un2` を含め、各要素に4キーを出す。既存 `genre` 列は維持。§1 |
 | `Program.relatedItems` | 無し | EPGStation のイベントリレーに未対応。`relatedItems` が無いこと自体は EPGStation の `isMainProgram()` が未定義ならtrueを返すため、番組の通常取り込みには影響しない |
 | `isFree` | 常に `true` 固定 | 無料/有料の判別ができない |
 | 放送時間未定 (`duration: 1`) | 未確認 | 番組表・予約が壊れうる |

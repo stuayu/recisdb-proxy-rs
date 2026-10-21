@@ -975,6 +975,7 @@ async fn epg_programs(
                         description: row.program.description,
                         extended: row.program.extended,
                         genre: row.program.genre,
+                        genres: row.program.genres,
                         updated_at: row.program.updated_at,
                         source: row.program.source as u8,
                         basic_updated_at: row.program.basic_updated_at,

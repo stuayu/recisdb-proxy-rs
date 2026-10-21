@@ -54,7 +54,8 @@ const PROGRAM_READ_COLUMNS: &str = "SELECT p.id, p.nid, p.sid, p.tsid, p.event_i
     COALESCE(p.description, shared.description, legacy.description) AS description,
     COALESCE(p.extended, shared.extended, legacy.extended) AS extended,
     COALESCE(p.genre, shared.genre, legacy.genre) AS genre,
-    p.free_ca_mode, p.updated_at, p.audios, p.video";
+    p.free_ca_mode, p.updated_at, p.audios, p.video,
+    COALESCE(p.genres, shared.genres, legacy.genres) AS genres";
 
 impl Database {
     pub fn get_enabled_network_ids(&self) -> Result<Vec<u16>> {
@@ -86,9 +87,9 @@ impl Database {
         let mut before = HashMap::new();
         for p in programs {
             let snapshot = self.connection().query_row(
-                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode,audios,video FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
+                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode,audios,video,genres FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
                 params![p.nid as i32,p.sid as i32,p.tsid as i32,p.event_id as i32],
-                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?)),
+                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?)),
             ).optional()?;
             before.insert((p.nid, p.sid, p.tsid, p.event_id), snapshot);
         }
@@ -96,9 +97,9 @@ impl Database {
         let mut changed = HashMap::new();
         for p in programs {
             let after = self.connection().query_row(
-                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode,audios,video FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
+                "SELECT start_at,duration_secs,name,description,extended,genre,free_ca_mode,audios,video,genres FROM programs WHERE nid=?1 AND sid=?2 AND tsid=?3 AND event_id=?4",
                 params![p.nid as i32,p.sid as i32,p.tsid as i32,p.event_id as i32],
-                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?)),
+                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?)),
             ).optional()?;
             let key = (p.nid, p.sid, p.tsid, p.event_id);
             if before.get(&key) != Some(&after) {
@@ -112,6 +113,7 @@ impl Database {
                     free_ca_mode,
                     audios_json,
                     video_json,
+                    genres_json,
                 )) = after
                 {
                     let mut visible = p.clone();
@@ -124,6 +126,7 @@ impl Database {
                     visible.free_ca_mode = free_ca_mode;
                     visible.audios = audios_json.and_then(|json| serde_json::from_str(&json).ok());
                     visible.video = video_json.and_then(|json| serde_json::from_str(&json).ok());
+                    visible.genres = genres_json.and_then(|json| serde_json::from_str(&json).ok());
                     changed.insert(key, visible);
                 }
             }
@@ -149,6 +152,7 @@ impl Database {
                 Ok((
                     p.audios.as_ref().map(serde_json::to_string).transpose()?,
                     p.video.as_ref().map(serde_json::to_string).transpose()?,
+                    p.genres.as_ref().map(serde_json::to_string).transpose()?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -159,9 +163,9 @@ impl Database {
                     name, description, extended, genre, free_ca_mode, updated_at,
                     source, pf_updated_at, schedule_updated_at,
                     basic_updated_at, extended_updated_at, shared_sid, shared_event_id,
-                    audios, video
+                    audios, video, genres
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                  ON CONFLICT(nid, sid, tsid, event_id) DO UPDATE SET
                     tsid = excluded.tsid,
                     start_at = CASE WHEN (excluded.source = 0 AND
@@ -200,10 +204,13 @@ impl Database {
                     shared_sid = CASE WHEN excluded.shared_sid IS NOT NULL THEN excluded.shared_sid ELSE programs.shared_sid END,
                     shared_event_id = CASE WHEN excluded.shared_sid IS NOT NULL THEN excluded.shared_event_id ELSE programs.shared_event_id END,
                     audios = COALESCE(excluded.audios, programs.audios),
-                    video = COALESCE(excluded.video, programs.video)",
+                    video = COALESCE(excluded.video, programs.video),
+                    genres = COALESCE(excluded.genres, programs.genres)",
             )?;
 
-            for (p, (audios_json, video_json)) in programs.iter().zip(component_json.iter()) {
+            for (p, (audios_json, video_json, genres_json)) in
+                programs.iter().zip(component_json.iter())
+            {
                 stmt.execute(params![
                     p.nid as i32,
                     p.sid as i32,
@@ -234,6 +241,7 @@ impl Database {
                     p.shared_event_id.map(i32::from),
                     audios_json,
                     video_json,
+                    genres_json,
                 ])?;
             }
         }
@@ -283,7 +291,7 @@ impl Database {
             "SELECT id,nid,sid,tsid,event_id,start_at,duration_secs,free_ca_mode,
                     name,description,extended,genre,updated_at,source,
                     basic_updated_at,extended_updated_at,shared_sid,shared_event_id,pf_updated_at,schedule_updated_at,
-                    audios,video
+                    audios,video,genres
              FROM programs
              WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
                AND start_at + duration_secs > ?3",
@@ -342,6 +350,9 @@ impl Database {
                         .and_then(|json| serde_json::from_str(&json).ok()),
                     video: r
                         .get::<_, Option<String>>(21)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
+                    genres: r
+                        .get::<_, Option<String>>(22)?
                         .and_then(|json| serde_json::from_str(&json).ok()),
                 },
                 pf_updated_at: r.get(18)?,
@@ -540,6 +551,9 @@ impl Database {
             description: row.get("description")?,
             extended: row.get("extended")?,
             genre: row.get("genre")?,
+            genres: row
+                .get::<_, Option<String>>("genres")?
+                .and_then(|json| serde_json::from_str(&json).ok()),
             audios: row
                 .get::<_, Option<String>>("audios")?
                 .and_then(|json| serde_json::from_str(&json).ok()),
@@ -568,6 +582,7 @@ mod tests {
             description: Some("desc".to_string()),
             extended: None,
             genre: Some(0x21),
+            genres: None,
             audios: None,
             video: None,
             free_ca_mode: false,
@@ -622,6 +637,20 @@ mod tests {
             stream_content: 5,
             component_type: 0xB1,
         });
+        row.genres = Some(vec![
+            crate::ts_analyzer::EitGenre {
+                lv1: 0xE,
+                lv2: 1,
+                un1: 2,
+                un2: 3,
+            },
+            crate::ts_analyzer::EitGenre {
+                lv1: 2,
+                lv2: 1,
+                un1: 0xA,
+                un2: 0xB,
+            },
+        ]);
         db.upsert_programs(&[row.clone()]).unwrap();
 
         let records = db
@@ -629,11 +658,13 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].audios, row.audios);
         assert_eq!(records[0].video, row.video);
+        assert_eq!(records[0].genres, row.genres);
         let (page, _) = db
             .get_programs_for_node_page(&[], i64::MIN, 0, i64::MIN, 10)
             .unwrap();
         assert_eq!(page[0].program.audios, row.audios);
         assert_eq!(page[0].program.video, row.video);
+        assert_eq!(page[0].program.genres, row.genres);
     }
 
     #[test]

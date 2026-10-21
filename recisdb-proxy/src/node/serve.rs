@@ -119,6 +119,8 @@ pub struct ProgramUpsertWire {
     #[serde(default)]
     pub genre: Option<i64>,
     #[serde(default)]
+    pub genres: Option<Vec<crate::ts_analyzer::EitGenre>>,
+    #[serde(default)]
     pub updated_at: i64,
     #[serde(default)]
     pub source: u8,
@@ -154,6 +156,7 @@ impl From<ProgramUpsert> for ProgramUpsertWire {
             description: value.description,
             extended: value.extended,
             genre: value.genre,
+            genres: value.genres,
             updated_at: value.updated_at,
             source: value.source as u8,
             basic_updated_at: value.basic_updated_at,
@@ -189,6 +192,7 @@ impl From<ProgramUpsertWire> for ProgramUpsert {
             description: value.description,
             extended: value.extended,
             genre: value.genre,
+            genres: value.genres,
             updated_at: value.updated_at,
             source: if value.source == EpgSource::Schedule as u8 {
                 EpgSource::Schedule
