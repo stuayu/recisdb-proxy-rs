@@ -7,7 +7,7 @@ use bytes::Bytes;
 use log::{error, info, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::database::Database;
 use crate::server::session::Session;
@@ -83,11 +83,27 @@ impl Server {
     /// Run the server, accepting connections until shutdown.
     pub async fn run(&self) -> std::io::Result<()> {
         let listener = bind_with_retry(self.config.listen_addr).await?;
+        // Tokio reserves part of usize's range for internal bookkeeping, so
+        // clamp pathological TOML values instead of panicking during startup.
+        let connection_limit = self.config.max_connections.min(Semaphore::MAX_PERMITS);
+        let connection_slots = Arc::new(Semaphore::new(connection_limit));
         info!("Server listening on {}", self.config.listen_addr);
 
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
+                    let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned()
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!(
+                                "Rejecting connection from {}: maximum connections reached",
+                                addr
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                    };
                     // Session ids come from the registry so that BNDP and the
                     // HTTP stream paths (`web/http_session.rs`) never hand out
                     // the same id — they share one map and one disconnect API.
@@ -102,6 +118,9 @@ impl Server {
                     let session_registry = Arc::clone(&self.session_registry);
 
                     tokio::spawn(async move {
+                        // Keep the slot occupied for the full connection task
+                        // lifetime, including cleanup after client disconnect.
+                        let _connection_permit = connection_permit;
                         if let Err(e) = handle_connection(
                             socket,
                             addr,
@@ -397,12 +416,121 @@ pub async fn bind_with_retry(addr: std::net::SocketAddr) -> std::io::Result<TcpL
                     && started.elapsed() < BIND_RETRY_WINDOW =>
             {
                 if !warned {
-                    log::warn!("{addr} is still in use; retrying bind for up to {}s", BIND_RETRY_WINDOW.as_secs());
+                    log::warn!(
+                        "{addr} is still in use; retrying bind for up to {}s",
+                        BIND_RETRY_WINDOW.as_secs()
+                    );
                     warned = true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use crate::tuner::TunerPoolConfig;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn connection_limit_rejects_excess_and_reopens_slot_after_disconnect() {
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserve.local_addr().unwrap();
+        drop(reserve);
+
+        let registry = Arc::new(SessionRegistry::new());
+        let server = Arc::new(Server::new(
+            ServerConfig {
+                listen_addr: addr,
+                max_connections: 1,
+                max_tuners: 1,
+                default_tuner: None,
+                database: Arc::new(tokio::sync::Mutex::new(Database::open_in_memory().unwrap())),
+                tuner_config: TunerPoolConfig::default(),
+                #[cfg(feature = "tls")]
+                tls_config: None,
+            },
+            Arc::clone(&registry),
+        ));
+        let server_task = tokio::spawn(async move { server.run().await });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while registry.count().await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), second.read(&mut byte))
+            .await
+            .expect("excess connection should be closed promptly")
+            .unwrap();
+        assert_eq!(read, 0, "excess connection must not become a session");
+        assert_eq!(registry.count().await, 1);
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while registry.count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let third = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while registry.count().await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(third);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unrepresentably_large_connection_limit_does_not_panic() {
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserve.local_addr().unwrap();
+        drop(reserve);
+        let server = Server::new(
+            ServerConfig {
+                listen_addr: addr,
+                max_connections: usize::MAX,
+                max_tuners: 1,
+                default_tuner: None,
+                database: Arc::new(tokio::sync::Mutex::new(Database::open_in_memory().unwrap())),
+                tuner_config: TunerPoolConfig::default(),
+                #[cfg(feature = "tls")]
+                tls_config: None,
+            },
+            Arc::new(SessionRegistry::new()),
+        );
+        let mut server_task = tokio::spawn(async move { server.run().await });
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut server_task).await;
+        assert!(
+            result.is_err(),
+            "listener should remain running instead of panicking"
+        );
+        server_task.abort();
     }
 }
