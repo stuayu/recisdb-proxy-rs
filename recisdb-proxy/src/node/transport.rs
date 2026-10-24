@@ -481,6 +481,9 @@ pub struct EpgProgramsRequest {
     pub cursor_updated_at: i64,
     #[serde(default)]
     pub cursor_id: i64,
+    /// Server-selected upper bound for a stable multi-page sync cycle.
+    #[serde(default)]
+    pub max_updated_at: Option<i64>,
     #[serde(default = "default_program_page_limit")]
     pub limit: u32,
     /// 初回ページ以外でも mux coverage を返してほしいとき true。
@@ -515,6 +518,9 @@ pub struct EpgProgramsReply {
     pub next_cursor_id: i64,
     #[serde(default)]
     pub has_more: bool,
+    /// Echoes the server-clock upper bound used for this page.
+    #[serde(default)]
+    pub max_updated_at: Option<i64>,
     #[serde(default)]
     pub coverage: Vec<EpgProgramCoverageWire>,
 }
@@ -924,12 +930,16 @@ async fn epg_programs(
     };
     let limit = payload.limit.clamp(1, 2000);
     let now = chrono::Utc::now().timestamp();
+    let max_updated_at = payload
+        .max_updated_at
+        .unwrap_or_else(|| now.saturating_sub(crate::node::epg_sync::CURSOR_SAFETY_WINDOW_SECS));
     let result = {
         let db = database.lock().await;
         let page = db.get_programs_for_node_page(
             &payload.network_ids,
             payload.cursor_updated_at,
             payload.cursor_id,
+            Some(max_updated_at),
             now,
             limit,
         );
@@ -991,6 +1001,7 @@ async fn epg_programs(
                 next_cursor_updated_at: next_updated_at,
                 next_cursor_id: next_id,
                 has_more,
+                max_updated_at: Some(max_updated_at),
                 coverage,
             })
             .into_response()
@@ -1553,9 +1564,17 @@ mod tests {
     fn epg_program_sync_wire_defaults_old_empty_payload() {
         let request: EpgProgramsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(request.limit, 1000);
+        assert_eq!(request.max_updated_at, None);
         let reply: EpgProgramsReply = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(reply.programs.is_empty());
         assert!(reply.coverage.is_empty());
+        assert_eq!(reply.max_updated_at, None);
+
+        let echoed: EpgProgramsReply = serde_json::from_value(serde_json::json!({
+            "max_updated_at": 1234
+        }))
+        .unwrap();
+        assert_eq!(echoed.max_updated_at, Some(1234));
     }
     use crate::node::{LeasePolicy, LogicalMuxId};
     use crate::tuner::EffectiveClaim;

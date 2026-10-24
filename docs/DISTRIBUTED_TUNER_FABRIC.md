@@ -15,8 +15,13 @@ TTLで回収する。stream leaseはEPG mux lockを取らず、通常の`acquire
 ### EPG番組行の定期同期
 
 ペアリング済み・有効なノードから、チューナーを使わずに番組行を取得する。供給側の
-`POST /node/v3/epg/programs` は `network_ids`、`cursor_updated_at`、`cursor_id`、`limit` を受け取り、
-終了していない行を `(updated_at, id)` のkeyset順で返す。`limit` は1〜2000に丸める（既定1000）。
+`POST /node/v3/epg/programs` は `network_ids`、`cursor_updated_at`、`cursor_id`、`limit` と任意の
+`max_updated_at` を受け取り、終了していない行を `(updated_at, id)` のkeyset順で返す。初回要求で
+`max_updated_at` がない場合、供給側が自身の時計で `now - 120秒` を決めて返答へechoする。要求側は
+その値を後続ページにも渡し、1周期の全ページで同じ上限を使う。`updated_at` の上限によりページ中の
+行集合を安定させ、10秒以内のEpgWriter遅延で未反映の行は次周期に拾う。部分周期はカーソルを
+巻き戻さず、受信済み最終行の位置から次周期へ進むため、大量の集中データでも同じ範囲を繰り返さない。
+`limit` は1〜2000に丸める（既定1000）。
 初回ページ（カーソル0,0）または要求側が `include_coverage=true` を付けたページでは `epg_scan_states` の
 mux単位section coverageも返す。要求側は周期ごとの最初のページで `include_coverage` を立てるので、
 coverageは周期ごとに更新される。p/f・scheduleの更新時計も失わない。
@@ -26,9 +31,10 @@ coverageは周期ごとに更新される。p/f・scheduleの更新時計も失�
 ノードごとにカーソルをメモリ保持し、1周期100ページまで、受信行はEpgWriterのキューを通さず
 1ページ単位でDBへ書き込む。未知NIDは破棄し、coverageは各時刻の大きい値へマージする。接続先は
 route syncと同じ有効endpointの先頭応答を使う。供給側のEpgWriterは受信から最大10秒遅れて書き込むため、
-読んだ時点のカーソルより古い `updated_at` の行があとから現れる。周期を完走したらカーソルを120秒
-巻き戻して保存し、重複分はUPSERTに吸収させる。多段中継では上流の古い`updated_at`行がカーソルより
-前に入り得るため、完全な履歴再同期を保証しない。旧ノードの404/405は互換性上のdebug扱いとする。
+旧サーバーからwatermarkのechoがない場合は従来互換動作に戻り、周期完了時にカーソルを120秒巻き戻す。
+要求・返答の追加フィールドは `#[serde(default)]` で省略可能にしてある。多段中継では上流の古い
+`updated_at` 行がカーソルより前に入り得るため、完全な履歴再同期を保証しない。旧ノードの404/405は
+互換性上のdebug扱いとする。
 
 `POST /node/v3/epg/metadata` の `RemoteEpgMetadataRequest` は、従来の固定滞在時間
 `dwell_secs` に加えて `dwell: Option<RemoteEpgDwell>` を持つ。`RemoteEpgDwell` のフィールドは

@@ -17,10 +17,22 @@ pub const INITIAL_DELAY: Duration = Duration::from_secs(60);
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_PAGES_PER_CYCLE: usize = 100;
 const PAGE_LIMIT: u32 = 1000;
-/// 周期をまたぐときにカーソルを巻き戻す秒数。供給側の EpgWriter は受信から
-/// 最大10秒遅れて書き込むので、読んだ時点のカーソルより古い `updated_at` の行が
-/// あとから現れる。巻き戻した分は UPSERT が同じ行として吸収する。
-const CURSOR_REWIND_SECS: i64 = 120;
+/// EpgWriter's 10-second maximum delay plus a safety margin for sync paging.
+pub(crate) const CURSOR_SAFETY_WINDOW_SECS: i64 = 120;
+
+fn cursor_after_cycle(
+    cursor: (i64, i64),
+    completed: bool,
+    stable_watermark: Option<i64>,
+) -> (i64, i64) {
+    if stable_watermark.is_some() {
+        cursor
+    } else if completed {
+        ((cursor.0 - CURSOR_SAFETY_WINDOW_SECS).max(0), 0)
+    } else {
+        cursor
+    }
+}
 
 pub struct EpgProgramSync {
     state: Arc<NodeTransportState>,
@@ -111,11 +123,13 @@ impl EpgProgramSync {
             let mut muxes = 0usize;
             let mut failed = None;
             let mut completed = false;
+            let mut stable_watermark = None;
             for page in 0..MAX_PAGES_PER_CYCLE {
                 let request = EpgProgramsRequest {
                     network_ids: network_ids.clone(),
                     cursor_updated_at: cursor.0,
                     cursor_id: cursor.1,
+                    max_updated_at: stable_watermark,
                     limit: PAGE_LIMIT,
                     include_coverage: page == 0,
                 };
@@ -147,6 +161,14 @@ impl EpgProgramSync {
                     break;
                 };
                 let next = (reply.next_cursor_updated_at, reply.next_cursor_id);
+                if let Some(expected) = stable_watermark {
+                    if reply.max_updated_at != Some(expected) {
+                        failed = Some("peer changed or omitted the EPG sync watermark".into());
+                        break;
+                    }
+                } else {
+                    stable_watermark = reply.max_updated_at;
+                }
                 match apply_reply(&self.database, &network_ids, &reply).await {
                     Ok((applied, coverage_count)) => {
                         rows += applied;
@@ -169,11 +191,7 @@ impl EpgProgramSync {
                 tokio::task::yield_now().await;
             }
             if completed || rows > 0 {
-                let stored = if completed {
-                    ((cursor.0 - CURSOR_REWIND_SECS).max(0), 0)
-                } else {
-                    cursor
-                };
+                let stored = cursor_after_cycle(cursor, completed, stable_watermark);
                 self.cursors.insert(node_id.clone(), stored);
                 if rows == 0 {
                     log::debug!("[node] EPG sync from {name}: 0 rows, {muxes} muxes coverage");
@@ -226,6 +244,20 @@ pub async fn apply_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_watermark_keeps_partial_cycle_cursor_monotonic() {
+        assert_eq!(
+            cursor_after_cycle((1_000, 900), false, Some(880)),
+            (1_000, 900)
+        );
+        assert_eq!(
+            cursor_after_cycle((1_000, 900), true, Some(880)),
+            (1_000, 900)
+        );
+        assert_eq!(cursor_after_cycle((1_000, 900), false, None), (1_000, 900));
+        assert_eq!(cursor_after_cycle((1_000, 900), true, None), (880, 0));
+    }
     use crate::database::{Database, EpgSource, ProgramUpsert};
     use crate::node::serve::ProgramUpsertWire;
 

@@ -284,6 +284,7 @@ impl Database {
         network_ids: &[u16],
         cursor_updated_at: i64,
         cursor_id: i64,
+        max_updated_at: Option<i64>,
         now: i64,
         limit: u32,
     ) -> Result<(Vec<ProgramUpsertWithClocks>, bool)> {
@@ -301,6 +302,10 @@ impl Database {
             Box::new(cursor_id),
             Box::new(now),
         ];
+        if let Some(max_updated_at) = max_updated_at {
+            sql.push_str(" AND updated_at <= ?");
+            values.push(Box::new(max_updated_at));
+        }
         if !network_ids.is_empty() {
             sql.push_str(" AND nid IN (");
             sql.push_str(
@@ -660,7 +665,7 @@ mod tests {
         assert_eq!(records[0].video, row.video);
         assert_eq!(records[0].genres, row.genres);
         let (page, _) = db
-            .get_programs_for_node_page(&[], i64::MIN, 0, i64::MIN, 10)
+            .get_programs_for_node_page(&[], i64::MIN, 0, None, i64::MIN, 10)
             .unwrap();
         assert_eq!(page[0].program.audios, row.audios);
         assert_eq!(page[0].program.video, row.video);
@@ -819,16 +824,89 @@ mod tests {
             sample(1, 100, 4, -10_000, 40),
         ])
         .unwrap();
-        let (first, more) = db.get_programs_for_node_page(&[1], 0, 0, 100, 1).unwrap();
+        let (first, more) = db
+            .get_programs_for_node_page(&[1], 0, 0, None, 100, 1)
+            .unwrap();
         assert!(more);
         assert_eq!(first.len(), 1);
         let (second, more) = db
-            .get_programs_for_node_page(&[1], first[0].program.updated_at, first[0].id, 100, 10)
+            .get_programs_for_node_page(
+                &[1],
+                first[0].program.updated_at,
+                first[0].id,
+                None,
+                100,
+                10,
+            )
             .unwrap();
         assert!(!more);
         assert_eq!(second.len(), 1);
         assert!(second.iter().all(|row| row.program.nid == 1));
         assert!(second.iter().all(|row| row.program.start_at > 1));
+    }
+
+    #[test]
+    fn node_page_watermark_defers_recent_rows_until_the_next_cycle() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[
+            sample(1, 100, 1, 10_000, 800),
+            sample(1, 100, 2, 12_000, 820),
+        ])
+        .unwrap();
+
+        let (first_page, has_more) = db
+            .get_programs_for_node_page(&[1], 0, 0, Some(880), 1_000, 1)
+            .unwrap();
+        assert!(has_more);
+        let cursor = (first_page[0].program.updated_at, first_page[0].id);
+
+        // EIT collection stamps updated_at before EpgWriter's batch flush.
+        // A recent row can flush after this cycle's watermark. The saved
+        // cursor stays below it, so a later watermark catches it.
+        db.upsert_programs(&[sample(1, 100, 3, 14_000, 995)])
+            .unwrap();
+        let (current_cycle, _) = db
+            .get_programs_for_node_page(&[1], cursor.0, cursor.1, Some(880), 1_000, 10)
+            .unwrap();
+        assert!(current_cycle.iter().all(|row| row.program.event_id != 3));
+
+        let (next_cycle, _) = db
+            .get_programs_for_node_page(&[1], cursor.0, cursor.1, Some(995), 1_120, 10)
+            .unwrap();
+        assert!(next_cycle.iter().any(|row| row.program.event_id == 3));
+    }
+
+    #[test]
+    fn node_page_watermark_bounds_pages_and_allows_monotonic_progress() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_programs(&[
+            sample(1, 100, 1, 10_000, 100),
+            sample(1, 100, 2, 12_000, 100),
+            sample(1, 100, 3, 14_000, 200),
+        ])
+        .unwrap();
+
+        let (first, has_more) = db
+            .get_programs_for_node_page(&[1], 0, 0, Some(100), 300, 1)
+            .unwrap();
+        assert!(has_more);
+        assert_eq!(first.len(), 1);
+        let cursor = (first[0].program.updated_at, first[0].id);
+        let (second, has_more) = db
+            .get_programs_for_node_page(&[1], cursor.0, cursor.1, Some(100), 300, 1)
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].program.event_id, 2);
+
+        // A later cycle raises the watermark and continues after the persisted cursor.
+        let cursor = (second[0].program.updated_at, second[0].id);
+        let (third, has_more) = db
+            .get_programs_for_node_page(&[1], cursor.0, cursor.1, Some(200), 300, 1)
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].program.event_id, 3);
     }
 
     #[test]
