@@ -331,7 +331,9 @@ EITにother-TS情報がないため、TS単位で独立して扱う。
 `tokio::spawn` して直ちに戻る。`max_concurrent_scans` が実行数を制限する。
 `ActiveScanGuard` と `InFlightGuard` はDrop時にカウンタとin-flight集合を解放し、
 `MuxLeaseGuard` は各スキャンタスクが所有する。プロセス内in-flight集合に加え、TTL付き
-`MuxLeaseManager` でも重複を防ぐ二重防御とする。
+`MuxLeaseManager` でも重複を防ぐ二重防御とする。スキャン中はguardがTTLの3分の1ごとに
+リースを更新し、guard dropまたはタスクキャンセルで更新を止めて即時解放する。プロセス停止時は
+最後のTTLが期限切れになり、別ノードが回収できる。
 
 Partialで終了したmuxは `min(target_refresh_secs, 1800)` 秒後まで再スキャン対象にしない。
 NoData/失敗はfailure_countに応じて60秒から指数的に延長し、最大3600秒のbackoffを使う。
@@ -342,8 +344,9 @@ CPU上限による中断(`cpu_aborted`)と視聴・録画による割り込み(`
 Completeも同じく `min(target_refresh_secs, 1800)` 秒は再スキャンしない。dwell側の完了判定は
 trackerが見たサービスだけを母数にするため、`channels` 側の母数で未完了のままだとstale判定が
 立ち続け、間隔なしでは同じmuxを連続で取り直すからである。それ以降は既存のstale判定に任せる。
-候補muxの列挙は coverage の母数と同じ規則を使うが、`service_type` がNULLの行は候補に残す
-（EITを一度受信するまで母数に入らないので、候補から外すと永久にスキャンされない）。dwellの既定値はmin 30秒、normal 180秒、max 600秒、
+候補muxの列挙とcoverageの母数は `service_type` が1、2、NULLのサービスを対象にする。
+未取得のNULL行も母数に含め、1サービスでもcoverageがないmuxは未取得として扱う。
+dwellの既定値はmin 30秒、normal 180秒、max 600秒、
 section idle timeout 90秒である。
 
 内部wakeは5秒、full evaluation周期は `scheduler_interval_secs` として分離する。

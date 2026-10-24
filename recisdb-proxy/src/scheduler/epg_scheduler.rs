@@ -496,7 +496,7 @@ impl EpgScanScheduler {
         driver: crate::database::BonDriverRecord,
         channel: crate::database::ChannelRecord,
         config: EpgGlobalSettings,
-        _mux_lease: MuxLeaseGuard,
+        mut mux_lease: MuxLeaseGuard,
         _active_guard: ActiveScanGuard,
         _in_flight_guard: InFlightGuard,
         mut stopped: watch::Receiver<bool>,
@@ -504,6 +504,9 @@ impl EpgScanScheduler {
         if *stopped.borrow() {
             return Ok(());
         }
+        // EPG dwell can be longer than the default mux-lease TTL. The guard
+        // stops renewing and releases the lease when this scan ends/cancels.
+        mux_lease.start_heartbeat();
         let remote_available = if config.allow_remote {
             let db = self.database.lock().await;
             let store = crate::node::NodeStore::new(&db)?;
@@ -655,8 +658,17 @@ impl EpgScanScheduler {
                 EpgReasonCode::NoCompatibleTuner,
                 serde_json::json!({"network_id": channel.nid, "tsid": channel.tsid}),
             );
+            let now = chrono::Utc::now().timestamp();
             let db = self.database.lock().await;
-            db.record_epg_deferred(channel.nid, channel.tsid, &reason, true)?;
+            db.epg_scan_finished(
+                history,
+                "failed",
+                channel.nid,
+                channel.tsid,
+                Some(&reason),
+                config.target_refresh_secs,
+            )?;
+            db.set_epg_scan_status(channel.nid, channel.tsid, EpgScanStatus::Failed, now)?;
             return Ok(());
         };
         let key = ChannelKey::space_channel(driver.dll_path.clone(), space, number);
@@ -1404,6 +1416,89 @@ mod tests {
         assert_eq!(remote_metadata_status(None, true), EpgScanStatus::Partial);
         assert_eq!(remote_metadata_status(None, false), EpgScanStatus::NoData);
     }
+
+    #[tokio::test]
+    async fn scan_without_tuning_coordinates_finishes_history_and_sets_backoff() {
+        use crate::node::LogicalMuxId;
+
+        let db = crate::database::Database::open_in_memory().unwrap();
+        let driver_id = db.get_or_create_bon_driver("test.dll").unwrap();
+        let mut info = recisdb_protocol::ChannelInfo::new(1, 10, 2);
+        info.service_type = Some(1);
+        db.insert_channel(driver_id, &info).unwrap();
+        let driver = db.get_bon_driver(driver_id).unwrap().unwrap();
+        let channel = db.get_channels_by_bon_driver(driver_id).unwrap().remove(0);
+        let db = Arc::new(tokio::sync::Mutex::new(db));
+        let mux = (channel.nid, channel.tsid);
+        let manager = Arc::new(EpgScanScheduler::new(
+            Arc::clone(&db),
+            Arc::new(TunerPool::new(1)),
+            MuxLeaseManager::new(Duration::from_secs(60)),
+        ));
+        let mux_lease = manager
+            .mux_leases
+            .try_acquire(LogicalMuxId {
+                nid: channel.nid,
+                tsid: channel.tsid,
+            })
+            .unwrap();
+        let active = ActiveScanGuard::new(Arc::clone(&manager.active));
+        let in_flight = InFlightGuard {
+            in_flight: Arc::clone(&manager.in_flight),
+            mux,
+            notify: Arc::clone(&manager.notify),
+        };
+        let (stopped, stopped_rx) = watch::channel(false);
+
+        manager
+            .run_scan(
+                driver,
+                channel.clone(),
+                config(),
+                mux_lease,
+                active,
+                in_flight,
+                stopped_rx,
+            )
+            .await
+            .unwrap();
+
+        let db = db.lock().await;
+        let history: (String, Option<i64>, String) = db
+            .connection()
+            .query_row(
+                "SELECT status,finished_at,reason FROM epg_scan_history
+                 WHERE network_id=?1 AND tsid=?2 ORDER BY id DESC LIMIT 1",
+                [channel.nid, channel.tsid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(history.0, "failed");
+        assert!(history.1.is_some(), "running history must be finalized");
+        let running_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM epg_scan_history
+                 WHERE network_id=?1 AND tsid=?2 AND status='running'",
+                [channel.nid, channel.tsid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(running_count, 0);
+        let reason: crate::database::EpgReason = serde_json::from_str(&history.2).unwrap();
+        assert_eq!(reason.code, EpgReasonCode::NoCompatibleTuner);
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| (state.network_id, state.tsid) == mux)
+            .unwrap();
+        assert_eq!(state.last_scan_status, Some("failed".into()));
+        assert_eq!(state.failure_count, 1);
+        assert!(state.next_eligible_at.is_some());
+        drop(stopped);
+    }
+
     fn config() -> EpgGlobalSettings {
         EpgGlobalSettings {
             enabled: true,

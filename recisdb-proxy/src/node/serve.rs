@@ -288,9 +288,10 @@ impl LocalMuxServer {
         // requester-side remote fallback here would create a multi-node loop.
         context.enter_node(&self.identity.node_id, spent_ms)?;
 
-        let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
+        let Some(mut mux_lease) = self.mux_leases.try_acquire(mux) else {
             return Err(ServeError::MuxLeaseUnavailable(mux));
         };
+        mux_lease.start_heartbeat();
 
         let candidates = self.local_candidates(mux, sid).await?;
         if candidates.is_empty() {
@@ -332,7 +333,7 @@ impl LocalMuxServer {
                 context.stream_class,
                 context.claim,
                 INITIAL_GENERATION,
-                Some(_mux_lease),
+                Some(mux_lease),
             )
             .await;
 
@@ -385,9 +386,10 @@ impl LocalMuxServer {
         remote_dwell: Option<RemoteEpgDwell>,
     ) -> Result<RemoteEpgMetadataOutcome, ServeError> {
         context.enter_node(&self.identity.node_id, spent_ms)?;
-        let Some(_mux_lease) = self.mux_leases.try_acquire(mux) else {
+        let Some(mut _mux_lease) = self.mux_leases.try_acquire(mux) else {
             return Err(ServeError::MuxLeaseUnavailable(mux));
         };
+        _mux_lease.start_heartbeat();
         let candidates = self.local_candidates(mux, sid).await?;
         if candidates.is_empty() {
             return Err(ServeError::NoRoute(mux));

@@ -7,6 +7,8 @@
 `acquire()` とbroadcast購読側の `EpgCollector::new_metadata()` を使い、放送TSではなく
 `ProgramUpsert`相当の結果だけを返す。scheduler と `LocalMuxServer` はストリーム用とは
 別の `MuxLeaseManager` で `(network_id, tsid)` を排他し、TTLまたはguard dropで解放する。
+長いEPG dwellやRemoteMuxLeaseが続く間、guardはTTLの3分の1ごとに更新する。guard dropや
+タスクキャンセルで更新を停止して即時解放し、プロセス停止時はTTLで回収する。
 `remote_allow_ts_transport` が無効でも、このmetadata経路はTS転送を行わない。
 
 ### EPG番組行の定期同期

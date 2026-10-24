@@ -33,6 +33,13 @@ pub struct MuxLeaseGuard {
     manager: Arc<MuxLeaseManager>,
     mux: LogicalMuxId,
     token: u64,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub struct MuxLeaseHeartbeat {
+    manager: Arc<MuxLeaseManager>,
+    mux: LogicalMuxId,
+    token: u64,
 }
 
 impl MuxLeaseManager {
@@ -59,6 +66,7 @@ impl MuxLeaseManager {
             manager: Arc::clone(self),
             mux,
             token,
+            heartbeat_task: None,
         })
     }
 
@@ -73,6 +81,9 @@ impl MuxLeaseManager {
 
 impl Drop for MuxLeaseGuard {
     fn drop(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
         let mut leases = self
             .manager
             .leases
@@ -83,6 +94,46 @@ impl Drop for MuxLeaseGuard {
             .is_some_and(|(token, _)| *token == self.token)
         {
             leases.remove(&self.mux);
+        }
+    }
+}
+
+impl MuxLeaseGuard {
+    /// Start renewing this lease until the guard is dropped. Call from an
+    /// async task for work whose lifetime may exceed the configured TTL.
+    pub fn start_heartbeat(&mut self) {
+        if self.heartbeat_task.is_none() {
+            let heartbeat = MuxLeaseHeartbeat {
+                manager: Arc::clone(&self.manager),
+                mux: self.mux,
+                token: self.token,
+            };
+            self.heartbeat_task = Some(tokio::spawn(heartbeat.run()));
+        }
+    }
+}
+
+impl MuxLeaseHeartbeat {
+    /// Extend the lease until its owner drops the guard. The heartbeat task
+    /// should be scoped to that operation and aborted when it is cancelled.
+    pub async fn run(self) {
+        let period = (self.manager.ttl / 3).max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut leases = self
+                .manager
+                .leases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match leases.get_mut(&self.mux) {
+                Some((token, expires)) if *token == self.token && *expires > now => {
+                    *expires = now + self.manager.ttl;
+                }
+                _ => return,
+            }
         }
     }
 }
@@ -426,6 +477,20 @@ mod tests {
         let manager = MuxLeaseManager::new(Duration::ZERO);
         let mux = LogicalMuxId { nid: 3, tsid: 4 };
         let _first = manager.try_acquire(mux).expect("first lease");
+        assert!(manager.try_acquire(mux).is_some());
+    }
+
+    #[tokio::test]
+    async fn active_mux_lease_heartbeat_prevents_expiry_and_drop_releases() {
+        let manager = MuxLeaseManager::new(Duration::from_millis(45));
+        let mux = LogicalMuxId { nid: 5, tsid: 6 };
+        let mut lease = manager.try_acquire(mux).expect("first lease");
+        lease.start_heartbeat();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(manager.try_acquire(mux).is_none());
+
+        drop(lease);
         assert!(manager.try_acquire(mux).is_some());
     }
 

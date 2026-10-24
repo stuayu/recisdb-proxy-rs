@@ -408,9 +408,13 @@ mod tests {
         let db = db();
         let driver = driver_id(&db);
         channel(&db, driver, 1, 2, 10, None);
+        channel(&db, driver, 1, 2, 11, None);
+        db.upsert_epg_service_coverage(&[coverage(1, 2, 10, Some(100), true)])
+            .unwrap();
         let mux = db.get_epg_mux_coverage().unwrap();
         assert_eq!(mux.len(), 1);
-        assert_eq!(mux[0].services_total, 1);
+        assert_eq!(mux[0].services_total, 2);
+        assert_eq!(mux[0].services_complete, 1);
         assert_eq!(mux[0].coverage_until, None);
     }
 
