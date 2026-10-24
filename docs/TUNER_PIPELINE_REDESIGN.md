@@ -282,10 +282,10 @@ pub enum Decision {
   取得」も「取得してから解放」も成立しない。これが `old_tuner_will_free_slot`
   (自セッション分を容量計数から除外する仕掛け) の置き換えであり、同フラグは
   撤去した。`SelectLogicalChannel` の候補ループでは、候補が失敗したときに
-  permit を回収して次の候補へ持ち回り、全候補が失敗したら旧チューナーへ
-  返却する (旧リーダーは動き続けるため)。旧readerの停止がタイムアウトした場合は
-  移譲を中止し、carried permitを旧ownerへ戻す。pool entryも残すため、reader終了前に
-  代替readerが同じDLLをopenすることはない。
+  permit を回収して次の候補へ持ち回り、全候補が失敗したら旧チューナーへ返却する。
+  同一DLLへの移譲で旧readerの停止がタイムアウトした場合は、そのreaderは既に
+  `Stopping` へ遷移しているため切替を中止しても旧配信は継続しない。carried permitは
+  旧ownerへ戻し、pool entryも残すため、reader終了前に代替readerが同じDLLをopenすることはない。
 - **再利用は permit 取得より先**に判定する。順序を誤ると、`max_instances=1`
   のドライバーで既存チャンネルへ合流できるはずのリクエストが容量不足として
   弾かれる。
@@ -613,9 +613,9 @@ BNDP v2 空間選局 (`handle_set_channel_space`) を `acquire()` に載せ替�
   あったのと同じ理由で、これをやらないと「これから合流するリーダー」を
   自分で止めてしまう。
 
-`AcquireOutcome::unused_permit` は、旧チューナーがまだ同一 DLL 上で稼働中なら
-そこへ戻す (`return_unused_permit`)。単に drop すると、デバイスが開いたままなのに
-プールがスロットを空きと見なす。
+`AcquireOutcome::unused_permit` は、旧チューナーがまだ同一 DLL 上でスロットを占有していれば
+(`Stopping` を含む) そこへ戻す (`return_unused_permit`)。単に drop すると、デバイスが
+開いたままなのにプールがスロットを空きと見なす。
 
 ### P2b-2 (続き) — v1 選局・論理チャンネル選局の配線 (実装済み)
 
