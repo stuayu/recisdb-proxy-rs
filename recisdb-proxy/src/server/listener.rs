@@ -23,7 +23,9 @@ pub type DatabaseHandle = Arc<tokio::sync::Mutex<Database>>;
 pub struct ServerConfig {
     /// Address to listen on.
     pub listen_addr: SocketAddr,
-    /// Maximum concurrent connections.
+    /// Maximum concurrent BNDP TCP connections accepted by this listener.
+    /// HTTP/Mirakurun streaming requests are handled by the web server and do
+    /// not consume this listener's connection slots.
     pub max_connections: usize,
     /// Pool-wide ceiling for shared tuner readers.
     ///
