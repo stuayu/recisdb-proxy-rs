@@ -106,14 +106,7 @@ impl Database {
                  -- Keep this in sync with
                  -- recisdb_protocol::broadcast_region::is_real_broadcast_service:
                  -- sid != 0 AND tsid != 0.
-                 WHERE (service_type IN (1, 2)
-                        OR (service_type IS NULL AND EXISTS (
-                            SELECT 1
-                            FROM epg_service_coverage received
-                            WHERE received.network_id = channels.nid
-                              AND received.tsid = channels.tsid
-                              AND received.service_id = channels.sid
-                        )))
+                 WHERE (service_type IN (1, 2) OR service_type IS NULL)
                    AND sid != 0 AND tsid != 0
                  GROUP BY nid, tsid, sid
              ), joined AS (
@@ -411,11 +404,14 @@ mod tests {
     }
 
     #[test]
-    fn null_service_type_without_coverage_is_not_a_target() {
+    fn null_service_type_without_coverage_is_an_incomplete_target() {
         let db = db();
         let driver = driver_id(&db);
         channel(&db, driver, 1, 2, 10, None);
-        assert!(db.get_epg_mux_coverage().unwrap().is_empty());
+        let mux = db.get_epg_mux_coverage().unwrap();
+        assert_eq!(mux.len(), 1);
+        assert_eq!(mux[0].services_total, 1);
+        assert_eq!(mux[0].coverage_until, None);
     }
 
     #[test]

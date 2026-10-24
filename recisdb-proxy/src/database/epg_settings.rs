@@ -381,7 +381,10 @@ impl Database {
         for (nid, tsid, until, updated) in grouped {
             tx.execute("INSERT INTO epg_scan_states(network_id,tsid,coverage_until,last_eit_received_at) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,tsid) DO UPDATE SET coverage_until=?3,last_eit_received_at=CASE WHEN ?4 IS NULL THEN epg_scan_states.last_eit_received_at ELSE MAX(COALESCE(epg_scan_states.last_eit_received_at,0),?4) END", params![nid,tsid,until,updated])?;
         }
-        tx.execute("UPDATE epg_scan_states SET coverage_until=NULL,last_eit_received_at=NULL WHERE NOT EXISTS (SELECT 1 FROM programs p WHERE p.nid=epg_scan_states.network_id AND p.tsid=epg_scan_states.tsid)", [])?;
+        // `coverage_until` is derived only from retained program rows, while
+        // `last_eit_received_at` tracks section freshness (including valid
+        // empty schedule sections) and must survive an empty programs table.
+        tx.execute("UPDATE epg_scan_states SET coverage_until=NULL WHERE NOT EXISTS (SELECT 1 FROM programs p WHERE p.nid=epg_scan_states.network_id AND p.tsid=epg_scan_states.tsid)", [])?;
         tx.commit()?;
         Ok(coverage)
     }
@@ -922,6 +925,43 @@ mod tests {
                 .unwrap(),
             Some(10_600)
         );
+    }
+
+    #[test]
+    fn program_refresh_without_rows_preserves_section_freshness() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_id = db
+            .connection()
+            .execute("INSERT INTO bon_drivers (dll_path) VALUES ('test')", [])
+            .map(|_| db.connection().last_insert_rowid())
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO channels (bon_driver_id, nid, sid, tsid, service_type)
+                 VALUES (?1, 1, 10, 2, 1)",
+                [driver_id],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO epg_scan_states
+                    (network_id, tsid, coverage_until, last_eit_received_at,
+                     section_coverage_until)
+                 VALUES (1, 2, 900, 800, 700)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.refresh_epg_coverage().unwrap(), None);
+        let state = db
+            .get_epg_scan_states()
+            .unwrap()
+            .into_iter()
+            .find(|state| (state.network_id, state.tsid) == (1, 2))
+            .unwrap();
+        assert_eq!(state.coverage_until, None);
+        assert_eq!(state.last_eit_received_at, Some(800));
+        assert_eq!(state.section_coverage_until, Some(700));
     }
 
     #[test]
