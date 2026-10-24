@@ -935,10 +935,10 @@ pub fn decode_server_message(
             }
             let timestamp = payload.get_i64_le();
             let count = payload.get_u32_le() as usize;
-            // An encoded channel requires at least 22 bytes even when every
+            // An encoded channel requires at least 20 bytes even when every
             // string is empty. Bound the reservation by the remaining frame
             // before trusting the peer-provided count.
-            const MIN_CHANNEL_BYTES: usize = 22;
+            const MIN_CHANNEL_BYTES: usize = 20;
             if count > payload.remaining() / MIN_CHANNEL_BYTES {
                 return Err(ProtocolError::IncompleteFrame {
                     expected: count.saturating_mul(MIN_CHANNEL_BYTES),
@@ -1268,6 +1268,35 @@ mod tests {
         let header = decode_header(&encoded).unwrap().unwrap();
         let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
         let decoded = decode_server_message(header.message_type, payload).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn get_channel_list_accepts_many_minimal_channel_records() {
+        let channels = (0..64)
+            .map(|sid| ClientChannelInfo {
+                nid: 1,
+                sid,
+                tsid: 1,
+                channel_name: String::new(),
+                network_name: None,
+                service_type: 1,
+                remote_control_key: None,
+                space_name: String::new(),
+                channel_display_name: String::new(),
+                priority: 0,
+            })
+            .collect();
+        let msg = ServerMessage::GetChannelListAck {
+            channels,
+            timestamp: 0,
+        };
+
+        let encoded = encode_server_message(&msg).unwrap();
+        let header = decode_header(&encoded).unwrap().unwrap();
+        let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
+        let decoded = decode_server_message(header.message_type, payload).unwrap();
+
         assert_eq!(decoded, msg);
     }
 
