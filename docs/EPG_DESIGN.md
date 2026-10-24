@@ -395,8 +395,9 @@ subscriptionからEITを収集し、EpgWriterへ渡す。最小/最大dwell、id
 判定前にsection coverageを再集計する。remote node側metadata
 実行は認証済み `POST /node/v3/epg/metadata` を使う。remote側は通常の `acquire()` と
 broadcast購読側の `EpgCollector::new_metadata()` で解析し、番組情報だけ返す。schedulerと
-`LocalMuxServer` は別系統の `MuxLeaseManager` を共有し、TTLまたはguard dropで同一
-(NID,TSID)の重複を防ぐ。
+`LocalMuxServer` のmetadata収集は別系統の `MuxLeaseManager` を共有し、同一(NID,TSID)の
+重複を防ぐ。長いEPG dwell中はguardがTTLの3分の1ごとに更新し、dropやキャンセルで即時解放する。
+通常stream leaseはEPG mux lockを取らず、ストリーム寿命を `RemoteLeaseManager` が管理する。
 
 経路の選択は純関数 `choose_execution_path()` が行い、`allow_remote` / `prefer_local` /
 `remote_prefer_metadata_execution` / `remote_allow_ts_transport` の4設定だけで決まる。

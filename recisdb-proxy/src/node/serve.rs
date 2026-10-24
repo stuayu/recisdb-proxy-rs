@@ -288,11 +288,6 @@ impl LocalMuxServer {
         // requester-side remote fallback here would create a multi-node loop.
         context.enter_node(&self.identity.node_id, spent_ms)?;
 
-        let Some(mut mux_lease) = self.mux_leases.try_acquire(mux) else {
-            return Err(ServeError::MuxLeaseUnavailable(mux));
-        };
-        mux_lease.start_heartbeat();
-
         let candidates = self.local_candidates(mux, sid).await?;
         if candidates.is_empty() {
             return Err(ServeError::NoRoute(mux));
@@ -321,10 +316,9 @@ impl LocalMuxServer {
         debug_assert!(outcome.unused_warm.is_none());
 
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
-
         let lease = self
             .leases
-            .create_with_mux_lease_for_requester(
+            .create_for_requester(
                 self.identity.node_id.clone(),
                 requester_node,
                 route_id_for(&outcome.key),
@@ -333,7 +327,6 @@ impl LocalMuxServer {
                 context.stream_class,
                 context.claim,
                 INITIAL_GENERATION,
-                Some(mux_lease),
             )
             .await;
 

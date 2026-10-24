@@ -1603,7 +1603,7 @@ mod tests {
         state.trust_peer(peer_b.clone(), credential_b.clone()).await;
         let lease = state
             .leases
-            .create_with_mux_lease_for_requester(
+            .create_for_requester(
                 state.identity.node_id.clone(),
                 peer_a.clone(),
                 "route".into(),
@@ -1612,7 +1612,6 @@ mod tests {
                 StreamClass::Record,
                 EffectiveClaim::new(2, false),
                 1,
-                None,
             )
             .await;
 

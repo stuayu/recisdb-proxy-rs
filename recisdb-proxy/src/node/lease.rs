@@ -181,7 +181,6 @@ pub struct RemoteMuxLease {
     pub replay: Arc<Mutex<ReplayBuffer>>,
     live_tx: broadcast::Sender<NodeTsFrame>,
     state: Arc<Mutex<LeaseTimes>>,
-    _mux_lease: Option<MuxLeaseGuard>,
     startup_grace_ms: AtomicU64,
 }
 
@@ -203,7 +202,6 @@ impl RemoteMuxLease {
         generation: u32,
         ttl: Duration,
         replay_budget: ReplayBudget,
-        mux_lease: Option<MuxLeaseGuard>,
     ) -> Self {
         let now = Instant::now();
         let (live_tx, _) = broadcast::channel(256);
@@ -227,7 +225,6 @@ impl RemoteMuxLease {
                 renewed_at: now,
                 expires_at: now + ttl,
             })),
-            _mux_lease: mux_lease,
             startup_grace_ms: AtomicU64::new(0),
         }
     }
@@ -321,31 +318,7 @@ impl RemoteLeaseManager {
         claim: EffectiveClaim,
         generation: u32,
     ) -> Arc<RemoteMuxLease> {
-        self.create_with_mux_lease(
-            owner_node,
-            route_id,
-            mux,
-            sid,
-            stream_class,
-            claim,
-            generation,
-            None,
-        )
-        .await
-    }
-
-    pub async fn create_with_mux_lease(
-        &self,
-        owner_node: NodeId,
-        route_id: String,
-        mux: LogicalMuxId,
-        sid: Option<u16>,
-        stream_class: StreamClass,
-        claim: EffectiveClaim,
-        generation: u32,
-        mux_lease: Option<MuxLeaseGuard>,
-    ) -> Arc<RemoteMuxLease> {
-        self.create_with_mux_lease_for_requester(
+        self.create_for_requester(
             owner_node.clone(),
             owner_node,
             route_id,
@@ -354,12 +327,11 @@ impl RemoteLeaseManager {
             stream_class,
             claim,
             generation,
-            mux_lease,
         )
         .await
     }
 
-    pub async fn create_with_mux_lease_for_requester(
+    pub async fn create_for_requester(
         &self,
         owner_node: NodeId,
         requester_node: NodeId,
@@ -369,7 +341,6 @@ impl RemoteLeaseManager {
         stream_class: StreamClass,
         claim: EffectiveClaim,
         generation: u32,
-        mux_lease: Option<MuxLeaseGuard>,
     ) -> Arc<RemoteMuxLease> {
         let lease = Arc::new(RemoteMuxLease::new(
             owner_node,
@@ -382,7 +353,6 @@ impl RemoteLeaseManager {
             generation,
             self.policy.ttl(stream_class),
             self.policy.replay_budget,
-            mux_lease,
         ));
         self.leases
             .write()
@@ -535,7 +505,7 @@ mod tests {
         let requester = NodeId::new("site-b").unwrap();
         let other = NodeId::new("site-c").unwrap();
         let lease = manager
-            .create_with_mux_lease_for_requester(
+            .create_for_requester(
                 owner,
                 requester.clone(),
                 "route".into(),
@@ -544,7 +514,6 @@ mod tests {
                 StreamClass::Record,
                 EffectiveClaim::new(2, false),
                 1,
-                None,
             )
             .await;
         assert!(!manager.renew_for(&lease.id, &other).await);
