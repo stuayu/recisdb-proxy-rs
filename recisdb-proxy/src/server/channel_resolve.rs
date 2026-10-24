@@ -819,6 +819,30 @@ mod tests {
     }
 
     #[test]
+    fn multiplex_resolution_deduplicates_services_on_one_physical_tuner() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_id = db
+            .insert_bon_driver(&NewBonDriver::new("shared-mux.dll"))
+            .unwrap();
+        let mut main_service = ChannelInfo::new(1, 100, 200);
+        main_service.bon_space = Some(0);
+        main_service.bon_channel = Some(13);
+        db.insert_channel(driver_id, &main_service).unwrap();
+
+        let mut sub_service = ChannelInfo::new(1, 101, 200);
+        sub_service.bon_space = Some(0);
+        sub_service.bon_channel = Some(13);
+        db.insert_channel(driver_id, &sub_service).unwrap();
+
+        let resolved =
+            resolve_multiplex_by_nid_tsid(&db, 1, 200).expect("multiplex should resolve");
+
+        assert_eq!(resolved.candidates.len(), 1);
+        assert_eq!(resolved.candidates[0].dll_path, "shared-mux.dll");
+        assert_eq!(resolved.channel.sid, 100);
+    }
+
+    #[test]
     fn unknown_nid_sid_is_not_found() {
         let db = Database::open_in_memory().unwrap();
         let err = resolve_service_by_nid_sid(&db, 1, 999).unwrap_err();
