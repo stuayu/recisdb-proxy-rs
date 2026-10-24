@@ -103,9 +103,9 @@ struct InstanceEntry {
     calls_finished: Condvar,
 }
 
-/// Keeps an instance registered while one exported call is using it. `Release`
-/// takes the registry write lock before deregistering and freeing the object,
-/// so it cannot invalidate a reference held through this guard.
+/// Holds an `Arc` and increments `active_calls` while one exported call uses
+/// the instance. `Release` removes the registry entry to block new guards,
+/// then waits for existing guards to drop before disconnecting and freeing it.
 struct InstanceGuard {
     entry: Arc<InstanceEntry>,
 }
@@ -763,18 +763,24 @@ pub unsafe extern "system" fn release(this: *mut c_void) {
     };
 
     // Removing the entry prevents new exports from acquiring a call guard.
-    // Wait for current exports before disconnecting the shared Connection.
+    // Disconnect first: this drops link_status and wakes synchronous RPCs
+    // that otherwise could hold their guard for the entire read timeout.
+    let connection = {
+        let state = entry.instance.state.lock();
+        state.connection.clone()
+    };
+    file_log!(info, "Release: Disconnecting...");
+    connection.release();
+
+    // The allocation remains alive through `entry` until all exports that
+    // acquired a guard before deregistration have returned.
     let mut active = entry.active_calls.lock();
     while *active != 0 {
         entry.calls_finished.wait(&mut active);
     }
     drop(active);
-    file_log!(info, "Release: Disconnecting...");
-    // `Connection::drop` also disconnects, but do it explicitly so the server
-    // sees the teardown before the allocation goes away.
-    entry.instance.state.lock().connection.disconnect();
     drop(entry);
-    file_log!(info, "Release: Disconnected and instance freed");
+    file_log!(info, "Release: Exports drained, instance freed");
 }
 
 // =============================================================================
@@ -1660,6 +1666,41 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("Release did not finish after the export returned");
         releaser.join().expect("Release thread panicked");
+    }
+
+    #[test]
+    fn release_interrupts_an_inflight_rpc_before_its_read_timeout() {
+        use std::time::Instant;
+
+        let inst = create_instance_with_config(ConnectionConfig {
+            read_timeout: Duration::from_secs(2),
+            ..ConnectionConfig::default()
+        }) as *mut c_void;
+        let mut req_rx = unsafe {
+            let instance = instance_of(inst).expect("instance should be live");
+            let receiver = instance.state.lock().connection.stub_unanswered_rpc();
+            receiver
+        };
+        let addr = inst as usize;
+        let tuning = std::thread::spawn(move || unsafe { set_channel2(addr as *mut c_void, 0, 0) });
+        let request_deadline = Instant::now() + Duration::from_secs(1);
+        while req_rx.try_recv().is_err() && Instant::now() < request_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            Instant::now() < request_deadline,
+            "SetChannel2 did not send its RPC"
+        );
+
+        let start = Instant::now();
+        unsafe { release(inst) };
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Release took {elapsed:?} despite being able to interrupt the pending RPC"
+        );
+        assert_eq!(tuning.join().expect("tuning thread panicked"), 0);
     }
 
     /// Enumeration hands the host a raw pointer whose lifetime it does not

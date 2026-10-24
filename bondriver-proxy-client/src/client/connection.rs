@@ -246,6 +246,9 @@ pub struct Connection {
     /// Set to true by `disconnect()` (explicit CloseTuner/Release path) so the
     /// reconnect supervisor knows the drop was intentional and must not retry.
     closing: AtomicBool,
+    /// Set only for the final BonDriver Release. Unlike `disconnect()`, this
+    /// permanently prevents an already-entered export from reopening the link.
+    released: AtomicBool,
     /// Wakes the supervisor out of a backoff sleep when shutting down.
     reconnect_notify: Notify,
     /// Whether the steady-state loop is currently pumping the socket (see the
@@ -271,6 +274,7 @@ impl Connection {
             signal_level: Mutex::new((0.0, None)),
             session: Mutex::new(SessionContext::default()),
             closing: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             reconnect_notify: Notify::new(),
             link_status: AtomicU8::new(link::DOWN),
             start_stream_retry_at: Mutex::new(None),
@@ -351,6 +355,11 @@ impl Connection {
     /// routine occurrence, not an exceptional one.
     pub fn connect(self: &Arc<Self>) -> bool {
         file_log!(info, "Connection::connect() called");
+
+        if self.released.load(Ordering::Acquire) {
+            file_log!(warn, "connect: BonDriver instance has been released");
+            return false;
+        }
 
         {
             let current = *self.state.lock();
@@ -433,7 +442,15 @@ impl Connection {
             file_log!(info, "connect: Connection supervisor ended");
         });
 
-        *self.runtime.lock() = Some(runtime);
+        let mut runtime_slot = self.runtime.lock();
+        if self.released.load(Ordering::Acquire) {
+            drop(runtime);
+            drop(runtime_slot);
+            self.disconnect();
+            return false;
+        }
+        *runtime_slot = Some(runtime);
+        drop(runtime_slot);
 
         // The Hello message is queued via blocking_send into the mpsc channel immediately.
         // The connection supervisor will dequeue and send it once the TCP connection is established.
@@ -503,6 +520,15 @@ impl Connection {
         *self.start_stream_retry_at.lock() = None;
         self.buffer.clear();
         *self.state.lock() = ConnectionState::Disconnected;
+    }
+
+    /// Permanently close this connection as part of BonDriver `Release`.
+    /// Signals in-flight synchronous RPCs before the export waits for their
+    /// guards, and prevents a call that entered just before Release from
+    /// starting a new connection afterward.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.disconnect();
     }
 
     /// Send a message and wait for response with timeout.
