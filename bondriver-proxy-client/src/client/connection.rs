@@ -299,6 +299,10 @@ impl Connection {
         *self.state.lock()
     }
 
+    pub(crate) fn should_cancel_wait(&self) -> bool {
+        self.closing.load(Ordering::Acquire) || self.released.load(Ordering::Acquire)
+    }
+
     /// Get the BonDriver version.
     #[allow(dead_code)]
     pub fn bondriver_version(&self) -> u8 {
@@ -506,6 +510,7 @@ impl Connection {
         self.closing.store(true, Ordering::SeqCst);
         self.link_status.store(link::DOWN, Ordering::SeqCst);
         self.reconnect_notify.notify_waiters();
+        self.buffer.cancel_waiters();
 
         // Drop the request channel to signal shutdown
         *self.request_tx.lock() = None;

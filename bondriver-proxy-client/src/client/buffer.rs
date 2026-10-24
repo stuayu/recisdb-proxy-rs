@@ -212,6 +212,17 @@ impl TsRingBuffer {
     ///
     /// Returns `true` if data is available, `false` on timeout.
     pub fn wait_data(&self, timeout: Duration) -> bool {
+        self.wait_data_with_cancel(timeout, || false)
+    }
+
+    /// Block until data arrives, the timeout expires, or `cancelled` becomes
+    /// true. Call [`Self::cancel_waiters`] after changing the cancellation
+    /// condition so any blocked waiter wakes promptly.
+    pub fn wait_data_with_cancel(&self, timeout: Duration, cancelled: impl Fn() -> bool) -> bool {
+        if cancelled() {
+            return false;
+        }
+
         // Fast path: data already waiting.
         if self.available() >= TS_PACKET_SIZE {
             return true;
@@ -221,6 +232,10 @@ impl TsRingBuffer {
         let mut guard = self.data_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
         loop {
+            if cancelled() {
+                return false;
+            }
+
             if self.available() >= TS_PACKET_SIZE {
                 return true;
             }
@@ -240,6 +255,13 @@ impl TsRingBuffer {
                 return false;
             }
         }
+    }
+
+    /// Wake threads blocked in [`Self::wait_data`] or
+    /// [`Self::wait_data_with_cancel`].
+    pub fn cancel_waiters(&self) {
+        let _guard = self.data_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.data_available.notify_all();
     }
 
     /// Consumer-side drop-oldest. When the buffer is full because the consumer

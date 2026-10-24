@@ -395,7 +395,7 @@ pub unsafe extern "system" fn wait_ts_stream(this: *mut c_void, timeout_ms: DWOR
 
     // Block until data arrives or timeout — no spin loop, no sleep().
     let timeout = Duration::from_millis(timeout_ms as u64);
-    if buffer.wait_data(timeout) {
+    if buffer.wait_data_with_cancel(timeout, || connection.should_cancel_wait()) {
         let ready = buffer.available() / TS_PACKET_SIZE;
         ready.min(DWORD::MAX as usize) as DWORD
     } else {
@@ -1701,6 +1701,27 @@ mod tests {
             "Release took {elapsed:?} despite being able to interrupt the pending RPC"
         );
         assert_eq!(tuning.join().expect("tuning thread panicked"), 0);
+    }
+
+    #[test]
+    fn release_wakes_wait_ts_stream_before_the_host_timeout() {
+        use std::time::Instant;
+
+        let inst = create_instance() as *mut c_void;
+        let addr = inst as usize;
+        let waiting =
+            std::thread::spawn(move || unsafe { wait_ts_stream(addr as *mut c_void, 2_000) });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let start = Instant::now();
+        unsafe { release(inst) };
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Release took {elapsed:?} while WaitTsStream was waiting"
+        );
+        assert_eq!(waiting.join().expect("WaitTsStream thread panicked"), 0);
     }
 
     /// Enumeration hands the host a raw pointer whose lifetime it does not
