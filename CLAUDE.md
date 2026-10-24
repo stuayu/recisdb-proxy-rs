@@ -52,9 +52,8 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
   放送休止、深夜帯を欠損扱いしない。
 - coverageは `programs` の `MAX(start_at + duration_secs)` から作らない。それは補助指標であり、
   完了・stale判定には `epg_scan_states.section_coverage_until` を使う。muxのcoverageは
-  `channels.service_type` が1または2のサービスを常に対象とし、NULLは
-  `epg_service_coverage` に受信済み行があるサービスだけを対象にする。対象サービスの最小値を
-  採用し、1つでも未取得なら未取得扱いにする。
+  番組表対象サービス（`channels.service_type` が1、2、またはNULL）の最小値とし、1つでも
+  未取得なら未取得扱いにする。
 - schedule EITの過去segmentは放送されない。先頭schedule tableでは現在segmentより前を完了扱いにし、
   現在segment以降と2番目以降のtableは受信sectionの完成度を要求する。
 - EPG行の書き込みは有界キューで行い、溢れた行は捨てて数える。送信側で待たない(SI collectorが

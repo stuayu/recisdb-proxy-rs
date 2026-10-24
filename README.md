@@ -689,7 +689,7 @@ Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境
 | `-t, --tuner` | ― | デフォルトのチューナーパス (DLL パスまたはデバイスパス) |
 | `-d, --database` | `recisdb-proxy.db` | SQLite データベースファイルのパス |
 | `-f, --config` | ― | 設定ファイルのパス |
-| `-c, --max-connections` | `64` | 最大同時接続数 |
+| `-c, --max-connections` | `64` | BNDP/TCP接続の上限 (Web/Mirakurunは別枠、0なら全て拒否) |
 | `--enable-scan` | `true` | 自動チャンネルスキャンの有効化 |
 | `--scan-on-start` | `false` | 起動時に即時スキャンを実行 |
 | `--scan-interval` | `60` | スキャンチェック間隔 (秒) |
@@ -708,6 +708,7 @@ Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境
 [server]
 listen = "0.0.0.0:40070"
 web_listen = "0.0.0.0:40080"
+# BNDP/TCP接続の上限 (Web/MirakurunのHTTPは別枠、0なら全て拒否)
 max_connections = 64
 
 [database]

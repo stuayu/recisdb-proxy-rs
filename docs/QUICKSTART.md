@@ -213,6 +213,7 @@ cat > recisdb-proxy.toml << 'EOF'
 [server]
 listen = "0.0.0.0:40070"
 web_listen = "0.0.0.0:40080"
+# BNDP/TCP接続の上限 (Web/MirakurunのHTTPは別枠、0なら全て拒否)
 max_connections = 64
 EOF
 
@@ -292,7 +293,7 @@ web_listen = "0.0.0.0:40080"
 # デフォルトチューナー（複数登録可能。DBに登録される）
 tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
 
-# 最大同時接続数
+# BNDP/TCP接続の上限 (Web/MirakurunのHTTPは別枠、0なら全て拒否)
 max_connections = 64
 
 [database]
@@ -318,7 +319,7 @@ recisdb-proxy --help
 | `--web-listen ADDR` | Webダッシュボードのリッスンアドレス | 0.0.0.0:40080 |
 | `--tuner PATH` | デフォルトチューナーパス | （指定なし） |
 | `--database PATH` | SQLiteデータベースファイル | recisdb-proxy.db |
-| `--max-connections N` | 最大同時接続数 | 64 |
+| `--max-connections N` | BNDP/TCP接続の上限 (0なら全て拒否) | 64 |
 | `--config FILE` | 設定ファイルパス | （指定なし） |
 | `--verbose` | デバッグログを有効化 | false |
 | `--enable-scan` | チャンネルスキャンを有効化 | true |

@@ -24,7 +24,7 @@ web_listen = "0.0.0.0:40080"
 # tuner = "C:\\BonDriver\\BonDriver_PX-MLT1.dll"
 
 # 最大同時接続数 (デフォルト: 64)
-# 同時に接続できるクライアント数の上限
+# BNDP/TCP の接続上限。Web/Mirakurun のHTTP接続は別枠。0 は全て拒否
 max_connections = 64
 
 # =====================================================
