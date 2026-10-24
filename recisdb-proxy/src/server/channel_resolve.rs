@@ -227,12 +227,14 @@ pub fn resolve_multiplex_by_nid_tsid(
     nid: u16,
     tsid: u16,
 ) -> Result<ResolvedService, ChannelResolveError> {
-    let mut rows = db
+    let rows = db
         .get_channels_by_nid_tsid_ordered(nid, tsid, None)?
         .into_iter()
         .map(|row| row.channel)
         .collect::<Vec<_>>();
-    rows.sort_by_key(|row| (std::cmp::Reverse(row.priority), row.id));
+    // Keep the database's channel-priority then driver scan-priority order.
+    // It chooses both the first physical candidate and the representative
+    // service shown for a multiplex stream.
     resolve_candidate_rows(db, rows, ChannelResolveError::NotFoundNidTsid(nid, tsid))
 }
 
@@ -777,6 +779,43 @@ mod tests {
             .candidates
             .iter()
             .any(|candidate| candidate.dll_path == "driver-b.dll"));
+    }
+
+    #[test]
+    fn multiplex_resolution_preserves_driver_scan_priority_when_channel_priorities_tie() {
+        let db = Database::open_in_memory().unwrap();
+        insert_channel_on_driver(
+            &db,
+            "driver-low-scan.dll",
+            1,
+            100,
+            Some(0),
+            Some(13),
+            5,
+            true,
+        );
+        insert_channel_on_driver(
+            &db,
+            "driver-high-scan.dll",
+            1,
+            101,
+            Some(2),
+            Some(27),
+            5,
+            true,
+        );
+        let high_scan_driver = db
+            .get_bon_driver_by_path("driver-high-scan.dll")
+            .unwrap()
+            .unwrap();
+        db.update_scan_config(high_scan_driver.id, None, None, Some(10), None)
+            .unwrap();
+
+        let resolved =
+            resolve_multiplex_by_nid_tsid(&db, 1, 200).expect("multiplex should resolve");
+
+        assert_eq!(resolved.candidates[0].dll_path, "driver-high-scan.dll");
+        assert_eq!(resolved.dll_path(), "driver-high-scan.dll");
     }
 
     #[test]

@@ -285,7 +285,7 @@ impl Database {
                  FROM channels c
                  JOIN bon_drivers bd ON c.bon_driver_id = bd.id
                  WHERE c.nid = ?1 AND c.tsid = ?2 AND c.sid = ?3 AND c.is_enabled = 1
-                 ORDER BY c.priority DESC, bd.scan_priority DESC",
+                 ORDER BY c.priority DESC, bd.scan_priority DESC, c.id ASC",
             )?;
             let rows = stmt.query_map(params![nid as i32, tsid as i32, s as i32], |row| {
                 Ok(ChannelWithDriver {
@@ -301,7 +301,7 @@ impl Database {
                  FROM channels c
                  JOIN bon_drivers bd ON c.bon_driver_id = bd.id
                  WHERE c.nid = ?1 AND c.tsid = ?2 AND c.is_enabled = 1
-                 ORDER BY c.priority DESC, bd.scan_priority DESC",
+                 ORDER BY c.priority DESC, bd.scan_priority DESC, c.id ASC",
             )?;
             let rows = stmt.query_map(params![nid as i32, tsid as i32], |row| {
                 Ok(ChannelWithDriver {
