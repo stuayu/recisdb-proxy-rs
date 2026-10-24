@@ -36,7 +36,7 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| GET | `/api/channels` | チャンネル一覧。`bondriver_id`、`enabled_only`、`group_logical`対応 |
+| GET | `/api/channels` | チャンネル一覧。`bondriver_id`、`enabled_only`、`group_logical`、`limit` / `offset`、`q`、`sort` / `desc`、`sort2` / `desc2`、`sort3` / `desc3` に対応。ソートキーは `ChannelsView.vue` の列キーを固定allowlistで解決し、未対応値は `channel_name` にフォールバックする。 |
 | POST | `/api/channel` | チャンネル登録 |
 | POST | `/api/channel/:id` | チャンネル更新 |
 | DELETE | `/api/channel/:id` | チャンネル削除 |

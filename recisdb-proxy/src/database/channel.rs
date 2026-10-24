@@ -194,8 +194,7 @@ impl Database {
         bondriver_id: Option<i64>,
         enabled_only: bool,
         search: Option<&str>,
-        sort_column: &str,
-        descending: bool,
+        sort_columns: &[(&str, bool)],
         limit: Option<u32>,
         offset: u32,
     ) -> Result<(Vec<(ChannelRecord, String)>, u64)> {
@@ -222,12 +221,23 @@ impl Database {
             .conn
             .query_row(&count_sql, bound.as_slice(), |r| r.get::<_, i64>(0))?
             as u64;
-        let direction = if descending { " DESC" } else { " ASC" };
+        let order_by = sort_columns
+            .iter()
+            .map(|(column, descending)| {
+                let direction = if *descending { "DESC" } else { "ASC" };
+                format!("{column} {direction}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order_by = if order_by.is_empty() {
+            "c.channel_name ASC".to_string()
+        } else {
+            order_by
+        };
         let sql = format!(
-            "SELECT c.*, d.dll_path{} ORDER BY c.{}{} , c.id ASC{}",
+            "SELECT c.*, d.dll_path{} ORDER BY {}, c.id ASC{}",
             where_sql,
-            sort_column,
-            direction,
+            order_by,
             if limit.is_some() {
                 " LIMIT ? OFFSET ?"
             } else {
@@ -1292,6 +1302,33 @@ mod tests {
         info.bon_space = Some(0);
         info.bon_channel = Some(sid as u32);
         info
+    }
+
+    #[test]
+    fn channels_for_api_applies_secondary_sort_direction_in_sql() {
+        let db = Database::open_in_memory().unwrap();
+        let driver_id = db.get_or_create_bon_driver("sort-test.dll").unwrap();
+        let insert = |nid, sid, name: &str| {
+            let mut channel = create_test_channel(nid, sid, 1);
+            channel.channel_name = Some(name.to_string());
+            db.insert_channel(driver_id, &channel).unwrap()
+        };
+        let alpha_low_nid = insert(1, 101, "Alpha");
+        let alpha_high_nid = insert(9, 102, "Alpha");
+        let beta = insert(5, 103, "Beta");
+
+        let (rows, _) = db
+            .get_channels_for_api(
+                None,
+                false,
+                None,
+                &[("c.channel_name", false), ("c.nid", true)],
+                None,
+                0,
+            )
+            .unwrap();
+        let ids: Vec<i64> = rows.into_iter().map(|(channel, _)| channel.id).collect();
+        assert_eq!(ids, vec![alpha_high_nid, alpha_low_nid, beta]);
     }
 
     #[test]

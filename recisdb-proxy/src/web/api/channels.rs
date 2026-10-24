@@ -66,17 +66,67 @@ pub struct ChannelQuery {
     pub q: Option<String>,
     pub sort: Option<String>,
     pub desc: Option<bool>,
+    pub sort2: Option<String>,
+    pub desc2: Option<bool>,
+    pub sort3: Option<String>,
+    pub desc3: Option<bool>,
 }
 
-fn channel_sort_column(value: Option<&str>) -> &str {
+fn channel_sort_column(value: Option<&str>) -> &'static str {
     match value.unwrap_or("channel_name") {
-        "id" | "nid" | "sid" | "tsid" | "channel_name" | "raw_name" | "physical_ch"
-        | "network_name" | "bon_space" | "bon_channel" | "priority" | "failure_count"
-        | "scan_time" | "last_seen" | "created_at" | "updated_at" | "bon_driver_id" => {
-            value.unwrap_or("channel_name")
-        }
-        _ => "channel_name",
+        "is_enabled" => "c.is_enabled",
+        "channel_name" => "c.channel_name",
+        "nid" => "c.nid",
+        "sid" => "c.sid",
+        "tsid" => "c.tsid",
+        "band_type" => "c.band_type",
+        "terrestrial_region" => "c.terrestrial_region",
+        "network_name" => "c.network_name",
+        "bon_driver_path" => "d.dll_path",
+        "bon_space" => "c.bon_space",
+        "bon_channel" => "c.bon_channel",
+        "priority" => "c.priority",
+        "id" => "c.id",
+        "raw_name" => "c.raw_name",
+        "manual_sheet" => "c.manual_sheet",
+        "physical_ch" => "c.physical_ch",
+        "remote_control_key" => "c.remote_control_key",
+        "service_type" => "c.service_type",
+        "failure_count" => "c.failure_count",
+        "scan_time" => "c.scan_time",
+        "last_seen" => "c.last_seen",
+        "created_at" => "c.created_at",
+        "updated_at" => "c.updated_at",
+        _ => "c.channel_name",
     }
+}
+
+fn channel_sort_columns(query: &ChannelQuery) -> Vec<(&'static str, bool)> {
+    let requested = [
+        (
+            query.sort.as_deref().unwrap_or("channel_name"),
+            query.desc.unwrap_or(false),
+        ),
+        (
+            query.sort2.as_deref().unwrap_or(""),
+            query.desc2.unwrap_or(false),
+        ),
+        (
+            query.sort3.as_deref().unwrap_or(""),
+            query.desc3.unwrap_or(false),
+        ),
+    ];
+    let mut columns = Vec::with_capacity(3);
+    for (key, descending) in requested {
+        if key.is_empty() {
+            continue;
+        }
+        let column = channel_sort_column(Some(key));
+        if !columns.iter().any(|(existing, _)| *existing == column) {
+            columns.push((column, descending));
+        }
+    }
+    columns
 }
 
 /// Get all channels.
@@ -92,15 +142,18 @@ pub async fn get_channels(
             || query.offset.is_some()
             || query.q.is_some()
             || query.sort.is_some()
-            || query.desc.is_some())
+            || query.desc.is_some()
+            || query.sort2.is_some()
+            || query.desc2.is_some()
+            || query.sort3.is_some()
+            || query.desc3.is_some())
     {
-        let sort_column = channel_sort_column(query.sort.as_deref());
+        let sort_columns = channel_sort_columns(&query);
         let (channels, total) = db.get_channels_for_api(
             query.bondriver_id,
             enabled_only,
             query.q.as_deref(),
-            sort_column,
-            query.desc.unwrap_or(false),
+            &sort_columns,
             query.limit,
             query.offset.unwrap_or(0),
         )?;
@@ -350,12 +403,67 @@ pub async fn get_channels(
 
 #[cfg(test)]
 mod tests {
-    use super::channel_sort_column;
+    use super::{channel_sort_column, channel_sort_columns, ChannelQuery};
 
     #[test]
     fn sort_key_is_whitelisted() {
-        assert_eq!(channel_sort_column(Some("channel_name")), "channel_name");
-        assert_eq!(channel_sort_column(Some("id DESC, secret")), "channel_name");
+        assert_eq!(channel_sort_column(Some("channel_name")), "c.channel_name");
+        assert_eq!(channel_sort_column(Some("bon_driver_path")), "d.dll_path");
+        assert_eq!(
+            channel_sort_column(Some("id DESC, secret")),
+            "c.channel_name"
+        );
+        for key in [
+            "is_enabled",
+            "nid",
+            "sid",
+            "tsid",
+            "band_type",
+            "terrestrial_region",
+            "network_name",
+            "bon_space",
+            "bon_channel",
+            "priority",
+            "id",
+            "raw_name",
+            "manual_sheet",
+            "physical_ch",
+            "remote_control_key",
+            "service_type",
+            "failure_count",
+            "scan_time",
+            "last_seen",
+            "created_at",
+            "updated_at",
+        ] {
+            assert_ne!(
+                channel_sort_column(Some(key)),
+                "c.channel_name",
+                "UI sort key {key} must map to a fixed SQL column"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_sort_keys_are_allowlisted_and_ordered() {
+        let query = ChannelQuery {
+            sort: Some("nid".into()),
+            desc: Some(true),
+            sort2: Some("bon_driver_path".into()),
+            desc2: Some(false),
+            sort3: Some("sid".into()),
+            desc3: Some(true),
+            bondriver_id: None,
+            enabled_only: None,
+            group_logical: None,
+            limit: None,
+            offset: None,
+            q: None,
+        };
+        assert_eq!(
+            channel_sort_columns(&query),
+            vec![("c.nid", true), ("d.dll_path", false), ("c.sid", true)]
+        );
     }
 }
 

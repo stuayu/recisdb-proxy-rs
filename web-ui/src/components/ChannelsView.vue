@@ -3,6 +3,11 @@ import { computed, onMounted, onUnmounted, reactive, ref, shallowRef, watch } fr
 import { api, downloadApi, unwrapArray, type JsonRecord } from '../api'
 import EntityLookup, { type LookupEntity } from './EntityLookup.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
+import {
+  buildChannelListParams,
+  createLatestRequestGate,
+  pageSizeChangeAction,
+} from '../composables/channelList'
 
 type Column = {
   key: string
@@ -132,6 +137,7 @@ const pageSize = ref(pageSizeOptions.includes(savedPageSize) ? savedPageSize : 1
 const page = ref(1)
 const total = ref(0)
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+const channelLoadGate = createLatestRequestGate()
 const pageRows = computed(() => rows.value)
 const sorted = computed(() => rows.value)
 const rangeStart = computed(() => (total.value ? (page.value - 1) * pageSize.value + 1 : 0))
@@ -141,8 +147,10 @@ watch([appliedQuery, sortKey, descending, sortKey2, descending2, sortKey3, desce
   void load()
 })
 watch(pageSize, (value) => {
-  page.value = 1
+  const action = pageSizeChangeAction(page.value)
+  page.value = action.page
   localStorage.setItem('channelPageSize', String(value))
+  if (action.reload) void load()
 })
 watch(page, () => void load())
 watch(totalPages, (value) => {
@@ -168,19 +176,24 @@ const allSelected = computed(
 )
 
 async function load() {
+  const request = channelLoadGate.begin()
   loading.value = true
   try {
-    const params = new URLSearchParams({
-      limit: String(pageSize.value),
-      offset: String((page.value - 1) * pageSize.value),
-      sort: sortKey.value,
-      desc: String(descending.value),
+    const params = buildChannelListParams({
+      page: page.value,
+      pageSize: pageSize.value,
+      query: appliedQuery.value,
+      sorts: [
+        { key: sortKey.value, descending: descending.value },
+        { key: sortKey2.value, descending: descending2.value },
+        { key: sortKey3.value, descending: descending3.value },
+      ],
     })
-    if (appliedQuery.value.trim()) params.set('q', appliedQuery.value.trim())
     const [channelResponse, driverResponse] = await Promise.all([
       api<JsonRecord>(`/channels?${params.toString()}`),
       api<JsonRecord>('/bondrivers'),
     ])
+    if (!channelLoadGate.isCurrent(request)) return
     rows.value = unwrapArray(channelResponse, ['channels'])
     total.value = Number(channelResponse.total ?? channelResponse.count ?? rows.value.length)
     const driverRows = unwrapArray(driverResponse, ['bondrivers', 'tuners'])
@@ -196,9 +209,11 @@ async function load() {
     selected.value = selected.value.filter((id) => knownIds.has(id))
     error.value = ''
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    if (channelLoadGate.isCurrent(request)) {
+      error.value = cause instanceof Error ? cause.message : String(cause)
+    }
   } finally {
-    loading.value = false
+    if (channelLoadGate.isCurrent(request)) loading.value = false
   }
 }
 
