@@ -1847,16 +1847,14 @@ mod tests {
         let result = acquire(&pool, &database, request).await;
         let retained = pool.get(&old_key).await.is_some();
         let old_state = old.state();
-        let restored_permit = old.take_slot_permit().is_some();
+        let restored_permit = old
+            .take_slot_permit()
+            .expect("the carried reservation must return to its owner");
         gate.release();
 
         assert!(result.is_err());
         assert!(retained, "timed-out reader must stay in the pool");
         assert_eq!(old_state, crate::tuner::shared::ReaderState::Stopping);
-        assert!(
-            restored_permit,
-            "the carried reservation must return to its owner"
-        );
         tokio::time::timeout(Duration::from_secs(2), async {
             while old.state() != crate::tuner::shared::ReaderState::Stopped {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1864,6 +1862,8 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(restored_permit);
+        assert!(pool.acquire_slot(path, 1).await.is_some());
         old.stop_reader().await;
     }
 

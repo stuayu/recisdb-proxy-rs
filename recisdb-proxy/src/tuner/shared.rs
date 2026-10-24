@@ -3310,7 +3310,7 @@ mod tests {
         }
         assert_eq!(state_during_timeout, ReaderState::Stopping);
         assert!(slot_was_still_owned);
-        assert!(shared.occupies_slot() == false);
+        assert!(!shared.occupies_slot());
         assert!(pool.acquire_slot("/dev/stuck-test", 1).await.is_some());
         assert!(shared.stop_reader().await);
     }
