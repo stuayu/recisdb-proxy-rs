@@ -2870,6 +2870,7 @@ mod tests {
         assert!(app.install_dir().is_absolute());
     }
 
+    #[cfg(windows)]
     #[test]
     fn config_and_db_paths_are_derived_from_install_location() {
         let mut app = SetupApp::new();
