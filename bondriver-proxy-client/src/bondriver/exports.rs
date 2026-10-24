@@ -4,8 +4,8 @@
 //! This module implements the BonDriver interface functions that are called
 //! by the host application (e.g., TVTest).
 
-use std::collections::HashSet;
 use std::ffi::c_void;
+use std::ops::Deref;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use log::{debug, error, info, trace};
 use once_cell::sync::OnceCell;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::bondriver::interface::*;
 use crate::client::buffer::TS_PACKET_SIZE;
@@ -77,9 +77,11 @@ pub struct BonDriverInstance {
 unsafe impl Send for BonDriverInstance {}
 unsafe impl Sync for BonDriverInstance {}
 
-/// Addresses of the instances that are currently alive.
+/// Entries for the instances that are currently alive. An export clones its
+/// entry before using the object; Release removes it from this map first, then
+/// waits for existing entry guards to finish before disconnecting and freeing.
 ///
-/// Every exported method validates its `this` against this set before
+/// Every exported method validates its `this` against this map before
 /// dereferencing it, so a stale pointer (a host calling into an instance it
 /// already released, or a null `this`) turns into a benign failure return
 /// instead of undefined behaviour.  A panic must never cross the
@@ -88,10 +90,44 @@ unsafe impl Sync for BonDriverInstance {}
 /// An `RwLock` rather than a `Mutex`: every FFI call takes this, including
 /// `GetTsStream` on the host's streaming thread, and they are all readers.
 /// Writes happen only on create/release.
-static LIVE_INSTANCES: OnceCell<RwLock<HashSet<usize>>> = OnceCell::new();
+static LIVE_INSTANCES: OnceCell<RwLock<std::collections::HashMap<usize, Arc<InstanceEntry>>>> =
+    OnceCell::new();
 
-fn live_instances() -> &'static RwLock<HashSet<usize>> {
-    LIVE_INSTANCES.get_or_init(|| RwLock::new(HashSet::new()))
+fn live_instances() -> &'static RwLock<std::collections::HashMap<usize, Arc<InstanceEntry>>> {
+    LIVE_INSTANCES.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+struct InstanceEntry {
+    instance: Box<BonDriverInstance>,
+    active_calls: Mutex<usize>,
+    calls_finished: Condvar,
+}
+
+/// Keeps an instance registered while one exported call is using it. `Release`
+/// takes the registry write lock before deregistering and freeing the object,
+/// so it cannot invalidate a reference held through this guard.
+struct InstanceGuard {
+    entry: Arc<InstanceEntry>,
+}
+
+impl Deref for InstanceGuard {
+    type Target = BonDriverInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry.instance
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let mut active = self.entry.active_calls.lock();
+        if *active > 0 {
+            *active -= 1;
+        }
+        if *active == 0 {
+            self.entry.calls_finished.notify_all();
+        }
+    }
 }
 
 /// Process-wide intern table for the wide strings handed back by
@@ -163,8 +199,13 @@ fn create_instance_with_config(config: ConnectionConfig) -> *mut IBonDriver {
         vtbl: get_vtable_ptr(),
         state: Mutex::new(BonDriverState::new(config)),
     });
-    let ptr = Box::into_raw(instance);
-    live_instances().write().insert(ptr as usize);
+    let ptr = (&*instance) as *const BonDriverInstance as *mut BonDriverInstance;
+    let entry = Arc::new(InstanceEntry {
+        instance,
+        active_calls: Mutex::new(0),
+        calls_finished: Condvar::new(),
+    });
+    live_instances().write().insert(ptr as usize, entry);
     file_log!(info, "create_instance: new instance at {:p}", ptr);
 
     ptr as *mut IBonDriver
@@ -172,20 +213,33 @@ fn create_instance_with_config(config: ConnectionConfig) -> *mut IBonDriver {
 
 /// Resolve the instance a call belongs to, or `None` if `this` is null or no
 /// longer alive.
-unsafe fn instance_of<'a>(this: *mut c_void) -> Option<&'a BonDriverInstance> {
+unsafe fn instance_of(this: *mut c_void) -> Option<InstanceGuard> {
     if this.is_null() {
         file_log!(error, "FFI call with null `this`; ignoring");
         return None;
     }
-    if !live_instances().read().contains(&(this as usize)) {
+    let live = live_instances().read();
+    let Some(entry) = live.get(&(this as usize)) else {
         file_log!(
             error,
             "FFI call on released/unknown instance {:p}; ignoring",
             this
         );
         return None;
-    }
-    Some(&*(this as *const BonDriverInstance))
+    };
+    let mut active = entry.active_calls.lock();
+    let Some(next_active) = active.checked_add(1) else {
+        error!(
+            "Too many concurrent exports for instance {:p}; ignoring",
+            this
+        );
+        return None;
+    };
+    *active = next_active;
+    drop(active);
+    Some(InstanceGuard {
+        entry: Arc::clone(entry),
+    })
 }
 
 /// Load configuration from INI file or environment.
@@ -699,21 +753,27 @@ pub unsafe extern "system" fn release(this: *mut c_void) {
         file_log!(error, "Release with null `this`; ignoring");
         return;
     }
-    if !live_instances().write().remove(&(this as usize)) {
+    let Some(entry) = live_instances().write().remove(&(this as usize)) else {
         file_log!(
             error,
             "Release on released/unknown instance {:p}; ignoring",
             this
         );
         return;
-    }
+    };
 
-    let instance = Box::from_raw(this as *mut BonDriverInstance);
+    // Removing the entry prevents new exports from acquiring a call guard.
+    // Wait for current exports before disconnecting the shared Connection.
+    let mut active = entry.active_calls.lock();
+    while *active != 0 {
+        entry.calls_finished.wait(&mut active);
+    }
+    drop(active);
     file_log!(info, "Release: Disconnecting...");
     // `Connection::drop` also disconnects, but do it explicitly so the server
     // sees the teardown before the allocation goes away.
-    instance.state.lock().connection.disconnect();
-    drop(instance);
+    entry.instance.state.lock().connection.disconnect();
+    drop(entry);
     file_log!(info, "Release: Disconnected and instance freed");
 }
 
@@ -1424,7 +1484,8 @@ mod tests {
             // what matters here is that the two objects address different
             // storage.
             {
-                let mut st = instance_of(a).unwrap().state.lock();
+                let instance = instance_of(a).unwrap();
+                let mut st = instance.state.lock();
                 st.cur_space = 3;
                 st.cur_channel = 11;
             }
@@ -1462,7 +1523,8 @@ mod tests {
         unsafe {
             // Nobody answers the request, so SetChannel2 blocks in the RPC.
             let _req_rx = {
-                let state = instance_of(inst).unwrap().state.lock();
+                let instance = instance_of(inst).unwrap();
+                let state = instance.state.lock();
                 state
                     .connection
                     .buffer()
@@ -1506,7 +1568,8 @@ mod tests {
             // Put more than one packet in the ring buffer so the read is not
             // limited by availability.
             {
-                let state = instance_of(inst).unwrap().state.lock();
+                let instance = instance_of(inst).unwrap();
+                let state = instance.state.lock();
                 state
                     .connection
                     .buffer()
@@ -1575,6 +1638,28 @@ mod tests {
             assert_eq!(get_active_device_num(null), 0);
             release(null);
         }
+    }
+
+    #[test]
+    fn release_waits_for_an_inflight_export_instance_guard() {
+        let inst = create_instance() as *mut c_void;
+        let instance_guard = unsafe { instance_of(inst) }.expect("instance should be live");
+        let addr = inst as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            unsafe { release(addr as *mut c_void) };
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "Release must wait while an export holds an instance guard"
+        );
+        drop(instance_guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Release did not finish after the export returned");
+        releaser.join().expect("Release thread panicked");
     }
 
     /// Enumeration hands the host a raw pointer whose lifetime it does not
