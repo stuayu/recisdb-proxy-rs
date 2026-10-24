@@ -83,7 +83,13 @@ pub(super) async fn stop_and_remove_tuner(
     wait_for_stop: bool,
 ) {
     tuner_pool.cancel_idle_close(key).await;
-    tuner.stop_reader().await;
+    if !tuner.stop_reader().await {
+        tracing::warn!(
+            "keeping tuner {:?} in the pool because its reader has not exited",
+            key
+        );
+        return;
+    }
 
     if wait_for_stop {
         // Wait for the slot to actually be released, not merely for TS data

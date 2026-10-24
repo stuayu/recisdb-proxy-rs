@@ -1139,8 +1139,8 @@ impl SharedTuner {
     /// [`Self::stop_existing_reader_before_restart`]) can tell a confirmed
     /// stop apart from "gave up waiting", since only the former makes it
     /// actually safe to open a second instance on the same DLL
-    /// (docs/TUNER_PIPELINE_REDESIGN.md §2.1-3). Most callers (idle-close,
-    /// session teardown, eviction) don't care and simply discard it.
+    /// (docs/TUNER_PIPELINE_REDESIGN.md §2.1-3). Callers that remove a pool
+    /// entry or transfer its permit must preserve the entry on `false`.
     pub async fn stop_reader(&self) -> bool {
         info!("[SharedTuner] Stopping reader for {:?}...", self.key);
 
@@ -1161,10 +1161,10 @@ impl SharedTuner {
         )
         .await
         {
-            if let Some(handle) = guard.take() {
+            if let Some(mut handle) = guard.take() {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(timing::STOP_READER_TIMEOUT_MS),
-                    handle,
+                    &mut handle,
                 )
                 .await
                 {
@@ -1177,9 +1177,10 @@ impl SharedTuner {
                     }
                     Err(_) => {
                         error!(
-                            "[SharedTuner] Reader task timeout for {:?}, aborting",
+                            "[SharedTuner] Reader task timeout for {:?}; retaining its DLL slot",
                             self.key
                         );
+                        *guard = Some(handle);
                         false
                     }
                 }
@@ -1197,26 +1198,19 @@ impl SharedTuner {
             false
         };
 
-        // Final ensure: mark as stopped, even if the reader task never got a
-        // chance to set this itself (timeout/abort above). Also releases the
-        // driver-slot permit explicitly here (docs/TUNER_PIPELINE_REDESIGN.md
-        // P1b item 2) rather than waiting on this `SharedTuner`'s `Arc` to
-        // drop — a caller that immediately reopens the same DLL (permit
-        // handoff during a channel switch) needs the slot freed
-        // deterministically at this point, not whenever the last reference
-        // happens to go away.
-        //
-        // This unconditional release even on `joined == false` is a
-        // deliberate trade-off carried over from P1b: a DLL that truly never
-        // returns from its blocking call would otherwise leak the slot
-        // forever. The residual risk (a still-running old thread and a new
-        // reader both touching the same DLL) is what
-        // `stop_existing_reader_before_restart` guards against by refusing
-        // to *proceed to a new open* when `joined` is `false`, rather than
-        // by holding the permit here.
-        self.stop_and_release_slot();
-
-        info!("[SharedTuner] Reader stopped for {:?}", self.key);
+        // The reader task itself releases its slot when it exits. Only force
+        // the final transition for the never-started/no-handle case; on a
+        // timeout keep `Stopping` and its permit until the blocking DLL call
+        // returns and the reader's own cleanup runs.
+        if joined {
+            self.stop_and_release_slot();
+            info!("[SharedTuner] Reader stopped for {:?}", self.key);
+        } else {
+            warn!(
+                "[SharedTuner] Reader for {:?} is still stopping; slot remains reserved",
+                self.key
+            );
+        }
         joined
     }
 
@@ -1270,13 +1264,10 @@ impl SharedTuner {
         startup_config: ReaderStartupConfig,
         ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
-        // Already set by the caller (`start_bondriver_reader`/
-        // `WarmTunerHandle::activate`) before this function was ever
-        // scheduled, so the pool entry is occupied from the moment the
-        // caller decided to start a reader — not just from whenever this
-        // `spawn_blocking` closure happens to run. Set again here
-        // defensively (idempotent) in case a future caller forgets.
-        shared.set_state(ReaderState::Starting);
+        // The caller sets `Starting` before scheduling this blocking task.
+        // Do not write it again here: `stop_reader()` may have changed the
+        // state to `Stopping` before this closure gets CPU time, and resetting
+        // it would erase the stop request and resurrect the reader.
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
         // Set channel with retry for network-latency environments
@@ -3056,6 +3047,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reader_task_entry_does_not_resurrect_a_stop_requested_before_start() {
+        let key = ChannelKey::simple("/dev/prestopped-test", 1);
+        let shared = SharedTuner::new(key, 2);
+        shared.set_state(ReaderState::Stopping);
+
+        let gate = crate::tuner::ts_source::BlockingGate::new();
+        let source = crate::tuner::ts_source::FakeTsSource::new()
+            .with_startup_delay(std::time::Duration::from_millis(100))
+            .with_get_ts_stream_gate(gate.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task_shared = Arc::clone(&shared);
+        let task = tokio::task::spawn_blocking(move || {
+            SharedTuner::run_bondriver_reader_with_tuner(
+                task_shared,
+                source,
+                "fake://pre-stopped".to_string(),
+                0,
+                1,
+                test_startup_config(),
+                ready_tx,
+            );
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("reader ready signal timed out")
+            .expect("reader ready channel closed")
+            .expect("fake reader startup failed");
+        let state_after_startup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = shared.state();
+                if state != ReaderState::Stopping {
+                    break state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reader did not reach a terminal or resurrected state");
+        gate.release();
+        if state_after_startup != ReaderState::Stopped {
+            shared.set_state(ReaderState::Stopping);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("reader task did not exit after gate release")
+            .expect("reader task panicked");
+
+        assert_eq!(state_after_startup, ReaderState::Stopped);
+        assert_eq!(shared.state(), ReaderState::Stopped);
+    }
+
     // -----------------------------------------------------------------
     // P2a: orphaned-reader fix (§2.1-1) and restart-must-wait fix (§2.1-3).
     // -----------------------------------------------------------------
@@ -3200,6 +3244,12 @@ mod tests {
     async fn stop_existing_reader_before_restart_errors_if_reader_does_not_stop_in_time() {
         let key = ChannelKey::simple("/dev/stuck-test", 1);
         let shared = SharedTuner::new(key, 2);
+        let pool = crate::tuner::pool::TunerPool::new(2);
+        let permit = pool
+            .acquire_slot("/dev/stuck-test", 1)
+            .await
+            .expect("test reader should reserve its sole driver slot");
+        shared.set_slot_permit(permit);
 
         // `get_ts_stream` blocks on this gate until the test releases it —
         // simulating a hung DLL call that never returns. `wait_until_entered`
@@ -3239,17 +3289,30 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
 
-        // `stop_and_release_slot` inside `stop_reader` unconditionally marks
-        // this `Stopped` even on a timeout (see that method's doc comment on
-        // why) — the error return above, not this state, is what a caller
-        // must act on to avoid proceeding with a new open.
-        assert_eq!(shared.state(), ReaderState::Stopped);
+        // Capture behavior before releasing the simulated DLL, then let the
+        // blocking task finish before asserting so a regression cannot hang
+        // Tokio runtime shutdown.
+        let state_during_timeout = shared.state();
+        let slot_was_still_owned = pool.acquire_slot("/dev/stuck-test", 1).await.is_none();
 
         // Release the stuck blocking thread so it can actually finish (it
         // will then observe `state() != Running` and exit) before the test
         // ends — otherwise the runtime's own shutdown would block on it
         // indefinitely instead of just until the gate opens.
         gate.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while shared.state() != ReaderState::Stopped {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stuck reader did not exit after release"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_during_timeout, ReaderState::Stopping);
+        assert!(slot_was_still_owned);
+        assert!(shared.occupies_slot() == false);
+        assert!(pool.acquire_slot("/dev/stuck-test", 1).await.is_some());
+        assert!(shared.stop_reader().await);
     }
 }
 

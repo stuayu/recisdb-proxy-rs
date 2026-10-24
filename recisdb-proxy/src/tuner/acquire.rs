@@ -644,7 +644,13 @@ async fn evict_tuner(pool: &Arc<TunerPool>, key: &ChannelKey) {
         info!("[acquire] evicting idle {:?} to free a slot", key);
     }
     pool.cancel_idle_close(key).await;
-    tuner.stop_reader().await;
+    if !tuner.stop_reader().await {
+        warn!(
+            "[acquire] keeping {:?} in the pool because its reader has not exited",
+            key
+        );
+        return;
+    }
     pool.remove(key).await;
 }
 
@@ -831,7 +837,15 @@ pub(crate) async fn acquire(
                             );
                             pool.cancel_idle_close(own_key).await;
                             old.set_stop_reason(StopReason::Released);
-                            old.stop_reader().await;
+                            if !old.stop_reader().await {
+                                return Err(AcquireError::ReaderStart(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "reader for {:?} is still stopping; same-DLL slot transfer cancelled",
+                                        own_key
+                                    ),
+                                )));
+                            }
                             pool.remove(own_key).await;
                         }
                     }
@@ -1186,7 +1200,7 @@ impl std::fmt::Debug for AcquireOutcome {
 mod tests {
     use super::*;
     use crate::database::{Database, NewBonDriver};
-    use crate::tuner::ts_source::FakeTsSource;
+    use crate::tuner::ts_source::{BlockingGate, FakeTsSource};
     use std::time::Duration;
 
     #[test]
@@ -1798,6 +1812,106 @@ mod tests {
             !old.is_running(),
             "the old reader must not still be running on the transferred slot"
         );
+    }
+
+    #[tokio::test]
+    async fn same_dll_transfer_keeps_old_tuner_and_permit_when_stop_times_out() {
+        let pool = Arc::new(TunerPool::new(10));
+        let path = "/nonexistent/recisdb-proxy-test-stuck-device";
+        let database = db_handle_with_driver(path, 1);
+        let old_key = ChannelKey::space_channel(path, 0, 1);
+        let permit = pool.acquire_slot(path, 1).await.unwrap();
+        let old = pool
+            .get_or_create(old_key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let gate = BlockingGate::new();
+        let ready = old
+            .spawn_fake_reader(
+                FakeTsSource::new().with_get_ts_stream_gate(gate.clone()),
+                0,
+                1,
+                fast_startup_config(),
+            )
+            .await;
+        ready.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .unwrap();
+
+        let carried = old.take_slot_permit().unwrap();
+        let mut request = empty_request(vec![ChannelKey::space_channel(path, 0, 2)]);
+        request.carried_permit = Some(carried);
+        request.own_key = Some(old_key.clone());
+        request.own_key_will_free_slot = true;
+        let result = acquire(&pool, &database, request).await;
+        let retained = pool.get(&old_key).await.is_some();
+        let old_state = old.state();
+        let restored_permit = old.take_slot_permit().is_some();
+        gate.release();
+
+        assert!(result.is_err());
+        assert!(retained, "timed-out reader must stay in the pool");
+        assert_eq!(old_state, crate::tuner::shared::ReaderState::Stopping);
+        assert!(
+            restored_permit,
+            "the carried reservation must return to its owner"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while old.state() != crate::tuner::shared::ReaderState::Stopped {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        old.stop_reader().await;
+    }
+
+    #[tokio::test]
+    async fn eviction_keeps_tuner_and_slot_when_reader_stop_times_out() {
+        let pool = Arc::new(TunerPool::new(10));
+        let path = "/dev/eviction-timeout-test";
+        let key = ChannelKey::space_channel(path, 0, 1);
+        let permit = pool.acquire_slot(path, 1).await.unwrap();
+        let tuner = pool
+            .get_or_create(key.clone(), 2, permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        let gate = BlockingGate::new();
+        let ready = tuner
+            .spawn_fake_reader(
+                FakeTsSource::new().with_get_ts_stream_gate(gate.clone()),
+                0,
+                1,
+                fast_startup_config(),
+            )
+            .await;
+        ready.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .unwrap();
+
+        evict_tuner(&pool, &key).await;
+        let retained = pool.get(&key).await.is_some();
+        let state = tuner.state();
+        let slot_still_held = pool.acquire_slot(path, 1).await.is_none();
+        gate.release();
+
+        assert!(retained, "timed-out reader must stay in the pool");
+        assert_eq!(state, crate::tuner::shared::ReaderState::Stopping);
+        assert!(
+            slot_still_held,
+            "slot must remain reserved until reader exit"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tuner.state() != crate::tuner::shared::ReaderState::Stopped {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        evict_tuner(&pool, &key).await;
+        assert!(pool.get(&key).await.is_none());
     }
 
     // -----------------------------------------------------------------

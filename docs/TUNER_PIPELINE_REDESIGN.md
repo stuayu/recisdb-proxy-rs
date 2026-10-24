@@ -270,8 +270,9 @@ pub enum Decision {
   しまい、設定した上限を超えて開けるようになる)。**満杯なら待たずに
   `None`** を返し、退避・フォールバック・失敗の判断は呼び出し元に委ねる。
 - `SlotPermit` は `Drop` で解放される。`SharedTuner` が保持し、
-  `stop_reader()` とリーダーの全異常終了経路 (`stop_and_release_slot`) で
-  明示的に解放する (Arc の drop 待ちにしない)。
+  `stop_reader()` はreader taskの終了を確認した場合に限って解放する。ブロッキング
+  DLL呼び出しがタイムアウト内に戻らない場合は `Stopping` とpermitを保持し、reader
+  task自身が終了時に解放する。これにより同じDLLの再openを二重化しない。
 - **`start_bondriver_reader` / `WarmTunerHandle::activate` の引数に
   `SlotPermit` を必須化**した。permit なしにリーダーを起動できないことを
   型で保証している。
@@ -282,7 +283,9 @@ pub enum Decision {
   (自セッション分を容量計数から除外する仕掛け) の置き換えであり、同フラグは
   撤去した。`SelectLogicalChannel` の候補ループでは、候補が失敗したときに
   permit を回収して次の候補へ持ち回り、全候補が失敗したら旧チューナーへ
-  返却する (旧リーダーは動き続けるため)。
+  返却する (旧リーダーは動き続けるため)。旧readerの停止がタイムアウトした場合は
+  移譲を中止し、carried permitを旧ownerへ戻す。pool entryも残すため、reader終了前に
+  代替readerが同じDLLをopenすることはない。
 - **再利用は permit 取得より先**に判定する。順序を誤ると、`max_instances=1`
   のドライバーで既存チャンネルへ合流できるはずのリクエストが容量不足として
   弾かれる。
@@ -367,8 +370,11 @@ P2b に残した (下記)。
   `stop_existing_reader_before_restart()` で `stop_reader()` を確実に待ち、
   戻り値 (`bool`) が `false` (タイムアウト) ならエラーを返して新規オープンに
   進まない。旧実装の「500ms 待って諦めて続行」は撤去した。`stop_reader()` 自体
-  も `bool` を返すよう変更 (`true`=確認できた停止、`false`=タイムアウト) —
-  既存の呼び出し元は戻り値を無視するだけで済むため後方互換。
+  も `bool` を返すよう変更 (`true`=確認できた停止、`false`=タイムアウト)。timeout時は
+  JoinHandleをdetachせず保持し、`Stopping` とpermitを維持する。eviction、session cleanup、
+  idle closeも `false` のときpool entryを削除せず、同DLL移譲もエラーで中止する。
+  reader task entryでは `Starting` を再設定しない。callerがspawn前に状態を設定するため、
+  entry側で上書きするとspawn待ちの間に届いた `Stopping` を消してreaderが復活する。
 - **時定数の集約 (`tuner/timing.rs`)**:
 
   | 定数 | 値 | 根拠 |
@@ -474,10 +480,9 @@ P2b に残した (下記)。
     取得しない。P1b §6 の「再利用は permit 取得より先」が構造的に保証される
     (このブランチにコードとして `acquire_slot` 呼び出しが存在しない)。
   - `Create { key, evict }`: まず `evict` を停止・除去する
-    (`SharedTuner::stop_reader()` が戻り値を返す時点で permit を確定的に
-    解放しているため、`server::session_capacity::stop_and_remove_tuner` が
-    P1b 以前に必要としていた「解放待ちポーリング」は不要 ―― `acquire.rs`
-    内に `stop_and_remove_tuner` 相当の `evict_tuner()` を独自実装した。
+    (`SharedTuner::stop_reader()` が `true` を返した場合に限り permit 解放を
+    確認できる。timeout時はentryを維持して次の候補へ進み、同じDLLを再openしない。
+    `acquire.rs` 内に `stop_and_remove_tuner` 相当の `evict_tuner()` を独自実装した。
     `session_capacity` 側の関数は `pub(super)` で `server` モジュール限定の
     ため、そのまま import はできない)。次に permit を
     `carried_permit`(パス一致時) → `warm` ハンドルの permit(パス一致時) →

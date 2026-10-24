@@ -617,8 +617,11 @@ impl TunerPool {
         if keep_alive_secs == 0 {
             info!("Keep-alive disabled, stopping reader for {:?}", key);
             tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
-            tuner.stop_reader().await;
-            let _ = self.remove(&key).await;
+            if tuner.stop_reader().await {
+                let _ = self.remove(&key).await;
+            } else {
+                warn!("Keeping {:?} in the pool; reader is still stopping", key);
+            }
             return;
         }
 
@@ -654,36 +657,15 @@ impl TunerPool {
                         if !tuner.has_subscribers() {
                             info!("Keep-alive timeout reached, stopping reader for {:?}", key);
                             tuner.set_stop_reason(crate::tuner::shared::StopReason::Released);
-                            tuner.stop_reader().await;
-                            // ★ Bug F revised fix: Always remove the pool entry after stop_reader().
-                            // stop_reader() is async and yields; a concurrent subscribe() +
-                            // cancel_idle_close() may have run during that await window.
-                            // The reader is now dead regardless.  Leaving a stopped entry in
-                            // the pool would cause the reuse path in SetChannelSpace to find
-                            // an is_running()==false SharedTuner, and get_or_create() would
-                            // return it without restarting the reader — resulting in subscribers
-                            // that never receive data.
-                            // By removing the entry, the next SetChannelSpace will create a
-                            // fresh SharedTuner and start a new reader via get_or_create().
-                            //
-                            // `stop_reader()` always leaves `state() ==
-                            // Stopped` (P1), so at this point
-                            // `tuner.is_reclaimable() == !tuner.has_subscribers()`
-                            // exactly — the two checks below are equivalent
-                            // to a single `is_reclaimable()` call, spelled
-                            // out for the warn-log branch.
-                            if tuner.has_subscribers() {
-                                warn!("Keep-alive: subscriber appeared during stop_reader for {:?}; \
-                                       removing stale pool entry (reader is stopped, new reader will be created on next access)",
-                                      key);
-                            }
-                            {
+                            if tuner.stop_reader().await {
                                 let mut tuners = pool.tuners.write().await;
                                 if let Some(current) = tuners.get(&key) {
                                     if Arc::ptr_eq(current, &tuner) {
                                         tuners.remove(&key);
                                     }
                                 }
+                            } else {
+                                warn!("Keeping {:?} in the pool; reader is still stopping", key);
                             }
                         } else {
                             info!("Keep-alive timeout reached but subscribers present for {:?}", key);
@@ -946,7 +928,10 @@ impl TunerPool {
             // stop_reader() yields; a subscribe() may have raced in during
             // that window, so re-check identity (not just presence) before
             // removing the entry — same pattern as schedule_idle_close().
-            tuner.stop_reader().await;
+            if !tuner.stop_reader().await {
+                warn!("Could not reclaim {:?}; reader is still stopping", key);
+                continue;
+            }
             {
                 let mut tuners = self.tuners.write().await;
                 if let Some(current) = tuners.get(&key) {
