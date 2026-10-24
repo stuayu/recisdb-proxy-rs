@@ -758,6 +758,14 @@ mod tests {
             Arc::new(RemoteLeaseManager::new(Default::default())),
             MuxLeaseManager::new(Duration::from_secs(60)),
         );
+        let mux = LogicalMuxId {
+            nid: 0x1001,
+            tsid: 0x2001,
+        };
+        let _epg_lock = server
+            .mux_leases
+            .try_acquire(mux)
+            .expect("test holds the EPG scan lock for this mux");
         let mut context = RequestContext {
             request_id: "test-request".to_owned(),
             trace_id: "test-trace".to_owned(),
@@ -773,10 +781,7 @@ mod tests {
         let error = match server
             .open_lease(
                 &mut context,
-                LogicalMuxId {
-                    nid: 0x1001,
-                    tsid: 0x2001,
-                },
+                mux,
                 None,
                 0,
                 super::super::types::NodeId::new("requester-node").unwrap(),
