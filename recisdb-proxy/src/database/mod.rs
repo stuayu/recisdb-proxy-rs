@@ -704,6 +704,20 @@ impl Database {
     /// this migration, and the temporary table is explicitly removed first.
     fn migration_025_programs_tsid_unique_key(&self) -> Result<()> {
         self.add_column_if_not_exists("programs", "free_ca_mode", "INTEGER NOT NULL DEFAULT 0")?;
+        // Migration 025 rebuilds the table. Prepare columns introduced later
+        // first, so user_version=0 replay can preserve data from pre-ledger
+        // databases that already have the current schema. Later migrations
+        // remain idempotent because these additions are conditional.
+        self.add_column_if_not_exists("programs", "source", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_not_exists("programs", "pf_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "schedule_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "basic_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "extended_updated_at", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "shared_sid", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "shared_event_id", "INTEGER")?;
+        self.add_column_if_not_exists("programs", "audios", "TEXT")?;
+        self.add_column_if_not_exists("programs", "video", "TEXT")?;
+        self.add_column_if_not_exists("programs", "genres", "TEXT")?;
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS programs_new;
              CREATE TABLE programs_new (
@@ -718,15 +732,31 @@ impl Database {
                  description TEXT,
                  extended TEXT,
                  genre INTEGER,
+                 genres TEXT,
                  free_ca_mode INTEGER NOT NULL DEFAULT 0,
                  updated_at INTEGER NOT NULL,
+                 source INTEGER NOT NULL DEFAULT 0,
+                 pf_updated_at INTEGER,
+                 schedule_updated_at INTEGER,
+                 basic_updated_at INTEGER,
+                 extended_updated_at INTEGER,
+                 shared_sid INTEGER,
+                 shared_event_id INTEGER,
+                 audios TEXT,
+                 video TEXT,
                  UNIQUE(nid, sid, tsid, event_id)
              );
              INSERT OR REPLACE INTO programs_new
                  (id, nid, sid, tsid, event_id, start_at, duration_secs,
-                  name, description, extended, genre, free_ca_mode, updated_at)
+                  name, description, extended, genre, genres, free_ca_mode,
+                  updated_at, source, pf_updated_at, schedule_updated_at,
+                  basic_updated_at, extended_updated_at, shared_sid,
+                  shared_event_id, audios, video)
                  SELECT id, nid, sid, tsid, event_id, start_at, duration_secs,
-                        name, description, extended, genre, free_ca_mode, updated_at
+                        name, description, extended, genre, genres, free_ca_mode,
+                        updated_at, source, pf_updated_at, schedule_updated_at,
+                        basic_updated_at, extended_updated_at, shared_sid,
+                        shared_event_id, audios, video
                    FROM programs;
              DROP TABLE programs;
              ALTER TABLE programs_new RENAME TO programs;
@@ -2583,6 +2613,71 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(final_version, target);
+    }
+
+    #[test]
+    fn migration_replay_preserves_all_program_metadata_columns() {
+        let db = Database::open_in_memory().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO programs
+                    (id,nid,sid,tsid,event_id,start_at,duration_secs,name,description,
+                     extended,genre,free_ca_mode,updated_at,source,pf_updated_at,
+                     schedule_updated_at,basic_updated_at,extended_updated_at,
+                     shared_sid,shared_event_id,audios,video,genres)
+                 VALUES
+                    (7,1,2,3,4,5000,600,'name','desc','extended',5,1,700,2,
+                     710,720,730,740,8,9,'audio','video','genres')",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute_batch("PRAGMA user_version = 0")
+            .unwrap();
+
+        db.apply_migrations().unwrap();
+
+        let values = db
+            .connection()
+            .query_row(
+                "SELECT source,pf_updated_at,schedule_updated_at,basic_updated_at,
+                        extended_updated_at,shared_sid,shared_event_id,audios,video,
+                        genres,free_ca_mode
+                 FROM programs WHERE id=7",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            values,
+            (
+                2,
+                Some(710),
+                Some(720),
+                Some(730),
+                Some(740),
+                Some(8),
+                Some(9),
+                Some("audio".into()),
+                Some("video".into()),
+                Some("genres".into()),
+                1,
+            )
+        );
     }
 
     #[test]
