@@ -935,6 +935,16 @@ pub fn decode_server_message(
             }
             let timestamp = payload.get_i64_le();
             let count = payload.get_u32_le() as usize;
+            // An encoded channel requires at least 22 bytes even when every
+            // string is empty. Bound the reservation by the remaining frame
+            // before trusting the peer-provided count.
+            const MIN_CHANNEL_BYTES: usize = 22;
+            if count > payload.remaining() / MIN_CHANNEL_BYTES {
+                return Err(ProtocolError::IncompleteFrame {
+                    expected: count.saturating_mul(MIN_CHANNEL_BYTES),
+                    actual: payload.remaining(),
+                });
+            }
             let mut channels = Vec::with_capacity(count);
             for _ in 0..count {
                 channels.push(decode_client_channel_info(&mut payload)?);
@@ -1259,5 +1269,17 @@ mod tests {
         let payload = Bytes::copy_from_slice(&encoded[HEADER_SIZE..]);
         let decoded = decode_server_message(header.message_type, payload).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn get_channel_list_rejects_impossible_count_before_allocating() {
+        let mut payload = BytesMut::new();
+        payload.put_i64_le(0);
+        payload.put_u32_le(u32::MAX);
+        let err =
+            decode_server_message(MessageType::GetChannelListAck, payload.freeze()).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::IncompleteFrame { actual: 0, expected } if expected > 1_000_000)
+        );
     }
 }
