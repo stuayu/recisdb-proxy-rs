@@ -2484,8 +2484,10 @@ impl Session {
     /// slot is free while the device is still open.
     async fn return_unused_permit(&mut self, permit: SlotPermit) {
         if let Some(cur) = self.current_tuner.as_ref() {
-            if cur.key.tuner_path == permit.dll_path() && cur.occupies_slot() {
-                cur.set_slot_permit(permit);
+            if cur.key.tuner_path == permit.dll_path() {
+                if let Some(unrestored) = cur.restore_slot_permit(permit) {
+                    drop(unrestored);
+                }
                 return;
             }
         }

@@ -599,18 +599,18 @@ impl SharedTuner {
         *self.slot.lock().unwrap() = Some(permit);
     }
 
-    /// Put a permit back only if this entry is not already holding one.
+    /// Put a permit back only while this entry still occupies its slot and
+    /// is not already holding a permit.
     ///
-    /// Used by `tuner::acquire`'s carried-permit guard on the error paths of a
-    /// same-DLL channel switch: the permit was detached from this still-live
-    /// reader, so it must go back rather than be released while the native
-    /// BonDriver stays open. Unlike [`Self::set_slot_permit`] this never
-    /// silently drops an existing reservation — if one is already stored the
-    /// permit is handed back to the caller to release itself.
+    /// Used by `tuner::acquire`'s carried-permit guard and session switch
+    /// cleanup: a detached permit must return only while the native BonDriver
+    /// still occupies this entry. Unlike [`Self::set_slot_permit`] this never
+    /// silently drops an existing reservation — if the owner has stopped or a
+    /// permit is already stored, the permit is handed back to the caller.
     #[must_use = "an unrestored permit must still be released"]
     pub(crate) fn restore_slot_permit(&self, permit: SlotPermit) -> Option<SlotPermit> {
         let mut slot = self.slot.lock().unwrap();
-        if slot.is_some() {
+        if slot.is_some() || !self.occupies_slot() {
             return Some(permit);
         }
         *slot = Some(permit);
@@ -2662,6 +2662,29 @@ mod tests {
             tuner.incumbent_claim().map(|claim| claim.usage),
             Some(TunerUsage::Record)
         );
+    }
+
+    #[tokio::test]
+    async fn restore_slot_permit_rejects_a_stopped_owner() {
+        let pool = TunerPool::new(1);
+        let path = "/dev/stopped-owner";
+        let shared = SharedTuner::new(ChannelKey::simple(path, 1), 1);
+        shared.set_slot_permit(pool.acquire_slot(path, 1).await.unwrap());
+        let detached = shared.take_slot_permit().unwrap();
+        shared.set_state(ReaderState::Stopped);
+
+        let returned = shared.restore_slot_permit(detached);
+        assert!(
+            returned.is_some(),
+            "a fully stopped owner must not retain a detached permit"
+        );
+        drop(returned);
+        let available = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.acquire_slot(path, 1),
+        )
+        .await;
+        assert!(matches!(available, Ok(Some(_))));
     }
 
     /// 通常のストリーミング(空振りが単発で終わる)では1行も出さない。

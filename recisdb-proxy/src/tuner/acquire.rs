@@ -389,7 +389,7 @@ impl Drop for CarriedPermitGuard {
                     None => return,
                     Some(returned) => {
                         warn!(
-                            "[acquire] carried permit for {} could not be restored to {:?} (slot already refilled); releasing",
+                            "[acquire] carried permit for {} could not be restored to {:?} (owner stopped or slot already refilled); releasing",
                             returned.dll_path(),
                             owner.key
                         );
