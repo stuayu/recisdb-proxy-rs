@@ -94,6 +94,8 @@ pub enum ChannelResolveError {
     /// instead of `channels.id`.
     #[error("service (nid={0}, sid={1}) not found")]
     NotFoundNidSid(u16, u16),
+    #[error("multiplex (nid={0}, tsid={1}) not found")]
+    NotFoundNidTsid(u16, u16),
     #[error("service {0} is disabled")]
     Disabled(i64),
     #[error("service {0} has no assigned BonDriver")]
@@ -215,6 +217,23 @@ pub fn resolve_service_by_nid_sid(
 ) -> Result<ResolvedService, ChannelResolveError> {
     let channels = db.get_channels_by_nid_sid(nid, sid)?;
     resolve_candidate_rows(db, channels, ChannelResolveError::NotFoundNidSid(nid, sid))
+}
+
+/// Resolve every enabled service row in one multiplex into physical tuner
+/// candidates. Mirakurun's `/channels/:type/:channel/stream` identifies a
+/// multiplex, so rows for different SIDs can still provide valid tuner paths.
+pub fn resolve_multiplex_by_nid_tsid(
+    db: &Database,
+    nid: u16,
+    tsid: u16,
+) -> Result<ResolvedService, ChannelResolveError> {
+    let mut rows = db
+        .get_channels_by_nid_tsid_ordered(nid, tsid, None)?
+        .into_iter()
+        .map(|row| row.channel)
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| (std::cmp::Reverse(row.priority), row.id));
+    resolve_candidate_rows(db, rows, ChannelResolveError::NotFoundNidTsid(nid, tsid))
 }
 
 /// Single-row resolution body for [`resolve_service`]. Errors reference the
@@ -735,6 +754,29 @@ mod tests {
             resolve_service_by_nid_sid(&db, 1, 100).expect("should resolve by (nid, sid)");
         assert_eq!(by_id.channel_key(), by_nid_sid.channel_key());
         assert_eq!(by_id.channel.id, by_nid_sid.channel.id);
+    }
+
+    #[test]
+    fn multiplex_stream_resolution_uses_candidates_from_every_service_row() {
+        let db = Database::open_in_memory().unwrap();
+        insert_channel_on_driver(&db, "driver-a.dll", 1, 100, Some(0), Some(13), 5, true);
+        insert_channel_on_driver(&db, "driver-b.dll", 1, 101, Some(2), Some(27), 1, true);
+
+        // The channel stream endpoint addresses (nid, tsid), not one service
+        // row. Each driver may have scanned a different service from the same
+        // multiplex, so resolving only the representative row misses a valid
+        // fallback driver.
+        let resolved =
+            resolve_multiplex_by_nid_tsid(&db, 1, 200).expect("multiplex should resolve");
+        assert_eq!(resolved.candidates.len(), 2);
+        assert!(resolved
+            .candidates
+            .iter()
+            .any(|candidate| candidate.dll_path == "driver-a.dll"));
+        assert!(resolved
+            .candidates
+            .iter()
+            .any(|candidate| candidate.dll_path == "driver-b.dll"));
     }
 
     #[test]

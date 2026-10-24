@@ -394,6 +394,9 @@ EPGStation は録画の開始・終了をストリームの挙動そのもので
    物理 15ch には 7 つの networkId が乗っており、`GET /channels` は別局のサービスを 1 つの multiplex として
    束ね、`/channels/GR/15/stream` は最初の 1 局しか返せなかった。→ `assign_channel_strings()` が衝突した
    ものだけ `15_32416` 形式へ振り分ける
+   `/channels/{type}/{channel}/stream` はこの `(type, channel)` が指す multiplex 全体を選局するため、
+   2026-10-24 以降は同じ `(nid, tsid)` の全サービス行を候補にする。別サービスだけをスキャンした
+   BonDriver も候補に含め、先頭 service のドライバが満杯なら `acquire()` が別候補へ進む。
 3. **`remoteControlKeyId` を返していなかった** — DB (`channels.remote_control_key`) には入っているのに
    応答に載せておらず、EPGStation の番組表でリモコン番号が使えなかった。本物 Mirakurun は地上波
    (`GR`/`NW*`) の全サービスに付け、BS/CS には付けない。CS110 では同じ列に 3 桁チャンネル番号が入るため、
@@ -602,6 +605,7 @@ first-TS猶予超過時は接続を終了する。開始待ちを示す独自chu
 | `Server` レスポンスヘッダー | 実装済み (2026-10-18) | Mirakurun 互換ルーターの全応答に `Server: Mirakurun/4.3.0-stuayu` を付与。`/version` の `current` / `latest` と共通定数を使う。KonomiTV の起動時 URL 判定にも必要 (`docs/KONOMITV_COMPAT.md` §2)。 |
 | `GET /services` / `/programs` | 実装済み (`/services` は 2026-08-12修正、`/programs` filter は 2026-09-04追加、イベント共有解決は 2026-10-12追加) | `/services` は `(networkId, serviceId)` ごとに 1 件へ重複排除し、`(type, channel)` が multiplex を一意に指すよう衝突を解消する。`/programs` は `networkId` / `serviceId` の単独・併用filterと無指定全件をDB queryで処理する。`remoteControlKeyId` は地上波のみ。共有イベントのサブチャンネル行は、読み出し時に主サービスの名前・概要・拡張記述・ジャンルを補う。§1・§5.2-1/2/3 |
 | `GET /services/{id}/stream` | 実装済み (2026-08-12 にサービスフィルタ追加、2026-08 に複数候補対応) | `TsServiceFilter` で対象サービスのみへ絞る (旧実装は multiplex 全体)。§5.2-5/6。**実起動で確認した事実**: `channels` テーブルは (BonDriver, サービス) ごとに1行なので同じサービスが複数ドライバに載ることがある。修正前は先頭行 1件だけを `tuner::acquire::acquire` に渡していたため、先頭行のドライバが満杯だと**他ドライバで既に配信中でも** 503 になっていた。`resolve_service_by_sid`/`resolve_service_by_nid_sid` が全 enabled 行を候補として渡すよう修正し、この経路で `/services/{id}/stream` 経由の EPGStation 録画・視聴が同じ恩恵を受ける (満杯ドライバでも別ドライバに相乗りして 200 が返るようになった)。詳細: `docs/STREAMING_DESIGN.md` P6「複数候補への対応」節、`docs/TUNER_PIPELINE_REDESIGN.md` |
+| `GET /channels/{type}/{channel}/stream` | 実装済み (2026-10-24 複数mux候補対応) | endpointの契約どおり `(type, channel)` から `(nid, tsid)` を特定し、mux内の全 enabled service row から物理候補を集める。別サービス行にしか載っていないBonDriverも含め、同じTSを受信できる候補へ fallback する。サービス単位のフィルタは行わずmultiplex全体を流す。§5.2-2 |
 | `GET /services/{id}/logo` | 実装済み (2026-08-14) | ロゴ収集器が CDT から保存した `logos/<nid>_<sid>.png` を `image/png` で返す。`hasLogoData` はそのファイルの有無 (`collected_logo_keys()` がディレクトリを 1 回読んで判定するので、数百サービス分を stat しない)。**ロゴは放送波からしか手に入らないため、一度も選局していない局には出ない**。ファイルが無ければ 404、サービス id として解釈できない値なら 400 |
 | SID/TSID 0 の仮チャンネル行 | 実装済み (2026-09-11) | `usable_channels()` で `sid != 0 && tsid != 0` を満たさない行を除外し、`/services` と `/channels` に物理チャンネルだけの仮行を出さない。**本番 (fuku) で確認した事実**: 修正前は `/services` に `serviceId: 0` の偽サービスが 31 件 (「40Ch」「29Ch」など物理ch名) 出ていた。しかも仮行 `(nid, tsid=0)` も 1 multiplex として `assign_channel_strings()` の衝突判定に数えられ、**仮行が自然なチャンネル文字列を先取りし、実在の multiplex が長い形へ押し出されていた** (例: 仮行が `GR/24_32128`、NHK総合・岐阜 (32128, 32128) が `GR/24_32128_32128`)。修正後は偽サービスが消え、実在 multiplex のチャンネル文字列が短くなる (`24_32128_32128` → `24_32128`、衝突相手が無くなれば `24`)。**サービス ID (`networkId * 100000 + serviceId`) は変わらないので予約・録画は維持されるが、EPGStation 側でチャンネル情報の再取得 (再起動) が要る** |
 | `remoteControlKeyId` の欠損 | 実装済み (2026-08-14) | 手動登録 (CSV インポート / `POST /api/channels`) した行は `remote_control_key` が NULL で、EPGStation の番組表・放映中で末尾に回されていた。視聴・EPG 収集中の NIT から NULL の列だけ補完する (`tuner/nit_collector.rs` → `nit_writer.rs`)。**一度も選局していない局は埋まらない**。§5.4 |

@@ -577,6 +577,7 @@ pub(crate) fn channel_resolve_error_response(
     let status = match e {
         ChannelResolveError::NotFound(_)
         | ChannelResolveError::NotFoundNidSid(_, _)
+        | ChannelResolveError::NotFoundNidTsid(_, _)
         | ChannelResolveError::Disabled(_)
         | ChannelResolveError::NoDriver(_)
         | ChannelResolveError::NoPhysicalChannel(_) => StatusCode::NOT_FOUND,

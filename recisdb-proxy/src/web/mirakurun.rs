@@ -1303,7 +1303,7 @@ pub async fn stream_channel_by_type(
     // advertises ([`assign_channel_strings`]) — a bare [`channel_string`]
     // comparison would miss every multiplex that had to be disambiguated, and
     // would happily match a *different* network that shares the RF number.
-    let target_id = {
+    let target_mux = {
         let db = web_state.database.lock().await;
         let channels = match usable_channels(&db) {
             Ok(c) => c,
@@ -1323,11 +1323,11 @@ pub async fn stream_channel_by_type(
             // own namespace, so RF 15 needs no disambiguation once the areas
             // are separated).
             let (ty, cs) = channel_strings.get(&(c.nid, c.tsid))?;
-            (*ty == channel_type && *cs == channel_str).then_some(c.id)
+            (*ty == channel_type && *cs == channel_str).then_some((c.nid, c.tsid))
         })
     };
 
-    let Some(id) = target_id else {
+    let Some((nid, tsid)) = target_mux else {
         return error_response(
             StatusCode::NOT_FOUND,
             format!("channel {}/{} not found", channel_type, channel_str),
@@ -1336,11 +1336,11 @@ pub async fn stream_channel_by_type(
 
     let resolved = {
         let db = web_state.database.lock().await;
-        channel_resolve::resolve_service(&db, id)
+        channel_resolve::resolve_multiplex_by_nid_tsid(&db, nid, tsid)
     };
     let resolved = match resolved {
         Ok(r) => r,
-        Err(e) => return channel_resolve_error_response(id, &e),
+        Err(e) => return channel_resolve_error_response(format!("{nid}/{tsid}"), &e),
     };
 
     let tuner = match channel_resolve::start_tuner_for_service(
@@ -1351,7 +1351,7 @@ pub async fn stream_channel_by_type(
     .await
     {
         Ok(t) => t,
-        Err(e) => return channel_resolve_error_response(id, &e),
+        Err(e) => return channel_resolve_error_response(format!("{nid}/{tsid}"), &e),
     };
 
     let (session, shutdown_rx) = HttpStreamSession::register(
