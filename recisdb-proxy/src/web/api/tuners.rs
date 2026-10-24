@@ -11,17 +11,52 @@ use crate::web::state::WebState;
 
 use super::error::ApiError;
 
+#[cfg(test)]
+mod tests {
+    use super::stopping_reader_count;
+    use crate::tuner::{
+        shared::{ReaderState, SharedTuner},
+        ChannelKey,
+    };
+
+    #[test]
+    fn stopping_reader_count_includes_all_driver_instances() {
+        let running = SharedTuner::new(ChannelKey::simple("driver.dll", 1), 2);
+        running.set_state(ReaderState::Running);
+        let stopping = SharedTuner::new(ChannelKey::simple("driver.dll", 2), 2);
+        stopping.set_state(ReaderState::Stopping);
+        let other_stopping = SharedTuner::new(ChannelKey::simple("driver.dll", 3), 2);
+        other_stopping.set_state(ReaderState::Stopping);
+
+        assert_eq!(
+            stopping_reader_count(&[running, stopping, other_stopping]),
+            2
+        );
+    }
+}
+
+fn stopping_reader_count(tuners: &[Arc<crate::tuner::shared::SharedTuner>]) -> usize {
+    tuners
+        .iter()
+        .filter(|tuner| tuner.state() == crate::tuner::shared::ReaderState::Stopping)
+        .count()
+}
+
 /// Legacy: Get all active tuners (alias for get_bondrivers).
 pub async fn get_tuners(
     State(web_state): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime = web_state.tuner_pool.keys().await;
-    let mut runtime_by_path = std::collections::HashMap::new();
+    let mut runtime_by_path: std::collections::HashMap<
+        String,
+        Vec<Arc<crate::tuner::shared::SharedTuner>>,
+    > = std::collections::HashMap::new();
     for key in runtime {
         if let Some(tuner) = web_state.tuner_pool.get(&key).await {
             runtime_by_path
                 .entry(key.tuner_path.clone())
-                .or_insert(tuner);
+                .or_default()
+                .push(tuner);
         }
     }
     let db = web_state.database.lock().await;
@@ -29,19 +64,49 @@ pub async fn get_tuners(
     let tuners: Vec<serde_json::Value> = drivers
         .iter()
         .map(|d| {
-            let runtime_tuner = runtime_by_path.get(&d.dll_path);
+            let runtime_tuners = runtime_by_path.get(&d.dll_path);
+            let runtime_tuner = runtime_tuners.and_then(|tuners| {
+                tuners
+                    .iter()
+                    .find(|tuner| tuner.state() == crate::tuner::shared::ReaderState::Running)
+                    .or_else(|| {
+                        tuners.iter().find(|tuner| {
+                            matches!(
+                                tuner.state(),
+                                crate::tuner::shared::ReaderState::Reserved
+                                    | crate::tuner::shared::ReaderState::Starting
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        tuners.iter().find(|tuner| {
+                            tuner.state() == crate::tuner::shared::ReaderState::Stopping
+                        })
+                    })
+                    .or_else(|| tuners.first())
+            });
+            let stopping_readers = runtime_tuners
+                .map(|tuners| stopping_reader_count(tuners))
+                .unwrap_or(0);
             let converter = runtime_tuner.and_then(|t| t.mmt_status());
-            let startup_waiting = runtime_tuner
-                .map(|t| t.awaiting_first_ts())
+            let startup_waiting = runtime_tuners
+                .map(|tuners| tuners.iter().any(|tuner| tuner.awaiting_first_ts()))
                 .unwrap_or(false);
             let startup_active = startup_waiting
-                || runtime_tuner.is_some_and(|t| {
-                    matches!(
-                        t.state(),
-                        crate::tuner::shared::ReaderState::Reserved
-                            | crate::tuner::shared::ReaderState::Starting
-                    )
+                || runtime_tuners.is_some_and(|tuners| {
+                    tuners.iter().any(|tuner| {
+                        matches!(
+                            tuner.state(),
+                            crate::tuner::shared::ReaderState::Reserved
+                                | crate::tuner::shared::ReaderState::Starting
+                        )
+                    })
                 });
+            let runtime_streaming = runtime_tuners.is_some_and(|tuners| {
+                tuners
+                    .iter()
+                    .any(|tuner| tuner.state() == crate::tuner::shared::ReaderState::Running)
+            });
             json!({
             "id": d.id,
             "dll_path": d.dll_path,
@@ -50,7 +115,8 @@ pub async fn get_tuners(
             "max_instances": d.max_instances,
             "stream_format": db.driver_stream_format(&d.dll_path).as_db_value(),
                 "state": runtime_tuner.map(|t| format!("{:?}", t.state())).unwrap_or_else(|| "Idle".to_string()),
-                "startup_state": if startup_active { "starting" } else if runtime_tuner.is_some() { "streaming" } else { "idle" },
+                "stopping_readers": stopping_readers,
+                "startup_state": if startup_active { "starting" } else if runtime_streaming { "streaming" } else { "idle" },
                 "startup_elapsed_seconds": runtime_tuner.and_then(|t| t.startup_elapsed_ms()).map(|ms| ms / 1000).unwrap_or(0),
                 "startup_grace_seconds": runtime_tuner.map(|t| t.startup_grace_ms() / 1000).unwrap_or(0),
                 "startup_slow": runtime_tuner.map(|t| t.startup_slow()).unwrap_or(false),

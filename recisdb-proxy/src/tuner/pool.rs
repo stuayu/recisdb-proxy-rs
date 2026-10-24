@@ -665,6 +665,11 @@ impl TunerPool {
                                     }
                                 }
                             } else {
+                                // If the task exits after this timeout it sets
+                                // Stopped and releases its permit itself. That
+                                // stale entry is not joinable; get_or_create
+                                // reclaims it before reuse, while pool-capacity
+                                // cleanup also drops reclaimable entries.
                                 warn!("Keeping {:?} in the pool; reader is still stopping", key);
                             }
                         } else {

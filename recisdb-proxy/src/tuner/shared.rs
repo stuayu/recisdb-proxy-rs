@@ -1093,13 +1093,17 @@ impl SharedTuner {
     /// Broader than [`Self::is_reclaimable`] by design — it also covers
     /// [`ReaderState::Reserved`] (created but abandoned before its reader was
     /// ever started, e.g. a capacity conflict detected after
-    /// `get_or_create`) and `Stopping`. Only the *owner* of the entry should
-    /// use this; pool-internal stale sweeps must keep using
+    /// `get_or_create`). It deliberately excludes `Stopping`: the native
+    /// reader still owns its DLL slot until its task exits. Only the *owner*
+    /// of the entry should use this; pool-internal stale sweeps must keep using
     /// [`Self::is_reclaimable`], which deliberately leaves another task's
     /// `Reserved`/`Starting` entry alone (SYSTEM_REVIEW_2026-07.md M8).
     pub fn is_orphanable(&self) -> bool {
         !self.has_subscribers()
-            && !matches!(self.state(), ReaderState::Starting | ReaderState::Running)
+            && !matches!(
+                self.state(),
+                ReaderState::Starting | ReaderState::Running | ReaderState::Stopping
+            )
     }
 
     /// Whether this pool entry is stale and safe to evict/replace: the
@@ -1132,9 +1136,11 @@ impl SharedTuner {
     /// Returns `true` if the reader task was confirmed to have actually
     /// exited (or there was nothing to wait for), `false` if either the
     /// `reader_handle` lock or the task join timed out
-    /// (`timing::STOP_READER_TIMEOUT_MS`). Either way, `self` is left in
-    /// `ReaderState::Stopped` with its slot permit released — the return
-    /// value exists purely so callers that are about to *reuse this exact
+    /// (`timing::STOP_READER_TIMEOUT_MS`). On `true`, `self` is left in
+    /// `ReaderState::Stopped` with its slot permit released. On `false`, it
+    /// remains in `ReaderState::Stopping` and retains its permit until the
+    /// reader task exits and performs cleanup. The return value lets callers
+    /// that are about to *reuse this exact
     /// DLL slot* for a new reader (see
     /// [`Self::stop_existing_reader_before_restart`]) can tell a confirmed
     /// stop apart from "gave up waiting", since only the former makes it
@@ -2955,6 +2961,15 @@ mod tests {
         // safe to call on an already-stopped reader and guarantees the
         // `spawn_blocking` task is awaited before the test ends.
         shared.stop_reader().await;
+    }
+
+    #[test]
+    fn stopping_reader_is_not_orphanable_before_the_task_exits() {
+        let shared = SharedTuner::new(ChannelKey::simple("/dev/stopping", 1), 2);
+        shared.set_state(ReaderState::Stopping);
+
+        assert!(!shared.is_orphanable());
+        assert!(!shared.is_reclaimable());
     }
 
     /// `AddrNotAvailable` is the one error kind `run_bondriver_reader_with_tuner`

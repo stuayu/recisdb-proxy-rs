@@ -1863,7 +1863,19 @@ mod tests {
         .await
         .unwrap();
         drop(restored_permit);
-        assert!(pool.acquire_slot(path, 1).await.is_some());
+        let next_permit = pool
+            .acquire_slot(path, 1)
+            .await
+            .expect("the exited reader must release its slot");
+        let replacement = pool
+            .get_or_create(old_key.clone(), 2, next_permit, || async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&old, &replacement),
+            "get_or_create must replace the stopped stale entry"
+        );
+        replacement.stop_reader().await;
         old.stop_reader().await;
     }
 

@@ -186,7 +186,8 @@ HTTP/Mirakurun 側の配信経路も、ダッシュボードの強制切断
   - `occupies_slot()` … Reserved/Starting/Running/Stopping。容量計上・prewarm 抑止
   - `needs_reader_start()` … Starting/Running 以外。リーダー起動の要否
   - `is_reclaimable()` … (Idle/Stopped) かつ購読者なし。**プール内部**の stale 掃除
-  - `is_orphanable()` … Starting/Running 以外かつ購読者なし。**entry 所有者**による返却
+  - `is_orphanable()` … Starting/Running/Stopping 以外かつ購読者なし。**entry 所有者**による返却。
+    Stopping はリーダータスクが実際に終了するまで DLL スロットを保持するため除外する
 - **停止の理由**: `StopReason = Unspecified | Evicted | ReaderFailed | Released` を停止の起点で記録し、
   状態変化は `tokio::sync::watch` で配信する。セッションは自分のチューナーの状態を購読し、
   退避やドライバ障害を即座に検知して理由付きで切断する (旧: 2 秒周期のポーリング)。
@@ -389,7 +390,7 @@ stateDiagram-v2
 | `occupies_slot()` | Reserved / Starting / Running / Stopping | 容量計上・prewarm 抑止 |
 | `needs_reader_start()` | Starting / Running **以外** | リーダー起動の要否 |
 | `is_reclaimable()` | (Idle / Stopped) かつ購読者なし | **プール内部**の stale 掃除 |
-| `is_orphanable()` | Starting / Running 以外 かつ購読者なし | **所有者**による返却 |
+| `is_orphanable()` | Starting / Running / Stopping 以外 かつ購読者なし | **所有者**による返却。停止タスクが DLL を解放するまで Stopping は保持 |
 
 `Reserved` と `Starting` を分けないと「起動すべきか」の判定が必ず誤る
 (起動をサボる、または他タスクの起動に重ねて二重オープンする)。
@@ -705,7 +706,7 @@ src/
 
 | 層 | 内容 |
 |---|---|
-| CLI / TOML | `listen` (既定 **0.0.0.0:40070**), `web_listen` (既定 **127.0.0.1:40080**、2026-07-04 変更。REVIEW P0), `tuner`, `database`, `max_connections` (64), ログ設定, TLS パス, `[web] auth_enabled`/`auth_token`, `[tsreplace] command_path` |
+| CLI / TOML | `listen` (既定 **0.0.0.0:40070**), `web_listen` (既定 **127.0.0.1:40080**、2026-07-04 変更。REVIEW P0), `tuner`, `database`, `max_connections` (64、BNDP TCP のみ。0 は全接続拒否), ログ設定, TLS パス, `[web] auth_enabled`/`auth_token`, `[tsreplace] command_path` |
 | DB (Web API から変更) | `tuner_config` (keep_alive=60s, min_hold=10s, reject_cooldown=2000ms, no_data_timeout=30s, prewarm, SetChannel リトライ, signal 待ち), `scan_scheduler_config`, `tsreplace_config` (`command_path` を除く — API からは変更不可), `web_auth_config` (トークン永続化、API からは変更不可・main.rs のみが書き込む) |
 
 TLS 設定 (`[tls]`) は **現状サーバー側で機能しない** (パースのみ、accept 経路未結線)。実装完了までは使用しない。

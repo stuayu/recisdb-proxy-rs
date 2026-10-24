@@ -243,6 +243,13 @@ onMounted(load)
                 <span v-if="row.startup_state === 'starting'" class="badge badge-scanning">
                   開始中（{{ Number(row.startup_elapsed_seconds ?? 0) }}秒）
                 </span>
+                <span
+                  v-if="Number(row.stopping_readers ?? (row.state === 'Stopping' ? 1 : 0)) > 0"
+                  class="badge badge-breaker-open"
+                  title="BonDriverの停止処理が終わるまで、この受信機は利用できません"
+                >
+                  停止待ち（{{ Number(row.stopping_readers ?? 1) }}件）
+                </span>
                 <span v-if="row.is_scanning" class="badge badge-scanning">スキャン中</span>
                 <!-- 「開けない」と「遅い」は別の障害。どちらも視聴できない
                      理由になり得るので、いつ再試行されるかまで出す。 -->
@@ -261,7 +268,9 @@ onMounted(load)
                   class="badge badge-degraded"
                   title="オープンには成功しますが、毎回時間がかかりすぎています"
                 >動作が遅い</span>
-                <span v-if="row.startup_state !== 'starting' && !row.is_scanning && (!row.breaker_state || row.breaker_state === 'healthy')">—</span>
+                <span
+                  v-if="row.startup_state !== 'starting' && Number(row.stopping_readers ?? (row.state === 'Stopping' ? 1 : 0)) <= 0 && !row.is_scanning && (!row.breaker_state || row.breaker_state === 'healthy')"
+                >—</span>
               </td>
               <td data-label="操作">
                 <div class="actions">

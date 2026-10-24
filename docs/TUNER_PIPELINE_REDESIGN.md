@@ -239,7 +239,7 @@ pub enum Decision {
   | `occupies_slot()` | Reserved / Starting / Running / Stopping | 容量計上・prewarm 抑止 |
   | `needs_reader_start()` | Starting / Running **以外** | リーダー起動の要否 |
   | `is_reclaimable()` | (Idle / Stopped) かつ購読者なし | **プール内部**の stale 掃除 |
-  | `is_orphanable()` | Starting / Running 以外 かつ購読者なし | **entry の所有者**による返却 |
+  | `is_orphanable()` | Starting / Running / Stopping 以外 かつ購読者なし | **entry の所有者**による返却。停止タスクが DLL を解放するまで Stopping は保持 |
 
   旧 `is_running` はリーダー本体の先頭で `true` にしていたため**初期化中も真**
   だった。新 `is_running()` は `Running` のみなので、容量計上・二重起動防止・

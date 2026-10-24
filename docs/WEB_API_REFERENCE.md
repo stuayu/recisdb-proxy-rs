@@ -32,6 +32,9 @@ Webダッシュボードが使用するAPIの一覧。`/api/*` は、認証が�
 | GET | `/api/bondrivers/ranking` | ドライバー品質ランキング |
 | GET | `/api/scan-history` | スキャン履歴 |
 
+`GET /api/tuners` はBonDriverごとに `state` と `stopping_readers` を返します。`stopping_readers` は停止要求後も
+リーダータスクが終了していないインスタンス数です。ダッシュボードはこれを「停止待ち」と表示します。
+
 ## チャンネル・クライアント設定
 
 | Method | Path | 用途 |
