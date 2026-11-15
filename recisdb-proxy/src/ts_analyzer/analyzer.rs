@@ -320,7 +320,10 @@ impl TsAnalyzer {
         // Reject an older version, but retain every section of the current
         // version. PAT may span multiple sections.
         if let Some(ref existing) = self.result.pat {
-            if existing.version_number != section.header.version_number
+            // A PAT without services (e.g. dantto4k built it from a PLT that
+            // lost data) is never worth keeping over a later one.
+            if pat_has_services(existing)
+                && existing.version_number != section.header.version_number
                 && !is_newer_version(existing.version_number, section.header.version_number)
             {
                 return;
@@ -484,6 +487,11 @@ impl TsAnalyzer {
         if !all_sections_received(&self.pat_sections, self.pat_last_section_number) {
             return false;
         }
+        // An empty PAT would end a scan with zero services. Keep reading; the
+        // max_packets limit still bounds how long that can take.
+        if !self.result.pat.as_ref().is_some_and(pat_has_services) {
+            return false;
+        }
         if self.config.parse_nit
             && !all_sections_received(&self.nit_sections, self.nit_last_section_number)
         {
@@ -508,6 +516,10 @@ fn is_newer_version(current: u8, new: u8) -> bool {
     let new = new & 0x1F;
     let delta = new.wrapping_sub(current) & 0x1F;
     delta != 0 && delta < 16
+}
+
+fn pat_has_services(pat: &PatTable) -> bool {
+    pat.programs.iter().any(|p| p.program_number != 0)
 }
 
 fn all_sections_received<T>(sections: &HashMap<u8, T>, last_section_number: Option<u8>) -> bool {
@@ -563,6 +575,43 @@ fn merge_sdt_sections(sections: &HashMap<u8, SdtTable>) -> SdtTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pat_packet(version: u8, programs: &[(u16, u16)], cc: u8) -> Vec<u8> {
+        let mut section = vec![0x00, 0, 0, 0xB0, 0x72, 0xC1 | (version << 1), 0, 0];
+        for &(number, pid) in programs {
+            section.extend_from_slice(&number.to_be_bytes());
+            section.extend_from_slice(&(0xE000 | pid).to_be_bytes());
+        }
+        let length = (section.len() - 3 + 4) as u16;
+        section[1] = 0xB0 | (length >> 8) as u8;
+        section[2] = length as u8;
+        let crc = super::super::psi::crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        let mut packet = vec![0x47, 0x40, 0x00, 0x10 | (cc & 0x0F), 0x00];
+        packet.extend_from_slice(&section);
+        packet.resize(TS_PACKET_SIZE, 0xFF);
+        packet
+    }
+
+    #[test]
+    fn an_empty_pat_does_not_complete_the_analysis() {
+        let config = AnalyzerConfig {
+            parse_nit: false,
+            parse_sdt: false,
+            parse_all_pmts: false,
+            max_packets: 0,
+        };
+        let mut analyzer = TsAnalyzer::new(config);
+
+        // dantto4k builds PAT from PLT; a PLT that lost data yields a PAT with
+        // no services, and a newer version number must not lock it in.
+        assert!(!analyzer.feed(&pat_packet(5, &[], 0)));
+        assert!(!analyzer.is_complete());
+
+        assert!(analyzer.feed(&pat_packet(3, &[(141, 0x1000)], 1)));
+        let pat = analyzer.into_result().pat.unwrap();
+        assert_eq!(pat.get_all_program_numbers(), vec![141]);
+    }
 
     #[test]
     fn psi_version_comparison_wraps_at_31() {
