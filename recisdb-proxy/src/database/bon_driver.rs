@@ -1,6 +1,6 @@
 //! BonDriver CRUD operations.
 
-use super::{BonDriverRecord, Database, NewBonDriver, Result};
+use super::{BonDriverRecord, Database, NewBonDriver, Result, StreamFormat};
 use rusqlite::params;
 
 impl Database {
@@ -22,6 +22,80 @@ impl Database {
             params![driver.dll_path, driver.driver_name, driver.version, driver.max_instances.unwrap_or(1)],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a BonDriver and apply all registration settings atomically.
+    ///
+    /// The CLI uses this so a database error while writing secondary settings
+    /// cannot leave a partially configured row that blocks a retry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_bon_driver(
+        &mut self,
+        driver: &NewBonDriver,
+        group_name: Option<&str>,
+        stream_format: StreamFormat,
+        disable_b25: bool,
+        auto_scan_enabled: bool,
+        scan_interval_hours: i32,
+        scan_priority: i32,
+        passive_scan_enabled: bool,
+        scan_now: bool,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO bon_drivers (dll_path, driver_name, version, max_instances)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                driver.dll_path,
+                driver.driver_name,
+                driver.version,
+                driver.max_instances.unwrap_or(1)
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+
+        if let Some(group_name) = group_name {
+            tx.execute(
+                "UPDATE bon_drivers
+                 SET group_name = ?1, updated_at = strftime('%s', 'now')
+                 WHERE id = ?2",
+                params![group_name, id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE bon_drivers
+             SET stream_format = ?1, updated_at = strftime('%s', 'now')
+             WHERE id = ?2",
+            params![stream_format.as_db_value(), id],
+        )?;
+        tx.execute(
+            "UPDATE bon_drivers
+             SET disable_b25 = ?1, updated_at = strftime('%s', 'now')
+             WHERE id = ?2",
+            params![disable_b25 as i32, id],
+        )?;
+        tx.execute(
+            "UPDATE bon_drivers
+             SET auto_scan_enabled = ?1, scan_interval_hours = ?2,
+                 scan_priority = ?3, passive_scan_enabled = ?4
+             WHERE id = ?5",
+            params![
+                auto_scan_enabled as i32,
+                scan_interval_hours,
+                scan_priority,
+                passive_scan_enabled as i32,
+                id
+            ],
+        )?;
+        if scan_now {
+            tx.execute(
+                "UPDATE bon_drivers SET next_scan_at = 0 WHERE id = ?1",
+                [id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Get BonDriver by ID.

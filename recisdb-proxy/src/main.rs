@@ -26,6 +26,7 @@ use server::{Server, ServerConfig};
 use tuner::TunerPoolConfig;
 
 mod app_config;
+mod driver_cli;
 mod service_cli;
 
 /// recisdb-proxy - Network proxy server for BonDriver
@@ -54,9 +55,10 @@ struct Args {
     #[arg(short, long)]
     tuner: Option<String>,
 
-    /// Path to the database file
-    #[arg(short, long, default_value = "recisdb-proxy.db")]
-    database: PathBuf,
+    /// Path to the database file. Overrides [database].path for the server and driver commands;
+    /// service commands use the configured service file.
+    #[arg(short, long, global = true)]
+    database: Option<PathBuf>,
 
     /// Maximum concurrent connections
     #[arg(short = 'c', long, default_value = "64")]
@@ -149,16 +151,43 @@ enum Command {
         #[command(subcommand)]
         action: service_cli::ServiceAction,
     },
+    /// BonDriver をデータベースへ登録・一覧・スキャン予約する
+    Driver {
+        #[command(subcommand)]
+        action: driver_cli::DriverAction,
+    },
+}
+
+fn database_option_scope_error(args: &Args) -> Option<&'static str> {
+    if args.database.is_some() && matches!(args.command.as_ref(), Some(Command::Service { .. })) {
+        Some(
+            "--database is not supported with service commands; configure [database].path in the service config file",
+        )
+    } else {
+        None
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if let Some(error) = database_option_scope_error(&args) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
 
     // Subcommands run before any logging/database setup and never start the
     // server.
     if let Some(Command::Service { action }) = &args.command {
         let code = service_cli::run(action, args.config.as_deref());
         std::process::exit(code);
+    }
+    if let Some(Command::Driver { action }) = &args.command {
+        if let Err(error) = driver_cli::run(action, &args) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
     }
 
     // The restart helper only talks to the SCM; it must not open the database
@@ -1109,4 +1138,88 @@ async fn run_server(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::driver_cli::{DriverAction, DriverStreamFormat};
+    use super::{database_option_scope_error, Args, Command};
+    use clap::Parser;
+
+    #[test]
+    fn driver_register_options_are_grouped_under_a_subcommand() {
+        let args = Args::try_parse_from([
+            "recisdb-proxy",
+            "driver",
+            "register",
+            "--database",
+            "channels.sqlite",
+            "--path",
+            "px4daemon:any",
+            "--name",
+            "PX4_Drv ISDB-C",
+            "--max-instances",
+            "1",
+            "--stream-format",
+            "ts",
+            "--scan-now",
+        ])
+        .unwrap();
+
+        match args.command.unwrap() {
+            Command::Driver {
+                action:
+                    DriverAction::Register {
+                        path,
+                        name,
+                        max_instances,
+                        stream_format,
+                        scan_now,
+                        ..
+                    },
+            } => {
+                assert_eq!(path, "px4daemon:any");
+                assert_eq!(name.as_deref(), Some("PX4_Drv ISDB-C"));
+                assert_eq!(max_instances, 1);
+                assert_eq!(stream_format, DriverStreamFormat::Ts);
+                assert!(scan_now);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_command_rejects_an_ignored_database_override() {
+        let args = Args::try_parse_from([
+            "recisdb-proxy",
+            "service",
+            "install",
+            "--database",
+            "alternate.sqlite",
+        ])
+        .unwrap();
+
+        assert!(database_option_scope_error(&args).is_some());
+    }
+
+    #[test]
+    fn service_command_without_database_override_is_accepted() {
+        let args = Args::try_parse_from(["recisdb-proxy", "service", "install"]).unwrap();
+
+        assert!(database_option_scope_error(&args).is_none());
+    }
+
+    #[test]
+    fn driver_register_rejects_zero_instances() {
+        let result = Args::try_parse_from([
+            "recisdb-proxy",
+            "driver",
+            "register",
+            "--path",
+            "px4daemon:any",
+            "--max-instances",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
 }

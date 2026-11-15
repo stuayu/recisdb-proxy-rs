@@ -687,7 +687,7 @@ Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境
 | `--listen` | `0.0.0.0:40070` | プロキシサーバーの待ち受けアドレス |
 | `--web-listen` | `127.0.0.1:40080` | Web ダッシュボードの待ち受けアドレス。既定はループバックのみ (別PCのブラウザから開くには `0.0.0.0:40080` を指定するか、設定ファイルの `web_listen` を使う) |
 | `-t, --tuner` | ― | デフォルトのチューナーパス (DLL パスまたはデバイスパス) |
-| `-d, --database` | `recisdb-proxy.db` | SQLite データベースファイルのパス |
+| `-d, --database` | `[database].path`、未設定なら `recisdb-proxy.db` | SQLite データベースファイルのパス。指定時は設定ファイルの値より優先 |
 | `-f, --config` | ― | 設定ファイルのパス |
 | `-c, --max-connections` | `64` | BNDP/TCP接続の上限 (Web/Mirakurunは別枠、0なら全て拒否) |
 | `--enable-scan` | `true` | 自動チャンネルスキャンの有効化 |
@@ -696,6 +696,10 @@ Linux amd64 / arm64、macOS Intel / Apple Silicon です。それ以外の環境
 | `--log-dir` | `logs` | ログファイルの保存先 |
 | `--log-retention-days` | `7` | ログの保持日数 |
 | `-v, --verbose` | `false` | 詳細ログの有効化 |
+
+互換性の注意: `--database` は明示指定時に `[database].path` より優先します。以前の版では
+設定ファイルのパスが優先されていたため、既存の起動コマンドで両方を指定している場合は
+意図したDBを開いているか確認してください。
 
 サブコマンド `recisdb-proxy service <install|uninstall|start|stop|restart|status>` については
 「サービスとして常時稼働させる」を参照してください。

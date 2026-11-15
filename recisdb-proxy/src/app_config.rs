@@ -272,6 +272,15 @@ pub fn load_file_config(args: &Args) -> Result<ConfigFile, Box<dyn std::error::E
     }
 }
 
+/// Resolve the database in normal command-line priority order: explicit CLI
+/// value, TOML setting, then the default file in the working directory.
+pub fn resolve_database_path(args: &Args, file_config: &ConfigFile) -> PathBuf {
+    args.database
+        .clone()
+        .or_else(|| file_config.database.path.clone().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("recisdb-proxy.db"))
+}
+
 /// Log output directory, resolved before `logging::init_logging` is called
 /// (so it cannot itself use the `log` macros).
 ///
@@ -340,12 +349,7 @@ pub fn load(
         .server
         .max_connections
         .unwrap_or(args.max_connections);
-    let db_path = file_config
-        .database
-        .path
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| args.database.clone());
+    let db_path = resolve_database_path(args, file_config);
 
     let web_auth_enabled = file_config.web.auth_enabled.unwrap_or(true);
     let mirakurun_enabled = file_config.mirakurun.enabled.unwrap_or(false);
@@ -555,6 +559,31 @@ mod tests {
     /// overrides), so tests can flip individual fields to exercise priority.
     fn default_args() -> Args {
         Args::parse_from(["recisdb-proxy"])
+    }
+
+    #[test]
+    fn explicit_cli_database_path_overrides_toml_and_default() {
+        let args = Args::parse_from(["recisdb-proxy", "--database", "cli.sqlite"]);
+        let file_config: ConfigFile = toml::from_str("[database]\npath='config.sqlite'\n").unwrap();
+        assert_eq!(
+            resolve_database_path(&args, &file_config),
+            PathBuf::from("cli.sqlite")
+        );
+    }
+
+    #[test]
+    fn database_path_falls_back_from_toml_to_default() {
+        let mut args = default_args();
+        args.database = None;
+        let file_config: ConfigFile = toml::from_str("[database]\npath='config.sqlite'\n").unwrap();
+        assert_eq!(
+            resolve_database_path(&args, &file_config),
+            PathBuf::from("config.sqlite")
+        );
+        assert_eq!(
+            resolve_database_path(&args, &ConfigFile::default()),
+            PathBuf::from("recisdb-proxy.db")
+        );
     }
 
     #[test]

@@ -101,6 +101,39 @@ recisdb-proxy
 recisdb-proxy --tuner "C:\BonDriver\BonDriver_PX-MLT1.dll"
 ```
 
+### BonDriverのDB登録とスキャン
+
+サーバーを起動せずにBonDriverを登録し、一覧や単発スキャンを操作できます。
+`--database` があればそのパスを使い、無ければ設定ファイルの `[database].path`、
+最後に既定の `recisdb-proxy.db` を使います。`driver register` / `driver list` /
+`driver scan` は、指定先のDBファイルが存在しない場合に新規作成せずエラーになります。
+先にサーバーを一度起動してDBを作成してください。各コマンドの最初に `DATABASE` 行で
+実際に解決した絶対パスを表示します。
+`--database` と `[database].path` の両方を指定した場合は、コマンドラインの
+`--database` が優先されます。以前の版で設定ファイルのDBを使っていたコマンドに
+`--database` を付けて実行していた場合は、登録先が変わっていないか `DATABASE` 行を確認してください。
+
+```bash
+# ISDB-C BonDriverを登録して初回スキャンを予約
+recisdb-proxy --config recisdb-proxy.toml driver register \
+  --path "px4daemon:any" --name "PX4_Drv ISDB-C" \
+  --max-instances 1 --stream-format ts --scan-now
+
+# 登録内容とIDを確認
+recisdb-proxy --config recisdb-proxy.toml driver list
+
+# 登録済みBonDriverの単発スキャンを予約
+recisdb-proxy --config recisdb-proxy.toml driver scan --id 1
+```
+
+`--scan-now` / `driver scan` は次回スケジューラ実行時の単発スキャンを予約します。
+周期スキャンは既定で無効です。周期スキャンも行う場合だけ登録時に
+`--auto-scan --scan-interval-hours 24` を指定します。`--stream-format` は `ts` または
+`mmttlv`、既定値は `ts` です。起動時の `--tuner` 登録も従来どおり利用できます。
+サーバー稼働中に登録したBonDriverはDBへ保存されますが、実行中のチューナープールには
+次回起動時に読み込まれます。登録後は視聴・録画セッションがないことを確認してから
+サーバーまたはサービスを再起動してください。
+
 ### 3. カスタムポートで起動
 
 ```bash
@@ -318,7 +351,7 @@ recisdb-proxy --help
 | `--listen ADDR` | プロキシサーバーのリッスンアドレス | 0.0.0.0:40070 |
 | `--web-listen ADDR` | Webダッシュボードのリッスンアドレス | 0.0.0.0:40080 |
 | `--tuner PATH` | デフォルトチューナーパス | （指定なし） |
-| `--database PATH` | SQLiteデータベースファイル | recisdb-proxy.db |
+| `--database PATH` | SQLiteデータベースファイル（指定時は `[database].path` より優先） | `[database].path`、未設定なら `recisdb-proxy.db` |
 | `--max-connections N` | BNDP/TCP接続の上限 (0なら全て拒否) | 64 |
 | `--config FILE` | 設定ファイルパス | （指定なし） |
 | `--verbose` | デバッグログを有効化 | false |
