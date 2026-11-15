@@ -87,6 +87,11 @@ Linux/macOS/Windows の B25 用 PC/SC 一覧の先頭に `BonCasLink Client Card
 PC/SC シムは BonCasLink の length-prefix APDU プロトコルを使う。カード接続は3秒、
 APDUの送受信は5秒でタイムアウトする。BonCasLink サーバーが無い環境でも、通常の
 ローカル PC/SC リーダーは従来どおり利用できる。
+ネイティブ PC/SC のカードハンドルは値域を仮定せず、シムが発行する opaque alias で
+呼び出し元へ返す。送受信・切断時にだけ backend の実ハンドルへ戻すため、ネイティブ
+リーダーのハンドル値が合成リーダー用の値域に入っても接続を拒否しない。コンテキスト
+解放では、そのコンテキストに属する仮想カードと alias を backend 解放より先に retire し、
+解放後に同じ数値のコンテキストが再利用されても古い後処理が新しい接続へ触れないようにする。
 
 ネットワーク ID ごとにリーダーを固定する場合は、同じファイルの
 `[b25.network_readers]` に NID (16進数) と PC/SC リーダー名、または
@@ -225,6 +230,11 @@ macOS 版はキャラクタデバイスではなくユーザー空間デーモ�
 動作する。recisdb-proxy はこれを `px4daemon:` バックエンド
 (`bondriver/px4_daemon.rs`) で扱う。
 
+DriverHost の制御・データ・カードソケットとロックファイルは、`PX4_RUNTIME_DIR` で
+配置先を変更できます。指定ディレクトリを先に作成し、recisdb-proxy 側の `@制御ソケット`
+と `PX4_CARD_SOCKET` に同じ場所を指定してください。既定の配置先は DriverHost と
+`b25-sys` の互換性のため `/tmp` です。
+
 ### 1. デーモンを起動しておく
 
 ```bash
@@ -278,10 +288,30 @@ cargo test -p recisdb-proxy --lib px4_daemon -- --ignored --nocapture
 (既定 `0` = UHF 13) で対象を変えられる。CNR と、読み出した TS の同期バイト
 ストライドが保たれているかを表示する。
 
+### 4. B-CAS カードと B25
+
+PX4 デバイス内蔵の B-CAS リーダーは、macOS の標準 PC/SC リーダー一覧に
+現れない場合がある。`DriverHost_PX4` が公開するカードソケット
+(`/tmp/px4_card_pipe.sock`) を `b25-sys` が PC/SC 仮想リーダーとして中継するため、
+DriverHost とカードを接続した状態であれば libaribb25 の B25 初期化に利用できる。
+ソケットの場所を変更した場合は、recisdb-proxy 起動前に `PX4_CARD_SOCKET` へ
+そのパスを設定する。
+
+実機での初期化確認は、DriverHost と B-CAS カードを用意して次を実行する。
+
+```bash
+cargo test -p b25-sys --test card_reader_hardware --features prioritized_card_reader \
+  -- --ignored --nocapture px4_driverhost_internal_reader_initializes_b25
+```
+
+カードが認識されない場合は、DriverHost の起動状態とカードソケットへの接続を確認する。
+この経路はカード APDU の中継と libaribb25 初期化を行う。受信波の復号映像まで確認するには、
+スクランブル放送を選局して B25 有効のストリームを別途再生する。
+
 ### 制約
 
 - B25 デスクランブルは recisdb-proxy 側の `b25-sys` (libaribb25) を使う。
-  macOS で libaribb25 が初期化できない場合はスクランブル済みの生 TS が流れる。
+  DriverHost やカードが利用できず libaribb25 が初期化できない場合はスクランブル済みの生 TS が流れる。
 - 同一系統の既知のQAMへの再選局は capture を止めずに SET_PARAMS + TUNE + PURGE で行う。
   CATV の未判定チャンネルでは使い捨てセッションによる自動判定を先に行う。daemon 側は
   `SET_CAPTURE(false)` でストリームスレッドを終了させ、`SET_DATA_ID` は接続あたり

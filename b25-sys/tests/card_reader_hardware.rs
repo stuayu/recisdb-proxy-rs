@@ -45,3 +45,24 @@ fn set_card_reader_name_does_not_crash() {
 fn list_card_readers_reports_what_pcsc_sees() {
     println!("{:?}", b25_sys::list_card_readers());
 }
+
+#[cfg(all(target_os = "macos", feature = "prioritized_card_reader"))]
+#[test]
+#[ignore = "requires a running DriverHost_PX4 and an inserted B-CAS card"]
+fn px4_driverhost_internal_reader_initializes_b25() {
+    let readers = b25_sys::list_card_readers();
+    let Some(reader) = readers
+        .iter()
+        .find(|reader| reader.starts_with("PX4 DriverHost: "))
+    else {
+        panic!("PX4 DriverHost card reader is not visible to B25: {readers:?}");
+    };
+
+    let decoder =
+        b25_sys::StreamDecoder::with_card_reader(b25_sys::DecoderOptions::default(), Some(reader));
+    assert!(
+        decoder.is_ok(),
+        "B25 failed to initialize from PX4 DriverHost card reader {reader:?}: {:?}",
+        decoder.err()
+    );
+}

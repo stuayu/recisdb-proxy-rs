@@ -14,6 +14,8 @@ mod boncaslink;
 mod pcsc_shim;
 #[cfg(windows)]
 mod pcsc_windows;
+#[cfg(target_os = "macos")]
+mod px4_card;
 
 static KEY0: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static KEY1: Mutex<Vec<u64>> = Mutex::new(Vec::new());
