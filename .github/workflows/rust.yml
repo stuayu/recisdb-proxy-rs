@@ -45,6 +45,8 @@ jobs:
           - debian:testing-slim
           - debian:stable-slim
           - ubuntu:noble
+          # Alpine's matrix entry has been disabled since 2023; this job
+          # currently validates Debian/Ubuntu Linux environments only.
           # - alpine:latest
     container:
       image: ${{ matrix.os }}
@@ -55,14 +57,14 @@ jobs:
           apt-get update
           # curl + ca-certificates are required by dtolnay/rust-toolchain to download rustup
           apt-get install build-essential cmake libpcsclite-dev libdvbv5-dev libudev-dev git wget curl ca-certificates clang pkg-config -qy
-        if: matrix.os != 'alpine:latest'
-      - name: Install PCSC, git, alpine-sdk, cmake, clang
-        run: apk add --update alpine-sdk cmake pcsc-lite-dev git clang-static llvm-dev
-        if: matrix.os == 'alpine:latest'
-      - name: Alpine-specific setup
+      - name: Install FFmpeg with libx264/libx265 for preview regressions
         run: |
-          apk add zlib-static libffi-dev ncurses-dev
-        if: matrix.os == 'alpine:latest'
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install ffmpeg -qy
+          command -v ffprobe >/dev/null
+          encoders="$(ffmpeg -hide_banner -encoders)"
+          printf '%s\n' "$encoders" | awk '$2 == "libx264" { x264=1 } $2 == "libx265" { x265=1 } END { exit !(x264 && x265) }'
+          echo "RECISDB_REQUIRE_FFMPEG_FIXTURES=1" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -74,16 +76,23 @@ jobs:
           key: ${{ matrix.os }}
       - name: Check
         run: cargo check --workspace -F dvb
-        if: matrix.os != 'alpine:latest'
-      - name: Check
-        run: cargo check --workspace --no-default-features -F bg-static
-        if: matrix.os == 'alpine:latest'
       - name: Run tests
         run: cargo test --workspace -F dvb
-        if: matrix.os != 'alpine:latest'
-      - name: Run tests
-        run: cargo test --workspace --no-default-features -F bg-static
-        if: matrix.os == 'alpine:latest'
+
+  test-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: b25-sys-macos
+      - name: Test macOS PC/SC and PX4 paths
+        run: cargo test -p b25-sys -- --test-threads=1
 
   build-windows-non-msys:
     runs-on: windows-2025
@@ -98,6 +107,45 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: build-windows-non-msys
+      - name: Install FFmpeg fixtures with libx264 and libx265
+        shell: pwsh
+        run: |
+          choco install ffmpeg-full --version=9.0.2 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "choco install ffmpeg-full failed with exit code $LASTEXITCODE"
+          }
+
+          $toolsPath = Join-Path $env:ChocolateyInstall "lib\ffmpeg-full\tools"
+          $ffmpeg = Get-ChildItem -Path $toolsPath -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1
+          if ($null -eq $ffmpeg) {
+            throw "Chocolatey installed ffmpeg-full without ffmpeg.exe under $toolsPath"
+          }
+          $ffmpegDirectory = $ffmpeg.DirectoryName
+          $ffprobePath = Join-Path $ffmpegDirectory "ffprobe.exe"
+          if (-not (Test-Path -LiteralPath $ffprobePath -PathType Leaf)) {
+            throw "ffprobe.exe is missing beside $($ffmpeg.FullName)"
+          }
+
+          $encoders = (& $ffmpeg.FullName -hide_banner -encoders 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "ffmpeg -encoders failed with exit code $LASTEXITCODE"
+          }
+
+          foreach ($encoder in @("libx264", "libx265")) {
+            $pattern = '(?m)^\s*V\S*\s+' + [regex]::Escape($encoder) + '(\s|$)'
+            if ($encoders -notmatch $pattern) {
+              throw "FFmpeg does not provide the required $encoder encoder"
+            }
+          }
+
+          $ffprobeVersion = & $ffprobePath -version 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "ffprobe failed with exit code $LASTEXITCODE"
+          }
+          $ffprobeVersion | Select-Object -First 1
+
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $ffmpegDirectory -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RECISDB_REQUIRE_FFMPEG_FIXTURES=1" -Encoding utf8
       - name: Test
         run: |
           rustup target add x86_64-pc-windows-gnu

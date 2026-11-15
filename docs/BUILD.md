@@ -2,6 +2,9 @@
 
 recisdb-rs ワークスペースのビルド方法。通常ビルドと、macOS から Linux amd64 へのクロスビルド手順をまとめる。
 
+Linux CI は Debian sid/testing/stable と Ubuntu Noble を検証する。Alpine は CI で
+2023 年から無効化されており、現在の必須 FFmpeg fixture 検査の対象にも含まれない。
+
 ## 前提
 
 - Rust (stable)。`b25-sys` を含むビルドには **cmake** と **pkg-config** も必要
