@@ -489,10 +489,20 @@ CREATE TABLE encode_profiles(
 - **broadcast Lagged の扱い**: HTTP ストリームは PREVIEW 相当のポリシーで、`Lagged` はログのみで継続
   (§3.2/§3.3 の VIEW/PREVIEW 方針を踏襲)。RECORD 相当の「溢れたら切断」は HTTP エンドポイントには適用していない
   (Mirakurun 風 HTTP 配信は §2 の意味では PREVIEW/VIEW 用途を想定)。
-- **profile=preview の SID 選択**: `/api/stream/service/:sid` は1サービス指定なので、
-  `encoder_pool::args_contain_service_option` が偽なら常に `sids=[その1 SID]` でエンコード
-  (session.rs の single-service モードと同じ規約)。`tsreplace_config.enabled=false` の場合は
-  503 で明示エラーを返す (実行コマンド自体を無効化している設定なので、preview だけ黙って動かすのは矛盾するため)。
+- **EncoderPool の SID 選択 (BNDP / profile=preview)**: `needs_service_sid()` が真になる場合だけ、EncoderPoolキーにSIDを含める。
+  対象は有効な `{SID}` テンプレート、またはサービス指定を自動注入する tsreplace コマンド。
+  tsreplace/tsreadex の明示的なサービス指定と、SID選択をしない汎用エンコーダーではSIDを空にし、
+  同じmultiplexのプレビューを共有する。FFmpegの `-s WxH` はサイズ指定として扱い、
+  tsreplaceの `-s <SID>` と混同しない。この判定をsession.rsとプレビューの両方で共有する。
+  `{SID}` テンプレートは1サービス分の値なので、sessionがフルTSモードでも現在選局中のSIDだけをキーにする。
+  SIDが未解決なら空のままspawnへ渡し、明示的なエラーにする。tsreplaceの encoder 境界は独立した `-e` / `--encoder`
+  トークンのみを認識し、その後ろは子エンコーダー引数として扱う。`-e=...` / `--encoder=...` は未対応として拒否する。
+  tsreplace / tsreadex のコマンド判定はファイル名全体で行い、`.exe` / `.bat` / `.cmd` と末尾の `_x86` / `_x64` を正規化する。
+  そのため `notsreplace` などの部分一致は対象にしない。
+  BNDPのローカル選局成功時は、EncoderPoolを再起動する前に選局先のDB metadataを反映し、`current_nid/current_tsid/current_sid`
+  とサービスフィルターを更新する。v1 `SetChannel`・v2 `SetChannelSpace`・論理チャンネル選局のどの経路でも、旧SIDで新しいエンコーダーを起動しない。
+  論理チャンネル選局では `(NID, TSID, optional SID)` で選んだ候補行のサービス metadata を適用する。物理 `(path, space, channel)` だけで引き直すと、同じ multiplex の先頭 SID を選び直してしまう。
+  `preview_encoder_config.enabled=false` の場合は503で明示エラーを返す。
 - **生 passthrough の範囲**: `profile` 未指定時はチューナーの生 TS (物理チャンネルのフル multiplex) を
   そのまま流す。session.rs のようなサービスPIDフィルタ (`ts_analyzer::service_filter`) は適用していない
   — 実装コスト・回帰リスクに対して仕様上の要求 (§6.3 は「生 TS」としか書いていない) を超えないための意図的な

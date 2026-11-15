@@ -16,6 +16,7 @@ use recisdb_protocol::{
     PROTOCOL_VERSION,
 };
 
+use crate::database::ChannelRecord;
 use crate::server::listener::DatabaseHandle;
 use crate::server::prefill::{default_bitrate_bps, prefill_target_bytes, PrefillBuffer};
 use crate::ts_analyzer::service_filter::TsServiceFilter;
@@ -62,6 +63,50 @@ use crate::server::session_space_cache::{
 };
 use crate::server::session_tuner_handoff::handoff_current_tuner;
 use crate::tuner::acquire::{acquire, AcquireError, AcquireRequest};
+
+/// Select the SIDs that identify a session's shared encoder entry.
+/// `{SID}` templates are single-service by definition, even if this session
+/// otherwise streams the full transport stream. Legacy tsreplace auto-injection
+/// can still use the full-mux SID set to build one chain per service.
+fn select_session_encode_sids(
+    runtime: &EncoderRuntimeConfig,
+    current_sid: Option<u16>,
+    resolved_sids: Vec<u16>,
+) -> Vec<u16> {
+    if !encoder_pool::needs_service_sid(runtime) {
+        Vec::new()
+    } else if encoder_pool::uses_sid_placeholder(runtime) {
+        current_sid.into_iter().collect()
+    } else {
+        resolved_sids
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChannelServiceMetadata {
+    channel_name: Option<String>,
+    nid: Option<u16>,
+    tsid: Option<u16>,
+    sid: Option<u16>,
+}
+
+impl From<&ChannelRecord> for ChannelServiceMetadata {
+    fn from(record: &ChannelRecord) -> Self {
+        Self {
+            channel_name: record.channel_name.clone().or(record.raw_name.clone()),
+            nid: Some(record.nid),
+            tsid: Some(record.tsid),
+            sid: Some(record.sid),
+        }
+    }
+}
+
+fn choose_channel_service_metadata(
+    selected_service: Option<ChannelServiceMetadata>,
+    physical_lookup: Option<ChannelServiceMetadata>,
+) -> Option<ChannelServiceMetadata> {
+    selected_service.or(physical_lookup)
+}
 
 /// The active BNDP payload source. A remote lease has the same broadcast
 /// receiver shape as a local tuner, but its lease handle must stay alive until
@@ -585,15 +630,6 @@ impl Session {
             .set_max_concurrent(cfg.max_concurrent_encoders.max(1) as usize)
             .await;
 
-        // If the user's argument template already carries --service, no
-        // per-SID auto-injection happens; normalize the SID set to empty so
-        // every such session on this channel shares a single encoder.
-        let sids = if encoder_pool::args_contain_service_option(&cfg.arguments) {
-            Vec::new()
-        } else {
-            self.resolve_encode_sids().await
-        };
-
         let runtime = EncoderRuntimeConfig {
             command_path: cfg.command_path,
             arguments: cfg.arguments,
@@ -601,6 +637,19 @@ impl Session {
             preprocessor_path: cfg.preprocessor_path,
             preprocessor_arguments: cfg.preprocessor_arguments,
         };
+
+        // Only key by SID when spawning substitutes the placeholder or injects
+        // tsreplace's service selector. Generic encoders without a selector
+        // consume the same mux stream for every requested SID.
+        let resolved_sids = if encoder_pool::needs_service_sid(&runtime)
+            && !encoder_pool::uses_sid_placeholder(&runtime)
+        {
+            self.resolve_encode_sids().await
+        } else {
+            Vec::new()
+        };
+        let sids = select_session_encode_sids(&runtime, self.current_sid, resolved_sids);
+
         let generation = encoder_pool::config_generation(&runtime);
         let key = EncodeKey::new(tuner.key.clone(), sids, generation);
 
@@ -1903,7 +1952,8 @@ impl Session {
             .await;
         }
 
-        self.finish_set_channel_success(&outcome.tuner).await
+        self.finish_set_channel_success(&outcome.tuner, &tuner_path, channel as u32)
+            .await
     }
 
     async fn take_and_cleanup_current_tuner_for_switch(
@@ -1953,7 +2003,8 @@ impl Session {
         // on, so the run loop notices *this* reader dying (P4). Every
         // successful selection funnels through here.
         self.reader_state_rx = self.current_tuner.as_ref().map(|t| t.subscribe_state());
-        self.ts_quality_analyzer.reset();
+        // Callers apply the selected channel's metadata before reaching this
+        // point so a streaming encoder restarts with the new SID.
         self.restart_tsreplace_pipeline_if_streaming().await;
     }
 
@@ -1969,7 +2020,11 @@ impl Session {
     async fn finish_set_channel_success(
         &mut self,
         tuner: &Arc<SharedTuner>,
+        tuner_path: &str,
+        actual_bon_channel: u32,
     ) -> std::io::Result<()> {
+        self.apply_channel_metadata(tuner_path, 0, actual_bon_channel, None)
+            .await;
         self.finalize_tuner_switch(tuner).await;
         self.send_message(ServerMessage::SetChannelAck {
             success: true,
@@ -2020,9 +2075,9 @@ impl Session {
         actual_space: u32,
         actual_bon_channel: u32,
     ) -> std::io::Result<()> {
-        self.finalize_tuner_switch(tuner).await;
-        self.apply_channel_metadata(tuner_path, actual_space, actual_bon_channel)
+        self.apply_channel_metadata(tuner_path, actual_space, actual_bon_channel, None)
             .await;
+        self.finalize_tuner_switch(tuner).await;
         info!(
             "[Session {}] Successfully set channel, sending SetChannelSpaceAck success=true",
             self.id
@@ -2041,8 +2096,8 @@ impl Session {
         tuner_id: &str,
         space: u32,
         channel: u32,
+        selected_service: ChannelServiceMetadata,
     ) -> std::io::Result<()> {
-        self.finalize_tuner_switch(tuner).await;
         if self.state == SessionState::Ready {
             self.state = SessionState::TunerOpen;
         }
@@ -2051,7 +2106,9 @@ impl Session {
             self.id, candidate_idx, tuner_id, space, channel
         );
         self.set_selected_tuner_path_and_registry(tuner_id).await;
-        self.apply_channel_metadata(tuner_id, space, channel).await;
+        self.apply_channel_metadata(tuner_id, space, channel, Some(selected_service))
+            .await;
+        self.finalize_tuner_switch(tuner).await;
         self.send_message(ServerMessage::SelectLogicalChannelAck {
             success: true,
             error_code: 0,
@@ -2062,27 +2119,28 @@ impl Session {
         .await
     }
 
-    /// Common post-selection bookkeeping shared by every successful
-    /// `SetChannelSpace` path (direct start, existing-tuner reuse, and the
-    /// three capacity/priority fallback branches). Looks the channel up by
-    /// its physical `(path, space, channel)`, updates the session registry
-    /// (channel info/name/NID+SID), applies the single-service filter, and
-    /// records `current_channel_*`. Does NOT send the Ack — each caller keeps
-    /// control of its own reply/return so the surrounding control flow stays
-    /// explicit. Extracted to kill five near-identical copies (see
-    /// docs/SYSTEM_REVIEW_2026-07.md H2).
+    /// Common post-selection bookkeeping for successful local channel changes
+    /// (v1 `SetChannel`, v2 `SetChannelSpace`, and logical selection). Generic
+    /// selections look the channel up by physical `(path, space, channel)`;
+    /// logical selection supplies the exact chosen service row so a multiplex
+    /// with multiple SIDs retains the requested service. Updates the session
+    /// registry, applies the single-service filter, and records
+    /// `current_channel_*`. It also resets the TS quality analyzer once for
+    /// the new multiplex. Does NOT send the Ack — each caller keeps control of
+    /// its own reply/return so surrounding control flow stays explicit.
+    /// Extracted to kill five near-identical copies
+    /// (see docs/SYSTEM_REVIEW_2026-07.md H2).
     async fn apply_channel_metadata(
         &mut self,
         path: &str,
         actual_space: u32,
         actual_bon_channel: u32,
+        selected_service: Option<ChannelServiceMetadata>,
     ) {
         // A successful channel change means an entirely new stream/lineup: the
         // old PIDs and their CC baselines are gone. Fully reset the analyzer so
         // the first packets of the new lineup re-baseline instead of each
-        // counting a spurious drop. This helper is the single shared hook that
-        // every successful SetChannelSpace path funnels through, so it fires
-        // exactly once per switch.
+        // counting a spurious drop.
         self.ts_quality_analyzer.reset();
 
         let channel_info = format!("Space {}, Ch {}", actual_space, actual_bon_channel);
@@ -2091,18 +2149,21 @@ impl Session {
             .await;
         self.current_channel_info = Some(channel_info);
 
-        let (channel_name, ch_nid, ch_tsid, ch_sid) = {
+        let physical_lookup = if selected_service.is_none() {
             let db = self.database.lock().await;
             match db.get_channel_by_physical(path, actual_space, actual_bon_channel) {
-                Ok(Some(rec)) => (
-                    rec.channel_name.or(rec.raw_name),
-                    Some(rec.nid),
-                    Some(rec.tsid),
-                    Some(rec.sid),
-                ),
-                _ => (None, None, None, None),
+                Ok(Some(record)) => Some(ChannelServiceMetadata::from(&record)),
+                _ => None,
             }
+        } else {
+            None
         };
+        let ChannelServiceMetadata {
+            channel_name,
+            nid: ch_nid,
+            tsid: ch_tsid,
+            sid: ch_sid,
+        } = choose_channel_service_metadata(selected_service, physical_lookup).unwrap_or_default();
         self.session_registry
             .update_channel_name(self.id, channel_name.clone())
             .await;
@@ -2966,6 +3027,7 @@ impl Session {
                     && c.channel.bon_channel.unwrap_or(0) == chosen_channel
             })
             .unwrap_or(0);
+        let selected_service = ChannelServiceMetadata::from(&channels[candidate_idx].channel);
 
         self.tuner_pool.cancel_idle_close(&outcome.key).await;
         self.drop_remote_source().await;
@@ -3000,6 +3062,7 @@ impl Session {
             &chosen_path,
             chosen_space,
             chosen_channel,
+            selected_service,
         )
         .await
     }
@@ -3725,6 +3788,98 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sid_placeholder_session_uses_only_the_current_service() {
+        let runtime = EncoderRuntimeConfig {
+            command_path: "ffmpeg".to_owned(),
+            arguments: "-i - -map 0:{SID} -f mpegts -".to_owned(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
+        };
+
+        assert_eq!(
+            select_session_encode_sids(&runtime, Some(431), vec![431, 432]),
+            [431]
+        );
+        assert!(select_session_encode_sids(&runtime, None, vec![431, 432]).is_empty());
+    }
+
+    #[test]
+    fn logical_channel_metadata_prefers_selected_service_over_mux_first_row() {
+        let mux_first_service = ChannelServiceMetadata {
+            channel_name: Some("service 431".to_owned()),
+            nid: Some(0xFFF7),
+            tsid: Some(515),
+            sid: Some(431),
+        };
+        let selected_service = ChannelServiceMetadata {
+            channel_name: Some("service 432".to_owned()),
+            nid: Some(0xFFF7),
+            tsid: Some(515),
+            sid: Some(432),
+        };
+
+        assert_eq!(
+            choose_channel_service_metadata(
+                Some(selected_service.clone()),
+                Some(mux_first_service),
+            ),
+            Some(selected_service),
+        );
+    }
+
+    #[test]
+    fn channel_switch_encoder_key_uses_the_new_service_sid() {
+        let runtime = EncoderRuntimeConfig {
+            command_path: "ffmpeg".to_owned(),
+            arguments: "-i - -map 0:{SID} -f mpegts -".to_owned(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
+        };
+
+        // apply_channel_metadata updates current_sid before the successful
+        // switch restarts the pipeline. The encoder key must therefore select
+        // the new service rather than the SID from the previous channel.
+        let key = EncodeKey::new(
+            ChannelKey::space_channel("driver", 0, 5),
+            select_session_encode_sids(&runtime, Some(432), vec![431, 432]),
+            1,
+        );
+
+        assert_eq!(key.sids, [432]);
+    }
+
+    #[test]
+    fn full_ts_tsreplace_keeps_its_multi_service_sid_set() {
+        let runtime = EncoderRuntimeConfig {
+            command_path: "tsreplace".to_owned(),
+            arguments: "-i - -o -".to_owned(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
+        };
+
+        assert_eq!(
+            select_session_encode_sids(&runtime, Some(431), vec![431, 432]),
+            [431, 432]
+        );
+    }
+
+    #[test]
+    fn generic_encoder_session_does_not_key_by_service_id() {
+        let runtime = EncoderRuntimeConfig {
+            command_path: "ffmpeg".to_owned(),
+            arguments: "-i - -s 1280x720 -f mpegts -".to_owned(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: String::new(),
+            preprocessor_arguments: String::new(),
+        };
+
+        assert!(select_session_encode_sids(&runtime, Some(431), vec![431]).is_empty());
+    }
 
     // ---- STREAMING_DESIGN.md §2: auto-promotion threshold ----
 

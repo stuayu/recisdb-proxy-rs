@@ -165,13 +165,94 @@ pub enum EncoderPoolError {
     SpawnFailed(String),
 }
 
-/// Check whether `--service`/`-s` is already present in the user's argument
-/// template. If so, we must not auto-inject `--service <SID>` (that's the
-/// pre-existing single-process behavior carried over from `session.rs`).
-pub(crate) fn args_contain_service_option(arguments: &str) -> bool {
-    arguments
-        .split_whitespace()
-        .any(|t| t == "--service" || t == "-s")
+fn command_path_matches(command_path: &str, expected_name: &str) -> bool {
+    let file_name = command_path.rsplit(['/', '\\']).next().unwrap_or_default();
+    let command_name = match file_name.rsplit_once('.') {
+        Some((stem, extension))
+            if ["exe", "bat", "cmd"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported)) =>
+        {
+            stem
+        }
+        _ => file_name,
+    }
+    .to_ascii_lowercase();
+    let expected_name = expected_name.to_ascii_lowercase();
+
+    command_name == expected_name
+        || ["_x86", "_x64"].iter().any(|architecture_suffix| {
+            command_name
+                .strip_suffix(architecture_suffix)
+                .is_some_and(|name| name == expected_name)
+        })
+}
+
+fn arguments_contain_service_option(command_path: &str, arguments: &str) -> bool {
+    if command_path_matches(command_path, "tsreplace") {
+        for argument in arguments.split_whitespace() {
+            // tsreplace forwards every token after -e/--encoder to that child
+            // process; an FFmpeg -s size there is not tsreplace's -s service.
+            if argument == "-e" || argument == "--encoder" {
+                return false;
+            }
+            if argument == "--service" || argument == "-s" {
+                return true;
+            }
+        }
+        false
+    } else if command_path_matches(command_path, "tsreadex") {
+        arguments
+            .split_whitespace()
+            .any(|argument| argument == "-n")
+    } else {
+        false
+    }
+}
+
+/// Whether an active encoder or preprocessor argument template uses the
+/// resolved service id. An unconfigured preprocessor's template is ignored.
+pub(crate) fn uses_sid_placeholder(cfg: &EncoderRuntimeConfig) -> bool {
+    cfg.arguments.contains(SID_PLACEHOLDER)
+        || (cfg.preprocessor().is_some() && cfg.preprocessor_arguments.contains(SID_PLACEHOLDER))
+}
+
+/// Whether the configured encoder or active preprocessor already selects a
+/// service, in which case tsreplace must not receive another selector.
+pub(crate) fn config_selects_service(cfg: &EncoderRuntimeConfig) -> bool {
+    if uses_sid_placeholder(cfg) {
+        // Placeholders need the resolved SID in EncodeKey and are expanded
+        // during spawning; they are not fixed service selections.
+        return false;
+    }
+    arguments_contain_service_option(&cfg.command_path, &cfg.arguments)
+        || cfg
+            .preprocessor()
+            .is_some_and(|path| arguments_contain_service_option(path, &cfg.preprocessor_arguments))
+}
+
+/// Whether the pool key must include the resolved SID because spawning will
+/// substitute `{SID}` or inject a tsreplace service selector. Generic encoders
+/// without a selector consume the same mux stream for every requested SID and
+/// should share one encoder entry.
+pub(crate) fn needs_service_sid(cfg: &EncoderRuntimeConfig) -> bool {
+    uses_sid_placeholder(cfg)
+        || (command_path_matches(&cfg.command_path, "tsreplace") && !config_selects_service(cfg))
+}
+
+/// tsreplace only recognises the standalone `-e` / `--encoder` tokens; once
+/// either appears, the remaining arguments belong to the child encoder.
+/// Attached spellings such as `--encoder=ffmpeg` are invalid tsreplace syntax.
+fn has_unsupported_attached_encoder_option(arguments: &str) -> bool {
+    for argument in arguments.split_whitespace() {
+        if argument == "-e" || argument == "--encoder" {
+            return false;
+        }
+        if argument.starts_with("-e=") || argument.starts_with("--encoder=") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build command arguments with `--service <SID>` auto-injected, inserting it
@@ -229,19 +310,28 @@ enum SpawnPlan {
 /// Decide process wiring and argument vectors for `cfg` + `sids`.
 ///
 /// Rules (in priority order):
-/// 1. If either argument template contains [`SID_PLACEHOLDER`], the token is
-///    substituted with the (single) target SID and no `--service` injection
-///    happens. Requires exactly one SID.
+/// 1. If the encoder template or a configured preprocessor template contains
+///    [`SID_PLACEHOLDER`], substitute it with the (single) target SID and do
+///    not inject `--service`. Requires exactly one SID.
 /// 2. Otherwise, the pre-existing tsreplace behavior: `--service <SID>`
-///    auto-injection into `arguments` unless the template already carries
-///    `--service`/`-s` or `sids` is empty; 2+ SIDs use the per-SID chain.
+///    auto-injection into a tsreplace command unless its encoder or active
+///    preprocessor already selects a service, or `sids` is empty; 2+ SIDs use
+///    the per-SID chain.
 /// 3. A preprocessor (when configured) is prepended as stage 1 in the
 ///    single-process cases; it is not supported with the multi-SID chain.
 fn plan_spawn(cfg: &EncoderRuntimeConfig, sids: &[u16]) -> std::io::Result<SpawnPlan> {
     let split = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     let has_preprocessor = cfg.preprocessor().is_some();
-    let has_placeholder = cfg.arguments.contains(SID_PLACEHOLDER)
-        || cfg.preprocessor_arguments.contains(SID_PLACEHOLDER);
+    let is_tsreplace = command_path_matches(&cfg.command_path, "tsreplace");
+
+    if is_tsreplace && has_unsupported_attached_encoder_option(&cfg.arguments) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tsreplace requires a separate -e/--encoder option token; attached forms are not supported",
+        ));
+    }
+
+    let has_placeholder = uses_sid_placeholder(cfg);
 
     if has_placeholder {
         let sid = match sids {
@@ -278,8 +368,8 @@ fn plan_spawn(cfg: &EncoderRuntimeConfig, sids: &[u16]) -> std::io::Result<Spawn
         });
     }
 
-    let user_specified_service = args_contain_service_option(&cfg.arguments);
-    let enc_args = if user_specified_service || sids.is_empty() {
+    let user_specified_service = config_selects_service(cfg);
+    let enc_args = if !is_tsreplace || user_specified_service || sids.is_empty() {
         split(&cfg.arguments)
     } else if sids.len() == 1 {
         build_tsreplace_args(&cfg.arguments, sids[0])
@@ -1195,6 +1285,180 @@ mod tests {
         assert_ne!(g4, g5);
     }
 
+    #[test]
+    fn service_selection_options_are_scoped_to_the_known_command() {
+        let tsreplace = runtime_config(r"C:\tools\TSREPLACE.EXE", "-s 432", "", "");
+        assert!(config_selects_service(&tsreplace));
+
+        let tsreplace_missing_value = runtime_config("tsreplace", "-s", "", "");
+        assert!(config_selects_service(&tsreplace_missing_value));
+
+        let tsreadex = runtime_config("ffmpeg", "-i -", "tsreadex", "-n 432 -");
+        assert!(config_selects_service(&tsreadex));
+
+        let padded_tsreadex = runtime_config("ffmpeg", "-i -", " tsreadex ", "-n 432 -");
+        assert!(config_selects_service(&padded_tsreadex));
+
+        let tsreadex_placeholder = runtime_config("ffmpeg", "-i -", "tsreadex", "-n {SID} -");
+        assert!(!config_selects_service(&tsreadex_placeholder));
+
+        let ffmpeg_size_keyword = runtime_config("ffmpeg", "-i - -s hd720", "", "");
+        assert!(!config_selects_service(&ffmpeg_size_keyword));
+
+        let ffmpeg_size_dimensions = runtime_config("ffmpeg", "-i - -s 1280x720", "", "");
+        assert!(!config_selects_service(&ffmpeg_size_dimensions));
+
+        let wrapped_ffmpeg_size =
+            runtime_config("tsreplace", "-i - --encoder ffmpeg -s hd720", "", "");
+        assert!(!config_selects_service(&wrapped_ffmpeg_size));
+        match plan_spawn(&wrapped_ffmpeg_size, &[432]).unwrap() {
+            SpawnPlan::Single { enc_args } => {
+                let encoder_index = enc_args.iter().position(|arg| arg == "--encoder").unwrap();
+                let service_index = enc_args.iter().position(|arg| arg == "--service").unwrap();
+                assert_eq!(enc_args[service_index + 1], "432");
+                assert!(service_index < encoder_index);
+                assert!(enc_args.windows(2).any(|pair| pair == ["-s", "hd720"]));
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+
+        let wrapped_ffmpeg_size_short =
+            runtime_config("tsreplace", "-i - -e ffmpeg -s hd720", "", "");
+        assert!(!config_selects_service(&wrapped_ffmpeg_size_short));
+        match plan_spawn(&wrapped_ffmpeg_size_short, &[433]).unwrap() {
+            SpawnPlan::Single { enc_args } => {
+                let encoder_index = enc_args.iter().position(|arg| arg == "-e").unwrap();
+                let service_index = enc_args.iter().position(|arg| arg == "--service").unwrap();
+                assert_eq!(enc_args[service_index + 1], "433");
+                assert!(service_index < encoder_index);
+                assert!(enc_args.windows(2).any(|pair| pair == ["-s", "hd720"]));
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+
+        let tsreplace_service = runtime_config("tsreplace", "-s 432 -i - -o -", "", "");
+        assert!(config_selects_service(&tsreplace_service));
+
+        let padded_tsreadex_preprocessor =
+            runtime_config("tsreplace", "-i - -o -", " tsreadex ", "-n 432 -");
+        assert!(config_selects_service(&padded_tsreadex_preprocessor));
+        assert!(matches!(
+            plan_spawn(&padded_tsreadex_preprocessor, &[431]).unwrap(),
+            SpawnPlan::TwoStage { enc_args, .. } if enc_args == ["-i", "-", "-o", "-"]
+        ));
+
+        let padded_tsreplace_preprocessor =
+            runtime_config("tsreplace", "-i - -o -", " tsreplace ", "-s 432 -i - -o -");
+        assert!(config_selects_service(&padded_tsreplace_preprocessor));
+        assert!(matches!(
+            plan_spawn(&padded_tsreplace_preprocessor, &[431]).unwrap(),
+            SpawnPlan::TwoStage { enc_args, .. } if enc_args == ["-i", "-", "-o", "-"]
+        ));
+
+        let unsupported_equals_form =
+            runtime_config("tsreplace", "--service=432 -i - -o -", "", "");
+        assert!(!config_selects_service(&unsupported_equals_form));
+
+        let unsupported_attached_tsreadex_form =
+            runtime_config("ffmpeg", "-i -", "tsreadex", "-n432 -");
+        assert!(!config_selects_service(&unsupported_attached_tsreadex_form));
+
+        assert!(needs_service_sid(&runtime_config(
+            "tsreplace",
+            "-i - -o -",
+            "",
+            ""
+        )));
+        assert!(!needs_service_sid(&runtime_config(
+            "ffmpeg",
+            "-i - -s 1280x720",
+            "",
+            ""
+        )));
+        assert!(needs_service_sid(&tsreadex_placeholder));
+        assert!(!needs_service_sid(&tsreadex));
+        assert!(!needs_service_sid(&tsreplace_service));
+
+        let unrelated_command = runtime_config("notsreplace", "--service 432", "", "");
+        assert!(!config_selects_service(&unrelated_command));
+    }
+
+    #[test]
+    fn tsreplace_name_variants_keep_service_option_parsing() {
+        for command_path in [
+            "tsreplace.bat",
+            "tsreplace.cmd",
+            "tsreplace_x64.exe",
+            "tsreplace_x86.exe",
+        ] {
+            let cfg = runtime_config(command_path, "-i - --encoder ffmpeg -s hd720", "", "");
+            assert!(
+                !config_selects_service(&cfg),
+                "child encoder arguments should not select a service for {command_path}"
+            );
+            assert!(needs_service_sid(&cfg), "{command_path}");
+
+            match plan_spawn(&cfg, &[432]).unwrap() {
+                SpawnPlan::Single { enc_args } => {
+                    let service_index = enc_args
+                        .iter()
+                        .position(|argument| argument == "--service")
+                        .unwrap();
+                    let encoder_index = enc_args
+                        .iter()
+                        .position(|argument| argument == "--encoder")
+                        .unwrap();
+                    assert_eq!(enc_args[service_index + 1], "432", "{command_path}");
+                    assert!(service_index < encoder_index, "{command_path}");
+                    assert!(
+                        enc_args.windows(2).any(|pair| pair == ["-s", "hd720"]),
+                        "{command_path}"
+                    );
+                }
+                other => panic!("expected Single for {command_path}, got {other:?}"),
+            }
+
+            let selected_cfg = runtime_config(command_path, "-s 432 -i - -o -", "", "");
+            assert!(config_selects_service(&selected_cfg), "{command_path}");
+            assert!(!needs_service_sid(&selected_cfg), "{command_path}");
+            assert!(matches!(
+                plan_spawn(&selected_cfg, &[431]).unwrap(),
+                SpawnPlan::Single { enc_args }
+                    if enc_args == ["-s", "432", "-i", "-", "-o", "-"]
+            ));
+        }
+
+        for command_path in [
+            "notsreplace.exe",
+            "tsreplace_helper.exe",
+            "tsreplace_x64_debug.exe",
+            "tsreplace.ps1",
+        ] {
+            let cfg = runtime_config(command_path, "-i - --encoder ffmpeg -s hd720", "", "");
+            assert!(!config_selects_service(&cfg), "{command_path}");
+            assert!(!needs_service_sid(&cfg), "{command_path}");
+            assert!(matches!(
+                plan_spawn(&cfg, &[432]).unwrap(),
+                SpawnPlan::Single { enc_args } if enc_args == ["-i", "-", "--encoder", "ffmpeg", "-s", "hd720"]
+            ));
+        }
+
+        for command_path in [
+            "tsreadex.bat",
+            "tsreadex.cmd",
+            "tsreadex_x64.exe",
+            "tsreadex_x86.exe",
+        ] {
+            let cfg = runtime_config("ffmpeg", "-i -", command_path, "-n 432 -");
+            assert!(config_selects_service(&cfg), "{command_path}");
+            assert!(matches!(
+                plan_spawn(&cfg, &[431]).unwrap(),
+                SpawnPlan::TwoStage { pre_args, enc_args }
+                    if pre_args == ["-n", "432", "-"] && enc_args == ["-i", "-"]
+            ));
+        }
+    }
+
     // ---- {SID} substitution & spawn planning (pure, no processes) ----
 
     #[test]
@@ -1251,6 +1515,63 @@ mod tests {
     }
 
     #[test]
+    fn unused_preprocessor_placeholder_does_not_disable_service_injection() {
+        let cfg = runtime_config("tsreplace", "-i - -o -", "", "-map 0:p:{SID}");
+
+        match plan_spawn(&cfg, &[431]).unwrap() {
+            SpawnPlan::Single { enc_args } => {
+                assert!(enc_args.windows(2).any(|pair| pair == ["--service", "431"]));
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ffmpeg_size_short_option_does_not_receive_tsreplace_service_arguments() {
+        let cfg = runtime_config(
+            "/usr/bin/ffmpeg",
+            "-i - -s 1280x720 -map 0:v:0 -f mpegts -",
+            "",
+            "",
+        );
+
+        match plan_spawn(&cfg, &[431]).unwrap() {
+            SpawnPlan::Single { enc_args } => assert_eq!(
+                enc_args,
+                ["-i", "-", "-s", "1280x720", "-map", "0:v:0", "-f", "mpegts", "-"]
+            ),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_preprocessor_service_option_disables_encoder_service_injection() {
+        let cfg = runtime_config(
+            "tsreplace",
+            "-i - -o -",
+            "tsreplace",
+            "--service 432 -i - -o -",
+        );
+
+        match plan_spawn(&cfg, &[431]).unwrap() {
+            SpawnPlan::TwoStage { pre_args, enc_args } => {
+                assert_eq!(pre_args, ["--service", "432", "-i", "-", "-o", "-"]);
+                assert_eq!(enc_args, ["-i", "-", "-o", "-"]);
+            }
+            other => panic!("expected TwoStage, got {other:?}"),
+        }
+
+        let cfg = runtime_config("tsreplace", "-i - -o -", "tsreadex", "-n 432 -");
+        match plan_spawn(&cfg, &[431]).unwrap() {
+            SpawnPlan::TwoStage { pre_args, enc_args } => {
+                assert_eq!(pre_args, ["-n", "432", "-"]);
+                assert_eq!(enc_args, ["-i", "-", "-o", "-"]);
+            }
+            other => panic!("expected TwoStage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn plan_without_placeholder_keeps_legacy_service_injection() {
         // Single SID, no --service in template -> auto-injected.
         let cfg = runtime_config("tsreplace", "-i - -o -", "", "");
@@ -1261,6 +1582,12 @@ mod tests {
             }
             other => panic!("expected Single, got {:?}", other),
         }
+
+        let cfg = runtime_config(r"C:\DTV\tsreplace.exe", "-i - -o -", "", "");
+        assert!(matches!(
+            plan_spawn(&cfg, &[500]).unwrap(),
+            SpawnPlan::Single { enc_args } if enc_args.windows(2).any(|pair| pair == ["--service", "500"])
+        ));
 
         // Template already has --service -> used verbatim.
         let cfg = runtime_config("tsreplace", "--service 42 -i - -o -", "", "");
@@ -1277,6 +1604,33 @@ mod tests {
     }
 
     #[test]
+    fn tsreplace_rejects_attached_encoder_option_forms() {
+        for arguments in [
+            "-i - --encoder=ffmpeg -s hd720 -o -",
+            "-i - -e=ffmpeg -s hd720 -o -",
+        ] {
+            let cfg = runtime_config("tsreplace", arguments, "", "");
+            let error = plan_spawn(&cfg, &[431]).unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("separate -e/--encoder"));
+        }
+
+        // Once a supported encoder boundary is reached, all following tokens
+        // belong to that child and must not be rejected as tsreplace syntax.
+        let cfg = runtime_config(
+            "tsreplace",
+            "-i - --encoder ffmpeg --encoder=child-option -o -",
+            "",
+            "",
+        );
+        assert!(matches!(
+            plan_spawn(&cfg, &[431]).unwrap(),
+            SpawnPlan::Single { enc_args } if enc_args.contains(&"--encoder=child-option".to_owned())
+        ));
+    }
+
+    #[test]
     fn plan_preprocessor_without_placeholder_wraps_single_stage_cases() {
         // Empty SIDs: verbatim args, two stages.
         let cfg = runtime_config("enc", "-i - -o -", "pre", "-a -b");
@@ -1289,8 +1643,12 @@ mod tests {
         }
 
         // Multi-SID chain + preprocessor is rejected.
-        let cfg = runtime_config("enc", "-i - -o -", "pre", "-a");
-        assert!(plan_spawn(&cfg, &[1, 2]).is_err());
+        let cfg = runtime_config("tsreplace", "-i - -o -", "pre", "-a");
+        let error = plan_spawn(&cfg, &[1, 2]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("not supported with a multi-SID encoder chain"));
     }
 
     #[test]

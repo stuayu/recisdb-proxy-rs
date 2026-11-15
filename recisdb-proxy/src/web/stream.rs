@@ -631,6 +631,14 @@ impl PreviewBand {
     }
 }
 
+fn preview_encoder_sids(config: &EncoderRuntimeConfig, service_id: u16) -> Vec<u16> {
+    if encoder_pool::needs_service_sid(config) {
+        vec![service_id]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Load the runtime encoder settings for `?profile=preview`: codec/bitrate/
 /// arguments from the `encode_profiles` row with `purpose='preview'`
 /// (STREAMING_DESIGN.md §5.3), everything else from `preview_encoder_config`
@@ -995,14 +1003,9 @@ async fn stream_resolved(
         }
     };
 
-    // Single-service stream: encode only this service's SID, unless the
-    // profile's own arguments already specify `--service` (same convention
-    // `server::session::start_tsreplace_pipeline` uses).
-    let sids = if encoder_pool::args_contain_service_option(&encoder_cfg.arguments) {
-        Vec::new()
-    } else {
-        vec![resolved.channel.sid]
-    };
+    // Single-service stream: preserve `{SID}` resolution first, then follow
+    // the shared encoder/preprocessor service-selection predicate.
+    let sids = preview_encoder_sids(&encoder_cfg, resolved.channel.sid);
     let key = EncodeKey::new(tuner.key.clone(), sids, generation);
 
     match web_state
