@@ -126,6 +126,8 @@ pub async fn get_tuners(
                 "output_bytes": s.read_bytes(),
                 "queued_chunks": s.queued_chunks(),
                 "backlog_capacity": crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity(),
+                "queued_bytes": s.queued_bytes(),
+                "backlog_capacity_bytes": crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity_bytes(),
                 "dropped_chunks": s.dropped_chunks(),
                 "descramble_errors": s.descramble_error_count(),
                 "exit_code": s.process_exit_code(),

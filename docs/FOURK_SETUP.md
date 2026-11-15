@@ -101,7 +101,7 @@ dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の
 
 ## 障害診断ログ
 
-4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued/capacity` はstdin待ち行列、`dropped` は投入できず破棄したチャンク。`no_output_for` は読者の初回TS猶予に従い、猶予超過時に変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。
+4Kリーダーは10秒ごとに `[MmtPipe] status` をINFO出力する。`input` はBonDriverから受け取ったMMT/TLV、`output` は変換器stdoutのTS、`queued` はstdin待ち行列のチャンク数とバイト数 (上限16 MiB に対する割合)、`dropped` は投入できず破棄したチャンク。`no_output_for` は読者の初回TS猶予に従い、猶予超過時に変換器のstdout停止としてERRORになる。stderrは未知行もWARNへ出し、復号失敗、プロセス終了、変換器停滞を区別できる。
 
 `GET /api/tuners` に `mmt_converter` 診断を載せる。`active=false` はそのBonDriverの実行中リーダーに変換器状態が無い、`output_bytes=0` かつ `input_bytes>0` は変換器が入力を受けたがTSを返していない状態を示す。ダッシュボードのBonDriver画面にも表示する。
 

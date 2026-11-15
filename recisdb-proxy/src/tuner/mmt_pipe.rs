@@ -50,7 +50,16 @@ use log::{error, info, warn};
 /// on a card, say) would otherwise stall the tuner thread and overflow the
 /// driver's own buffer. Chunks that do not fit are dropped and counted — a
 /// visible gap is better than a wedged tuner.
-const WRITE_BACKLOG_CHUNKS: usize = 64;
+///
+/// The limit is in bytes because chunk sizes vary from a few KB to hundreds of
+/// KB. dantto4k stops reading stdin until the first ECM is answered by the
+/// card (measured 0.2–0.4 s over BonCasLink, up to its own 10 s timeout); at
+/// ~38 Mbit/s a 64-chunk limit of 8 KB reads held only ~0.1 s and shredded the
+/// start of every stream. 16 MiB is ~3.5 s at that rate.
+const WRITE_BACKLOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Channel slots; memory is bounded by [`WRITE_BACKLOG_BYTES`], not this.
+const WRITE_BACKLOG_CHUNKS: usize = 4096;
 
 /// Size of each read from the converter's stdout.
 const STDOUT_CHUNK: usize = 256 * 1024;
@@ -193,6 +202,8 @@ pub struct ConverterStatus {
     /// Bytes read back from the converter's stdout.
     read_bytes: AtomicU64,
     queued_chunks: AtomicU64,
+    /// Bytes waiting for the converter's stdin; bounded by WRITE_BACKLOG_BYTES.
+    queued_bytes: AtomicU64,
     input_started_at: Mutex<Option<Instant>>,
     last_output_at: Mutex<Option<Instant>>,
     process_exit_code: std::sync::atomic::AtomicI32,
@@ -239,6 +250,14 @@ impl ConverterStatus {
 
     pub fn backlog_capacity() -> u64 {
         WRITE_BACKLOG_CHUNKS as u64
+    }
+
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn backlog_capacity_bytes() -> u64 {
+        WRITE_BACKLOG_BYTES
     }
 
     pub fn no_output_for(&self) -> Option<Duration> {
@@ -405,6 +424,9 @@ impl MmtPipe {
                     .queued_chunks
                     .fetch_sub(1, Ordering::Relaxed);
                 status_for_stdin
+                    .queued_bytes
+                    .fetch_sub(len, Ordering::Relaxed);
+                status_for_stdin
                     .written_bytes
                     .fetch_add(len, Ordering::Relaxed);
             }
@@ -491,12 +513,33 @@ impl MmtPipe {
                     "converter input already closed",
                 ));
             };
-            match tx.try_send(input.to_vec()) {
+            let queued = self.status.queued_bytes.load(Ordering::Relaxed);
+            // Always admit a chunk into an empty backlog so one oversized
+            // read can never be dropped forever.
+            let over_budget = queued > 0 && queued + input.len() as u64 > WRITE_BACKLOG_BYTES;
+            let sent = if over_budget {
+                Err(std::sync::mpsc::TrySendError::Full(Vec::new()))
+            } else {
+                // Count before sending: the feeder subtracts as soon as it
+                // has written, which may happen before try_send returns.
+                self.status
+                    .queued_bytes
+                    .fetch_add(input.len() as u64, Ordering::Relaxed);
+                self.status.queued_chunks.fetch_add(1, Ordering::Relaxed);
+                let result = tx.try_send(input.to_vec());
+                if result.is_err() {
+                    self.status
+                        .queued_bytes
+                        .fetch_sub(input.len() as u64, Ordering::Relaxed);
+                    self.status.queued_chunks.fetch_sub(1, Ordering::Relaxed);
+                }
+                result
+            };
+            match sent {
                 Ok(()) => {
                     self.status
                         .received_bytes
                         .fetch_add(input.len() as u64, Ordering::Relaxed);
-                    self.status.queued_chunks.fetch_add(1, Ordering::Relaxed);
                     let mut started = self
                         .status
                         .input_started_at
@@ -771,6 +814,27 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
+    /// dantto4k does not read stdin until the card answers the first ECM.
+    /// Several MB of small reads arriving meanwhile must be held, not dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_converter_that_pauses_at_start_loses_nothing() {
+        let mut pipe = MmtPipe::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 0.5; cat >/dev/null".to_string()],
+        )
+        .expect("spawn sh");
+
+        // ~4 MB in 8 KB reads, faster than the converter starts.
+        let chunk = vec![0u8; 8 * 1024];
+        for _ in 0..512 {
+            pipe.push(&chunk)
+                .expect("push must not fail during a short pause");
+        }
+        assert_eq!(pipe.status().dropped_chunks(), 0);
+        assert!(pipe.status().queued_bytes() <= ConverterStatus::backlog_capacity_bytes());
+    }
+
     /// A converter that produces nothing must be reported, not warned about
     /// forever: dropping MMT/TLV shreds the stream, so there is nothing to
     /// recover by continuing. Observed for real — the process stayed alive and
@@ -784,7 +848,7 @@ mod tests {
         // Push until the bounded backlog fills and the stall limit trips.
         let chunk = vec![0u8; 64 * 1024];
         let mut err = None;
-        for _ in 0..(WRITE_BACKLOG_CHUNKS as u64 + STALLED_DROP_LIMIT + 8) {
+        for _ in 0..(WRITE_BACKLOG_BYTES / chunk.len() as u64 + STALLED_DROP_LIMIT + 8) {
             if let Err(e) = pipe.push(&chunk) {
                 err = Some(e);
                 break;
@@ -815,7 +879,7 @@ mod tests {
 
         let chunk = vec![0u8; 64 * 1024];
         let mut err = None;
-        for _ in 0..(WRITE_BACKLOG_CHUNKS as u64 + STALLED_DROP_LIMIT + 8) {
+        for _ in 0..(WRITE_BACKLOG_BYTES / chunk.len() as u64 + STALLED_DROP_LIMIT + 8) {
             if let Err(e) = pipe.push(&chunk) {
                 err = Some(e);
                 break;

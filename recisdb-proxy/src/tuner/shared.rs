@@ -1606,10 +1606,11 @@ impl SharedTuner {
                         pipe.refresh_process_status();
                     }
                     let Some(pipe) = mmt.as_ref() else { continue };
-                    info!("[MmtPipe] status tuner={:?} input={}B output={}B queued={}/{} ({:.0}%) dropped={} no_output_for={:?}",
+                    info!("[MmtPipe] status tuner={:?} input={}B output={}B queued={} chunk(s) {}/{}B ({:.0}%) dropped={} no_output_for={:?}",
                         shared.key, pipe.status().received_bytes(), pipe.status().read_bytes(),
-                        pipe.status().queued_chunks(), crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity(),
-                        pipe.status().queued_chunks() as f64 * 100.0 / crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity() as f64,
+                        pipe.status().queued_chunks(),
+                        pipe.status().queued_bytes(), crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity_bytes(),
+                        pipe.status().queued_bytes() as f64 * 100.0 / crate::tuner::mmt_pipe::ConverterStatus::backlog_capacity_bytes() as f64,
                         pipe.status().dropped_chunks(), pipe.status().no_output_for());
                     if let Some(code) = pipe.status().process_exit_code() {
                         error!(
