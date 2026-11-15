@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api, type JsonRecord } from '../api'
+import { boncaslinkNetworkReaderPayload } from '../composables/boncaslinkSettings'
 import { latestScanCompletedAt } from '../composables/useEpgEvents'
 
 const endpoints = [
@@ -660,10 +661,7 @@ async function saveBonCaslink() {
       body: JSON.stringify({
         b25_server: boncaslinkB25.value,
         mmttlv_server: boncaslinkMmttlv.value,
-        network_readers: boncaslinkRows.value.map((row) => ({
-          nid: Number.parseInt(row.nid.trim(), 16),
-          reader: row.custom ? `boncaslink://${row.reader.replace(/^boncaslink:\/\//, '')}` : row.reader,
-        })),
+        network_readers: boncaslinkNetworkReaderPayload(boncaslinkRows.value),
       }),
     })
     boncaslinkMessage.value = '保存しました。次にチューナーを起動したときから反映されます。'
