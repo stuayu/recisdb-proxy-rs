@@ -257,14 +257,16 @@ cd /path/to/px4_drv/macos/build
 | `px4daemon:any` | 空いている系統を daemon に選ばせる |
 | `px4daemon:0+lnb` | LNB 給電を有効化 (BS/CS を受信するなら必須) |
 | `px4daemon:any+tsmf=0` | CATV の TSMF Relative stream 0 を選択 |
-| `px4daemon:any+tlv` | CATV の生TLVを出力 (`stream_format='mmttlv'` 必須) |
+| `px4daemon:any+tlv` | 旧方式: 空間 3 を生TLVにする (`stream_format='mmttlv'` 必須)。新規登録では `+tlv` なしで空間 4 を使う |
 | `px4daemon:0+qam=256+coffset=-275` | CATV のQAMと周波数補正 (kHz) を固定 |
 | `px4daemon:0+j83b` | 空間 3 を J.83 Annex B の配置にする (実験的。デーモン側の `ExperimentalJ83B=true` が必要) |
 | `px4daemon:1@/run/px4_ctrl.sock` | 制御ソケットのパスを変更 (データソケットは `ctrl`→`data` 置換で導出) |
 
 接尾辞は `@` より前に順不同で併用できます。ただし `+j83b` は例外で、`+tsmf` / `+tlv` /
 `+qam` / `+coffset` と併用できません。不明な接尾辞・不正値・重複もエラーです。
-通常 CATV は物理空間 3 / channel 0〜50 (C13〜C63) です。`+qam` 省略時は自動判定します。
+通常 CATV は物理空間 3 / channel 0〜50 (C13〜C63)、51〜100 (UHF 帯 U13〜U62) です。`+qam` 省略時は自動判定します。
+空間 4 (`CATV-TLV`) は同じ周波数を生TLVで選局し、4K は1つのドライバのままこの空間で受信します
+(TS/TLV は選局ごとに判定され、ドライバの `stream_format` は `ts` のまま)。
 `+j83b` の場合、空間3は H01〜H77 の77波になります。daemon の `ExperimentalJ83B=true` は
 デバイス全体の ISDB-C 選局へ効くため、J.83B 専用 PX-MLT デバイスを分けてください。
 TSMF・生TLVの設定、選局手順と実機テストは [FOURK_SETUP.md](FOURK_SETUP.md#macos-の-catv-トラモジ-isdb-c--tsmf--生tlv) を参照してください。

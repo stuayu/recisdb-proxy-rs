@@ -68,6 +68,35 @@ FIFO で実測した結果 (修正前 → 修正後): `tellg()` が `-1` → 正
 **この修正を入れた変換器が必要。** 素のビルドでは標準入力から何も読まないため、
 `MmtPipe` の停滞検出がエラーを出して止まる。
 
+**2026-10-29 に追加した修正** (`target/work/dantto4k` の作業ツリー、未コミット)。
+いずれも受信エラーや TLV 以外のデータが混ざった入力で再現した。
+
+- **64KB 読みと最大 65,539 バイトの TLV の組み合わせで無限ループ。** 長い TLV (壊れた
+  ヘッダーを含む) がバッファ先頭に来ると、消費 0 のまま追加読み込みもせず CPU 100% で
+  回り続けた。消費できなかったときは次の読み込みを強制する (`dantto4k.cpp`)
+- **8バイト以下の暗号化 MMTP ペイロードで範囲外アクセス** (SIGBUS)。復号長
+  `size - 8` が負になっていた。8バイト以下は復号しない (`acasHandler.cpp`)
+- **MPT から消えたストリームの削除で `end()` を参照** (`processMmtPackageTable`)
+- **解析中の `std::out_of_range` が捕捉されずプロセスが終了。** TLV 1個の処理を
+  try/catch で囲み、その TLV だけ捨てる。ECM 処理スレッドも同様 (統計に `Malformed`)
+- Makefile にヘッダー依存 (`-MMD -MP`) を追加。ヘッダー変更後の部分再ビルドで
+  クラス配置が食い違い、別の場所で落ちたため
+- **MPU 番号が1つ飛ぶと、そのストリームの PTS が以後ずっと取れない。** 現在の MPU 番号は
+  「直前 +1」のときだけ進んでいたため、受信開始直後や ECM 待ちで MPU を1つ取りこぼすと
+  古い番号に固定され、タイムスタンプの照合が全滅していた。BS-TBS 4K では音声が丸ごと
+  出なかった (音声 MFU 473個がすべて破棄)。前方への飛びにも追従する (`processMpu`)
+
+ビルドは pcsc-lite が keg-only なので
+`PKG_CONFIG_PATH=/opt/homebrew/opt/pcsc-lite/lib/pkgconfig:/opt/homebrew/share/pkgconfig make CXX=clang++`。
+**`/opt/homebrew/bin/recisdb-dantto4k` へ入れるときは `cp` で上書きしない。** 実行中のプロセスが
+ある状態で上書きすると、macOS のコード署名検査で以後の起動がすべて SIGKILL (exit 137) になる。
+別名へコピーしてから `mv` で置き換える。
+
+dantto4k は最初の ECM がカードから返るまで stdin を読まない (BonCasLink 経由で実測
+0.2〜0.4 秒、自身のタイムアウトは10秒)。`MmtPipe` の待ち行列はこの間の入力を保持できるよう、
+チャンク数ではなく **16 MiB** (38Mbps で約3.5秒) で上限を決める。以前の64チャンクは
+8KB 読みだと約0.1秒分しかなく、毎回ストリームの先頭を捨てていた。
+
 ### ラッパー方式の制約
 
 dantto4k は `BonDriver_dantto4k.dll` も同梱していて、これは内側の BonDriver を
@@ -575,12 +604,16 @@ ACAS (AES)・ARIB B24 変換を全部書くことになり、得るものに対�
 ## macOS の CATV トラモジ (ISDB-C / TSMF / 生TLV)
 
 `px4daemon:` バックエンドは DriverHost_PX4 の ISDB-C 対応を利用できます。
-物理チューニング空間 3 は `CATV`、channel 0〜50 は C13〜C63 です。
+物理チューニング空間 3 は `CATV`、channel 0〜50 は C13〜C63、51〜100 は UHF 帯の
+U13〜U62 (中心 473 MHz から 6 MHz 間隔、補正なし) です。空間 4 は `CATV-TLV` で、
+空間 3 と同じ周波数を TSMF Relative stream 0 の生TLVとして選局します (下記
+「1台の受信機で通常TSと4Kを切り替える」)。
 既存の空間 0 (GR)、1 (BS)、2 (CS) の番号は変更しません。
 C13〜C22 は物理 ch 3〜12、C23〜C63 は物理 ch 22〜62 に対応します。
 中心周波数は `93000 + 物理ch × 6000` kHz (物理 ch 12 のみ +2000 kHz) に、
 px4_drv の `winusb/pkg/BonDriver_PX4/BonDriver_PX4-C.ChSet.txt` の CATV 空間の
-第7項目を既定の補正として加えます。回線に合わせて `+coffset` で上書きできます。
+第7項目を既定の補正として加えます。回線に合わせて `+coffset` で上書きできます
+(`+coffset` は C13〜C63 だけに掛かり、UHF 帯には掛かりません)。
 
 パスは `px4daemon:<受信機index|any>[+接尾辞…][@制御ソケット]` です。
 接尾辞は順不同で併用でき、未知の接尾辞・不正値・重複指定はエラーになります。
@@ -589,8 +622,8 @@ px4_drv の `winusb/pkg/BonDriver_PX4/BonDriver_PX4-C.ChSet.txt` の CATV 空間
 |---|---|
 | `+lnb` | ISDB-S 選局時だけ LNB 給電を有効化 |
 | `+tsmf=0`〜`+tsmf=14` | CATV 選局で TSMF の Relative stream を選択 (slot offset は 0) |
-| `+tlv` | TSMF の生TLV出力。`+tsmf` がなければ Relative stream 0 |
-| `+qam=64` / `+qam=256` | CATV の変調方式を固定。省略時は自動判定 |
+| `+tlv` | 旧方式。空間 3 自体を生TLVにする。空間 0〜2 はチャンネルを列挙せず、空間 4 も出さない。新規登録では使わず、空間 4 を使う |
+| `+qam=64` / `+qam=256` | CATV の変調方式を固定。省略時は空間 3 は自動判定、空間 4 は 256QAM |
 | `+coffset=-275` | CATV 全チャンネルで使う固定周波数補正 (符号付き kHz) |
 | `+j83b` | 空間 3 を J.83 Annex B の配置 (93.25 MHz から 6.5 MHz 間隔、77 波) にする。実験的・未検証 |
 
@@ -603,7 +636,9 @@ C22 は space=3/channel=9、C23 は space=3/channel=10 で選局できます。
 変調方式の自動判定は、使い捨ての受信機セッションで capture を開始してから
 SET_PARAMS (MODULATION=0) → TUNE → GET_PARAMS を実行し、確定した64/256QAMを読みます。
 そのセッションを停止・CLOSE して、本番用に OPEN し直して固定QAMで選局します。
-判定結果はチャンネルごとに保持します。USB 入力パケット数を確認するために capture が
+判定結果は (制御ソケット, 周波数) ごとにプロセス全体で保持します (以前は受信機ごとで、
+リーダーはチャンネル切り替えのたびに作り直されるため、毎回判定し直していました)。
+空間 4 は 256QAM 固定なので判定しません。USB 入力パケット数を確認するために capture が
 必要ですが、capture 中の選局では PURGE 後も旧データが漏れるため、この二段階に分けます。
 判定用セッションは px4rec と異なりデータソケットを接続しません。
 ReceiverBase::StreamBuffer::Write の入力計数はリング書込みより前で、
@@ -647,6 +682,176 @@ PX4_TEST_SWEEP_RECEIVER=px4daemon:4 \
 
 `PX4_TEST_SWEEP_CHANNELS=6,47` のように対象を絞れます。実機テストは同じ受信系統を掴むので、
 複数を同時に走らせると `Operation already in progress` で失敗します。`--test-threads=1` を付けてください。
+
+### XIT-SQR100 での 4K 実機確認 (2026-10-29)
+
+`px4daemon:any+tlv+qam=256` 系統で、生TLVを10秒取り込み dantto4k に通した結果です。
+
+| 周波数 | 受信レベル | 結果 |
+|---|---|---|
+| 167 MHz (ch 9) | — | 64/256QAM・自動判定いずれもロックしない |
+| 225 MHz (ch 10) | 約 29 dB | 4K HEVC と音声を復号できるが、TLV が約 0.3〜0.8% 欠ける。映像はブロック状に崩れる |
+| 569 MHz | 約 39 dB | NHK BS8K。8K は複数の搬送波に分けて送られ、この1波だけでは映像も NIT も揃わない (TLV が約30%欠けて見えるのもこのため)。視聴・登録はできない |
+| 587〜605 MHz | 約 39 dB | TLV の欠けは 0.01% 未満 |
+| 611 MHz | 約 39 dB | TSMF ヘッダーの stream_type が 1 (TS)。生TLVは出ない |
+
+225 MHz の欠けは受信エラー (TEI) によるものです。DriverHost の `TSMF stats` で
+TEI が入力の約 0.19% あり、TEI 付きのパケットを TLV 再構成で捨てるため、その位置の TLV
+(約 1.3KB) が丸ごと失われます。同じ構成の 587〜605 MHz では TEI が 0 なので、ソフトの
+問題ではなく受信レベル (CN 比) の不足です。ブースター・分配器・ケーブルを見直してください。
+
+周波数補正は 225 MHz で `+coffset=0` が最も悪く (欠け 0.7〜0.8%)、-250〜-375 kHz で
+0.3〜0.5% に下がりました。既定の補正 (C22 相当で -350 kHz) を使うため、この系統では
+`+coffset` を付けずに登録します。
+
+同じ DriverHost の受信機を複数のドライバ (`+tlv` の有無や `+coffset` 違い) で登録すると、
+recisdb-proxy からは別のチューナーに見えますが、物理受信機は共有です。片方の視聴が終わった
+直後の keep-alive (既定60秒) 中に、もう片方を開くと DriverHost が EALREADY で断ります。
+この場合は、同じ制御ソケットを使う他ドライバの keep-alive 読み取りも回収して再試行します
+(`TunerPool::reclaim_keepalive_leftovers_on_path`)。以前は同じパスしか回収せず、HTTP 503 に
+なっていました。
+
+プレビューは 2026-10-30 に BS-TBS 4K で確認しました。HTTP プレビューは H.264 1280x720・
+AAC 2ch で 30 秒分をデコードエラーなしで取得でき、ダッシュボードの「チャンネル」から
+Chrome で再生すると 1280x720 で再生が進み、音声もデコードされました。このホストの
+`preview-4k` は音声なしの設定になっていましたが、音声が出なかった原因は上記の dantto4k の
+MPU 番号の不具合だったため、音声付き (`-map 0:p:{SID}:a:0?` と AAC 再エンコード) に戻しました。
+
+`stream_format='mmttlv'` の系統のスキャンは次のように扱います (TS の系統は従来どおり)。
+
+- 1チャンネルの解析は最大60秒 (`ts_read_timeout_ms` が長くてもこれで打ち切る)。変換後の
+  PAT/NIT/SDT は数秒ごとに出るので、60秒で揃わない搬送波は待っても揃わない
+- 生TLVが1バイトも来ない (TLV ではない多重) か、60秒流れても NIT が無い (8K の一部の
+  搬送波など) ときは再試行しない。以前は 300秒×3回で1波15分かかっていた
+- サービスを1件も含まない PAT では解析を完了にしない。TLV が欠けると dantto4k が空の PLT
+  から空の PAT を作ることがあり、それで「NID は取れたがサービス0件」になっていた
+
+### 1台の受信機で通常TSと4Kを切り替える (2026-10-30)
+
+以前は同じ受信機を「TS 用」と「4K (`+tlv`, `stream_format='mmttlv'`) 用」の別ドライバとして
+登録していました。recisdb-proxy からは別チューナーに見えるため、片方の keep-alive 中にもう片方を
+開くと DriverHost が EALREADY で断り、切り替えのたびに回収と再試行が挟まっていました。
+
+現在は **1つのドライバ (`+tlv` なし) で両方を扱えます**。
+
+- 空間 3 (`CATV`): 通常の ISDB-C TS。C13〜C63 と UHF 帯 U13〜U62
+- 空間 4 (`CATV-TLV`): 同じ周波数を TSMF Relative stream 0 の生TLVとして選局 (256QAM 固定)
+
+TS か TLV かはドライバではなく選局ごとに決めます (`bondriver::tune_delivers_tlv`)。
+`tuner/acquire.rs` は空間 4 の選局にだけ dantto4k を挟み、B25 を止めます。スキャンも空間 4 だけ
+変換器を通します。ドライバの `stream_format` は `ts` のままです。
+
+登録例 (この回線は全搬送波が 256QAM なので固定し、QAM 自動判定の時間を省いています):
+
+```text
+px4daemon:any+qam=256@<制御ソケット>   stream_format=ts  disable_b25=false
+```
+
+CAS は放送ごとに分かれます。
+
+| 選局 | 復号 |
+|---|---|
+| 空間 0〜3 の TS (地デジ・BS・CS・CATV) | libaribb25。カードは NID ごとの読み取り装置表 (`boncaslink_network_readers`) で選び、未登録の NID は既定のカード (B-CAS。XIT-SQR100 内蔵スロット) |
+| 空間 3 の TS 形式 4K (NID `0xFFF7`、ショップチャンネル4K など) | libaribb25。上の表で `0xFFF7` を ACAS の BonCasLink に向ける |
+| 空間 4 の TLV (BS4K) | dantto4k。`[mmttlv]` / `boncaslink_settings.mmttlv` の BonCasLink (ACAS) |
+
+既定のカード (カードリーダー未選択時) は、設定した BonCasLink (`[b25] boncaslink_server`) →
+ローカルの PC/SC → PX4 内蔵カード → NID 専用の BonCasLink の順に試します。以前は NID 専用に
+登録した BonCasLink (この環境では `0xFFF7` 用の ACAS) が先頭に並び、地デジ・BS・CS の ECM まで
+ACAS へ送られて約95%がスクランブルのままでした (`b25-sys` の `prepend_reader` /
+`merge_px4_readers`)。
+
+ドライバの `disable_b25` は TS 側にも効くため、統合したドライバでは `false` にします。
+4K (NID `0x000B`/`0x000C`) と空間 4 は `b25_enabled_for` と変換器の有無で B25 を通らないので、
+`disable_b25` で止める必要はありません。
+
+空間 4 のスキャンはロックした搬送波を全部回ります。TS だけの搬送波で待たないよう、次のように
+打ち切ります。
+
+- TLV の選局で4秒間1バイトも来ない (TSMF でない搬送波) — 以前は10秒
+- 来たデータが 188 バイト周期の `0x47` (TS 形式の TSMF) — 即座に打ち切り、再試行しない
+
+スキャンの時間上限は `scan_timeout_secs` (既定900秒) と「チャンネル数 × 12秒」の大きい方です。
+GR + BS + CS + CATV 101 + CATV-TLV 101 の 276 チャンネルでは約55分になります。上限はチャンネルの
+間で判定し、上限までに見つかった分は登録します。以前は外側の `tokio::time::timeout` で打ち切って
+いたため、スキャンのスレッドが受信機を掴んだまま走り続け、結果は捨てられ、次のスキャンがそれと
+並行して全チャンネル EALREADY で失敗していました。
+
+#### 選局の速さ
+
+チャンネル切り替え1回あたりの内訳と対策です (XIT-SQR100、ISDB-C 256QAM)。
+
+| 段階 | 以前 | 現在 | 対策 |
+|---|---|---|---|
+| 旧リーダー停止後の CLOSE → OPEN | 約0.4秒 + EALREADY 再試行 0.3秒 | 0 | 受信機を3秒間保持して次の選局で引き継ぐ (下記) |
+| QAM 自動判定 | 周波数ごと・毎回 (数秒) | 初回だけ | 判定結果をプロセス全体で保持。空間 4 は判定しない |
+| TUNE (ロック待ち) | 約1.5秒 | 約0.9秒 | DriverHost がロック時に FEC 計数を 250ms 間隔で3回読んでいた待ちを削除 (px4_drv `driver/cxd2856er.c`) |
+| SetChannel 後の待機 | 0.5秒 | 0 | px4daemon は SetChannel がロックと PURGE まで済ませるので不要 (PURGE 後に 50ms 置いてから捨てる。下記) |
+
+実測 (HTTP `/api/stream/service/:id` で TS↔4K を交互に切り替え、要求から最初のバイトまで):
+以前は約2.8秒 (TS と 4K が別ドライバで、keep-alive の回収と再試行が挟まっていた)、
+現在は 1.2〜1.7秒です。SetChannel 自体は約1.8秒から約1.1秒になりました。
+
+選局直後の TS 欠け: DriverHost の XIT-SQR100 の受信バッファ (`ReceiverMaxPackets`) が
+2048 パケット (約0.1秒分) しかなく、リーダーが選局直後に B25 の初期化などで読み出しを止めると
+溢れて、全 PID に continuity error が出ていました (1チャンネルあたり 25〜50 件、TEI は 0)。
+px4_drv の `macos/DriverHost_PX4.ini` で XIT-SQR100 だけ 16384 パケット (約1秒分) にし、
+0〜2 件 (起動直後の最初の選局だけ 10 件前後) になりました。PURGE は応答のないコマンドで、
+DriverHost の書き込みスレッドが PURGE 前に取り出した分が後から届くため、PURGE を送ってから
+50ms 待って読み捨てます (`purge_ts_stream`)。
+
+視聴 (HTTP/Mirakurun) の要求が、EPG 取得などの起動途中のリーダーに受信機を取られていた場合
+(`Warming`)、以前はその場で 503 にしていました。起動途中のリーダーは退かせませんが、起動後は
+優先度の高い視聴が奪えるので、最大8秒まで待って選局し直します (`channel_resolve::try_acquire`)。
+
+受信機の引き継ぎ (`px4_daemon.rs` の parking): リーダーが終わると `Px4DaemonTuner` は受信機を
+CLOSE せず、制御・データ接続ごと3秒間保持します。同じ制御ソケットで新しい受信機を開くと、それを
+引き継いで SET_PARAMS → TUNE → PURGE だけで選局します (BonDriver の SetChannel と同じ経路)。
+OPEN が EALREADY で断られたときは、終了処理中の受信機が保持されるのを最大1.5秒待ちます。
+データ接続が切れた・制御通信が失敗した受信機は引き継ぎません。
+
+### BS8K (複数搬送波の合成、2026-10-30)
+
+BS8K は1波 (256QAM 約 38 Mbps) に収まらないため、ケーブルでは3波に分けて送られる (この環境では 569 / 575 / 581 MHz)。各波は拡張 TSMF で、ヘッダーの拡張領域で次を見分ける。
+
+- **群:** `group_id` (8)、`number_of_carriers` (3)、`carrier_sequence` (1〜3)
+- **フレーム位置:** 4フレームで1周する `frame_position`
+
+合成の規則は情報通信審議会 放送システム委員会の報告 (「ケーブルテレビにおける超高精細度テレビジョン放送の導入に関する伝送方式の高度化提案」4.7 節) による。
+
+- 各波のスーパーフレーム (4フレーム) の先頭をそろえる。
+- 同じスロット番号を第1→第2→第3の順に1つずつ取る。
+
+1波だけを見ると、7スロットにまたがる TLV が 2,566 件中 6 件しかつながらない。スロット単位で波をまたいでいるためで、1台のチューナーでは受信できない。
+
+**実装:**
+
+- **px4_drv:** `TSMF_MODE=2` で、受信機が TSMF ヘッダーと NULL を含む全スロットをそのまま出す (`ReceiverBase::StreamBuffer::SetRawPassthrough`)。
+- **recisdb-proxy:** 空間 5 `CATV-8K` を新設した。チャンネルは群の第1搬送波の周波数 (BS8K は U29)。
+- **選局の流れ:**
+  1. 第1搬送波を受信してヘッダーを読む。
+  2. ±60 MHz の範囲で同じ群の残りの波を別の受信機で探し、見つけた周波数を覚えておく。
+  3. `bondriver/tsmf_bond.rs` で合成し、生 TLV として dantto4k へ渡す。
+- **位相合わせ:** 受信機ごとにデータの届く時刻がずれる。`frame_position` は 0〜3 しかなく4フレーム単位のずれを区別できないため、候補の組み合わせごとに合成して、TLV の長さと次の TLV の開始位置が合う割合で選ぶ。
+- **自動の合わせ直し:** どれかの波でデータが欠けたとき、または TLV が半分以上壊れたとき。
+- **スキャンでの扱い:** 第2・第3搬送波 (U30・U31) と、TSMF でない波は「チャンネルではない」として扱う。
+
+**必要なもの:** 同じ DriverHost_PX4 に ISDB-C を受信できる受信機が3つ。
+
+- XIT-SQR100 (1つ) だけでは、選局時に「3-carrier group needs 3 free ISDB-C receivers」で失敗する。
+- PX-MLT5PE (5つ) を接続すると受信できる見込み。
+- 合成した 8K の TLV を dantto4k が処理できるか (7680x4320 HEVC、約 100 Mbps) は未確認。
+
+**確認済み:**
+
+- 合成器の単体テスト: 3波で受信開始のずれが異なる場合に、元の TLV と1バイトも違わない。途中でデータが欠けた後も合わせ直す。
+- 実機 (XIT-SQR100):
+  - 569 MHz を「群8の第1搬送波 (3波)」と判定した。
+  - 575 MHz を「第2搬送波なのでチャンネルではない」と判定した。
+
+**ハードウェア試験:** `PX4_TEST_BOND_RECEIVER=px4daemon:any+qam=256@<ctrl socket> cargo test --lib hardware_bs8k -- --ignored`
+
+空間 5 を追加したことで、空間の列挙が変わった。.ch2 / ChSet を使うクライアントは再生成が必要。
 
 ### J.83 Annex B (px4_drv の実験機能、未検証)
 

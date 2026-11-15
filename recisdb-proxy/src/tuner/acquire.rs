@@ -934,8 +934,16 @@ pub(crate) async fn acquire(
                     startup_config.b25_card_reader = crate::network_card_reader(nid);
                     startup_config.b25_enabled =
                         b25_enabled_for(db.driver_disables_b25(&key.tuner_path), band_type);
+                    // Per tune: one px4daemon receiver carries TS on the
+                    // CATV space and raw TLV on the CATV-TLV space.
+                    let stream_format =
+                        if crate::bondriver::tune_delivers_tlv(&key.tuner_path, space) {
+                            crate::database::StreamFormat::MmtTlv
+                        } else {
+                            db.driver_stream_format(&key.tuner_path)
+                        };
                     (
-                        db.driver_stream_format(&key.tuner_path),
+                        stream_format,
                         band_type,
                         db.get_driver_first_ts_latency_ms_by_path(&key.tuner_path)
                             .ok()

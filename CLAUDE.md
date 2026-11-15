@@ -32,6 +32,7 @@ cargo build --release                 # 配布用。debugと挙動が変わり�
 - **GetTsStreamが返した `size` は全バイト受け取る。** DLLは返した時点で内部バッファを消費済み。呼び出し側バッファに入らない分を切り捨てると、そのTSは永久に失われ、しかも切れ目が188境界に乗らないので以降の同期も壊れる。入らなかった分は `IBon::pending` に退避し次回返す(`bondriver/windows.rs`)。プロキシ系DLL(BonDriver_NetworkProxy / BonDriverProxyEx)はハードウェアDLLよりずっと大きいチャンクを返すため、多段構成で顕在化する。
 - **クライアントDLLは `CreateBonDriver()` ごとに独立インスタンスを返す。** 接続・リングバッファ・選局状態をプロセス共有にしない(詳細と理由: `docs/DESIGN.md` §5)。
 - **4Kドライバ(`bon_drivers.stream_format='mmttlv'`)は生MMT/TLVを返す。** リーダーは `tuner/mmt_pipe.rs` の外部変換器(dantto4k CLI)を通してからbroadcastする。変換をbroadcastの後(セッション側)でやらない——TS解析・EPG/ロゴ収集もTSしか解さない。
+- **TS/TLVの判定は選局ごと。** px4daemon の空間4(CATV-TLV)は `stream_format='ts'` のドライバでも生TLVを返す(1台で通常TSと4Kを切り替えるため)。変換器を付けるかの判定は `bondriver::tune_delivers_tlv(path, space)` を使い、ドライバの `stream_format` だけで決めない(`acquire.rs`・`scan_scheduler.rs`)。空間5(CATV-8K)は複数搬送波を合成した生TLVで、1チャンネルで同じ DriverHost の受信機を搬送波の数だけ使う(`bondriver/tsmf_bond.rs`)。
 - **4K(NID 0x000B/0x000C)ではB25を走らせない。** 変換器が復号済みにするがPMTにCA記述子が残り、そのCA system IDが0x0005で我々のB-CASシムと一致するため、libaribb25が死んだECM PIDを掴む。判定は `tuner/acquire.rs::b25_enabled_for` の1箇所(詳細: `docs/FOURK_SETUP.md`)。
 - C++側FFIラッパーは必ず `try { } catch (...) { }` で包む。Rustの `catch_unwind` はC++/SEH例外を捕まえられない。SEHには `/EHa`。
 - Rust panic がFFI境界(`extern "system"`)を越えるとプロセスabort(TVTestが無言で落ちる)。クライアントDLL内では panic し得るコード(unwrap/添字)を書かない。

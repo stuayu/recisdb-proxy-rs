@@ -232,21 +232,29 @@ impl ScanScheduler {
             let _reservation = reservation;
             info!("ScanScheduler: Starting scan for {}", driver.dll_path);
 
-            // Perform the scan with timeout
-            let scan_result = tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                perform_scan(
-                    &driver,
-                    database.clone(),
-                    tuner_pool,
-                    signal_lock_wait_ms,
-                    ts_read_timeout_ms,
-                ),
+            // The time limit is enforced inside the scan, between channels.
+            // An outer `tokio::time::timeout` only dropped the future: the
+            // blocking scan thread kept tuning, its results were discarded,
+            // and the reservation was released while it still held the
+            // receiver — so the next scheduled scan ran concurrently against
+            // the same hardware and failed every channel with EALREADY.
+            let scan_result = perform_scan(
+                &driver,
+                database.clone(),
+                tuner_pool,
+                signal_lock_wait_ms,
+                ts_read_timeout_ms,
+                timeout_secs,
             )
             .await;
+            let timed_out = scan_result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<ScanTimedOut>())
+                .is_some();
 
             match scan_result {
-                Ok(Ok(channel_count)) => {
+                Ok(channel_count) => {
                     info!(
                         "ScanScheduler: Scan completed for {}: {} channels found",
                         driver.dll_path, channel_count
@@ -269,22 +277,27 @@ impl ScanScheduler {
                         warn!("ScanScheduler: Failed to update next scan time: {}", e);
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) if timed_out => {
+                    error!("ScanScheduler: {} ({})", e, driver.dll_path);
+                    let db = database.lock().await;
+                    let _ = db.insert_scan_history(driver.id, 0, false, Some(&e.to_string()));
+                    // Partial results are already merged. Re-running at once
+                    // would only hit the same limit again and keep the tuner
+                    // busy forever, so the one-shot request is consumed.
+                    let current = db.get_bon_driver(driver.id).ok().flatten();
+                    let next_scan = current.and_then(|d| {
+                        (d.auto_scan_enabled && d.scan_interval_hours > 0).then(|| {
+                            chrono::Utc::now().timestamp() + (d.scan_interval_hours as i64 * 3600)
+                        })
+                    });
+                    let _ = db.update_next_scan(driver.id, next_scan);
+                }
+                Err(e) => {
                     error!("ScanScheduler: Scan failed for {}: {}", driver.dll_path, e);
 
                     // Record failure in scan history
                     let db = database.lock().await;
                     let _ = db.insert_scan_history(driver.id, 0, false, Some(&e.to_string()));
-                }
-                Err(_) => {
-                    error!(
-                        "ScanScheduler: Scan timed out for {} after {} seconds",
-                        driver.dll_path, timeout_secs
-                    );
-
-                    // Record timeout in scan history
-                    let db = database.lock().await;
-                    let _ = db.insert_scan_history(driver.id, 0, false, Some("Scan timed out"));
                 }
             }
 
@@ -468,6 +481,10 @@ struct TsAnalysis {
     remote_control_key: Option<u8>,
     physical_ch: Option<u8>,
     services: Vec<ServiceInfo>,
+    /// An MMT/TLV channel ended without usable tables in a way a retry cannot
+    /// fix: no raw TLV at all (the multiplex is not TLV), or TLV flowed for the
+    /// whole budget without NIT (e.g. one carrier of a multi-carrier 8K mux).
+    tlv_retry_pointless: bool,
 }
 
 /// Service information extracted from TS stream.
@@ -551,7 +568,10 @@ fn enumerate_spaces_and_channels_blocking(
 fn px4_catv_requires_complete_scan(dll_path: &str, space: u32) -> bool {
     #[cfg(unix)]
     {
-        space == 3 && dll_path.starts_with(crate::bondriver::PX4_DAEMON_PATH_PREFIX)
+        (space == 3
+            || space == crate::bondriver::px4_daemon::CATV_TLV_SPACE
+            || space == crate::bondriver::px4_daemon::CATV_BOND_SPACE)
+            && dll_path.starts_with(crate::bondriver::PX4_DAEMON_PATH_PREFIX)
     }
     #[cfg(not(unix))]
     {
@@ -569,6 +589,7 @@ fn scan_space_blocking(
     signal_lock_wait_ms: u64,
     ts_read_timeout_ms: u64,
     mmt_converter: Option<&crate::tuner::mmt_pipe::MmtConverterConfig>,
+    deadline: std::time::Instant,
 ) -> Result<Vec<ScanChannelResult>, Box<dyn std::error::Error + Send + Sync>> {
     info!("scan_space_blocking: Loading BonDriver {}", dll_path);
     let tuner = BonDriverTuner::new(dll_path)?;
@@ -606,6 +627,13 @@ fn scan_space_blocking(
 
     for (channel, channel_name) in channels {
         let channel = *channel;
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "scan_space_blocking: time limit reached; stopping space {} before channel {} ({})",
+                space, channel, channel_name
+            );
+            break;
+        }
 
         debug!(
             "scan_space_blocking: Trying space={}, channel={} ({})",
@@ -814,6 +842,13 @@ fn scan_space_blocking(
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     continue;
                 }
+                Ok(a) if a.network_id.is_none() && a.tlv_retry_pointless => {
+                    info!(
+                        "scan_space_blocking:   → MMT/TLV gave no usable NIT (not TLV, or a partial multi-carrier mux); skipping retries"
+                    );
+                    analysis_result = Some(a);
+                    break;
+                }
                 Ok(a) if a.network_id.is_none() => {
                     // NID not detected, retry
                     warn!(
@@ -928,6 +963,23 @@ fn scan_space_blocking(
     Ok(results)
 }
 
+/// Bytes of raw input to see before deciding whether a TLV tune delivered TS.
+const RAW_FORMAT_SNIFF_BYTES: usize = 188 * 8;
+
+/// Whether `data` is MPEG-2 TS: 0x47 at the same phase every 188 bytes.
+/// TLV packets start with 0x7F and have variable length, so eight aligned
+/// sync bytes do not occur by chance.
+fn looks_like_ts(data: &[u8]) -> bool {
+    const PACKETS: usize = 8;
+    if data.len() < TS_PACKET_SIZE * PACKETS {
+        return false;
+    }
+    (0..TS_PACKET_SIZE).any(|phase| {
+        data.len() >= phase + TS_PACKET_SIZE * PACKETS
+            && (0..PACKETS).all(|i| data[phase + i * TS_PACKET_SIZE] == 0x47)
+    })
+}
+
 /// Analyze TS stream to extract TSID, NID, and service information.
 fn analyze_ts_stream(
     tuner: &BonDriverTuner,
@@ -967,7 +1019,16 @@ fn analyze_ts_stream(
     let mut carry: Vec<u8> = Vec::with_capacity(TS_PACKET_SIZE * 4);
 
     let start_time = std::time::Instant::now();
+    // Converted 4K signalling repeats within seconds; a TLV mux that has not
+    // produced PAT/NIT/SDT in a minute will not. Without this cap a carrier
+    // that only holds part of a multi-carrier 8K mux costs 3 x 5 minutes.
+    const MMT_TABLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
     let timeout = std::time::Duration::from_millis(ts_read_timeout_ms);
+    let timeout = if mmt.is_some() {
+        timeout.min(MMT_TABLE_BUDGET)
+    } else {
+        timeout
+    };
 
     // `ts_read_timeout_ms` is the budget for *collecting enough tables*, and
     // its default is deliberately generous (5 minutes) because SDT/NIT can
@@ -978,7 +1039,20 @@ fn analyze_ts_stream(
     // single channel and makes a 50-channel scan effectively never finish.
     // So bail out early if nothing at all has arrived, while still allowing
     // the full timeout once the stream is flowing.
+    //
+    // Raw TLV from a CATV carrier starts as soon as TUNE reports lock, so a
+    // TLV tune that delivers nothing within a few seconds is a TS-only (or
+    // non-TSMF) carrier. The CATV-TLV space visits every locked carrier, so
+    // waiting the full 10 s on each would add minutes to a scan.
     const NO_DATA_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(10);
+    const NO_TLV_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(4);
+    let no_data_give_up = if mmt.is_some() {
+        NO_TLV_GIVE_UP
+    } else {
+        NO_DATA_GIVE_UP
+    };
+    let mut checked_raw_format = false;
+    let mut raw_was_ts = false;
 
     let mut total_bytes_read = 0usize;
     let mut reads = 0usize;
@@ -988,7 +1062,7 @@ fn analyze_ts_stream(
     let mut backoff_ms: u64 = 1;
 
     while !analyzer.is_complete() && start_time.elapsed() < timeout {
-        if total_bytes_read == 0 && start_time.elapsed() >= NO_DATA_GIVE_UP {
+        if total_bytes_read == 0 && start_time.elapsed() >= no_data_give_up {
             warn!(
                 "analyze_ts_stream: No TS data at all after {:?} ({} attempts) — giving up on this channel",
                 start_time.elapsed(),
@@ -1037,6 +1111,18 @@ fn analyze_ts_stream(
 
         // 3) carry へ入れて 188 単位で feed（TS固定長）[1](https://zenn.dev/sakuraimikoto33/articles/36b1b633c7607d)
         //    4K は変換器を通してからでないと 0x47 が現れない。
+        if mmt.is_some() && !checked_raw_format && size >= RAW_FORMAT_SNIFF_BYTES {
+            checked_raw_format = true;
+            if looks_like_ts(&buffer[..size]) {
+                // The carrier's relative stream 0 is TS, not TLV: nothing the
+                // converter can use. Give up now, without retries.
+                info!(
+                    "analyze_ts_stream: TLV tune delivered MPEG-2 TS (TS-type TSMF carrier); not a 4K TLV channel"
+                );
+                raw_was_ts = true;
+                break;
+            }
+        }
         match mmt.as_mut() {
             Some(pipe) => {
                 // 復号できていない変換器は、正常終了しながら暗号化された TS を
@@ -1154,7 +1240,10 @@ fn analyze_ts_stream(
         );
     }
 
-    build_ts_analysis(result)
+    let mut analysis = build_ts_analysis(result)?;
+    analysis.tlv_retry_pointless =
+        mmt.is_some() && (raw_was_ts || total_bytes_read == 0 || elapsed >= timeout);
+    Ok(analysis)
 }
 
 /// Physical channel of the tuned TS. Terrestrial comes from the NIT
@@ -1265,12 +1354,42 @@ fn scan_results_to_channel_infos(
 }
 
 /// Perform a channel scan for a BonDriver.
+/// A scan stopped at its time limit. Results found until then are merged.
+#[derive(Debug)]
+struct ScanTimedOut {
+    budget: Duration,
+    partial_channels: usize,
+}
+
+impl std::fmt::Display for ScanTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Scan timed out after {}s; merged {} channel(s) found before the limit",
+            self.budget.as_secs(),
+            self.partial_channels
+        )
+    }
+}
+
+impl std::error::Error for ScanTimedOut {}
+
+/// Per-channel allowance used to size a scan's time limit. The configured
+/// `scan_timeout_secs` (900 s by default) was sized for one band; a px4daemon
+/// receiver enumerates GR + BS + CS + CATV (101) + CATV-TLV (101) channels.
+const SCAN_BUDGET_PER_CHANNEL: Duration = Duration::from_secs(12);
+
+fn scan_budget(configured: Duration, total_channels: usize) -> Duration {
+    configured.max(SCAN_BUDGET_PER_CHANNEL * total_channels as u32)
+}
+
 async fn perform_scan(
     driver: &BonDriverRecord,
     database: DatabaseHandle,
     tuner_pool: Arc<TunerPool>,
     signal_lock_wait_ms: u64,
     ts_read_timeout_ms: u64,
+    timeout_secs: u64,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     debug!("perform_scan: Starting scan for {}", driver.dll_path);
 
@@ -1308,43 +1427,63 @@ async fn perform_scan(
     // The scan needs the same conversion the streaming path gets — resolved
     // here because the blocking closure below can touch neither the async DB
     // handle nor the pool.
-    let mmt_converter = {
-        let is_mmt_tlv = {
-            let db = database.lock().await;
-            db.driver_stream_format(&dll_path).is_mmt_tlv()
-        };
-        if is_mmt_tlv {
-            let cfg = tuner_pool.config().await.mmt_converter;
-            info!(
-                "perform_scan: {} is registered as MMT/TLV; scanning through the converter",
-                dll_path
-            );
-            Some(cfg)
-        } else {
-            None
-        }
+    //
+    // Decided per space: a px4daemon receiver delivers TS on its CATV space
+    // and raw TLV on its CATV-TLV space (`bondriver::tune_delivers_tlv`).
+    let driver_is_mmt_tlv = {
+        let db = database.lock().await;
+        db.driver_stream_format(&dll_path).is_mmt_tlv()
     };
+    if driver_is_mmt_tlv {
+        info!(
+            "perform_scan: {} is registered as MMT/TLV; scanning through the converter",
+            dll_path
+        );
+    }
+    let mmt_converter_config = tuner_pool.config().await.mmt_converter;
 
     let dll = dll_path.clone();
-    let all_results = tokio::task::spawn_blocking(move || {
+    let configured_budget = Duration::from_secs(timeout_secs);
+    let (all_results, timed_out_budget) = tokio::task::spawn_blocking(move || {
         let mut results = Vec::new();
+        let mut timed_out_budget = None;
 
         // 1) Open tuner and enumerate spaces/channels first
         let plans = match enumerate_spaces_and_channels_blocking(&dll) {
             Ok(p) => p,
             Err(e) => {
                 warn!("perform_scan: Failed to enumerate spaces/channels: {}", e);
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results);
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>((results, None));
             }
         };
 
         if plans.is_empty() {
             warn!("perform_scan: BonDriver reported no tuning spaces");
-            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results);
+            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>((results, None));
         }
+
+        let total_channels: usize = plans.iter().map(|(_, _, c)| c.len()).sum();
+        let budget = scan_budget(configured_budget, total_channels);
+        let deadline = std::time::Instant::now() + budget;
+        info!(
+            "perform_scan: {} channel(s) in {} space(s); time limit {}s",
+            total_channels,
+            plans.len(),
+            budget.as_secs()
+        );
 
         // 2) Use all (space, channel list) from enumeration to run scans
         for (space, space_name, channels) in plans {
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "perform_scan: time limit {}s reached before space {} ({}); stopping",
+                    budget.as_secs(),
+                    space,
+                    space_name
+                );
+                timed_out_budget = Some(budget);
+                break;
+            }
             if channels.is_empty() {
                 warn!(
                     "perform_scan: Space {} ({}) has no channels from BonDriver enumeration",
@@ -1360,20 +1499,39 @@ async fn perform_scan(
                 channels.len()
             );
 
+            let space_is_tlv =
+                driver_is_mmt_tlv || crate::bondriver::tune_delivers_tlv(&dll, space);
+            if space_is_tlv && !driver_is_mmt_tlv {
+                info!(
+                    "perform_scan: space {} ({}) delivers MMT/TLV; scanning it through the converter",
+                    space, space_name
+                );
+            }
             match scan_space_blocking(
                 &dll,
                 space,
                 &channels,
                 signal_lock_wait_ms,
                 ts_read_timeout_ms,
-                mmt_converter.as_ref(),
+                space_is_tlv.then_some(&mmt_converter_config),
+                deadline,
             ) {
                 Ok(r) => results.extend(r),
                 Err(e) => warn!("perform_scan: Space {} scan failed: {}", space, e),
             }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "perform_scan: time limit {}s reached during space {} ({}); stopping",
+                    budget.as_secs(),
+                    space,
+                    space_name
+                );
+                timed_out_budget = Some(budget);
+                break;
+            }
         }
 
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((results, timed_out_budget))
     })
     .await??;
 
@@ -1411,6 +1569,13 @@ async fn perform_scan(
         let _ = db.insert_scan_history(driver_id, total as i32, true, None);
     }
 
+    if let Some(budget) = timed_out_budget {
+        return Err(Box::new(ScanTimedOut {
+            budget,
+            partial_channels: total,
+        }));
+    }
+
     info!(
         "perform_scan: Completed scan for {}: {} channels found",
         driver.dll_path, total
@@ -1421,6 +1586,34 @@ async fn perform_scan(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_budget_grows_with_the_channel_count() {
+        let configured = std::time::Duration::from_secs(900);
+        assert_eq!(super::scan_budget(configured, 10), configured);
+        // GR 50 + BS 12 + CS 12 + CATV 101 + CATV-TLV 101.
+        assert_eq!(
+            super::scan_budget(configured, 276),
+            std::time::Duration::from_secs(276 * 12)
+        );
+    }
+
+    #[test]
+    fn ts_is_told_apart_from_tlv_in_a_tlv_tune() {
+        let mut ts = vec![0u8; 188 * 10 + 5];
+        for i in 0..10 {
+            ts[5 + i * 188] = 0x47;
+        }
+        assert!(super::looks_like_ts(&ts));
+        // TLV: 0x7F-led variable-length packets, no 188-byte cadence.
+        let mut tlv = Vec::new();
+        while tlv.len() < 188 * 10 {
+            tlv.extend_from_slice(&[0x7F, 0x01, 0x00, 0x9A]);
+            tlv.extend(std::iter::repeat(0x00).take(154));
+        }
+        assert!(!super::looks_like_ts(&tlv));
+        assert!(!super::looks_like_ts(&ts[..188 * 4]));
+    }
+
     use super::*;
 
     #[test]
@@ -1753,5 +1946,6 @@ fn build_ts_analysis(
         remote_control_key,
         physical_ch,
         services,
+        tlv_retry_pointless: false,
     })
 }

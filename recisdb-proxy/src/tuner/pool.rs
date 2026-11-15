@@ -912,7 +912,7 @@ impl TunerPool {
             .keys_pending_idle_close()
             .await
             .into_iter()
-            .filter(|k| k.tuner_path == tuner_path && except != Some(k))
+            .filter(|k| shares_device(&k.tuner_path, tuner_path) && except != Some(k))
             .collect();
 
         let mut reclaimed = 0usize;
@@ -948,6 +948,23 @@ impl TunerPool {
             reclaimed += 1;
         }
         reclaimed
+    }
+}
+
+/// Paths that contend for the same hardware. Separate px4daemon drivers on
+/// one DriverHost share its receivers: a keep-alive reader on one makes the
+/// daemon refuse (EALREADY) an open on another.
+fn shares_device(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        crate::bondriver::px4_same_daemon(a, b)
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 

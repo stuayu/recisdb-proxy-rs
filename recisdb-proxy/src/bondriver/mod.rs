@@ -32,10 +32,44 @@ mod dvbv5;
 #[cfg(unix)]
 pub(crate) mod px4_daemon;
 #[cfg(unix)]
+pub(crate) mod tsmf_bond;
+#[cfg(unix)]
 mod unix;
 
 #[cfg(unix)]
+pub use px4_daemon::same_daemon as px4_same_daemon;
+#[cfg(unix)]
 pub use px4_daemon::PATH_PREFIX as PX4_DAEMON_PATH_PREFIX;
+
+/// Whether tuning `space` on `path` yields raw MMT/TLV instead of TS.
+///
+/// Per tune, not per driver: a px4daemon receiver serves normal ISDB-C TS on
+/// space 3 and 4K TLV on space 4 (`px4_daemon::CATV_TLV_SPACE`), so one
+/// physical tuner can switch between them. Drivers registered with
+/// `stream_format='mmttlv'` are TLV on every space regardless.
+pub fn tune_delivers_tlv(path: &str, space: u32) -> bool {
+    #[cfg(unix)]
+    if path.starts_with(px4_daemon::PATH_PREFIX) {
+        return px4_daemon::tune_delivers_tlv(path, space);
+    }
+    let _ = (path, space);
+    false
+}
+
+/// Whether `SetChannel` on `path` already purges the old channel's data and
+/// returns only once the stream is flowing, so no settle delay is needed.
+///
+/// px4daemon's `set_channel` returns after TUNE reports lock and PURGE, and
+/// its reader polls the data socket; the generic 500 ms wait exists for
+/// BonDriver DLLs whose buffers fill only some time after SetChannel.
+pub fn set_channel_settles_stream(path: &str) -> bool {
+    #[cfg(unix)]
+    if path.starts_with(px4_daemon::PATH_PREFIX) {
+        return true;
+    }
+    let _ = path;
+    false
+}
 
 #[cfg(unix)]
 mod dispatch {

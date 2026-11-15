@@ -40,6 +40,9 @@
 //! `+j83b` is exclusive of those suffixes other than `+lnb` and requires
 //! daemon-wide `ExperimentalJ83B=true`.
 //! `+tlv` implies TSMF relative stream 0 unless explicitly selected.
+//! Space 4 (CATV-TLV) tunes the same carriers with TLV output, and space 5
+//! (CATV-8K) combines a multi-carrier group (BS8K) from several receivers;
+//! see [`super::tsmf_bond`].
 //! Register raw TLV drivers with `bon_drivers.stream_format='mmttlv'`;
 //! the reader must run dantto4k before TS parsing or broadcast. Raw TLV
 //! cannot pass through processing that assumes 188-byte TS boundaries.
@@ -58,9 +61,11 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
+
+use super::tsmf_bond::{self, BondCombiner, ExtHeader};
 
 /// Default control socket, matching px4_drv's macOS daemon.
 const DEFAULT_CTRL_SOCK: &str = "/tmp/px4_ctrl_pipe.sock";
@@ -196,6 +201,66 @@ fn catv_frequency(channel: u32, offset: Option<i32>) -> Result<u32, io::Error> {
     Ok(frequency as u32)
 }
 
+/// Number of CATV channels in spaces 3/4: C13–C63 (0..=50), then the UHF
+/// band U13–U62 (51..=100). Cable operators put 256QAM carriers — including
+/// BS4K/CS4K TLV transmodulation — above C63, on the UHF raster.
+const CATV_CHANNELS: u32 = 101;
+/// First UHF-band channel index in the CATV plan.
+const CATV_UHF_FIRST: u32 = 51;
+
+/// Space index of the CATV raw-TLV plan (same carriers as space 3, tuned with
+/// TSMF relative stream 0 and TLV output). Lets one receiver path serve both
+/// the normal ISDB-C TS channels (space 3) and the 4K MMT/TLV channels.
+pub const CATV_TLV_SPACE: u32 = 4;
+
+/// Space index of CATV multi-carrier groups (BS8K). A channel is the
+/// frequency of the group's first carrier (`carrier_sequence` 1); the other
+/// carriers are found from their TSMF headers and received on further
+/// receivers of the same daemon, then combined into one TLV stream.
+pub const CATV_BOND_SPACE: u32 = 5;
+
+/// How long to wait for a TSMF header after TUNE. Frames repeat every ~2 ms;
+/// a carrier with no header in this time is plain TS or not TSMF at all.
+const TSMF_HEADER_WAIT: Duration = Duration::from_millis(800);
+
+/// How far from the first carrier to look for the rest of a group. Groups are
+/// laid out on adjacent channels in practice (BS8K: 569/575/581 MHz); every
+/// probe of an empty frequency costs a TUNE timeout.
+const BOND_SEARCH_RANGE_KHZ: u32 = 60_000;
+
+/// Raw bytes to read before judging a carrier's TSMF header (~0.1 s at 38 Mbps).
+const HEADER_SAMPLE_BYTES: usize = 512 * 1024;
+
+/// Centre frequency (kHz) of CATV plan channel `channel`.
+///
+/// C13–C63 apply the ChSet default offset (or `+coffset`). The UHF part has
+/// no ChSet table; the measured carriers sit exactly on the 6 MHz raster
+/// (e.g. U32 = 587 MHz), so `+coffset` does not apply there.
+fn catv_plan_frequency(channel: u32, offset: Option<i32>) -> Result<u32, io::Error> {
+    if channel < CATV_UHF_FIRST {
+        return catv_frequency(channel, offset);
+    }
+    if channel >= CATV_CHANNELS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "CATV channel {} out of range (0-{})",
+                channel,
+                CATV_CHANNELS - 1
+            ),
+        ));
+    }
+    Ok(473_000 + (channel - CATV_UHF_FIRST) * 6_000)
+}
+
+fn catv_channel_label(channel: u32) -> String {
+    if channel < CATV_UHF_FIRST {
+        format!("C{}", channel + 13)
+    } else {
+        format!("U{}", channel - CATV_UHF_FIRST + 13)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReceiverOptions {
     lnb: bool,
@@ -236,6 +301,16 @@ struct TuneTarget {
     system: u32,
     freq_khz: u32,
     modulation: u32,
+    /// The tune delivers raw TLV (TSMF relative stream, or a combined group).
+    tlv: bool,
+    /// Combine a multi-carrier group; the daemon outputs every slot unfiltered.
+    bonded: bool,
+}
+
+/// Whether `options` expose the CATV TLV space (4). A `+tlv` receiver is
+/// already TLV-only on space 3, and J.83B carries no TSMF.
+fn has_tlv_space(options: &ReceiverOptions) -> bool {
+    !options.tlv && !options.j83b
 }
 
 /// Resolve all channel bounds and tuning parameters from one pure plan.
@@ -244,24 +319,47 @@ fn tune_target(
     channel: u32,
     options: &ReceiverOptions,
 ) -> Result<TuneTarget, io::Error> {
-    let (sys, freq_khz, modulation) = if space == 3 {
+    // Raw TLV is carried over TSMF on ISDB-C only. Tuning GR/BS/CS with +tlv
+    // yields no usable stream, and a scan would waste minutes per channel.
+    if options.tlv && space != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "px4daemon +tlv is only valid for the CATV space (3)",
+        ));
+    }
+    let bond_space = space == CATV_BOND_SPACE && has_tlv_space(options);
+    let tlv_space = (space == CATV_TLV_SPACE && has_tlv_space(options)) || bond_space;
+    if space == 3 || tlv_space {
         let (freq_khz, modulation) = if options.j83b {
             (j83b_frequency(channel)?, 256)
+        } else if tlv_space {
+            // TLV transmodulation is always 256QAM; skipping the 64QAM probe
+            // saves a disposable receiver session per carrier.
+            (
+                catv_plan_frequency(channel, options.coffset)?,
+                options.qam.unwrap_or(256),
+            )
         } else {
             (
-                catv_frequency(channel, options.coffset)?,
+                catv_plan_frequency(channel, options.coffset)?,
                 options.qam.unwrap_or(0),
             )
         };
-        (system::ISDB_C, freq_khz, modulation)
-    } else {
-        let (sys, freq) = space_channel_to_freq(space, channel)?;
-        (sys, freq, options.qam.unwrap_or(0))
-    };
+        return Ok(TuneTarget {
+            system: system::ISDB_C,
+            freq_khz,
+            modulation,
+            tlv: options.tlv || tlv_space,
+            bonded: bond_space,
+        });
+    }
+    let (sys, freq) = space_channel_to_freq(space, channel)?;
     Ok(TuneTarget {
         system: sys,
-        freq_khz,
-        modulation,
+        freq_khz: freq,
+        modulation: options.qam.unwrap_or(0),
+        tlv: false,
+        bonded: false,
     })
 }
 
@@ -272,7 +370,7 @@ fn channel_name(space: u32, channel: u32, options: &ReceiverOptions) -> Option<S
         1 => Some(format!("BS{}", channel * 2 + 1)),
         2 => Some(format!("CS{}", channel * 2 + 2)),
         3 if options.j83b => Some(format!("H{:02}", channel + 1)),
-        3 => Some(format!("C{}", channel + 13)),
+        3 | CATV_TLV_SPACE | CATV_BOND_SPACE => Some(catv_channel_label(channel)),
         _ => None,
     }
 }
@@ -319,12 +417,17 @@ fn tuning_params(
     options: &ReceiverOptions,
     modulation: u32,
     probe: bool,
+    raw: bool,
 ) -> Vec<(u32, u32)> {
     if sys != system::ISDB_C {
         return Vec::new();
     }
     let mut params = vec![(1, 6), (2, 5274), (3, modulation)];
-    if !probe {
+    if raw && !probe {
+        // TSMF_MODE=2: every slot, TSMF headers and nulls included, for
+        // combining a multi-carrier group (px4_drv ReceiverBase).
+        params.push((4, 2));
+    } else if !probe {
         if let Some(relative) = options.tsmf.or(options.tlv.then_some(0)) {
             params.extend([(4, 1), (5, relative), (6, 0)]);
             if options.tlv {
@@ -382,8 +485,29 @@ pub(super) fn space_channel_to_freq(space: u32, channel: u32) -> Result<(u32, u3
     }
 }
 
+/// Whether tuning `space` on this px4daemon path yields raw MMT/TLV rather
+/// than TS (a `+tlv` receiver's space 3, or the CATV TLV space 4). Decided
+/// per tune so one receiver can carry both TS and 4K channels.
+pub fn tune_delivers_tlv(path: &str, space: u32) -> bool {
+    let Ok((_, options, _, _)) = parse_path(path) else {
+        return false;
+    };
+    // Any in-range channel works: TLV-ness is a property of the space.
+    tune_target(space, 0, &options).is_ok_and(|target| target.tlv)
+}
+
 /// Parse `px4daemon:<index>` (or `px4daemon:any`), optionally followed by
 /// `@<ctrl_sock>` for a non-default socket path.
+/// Whether two px4daemon paths talk to the same DriverHost (same control
+/// socket). Such paths share physical receivers even when registered as
+/// separate drivers, so one can be refused while the other holds a receiver.
+pub fn same_daemon(a: &str, b: &str) -> bool {
+    match (parse_path(a), parse_path(b)) {
+        (Ok((_, _, ctrl_a, _)), Ok((_, _, ctrl_b, _))) => ctrl_a == ctrl_b,
+        _ => false,
+    }
+}
+
 fn parse_path(path: &str) -> Result<(i32, ReceiverOptions, String, String), io::Error> {
     let rest = path.strip_prefix(PATH_PREFIX).ok_or_else(|| {
         io::Error::new(
@@ -487,8 +611,13 @@ pub struct Px4DaemonTuner {
     index: i32,
     /// Per-receiver path options; CATV options apply only to space 3.
     options: ReceiverOptions,
-    /// QAM is a channel property; cache successful disposable probes.
-    catv_modulations: Mutex<std::collections::HashMap<u32, u32>>,
+    /// Control socket path; keys the process-wide QAM cache and the parking lot.
+    ctrl_sock_path: String,
+    /// Set on a parked receiver about to be closed for good, so its `Drop`
+    /// closes instead of parking again.
+    no_park: AtomicBool,
+    /// A control/data socket operation failed; never hand this session on.
+    broken: AtomicBool,
     /// Whether we currently have LNB power switched on. The daemon
     /// reference-counts it and asserts the on/off calls balance, so this must
     /// track our own state exactly — including on drop.
@@ -510,6 +639,128 @@ pub struct Px4DaemonTuner {
     cnr_unsupported: AtomicBool,
     capturing: AtomicBool,
     current_space: AtomicI32,
+    /// The other carriers of a multi-carrier group (space 5) and the combiner.
+    bond: Mutex<Option<Bond>>,
+}
+
+/// Receivers and state for one combined multi-carrier tune.
+struct Bond {
+    /// Carriers 2..=n in `carrier_sequence` order; this tuner is carrier 1.
+    helpers: Vec<Px4DaemonTuner>,
+    combiner: BondCombiner,
+    scratch: Vec<u8>,
+    last_log: Instant,
+}
+
+/// Frequencies of carriers 2..=n per (control socket, first carrier kHz).
+fn bond_groups() -> &'static Mutex<std::collections::HashMap<(String, u32), Vec<u32>>> {
+    static GROUPS: std::sync::OnceLock<Mutex<std::collections::HashMap<(String, u32), Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    GROUPS.get_or_init(Default::default)
+}
+
+// ---------------------------------------------------------------------
+// Process-wide state shared by every receiver on a daemon
+// ---------------------------------------------------------------------
+
+/// Detected CATV QAM per (control socket, frequency kHz).
+///
+/// Auto QAM costs a disposable receiver session (release, OPEN, TUNE with a
+/// 64→256 fallback, CLOSE) — seconds per carrier. Each reader creates a fresh
+/// tuner, so a per-instance cache re-probed on every channel switch.
+fn qam_cache() -> &'static Mutex<std::collections::HashMap<(String, u32), u32>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<(String, u32), u32>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Wait after PURGE before draining (see `purge_ts_stream`).
+const PURGE_SETTLE: Duration = Duration::from_millis(50);
+
+/// How long a released receiver stays open for the next tuner to take over.
+///
+/// A channel switch drops the old reader's tuner and opens a new one. Closing
+/// and re-opening the receiver costs CLOSE + OPEN (backend power cycle and
+/// demodulator init, ~0.4 s on XIT-SQR100) plus the caller's EALREADY retry
+/// when the new OPEN races the old CLOSE. Parking keeps the receiver, its
+/// data connection and capture alive so the new tuner retunes in place —
+/// the same path a BonDriver `SetChannel` takes.
+const PARK_TTL: Duration = Duration::from_secs(3);
+/// How long an OPEN refused with EALREADY waits for a receiver being parked.
+const PARK_WAIT: Duration = Duration::from_millis(1_500);
+
+struct ParkedReceiver {
+    id: u64,
+    tuner: Px4DaemonTuner,
+}
+
+fn parking_lot() -> &'static Mutex<std::collections::HashMap<String, Vec<ParkedReceiver>>> {
+    static LOT: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<ParkedReceiver>>>> =
+        std::sync::OnceLock::new();
+    LOT.get_or_init(Default::default)
+}
+
+/// Take the most recently parked receiver on `ctrl_sock` that `index` may use.
+fn take_parked(ctrl_sock: &str, index: i32) -> Option<Px4DaemonTuner> {
+    let mut lot = parking_lot().lock().unwrap_or_else(|e| e.into_inner());
+    let entries = lot.get_mut(ctrl_sock)?;
+    let pos = entries
+        .iter()
+        .rposition(|p| index < 0 || p.tuner.index == index)?;
+    Some(entries.remove(pos).tuner)
+}
+
+fn park(tuner: Px4DaemonTuner) {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let key = tuner.ctrl_sock_path.clone();
+    debug!(
+        "[px4daemon] parked receiver (system=0x{:02x}) for {:?}",
+        tuner.opened_system.load(Ordering::Acquire),
+        PARK_TTL
+    );
+    parking_lot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.clone())
+        .or_default()
+        .push(ParkedReceiver { id, tuner });
+    let reaper_key = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name("px4-park-reaper".into())
+        .spawn(move || {
+            let key = reaper_key;
+            std::thread::sleep(PARK_TTL);
+            let expired = {
+                let mut lot = parking_lot().lock().unwrap_or_else(|e| e.into_inner());
+                lot.get_mut(&key).and_then(|entries| {
+                    let pos = entries.iter().position(|p| p.id == id)?;
+                    Some(entries.remove(pos).tuner)
+                })
+            };
+            if let Some(tuner) = expired {
+                tuner.no_park.store(true, Ordering::Release);
+                debug!(
+                    "[px4daemon] closing parked receiver after {:?} idle",
+                    PARK_TTL
+                );
+                drop(tuner);
+            }
+        });
+    if let Err(e) = spawned {
+        // Without a reaper the receiver would stay open forever; close now.
+        warn!("[px4daemon] cannot spawn park reaper ({e}); closing receiver");
+        if let Some(tuner) = take_parked_by_id(&key, id) {
+            tuner.no_park.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn take_parked_by_id(ctrl_sock: &str, id: u64) -> Option<Px4DaemonTuner> {
+    let mut lot = parking_lot().lock().unwrap_or_else(|e| e.into_inner());
+    let entries = lot.get_mut(ctrl_sock)?;
+    let pos = entries.iter().position(|p| p.id == id)?;
+    Some(entries.remove(pos).tuner)
 }
 
 impl Px4DaemonTuner {
@@ -529,20 +780,7 @@ impl Px4DaemonTuner {
         ctrl.set_read_timeout(Some(Duration::from_secs(35)))?;
         ctrl.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let tuner = Self {
-            ctrl: Mutex::new(ctrl),
-            data: Mutex::new(None),
-            data_sock_path: data_sock,
-            index,
-            options,
-            catv_modulations: Mutex::new(std::collections::HashMap::new()),
-            lnb_on: AtomicBool::new(false),
-            data_id: AtomicU64::new(NO_DATA_ID),
-            opened_system: AtomicI32::new(0),
-            cnr_unsupported: AtomicBool::new(false),
-            capturing: AtomicBool::new(false),
-            current_space: AtomicI32::new(0),
-        };
+        let tuner = Self::with_ctrl(ctrl, ctrl_sock.clone(), data_sock, index, options);
 
         // Handshake, so a mismatched daemon fails here rather than midway
         // through a channel change.
@@ -556,7 +794,143 @@ impl Px4DaemonTuner {
             ctrl_sock, driver_version, cmd_version, index
         );
 
+        // A receiver released moments ago (channel switch) is still open;
+        // take it over instead of closing and re-opening the hardware.
+        if let Some(parked) = take_parked(&tuner.ctrl_sock_path, tuner.index) {
+            tuner.adopt(parked);
+        }
+
         Ok(tuner)
+    }
+
+    fn with_ctrl(
+        ctrl: UnixStream,
+        ctrl_sock_path: String,
+        data_sock_path: String,
+        index: i32,
+        options: ReceiverOptions,
+    ) -> Self {
+        Self {
+            ctrl: Mutex::new(ctrl),
+            data: Mutex::new(None),
+            data_sock_path,
+            index,
+            options,
+            ctrl_sock_path,
+            no_park: AtomicBool::new(false),
+            broken: AtomicBool::new(false),
+            lnb_on: AtomicBool::new(false),
+            data_id: AtomicU64::new(NO_DATA_ID),
+            opened_system: AtomicI32::new(0),
+            cnr_unsupported: AtomicBool::new(false),
+            capturing: AtomicBool::new(false),
+            current_space: AtomicI32::new(0),
+            bond: Mutex::new(None),
+        }
+    }
+
+    /// Swap every piece of receiver state with `other`.
+    ///
+    /// The receiver belongs to the control *connection* on the daemon side,
+    /// so moving the connection moves the receiver. Afterwards `other` holds
+    /// this tuner's unopened connection and closes nothing when dropped.
+    fn swap_state(&self, other: &Self) {
+        {
+            let mut a = self.ctrl.lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = other.ctrl.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::swap(&mut *a, &mut *b);
+        }
+        {
+            let mut a = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = other.data.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::swap(&mut *a, &mut *b);
+        }
+        let swap_u64 = |a: &AtomicU64, b: &AtomicU64| {
+            a.store(
+                b.swap(a.load(Ordering::Acquire), Ordering::AcqRel),
+                Ordering::Release,
+            )
+        };
+        let swap_i32 = |a: &AtomicI32, b: &AtomicI32| {
+            a.store(
+                b.swap(a.load(Ordering::Acquire), Ordering::AcqRel),
+                Ordering::Release,
+            )
+        };
+        let swap_bool = |a: &AtomicBool, b: &AtomicBool| {
+            a.store(
+                b.swap(a.load(Ordering::Acquire), Ordering::AcqRel),
+                Ordering::Release,
+            )
+        };
+        swap_u64(&self.data_id, &other.data_id);
+        swap_i32(&self.opened_system, &other.opened_system);
+        swap_i32(&self.current_space, &other.current_space);
+        swap_bool(&self.capturing, &other.capturing);
+        swap_bool(&self.lnb_on, &other.lnb_on);
+        swap_bool(&self.cnr_unsupported, &other.cnr_unsupported);
+        swap_bool(&self.broken, &other.broken);
+    }
+
+    /// Take over a parked receiver if its control connection still answers.
+    /// Returns whether it was adopted; an unusable one is closed.
+    fn adopt(&self, parked: Px4DaemonTuner) -> bool {
+        let mut probe = vec![0u8; CHECK_LOCK_CMD_SIZE];
+        probe[..HEADER_SIZE].copy_from_slice(&header(cmd::CHECK_LOCK));
+        if let Err(e) = parked.transact(&mut probe) {
+            debug!("[px4daemon] parked receiver is gone ({e}); opening a new one");
+            parked.no_park.store(true, Ordering::Release);
+            return false;
+        }
+        self.swap_state(&parked);
+        // `parked` now holds our fresh, unopened connection.
+        parked.no_park.store(true, Ordering::Release);
+        info!(
+            "[px4daemon] reusing open receiver (system=0x{:02x}); skipping CLOSE/OPEN",
+            self.opened_system.load(Ordering::Acquire)
+        );
+        true
+    }
+
+    /// Whether this session is in a state the next tuner can retune in place.
+    fn parkable(&self) -> bool {
+        !self.no_park.load(Ordering::Acquire)
+            && !self.broken.load(Ordering::Acquire)
+            && self.opened_system.load(Ordering::Acquire) != 0
+            && self.capturing.load(Ordering::Acquire)
+            && !self.lnb_on.load(Ordering::Acquire)
+            && self.data.lock().map(|g| g.is_some()).unwrap_or(false)
+            && self.bond.lock().map(|g| g.is_none()).unwrap_or(false)
+    }
+
+    /// OPEN, and if another tuner of ours still holds the receiver because it
+    /// is being released right now, wait for it to be parked and take it.
+    ///
+    /// `reuse = false` (QAM probe) closes the parked receiver and opens a
+    /// fresh one, since the probe needs a session without a data connection.
+    fn open_or_adopt(&self, sys: u32, reuse: bool) -> Result<(), io::Error> {
+        let err = match self.open_receiver(sys) {
+            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => e,
+            other => return other,
+        };
+        let deadline = std::time::Instant::now() + PARK_WAIT;
+        loop {
+            if let Some(parked) = take_parked(&self.ctrl_sock_path, self.index) {
+                if reuse && self.adopt(parked) {
+                    if self.opened_system.load(Ordering::Acquire) as u32 != sys {
+                        self.release_receiver()?;
+                        self.open_receiver(sys)?;
+                    }
+                    return Ok(());
+                }
+                // Not reusable (or dropped above as dead): closed by now.
+                return self.open_receiver(sys);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Send a command and read the same-sized response in place.
@@ -568,10 +942,15 @@ impl Px4DaemonTuner {
             .ctrl
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "px4daemon ctrl lock poisoned"))?;
-        ctrl.write_all(buf)?;
-        ctrl.flush()?;
-        ctrl.read_exact(buf)?;
-        Ok(())
+        let result = (|| {
+            ctrl.write_all(buf)?;
+            ctrl.flush()?;
+            ctrl.read_exact(buf)
+        })();
+        if result.is_err() {
+            self.broken.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// `transact`, and fail unless the daemon reported success.
@@ -668,9 +1047,13 @@ impl Px4DaemonTuner {
         sys: u32,
         freq_khz: u32,
         modulation: u32,
+        tlv: bool,
         probe: bool,
+        raw: bool,
     ) -> Result<(), io::Error> {
-        let params = tuning_params(sys, &self.options, modulation, probe);
+        let mut options = self.options.clone();
+        options.tlv = tlv;
+        let params = tuning_params(sys, &options, modulation, probe, raw);
         let mut buf = params_command(cmd::SET_PARAMS, sys, freq_khz, &params);
         self.transact_checked(&mut buf, "SET_PARAMS")
     }
@@ -686,10 +1069,10 @@ impl Px4DaemonTuner {
         // PxMltReceiver::SetCapture starts USB capture independently of readers.
         // This reader-free probe still needs verification on real hardware.
         // Never toggle capture on a live data connection.
-        self.open_receiver(system::ISDB_C)?;
+        self.open_or_adopt(system::ISDB_C, false)?;
         let result = (|| {
             self.set_capture(true)?;
-            self.set_params(system::ISDB_C, freq_khz, 0, true)?;
+            self.set_params(system::ISDB_C, freq_khz, 0, false, true, false)?;
             self.tune()?;
             let mut buf = params_command(cmd::GET_PARAMS, 0, 0, &[(3, 0)]);
             self.transact_checked(&mut buf, "GET_PARAMS")?;
@@ -787,6 +1170,9 @@ impl Px4DaemonTuner {
 
     pub fn set_channel(&self, space: u32, channel: u32) -> Result<(), io::Error> {
         let target = tune_target(space, channel, &self.options)?;
+        // Any retune ends a previous combined tune and frees its receivers.
+        let previous_bond = self.bond.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(previous_bond);
         let sys = target.system;
         let freq_khz = target.freq_khz;
         let j83b = space == 3 && self.options.j83b;
@@ -794,25 +1180,53 @@ impl Px4DaemonTuner {
         // 受信機セッション) は意味がなく、77 波ぶんの時間だけ掛かる。
         let mut modulation = target.modulation;
         if sys == system::ISDB_C && modulation == 0 {
-            modulation = self
-                .catv_modulations
+            let key = (self.ctrl_sock_path.clone(), freq_khz);
+            modulation = qam_cache()
                 .lock()
-                .map_err(|_| io::Error::other("px4daemon QAM cache lock poisoned"))?
-                .get(&channel)
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
                 .copied()
                 .unwrap_or(0);
             if modulation == 0 {
                 // Release the current receiver before the disposable probe.
-                // Cached channels subsequently retain the live retune path.
+                // Cached carriers subsequently retain the live retune path.
                 self.release_receiver()?;
                 modulation = self.probe_catv_modulation(freq_khz)?;
-                self.catv_modulations
+                qam_cache()
                     .lock()
-                    .map_err(|_| io::Error::other("px4daemon QAM cache lock poisoned"))?
-                    .insert(channel, modulation);
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, modulation);
             }
         }
 
+        self.tune_prepared(sys, freq_khz, modulation, target.tlv, target.bonded, j83b)?;
+        if target.bonded {
+            self.setup_bond(freq_khz, modulation)?;
+        }
+
+        self.current_space.store(space as i32, Ordering::Release);
+        info!(
+            "[px4daemon] tuned: space={} channel={} → system=0x{:02x} {} kHz{}",
+            space,
+            channel,
+            sys,
+            freq_khz,
+            if target.tlv { " (TLV)" } else { "" }
+        );
+        Ok(())
+    }
+
+    /// Tune with QAM already resolved: (re)OPEN when the system changes,
+    /// attach the data socket, SET_PARAMS + TUNE, purge, start capture.
+    fn tune_prepared(
+        &self,
+        sys: u32,
+        freq_khz: u32,
+        modulation: u32,
+        tlv: bool,
+        raw: bool,
+        j83b: bool,
+    ) -> Result<(), io::Error> {
         // Deliberately *not* stopping capture here when the receiver stays
         // open. Capture toggling is what makes re-tuning fragile on this
         // daemon:
@@ -839,7 +1253,7 @@ impl Px4DaemonTuner {
         let opened = self.opened_system.load(Ordering::Acquire) as u32;
         if opened != sys {
             self.release_receiver()?;
-            self.open_receiver(sys)?;
+            self.open_or_adopt(sys, true)?;
         }
 
         self.apply_lnb_power(sys)?;
@@ -849,7 +1263,7 @@ impl Px4DaemonTuner {
             // daemon-buffer-sized chunk during simultaneous tuner startup.
             self.attach_data_socket()?;
         }
-        self.set_params(sys, freq_khz, modulation, false)?;
+        self.set_params(sys, freq_khz, modulation, tlv && !raw, false, raw)?;
         if let Err(error) = self.tune() {
             if j83b && error.kind() == io::ErrorKind::AddrNotAvailable {
                 // ISDB-C tuning parameters intentionally retain symbol rate 5274;
@@ -861,16 +1275,219 @@ impl Px4DaemonTuner {
             }
             return Err(error);
         }
-        self.purge_ts_stream();
+        self.purge_data();
         if !self.capturing.load(Ordering::Acquire) {
             self.set_capture(true)?;
         }
 
-        self.current_space.store(space as i32, Ordering::Release);
-        info!(
-            "[px4daemon] tuned: space={} channel={} → system=0x{:02x} {} kHz",
-            space, channel, sys, freq_khz
+        Ok(())
+    }
+
+    /// Read raw TS until a TSMF header arrives (`None` after `wait`).
+    fn read_tsmf_header(&self, wait: Duration) -> Result<Option<ExtHeader>, io::Error> {
+        let deadline = Instant::now() + wait;
+        let mut acc = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        while Instant::now() < deadline {
+            if !self.wait_data(20) {
+                continue;
+            }
+            match self.read_data(&mut buf) {
+                Ok((n, _)) => acc.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
+            // About 0.1 s of a 256QAM carrier. The first bytes after a retune
+            // can still be the previous frequency's (PURGE races data in
+            // flight), so judge by the last header, not the first.
+            if acc.len() >= HEADER_SAMPLE_BYTES {
+                return Ok(tsmf_bond::find_last_header(&acc));
+            }
+        }
+        Ok(tsmf_bond::find_last_header(&acc))
+    }
+
+    /// A second receiver on the same daemon for another carrier of a group.
+    fn open_helper(&self, carriers: u8) -> Result<Px4DaemonTuner, io::Error> {
+        let ctrl = UnixStream::connect(&self.ctrl_sock_path)?;
+        ctrl.set_read_timeout(Some(Duration::from_secs(35)))?;
+        ctrl.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let helper = Self::with_ctrl(
+            ctrl,
+            self.ctrl_sock_path.clone(),
+            self.data_sock_path.clone(),
+            -1,
+            self.options.clone(),
         );
+        // Helpers live and die with the combined tune; never hand one on.
+        helper.no_park.store(true, Ordering::Release);
+        match helper.open_or_adopt(system::ISDB_C, true) {
+            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "px4daemon: a {carriers}-carrier group needs {carriers} free ISDB-C receivers on this DriverHost"
+                ),
+            )),
+            other => other.map(|()| helper),
+        }
+    }
+
+    /// Tune a helper to `freq_khz` and return the carrier's TSMF header.
+    fn tune_member(&self, freq_khz: u32, modulation: u32) -> Result<Option<ExtHeader>, io::Error> {
+        self.tune_prepared(system::ISDB_C, freq_khz, modulation, false, true, false)?;
+        self.read_tsmf_header(TSMF_HEADER_WAIT)
+    }
+
+    /// Find carriers 2..=n of the group whose first carrier this tuner is
+    /// tuned to, on helpers, and start combining them.
+    fn setup_bond(&self, head_khz: u32, modulation: u32) -> Result<(), io::Error> {
+        let started = Instant::now();
+        let head = self.read_tsmf_header(TSMF_HEADER_WAIT)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "px4daemon: no TSMF header on this carrier",
+            )
+        })?;
+        if !head.is_multi_carrier() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "px4daemon: not a multi-carrier (extended TSMF) carrier",
+            ));
+        }
+        if head.carrier_sequence != 1 {
+            // Each group is registered once, on its first carrier.
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "px4daemon: carrier {}/{} of group {}; the group is tuned on its first carrier",
+                    head.carrier_sequence, head.number_of_carriers, head.group_id
+                ),
+            ));
+        }
+        let carriers = head.number_of_carriers;
+        let members = carriers as usize - 1;
+        let key = (self.ctrl_sock_path.clone(), head_khz);
+        let cached = bond_groups()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+
+        let matches = |h: &Option<ExtHeader>, seq: usize| {
+            h.as_ref().is_some_and(|h| {
+                h.is_multi_carrier()
+                    && h.group_id == head.group_id
+                    && h.number_of_carriers == carriers
+                    && h.carrier_sequence as usize == seq
+            })
+        };
+
+        let mut helpers: Vec<Option<Px4DaemonTuner>> = (0..members).map(|_| None).collect();
+        let mut freqs = vec![0u32; members];
+        if let Some(known) = cached.filter(|f| f.len() == members) {
+            for (i, &freq) in known.iter().enumerate() {
+                let helper = self.open_helper(carriers)?;
+                let header = helper.tune_member(freq, modulation).or_else(|e| {
+                    if e.kind() == io::ErrorKind::AddrNotAvailable {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                })?;
+                if !matches(&header, i + 2) {
+                    // The plant changed; forget and search again below.
+                    bond_groups()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                    helpers.iter_mut().for_each(|h| *h = None);
+                    drop(helper);
+                    break;
+                }
+                freqs[i] = freq;
+                helpers[i] = Some(helper);
+            }
+        }
+        if helpers.iter().any(Option::is_none) {
+            helpers.iter_mut().for_each(|h| *h = None);
+            let mut candidates: Vec<u32> = (0..CATV_CHANNELS)
+                .filter_map(|ch| catv_plan_frequency(ch, self.options.coffset).ok())
+                .filter(|&f| f != head_khz && f.abs_diff(head_khz) <= BOND_SEARCH_RANGE_KHZ)
+                .collect();
+            // Nearest first; above before below at the same distance.
+            candidates.sort_by_key(|&f| (f.abs_diff(head_khz), f < head_khz));
+            let mut probe: Option<Px4DaemonTuner> = None;
+            for freq in candidates {
+                if helpers.iter().all(Option::is_some) {
+                    break;
+                }
+                let helper = match probe.take() {
+                    Some(h) => h,
+                    None => self.open_helper(carriers)?,
+                };
+                let header = match helper.tune_member(freq, modulation) {
+                    Ok(h) => h,
+                    Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => None,
+                    Err(e) => return Err(e),
+                };
+                let seq = header.as_ref().map_or(0, |h| h.carrier_sequence as usize);
+                if seq >= 2 && matches(&header, seq) && helpers[seq - 2].is_none() {
+                    info!(
+                        "[px4daemon] group {} carrier {}/{} at {} kHz",
+                        head.group_id, seq, carriers, freq
+                    );
+                    freqs[seq - 2] = freq;
+                    helpers[seq - 2] = Some(helper);
+                } else {
+                    probe = Some(helper);
+                }
+            }
+            if helpers.iter().any(Option::is_none) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!(
+                        "px4daemon: group {} has {} carriers but only {} were found within {} MHz of {} kHz",
+                        head.group_id,
+                        carriers,
+                        1 + helpers.iter().filter(|h| h.is_some()).count(),
+                        BOND_SEARCH_RANGE_KHZ / 1000,
+                        head_khz
+                    ),
+                ));
+            }
+            bond_groups()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, freqs.clone());
+        }
+
+        let helpers: Vec<Px4DaemonTuner> = helpers.into_iter().map(Option::unwrap).collect();
+        // Discovery took a while; start every carrier from fresh data.
+        self.purge_data();
+        for h in &helpers {
+            h.purge_data();
+        }
+        info!(
+            "[px4daemon] combining group {} ({} carriers: {} kHz + {:?} kHz) after {:?}",
+            head.group_id,
+            carriers,
+            head_khz,
+            freqs,
+            started.elapsed()
+        );
+        *self.bond.lock().unwrap_or_else(|e| e.into_inner()) = Some(Bond {
+            combiner: BondCombiner::new(helpers.len() + 1),
+            helpers,
+            scratch: vec![0u8; 256 * 1024],
+            last_log: Instant::now(),
+        });
         Ok(())
     }
 
@@ -919,7 +1536,7 @@ impl Px4DaemonTuner {
         buf[8] != 0
     }
 
-    pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {
+    fn wait_data(&self, timeout_ms: u32) -> bool {
         use nix::poll::{poll, PollFd, PollFlags};
 
         let guard = match self.data.lock() {
@@ -948,7 +1565,7 @@ impl Px4DaemonTuner {
     /// Read raw TS or TLV without packet alignment or truncation.
     /// Returns `(bytes_read, remaining)`; the daemon does not report
     /// a backlog, so `remaining` is always 0.
-    pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
+    fn read_data(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
         let mut guard = self
             .data
             .lock()
@@ -960,16 +1577,27 @@ impl Px4DaemonTuner {
             ));
         };
         match sock.read(buf) {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "px4daemon: data socket closed by the daemon",
-            )),
+            Ok(0) => {
+                self.broken.store(true, Ordering::Release);
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "px4daemon: data socket closed by the daemon",
+                ))
+            }
             Ok(n) => Ok((n, 0)),
-            Err(e) => Err(e),
+            Err(e) => {
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    self.broken.store(true, Ordering::Release);
+                }
+                Err(e)
+            }
         }
     }
 
-    pub fn purge_ts_stream(&self) {
+    fn purge_data(&self) {
         // Ask the daemon to drop what it has buffered for us...
         if let Ok(guard) = self.data.lock() {
             if let Some(sock) = guard.as_ref() {
@@ -982,27 +1610,143 @@ impl Px4DaemonTuner {
         }
 
         // ...and drain whatever is already in flight towards us.
+        //
+        // PURGE has no reply and is handled by the connection's command
+        // thread, while a separate writer thread may already hold a chunk
+        // taken from the buffer before the purge. Draining at once leaves
+        // that tail to arrive *after* we start reading, followed by the
+        // post-purge data: a gap inside the delivered stream (continuity
+        // errors on every PID ~0.3 s into each tune, measured). Give the
+        // daemon a moment to act on the purge and flush the tail first.
+        std::thread::sleep(PURGE_SETTLE);
         let mut discard = vec![0u8; 65536];
-        for _ in 0..16 {
-            if !self.wait_ts_stream(0) {
+        for _ in 0..64 {
+            if !self.wait_data(0) {
                 break;
             }
-            match self.get_ts_stream(&mut discard) {
+            match self.read_data(&mut discard) {
                 Ok((n, _)) if n > 0 => continue,
                 _ => break,
             }
         }
     }
 
+    fn data_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.data.lock().ok()?.as_ref().map(|s| s.as_raw_fd())
+    }
+
+    pub fn wait_ts_stream(&self, timeout_ms: u32) -> bool {
+        let fds: Vec<std::os::unix::io::RawFd> = {
+            let guard = self.bond.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(bond) = guard.as_ref() else {
+                drop(guard);
+                return self.wait_data(timeout_ms);
+            };
+            if bond.combiner.pending() > 0 {
+                return true;
+            }
+            std::iter::once(self.data_fd())
+                .chain(bond.helpers.iter().map(|h| h.data_fd()))
+                .flatten()
+                .collect()
+        };
+        let mut pfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: the descriptors belong to sockets owned by this tuner and its
+        // helpers; a socket closed meanwhile only makes poll report POLLNVAL.
+        let n = unsafe {
+            libc::poll(
+                pfds.as_mut_ptr(),
+                pfds.len() as libc::nfds_t,
+                timeout_ms.min(i32::MAX as u32) as i32,
+            )
+        };
+        n > 0 && pfds.iter().any(|p| p.revents & libc::POLLIN != 0)
+    }
+
+    /// Read raw TS or TLV without packet alignment or truncation. A combined
+    /// group (space 5) returns whole TLV packets once the carriers are aligned.
+    pub fn get_ts_stream(&self, buf: &mut [u8]) -> Result<(usize, usize), io::Error> {
+        let mut guard = self.bond.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bond) = guard.as_mut() else {
+            drop(guard);
+            return self.read_data(buf);
+        };
+        let Bond {
+            helpers,
+            combiner,
+            scratch,
+            last_log,
+        } = bond;
+        let now = Instant::now();
+        for carrier in 0..=helpers.len() {
+            let source = if carrier == 0 {
+                self
+            } else {
+                &helpers[carrier - 1]
+            };
+            for _ in 0..16 {
+                match source.read_data(scratch) {
+                    Ok((n, _)) => combiner.push(carrier, &scratch[..n], now),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        combiner.pump();
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            let stats = combiner.stats();
+            info!(
+                "[px4daemon] multi-carrier: synced={} resyncs={} tlv ok={} broken={}",
+                stats.synced, stats.resyncs, stats.tlv_good, stats.tlv_bad
+            );
+            *last_log = Instant::now();
+        }
+        match combiner.read(buf) {
+            0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            n => Ok((n, combiner.pending())),
+        }
+    }
+
+    pub fn purge_ts_stream(&self) {
+        let mut guard = self.bond.lock().unwrap_or_else(|e| e.into_inner());
+        self.purge_data();
+        if let Some(bond) = guard.as_mut() {
+            for h in &bond.helpers {
+                h.purge_data();
+            }
+            bond.combiner.clear();
+        }
+    }
+
     pub fn enum_tuning_space(&self, space: u32) -> Option<String> {
         // Use the plan's range validation so enumeration and SetChannel agree.
-        tune_target(space, 0, &self.options).ok()?;
+        // With +tlv, spaces 0-2 keep their names (so space 3 keeps its index)
+        // but expose no channels.
+        if !(self.options.tlv && space < 3) {
+            tune_target(space, 0, &self.options).ok()?;
+        }
         match space {
             0 => Some("GR".to_string()),
             1 => Some("BS".to_string()),
             2 => Some("CS".to_string()),
             3 if self.options.j83b => Some("J.83B".to_string()),
             3 => Some("CATV".to_string()),
+            CATV_TLV_SPACE => Some("CATV-TLV".to_string()),
+            CATV_BOND_SPACE => Some("CATV-8K".to_string()),
             _ => None,
         }
     }
@@ -1037,6 +1781,23 @@ impl Drop for Px4DaemonTuner {
         // a purge to drop the previous channel's bytes — keeps one stream
         // thread alive for the whole life of the receiver. This matches what
         // a BonDriver `SetChannel` does anyway.
+        if self.parkable() {
+            // Hand the open receiver to the next tuner instead of closing it
+            // (see `PARK_TTL`). A socket pair stands in for the connection the
+            // shell never uses.
+            if let Ok((dummy, _peer)) = UnixStream::pair() {
+                let shell = Self::with_ctrl(
+                    dummy,
+                    self.ctrl_sock_path.clone(),
+                    self.data_sock_path.clone(),
+                    self.index,
+                    self.options.clone(),
+                );
+                shell.swap_state(self);
+                park(shell);
+                return;
+            }
+        }
         self.drop_data_socket();
         if self.lnb_on.load(Ordering::Acquire) {
             // The daemon reference-counts LNB power and asserts the calls
@@ -1122,7 +1883,9 @@ mod tests {
             TuneTarget {
                 system: system::ISDB_C,
                 freq_khz: 93_250,
-                modulation: 256
+                modulation: 256,
+                tlv: false,
+                bonded: false,
             }
         );
         assert_eq!(channel_name(3, 0, &options).as_deref(), Some("H01"));
@@ -1132,7 +1895,9 @@ mod tests {
             TuneTarget {
                 system: system::ISDB_C,
                 freq_khz: 587_250,
-                modulation: 256
+                modulation: 256,
+                tlv: false,
+                bonded: false,
             }
         );
         assert_eq!(channel_name(3, 76, &options).as_deref(), Some("H77"));
@@ -1246,7 +2011,7 @@ mod tests {
         );
         let (_, options, _, _) = parse_path("px4daemon:any+tlv").unwrap();
         assert_eq!(
-            tuning_params(system::ISDB_C, &options, 256, false)[4],
+            tuning_params(system::ISDB_C, &options, 256, false, false)[4],
             (5, 0)
         );
         for suffix in [
@@ -1281,7 +2046,7 @@ mod tests {
             tlv: true,
             ..Default::default()
         };
-        let params = tuning_params(system::ISDB_C, &options, 256, false);
+        let params = tuning_params(system::ISDB_C, &options, 256, false, false);
         let wire = params_command(cmd::SET_PARAMS, system::ISDB_C, 166_725, &params);
         let words: Vec<u32> = wire
             .chunks_exact(4)
@@ -1292,17 +2057,23 @@ mod tests {
             vec![17, 0, 0x40, 166_725, 7, 1, 6, 2, 5274, 3, 256, 4, 1, 5, 14, 6, 0, 7, 1]
         );
         assert_eq!(wire.len(), 76);
-        let normal = tuning_params(system::ISDB_C, &ReceiverOptions::default(), 64, false);
+        let normal = tuning_params(
+            system::ISDB_C,
+            &ReceiverOptions::default(),
+            64,
+            false,
+            false,
+        );
         assert_eq!(normal, vec![(1, 6), (2, 5274), (3, 64)]);
         assert_eq!(
             params_command(cmd::SET_PARAMS, system::ISDB_C, 110_800, &normal).len(),
             44
         );
         assert_eq!(
-            tuning_params(system::ISDB_C, &options, 0, true),
+            tuning_params(system::ISDB_C, &options, 0, true, false),
             vec![(1, 6), (2, 5274), (3, 0)]
         );
-        assert!(tuning_params(system::ISDB_S, &options, 256, false).is_empty());
+        assert!(tuning_params(system::ISDB_S, &options, 256, false, false).is_empty());
         let tsmf = ReceiverOptions {
             tsmf: Some(0),
             ..Default::default()
@@ -1312,7 +2083,7 @@ mod tests {
                 cmd::SET_PARAMS,
                 system::ISDB_C,
                 166_725,
-                &tuning_params(system::ISDB_C, &tsmf, 256, false)
+                &tuning_params(system::ISDB_C, &tsmf, 256, false, false)
             )
             .len(),
             68
@@ -1655,5 +2426,201 @@ mod tests {
         assert!(space_channel_to_freq(2, 12).is_err());
         assert!(space_channel_to_freq(3, 51).is_err());
         assert!(space_channel_to_freq(4, 0).is_err());
+    }
+
+    #[test]
+    fn same_daemon_compares_control_sockets() {
+        assert!(same_daemon(
+            "px4daemon:any+tlv+coffset=458000@/run/a.sock",
+            "px4daemon:any+qam=256@/run/a.sock"
+        ));
+        assert!(same_daemon("px4daemon:0", "px4daemon:any+tlv"));
+        assert!(!same_daemon(
+            "px4daemon:any@/run/a.sock",
+            "px4daemon:any@/run/b.sock"
+        ));
+        assert!(!same_daemon("px4daemon:any", "C:/BonDriver_PX4.dll"));
+    }
+
+    #[test]
+    fn one_receiver_serves_catv_ts_and_tlv_spaces() {
+        let path = "px4daemon:any+qam=256@/run/px4_ctrl_pipe.sock";
+        let (_, options, _, _) = parse_path(path).unwrap();
+
+        // Space 3: TS, same carriers as before, now extended into the UHF band.
+        let ts = tune_target(3, 9, &options).unwrap();
+        assert!(!ts.tlv);
+        assert_eq!(
+            tuning_params(ts.system, &options, ts.modulation, false, false).len(),
+            3
+        );
+        assert_eq!(tune_target(3, 51, &options).unwrap().freq_khz, 473_000);
+        assert_eq!(channel_name(3, 51, &options).as_deref(), Some("U13"));
+
+        // Space 4: TLV on the same frequencies, always 256QAM.
+        let tlv = tune_target(CATV_TLV_SPACE, 9, &options).unwrap();
+        assert!(tlv.tlv);
+        assert_eq!(tlv.freq_khz, ts.freq_khz);
+        // The measured BS4K carriers: 225 MHz (C22) and 587-605 MHz (U32-U35).
+        assert_eq!(
+            tune_target(CATV_TLV_SPACE, 10, &options).unwrap().freq_khz,
+            224_650
+        );
+        assert_eq!(
+            tune_target(CATV_TLV_SPACE, 70, &options).unwrap().freq_khz,
+            587_000
+        );
+        assert_eq!(
+            tune_target(CATV_TLV_SPACE, 73, &options).unwrap().freq_khz,
+            605_000
+        );
+        assert_eq!(
+            channel_name(CATV_TLV_SPACE, 70, &options).as_deref(),
+            Some("U32")
+        );
+        assert!(tune_target(CATV_TLV_SPACE, 101, &options).is_err());
+        let mut tlv_options = options.clone();
+        tlv_options.tlv = tlv.tlv;
+        let params = tuning_params(tlv.system, &tlv_options, tlv.modulation, false, false);
+        assert_eq!(&params[2..], &[(3, 256), (4, 1), (5, 0), (6, 0), (7, 1)]);
+
+        // Auto QAM still means 256 for TLV.
+        let (_, auto, _, _) = parse_path("px4daemon:any").unwrap();
+        assert_eq!(
+            tune_target(CATV_TLV_SPACE, 0, &auto).unwrap().modulation,
+            256
+        );
+        assert_eq!(tune_target(3, 0, &auto).unwrap().modulation, 0);
+
+        assert!(tune_delivers_tlv(path, CATV_TLV_SPACE));
+        assert!(!tune_delivers_tlv(path, 3));
+        assert!(!tune_delivers_tlv(path, 0));
+        // Legacy +tlv receivers: TLV on space 3 and no separate TLV space.
+        assert!(tune_delivers_tlv("px4daemon:any+tlv", 3));
+        assert!(!tune_delivers_tlv("px4daemon:any+tlv", CATV_TLV_SPACE));
+        // J.83B has no TSMF.
+        assert!(!tune_delivers_tlv("px4daemon:0+j83b", CATV_TLV_SPACE));
+    }
+
+    #[test]
+    fn tlv_receivers_expose_only_the_catv_space() {
+        let (_, options, _, _) = parse_path("px4daemon:any+tlv+qam=256").unwrap();
+        for space in 0..3 {
+            assert!(tune_target(space, 0, &options).is_err(), "space {space}");
+            assert_eq!(channel_name(space, 0, &options), None, "space {space}");
+        }
+        assert_eq!(channel_name(3, 9, &options).as_deref(), Some("C22"));
+        assert!(tune_target(3, 9, &options).is_ok());
+
+        // Without +tlv the terrestrial space stays available.
+        let (_, options, _, _) = parse_path("px4daemon:any+qam=256").unwrap();
+        assert_eq!(channel_name(0, 0, &options).as_deref(), Some("GR13"));
+    }
+
+    /// 複数搬送波 (BS8K, U29 = 569 MHz から3波) を合成して TLV が流れるか。
+    /// ISDB-C を受信できる受信機が同じ DriverHost に3つ以上必要。
+    /// 例: PX4_RUNTIME_DIR の制御ソケットを付けて
+    /// `PX4_TEST_BOND_RECEIVER=px4daemon:any+qam=256@…/px4_ctrl_pipe.sock`。
+    #[test]
+    #[ignore = "requires DriverHost_PX4 with three ISDB-C receivers and BS8K on CATV"]
+    fn hardware_bs8k_group_combines_into_tlv() {
+        let path = std::env::var("PX4_TEST_BOND_RECEIVER")
+            .unwrap_or_else(|_| "px4daemon:any+qam=256".to_string());
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+        let started = std::time::Instant::now();
+        tuner
+            .set_channel(CATV_BOND_SPACE, 67)
+            .expect("tune BS8K group on U29");
+        eprintln!("set_channel took {:?}", started.elapsed());
+        let mut pending = Vec::new();
+        let mut buf = vec![0; 1 << 20];
+        let (mut packets, mut total) = (0usize, 0usize);
+        let mut first_byte = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if !tuner.wait_ts_stream(100) {
+                continue;
+            }
+            match tuner.get_ts_stream(&mut buf) {
+                Ok((n, _)) => {
+                    first_byte.get_or_insert_with(|| started.elapsed());
+                    pending.extend_from_slice(&buf[..n]);
+                    total += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("read failed: {e}"),
+            }
+            let mut consumed = 0;
+            while pending.len() - consumed >= 4 {
+                let header = &pending[consumed..consumed + 4];
+                assert_eq!(header[0], 0x7f, "lost TLV boundary at packet {packets}");
+                let size = 4 + usize::from(u16::from_be_bytes([header[2], header[3]]));
+                if pending.len() - consumed < size {
+                    break;
+                }
+                consumed += size;
+                packets += 1;
+            }
+            pending.drain(..consumed);
+        }
+        let seconds = deadline.duration_since(started).as_secs_f64();
+        eprintln!(
+            "first byte after {first_byte:?}; {packets} TLV packets, {total} bytes ({:.1} Mbps avg)",
+            total as f64 * 8.0 / seconds / 1e6
+        );
+        // 3波 x 256QAM で約 100 Mbps。合成できていれば 1 波分 (38 Mbps) を大きく超える。
+        assert!(
+            total as f64 * 8.0 / seconds > 50e6,
+            "too little data: {total} bytes"
+        );
+    }
+
+    /// 群の2番目以降の搬送波は、空間 5 では登録しない (第1搬送波で選局する)。
+    #[test]
+    #[ignore = "requires DriverHost_PX4 and BS8K on CATV"]
+    fn hardware_bs8k_second_carrier_is_not_a_channel() {
+        let path = std::env::var("PX4_TEST_BOND_RECEIVER")
+            .unwrap_or_else(|_| "px4daemon:any+qam=256".to_string());
+        let tuner = Px4DaemonTuner::new(&path).expect("open receiver");
+        let err = tuner
+            .set_channel(CATV_BOND_SPACE, 68)
+            .expect_err("U30 is carrier 2");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable, "{err}");
+        assert!(err.to_string().contains("carrier 2/3"), "{err}");
+    }
+
+    #[test]
+    fn multi_carrier_space_tunes_raw_slots_and_delivers_tlv() {
+        let (_, options, _, _) = parse_path("px4daemon:any+qam=256").unwrap();
+        // U29 = 569 MHz: first carrier of the BS8K group measured 2026-10-30.
+        let target = tune_target(CATV_BOND_SPACE, 67, &options).unwrap();
+        assert_eq!(
+            target,
+            TuneTarget {
+                system: system::ISDB_C,
+                freq_khz: 569_000,
+                modulation: 256,
+                tlv: true,
+                bonded: true,
+            }
+        );
+        assert_eq!(
+            channel_name(CATV_BOND_SPACE, 67, &options).as_deref(),
+            Some("U29")
+        );
+        assert!(tune_delivers_tlv("px4daemon:any+qam=256", CATV_BOND_SPACE));
+        // TSMF_MODE=2 alone: no relative stream, no TLV extraction in the daemon.
+        assert_eq!(
+            tuning_params(system::ISDB_C, &options, 256, false, true),
+            vec![(1, 6), (2, 5274), (3, 256), (4, 2)]
+        );
+        // +tlv and +j83b receivers have no multi-carrier space.
+        for path in ["px4daemon:any+tlv", "px4daemon:any+j83b"] {
+            let (_, options, _, _) = parse_path(path).unwrap();
+            assert!(
+                tune_target(CATV_BOND_SPACE, 67, &options).is_err(),
+                "{path}"
+            );
+        }
     }
 }

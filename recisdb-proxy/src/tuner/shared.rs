@@ -1352,13 +1352,14 @@ impl SharedTuner {
             }
         }
 
-        // Purge any stale data from the buffer
-        tuner.purge_ts_stream();
-
-        // Short stabilization wait for new driver to have something in buffer
-        std::thread::sleep(std::time::Duration::from_millis(
-            timing::SET_CHANNEL_STABILIZATION_SLEEP_MS,
-        ));
+        // Purge stale data and give the driver a moment to fill its buffer —
+        // except where SetChannel itself waits for lock and purges.
+        if !crate::bondriver::set_channel_settles_stream(&tuner_path) {
+            tuner.purge_ts_stream();
+            std::thread::sleep(std::time::Duration::from_millis(
+                timing::SET_CHANNEL_STABILIZATION_SLEEP_MS,
+            ));
+        }
 
         // ===== B25 decoder init =====
         let b25_opt = DecoderOptions {
