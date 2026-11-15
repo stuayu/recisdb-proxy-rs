@@ -179,7 +179,10 @@ pub async fn get_channels(
                 region_id: c.region_id,
                 prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                 terrestrial_region: c.terrestrial_region,
-                wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
+                wide_area_prefectures: wide_area_prefectures(c.nid)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
                 is_enabled: c.is_enabled,
                 priority: c.priority,
                 failure_count: c.failure_count,
@@ -226,7 +229,10 @@ pub async fn get_channels(
                         region_id: c.region_id,
                         prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
                         terrestrial_region: c.terrestrial_region,
-                        wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
+                        wide_area_prefectures: wide_area_prefectures(c.nid)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
                         is_enabled: c.is_enabled,
                         priority: c.priority,
                         failure_count: c.failure_count,
@@ -305,9 +311,15 @@ pub async fn get_channels(
                                     bon_channel: c.bon_channel,
                                     band_type: c.band_type,
                                     region_id: c.region_id,
-                                    prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
+                                    prefecture_code: c
+                                        .terrestrial_region
+                                        .as_deref()
+                                        .and_then(prefecture_code),
                                     terrestrial_region: c.terrestrial_region.clone(),
-                                    wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
+                                    wide_area_prefectures: wide_area_prefectures(c.nid)
+                                        .into_iter()
+                                        .map(str::to_owned)
+                                        .collect(),
                                     is_enabled: c.is_enabled,
                                     priority: c.priority,
                                     failure_count: c.failure_count,
@@ -365,9 +377,15 @@ pub async fn get_channels(
                             bon_channel: c.bon_channel,
                             band_type: c.band_type,
                             region_id: c.region_id,
-                            prefecture_code: c.terrestrial_region.as_deref().and_then(prefecture_code),
+                            prefecture_code: c
+                                .terrestrial_region
+                                .as_deref()
+                                .and_then(prefecture_code),
                             terrestrial_region: c.terrestrial_region,
-                            wide_area_prefectures: wide_area_prefectures(c.nid).into_iter().map(str::to_owned).collect(),
+                            wide_area_prefectures: wide_area_prefectures(c.nid)
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect(),
                             is_enabled: c.is_enabled,
                             priority: c.priority,
                             failure_count: c.failure_count,

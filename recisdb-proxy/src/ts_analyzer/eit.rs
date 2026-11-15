@@ -579,7 +579,9 @@ mod tests {
         assert_eq!(audios[0].sampling_rate, 48_000);
         assert_eq!(audios[0].langs, ["jpn"]);
 
-        let other_rate = [0xC4, 9, 0x02, 0x03, 0x21, 0x02, 0x00, 0x5B, b'e', b'n', b'g'];
+        let other_rate = [
+            0xC4, 9, 0x02, 0x03, 0x21, 0x02, 0x00, 0x5B, b'e', b'n', b'g',
+        ];
         let audio = parse_audio_components(&other_rate).remove(0);
         assert_eq!(audio.sampling_rate, 32_000);
         assert_eq!(audio.langs, ["eng"]);
@@ -587,7 +589,9 @@ mod tests {
 
     #[test]
     fn malformed_audio_language_is_normalized_and_multilingual_stays_nonempty() {
-        let descriptors = [0xC4, 12, 0x02, 0x02, 0x01, 0x02, 0x00, 0xFF, 0xFF, b'p', b'n', b'e', b'n', b'g'];
+        let descriptors = [
+            0xC4, 12, 0x02, 0x02, 0x01, 0x02, 0x00, 0xFF, 0xFF, b'p', b'n', b'e', b'n', b'g',
+        ];
         let audio = parse_audio_components(&descriptors).remove(0);
         assert_eq!(audio.langs, ["etc", "eng"]);
         assert_eq!(audio.sampling_rate, 48_000);
@@ -663,8 +667,18 @@ mod tests {
         assert_eq!(
             parse_genres(&descriptors),
             vec![
-                EitGenre { lv1: 0xE, lv2: 1, un1: 2, un2: 3 },
-                EitGenre { lv1: 2, lv2: 1, un1: 0xA, un2: 0xB },
+                EitGenre {
+                    lv1: 0xE,
+                    lv2: 1,
+                    un1: 2,
+                    un2: 3
+                },
+                EitGenre {
+                    lv1: 2,
+                    lv2: 1,
+                    un1: 0xA,
+                    un2: 0xB
+                },
             ]
         );
     }
@@ -674,7 +688,10 @@ mod tests {
         let data = [0x12, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
         let mut descriptors = vec![descriptor_tag::EVENT_GROUP, data.len() as u8];
         descriptors.extend_from_slice(&data);
-        assert_eq!(parse_shared_events(&descriptors), vec![(0x0010, 0x0020), (0x0030, 0x0040)]);
+        assert_eq!(
+            parse_shared_events(&descriptors),
+            vec![(0x0010, 0x0020), (0x0030, 0x0040)]
+        );
 
         let group_type_two = [0x22, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40];
         let mut descriptors = vec![descriptor_tag::EVENT_GROUP, group_type_two.len() as u8];

@@ -492,7 +492,9 @@ pub struct EpgProgramsRequest {
     pub include_coverage: bool,
 }
 
-fn default_program_page_limit() -> u32 { 1000 }
+fn default_program_page_limit() -> u32 {
+    1000
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EpgProgramCoverageWire {
@@ -949,7 +951,10 @@ async fn epg_programs(
             db.get_epg_scan_states().map(|states| {
                 states
                     .into_iter()
-                    .filter(|state| payload.network_ids.is_empty() || payload.network_ids.contains(&state.network_id))
+                    .filter(|state| {
+                        payload.network_ids.is_empty()
+                            || payload.network_ids.contains(&state.network_id)
+                    })
                     .map(|state| EpgProgramCoverageWire {
                         network_id: state.network_id,
                         tsid: state.tsid,

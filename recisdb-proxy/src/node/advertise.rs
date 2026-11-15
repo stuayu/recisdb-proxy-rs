@@ -21,9 +21,9 @@ use recisdb_protocol::BandType;
 
 use crate::database::Database;
 use crate::server::listener::DatabaseHandle;
-use crate::tuner::TunerPool;
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::shared::ReaderState;
+use crate::tuner::TunerPool;
 
 use super::store::NodeStore;
 use super::types::{
@@ -206,8 +206,8 @@ pub async fn build_local_advertisements(
         let free_slots = total_slots.saturating_sub(driver.occupied);
         // Keep the legacy meaning: free slots plus slots held only by
         // background work. Reserved/starting entries remain unavailable.
-        let available_slots = total_slots
-            .saturating_sub(driver.occupied.saturating_sub(driver.background));
+        let available_slots =
+            total_slots.saturating_sub(driver.occupied.saturating_sub(driver.background));
         let running = driver
             .running_routes
             .contains(&(route.bon_space, route.bon_channel));

@@ -140,9 +140,9 @@ use serde_json::json;
 
 use crate::database::{ChannelRecord, Database, ProgramRecord, ProgramUpsert};
 use crate::server::channel_resolve;
+use crate::ts_analyzer::{EitAudioComponent, EitVideoComponent};
 use crate::tuner::logo_collector::{collected_logo_keys, logo_path};
 use crate::tuner::EffectiveClaim;
-use crate::ts_analyzer::{EitAudioComponent, EitVideoComponent};
 use crate::web::http_session::HttpStreamSession;
 use crate::web::mirakurun_program_stream;
 use crate::web::state::{SessionProtocol, WebState};
@@ -1228,7 +1228,11 @@ pub async fn stream_service_by_mirakurun_id(
     };
 
     let (rx, cleanup, info) = match &source {
-        channel_resolve::StreamSource::Local { tuner, claim, usage } => (
+        channel_resolve::StreamSource::Local {
+            tuner,
+            claim,
+            usage,
+        } => (
             BodyReceiver::Tuner(tuner.subscribe_with_claim_class(
                 claim.priority,
                 claim.exclusive,
@@ -1617,7 +1621,11 @@ pub async fn stream_program_by_mirakurun_id(
     };
 
     let (rx, cleanup, info) = match &source {
-        channel_resolve::StreamSource::Local { tuner, claim, usage } => (
+        channel_resolve::StreamSource::Local {
+            tuner,
+            claim,
+            usage,
+        } => (
             BodyReceiver::Tuner(tuner.subscribe_with_claim_class(
                 claim.priority,
                 claim.exclusive,
@@ -1714,22 +1722,41 @@ mod tests {
         assert_eq!(json["audios"][0]["langs"][0], "jpn");
         assert_eq!(json["video"]["type"], "h.264");
         assert_eq!(json["video"]["resolution"], "1080i");
-        assert_eq!(json["genres"][0], serde_json::json!({
-            "lv1": 14, "lv2": 1, "un1": 2, "un2": 3
-        }));
+        assert_eq!(
+            json["genres"][0],
+            serde_json::json!({
+                "lv1": 14, "lv2": 1, "un1": 2, "un2": 3
+            })
+        );
         assert!(json.get("audio").is_none());
 
         let old_row = build_mirakurun_program(
-            1, 2, 3, 5, 100, 30, None, None, None, Some(0xE1), None, false, None, None,
+            1,
+            2,
+            3,
+            5,
+            100,
+            30,
+            None,
+            None,
+            None,
+            Some(0xE1),
+            None,
+            false,
+            None,
+            None,
         );
         let json = serde_json::to_value(old_row).unwrap();
         assert!(json.get("audios").is_none());
         assert!(json.get("video").is_none());
         assert_eq!(json["audio"]["componentType"], 0);
         assert_eq!(json["audio"]["samplingRate"], 0);
-        assert_eq!(json["genres"][0], serde_json::json!({
-            "lv1": 14, "lv2": 1, "un1": 0, "un2": 0
-        }));
+        assert_eq!(
+            json["genres"][0],
+            serde_json::json!({
+                "lv1": 14, "lv2": 1, "un1": 0, "un2": 0
+            })
+        );
         for key in ["lv1", "lv2", "un1", "un2"] {
             assert!(json["genres"][0].get(key).is_some());
         }
@@ -2210,7 +2237,11 @@ mod tests {
     #[test]
     fn every_region_id_of_the_home_prefecture_is_gr() {
         let home = recisdb_protocol::broadcast_region::region_ids_from_prefecture_name("東京");
-        assert_eq!(home, vec![1, 23], "sanity: wide-area name has two region ids");
+        assert_eq!(
+            home,
+            vec![1, 23],
+            "sanity: wide-area name has two region ids"
+        );
 
         let services = unique_services(vec![
             gr_row(1, NID_WIDE_AREA, 1024, 21), // region 1

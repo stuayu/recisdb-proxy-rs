@@ -1327,7 +1327,10 @@ mod tests {
         assert_eq!(value["mirakurun"]["enabled"].as_bool(), Some(false));
         for section in ["tsreplace", "preview"] {
             if let Some(table) = value.get(section).and_then(|v| v.as_table()) {
-                assert!(table.get("command_path").is_none(), "[{section}] command_path leaked");
+                assert!(
+                    table.get("command_path").is_none(),
+                    "[{section}] command_path leaked"
+                );
                 assert!(
                     table.get("preprocessor_path").is_none(),
                     "[{section}] preprocessor_path leaked"
@@ -1351,7 +1354,10 @@ mod tests {
         let value: toml::Value = toml::from_str(&enabled).unwrap();
         assert_eq!(value["mirakurun"]["enabled"].as_bool(), Some(true));
         assert_eq!(value["mirakurun"]["home_region"].as_str(), Some("大阪"));
-        assert_eq!(value["preview"]["command_path"].as_str(), Some(r"C:\x\ffmpeg.exe"));
+        assert_eq!(
+            value["preview"]["command_path"].as_str(),
+            Some(r"C:\x\ffmpeg.exe")
+        );
     }
 
     #[test]

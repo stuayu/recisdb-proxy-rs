@@ -743,10 +743,8 @@ fn scan_space_blocking(
 
         // ロック済みだが信号強度を測れない (px4_drv の実験的 J.83B モードなど)。
         // 0.0 dB を「弱すぎる」と扱うと全チャンネルを捨てるので、TS の解析へ進める。
-        let unmeasurable = signal_passes_without_measurement(
-            signal_level,
-            tuner.signal_measurement_unsupported(),
-        );
+        let unmeasurable =
+            signal_passes_without_measurement(signal_level, tuner.signal_measurement_unsupported());
         if unmeasurable {
             info!(
                 "scan_space_blocking: Space={} CH={} Name=\"{}\" - locked, but this receiver mode cannot report signal level; continuing without it",
@@ -1450,7 +1448,6 @@ mod tests {
             (None, Vec::new())
         );
     }
-
 
     #[cfg(unix)]
     #[test]

@@ -2624,7 +2624,9 @@ impl Session {
             } else {
                 self.session_registry.unbind_tuner_claim(self.id).await;
                 self.ts_receiver = None;
-                if let Some(SessionStreamSource::Remote { receiver, .. }) = self.stream_source.as_mut() {
+                if let Some(SessionStreamSource::Remote { receiver, .. }) =
+                    self.stream_source.as_mut()
+                {
                     *receiver = None;
                 }
                 self.state = SessionState::TunerOpen;

@@ -107,7 +107,8 @@ impl RouteSync {
             generation: chrono::Utc::now().timestamp_millis().max(0) as u64,
         };
         for (node_id, credential, endpoints) in peers {
-            let Ok(client) = NodeTransportClient::new(self.state.identity.node_id.clone(), credential)
+            let Ok(client) =
+                NodeTransportClient::new(self.state.identity.node_id.clone(), credential)
             else {
                 continue;
             };

@@ -25,7 +25,10 @@ pub async fn index(
     let html =
         std::str::from_utf8(index.data.as_ref()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
-        [(CACHE_CONTROL, crate::web::api::cache_control_for("index.html"))],
+        [(
+            CACHE_CONTROL,
+            crate::web::api::cache_control_for("index.html"),
+        )],
         Html(html.to_owned()),
     ))
 }

@@ -33,6 +33,7 @@ pub use discovery::{
     inspect_tailscale_path, is_tailscale_ip, parse_interface_addresses, probe_endpoint,
     ProbeConfig,
 };
+pub use epg_sync::EpgProgramSync;
 pub use frame::{FrameFlags, NodeTsFrame};
 pub use identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
 pub use lease::{
@@ -50,7 +51,6 @@ pub use route::{capacity_class, rank_remote_routes, RemoteRouteCandidate, RouteC
 pub use serve::{LocalMuxServer, RemoteEpgMetadataOutcome, ServeError};
 pub use store::{NodeStore, PendingPairing, RouteGroup, StoredNode, StoredRemoteRoute};
 pub use sync::{RouteSync, DEFAULT_SYNC_INTERVAL};
-pub use epg_sync::EpgProgramSync;
 pub use transport::{
     serve_h2c, serve_h2c_on_addresses, LeaseStreamError, NodeCapabilities, NodeHello,
     NodeTransportClient, NodeTransportState, OpenLeaseReply, OpenLeaseRequest, RemoteEpgDwell,

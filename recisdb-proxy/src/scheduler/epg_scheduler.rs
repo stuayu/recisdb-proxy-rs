@@ -69,7 +69,10 @@ fn full_evaluation_is_due(
         now.duration_since(last) >= Duration::from_secs(scheduler_interval_secs.max(1) as u64)
     })
 }
-use recisdb_protocol::{broadcast_region::{classify_nid, is_real_broadcast_service}, BroadcastType};
+use recisdb_protocol::{
+    broadcast_region::{classify_nid, is_real_broadcast_service},
+    BroadcastType,
+};
 use std::{
     collections::HashSet,
     sync::{
@@ -1389,16 +1392,28 @@ mod tests {
 
     #[test]
     fn scan_driver_stays_on_the_first_carrier_while_scans_complete() {
-        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(26), 0), Some(0));
+        assert_eq!(
+            choose_scan_driver_index(&[26, 29, 30], Some(26), 0),
+            Some(0)
+        );
         assert_eq!(choose_scan_driver_index(&[26, 29, 30], None, 0), Some(0));
     }
 
     #[test]
     fn scan_driver_rotates_to_the_next_carrier_after_a_failure() {
-        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(26), 1), Some(1));
-        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(29), 90), Some(2));
+        assert_eq!(
+            choose_scan_driver_index(&[26, 29, 30], Some(26), 1),
+            Some(1)
+        );
+        assert_eq!(
+            choose_scan_driver_index(&[26, 29, 30], Some(29), 90),
+            Some(2)
+        );
         // 末尾まで試したら先頭へ戻る。
-        assert_eq!(choose_scan_driver_index(&[26, 29, 30], Some(30), 3), Some(0));
+        assert_eq!(
+            choose_scan_driver_index(&[26, 29, 30], Some(30), 3),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1907,7 +1922,10 @@ mod tests {
         // 待機中はネットワークごと候補から外れる(未スキャンの TS 2 も出ない)。
         let ranked = rank_targets(&[scanned, never, terrestrial], 1_000, &config());
         assert_eq!(
-            ranked.iter().map(|t| (t.network_id, t.tsid)).collect::<Vec<_>>(),
+            ranked
+                .iter()
+                .map(|t| (t.network_id, t.tsid))
+                .collect::<Vec<_>>(),
             [(0x7FE0, 9)]
         );
 

@@ -183,10 +183,7 @@ impl Database {
 
     /// Last measured first-TS latency for a driver. Used only to derive the
     /// next startup grace window; no separate operator setting is needed.
-    pub fn get_driver_first_ts_latency_ms_by_path(
-        &self,
-        dll_path: &str,
-    ) -> Result<Option<u64>> {
+    pub fn get_driver_first_ts_latency_ms_by_path(&self, dll_path: &str) -> Result<Option<u64>> {
         let value = self
             .conn
             .query_row(
@@ -198,9 +195,9 @@ impl Database {
                 |row| row.get::<_, Option<f64>>(0),
             )
             .optional()?;
-        Ok(value.flatten().and_then(|ms| {
-            ms.is_finite().then_some(ms.max(0.0).round() as u64)
-        }))
+        Ok(value
+            .flatten()
+            .and_then(|ms| ms.is_finite().then_some(ms.max(0.0).round() as u64)))
     }
 
     /// Get combined driver quality score by DLL path. Packet integrity and

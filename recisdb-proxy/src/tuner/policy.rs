@@ -827,9 +827,10 @@ fn decide_fallback(
         }
     }
 
-    if let Some(tuner) = candidate_tuples.iter().find_map(|(path, _, _)| {
-        locked_victim(snapshot, path)
-    }) {
+    if let Some(tuner) = candidate_tuples
+        .iter()
+        .find_map(|(path, _, _)| locked_victim(snapshot, path))
+    {
         return Decision::Reject {
             reason: RejectReason::Locked { tuner },
         };
@@ -1747,7 +1748,9 @@ mod tests {
             entries: vec![orphan.clone()],
         };
         let req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
-        assert!(matches!(decide(&snapshot, &req), Decision::Create { ref evict, .. } if evict.len() == 1));
+        assert!(
+            matches!(decide(&snapshot, &req), Decision::Create { ref evict, .. } if evict.len() == 1)
+        );
 
         orphan.held_for = Duration::from_secs(2);
         let snapshot = TunerSnapshot {
@@ -1802,7 +1805,9 @@ mod tests {
         let mut req = base_request(vec![ChannelKey::space_channel("A.dll", 0, 9)]);
         req.priority = 100;
 
-        assert!(matches!(decide(&snapshot, &req), Decision::Create { evict, .. } if evict.len() == 1));
+        assert!(
+            matches!(decide(&snapshot, &req), Decision::Create { evict, .. } if evict.len() == 1)
+        );
     }
 
     /// Rule 1/3/4: candidate ordering feeds directly into which driver is

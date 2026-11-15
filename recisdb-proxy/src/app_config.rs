@@ -22,7 +22,6 @@ use log::{error, info};
 
 use crate::Args;
 
-
 /// Configuration file format.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct ConfigFile {
@@ -719,8 +718,26 @@ mod tests {
 
     #[test]
     fn boncaslink_resolution_prefers_db_and_supports_explicit_disable() {
-        assert_eq!(recisdb_proxy::resolve_boncaslink_value(None, Some("toml:6900".into())), recisdb_proxy::ResolvedBonCasLinkValue { value: Some("toml:6900".into()), source: "toml" });
-        assert_eq!(recisdb_proxy::resolve_boncaslink_value(Some(String::new()), Some("toml:6900".into())), recisdb_proxy::ResolvedBonCasLinkValue { value: None, source: "db" });
-        assert_eq!(recisdb_proxy::resolve_boncaslink_value(None, None), recisdb_proxy::ResolvedBonCasLinkValue { value: None, source: "none" });
+        assert_eq!(
+            recisdb_proxy::resolve_boncaslink_value(None, Some("toml:6900".into())),
+            recisdb_proxy::ResolvedBonCasLinkValue {
+                value: Some("toml:6900".into()),
+                source: "toml"
+            }
+        );
+        assert_eq!(
+            recisdb_proxy::resolve_boncaslink_value(Some(String::new()), Some("toml:6900".into())),
+            recisdb_proxy::ResolvedBonCasLinkValue {
+                value: None,
+                source: "db"
+            }
+        );
+        assert_eq!(
+            recisdb_proxy::resolve_boncaslink_value(None, None),
+            recisdb_proxy::ResolvedBonCasLinkValue {
+                value: None,
+                source: "none"
+            }
+        );
     }
 }

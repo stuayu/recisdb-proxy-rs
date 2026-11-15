@@ -319,15 +319,23 @@ impl SessionRegistry {
     /// Associate a dashboard session with its live tuner claim.  The binding
     /// lets an override update the actual claim immediately, without waiting
     /// for the next SetChannel request.
-    pub async fn bind_tuner_claim(&self, id: u64, tuner: Arc<SharedTuner>, sub: &TunerSubscription) {
+    pub async fn bind_tuner_claim(
+        &self,
+        id: u64,
+        tuner: Arc<SharedTuner>,
+        sub: &TunerSubscription,
+    ) {
         // An untracked subscription has no claim to update; nothing to bind.
         let Some(claim_id) = sub.claim_id() else {
             return;
         };
-        self.claim_bindings
-            .write()
-            .await
-            .insert(id, ClaimBinding { tuner: Arc::clone(&tuner), claim_id });
+        self.claim_bindings.write().await.insert(
+            id,
+            ClaimBinding {
+                tuner: Arc::clone(&tuner),
+                claim_id,
+            },
+        );
         if let Some(info) = self.sessions.write().await.get_mut(&id) {
             info.locked = tuner.claim(claim_id).is_some_and(|claim| claim.exclusive);
         }
@@ -341,9 +349,12 @@ impl SessionRegistry {
     }
 
     async fn refresh_bound_claim(&self, id: u64, priority: Option<i32>, exclusive: bool) {
-        let binding = self.claim_bindings.read().await.get(&id).map(|b| {
-            (Arc::clone(&b.tuner), b.claim_id)
-        });
+        let binding = self
+            .claim_bindings
+            .read()
+            .await
+            .get(&id)
+            .map(|b| (Arc::clone(&b.tuner), b.claim_id));
         let Some((tuner, claim_id)) = binding else {
             return;
         };
@@ -471,7 +482,10 @@ impl SessionRegistry {
                 info.client_exclusive = e;
             }
         }
-        let (priority, exclusive) = self.get_effective_controls(id).await.unwrap_or((None, false));
+        let (priority, exclusive) = self
+            .get_effective_controls(id)
+            .await
+            .unwrap_or((None, false));
         self.refresh_bound_claim(id, priority, exclusive).await;
     }
 
@@ -490,7 +504,10 @@ impl SessionRegistry {
                 info.override_exclusive = e;
             }
         }
-        let (priority, exclusive) = self.get_effective_controls(id).await.unwrap_or((None, false));
+        let (priority, exclusive) = self
+            .get_effective_controls(id)
+            .await
+            .unwrap_or((None, false));
         self.refresh_bound_claim(id, priority, exclusive).await;
     }
 
@@ -538,11 +555,8 @@ impl SessionRegistry {
             if let Some(binding) = bindings.get(id) {
                 if binding.tuner.awaiting_first_ts() {
                     info.startup_state = "starting".to_string();
-                    info.startup_elapsed_seconds = binding
-                        .tuner
-                        .startup_elapsed_ms()
-                        .unwrap_or(0)
-                        / 1_000;
+                    info.startup_elapsed_seconds =
+                        binding.tuner.startup_elapsed_ms().unwrap_or(0) / 1_000;
                     info.startup_grace_seconds = binding.tuner.startup_grace_ms() / 1_000;
                     info.startup_slow = binding.tuner.startup_slow();
                 } else if info.is_streaming && info.startup_state == "starting" {
@@ -594,7 +608,11 @@ pub enum UpdateStatus {
 
 /// Shared state for the web server.
 pub struct WebState {
-    pub boncaslink_toml: (Option<String>, Option<String>, std::collections::HashMap<String, String>),
+    pub boncaslink_toml: (
+        Option<String>,
+        Option<String>,
+        std::collections::HashMap<String, String>,
+    ),
     /// Monotonic process start time used by the dashboard uptime statistic.
     pub started_at: Instant,
     /// Database handle.
@@ -789,15 +807,11 @@ mod tests {
         let registry = SessionRegistry::new();
         let addr: SocketAddr = "127.0.0.1:12346".parse().unwrap();
         let _shutdown_rx = registry.register(7, addr, SessionProtocol::Bndp).await;
-        let tuner = crate::tuner::SharedTuner::new(
-            crate::tuner::ChannelKey::simple("/dev/test", 1),
-            2,
-        );
+        let tuner =
+            crate::tuner::SharedTuner::new(crate::tuner::ChannelKey::simple("/dev/test", 1), 2);
         let sub = tuner.subscribe_with_claim(10, true);
         let claim_id = sub.claim_id().unwrap();
-        registry
-            .bind_tuner_claim(7, Arc::clone(&tuner), &sub)
-            .await;
+        registry.bind_tuner_claim(7, Arc::clone(&tuner), &sub).await;
 
         registry
             .update_override_controls(7, None, Some(Some(false)))

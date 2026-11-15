@@ -38,7 +38,8 @@ pub use descriptors::{parse_descriptor_loop, ServiceDescriptor, TerrestrialDeliv
 pub use eit::{EitAudioComponent, EitEvent, EitGenre, EitTable, EitVideoComponent};
 pub use eit_tracker::{
     eit_kind, EitKind, EitServiceCompletion, EitServiceKey, EpgSectionTracker, ObserveOutcome,
-    DEFAULT_MAX_SERVICES, ScheduleGap};
+    ScheduleGap, DEFAULT_MAX_SERVICES,
+};
 pub use nit::{uhf_channel_from_frequency, NitTable, NitTransportStream};
 pub use packet::{AdaptationField, TsHeader, TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
 pub use pat::{PatEntry, PatTable};

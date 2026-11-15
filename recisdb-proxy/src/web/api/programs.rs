@@ -251,7 +251,9 @@ pub async fn update_guide_config(
         }
     }
     db.update_guide_display_config(payload.default_region.as_deref())?;
-    Ok(Json(serde_json::json!({ "success": true, "default_region": payload.default_region })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "default_region": payload.default_region }),
+    ))
 }
 
 fn parse_services(value: &str) -> Result<Vec<(u16, u16)>, ApiError> {

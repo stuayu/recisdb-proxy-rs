@@ -1018,7 +1018,10 @@ pub async fn update_boncaslink(
             ))
         })?;
         if digits.is_empty() || digits.len() > 4 {
-            return Err(ApiError::bad_request(format!("network_readers nid {:?} must contain 1 to 4 hexadecimal digits", row.nid)));
+            return Err(ApiError::bad_request(format!(
+                "network_readers nid {:?} must contain 1 to 4 hexadecimal digits",
+                row.nid
+            )));
         }
         let reader = row.reader.trim();
         if reader.is_empty() || reader.chars().count() >= 1024 || reader.as_bytes().contains(&0) {

@@ -22,16 +22,25 @@ pub struct ResolvedBonCasLinkValue {
 }
 
 /// Resolve a DB override (empty means explicitly disabled) before its TOML fallback.
-pub fn resolve_boncaslink_value(db: Option<String>, toml: Option<String>) -> ResolvedBonCasLinkValue {
+pub fn resolve_boncaslink_value(
+    db: Option<String>,
+    toml: Option<String>,
+) -> ResolvedBonCasLinkValue {
     if let Some(value) = db {
         let value = (!value.trim().is_empty()).then_some(value);
-        ResolvedBonCasLinkValue { value, source: "db" }
+        ResolvedBonCasLinkValue {
+            value,
+            source: "db",
+        }
     } else if let Some(value) = toml {
         let value = (!value.trim().is_empty()).then_some(value);
         let source = if value.is_some() { "toml" } else { "none" };
         ResolvedBonCasLinkValue { value, source }
     } else {
-        ResolvedBonCasLinkValue { value: None, source: "none" }
+        ResolvedBonCasLinkValue {
+            value: None,
+            source: "none",
+        }
     }
 }
 

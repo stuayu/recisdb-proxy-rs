@@ -45,7 +45,11 @@ pub fn rank_remote_routes(candidates: &mut [RemoteRouteCandidate], claim: Effect
     candidates.sort_by(|a, b| {
         capacity_class(&a.route, claim)
             .cmp(&capacity_class(&b.route, claim))
-            .then_with(|| b.route.configured_priority.cmp(&a.route.configured_priority))
+            .then_with(|| {
+                b.route
+                    .configured_priority
+                    .cmp(&a.route.configured_priority)
+            })
             .then_with(|| b.route.confidence.total_cmp(&a.route.confidence))
             .then_with(|| b.route.source_quality.total_cmp(&a.route.source_quality))
             .then_with(|| b.transport_quality.total_cmp(&a.transport_quality))
@@ -91,8 +95,14 @@ mod tests {
         let mut free = route("free");
         free.free_slots = 1;
         let mut candidates = vec![
-            RemoteRouteCandidate { route: free, transport_quality: 100.0 },
-            RemoteRouteCandidate { route: running, transport_quality: 0.0 },
+            RemoteRouteCandidate {
+                route: free,
+                transport_quality: 100.0,
+            },
+            RemoteRouteCandidate {
+                route: running,
+                transport_quality: 0.0,
+            },
         ];
         rank_remote_routes(&mut candidates, EffectiveClaim::new(0, false));
         assert_eq!(candidates[0].route.route_id, "running");
@@ -105,8 +115,14 @@ mod tests {
         let mut locked = route("locked");
         locked.locked_slots = 1;
         let mut candidates = vec![
-            RemoteRouteCandidate { route: locked, transport_quality: 100.0 },
-            RemoteRouteCandidate { route: evictable, transport_quality: 0.0 },
+            RemoteRouteCandidate {
+                route: locked,
+                transport_quality: 100.0,
+            },
+            RemoteRouteCandidate {
+                route: evictable,
+                transport_quality: 0.0,
+            },
         ];
         rank_remote_routes(&mut candidates, EffectiveClaim::new(10, false));
         assert_eq!(candidates[0].route.route_id, "evictable");

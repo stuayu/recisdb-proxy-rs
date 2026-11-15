@@ -1308,7 +1308,10 @@ mod tests {
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             if path.ends_with("/tuners") {
-                assert!(json.is_array(), "KonomiTV expects /api/tuners to be an array");
+                assert!(
+                    json.is_array(),
+                    "KonomiTV expects /api/tuners to be an array"
+                );
             } else {
                 assert_eq!(json["current"], mirakurun::MIRAKURUN_COMPAT_VERSION);
             }

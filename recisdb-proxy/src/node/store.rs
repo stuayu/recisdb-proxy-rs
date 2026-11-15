@@ -251,12 +251,7 @@ impl<'a> NodeStore<'a> {
         ] {
             ensure_column(self.db, "reception_routes", name, definition)?;
         }
-        ensure_column(
-            self.db,
-            "node_path_health",
-            "connect_success_rate",
-            "REAL",
-        )?;
+        ensure_column(self.db, "node_path_health", "connect_success_rate", "REAL")?;
         Ok(())
     }
 
@@ -741,19 +736,17 @@ impl<'a> NodeStore<'a> {
                         connect_success_rate: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
                         rtt_p50_ms: row.get::<_, Option<f64>>(2)?.unwrap_or(f64::INFINITY),
                         rtt_p95_ms: row.get::<_, Option<f64>>(3)?.unwrap_or(f64::INFINITY),
-                        throughput_down_p10_bps: row
-                            .get::<_, Option<i64>>(4)?
-                            .unwrap_or(0)
-                            .max(0) as u64,
-                        throughput_down_ewma_bps: row
-                            .get::<_, Option<i64>>(5)?
-                            .unwrap_or(0)
-                            .max(0) as u64,
+                        throughput_down_p10_bps: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0)
+                            as u64,
+                        throughput_down_ewma_bps: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0)
+                            as u64,
                         jitter_ms: row.get::<_, Option<f64>>(6)?.unwrap_or(f64::INFINITY),
                         stall_rate: row.get::<_, Option<f64>>(7)?.unwrap_or(1.0),
                         reconnect_rate: row.get::<_, Option<f64>>(8)?.unwrap_or(1.0),
                         confidence: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                        tailscale_path: parse_enum(&row.get::<_, Option<String>>(10)?.unwrap_or_default()),
+                        tailscale_path: parse_enum(
+                            &row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                        ),
                         measured_at_unix_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
                     })
                 },
@@ -1349,12 +1342,7 @@ fn parse_enum<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
 }
 
-fn ensure_column(
-    db: &Database,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
+fn ensure_column(db: &Database, table: &str, column: &str, definition: &str) -> Result<()> {
     let exists = db
         .connection()
         .prepare(&format!("PRAGMA table_info({table})"))?

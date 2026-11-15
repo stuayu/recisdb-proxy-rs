@@ -436,11 +436,12 @@ async fn run_server(
     // Resolve runtime BonCasLink settings: database value (including empty) wins over TOML.
     let (b25_boncaslink, network_readers) = {
         let db_guard = db.lock().await;
-        let b25_db = db_guard
-            .get_boncaslink_setting("b25")
-            .ok()
-            .flatten();
-        let b25 = recisdb_proxy::resolve_boncaslink_value(b25_db, file_config.b25.boncaslink_server.clone()).value;
+        let b25_db = db_guard.get_boncaslink_setting("b25").ok().flatten();
+        let b25 = recisdb_proxy::resolve_boncaslink_value(
+            b25_db,
+            file_config.b25.boncaslink_server.clone(),
+        )
+        .value;
         let readers = if db_guard
             .get_boncaslink_setting("network_readers")
             .ok()
@@ -625,7 +626,11 @@ async fn run_server(
             let db_guard = db.lock().await;
             db_guard.get_boncaslink_setting("mmttlv").ok().flatten()
         };
-        let mmt_boncaslink = recisdb_proxy::resolve_boncaslink_value(db_mmt_boncaslink, file_config.mmttlv.boncaslink_server.clone()).value;
+        let mmt_boncaslink = recisdb_proxy::resolve_boncaslink_value(
+            db_mmt_boncaslink,
+            file_config.mmttlv.boncaslink_server.clone(),
+        )
+        .value;
         cfg.mmt_converter = recisdb_proxy::tuner::mmt_pipe::MmtConverterConfig {
             command_path: file_config.mmttlv.command_path.clone().unwrap_or_default(),
             boncaslink_server: mmt_boncaslink,
