@@ -568,6 +568,33 @@ async fn try_acquire(
     resolved: &ResolvedService,
     claim: EffectiveClaim,
 ) -> Result<acquire::AcquireOutcome, AcquireError> {
+    // `Warming` means every candidate is held by a reader that is still
+    // starting (typically a background EPG fetch that grabbed a single tuner
+    // between two viewer requests). A starting reader cannot be evicted, but
+    // once it runs a higher-priority viewer can take it over, so wait for the
+    // hint instead of failing the request with 503 at once.
+    let deadline = std::time::Instant::now() + HTTP_WARMING_WAIT;
+    loop {
+        match try_acquire_once(tuner_pool, database, resolved, &claim).await {
+            Err(AcquireError::Warming { retry_after })
+                if std::time::Instant::now() + retry_after < deadline =>
+            {
+                tokio::time::sleep(retry_after.max(std::time::Duration::from_millis(100))).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Longest an HTTP request waits for a starting reader to become evictable.
+const HTTP_WARMING_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+async fn try_acquire_once(
+    tuner_pool: &Arc<TunerPool>,
+    database: &DatabaseHandle,
+    resolved: &ResolvedService,
+    claim: &EffectiveClaim,
+) -> Result<acquire::AcquireOutcome, AcquireError> {
     acquire::acquire(
         tuner_pool,
         database,
