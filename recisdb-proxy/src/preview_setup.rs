@@ -1071,17 +1071,16 @@ fn update_preview_profile_args_if_default(
     }
 
     if let Some(profile_4k) = profiles.iter().find(|p| p.name == "preview-4k") {
-        if crate::database::preview_4k_extra_args_is_auto_generated(
-            profile_4k.extra_args.as_deref(),
-        ) {
-            // A machine with a working hardware HEVC decoder gets the full
-            // 1080p/60 template; everything else gets the throttled one.
-            let new_args = match hevc_hw_decoder {
-                Some(decoder) => {
-                    crate::database::preview_4k_encode_args_ffmpeg_hwdec(video_encoder, decoder)
-                }
-                None => crate::database::preview_4k_encode_args_ffmpeg(video_encoder),
-            };
+        if let Some((_, _, include_audio)) =
+            crate::database::preview_4k_generated_settings(profile_4k.extra_args.as_deref())
+        {
+            // Keep a previously generated video-only profile video-only while
+            // updating its encoder and the available HEVC decode path.
+            let new_args = crate::database::preview_4k_encode_args_ffmpeg_for_settings(
+                video_encoder,
+                hevc_hw_decoder,
+                include_audio,
+            );
             db.update_encode_profile(
                 profile_4k.id,
                 None,
@@ -1380,7 +1379,7 @@ mod tests {
         );
         assert!(args.contains("pipe:1"), "must write to stdout: {args}");
         assert!(
-            args.contains("-map 0:d?"),
+            args.contains("-map 0:p:{SID}:d?"),
             "must pass through the ID3 timed-metadata stream: {args}"
         );
         // x264 固有のオプションがハードウェアエンコーダに漏れていないこと。
@@ -1606,6 +1605,83 @@ enabled = false
         assert_eq!(after.extra_args.as_deref(), Some("--my-custom-args"));
         let after_4k = profiles.iter().find(|p| p.name == "preview-4k").unwrap();
         assert_eq!(after_4k.extra_args.as_deref(), Some("--my-custom-4k-args"));
+    }
+
+    #[test]
+    fn setup_rerun_preserves_generated_video_only_4k_profile() {
+        use crate::database::Database;
+
+        let db = Database::open_in_memory().unwrap();
+        let four_k = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "preview-4k")
+            .unwrap();
+        let old_audio_template = crate::database::preview_4k_encode_args_ffmpeg("h264_qsv");
+        let old_video_only_template = old_audio_template
+            .replace(
+                "-map 0:p:{SID}:v:0 -map 0:p:{SID}:a:0? -map 0:p:{SID}:d? -copy_unknown",
+                "-map 0:p:{SID}:v:0 -an",
+            )
+            .replace(
+                "-c:a aac -b:a 192k -ar 48000 -ac 2 -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy",
+                "",
+            );
+        assert!(crate::database::preview_4k_extra_args_is_auto_generated(
+            Some(&old_video_only_template)
+        ));
+        db.update_encode_profile(
+            four_k.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&old_video_only_template)),
+            None,
+        )
+        .unwrap();
+
+        update_preview_profile_args_if_default(&db, "h264_videotoolbox", None).unwrap();
+
+        let updated = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "preview-4k")
+            .unwrap();
+        let expected = crate::database::preview_4k_encode_args_ffmpeg("h264_videotoolbox")
+            .replace(
+                "-map 0:p:{SID}:v:0 -map 0:p:{SID}:a:0? -map 0:p:{SID}:d? -copy_unknown",
+                "-map 0:p:{SID}:v:0 -an",
+            )
+            .replace(
+                "-c:a aac -b:a 192k -ar 48000 -ac 2 -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy",
+                "",
+            );
+        assert_eq!(updated.extra_args.as_deref(), Some(expected.as_str()));
+        assert!(updated.extra_args.as_deref().unwrap().contains("-an"));
+        assert!(!updated.extra_args.as_deref().unwrap().contains("-c:a"));
+
+        update_preview_profile_args_if_default(&db, "h264_videotoolbox", Some("hevc_videotoolbox"))
+            .unwrap();
+        let hardware_updated = db
+            .get_all_encode_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "preview-4k")
+            .unwrap();
+        let hardware_args = hardware_updated.extra_args.as_deref().unwrap();
+        assert!(
+            hardware_args.contains("-c:v hevc_videotoolbox"),
+            "{hardware_args}"
+        );
+        assert!(
+            hardware_args.contains("-map 0:p:{SID}:v:0 -an"),
+            "{hardware_args}"
+        );
+        assert!(!hardware_args.contains("-c:a"), "{hardware_args}");
     }
 
     /// A machine whose ffmpeg really can decode HEVC in hardware must not be

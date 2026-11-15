@@ -22,6 +22,9 @@ pub use encode_profile::{
     preview_4k_extra_args_is_auto_generated, preview_encode_args_ffmpeg,
     preview_extra_args_is_auto_generated, video_encoder_tuning,
 };
+pub(crate) use encode_profile::{
+    preview_4k_encode_args_ffmpeg_for_settings, preview_4k_generated_settings,
+};
 pub use epg_settings::*;
 pub use models::*;
 

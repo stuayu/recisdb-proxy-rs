@@ -23,8 +23,10 @@
 //! STREAMING_DESIGN.md §7.1) can build its own passthrough streams on top of
 //! the exact same response-body machinery instead of re-implementing it.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
@@ -43,11 +45,12 @@ use tokio::sync::{broadcast, mpsc};
 use crate::database::Database;
 use crate::server::channel_resolve::{self, ChannelResolveError};
 use crate::ts_analyzer::service_filter::TsServiceFilter;
-use crate::ts_analyzer::{SYNC_BYTE, TS_PACKET_SIZE};
+use crate::ts_analyzer::{AnalyzerConfig, TsAnalyzer, SYNC_BYTE, TS_PACKET_SIZE};
 use crate::tuner::channel_key::ChannelKeySpec;
 use crate::tuner::encoder_pool::{
     self, EncodeKey, EncoderPoolError, EncoderRuntimeConfig, SharedEncoder,
 };
+use crate::tuner::epg_collector::EpgCollector;
 use crate::tuner::{EncoderPool, SharedTuner, TunerPool, TunerSubscription};
 use crate::web::http_session::{HttpStreamSession, HttpStreamSessionInfo};
 use crate::web::state::{SessionProtocol, WebState};
@@ -83,11 +86,11 @@ struct EncoderCleanup {
 /// conveniently means dropping it (when the body stream itself is dropped)
 /// also releases the tracked subscription automatically, no separate cleanup
 /// step needed for that half of the RAII story. The `?profile=preview`
-/// pipeline instead polls the [`SharedEncoder`]'s own (non-RAII, unrelated to
-/// `SharedTuner`) broadcast receiver directly; in that mode the tracked
-/// tuner subscription is kept alive separately — see
-/// `StreamCleanup::parked_tuner_sub` — deliberately unread, purely to hold
-/// the refcount for the response's lifetime.
+/// pipeline polls the [`SharedEncoder`]'s own (non-RAII, unrelated to
+/// `SharedTuner`) broadcast receiver after the codec probe; in that mode the
+/// tracked tuner subscription is kept alive separately — see
+/// `StreamCleanup::parked_tuner_sub` — and remains unread after the probe,
+/// purely to hold the refcount for the response's lifetime.
 pub(crate) enum BodyReceiver {
     Tuner(TunerSubscription),
     Encoder(broadcast::Receiver<Bytes>),
@@ -617,6 +620,134 @@ enum PreviewBand {
     Other,
 }
 
+struct PreviewBandDetection {
+    band: PreviewBand,
+    current_resolution: Option<String>,
+    eit_probe: PreviewEitProbe,
+}
+
+/// EpgCollector's metadata-only mode parses the same on-air EIT sections as
+/// the SI collector, but returns rows synchronously instead of waiting for the
+/// batched database writer. That lets preview classification observe live
+/// present/following metadata during the short PMT probe.
+struct PreviewEitProbe {
+    collector: EpgCollector,
+}
+
+impl PreviewEitProbe {
+    fn new() -> Self {
+        Self {
+            collector: EpgCollector::new_metadata(),
+        }
+    }
+
+    fn process_ts_chunk(
+        &mut self,
+        data: &[u8],
+        nid: u16,
+        tsid: u16,
+        sid: u16,
+        now: i64,
+    ) -> Option<String> {
+        self.collector.process_ts_chunk(data);
+        current_video_resolution_from_eit_records(
+            self.collector.drain_metadata_records(),
+            nid,
+            tsid,
+            sid,
+            now,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct PreviewPmtCacheKey {
+    nid: u16,
+    tsid: u16,
+    sid: u16,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPreviewBand {
+    band: PreviewBand,
+    expires_at: Instant,
+}
+
+const PREVIEW_PMT_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const PREVIEW_PMT_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(3);
+const PREVIEW_PMT_CACHE_CAPACITY: usize = 1024;
+const PREVIEW_EIT_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(3);
+static PREVIEW_PMT_CACHE: OnceLock<Mutex<HashMap<PreviewPmtCacheKey, CachedPreviewBand>>> =
+    OnceLock::new();
+static PREVIEW_EIT_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<PreviewPmtCacheKey, Instant>>> =
+    OnceLock::new();
+
+fn cached_preview_band(key: PreviewPmtCacheKey) -> Option<PreviewBand> {
+    let cache = PREVIEW_PMT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache.get(&key).copied()?;
+    if Instant::now() < entry.expires_at {
+        return Some(entry.band);
+    }
+    cache.remove(&key);
+    None
+}
+
+fn cache_preview_band(key: PreviewPmtCacheKey, band: PreviewBand, ttl: Duration) {
+    let cache = PREVIEW_PMT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| Instant::now() < entry.expires_at);
+    if cache.len() >= PREVIEW_PMT_CACHE_CAPACITY && !cache.contains_key(&key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| *key)
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        key,
+        CachedPreviewBand {
+            band,
+            expires_at: Instant::now() + ttl,
+        },
+    );
+}
+
+fn preview_eit_recently_missing(key: PreviewPmtCacheKey) -> bool {
+    let now = Instant::now();
+    let cache = PREVIEW_EIT_NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, expires_at| now < *expires_at);
+    cache.contains_key(&key)
+}
+
+fn cache_preview_eit_missing(key: PreviewPmtCacheKey) {
+    let now = Instant::now();
+    let cache = PREVIEW_EIT_NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, expires_at| now < *expires_at);
+    if cache.len() >= PREVIEW_PMT_CACHE_CAPACITY && !cache.contains_key(&key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, expires_at)| *expires_at)
+            .map(|(key, _)| *key)
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, now + PREVIEW_EIT_NEGATIVE_CACHE_TTL);
+}
+
 impl PreviewBand {
     /// Classified from the NID, the same way every other 4K decision in the
     /// codebase is (`tuner/acquire.rs::b25_enabled_for`, the channel
@@ -629,6 +760,325 @@ impl PreviewBand {
             _ => Self::Other,
         }
     }
+
+    fn for_service_stream_types(nid: u16, stream_types: &[u8]) -> Self {
+        if Self::of_nid(nid) == Self::FourK || stream_types.contains(&0x24) {
+            Self::FourK
+        } else {
+            Self::Other
+        }
+    }
+
+    /// A current EIT component descriptor is more precise than HEVC alone:
+    /// HEVC is also used for interlaced HD. Recognized non-4K resolutions use
+    /// the ordinary preview profile, whose default FFmpeg template deinterlaces
+    /// and keeps every decoded frame. Missing or unknown EIT data preserves
+    /// the NID/PMT classification (including the QVC 4K fallback).
+    fn with_video_resolution(self, nid: u16, resolution: Option<&str>) -> Self {
+        // NID is authoritative for standard broadcast networks. EIT is only
+        // needed to refine provisional HEVC detection on unknown CATV NIDs.
+        if !needs_preview_codec_probe(nid) {
+            return self;
+        }
+        match resolution {
+            Some("2160p" | "4320p") => Self::FourK,
+            Some("480i" | "480p" | "1080i" | "720p" | "240p" | "1080p" | "180p") => Self::Other,
+            _ => self,
+        }
+    }
+}
+
+/// Return the current event's EIT video resolution, if it is known. EIT is
+/// best-effort metadata: a database error, absent event, or absent component
+/// descriptor must leave the stream-type/NID fallback intact.
+fn current_program_video_resolution(
+    db: &Database,
+    nid: u16,
+    tsid: u16,
+    sid: u16,
+    now: i64,
+) -> Option<String> {
+    db.get_programs(now, now.saturating_add(1), Some(nid), Some(sid))
+        .ok()?
+        .into_iter()
+        .filter(|program| {
+            program.tsid == tsid
+                && program.start_at <= now
+                && program.start_at.saturating_add(program.duration_secs) > now
+        })
+        .max_by_key(|program| program.start_at)
+        .and_then(|program| program.video)
+        .and_then(|video| video.resolution)
+}
+
+fn current_video_resolution_from_eit_records(
+    records: impl IntoIterator<Item = crate::database::ProgramUpsert>,
+    nid: u16,
+    tsid: u16,
+    sid: u16,
+    now: i64,
+) -> Option<String> {
+    // EpgCollector maps PF rows from actual/other-TS EIT to the same source
+    // enum. An 0x4F row is other-TS by definition; requiring this exact NID,
+    // TSID, and SID prevents it from supplying the requested service's mode.
+    records
+        .into_iter()
+        .filter(|record| {
+            record.source == crate::database::EpgSource::PresentFollowing
+                && record.nid == nid
+                && record.tsid == tsid
+                && record.sid == sid
+                && record.start_at <= now
+                && record.start_at.saturating_add(record.duration_secs) > now
+        })
+        .max_by_key(|record| record.start_at)
+        .and_then(|record| record.video)
+        .and_then(|video| video.resolution)
+}
+
+fn current_unix_timestamp() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+}
+
+/// Inspect the requested service's PMT briefly so HEVC services on networks
+/// whose NID is not one of the BS4K IDs still get the progressive 4K preview
+/// profile. The encoder subscribes independently after this probe, so these
+/// startup chunks are not removed from any other viewer's stream.
+async fn detect_preview_band(
+    tuner_rx: &mut TunerSubscription,
+    nid: u16,
+    tsid: u16,
+    sid: u16,
+    deadline: tokio::time::Instant,
+) -> PreviewBandDetection {
+    let fallback = PreviewBand::of_nid(nid);
+    if fallback == PreviewBand::FourK || !needs_preview_codec_probe(nid) {
+        return PreviewBandDetection {
+            band: fallback,
+            current_resolution: None,
+            eit_probe: PreviewEitProbe::new(),
+        };
+    }
+    let cache_key = PreviewPmtCacheKey { nid, tsid, sid };
+    if let Some(cached) = cached_preview_band(cache_key) {
+        return PreviewBandDetection {
+            band: cached,
+            current_resolution: None,
+            eit_probe: PreviewEitProbe::new(),
+        };
+    }
+
+    let mut analyzer = TsAnalyzer::new(AnalyzerConfig {
+        parse_nit: false,
+        parse_sdt: false,
+        parse_all_pmts: true,
+        max_packets: 0,
+    });
+    let tuner = tuner_rx.tuner().clone();
+    let mut eit_probe = PreviewEitProbe::new();
+    let mut current_resolution = None;
+    let mut state_rx = tuner.subscribe_state();
+    let detected = tokio::time::timeout_at(deadline, async {
+        loop {
+            if matches!(
+                *state_rx.borrow_and_update(),
+                crate::tuner::shared::ReaderState::Stopping
+                    | crate::tuner::shared::ReaderState::Stopped
+            ) {
+                return None;
+            }
+            tokio::select! {
+                data = tuner_rx.recv() => match data {
+                Ok(data) => {
+                    if let Some(now) = current_unix_timestamp() {
+                        if let Some(resolution) = eit_probe.process_ts_chunk(&data, nid, tsid, sid, now) {
+                            current_resolution = Some(resolution);
+                        }
+                    }
+                    analyzer.feed(&data);
+                    if let Some(pmt) = analyzer.result().pmts.get(&sid) {
+                        let stream_types: Vec<u8> = pmt
+                            .streams
+                            .iter()
+                            .map(|stream| stream.stream_type)
+                            .collect();
+                        return Some((
+                            PreviewBand::for_service_stream_types(nid, &stream_types),
+                            current_resolution.clone(),
+                        ));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+                },
+                state = state_rx.changed() => {
+                    if state.is_err() {
+                        return None;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    match detected {
+        Ok(Some((band, current_resolution))) => {
+            cache_preview_band(cache_key, band, PREVIEW_PMT_CACHE_TTL);
+            PreviewBandDetection {
+                band,
+                current_resolution,
+                eit_probe,
+            }
+        }
+        Ok(None) => {
+            // The reader stopped or closed while probing. Do not cache this
+            // transient lifecycle result: a restarted reader must probe PMT.
+            PreviewBandDetection {
+                band: fallback,
+                current_resolution,
+                eit_probe,
+            }
+        }
+        Err(_) => {
+            debug!(
+                "[HTTP stream] PMT codec probe timed out for NID=0x{nid:04X} SID={sid}; using NID classification"
+            );
+            cache_preview_band(cache_key, fallback, PREVIEW_PMT_NEGATIVE_CACHE_TTL);
+            PreviewBandDetection {
+                band: fallback,
+                current_resolution,
+                eit_probe,
+            }
+        }
+    }
+}
+
+fn preview_pmt_probe_timeout(tuner: &crate::tuner::SharedTuner) -> Duration {
+    let Some(elapsed_ms) = tuner.startup_elapsed_ms() else {
+        return Duration::from_secs(2);
+    };
+    let grace_remaining_ms = tuner.startup_grace_ms().saturating_sub(elapsed_ms);
+    Duration::from_millis(grace_remaining_ms.saturating_add(2_000))
+}
+
+fn preview_probe_deadline(tuner: &crate::tuner::SharedTuner) -> tokio::time::Instant {
+    tokio::time::Instant::now() + preview_pmt_probe_timeout(tuner)
+}
+
+/// PMT inspection is only needed for unrecognized terrestrial NIDs, which
+/// include CATV networks that may carry HEVC 4K services. Standard broadcast
+/// NIDs already determine the preview band and should not delay every start
+/// while waiting for a PMT.
+fn needs_preview_codec_probe(nid: u16) -> bool {
+    matches!(
+        recisdb_protocol::broadcast_region::classify_nid(nid),
+        (
+            recisdb_protocol::BroadcastType::Terrestrial,
+            Some(recisdb_protocol::broadcast_region::TerrestrialRegion::Unknown(_))
+        )
+    )
+}
+
+/// A PMT only proves HEVC, not that the service is 2160p. On unrecognized
+/// terrestrial networks, defer finalizing a provisional 4K band until current
+/// EIT resolution is available or the existing PMT probe deadline expires.
+fn should_wait_for_preview_resolution(nid: u16, band: PreviewBand) -> bool {
+    band == PreviewBand::FourK && needs_preview_codec_probe(nid)
+}
+
+fn should_wait_for_live_preview_eit(
+    nid: u16,
+    band: PreviewBand,
+    current_resolution: Option<&str>,
+    key: PreviewPmtCacheKey,
+) -> bool {
+    should_wait_for_preview_resolution(nid, band)
+        && current_resolution.is_none()
+        && !preview_eit_recently_missing(key)
+}
+
+async fn wait_for_current_preview_eit_resolution(
+    tuner_rx: &mut TunerSubscription,
+    eit_probe: &mut PreviewEitProbe,
+    nid: u16,
+    tsid: u16,
+    sid: u16,
+    deadline: tokio::time::Instant,
+) -> PreviewEitWaitResult {
+    let tuner = tuner_rx.tuner().clone();
+    let mut state_rx = tuner.subscribe_state();
+    match tokio::time::timeout_at(deadline, async {
+        loop {
+            if matches!(
+                *state_rx.borrow_and_update(),
+                crate::tuner::shared::ReaderState::Stopping
+                    | crate::tuner::shared::ReaderState::Stopped
+            ) {
+                return PreviewEitWaitResult::ReaderStopped;
+            }
+            tokio::select! {
+                data = tuner_rx.recv() => match data {
+                    Ok(data) => {
+                        if let Some(now) = current_unix_timestamp() {
+                            if let Some(resolution) = eit_probe.process_ts_chunk(&data, nid, tsid, sid, now) {
+                                return PreviewEitWaitResult::Found(resolution);
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return PreviewEitWaitResult::ReaderStopped,
+                },
+                state = state_rx.changed() => {
+                    if state.is_err() {
+                        return PreviewEitWaitResult::ReaderStopped;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => PreviewEitWaitResult::TimedOut,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewEitWaitResult {
+    Found(String),
+    TimedOut,
+    ReaderStopped,
+}
+
+async fn wait_for_live_preview_eit_resolution(
+    tuner_rx: &mut TunerSubscription,
+    eit_probe: &mut PreviewEitProbe,
+    key: PreviewPmtCacheKey,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let result = wait_for_current_preview_eit_resolution(
+        tuner_rx, eit_probe, key.nid, key.tsid, key.sid, deadline,
+    )
+    .await;
+    match result {
+        PreviewEitWaitResult::Found(resolution) => Some(resolution),
+        PreviewEitWaitResult::TimedOut => {
+            cache_preview_eit_missing(key);
+            None
+        }
+        PreviewEitWaitResult::ReaderStopped => None,
+    }
+}
+
+fn select_preview_resolution(
+    current: Option<String>,
+    live: Option<String>,
+    database: Option<String>,
+) -> Option<String> {
+    current.or(live).or(database)
 }
 
 fn preview_encoder_sids(config: &EncoderRuntimeConfig, service_id: u16) -> Vec<u16> {
@@ -951,13 +1401,10 @@ async fn stream_resolved(
     // forwarded to the client comes from the shared encoder's own broadcast
     // instead — see `EncoderPool`'s doc comment on `subscribe_untracked`:
     // the encoder's own subscription to the tuner deliberately does NOT
-    // count, so *something* downstream must hold a tracked subscription or
-    // the tuner could be idle-closed out from under an active preview
-    // viewer. We intentionally never call `.recv()` on this receiver in
-    // preview mode (see below) — tokio broadcast receivers that are never
-    // polled do not block the sender or other receivers, they simply lag
-    // and get skipped, so this is safe and cheap.
-    let tuner_rx = tuner.subscribe_with_claim_class(
+    // count, so this tracked claim keeps the tuner alive. Preview mode reads
+    // this receiver briefly to identify the target service's video codec;
+    // the encoder subscribes independently afterward.
+    let mut tuner_rx = tuner.subscribe_with_claim_class(
         resolved.channel.priority,
         false,
         crate::tuner::shared::TunerUsage::from(StreamClass::View),
@@ -991,9 +1438,65 @@ async fn stream_resolved(
         );
     }
 
+    // PMT inspection and any follow-up EIT wait share one absolute deadline;
+    // fetching PMT must not restart or extend the startup probe budget.
+    let resolution_probe_deadline = preview_probe_deadline(&tuner);
+    let mut preview_detection = detect_preview_band(
+        &mut tuner_rx,
+        resolved.channel.nid,
+        resolved.channel.tsid,
+        resolved.channel.sid,
+        resolution_probe_deadline,
+    )
+    .await;
+    let preview_cache_key = PreviewPmtCacheKey {
+        nid: resolved.channel.nid,
+        tsid: resolved.channel.tsid,
+        sid: resolved.channel.sid,
+    };
+    let wait_for_resolution = should_wait_for_live_preview_eit(
+        resolved.channel.nid,
+        preview_detection.band,
+        preview_detection.current_resolution.as_deref(),
+        preview_cache_key,
+    );
+    let database_resolution = if preview_detection.current_resolution.is_none() {
+        current_unix_timestamp().and_then(|now| {
+            web_state.database.try_lock().ok().and_then(|db| {
+                current_program_video_resolution(
+                    &db,
+                    resolved.channel.nid,
+                    resolved.channel.tsid,
+                    resolved.channel.sid,
+                    now,
+                )
+            })
+        })
+    } else {
+        None
+    };
+    let live_resolution = if wait_for_resolution {
+        wait_for_live_preview_eit_resolution(
+            &mut tuner_rx,
+            &mut preview_detection.eit_probe,
+            preview_cache_key,
+            resolution_probe_deadline,
+        )
+        .await
+    } else {
+        None
+    };
+    let current_resolution = select_preview_resolution(
+        preview_detection.current_resolution,
+        live_resolution,
+        database_resolution,
+    );
     let (encoder_cfg, generation) = {
         let db = web_state.database.lock().await;
-        match load_preview_encoder_config(&db, PreviewBand::of_nid(resolved.channel.nid)) {
+        let preview_band = preview_detection
+            .band
+            .with_video_resolution(resolved.channel.nid, current_resolution.as_deref());
+        match load_preview_encoder_config(&db, preview_band) {
             Ok(v) => v,
             Err(msg) => {
                 release_tuner_subscription(&web_state.tuner_pool, tuner_rx).await;
@@ -1028,7 +1531,7 @@ async fn stream_resolved(
                 // The actual data comes from `enc_rx` below; this is only
                 // here to keep `tuner_rx`'s refcount alive for the response's
                 // lifetime (see `StreamCleanup::parked_tuner_sub`'s doc
-                // comment) — deliberately never read.
+                // comment) — unread after the codec probe.
                 parked_tuner_sub: Some(tuner_rx),
                 encoder: Some(EncoderCleanup {
                     pool: Arc::clone(&web_state.encoder_pool),
@@ -1082,7 +1585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, NewBonDriver};
+    use crate::database::{Database, EpgSource, NewBonDriver, ProgramUpsert};
     use crate::tuner::TunerPool;
     use crate::web::auth::AuthConfig;
     use axum::http::Request;
@@ -1187,6 +1690,21 @@ mod tests {
             log_level,
             epg_events_tx,
         ))
+    }
+
+    fn preview_encoder_config(
+        command_path: &str,
+        arguments: &str,
+        preprocessor_path: &str,
+        preprocessor_arguments: &str,
+    ) -> EncoderRuntimeConfig {
+        EncoderRuntimeConfig {
+            command_path: command_path.to_owned(),
+            arguments: arguments.to_owned(),
+            read_timeout_ms: 10_000,
+            preprocessor_path: preprocessor_path.to_owned(),
+            preprocessor_arguments: preprocessor_arguments.to_owned(),
+        }
     }
 
     #[tokio::test]
@@ -1495,6 +2013,713 @@ mod tests {
         assert_eq!(PreviewBand::of_nid(0x000C), PreviewBand::FourK);
         assert_eq!(PreviewBand::of_nid(4), PreviewBand::Other);
         assert_eq!(PreviewBand::of_nid(32391), PreviewBand::Other);
+    }
+
+    #[test]
+    fn hevc_pmt_selects_the_4k_preview_profile_for_a_catv_network() {
+        assert!(needs_preview_codec_probe(0xFFF7));
+        assert!(!needs_preview_codec_probe(4));
+        assert!(!needs_preview_codec_probe(0x7FE8));
+        assert_eq!(
+            PreviewBand::for_service_stream_types(0xFFF7, &[0x24]),
+            PreviewBand::FourK,
+        );
+        assert_eq!(
+            PreviewBand::for_service_stream_types(0xFFF7, &[0x1B]),
+            PreviewBand::Other,
+        );
+        assert_eq!(
+            PreviewBand::for_service_stream_types(0x000B, &[0x1B]),
+            PreviewBand::FourK,
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_band_detection_reads_hevc_from_the_requested_services_pmt() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-pmt-hevc-integration", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let broadcaster = Arc::clone(&tuner);
+        let sid = 431;
+        let send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for packet in preview_hevc_pat_and_pmt(sid) {
+                broadcaster.test_broadcast(packet);
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            detect_preview_band(
+                &mut tuner_rx,
+                0xFFF7,
+                0x5151,
+                sid,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the PMT should arrive before the bounded probe deadline");
+        send.await.unwrap();
+
+        assert_eq!(result.band, PreviewBand::FourK);
+        assert_eq!(
+            cached_preview_band(PreviewPmtCacheKey {
+                nid: 0xFFF7,
+                tsid: 0x5151,
+                sid,
+            }),
+            Some(PreviewBand::FourK)
+        );
+    }
+
+    #[test]
+    fn preview_resolution_prefers_probe_then_live_eit_then_database() {
+        assert_eq!(
+            select_preview_resolution(
+                Some("2160p".to_string()),
+                Some("1080i".to_string()),
+                Some("720p".to_string()),
+            )
+            .as_deref(),
+            Some("2160p")
+        );
+        assert_eq!(
+            select_preview_resolution(None, Some("1080i".to_string()), Some("2160p".to_string()),)
+                .as_deref(),
+            Some("1080i")
+        );
+        assert_eq!(
+            select_preview_resolution(None, None, Some("2160p".to_string())).as_deref(),
+            Some("2160p")
+        );
+    }
+
+    #[test]
+    fn preview_sid_placeholder_survives_ffmpeg_size_short_option() {
+        assert_eq!(
+            preview_encoder_sids(
+                &preview_encoder_config("ffmpeg", "-i - -s 1280x720 -map 0:p:{SID}", "", "",),
+                431
+            ),
+            vec![431]
+        );
+        assert_eq!(
+            preview_encoder_sids(
+                &preview_encoder_config("ffmpeg", "-i - -s 1280x720 -map 0:v:0", "", ""),
+                431
+            ),
+            Vec::<u16>::new()
+        );
+        assert_eq!(
+            preview_encoder_sids(
+                &preview_encoder_config("ffmpeg", "-i - -s hd720 -map 0:v:0", "", ""),
+                431
+            ),
+            Vec::<u16>::new()
+        );
+        assert!(preview_encoder_sids(
+            &preview_encoder_config("tsreplace", "-s 432 -i - -o -", "", ""),
+            431
+        )
+        .is_empty());
+        assert!(preview_encoder_sids(
+            &preview_encoder_config("tsreplace", "--service 432 -i - -o -", "", ""),
+            431
+        )
+        .is_empty());
+        assert_eq!(
+            preview_encoder_sids(
+                &preview_encoder_config("tsreplace", "-i - -o -", "", ""),
+                431
+            ),
+            vec![431]
+        );
+    }
+
+    #[test]
+    fn preprocessor_sid_placeholder_keeps_resolved_service() {
+        assert_eq!(
+            preview_encoder_sids(
+                &preview_encoder_config("ffmpeg", "-i -", "tsreadex", "-n {SID} -",),
+                431
+            ),
+            vec![431]
+        );
+        assert!(preview_encoder_sids(
+            &preview_encoder_config("tsreplace", "--service 432 -i - -o -", "", "-n 431"),
+            431
+        )
+        .is_empty());
+        assert!(preview_encoder_sids(
+            &preview_encoder_config("ffmpeg", "-i -", "tsreadex", "-n 432 -"),
+            431
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn standard_nid_classification_is_not_overridden_by_eit_resolution() {
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0x000B, Some("1080i")),
+            PreviewBand::FourK
+        );
+        assert_eq!(
+            PreviewBand::Other.with_video_resolution(4, Some("2160p")),
+            PreviewBand::Other
+        );
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0xFFF7, Some("1080i")),
+            PreviewBand::Other
+        );
+        assert_eq!(
+            PreviewBand::Other.with_video_resolution(0xFFF7, Some("2160p")),
+            PreviewBand::FourK
+        );
+    }
+
+    fn preview_program(
+        nid: u16,
+        sid: u16,
+        start_at: i64,
+        duration_secs: i64,
+        resolution: Option<&str>,
+    ) -> ProgramUpsert {
+        ProgramUpsert {
+            nid,
+            sid,
+            tsid: 515,
+            event_id: start_at as u16,
+            start_at,
+            duration_secs,
+            free_ca_mode: false,
+            name: Some("Preview test".to_string()),
+            description: None,
+            extended: None,
+            genre: None,
+            genres: None,
+            audios: None,
+            video: Some(crate::ts_analyzer::EitVideoComponent {
+                video_type: Some("h.265".to_string()),
+                resolution: resolution.map(str::to_string),
+                stream_content: 9,
+                component_type: if resolution == Some("1080i") {
+                    0xB1
+                } else {
+                    0x91
+                },
+            }),
+            updated_at: start_at,
+            source: EpgSource::PresentFollowing,
+            basic_updated_at: Some(start_at),
+            extended_updated_at: None,
+            shared_sid: None,
+            shared_event_id: None,
+        }
+    }
+
+    fn preview_eit_ts_packet(
+        now: i64,
+        table_id: u8,
+        nid: u16,
+        tsid: u16,
+        sid: u16,
+        component_type: u8,
+    ) -> Bytes {
+        let jst_timestamp = now - 30 + 9 * 60 * 60;
+        let days = jst_timestamp.div_euclid(86_400);
+        let seconds = jst_timestamp.rem_euclid(86_400);
+        let mjd = (40_587 + days) as u16;
+        let bcd = |value: i64| ((value / 10) as u8) << 4 | (value % 10) as u8;
+        let mut section_data = Vec::new();
+        section_data.extend_from_slice(&tsid.to_be_bytes());
+        section_data.extend_from_slice(&nid.to_be_bytes());
+        section_data.extend_from_slice(&[0x00, table_id]); // segment/last table
+
+        let mut event = vec![0x00, 0x01]; // event_id
+        event.extend_from_slice(&mjd.to_be_bytes());
+        event.extend_from_slice(&[
+            bcd(seconds / 3_600),
+            bcd((seconds % 3_600) / 60),
+            bcd(seconds % 60),
+            0x00,
+            0x10,
+            0x00,
+        ]); // start time and ten minute duration
+        let component = [0x50, 0x06, 0x09, component_type, 0x01, b'j', b'p', b'n'];
+        event.push((4 << 5) | ((component.len() >> 8) as u8)); // running_status=4
+        event.push(component.len() as u8);
+        event.extend_from_slice(&component);
+        section_data.extend_from_slice(&event);
+
+        let section_length = 5 + section_data.len() + 4;
+        let mut section = vec![
+            table_id,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            section_length as u8,
+        ];
+        section.extend_from_slice(&sid.to_be_bytes());
+        section.extend_from_slice(&[0xC1, 0x00, 0x00]); // current, section 0/0
+        section.extend_from_slice(&section_data);
+        let crc = test_crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(test_crc32_mpeg2(&section), 0);
+
+        let mut packet = vec![0xFF; TS_PACKET_SIZE];
+        packet[0] = SYNC_BYTE;
+        packet[1] = 0x40; // PUSI, PID high bits for 0x0012
+        packet[2] = crate::ts_analyzer::pid::EIT as u8;
+        packet[3] = 0x10; // payload only, continuity counter 0
+        packet[4] = 0x00; // pointer_field
+        packet[5..5 + section.len()].copy_from_slice(&section);
+        Bytes::from(packet)
+    }
+
+    fn preview_psi_section(table_id: u8, extension: u16, payload: &[u8]) -> Vec<u8> {
+        let section_length = 5 + payload.len() + 4;
+        let mut section = vec![
+            table_id,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            section_length as u8,
+        ];
+        section.extend_from_slice(&extension.to_be_bytes());
+        section.extend_from_slice(&[0xC1, 0x00, 0x00]);
+        section.extend_from_slice(payload);
+        let crc = test_crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(test_crc32_mpeg2(&section), 0);
+        section
+    }
+
+    fn preview_psi_ts_packet(pid: u16, section: &[u8]) -> Bytes {
+        assert!(section.len() <= TS_PACKET_SIZE - 5);
+        let mut packet = vec![0xFF; TS_PACKET_SIZE];
+        packet[0] = SYNC_BYTE;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1F);
+        packet[2] = pid as u8;
+        packet[3] = 0x10;
+        packet[4] = 0;
+        packet[5..5 + section.len()].copy_from_slice(section);
+        Bytes::from(packet)
+    }
+
+    fn preview_hevc_pat_and_pmt(sid: u16) -> [Bytes; 2] {
+        let pmt_pid = 0x0100;
+        let pat_entry = [
+            (sid >> 8) as u8,
+            sid as u8,
+            0xE0 | ((pmt_pid >> 8) as u8 & 0x1F),
+            pmt_pid as u8,
+        ];
+        let pat = preview_psi_section(crate::ts_analyzer::table_id::PAT, 0x5151, &pat_entry);
+        let pmt_payload = [
+            0xE1, 0x01, // PCR PID
+            0xF0, 0x00, // program info length
+            0x24, 0xE1, 0x01, 0xF0, 0x00, // HEVC video PID, no descriptors
+        ];
+        let pmt = preview_psi_section(crate::ts_analyzer::table_id::PMT, sid, &pmt_payload);
+        [
+            preview_psi_ts_packet(0, &pat),
+            preview_psi_ts_packet(pmt_pid, &pmt),
+        ]
+    }
+
+    fn test_crc32_mpeg2(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in data {
+            crc ^= (*byte as u32) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04C1_1DB7
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn current_preview_resolution_comes_from_the_current_program_for_this_service() {
+        let mut db = Database::open_in_memory().unwrap();
+        let now = 1_800_000_000;
+        let mut same_sid_on_other_tsid = preview_program(0xFFF7, 431, now - 30, 300, Some("2160p"));
+        same_sid_on_other_tsid.tsid = 516;
+        db.upsert_programs(&[
+            preview_program(0xFFF7, 431, now - 300, 300, Some("2160p")),
+            preview_program(0xFFF7, 431, now - 60, 300, Some("1080i")),
+            preview_program(0xFFF7, 431, now + 60, 300, Some("2160p")),
+            preview_program(0xFFF7, 432, now - 60, 300, Some("2160p")),
+            same_sid_on_other_tsid,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            current_program_video_resolution(&db, 0xFFF7, 515, 431, now).as_deref(),
+            Some("1080i")
+        );
+        assert_eq!(
+            current_program_video_resolution(&db, 0xFFF7, 515, 433, now),
+            None
+        );
+        assert_eq!(
+            current_program_video_resolution(&db, 0xFFF7, 516, 431, now).as_deref(),
+            Some("2160p")
+        );
+    }
+
+    #[test]
+    fn current_eit_resolution_refines_preview_band_without_breaking_fallbacks() {
+        assert!(!should_wait_for_preview_resolution(4, PreviewBand::FourK));
+        assert!(!should_wait_for_preview_resolution(
+            0xFFF7,
+            PreviewBand::Other
+        ));
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0xFFF7, Some("2160p")),
+            PreviewBand::FourK
+        );
+        assert_eq!(
+            PreviewBand::Other.with_video_resolution(0xFFF7, Some("2160p")),
+            PreviewBand::FourK
+        );
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0xFFF7, Some("1080i")),
+            PreviewBand::Other
+        );
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0xFFF7, None),
+            PreviewBand::FourK
+        );
+        assert_eq!(
+            PreviewBand::FourK.with_video_resolution(0xFFF7, Some("unrecognized")),
+            PreviewBand::FourK
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_catv_hevc_waits_for_live_pf_eit_1080i_before_finalizing_preview_band() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-live-eit-test", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let mut probe = PreviewEitProbe::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let provisional = PreviewBand::for_service_stream_types(0xFFF7, &[0x24]);
+        assert_eq!(provisional, PreviewBand::FourK);
+        assert!(should_wait_for_preview_resolution(0xFFF7, provisional));
+
+        let broadcaster = Arc::clone(&tuner);
+        let send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            broadcaster.test_broadcast(preview_eit_ts_packet(
+                now,
+                crate::ts_analyzer::table_id::EIT_PF_ACTUAL,
+                0xFFF7,
+                515,
+                431,
+                0xB1,
+            ));
+        });
+
+        let resolution = wait_for_current_preview_eit_resolution(
+            &mut tuner_rx,
+            &mut probe,
+            0xFFF7,
+            515,
+            431,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await;
+        send.await.unwrap();
+
+        assert_eq!(resolution, PreviewEitWaitResult::Found("1080i".to_string()));
+        let selected_band = provisional.with_video_resolution(0xFFF7, Some("1080i"));
+        assert_eq!(
+            selected_band,
+            PreviewBand::Other,
+            "HEVC must use the interlaced preview path once its current EIT arrives"
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000)
+            .unwrap();
+        db.set_preview_command_path("preview-enc").unwrap();
+        let preview_id = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .expect("seeded ordinary preview profile")
+            .id;
+        let ffmpeg_args = crate::database::preview_encode_args_ffmpeg("libx264");
+        db.update_encode_profile(
+            preview_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&ffmpeg_args)),
+            None,
+        )
+        .unwrap();
+        let (config, _) = load_preview_encoder_config(&db, selected_band).unwrap();
+        assert!(
+            config.arguments.contains("-f mpegts -i pipe:0")
+                && config.arguments.contains("-vf yadif=0:-1:1,scale=1280:720")
+                && config.arguments.contains("-c:v libx264"),
+            "the delayed 1080i EIT must select the generated FFmpeg profile that decodes MPEG-TS and deinterlaces: {}",
+            config.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_catv_hevc_keeps_the_4k_fallback_when_eit_misses_the_probe_deadline() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-eit-timeout-test", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let mut probe = PreviewEitProbe::new();
+        let provisional = PreviewBand::for_service_stream_types(0xFFF7, &[0x24]);
+        assert!(should_wait_for_preview_resolution(0xFFF7, provisional));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_current_preview_eit_resolution(
+                &mut tuner_rx,
+                &mut probe,
+                0xFFF7,
+                515,
+                431,
+                deadline,
+            ),
+        )
+        .await
+        .expect("EIT wait must stay inside its bounded deadline");
+
+        assert_eq!(result, PreviewEitWaitResult::TimedOut);
+        assert_eq!(
+            provisional.with_video_resolution(0xFFF7, None),
+            PreviewBand::FourK,
+            "EPG absence must preserve the QVC HEVC 4K PMT fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_live_eit_is_cached_to_skip_repeated_catv_preview_waits() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-eit-negative-cache-test", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let mut probe = PreviewEitProbe::new();
+        let key = PreviewPmtCacheKey {
+            nid: 0xFFF7,
+            tsid: 0x7E71,
+            sid: 0x7E72,
+        };
+        assert!(should_wait_for_live_preview_eit(
+            key.nid,
+            PreviewBand::FourK,
+            None,
+            key
+        ));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_live_preview_eit_resolution(
+                &mut tuner_rx,
+                &mut probe,
+                key,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("negative EIT cache should be set within the bounded wait");
+
+        assert_eq!(result, None);
+        assert!(preview_eit_recently_missing(key));
+        assert!(
+            !should_wait_for_live_preview_eit(key.nid, PreviewBand::FourK, None, key),
+            "repeat preview requests should reuse the short negative EIT result"
+        );
+        assert!(!should_wait_for_live_preview_eit(
+            key.nid,
+            PreviewBand::FourK,
+            Some("1080i"),
+            key
+        ));
+    }
+
+    #[tokio::test]
+    async fn preview_eit_probe_ignores_other_transport_present_following() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-eit-other-ts-test", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let mut probe = PreviewEitProbe::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let broadcaster = Arc::clone(&tuner);
+        let send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            broadcaster.test_broadcast(preview_eit_ts_packet(
+                now,
+                crate::ts_analyzer::table_id::EIT_PF_OTHER,
+                0xFFF7,
+                516,
+                431,
+                0xB1,
+            ));
+        });
+
+        let resolution = wait_for_current_preview_eit_resolution(
+            &mut tuner_rx,
+            &mut probe,
+            0xFFF7,
+            515,
+            431,
+            tokio::time::Instant::now() + Duration::from_millis(80),
+        )
+        .await;
+        send.await.unwrap();
+
+        assert_eq!(resolution, PreviewEitWaitResult::TimedOut);
+    }
+
+    #[test]
+    fn resolution_selected_profiles_keep_their_custom_arguments() {
+        let db = Database::open_in_memory().unwrap();
+        db.update_preview_encoder_config(true, "-x 18 -n {SID} -", 7_000)
+            .unwrap();
+        db.set_preview_command_path("preview-enc").unwrap();
+        let preview_id = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .expect("seeded preview profile")
+            .id;
+        let preview4k_id = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .expect("seeded 4K profile")
+            .id;
+        db.update_encode_profile(
+            preview_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--custom-preview")),
+            None,
+        )
+        .unwrap();
+        db.update_encode_profile(
+            preview4k_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--custom-preview4k")),
+            None,
+        )
+        .unwrap();
+
+        let (hd, _) = load_preview_encoder_config(
+            &db,
+            PreviewBand::FourK.with_video_resolution(0xFFF7, Some("1080i")),
+        )
+        .unwrap();
+        let (four_k, _) = load_preview_encoder_config(
+            &db,
+            PreviewBand::Other.with_video_resolution(0xFFF7, Some("2160p")),
+        )
+        .unwrap();
+
+        assert_eq!(hd.arguments, "--custom-preview");
+        assert_eq!(four_k.arguments, "--custom-preview4k");
+    }
+
+    #[test]
+    fn detected_preview_band_is_cached_per_mux_service() {
+        let key = PreviewPmtCacheKey {
+            nid: 0xFFF7,
+            tsid: 0x4321,
+            sid: 0x4567,
+        };
+        cache_preview_band(key, PreviewBand::FourK, PREVIEW_PMT_CACHE_TTL);
+        assert_eq!(cached_preview_band(key), Some(PreviewBand::FourK));
+    }
+
+    #[tokio::test]
+    async fn known_non_4k_network_preview_does_not_wait_for_a_pmt() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-pmt-test", 1),
+            1,
+        );
+        let mut tuner_rx = tuner.subscribe();
+        let deadline = preview_probe_deadline(&tuner);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            detect_preview_band(&mut tuner_rx, 4, 200, 101, deadline),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a known non-4K network should not wait for PMT"
+        );
+    }
+
+    #[test]
+    fn pmt_probe_timeout_covers_slow_tuner_startup_grace() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-pmt-timeout-test", 1),
+            1,
+        );
+        tuner.set_state(crate::tuner::shared::ReaderState::Starting);
+        tuner.configure_startup_policy(6_000, true);
+        tuner.begin_startup_metrics();
+        assert!(preview_pmt_probe_timeout(&tuner) >= Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn pmt_probe_returns_promptly_when_tuner_stops() {
+        let tuner = crate::tuner::SharedTuner::new(
+            crate::tuner::channel_key::ChannelKey::simple("preview-pmt-stop-test", 1),
+            1,
+        );
+        tuner.set_state(crate::tuner::shared::ReaderState::Starting);
+        tuner.configure_startup_policy(60_000, true);
+        tuner.begin_startup_metrics();
+        let mut tuner_rx = tuner.subscribe();
+        let deadline = preview_probe_deadline(&tuner);
+        let key = PreviewPmtCacheKey {
+            nid: 0xFFF7,
+            tsid: 0x7FFE,
+            sid: 0x6EEE,
+        };
+        let task = tokio::spawn(async move {
+            detect_preview_band(&mut tuner_rx, key.nid, key.tsid, key.sid, deadline).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tuner.set_state(crate::tuner::shared::ReaderState::Stopped);
+        let result = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("probe should observe reader stop promptly")
+            .unwrap();
+        assert_eq!(result.band, PreviewBand::Other);
+        assert_eq!(cached_preview_band(key), None);
     }
 
     /// Falling back keeps a (stuttering) preview working when the admin has

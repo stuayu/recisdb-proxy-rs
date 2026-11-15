@@ -28,14 +28,13 @@ const KNOWN_PREVIEW_ENCODERS: &[&str] = &[
 
 /// Recommended encoder arguments for the seeded `preview-h264` profile.
 ///
-/// A direct QSVEncC invocation (the `[preview] command_path` executable runs
-/// these as-is), designed to sit behind the recommended tsreadex stage-1
-/// (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` in `database::mod`): tsreadex
-/// selects the service via `-n {SID}` and converts captions to ID3
-/// timed-metadata, so no `{SID}`/`--service` appears here and
-/// `--data-copy timed_id3` carries the caption metadata through to
-/// aribb24.js. H.264 ~2Mbps VBR, deinterlaced, AAC stereo — the
-/// KonomiTV-equivalent browser-preview baseline.
+/// The historical default is a direct QSVEncC invocation (the
+/// `[preview] command_path` executable runs these as-is), designed to sit
+/// behind the recommended tsreadex stage-1
+/// (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` in `database::mod`). Current
+/// ffmpeg profiles select the requested `{SID}` program themselves, so they
+/// also work when no preprocessor is configured. H.264 ~2Mbps VBR,
+/// deinterlaced, AAC stereo — the browser-preview baseline.
 pub(crate) const DEFAULT_PREVIEW_ENCODE_ARGS: &str =
     "--avhw -i - --input-format mpegts --input-analyze 0.6 --input-probesize 1000K \
      --interlace tff --vpp-deinterlace normal -c h264 --profile high \
@@ -106,15 +105,41 @@ fn legacy_preview_encode_args_ffmpeg_pre_tuning(video_encoder: &str) -> String {
 /// 一切通らない。自動セットアップ (`preview_setup`) は ffmpeg を使うため、
 /// そちらで選ばれた映像エンコーダ名を埋め込んだ引数をここで作る。
 ///
-/// stdin から mpegts を読み stdout へ mpegts を書く。前段 tsreadex
-/// (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` の `-d 13`) が字幕を ID3
-/// timed-metadata に変換して data ストリームに載せるので、`-map 0:d?` +
-/// `-c:d copy` でそれを通す (aribb24.js が受け取る)。`?` はデータストリームが
-/// 無い放送でも失敗させないため。
+/// stdin から mpegts を読み stdout へ mpegts を書く。`{SID}` の program map
+/// で入力TSから対象サービスを選ぶため、tsreadexが無い構成でも他サービスを
+/// 混ぜない。前段 tsreadex (`DEFAULT_PREVIEW_PREPROCESSOR_ARGUMENTS` の `-d 13`)
+/// が字幕を ID3 timed-metadata に変換して複数の data stream に載せる場合は、
+/// `-map 0:p:{SID}:d?` + `-c:d copy` ですべて通す (aribb24.js が受け取る)。
+/// `?` は該当種別が無い放送でも失敗させないため。映像・音声は先頭1ストリームだけ
+/// 選び、重複トラックを別エンコードしない。映像が無い/サービスIDが違う入力は失敗させる。
+/// `+discardcorrupt` は使わない。TSのTEIで破損扱いになったPESを丸ごと捨てると、
+/// その中にあるデコード可能なHEVCフレームまで失われる。
 ///
 /// 引数は `encoder_pool` が `split_whitespace` で分割する (シェル解釈なし) ので、
 /// **1トークンの中に空白を入れてはいけない**。
 pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
+    preview_encode_args_ffmpeg_with_service_map(video_encoder, true, false)
+}
+
+/// The immediately preceding generated ffmpeg preview template used the
+/// first video/audio streams instead of selecting the requested program.
+/// Keep it as a migration sentinel so old installations can safely update.
+fn legacy_preview_encode_args_ffmpeg_unscoped_map(video_encoder: &str) -> String {
+    preview_encode_args_ffmpeg_with_service_map(video_encoder, false, true)
+}
+
+/// The immediately preceding service-scoped preview template discarded TS
+/// packets marked corrupt, including packets that still carried decodable
+/// HEVC frames. Keep its exact form as a migration sentinel.
+fn legacy_preview_encode_args_ffmpeg_discardcorrupt(video_encoder: &str) -> String {
+    preview_encode_args_ffmpeg_with_service_map(video_encoder, true, true)
+}
+
+fn preview_encode_args_ffmpeg_with_service_map(
+    video_encoder: &str,
+    select_service_program: bool,
+    discard_corrupt: bool,
+) -> String {
     let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
     let pre_input = spec
         .as_ref()
@@ -135,11 +160,21 @@ pub fn preview_encode_args_ffmpeg(video_encoder: &str) -> String {
     } else {
         tuning
     };
+    let stream_map = if select_service_program {
+        "-map 0:p:{SID}:v:0 -map 0:p:{SID}:a:0? -map 0:p:{SID}:d? -copy_unknown"
+    } else {
+        "-map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown"
+    };
+    let fflags = if discard_corrupt {
+        "+discardcorrupt+genpts"
+    } else {
+        "+genpts"
+    };
     format!(
-        "-hide_banner -loglevel error -fflags +discardcorrupt+genpts \
+        "-hide_banner -loglevel error -fflags {fflags} \
          -analyzeduration 600000 -probesize 1000000 \
          {pre_input}-f mpegts -i pipe:0 \
-         -map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown \
+         {stream_map} \
          -vf yadif=0:-1:1,scale=1280:720,setsar=1{filter_suffix} \
          -c:v {video_encoder} {tuning} -b:v 2000k -maxrate 3000k -bufsize 4000k \
          -g 60 -aspect 16:9 \
@@ -196,6 +231,149 @@ fn legacy_preview_4k_encode_args_ffmpeg(video_encoder: &str) -> [String; 2] {
 /// here after actually decoding a sample HEVC clip with it, because being
 /// listed in `-decoders` says nothing about whether a GPU backs it.
 pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &str) -> String {
+    preview_4k_encode_args_ffmpeg_hwdec_template(
+        video_encoder,
+        hevc_decoder,
+        true,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        true,
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_hwdec_with_audio(
+    video_encoder: &str,
+    hevc_decoder: &str,
+) -> String {
+    preview_4k_encode_args_ffmpeg_hwdec_template(
+        video_encoder,
+        hevc_decoder,
+        true,
+        true,
+        false,
+        false,
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_hwdec_video_only_legacy(
+    video_encoder: &str,
+    hevc_decoder: &str,
+) -> String {
+    preview_4k_encode_args_ffmpeg_hwdec_template(
+        video_encoder,
+        hevc_decoder,
+        false,
+        true,
+        false,
+        false,
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_hwdec_video_only(
+    video_encoder: &str,
+    hevc_decoder: &str,
+) -> String {
+    preview_4k_encode_args_ffmpeg_hwdec_template(
+        video_encoder,
+        hevc_decoder,
+        false,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        true,
+    )
+}
+
+fn legacy_preview_4k_encode_args_ffmpeg_hwdec_program_map(
+    video_encoder: &str,
+    hevc_decoder: &str,
+    include_audio: bool,
+) -> String {
+    preview_4k_encode_args_ffmpeg_hwdec_template(
+        video_encoder,
+        hevc_decoder,
+        include_audio,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        false,
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_hwdec_template(
+    video_encoder: &str,
+    hevc_decoder: &str,
+    include_audio: bool,
+    discard_corrupt: bool,
+    force_pixel_format: bool,
+    select_first_stream: bool,
+) -> String {
+    let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
+    let pre_input = spec
+        .as_ref()
+        .map(|spec| spec.pre_input.join(" "))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    let filter_suffix = spec
+        .as_ref()
+        .map(|spec| spec.filter_suffix.as_str())
+        .unwrap_or_default();
+    let tuning = spec
+        .as_ref()
+        .map(|spec| spec.tuning)
+        .unwrap_or_else(|| video_encoder_tuning(video_encoder));
+    let tuning = if tuning.is_empty() && video_encoder.starts_with("h264_") {
+        "-profile:v high"
+    } else {
+        tuning
+    };
+    let stream_map = if include_audio {
+        if select_first_stream {
+            "-map 0:p:{SID}:v:0 -map 0:p:{SID}:a:0? -map 0:p:{SID}:d? -copy_unknown"
+        } else {
+            "-map 0:p:{SID}:v? -map 0:p:{SID}:a? -map 0:p:{SID}:d? -copy_unknown"
+        }
+    } else {
+        if select_first_stream {
+            "-map 0:p:{SID}:v:0 -an"
+        } else {
+            "-map 0:p:{SID}:v? -an"
+        }
+    };
+    let audio_encode = if include_audio {
+        "-c:a aac -b:a 192k -ar 48000 -ac 2 \
+         -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy"
+    } else {
+        ""
+    };
+    // Preserve recoverable transport errors and convert Main10 input to the
+    // 8-bit format accepted by browser-compatible H.264 encoders.
+    let fflags = if discard_corrupt {
+        "+discardcorrupt+genpts"
+    } else {
+        "+genpts"
+    };
+    let pixel_format = if force_pixel_format {
+        "-pix_fmt yuv420p "
+    } else {
+        ""
+    };
+    format!(
+        "-hide_banner -loglevel error -fflags {fflags} \
+         -analyzeduration 600000 -probesize 1000000 \
+         -c:v {hevc_decoder} \
+         {pre_input}-f mpegts -i pipe:0 \
+         {stream_map} \
+         -vf scale=1920:1080,setsar=1{filter_suffix} \
+         -c:v {video_encoder} {tuning} {pixel_format}-b:v 4000k -maxrate 6000k -bufsize 8000k \
+         -g 60 -aspect 16:9 {audio_encode} \
+         -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
+        tuning = tuning,
+    )
+}
+
+/// Hardware-decoded 1080p template generated before program-specific mapping
+/// was introduced. Kept only for migrating rows seeded by older releases.
+fn legacy_preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &str) -> String {
     let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
     let pre_input = spec
         .as_ref()
@@ -235,19 +413,26 @@ pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &s
 /// is available**. Use [`preview_4k_encode_args_ffmpeg_hwdec`] when there is
 /// one; `preview_setup` decides which by probing.
 ///
-/// The tsreadex input and stream mapping match the normal preview, but the
-/// source is progressive 2160/59.94p HEVC Main10, so there is no deinterlacer
-/// and the picture is scaled to 1920x1080.
+/// The source is progressive 2160/59.94p HEVC Main10, so there is no
+/// deinterlacer. The preview scales the picture to 1280x720 and transcodes
+/// service audio to browser-compatible AAC. A host that cannot decode its
+/// AAC-LATM input can customize that host's profile to omit audio.
 ///
-/// **The decoder side is what costs, not the encoder.** Measured on the
-/// verification machine (Intel iGPU, `h264_qsv` available):
+/// **The decoder side is what costs, not the encoder.** The following numbers
+/// were measured on the verification machine (Intel iGPU, `h264_qsv`
+/// available) with the older, more aggressive `skip_loop_filter:all`
+/// setting. The current template was also measured on a Mac with a live
+/// XIT-SQR100/QVC input: a 25-second request produced 24.19 seconds (725
+/// frames at 29.97 fps) and the output decoded without errors. That confirms
+/// it can keep up for this short sample; it is not a long-duration stability
+/// benchmark.
 ///
 /// | template | realtime (40s) | realtime (120s) | first byte |
 /// |---|---|---|---|
 /// | 1080p, plain software decode | 0.27x | — | 17.3s |
 /// | 1080p, `-skip_loop_filter:v all` only | 0.66x | — | 2.1s |
 /// | 1080p, + `-skip_frame:v noref` | 0.99x | 0.88x | 1.6s |
-/// | **720p, + `-skip_frame:v noref`** (this one) | 0.99x | **0.99x** | 2.3s |
+/// | 720p, + `-skip_frame:v noref` | 0.99x | **0.99x** | 2.3s |
 ///
 /// 1080p looks fine over a short sample and then drifts ~12% behind over two
 /// minutes, which is exactly the "breaks up after a while" complaint. 720p is
@@ -260,13 +445,167 @@ pub fn preview_4k_encode_args_ffmpeg_hwdec(video_encoder: &str, hevc_decoder: &s
 /// silently falls back to the software decoder. Only the **encoder** side of
 /// QSV works there.
 ///
-/// So the decode work itself is cut down: deblocking/SAO is skipped and
-/// non-reference frames are dropped, which halves the preview to ~30fps
-/// (1151 frames in 39.7s measured). That is a deliberate trade — a browser
-/// preview that keeps up at 30fps beats one that falls behind at 60.
-/// Both options are scoped to `:v` because an unscoped `-skip_frame` is also
-/// applied to the AAC decoder, which rejects it and aborts the whole command.
+/// The earlier measured template skipped deblocking/SAO on every frame. The
+/// current template keeps loop filtering on reference frames (`noref`), while
+/// `-skip_frame:v noref` still drops non-reference frames for decode headroom.
+/// The Mac live test showed a clean 720p output for the sampled interval; input
+/// HEVC errors were still reported at startup, so a damaged source can still
+/// produce visual artifacts and long-duration stability remains unmeasured.
 pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
+    preview_4k_encode_args_ffmpeg_template(
+        video_encoder,
+        true,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        true,
+        "noref",
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_with_audio(video_encoder: &str) -> String {
+    preview_4k_encode_args_ffmpeg_template(video_encoder, true, true, false, false, "all")
+}
+
+fn preview_4k_encode_args_ffmpeg_video_only_legacy(video_encoder: &str) -> String {
+    preview_4k_encode_args_ffmpeg_template(video_encoder, false, true, false, false, "all")
+}
+
+fn preview_4k_encode_args_ffmpeg_video_only(video_encoder: &str) -> String {
+    preview_4k_encode_args_ffmpeg_template(
+        video_encoder,
+        false,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        true,
+        "noref",
+    )
+}
+
+pub(crate) fn preview_4k_encode_args_ffmpeg_for_settings(
+    video_encoder: &str,
+    hevc_decoder: Option<&str>,
+    include_audio: bool,
+) -> String {
+    match (hevc_decoder, include_audio) {
+        (Some(decoder), true) => preview_4k_encode_args_ffmpeg_hwdec(video_encoder, decoder),
+        (Some(decoder), false) => {
+            preview_4k_encode_args_ffmpeg_hwdec_video_only(video_encoder, decoder)
+        }
+        (None, true) => preview_4k_encode_args_ffmpeg(video_encoder),
+        (None, false) => preview_4k_encode_args_ffmpeg_video_only(video_encoder),
+    }
+}
+
+/// The immediately preceding generated software-decoding template used the
+/// invalid FFmpeg value `nonref`. Recognize both audio variants so seed can
+/// migrate those exact generated rows without treating administrator edits
+/// as defaults.
+fn legacy_preview_4k_encode_args_ffmpeg_nonref(video_encoder: &str, include_audio: bool) -> String {
+    preview_4k_encode_args_ffmpeg_template(
+        video_encoder,
+        include_audio,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        true,
+        "nonref",
+    )
+}
+
+fn legacy_preview_4k_encode_args_ffmpeg_program_map(
+    video_encoder: &str,
+    include_audio: bool,
+) -> String {
+    preview_4k_encode_args_ffmpeg_template(
+        video_encoder,
+        include_audio,
+        false,
+        !video_encoder.ends_with("_vaapi"),
+        false,
+        "all",
+    )
+}
+
+fn preview_4k_encode_args_ffmpeg_template(
+    video_encoder: &str,
+    include_audio: bool,
+    discard_corrupt: bool,
+    force_pixel_format: bool,
+    select_first_stream: bool,
+    loop_filter_skip: &str,
+) -> String {
+    let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
+    let pre_input = spec
+        .as_ref()
+        .map(|spec| spec.pre_input.join(" "))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    let filter_suffix = spec
+        .as_ref()
+        .map(|spec| spec.filter_suffix.as_str())
+        .unwrap_or_default();
+    let tuning = spec
+        .as_ref()
+        .map(|spec| spec.tuning)
+        .unwrap_or_else(|| video_encoder_tuning(video_encoder));
+    let tuning = if tuning.is_empty() && video_encoder.starts_with("h264_") {
+        "-profile:v high"
+    } else {
+        tuning
+    };
+    let stream_map = if include_audio {
+        if select_first_stream {
+            "-map 0:p:{SID}:v:0 -map 0:p:{SID}:a:0? -map 0:p:{SID}:d? -copy_unknown"
+        } else {
+            "-map 0:p:{SID}:v? -map 0:p:{SID}:a? -map 0:p:{SID}:d? -copy_unknown"
+        }
+    } else {
+        if select_first_stream {
+            "-map 0:p:{SID}:v:0 -an"
+        } else {
+            "-map 0:p:{SID}:v? -an"
+        }
+    };
+    let audio_encode = if include_audio {
+        "-c:a aac -b:a 192k -ar 48000 -ac 2 \
+         -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy"
+    } else {
+        ""
+    };
+    // The observed CATV 4K mux has recoverable TEI/continuity errors.
+    // `discardcorrupt` drops its decodable access units, so keep that flag
+    // only in the legacy sentinel used for migration.
+    let fflags = if discard_corrupt {
+        "+discardcorrupt+genpts"
+    } else {
+        "+genpts"
+    };
+    // HEVC Main 10 must be converted to 8-bit before H.264 High encoding.
+    let pixel_format = if force_pixel_format {
+        "-pix_fmt yuv420p "
+    } else {
+        ""
+    };
+    format!(
+        "-hide_banner -loglevel error -fflags {fflags} \
+         -analyzeduration 600000 -probesize 1000000 \
+         -skip_loop_filter:v {loop_filter_skip} -skip_frame:v noref \
+         {pre_input}-f mpegts -i pipe:0 \
+         {stream_map} \
+         -vf scale=1280:720:flags=fast_bilinear,setsar=1{filter_suffix} \
+         -c:v {video_encoder} {tuning} {pixel_format}-b:v 3000k -maxrate 4500k -bufsize 6000k \
+         -g 60 -aspect 16:9 {audio_encode} \
+         -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
+        tuning = tuning
+    )
+}
+
+/// The first automatically seeded 4K profile on this installation used the
+/// current 720p decode throttles but mapped the first video/audio streams
+/// without selecting a service program. Keep its exact generated shape as a
+/// migration sentinel; custom administrator arguments still match neither
+/// this nor the current templates.
+fn legacy_preview_4k_encode_args_ffmpeg_720p(video_encoder: &str) -> String {
     let spec = crate::encoder_probe::ffmpeg_encoder_spec(video_encoder);
     let pre_input = spec
         .as_ref()
@@ -298,7 +637,7 @@ pub fn preview_4k_encode_args_ffmpeg(video_encoder: &str) -> String {
          -g 60 -aspect 16:9 -c:a aac -b:a 192k -ar 48000 -ac 2 \
          -af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy \
          -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1",
-        tuning = tuning
+        tuning = tuning,
     )
 }
 
@@ -312,19 +651,88 @@ pub fn preview_4k_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool
     }
     KNOWN_PREVIEW_ENCODERS.iter().any(|enc| {
         args == preview_4k_encode_args_ffmpeg(enc)
-            || KNOWN_HEVC_HW_DECODERS
-                .iter()
-                .any(|dec| args == preview_4k_encode_args_ffmpeg_hwdec(enc, dec))
+            || args == preview_4k_encode_args_ffmpeg_video_only(enc)
+            || args == legacy_preview_4k_encode_args_ffmpeg_nonref(enc, true)
+            || args == legacy_preview_4k_encode_args_ffmpeg_nonref(enc, false)
+            || args == preview_4k_encode_args_ffmpeg_with_audio(enc)
+            || args == preview_4k_encode_args_ffmpeg_video_only_legacy(enc)
+            || args == legacy_preview_4k_encode_args_ffmpeg_program_map(enc, true)
+            || args == legacy_preview_4k_encode_args_ffmpeg_program_map(enc, false)
+            || args == legacy_preview_4k_encode_args_ffmpeg_720p(enc)
+            || KNOWN_HEVC_HW_DECODERS.iter().any(|dec| {
+                args == preview_4k_encode_args_ffmpeg_hwdec(enc, dec)
+                    || args == preview_4k_encode_args_ffmpeg_hwdec_video_only(enc, dec)
+                    || args == preview_4k_encode_args_ffmpeg_hwdec_with_audio(enc, dec)
+                    || args == preview_4k_encode_args_ffmpeg_hwdec_video_only_legacy(enc, dec)
+                    || args
+                        == legacy_preview_4k_encode_args_ffmpeg_hwdec_program_map(enc, dec, true)
+                    || args
+                        == legacy_preview_4k_encode_args_ffmpeg_hwdec_program_map(enc, dec, false)
+                    || args == legacy_preview_4k_encode_args_ffmpeg_hwdec(enc, dec)
+            })
             || legacy_preview_4k_encode_args_ffmpeg(enc)
                 .iter()
                 .any(|legacy| args == legacy.as_str())
     })
 }
 
+pub(crate) fn preview_4k_generated_settings(
+    extra_args: Option<&str>,
+) -> Option<(Option<&'static str>, Option<&'static str>, bool)> {
+    let args = extra_args.map(str::trim).unwrap_or_default();
+    if args.is_empty() || args == DEFAULT_PREVIEW_4K_ENCODE_ARGS {
+        return Some((None, None, true));
+    }
+    for encoder in KNOWN_PREVIEW_ENCODERS.iter().copied() {
+        if args == preview_4k_encode_args_ffmpeg(encoder)
+            || args == preview_4k_encode_args_ffmpeg_with_audio(encoder)
+            || args == legacy_preview_4k_encode_args_ffmpeg_nonref(encoder, true)
+            || args == legacy_preview_4k_encode_args_ffmpeg_program_map(encoder, true)
+            || args == legacy_preview_4k_encode_args_ffmpeg_720p(encoder)
+            || legacy_preview_4k_encode_args_ffmpeg(encoder)
+                .iter()
+                .any(|legacy| args == legacy)
+        {
+            return Some((Some(encoder), None, true));
+        }
+        if args == preview_4k_encode_args_ffmpeg_video_only(encoder)
+            || args == preview_4k_encode_args_ffmpeg_video_only_legacy(encoder)
+            || args == legacy_preview_4k_encode_args_ffmpeg_nonref(encoder, false)
+            || args == legacy_preview_4k_encode_args_ffmpeg_program_map(encoder, false)
+        {
+            return Some((Some(encoder), None, false));
+        }
+        for decoder in KNOWN_HEVC_HW_DECODERS.iter().copied() {
+            if args == preview_4k_encode_args_ffmpeg_hwdec(encoder, decoder)
+                || args == preview_4k_encode_args_ffmpeg_hwdec_with_audio(encoder, decoder)
+                || args
+                    == legacy_preview_4k_encode_args_ffmpeg_hwdec_program_map(
+                        encoder, decoder, true,
+                    )
+                || args == legacy_preview_4k_encode_args_ffmpeg_hwdec(encoder, decoder)
+            {
+                return Some((Some(encoder), Some(decoder), true));
+            }
+            if args == preview_4k_encode_args_ffmpeg_hwdec_video_only(encoder, decoder)
+                || args == preview_4k_encode_args_ffmpeg_hwdec_video_only_legacy(encoder, decoder)
+                || args
+                    == legacy_preview_4k_encode_args_ffmpeg_hwdec_program_map(
+                        encoder, decoder, false,
+                    )
+            {
+                return Some((Some(encoder), Some(decoder), false));
+            }
+        }
+    }
+    None
+}
+
 fn preview_video_encoder_from_auto_generated(extra_args: Option<&str>) -> Option<&'static str> {
     let args = extra_args?.trim();
     KNOWN_PREVIEW_ENCODERS.iter().copied().find(|enc| {
         args == preview_encode_args_ffmpeg(enc)
+            || args == legacy_preview_encode_args_ffmpeg_discardcorrupt(enc)
+            || args == legacy_preview_encode_args_ffmpeg_unscoped_map(enc)
             || args == legacy_preview_encode_args_ffmpeg(enc)
             || args == legacy_preview_encode_args_ffmpeg_pre_tuning(enc)
     })
@@ -383,6 +791,8 @@ pub fn preview_extra_args_is_auto_generated(extra_args: Option<&str>) -> bool {
     // 全候補と突き合わせて判定する。エンコーダが増えたらここに足すこと。
     KNOWN_PREVIEW_ENCODERS.iter().any(|enc| {
         args == preview_encode_args_ffmpeg(enc)
+            || args == legacy_preview_encode_args_ffmpeg_discardcorrupt(enc)
+            || args == legacy_preview_encode_args_ffmpeg_unscoped_map(enc)
             || args == legacy_preview_encode_args_ffmpeg(enc)
             || args == legacy_preview_encode_args_ffmpeg_pre_tuning(enc)
     })
@@ -634,7 +1044,7 @@ impl Database {
                 true,
             )?;
             log::info!(
-                "Seeded default encode profile 'preview-4k' (1080p downscale, no deinterlace, purpose=preview4k)"
+                "Seeded default encode profile 'preview-4k' (progressive H.264 downscale, purpose=preview4k)"
             );
         } else {
             // Exact-match migration preserves every administrator-edited row.
@@ -647,13 +1057,8 @@ impl Database {
                 )
                 .optional()?
                 .flatten();
-            let encoder = preview_video_encoder_from_auto_generated(preview_args.as_deref())
-                .unwrap_or("libx264");
-            let replacement = preview_4k_encode_args_ffmpeg(encoder);
-            // Any value this codebase generated itself is fair game to
-            // replace: the rigaya seed that ffmpeg cannot parse at all, and
-            // the first ffmpeg template that could not keep up with 2160p60.
-            // An administrator's own edit matches neither and is left alone.
+            let preferred_encoder =
+                preview_video_encoder_from_auto_generated(preview_args.as_deref());
             let current: Option<String> = self
                 .conn
                 .query_row(
@@ -663,14 +1068,41 @@ impl Database {
                 )
                 .optional()?
                 .flatten();
-            if preview_4k_extra_args_is_auto_generated(current.as_deref())
-                && current.as_deref() != Some(replacement.as_str())
+            // Migrate only exact templates emitted by this application. Keep
+            // the host's working hardware HEVC decoder and its audio choice;
+            // a legacy video-only profile remains video-only across upgrades.
+            // NULL and empty arguments are still defaults for setup's
+            // replaceability gate, but they are not migration sentinels: keep
+            // those database values untouched until setup chooses an encoder.
+            if current
+                .as_deref()
+                .is_some_and(|args| !args.trim().is_empty())
             {
-                self.conn.execute(
-                    "UPDATE encode_profiles SET extra_args = ?1 WHERE name = 'preview-4k'",
-                    params![replacement],
-                )?;
-                log::info!("Migrated encode profile 'preview-4k' to the current ffmpeg template");
+                if let Some((generated_encoder, decoder, include_audio)) =
+                    preview_4k_generated_settings(current.as_deref())
+                {
+                    let encoder = preferred_encoder.or(generated_encoder).unwrap_or("libx264");
+                    let replacement = match (decoder, include_audio) {
+                        (Some(decoder), true) => {
+                            preview_4k_encode_args_ffmpeg_hwdec(encoder, decoder)
+                        }
+                        (Some(decoder), false) => {
+                            preview_4k_encode_args_ffmpeg_hwdec_video_only(encoder, decoder)
+                        }
+                        (None, true) => preview_4k_encode_args_ffmpeg(encoder),
+                        (None, false) => preview_4k_encode_args_ffmpeg_video_only(encoder),
+                    };
+                    if current.as_deref() != Some(replacement.as_str()) {
+                        self.conn.execute(
+                            "UPDATE encode_profiles SET extra_args = ?1
+                         WHERE name = 'preview-4k' AND extra_args = ?2",
+                            params![replacement, current],
+                        )?;
+                        log::info!(
+                            "Migrated encode profile 'preview-4k' to the current ffmpeg template"
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -680,6 +1112,381 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::database::Database;
+    use std::io::{self, Read, Write};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn windows_ffmpeg_fixtures_are_not_unconditionally_ignored() {
+        let source = include_str!("encode_profile.rs");
+        let unconditional_ignore = [
+            "#[cfg_attr(windows, ",
+            "ignore = \"requires FFmpeg with libx264/libx265 and ffprobe\")]",
+        ]
+        .concat();
+        assert!(
+            !source.contains(&unconditional_ignore),
+            "Windows fixture execution must be gated at runtime so required mode can run or fail"
+        );
+    }
+
+    #[test]
+    fn windows_ffmpeg_fixture_skip_policy_respects_required_mode() {
+        assert!(should_skip_windows_ffmpeg_fixtures(true, false));
+        assert!(!should_skip_windows_ffmpeg_fixtures(true, true));
+        assert!(!should_skip_windows_ffmpeg_fixtures(false, false));
+    }
+
+    fn run_4k_preview_fixture(
+        ffmpeg: &Path,
+        encode_args: &str,
+        fixture_video_encoder: &str,
+    ) -> (bool, bool, String, String, usize) {
+        let mut fixture_command = Command::new(ffmpeg);
+        fixture_command.args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000",
+            "-t",
+            "0.5",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            fixture_video_encoder,
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-g",
+            "5",
+        ]);
+        if fixture_video_encoder == "libx265" {
+            fixture_command.args([
+                "-threads",
+                "1",
+                "-x265-params",
+                "pools=none:frame-threads=1:log-level=error",
+            ]);
+        }
+        let mut fixture = fixture_command
+            .args(["-mpegts_service_id", "1", "-f", "mpegts", "pipe:1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start lavfi MPEG-TS fixture producer");
+        let mut transcoder = Command::new(ffmpeg)
+            .args(encode_args.split_whitespace())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start generated 4K preview args");
+
+        let mut fixture_stdout = fixture.stdout.take().unwrap();
+        let mut transcoder_stdin = transcoder.stdin.take().unwrap();
+        let mut transcoder_stdout = transcoder.stdout.take().unwrap();
+        let output_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            transcoder_stdout
+                .read_to_end(&mut output)
+                .map(|_| output.len())
+        });
+        let copied = io::copy(&mut fixture_stdout, &mut transcoder_stdin);
+        drop(transcoder_stdin);
+        let fixture_output = fixture.wait_with_output().unwrap();
+        let transcoder_output = transcoder.wait_with_output().unwrap();
+        let output_bytes = output_reader.join().unwrap().unwrap();
+
+        (
+            fixture_output.status.success(),
+            transcoder_output.status.success(),
+            String::from_utf8_lossy(&fixture_output.stderr).into_owned(),
+            format!(
+                "{}; copied_input_bytes={}; output_bytes={output_bytes}",
+                String::from_utf8_lossy(&transcoder_output.stderr),
+                copied.unwrap_or_default()
+            ),
+            output_bytes,
+        )
+    }
+
+    fn ffmpeg_with_libx264() -> Option<std::path::PathBuf> {
+        let required = std::env::var_os("RECISDB_REQUIRE_FFMPEG_FIXTURES").is_some();
+        let output = match Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if required {
+                    panic!("required FFmpeg fixtures cannot run: ffmpeg unavailable ({error})");
+                }
+                eprintln!("skipping FFmpeg preview argument test: ffmpeg unavailable ({error})");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            if required {
+                panic!("required FFmpeg fixtures cannot run: `ffmpeg -encoders` failed");
+            }
+            eprintln!("skipping FFmpeg preview argument test: `ffmpeg -encoders` failed");
+            return None;
+        }
+        let encoders = String::from_utf8_lossy(&output.stdout);
+        if !encoders
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("libx264"))
+        {
+            if required {
+                panic!("required FFmpeg fixtures cannot run: ffmpeg has no libx264 encoder");
+            }
+            eprintln!("skipping FFmpeg preview argument test: ffmpeg has no libx264 encoder");
+            return None;
+        }
+        Some("ffmpeg".into())
+    }
+
+    fn should_skip_windows_ffmpeg_fixtures(is_windows: bool, required: bool) -> bool {
+        is_windows && !required
+    }
+
+    fn skip_optional_windows_ffmpeg_fixture(test_name: &str) -> bool {
+        let required = std::env::var_os("RECISDB_REQUIRE_FFMPEG_FIXTURES").is_some();
+        if should_skip_windows_ffmpeg_fixtures(cfg!(windows), required) {
+            eprintln!(
+                "skipping {test_name} on Windows; set RECISDB_REQUIRE_FFMPEG_FIXTURES=1 to run and require its FFmpeg encoders"
+            );
+            return true;
+        }
+        false
+    }
+
+    fn hevc_fixture_encoder_available(ffmpeg: &Path) -> bool {
+        if ffmpeg_has_encoder(ffmpeg, "libx265") {
+            return true;
+        }
+        if std::env::var_os("RECISDB_REQUIRE_FFMPEG_FIXTURES").is_some() {
+            panic!("required HEVC fixtures cannot run: ffmpeg has no libx265 encoder");
+        }
+        eprintln!("skipping HEVC preview fixture: ffmpeg has no libx265 encoder");
+        false
+    }
+
+    fn ffmpeg_has_encoder(ffmpeg: &Path, encoder: &str) -> bool {
+        Command::new(ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(1) == Some(encoder))
+            })
+            .unwrap_or(false)
+    }
+
+    fn hevc_fixture_with_corrupt_video_pes(ffmpeg: &Path) -> Result<Vec<u8>, String> {
+        let output = Command::new(ffmpeg)
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000",
+                "-t",
+                "3",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "pools=none:frame-threads=1:bframes=0:keyint=1:scenecut=0:log-level=error",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-streamid",
+                "0:256",
+                "-streamid",
+                "1:257",
+                "-mpegts_service_id",
+                "1",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ])
+            .output()
+            .map_err(|error| format!("start HEVC fixture producer: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+
+        let mut transport_stream = output.stdout;
+        let mut video_pes_index = 0;
+        let mut in_corrupt_video_pes = false;
+        let mut marked_packets = 0;
+        for packet in transport_stream.chunks_exact_mut(188) {
+            if packet[0] != 0x47 {
+                continue;
+            }
+            let pid = (usize::from(packet[1] & 0x1f) << 8) | usize::from(packet[2]);
+            if pid != 256 {
+                continue;
+            }
+            if packet[1] & 0x40 != 0 {
+                video_pes_index += 1;
+                in_corrupt_video_pes = video_pes_index == 10;
+            }
+            if in_corrupt_video_pes {
+                packet[1] |= 0x80;
+                marked_packets += 1;
+            }
+        }
+        if marked_packets == 0 {
+            return Err(format!(
+                "fixture had no video packets in selected PES ({} PES packets)",
+                video_pes_index
+            ));
+        }
+        Ok(transport_stream)
+    }
+
+    fn transcode_fixture(ffmpeg: &Path, args: &str, input: &[u8]) -> (bool, Vec<u8>, String) {
+        let mut transcoder = Command::new(ffmpeg)
+            .args(args.split_whitespace())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start preview transcode");
+        let mut stdin = transcoder.stdin.take().unwrap();
+        let mut stdout = transcoder.stdout.take().unwrap();
+        let output_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).map(|_| output)
+        });
+        let write_result = stdin.write_all(input);
+        drop(stdin);
+        let process_output = transcoder.wait_with_output().unwrap();
+        let output = output_reader.join().unwrap().unwrap();
+        let error = match write_result {
+            Ok(()) => String::from_utf8_lossy(&process_output.stderr).into_owned(),
+            Err(error) => format!("write fixture to FFmpeg: {error}"),
+        };
+        (process_output.status.success(), output, error)
+    }
+
+    fn count_video_frames(ffprobe: &Path, transport_stream: &[u8]) -> Result<usize, String> {
+        let mut probe = Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-count_frames",
+                "-show_entries",
+                "stream=codec_type,nb_read_frames",
+                "-of",
+                "compact=p=0:nk=0",
+                "-i",
+                "pipe:0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("start ffprobe: {error}"))?;
+        probe
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(transport_stream)
+            .map_err(|error| format!("write output to ffprobe: {error}"))?;
+        let output = probe
+            .wait_with_output()
+            .map_err(|error| format!("wait for ffprobe: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let output_text = String::from_utf8_lossy(&output.stdout);
+        let video_stream = output_text
+            .lines()
+            .find(|line| line.split('|').any(|field| field == "codec_type=video"))
+            .ok_or_else(|| format!("ffprobe returned no video stream: {output_text:?}"))?;
+        let frame_count = video_stream
+            .split('|')
+            .find_map(|field| field.strip_prefix("nb_read_frames="))
+            .ok_or_else(|| format!("ffprobe returned no frame count: {video_stream:?}"))?;
+        frame_count
+            .parse()
+            .map_err(|error| format!("parse ffprobe frame count {frame_count:?}: {error}"))
+    }
+
+    fn assert_tei_fixture_frames_preserved(
+        ffmpeg: &Path,
+        args: &str,
+        fixture: &[u8],
+        template_name: &str,
+    ) {
+        let no_discard_args = args.replace("-fflags +discardcorrupt+genpts", "-fflags +genpts");
+        let discardcorrupt_args =
+            no_discard_args.replace("-fflags +genpts", "-fflags +discardcorrupt+genpts");
+        assert!(discardcorrupt_args.contains("-fflags +discardcorrupt+genpts"));
+
+        let (generated_ok, generated_output, generated_error) =
+            transcode_fixture(ffmpeg, args, fixture);
+        assert!(
+            generated_ok,
+            "{template_name} generated transcode failed: {generated_error}"
+        );
+        let (control_ok, control_output, control_error) =
+            transcode_fixture(ffmpeg, &discardcorrupt_args, fixture);
+        assert!(
+            control_ok,
+            "{template_name} discardcorrupt positive control failed: {control_error}"
+        );
+
+        let ffprobe = ffmpeg.with_file_name("ffprobe");
+        let generated_frames = count_video_frames(&ffprobe, &generated_output)
+            .unwrap_or_else(|error| panic!("count {template_name} generated frames: {error}"));
+        let control_frames =
+            count_video_frames(&ffprobe, &control_output).unwrap_or_else(|error| {
+                panic!("count {template_name} positive-control frames: {error}")
+            });
+        assert_eq!(
+            generated_frames, 30,
+            "{template_name} generated template should preserve all fixture frames"
+        );
+        assert!(
+            no_discard_args.contains("-fflags +genpts"),
+            "{template_name} generated template must use +genpts without discardcorrupt"
+        );
+        assert!(!args.contains("+discardcorrupt"));
+        assert!(
+            control_frames < 30,
+            "{template_name} positive control should reproduce dropped frames: {control_frames}"
+        );
+    }
 
     #[test]
     fn seed_creates_default_preview_profile() {
@@ -819,6 +1626,152 @@ mod tests {
     }
 
     #[test]
+    fn previous_preview_template_with_discardcorrupt_is_migrated() {
+        let args = super::preview_encode_args_ffmpeg("h264_videotoolbox");
+        let previous = args.replace("-fflags +genpts", "-fflags +discardcorrupt+genpts");
+        assert_ne!(previous, args);
+        assert!(super::preview_extra_args_is_auto_generated(Some(&previous)));
+        assert_eq!(
+            super::preview_video_encoder_from_auto_generated(Some(&previous)),
+            Some("h264_videotoolbox")
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&previous)),
+            None,
+        )
+        .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        assert_eq!(
+            db.get_encode_profile(profile.id)
+                .unwrap()
+                .unwrap()
+                .extra_args
+                .as_deref(),
+            Some(args.as_str())
+        );
+    }
+
+    #[test]
+    fn ffmpeg_preview_template_selects_the_requested_program_without_tsreadex() {
+        let args = super::preview_encode_args_ffmpeg("h264_videotoolbox");
+        assert!(args.contains("-fflags +genpts"));
+        assert!(!args.contains("+discardcorrupt"));
+        assert!(args.contains("-map 0:p:{SID}:v:0 -map"));
+        assert!(args.contains("-map 0:p:{SID}:a:0?"));
+        assert!(args.contains("-map 0:p:{SID}:d?"));
+        assert!(!args.contains("-map 0:p:{SID}:v:0?"));
+        assert!(args.contains("{SID}"));
+        assert!(!args.contains("--service"));
+    }
+
+    #[test]
+    fn previous_generated_preview_template_is_recognized_and_migrated() {
+        let previous = concat!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts ",
+            "-analyzeduration 600000 -probesize 1000000 -f mpegts -i pipe:0 ",
+            "-map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown ",
+            "-vf yadif=0:-1:1,scale=1280:720,setsar=1 ",
+            "-c:v h264_videotoolbox -realtime 1 -allow_sw 1 -profile:v high ",
+            "-b:v 2000k -maxrate 3000k -bufsize 4000k -g 60 -aspect 16:9 ",
+            "-c:a aac -b:a 192k -ar 48000 -ac 2 ",
+            "-af aresample=async=1:min_hard_comp=0.100000:first_pts=0 ",
+            "-c:d copy -f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        );
+        assert!(super::preview_extra_args_is_auto_generated(Some(previous)));
+        assert_eq!(
+            super::preview_video_encoder_from_auto_generated(Some(previous)),
+            Some("h264_videotoolbox")
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(previous)),
+            None,
+        )
+        .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db.get_encode_profile(profile.id).unwrap().unwrap();
+        assert_eq!(
+            migrated.extra_args.as_deref(),
+            Some(super::preview_encode_args_ffmpeg("h264_videotoolbox").as_str())
+        );
+    }
+
+    #[test]
+    fn previous_generated_hardware_decode_4k_template_is_recognized() {
+        let previous = concat!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts ",
+            "-analyzeduration 600000 -probesize 1000000 ",
+            "-c:v hevc_videotoolbox -f mpegts -i pipe:0 ",
+            "-map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown ",
+            "-vf scale=1920:1080,setsar=1 ",
+            "-c:v h264_videotoolbox -realtime 1 -allow_sw 1 -profile:v high ",
+            "-b:v 4000k -maxrate 6000k -bufsize 8000k -g 60 -aspect 16:9 ",
+            "-c:a aac -b:a 192k -ar 48000 -ac 2 ",
+            "-af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy ",
+            "-f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        );
+        assert!(super::preview_4k_extra_args_is_auto_generated(Some(
+            previous
+        )));
+    }
+
+    #[test]
+    fn generated_4k_preview_keeps_audio_and_avoids_vaapi_software_pixel_format() {
+        let args = super::preview_4k_encode_args_ffmpeg("h264_videotoolbox");
+        assert!(args.contains("-map 0:p:{SID}:a:0?"), "{args}");
+        assert!(args.contains("-c:a aac"), "{args}");
+        assert!(!args.split_whitespace().any(|arg| arg == "-an"), "{args}");
+
+        for args in [
+            super::preview_4k_encode_args_ffmpeg("h264_vaapi"),
+            super::preview_4k_encode_args_ffmpeg_hwdec("h264_vaapi", "hevc_cuvid"),
+        ] {
+            assert!(!args.contains("-pix_fmt yuv420p"), "{args}");
+        }
+    }
+
+    #[test]
+    fn generated_4k_preview_templates_select_the_requested_program() {
+        let software = super::preview_4k_encode_args_ffmpeg("libx264");
+        let hardware =
+            super::preview_4k_encode_args_ffmpeg_hwdec("h264_videotoolbox", "hevc_videotoolbox");
+
+        for args in [software, hardware] {
+            assert!(args.contains("-fflags +genpts"));
+            assert!(!args.contains("+discardcorrupt"));
+            assert!(args.contains("-map 0:p:{SID}:v:0 -map"));
+            assert!(args.contains("-map 0:p:{SID}:a:0?"));
+            assert!(args.contains("-map 0:p:{SID}:d?"));
+            assert!(!args.contains("-map 0:p:{SID}:v:0?"));
+            assert!(args.contains("-c:a aac"));
+            assert!(args.contains("-pix_fmt yuv420p"));
+        }
+    }
+
+    #[test]
     fn seed_is_idempotent() {
         let db = Database::open_in_memory().unwrap();
         db.seed_default_encode_profiles().unwrap(); // called again on top of open()'s own seed
@@ -831,8 +1784,9 @@ mod tests {
     fn four_k_ffmpeg_args_preserve_pipeline_without_deinterlacing() {
         let args = super::preview_4k_encode_args_ffmpeg("h264_qsv");
         assert!(args.contains("-f mpegts -i pipe:0"));
-        assert!(args.contains("-map 0:d?"));
-        assert!(args.contains("-c:d copy"));
+        assert!(args.contains("-map 0:p:{SID}:v:0 -map"));
+        assert!(args.contains("-map 0:p:{SID}:a:0?"));
+        assert!(args.contains("-c:a aac"));
         assert!(args.contains("-vf scale=1280:720"));
         assert!(args.contains("setsar=1"));
         assert!(args.contains("-c:v h264_qsv"));
@@ -848,7 +1802,7 @@ mod tests {
     #[test]
     fn four_k_args_throttle_the_decoder_and_scope_it_to_video() {
         let args = super::preview_4k_encode_args_ffmpeg("h264_qsv");
-        assert!(args.contains("-skip_loop_filter:v all"), "{args}");
+        assert!(args.contains("-skip_loop_filter:v noref"), "{args}");
         assert!(args.contains("-skip_frame:v noref"), "{args}");
         assert!(!args.contains("-skip_frame noref"), "{args}");
         assert!(!args.contains("-skip_loop_filter all"), "{args}");
@@ -893,6 +1847,312 @@ mod tests {
             assert!(args.contains("-skip_frame:v noref"), "{args}");
             assert!(args.contains("scale=1280:720"), "{args}");
         }
+    }
+
+    #[test]
+    fn seed_migrates_the_previous_generated_4k_template_without_overwriting_custom_profiles() {
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let previous = concat!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts ",
+            "-analyzeduration 600000 -probesize 1000000 ",
+            "-skip_loop_filter:v all -skip_frame:v noref ",
+            "-f mpegts -i pipe:0 ",
+            "-map 0:v:0 -map 0:a:0 -map 0:d? -copy_unknown ",
+            "-vf scale=1280:720:flags=fast_bilinear,setsar=1 ",
+            "-c:v libx264 -preset veryfast -tune zerolatency -profile:v high ",
+            "-b:v 3000k -maxrate 4500k -bufsize 6000k -g 60 -aspect 16:9 ",
+            "-c:a aac -b:a 192k -ar 48000 -ac 2 ",
+            "-af aresample=async=1:min_hard_comp=0.100000:first_pts=0 -c:d copy ",
+            "-f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        );
+        assert_eq!(
+            super::legacy_preview_4k_encode_args_ffmpeg_720p("libx264"),
+            previous
+        );
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&previous)),
+            None,
+        )
+        .unwrap();
+
+        assert!(super::preview_4k_extra_args_is_auto_generated(Some(
+            &previous
+        )));
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let args = migrated.extra_args.as_deref().unwrap();
+        assert!(!args.split_whitespace().any(|arg| arg == "-an"), "{args}");
+        assert!(args.contains("-fflags +genpts"), "{args}");
+        assert!(args.contains("-pix_fmt yuv420p"), "{args}");
+        assert!(!args.contains("+discardcorrupt"), "{args}");
+        assert!(args.contains("-map 0:p:{SID}:a:0?"), "{args}");
+        assert!(args.contains("-c:a aac"), "{args}");
+
+        db.update_encode_profile(
+            migrated.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--administrator-customized")),
+            None,
+        )
+        .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let preserved = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved.extra_args.as_deref(),
+            Some("--administrator-customized")
+        );
+    }
+
+    #[test]
+    fn seed_preserves_null_generated_4k_args() {
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        assert!(super::preview_4k_extra_args_is_auto_generated(None));
+        db.update_encode_profile(profile.id, None, None, None, None, None, Some(None), None)
+            .unwrap();
+
+        db.seed_default_encode_profiles().unwrap();
+
+        assert_eq!(
+            db.get_encode_profile(profile.id)
+                .unwrap()
+                .unwrap()
+                .extra_args,
+            None
+        );
+    }
+
+    #[test]
+    fn seed_preserves_empty_generated_4k_args() {
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        assert!(super::preview_4k_extra_args_is_auto_generated(Some("")));
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("")),
+            None,
+        )
+        .unwrap();
+
+        db.seed_default_encode_profiles().unwrap();
+
+        assert_eq!(
+            db.get_encode_profile(profile.id)
+                .unwrap()
+                .unwrap()
+                .extra_args
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn seed_migrates_the_previous_video_only_4k_template() {
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let previous = concat!(
+            "-hide_banner -loglevel error -fflags +discardcorrupt+genpts ",
+            "-analyzeduration 600000 -probesize 1000000 ",
+            "-skip_loop_filter:v all -skip_frame:v noref ",
+            "-f mpegts -i pipe:0 -map 0:p:{SID}:v? -an ",
+            "-vf scale=1280:720:flags=fast_bilinear,setsar=1 ",
+            "-c:v h264_videotoolbox -realtime 1 -allow_sw 1 -profile:v high ",
+            "-b:v 3000k -maxrate 4500k -bufsize 6000k -g 60 -aspect 16:9  ",
+            "-f mpegts -flush_packets 1 -muxdelay 0 -muxpreload 0 pipe:1"
+        );
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(previous)),
+            None,
+        )
+        .unwrap();
+
+        assert!(super::preview_4k_extra_args_is_auto_generated(Some(
+            previous
+        )));
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let args = migrated.extra_args.as_deref().unwrap();
+        assert!(args.contains("-fflags +genpts"), "{args}");
+        assert!(!args.contains("+discardcorrupt"), "{args}");
+        assert!(args.contains("-pix_fmt yuv420p"), "{args}");
+        assert!(args.split_whitespace().any(|arg| arg == "-an"), "{args}");
+        assert!(!args.contains("-map 0:p:{SID}:a"), "{args}");
+        assert!(!args.contains("-c:a aac"), "{args}");
+    }
+
+    #[test]
+    fn seed_migrates_the_previous_invalid_nonref_profile_value() {
+        let db = Database::open_in_memory().unwrap();
+        let profile = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let previous = super::preview_4k_encode_args_ffmpeg_video_only("h264_videotoolbox")
+            .replace("-skip_loop_filter:v noref", "-skip_loop_filter:v nonref");
+        db.update_encode_profile(
+            profile.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&previous)),
+            None,
+        )
+        .unwrap();
+
+        assert!(super::preview_4k_extra_args_is_auto_generated(Some(
+            &previous
+        )));
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let args = migrated.extra_args.as_deref().unwrap();
+        assert!(args.contains("-skip_loop_filter:v noref"), "{args}");
+        assert!(!args.contains("nonref"), "{args}");
+        assert!(args.contains(" -an "), "{args}");
+    }
+
+    #[test]
+    fn seed_preserves_generated_4k_hardware_decoder_when_updating_encoder() {
+        let db = Database::open_in_memory().unwrap();
+        let ordinary = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
+        let four_k = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        db.update_encode_profile(
+            ordinary.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&super::preview_encode_args_ffmpeg(
+                "h264_videotoolbox",
+            ))),
+            None,
+        )
+        .unwrap();
+        let old_hw =
+            super::legacy_preview_4k_encode_args_ffmpeg_hwdec("h264_qsv", "hevc_videotoolbox");
+        db.update_encode_profile(
+            four_k.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&old_hw)),
+            None,
+        )
+        .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db.get_encode_profile(four_k.id).unwrap().unwrap();
+        assert_eq!(
+            migrated.extra_args.as_deref(),
+            Some(
+                super::preview_4k_encode_args_ffmpeg_hwdec(
+                    "h264_videotoolbox",
+                    "hevc_videotoolbox"
+                )
+                .as_str()
+            ),
+        );
+    }
+
+    #[test]
+    fn seed_preserves_4k_encoder_when_ordinary_profile_is_customized() {
+        let db = Database::open_in_memory().unwrap();
+        let ordinary = db
+            .get_encode_profile_by_purpose("preview")
+            .unwrap()
+            .unwrap();
+        let four_k = db
+            .get_encode_profile_by_purpose("preview4k")
+            .unwrap()
+            .unwrap();
+        let old_four_k =
+            super::legacy_preview_4k_encode_args_ffmpeg_hwdec("h264_qsv", "hevc_videotoolbox");
+        db.update_encode_profile(
+            ordinary.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("--administrator-preview")),
+            None,
+        )
+        .unwrap();
+        db.update_encode_profile(
+            four_k.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&old_four_k)),
+            None,
+        )
+        .unwrap();
+        db.seed_default_encode_profiles().unwrap();
+        let migrated = db.get_encode_profile(four_k.id).unwrap().unwrap();
+        assert_eq!(
+            migrated.extra_args.as_deref(),
+            Some(
+                super::preview_4k_encode_args_ffmpeg_hwdec("h264_qsv", "hevc_videotoolbox")
+                    .as_str()
+            ),
+        );
     }
 
     #[test]
@@ -1015,5 +2275,142 @@ mod tests {
             .get_encode_profile_by_purpose("preview")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn generated_4k_preview_ffmpeg_args_accept_the_small_mpeg_ts_fixture() {
+        if skip_optional_windows_ffmpeg_fixture(
+            "generated_4k_preview_ffmpeg_args_accept_the_small_mpeg_ts_fixture",
+        ) {
+            return;
+        }
+        let Some(ffmpeg) = ffmpeg_with_libx264() else {
+            return;
+        };
+        let audio_args = super::preview_4k_encode_args_ffmpeg("libx264").replace("{SID}", "1");
+        let (fixture_ok, transcode_ok, fixture_error, transcode_error, output_bytes) =
+            run_4k_preview_fixture(&ffmpeg, &audio_args, "mpeg2video");
+        assert!(fixture_ok, "fixture generation failed: {fixture_error}");
+        assert!(
+            transcode_ok,
+            "generated audio 4K args failed against the fixture: {transcode_error}"
+        );
+        assert!(
+            output_bytes > 0,
+            "FFmpeg exited successfully without output"
+        );
+
+        let video_only_args =
+            super::preview_4k_encode_args_ffmpeg_video_only("libx264").replace("{SID}", "1");
+        let (fixture_ok, transcode_ok, fixture_error, transcode_error, output_bytes) =
+            run_4k_preview_fixture(&ffmpeg, &video_only_args, "mpeg2video");
+        assert!(
+            fixture_ok,
+            "video-only fixture generation failed: {fixture_error}"
+        );
+        assert!(
+            transcode_ok,
+            "generated video-only 4K args failed against the fixture: {transcode_error}"
+        );
+        assert!(output_bytes > 0, "FFmpeg emitted no video-only output");
+
+        if hevc_fixture_encoder_available(&ffmpeg) {
+            // Use FFmpeg's built-in HEVC decoder to exercise the hardware-HEVC
+            // template's exact decoder option layout on CI hosts without a
+            // physical hardware decoder.
+            let hevc_decoder_args =
+                super::preview_4k_encode_args_ffmpeg_hwdec("libx264", "hevc").replace("{SID}", "1");
+            let (fixture_ok, transcode_ok, fixture_error, transcode_error, output_bytes) =
+                run_4k_preview_fixture(&ffmpeg, &hevc_decoder_args, "libx265");
+            assert!(
+                fixture_ok,
+                "HEVC fixture generation failed: {fixture_error}"
+            );
+            assert!(
+                transcode_ok,
+                "generated HEVC-decoder 4K args failed against the fixture: {transcode_error}"
+            );
+            assert!(output_bytes > 0, "FFmpeg emitted no HEVC-decoder output");
+        }
+
+        let invalid_args =
+            audio_args.replace("-skip_loop_filter:v noref", "-skip_loop_filter:v nonref");
+        assert_ne!(invalid_args, audio_args);
+        let (_, invalid_transcode_ok, _, invalid_error, _) =
+            run_4k_preview_fixture(&ffmpeg, &invalid_args, "mpeg2video");
+        assert!(
+            !invalid_transcode_ok,
+            "the FFmpeg fixture must reject the known-invalid `nonref` spelling: {invalid_error}"
+        );
+    }
+
+    #[test]
+    fn generated_preview_ffmpeg_args_decode_hevc_with_deinterlacing_and_no_frame_skip() {
+        if skip_optional_windows_ffmpeg_fixture(
+            "generated_preview_ffmpeg_args_decode_hevc_with_deinterlacing_and_no_frame_skip",
+        ) {
+            return;
+        }
+        let Some(ffmpeg) = ffmpeg_with_libx264() else {
+            return;
+        };
+        if !hevc_fixture_encoder_available(&ffmpeg) {
+            return;
+        }
+
+        let args = super::preview_encode_args_ffmpeg("libx264").replace("{SID}", "1");
+        assert!(args.contains("yadif=0:-1:1"));
+        assert!(!args.contains("-skip_frame"));
+        let (fixture_ok, transcode_ok, fixture_error, transcode_error, output_bytes) =
+            run_4k_preview_fixture(&ffmpeg, &args, "libx265");
+        assert!(
+            fixture_ok,
+            "HEVC fixture generation failed: {fixture_error}"
+        );
+        assert!(
+            transcode_ok,
+            "generated ordinary preview args failed to decode HEVC: {transcode_error}"
+        );
+        assert!(output_bytes > 0, "FFmpeg emitted no HEVC preview output");
+    }
+
+    #[test]
+    fn normal_hevc_preview_keeps_decodable_frames_from_a_tei_marked_pes() {
+        if skip_optional_windows_ffmpeg_fixture(
+            "normal_hevc_preview_keeps_decodable_frames_from_a_tei_marked_pes",
+        ) {
+            return;
+        }
+        let Some(ffmpeg) = ffmpeg_with_libx264() else {
+            return;
+        };
+        if !hevc_fixture_encoder_available(&ffmpeg) {
+            return;
+        }
+        let fixture = hevc_fixture_with_corrupt_video_pes(&ffmpeg)
+            .expect("generate HEVC fixture with a TEI-marked video PES");
+        let templates = [
+            (
+                "ordinary preview",
+                super::preview_encode_args_ffmpeg("libx264"),
+            ),
+            ("4K audio", super::preview_4k_encode_args_ffmpeg("libx264")),
+            (
+                "4K video-only",
+                super::preview_4k_encode_args_ffmpeg_video_only("libx264"),
+            ),
+            (
+                "4K HEVC decoder audio",
+                super::preview_4k_encode_args_ffmpeg_hwdec("libx264", "hevc"),
+            ),
+            (
+                "4K HEVC decoder video-only",
+                super::preview_4k_encode_args_ffmpeg_hwdec_video_only("libx264", "hevc"),
+            ),
+        ];
+        for (name, args) in templates {
+            let args = args.replace("{SID}", "1");
+            assert_tei_fixture_frames_preserved(&ffmpeg, &args, &fixture, name);
+        }
     }
 }
