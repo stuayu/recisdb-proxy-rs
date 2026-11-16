@@ -40,6 +40,69 @@ fn set_card_reader_name_does_not_crash() {
     assert!(b25_sys::set_card_reader_name(name));
 }
 
+/// recisdb-proxy は1プロセスでチューナーごとにデコーダーを持つ。SoftCAS 系の
+/// `winscard.dll` / `libpcsckai.so` は毎回同じコンテキスト値を返すため、2つ目以降の
+/// デコーダーが「カードリーダーなし」になっていた(2026-11, eefd4f0)。
+///
+/// `B25_TEST_TS` にスクランブルされた TS を指定すると、全デコーダーで復号し、
+/// 出力にスクランブル済みパケットが残らないことも確かめる。
+#[test]
+#[ignore]
+fn concurrent_decoders_all_initialize_and_descramble() {
+    use std::io::{Read, Write};
+
+    let input = std::env::var("B25_TEST_TS")
+        .ok()
+        .map(|path| std::fs::read(path).expect("B25_TEST_TS を読めない"));
+    let mut decoders = Vec::new();
+    for index in 0..4 {
+        let decoder = b25_sys::StreamDecoder::new(b25_sys::DecoderOptions::default());
+        assert!(
+            decoder.is_ok(),
+            "decoder #{index} failed while {} others are alive: {:?}",
+            decoders.len(),
+            decoder.err()
+        );
+        decoders.push(decoder.unwrap());
+    }
+    let Some(input) = input else {
+        return;
+    };
+    for (index, decoder) in decoders.iter_mut().enumerate() {
+        let mut output = Vec::new();
+        let mut buffer = vec![0u8; 1 << 20];
+        for chunk in input.chunks(188 * 256) {
+            decoder.write_all(chunk).unwrap();
+            loop {
+                let length = decoder.read(&mut buffer).unwrap();
+                if length == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..length]);
+            }
+        }
+        decoder.flush().unwrap();
+        loop {
+            let length = decoder.read(&mut buffer).unwrap();
+            if length == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..length]);
+        }
+        let packets = output.chunks_exact(188).filter(|p| p[0] == 0x47);
+        let (total, scrambled) = packets.fold((0usize, 0usize), |(t, s), p| {
+            (t + 1, s + usize::from(p[3] & 0xc0 != 0))
+        });
+        println!("decoder #{index}: {total} packets, {scrambled} scrambled");
+        assert!(total > 0, "decoder #{index} produced no packets");
+        // ECM 到着前の先頭パケットだけはスクランブルのまま出ることがある。
+        assert!(
+            scrambled * 100 <= total,
+            "decoder #{index} left {scrambled}/{total} packets scrambled"
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn list_card_readers_reports_what_pcsc_sees() {

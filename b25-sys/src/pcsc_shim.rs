@@ -294,15 +294,19 @@ pub unsafe extern "C" fn SCardEstablishContext(
     }
     let boncaslink_available = boncaslink::enabled() || boncaslink::has_registered_readers();
     if let Some(b) = backend() {
-        let status = (b.establish_context)(dw_scope, pv_reserved1, pv_reserved2, ph_context);
+        let mut backend_context: ScardContext = 0;
+        let status =
+            (b.establish_context)(dw_scope, pv_reserved1, pv_reserved2, &mut backend_context);
         if status == 0 {
-            let context = scard_handle_key(*ph_context);
-            if !boncaslink::register_native_context(context) {
-                let _ = (b.release_context)(*ph_context);
-                return SCARD_E_INVALID_HANDLE;
-            }
+            let Some(context) =
+                boncaslink::register_native_context_alias(scard_handle_key(backend_context))
+            else {
+                let _ = (b.release_context)(backend_context);
+                return SCARD_E_NO_SERVICE;
+            };
             #[cfg(target_os = "macos")]
             crate::px4_card::register_context(context);
+            *ph_context = scard_handle_from_key(context);
             return 0;
         }
         let virtual_readers_available =
@@ -355,7 +359,7 @@ pub(crate) fn release_native_context_with(
         release.release_lifecycle_lock();
         let px4_release = crate::px4_card::begin_context_release(context);
         release.reacquire_lifecycle_lock();
-        let status = release_backend(h_context);
+        let status = release_backend(scard_handle_from_key(release.backend_handle()));
         let succeeded = status == 0;
         if succeeded {
             boncaslink::release_context_cards(context);
@@ -366,7 +370,7 @@ pub(crate) fn release_native_context_with(
     };
 
     #[cfg(not(target_os = "macos"))]
-    let status = release_backend(h_context);
+    let status = release_backend(scard_handle_from_key(release.backend_handle()));
     #[cfg(not(target_os = "macos"))]
     let succeeded = status == 0;
     #[cfg(not(target_os = "macos"))]
@@ -406,18 +410,24 @@ pub unsafe extern "C" fn SCardListReaders(
     let px4 = px4_readers();
     let has_virtual_readers =
         boncaslink::enabled() || boncaslink::has_registered_readers() || !px4.is_empty();
+    let operation = boncaslink::begin_native_context_operation(scard_handle_key(h_context));
+    let backend_context = operation
+        .as_ref()
+        .map(|operation| scard_handle_from_key(operation.backend_handle()));
     if !has_virtual_readers {
-        return match backend() {
-            Some(b) => (b.list_readers)(h_context, msz_groups, msz_readers, pcch_readers),
-            None => SCARD_E_NO_SERVICE,
+        return match (backend(), backend_context) {
+            (Some(b), Some(context)) => {
+                (b.list_readers)(context, msz_groups, msz_readers, pcch_readers)
+            }
+            (Some(_), None) => SCARD_E_INVALID_HANDLE,
+            (None, _) => SCARD_E_NO_SERVICE,
         };
     }
     let mut local = Vec::new();
-    if !boncaslink::is_dummy_context(scard_handle_key(h_context)) {
+    if let Some(context) = backend_context {
         if let Some(b) = backend() {
             let mut required: Dword = 0;
-            let status =
-                (b.list_readers)(h_context, msz_groups, std::ptr::null_mut(), &mut required);
+            let status = (b.list_readers)(context, msz_groups, std::ptr::null_mut(), &mut required);
             if (status == 0 || status == SCARD_E_INSUFFICIENT_BUFFER)
                 && required > 0
                 && (required as usize) < (1 << 20)
@@ -425,7 +435,7 @@ pub unsafe extern "C" fn SCardListReaders(
                 let mut buffer = vec![0u8; required as usize];
                 let mut actual = required;
                 if (b.list_readers)(
-                    h_context,
+                    context,
                     msz_groups,
                     buffer.as_mut_ptr() as *mut c_char,
                     &mut actual,
@@ -500,12 +510,12 @@ pub unsafe extern "C" fn SCardConnect(
     match backend() {
         Some(b) => {
             let context = scard_handle_key(h_context);
-            let Some(_operation) = boncaslink::begin_native_context_operation(context) else {
+            let Some(operation) = boncaslink::begin_native_context_operation(context) else {
                 return SCARD_E_INVALID_HANDLE;
             };
             let mut backend_card: ScardContext = 0;
             let status = (b.connect)(
-                h_context,
+                scard_handle_from_key(operation.backend_handle()),
                 sz_reader,
                 dw_share_mode,
                 dw_preferred_protocols,

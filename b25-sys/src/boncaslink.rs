@@ -6,13 +6,18 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const BONCASLINK_READER_NAME: &str = "BonCasLink Client Card Reader";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a relay connect fails, list it behind local readers for this long so
+/// each decoder start does not wait CONNECT_TIMEOUT before reaching a working
+/// physical or virtual card. It stays listed and is tried again as a fallback.
+const RELAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 static SERVER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static RELAY_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 /// One entry per virtual card handle. Each session has its own lock so that a
 /// slow or dead server only stalls the decoder that is talking to it: the map
 /// lock is also taken by `is_card`, which every local-reader call goes through.
@@ -44,6 +49,10 @@ static NEXT_NATIVE_ALIAS: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Default)]
 struct NativeContextRegistration {
+    /// The backend's SCARDCONTEXT. Virtual readers (SoftCAS-style winscard.dll,
+    /// libpcsckai) may return the same value, even 0, for every establish, so
+    /// it is never used as a key.
+    backend: usize,
     aliases: HashSet<usize>,
     retiring: bool,
     active_operations: usize,
@@ -74,6 +83,7 @@ static NEXT_CONTEXT: AtomicUsize = AtomicUsize::new(0x1000);
 
 pub(crate) struct NativeContextRelease {
     context: usize,
+    backend: usize,
     aliases: Vec<usize>,
     registered: bool,
     #[cfg(test)]
@@ -84,6 +94,7 @@ pub(crate) struct NativeContextRelease {
 
 pub(crate) struct NativeContextOperation {
     context: usize,
+    backend: usize,
 }
 
 pub(crate) struct NativeCardOperation {
@@ -158,6 +169,34 @@ pub fn release_dummy_context(id: usize) -> bool {
     removed
 }
 
+/// Register a backend PC/SC context and return the shim-owned context handle
+/// handed to libaribb25. Like card handles, the backend value stays private:
+/// virtual readers return one constant context for every establish, and
+/// rejecting the duplicate left every decoder but the first without a reader.
+pub fn register_native_context_alias(backend: usize) -> Option<usize> {
+    let _lifecycle = lock_native_context_lifecycle();
+    // Same lock order as `new_dummy_context`; both draw from NEXT_CONTEXT.
+    let dummy_contexts = lock(&DUMMY_CONTEXTS);
+    let mut native_contexts = lock(&NATIVE_CONTEXTS);
+    for _ in 0..1024 {
+        let id = NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed);
+        if id != 0 && !dummy_contexts.contains(&id) && !native_contexts.contains_key(&id) {
+            native_contexts.insert(
+                id,
+                NativeContextRegistration {
+                    backend,
+                    ..Default::default()
+                },
+            );
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Register `id` as both the shim handle and the backend context. Tests use it
+/// to drive the lifecycle with fixed handle values.
+#[cfg(test)]
 pub fn register_native_context(id: usize) -> bool {
     if id == 0 {
         return false;
@@ -178,7 +217,13 @@ pub fn register_native_context(id: usize) -> bool {
     if native_contexts.contains_key(&id) {
         return false;
     }
-    native_contexts.insert(id, NativeContextRegistration::default());
+    native_contexts.insert(
+        id,
+        NativeContextRegistration {
+            backend: id,
+            ..Default::default()
+        },
+    );
     true
 }
 
@@ -210,6 +255,7 @@ fn begin_native_context_release_with(
         return unregistered_context_release(context);
     }
     registration.retiring = true;
+    let backend = registration.backend;
     let aliases = registration.aliases.iter().copied().collect::<Vec<_>>();
     let mut native_aliases = lock(&NATIVE_CARD_ALIASES);
     for alias in &aliases {
@@ -251,6 +297,7 @@ fn begin_native_context_release_with(
     }
     NativeContextRelease {
         context,
+        backend,
         aliases,
         registered,
         #[cfg(test)]
@@ -263,6 +310,7 @@ fn begin_native_context_release_with(
 fn unregistered_context_release(context: usize) -> NativeContextRelease {
     NativeContextRelease {
         context,
+        backend: 0,
         aliases: Vec::new(),
         registered: false,
         #[cfg(test)]
@@ -292,6 +340,16 @@ impl NativeContextRelease {
         if self.registered && self.lifecycle.is_none() {
             self.lifecycle = Some(lock_native_context_lifecycle());
         }
+    }
+
+    pub(crate) fn backend_handle(&self) -> usize {
+        self.backend
+    }
+}
+
+impl NativeContextOperation {
+    pub(crate) fn backend_handle(&self) -> usize {
+        self.backend
     }
 }
 
@@ -355,7 +413,10 @@ pub(crate) fn begin_native_context_operation(context: usize) -> Option<NativeCon
         return None;
     }
     registration.active_operations = registration.active_operations.checked_add(1)?;
-    Some(NativeContextOperation { context })
+    Some(NativeContextOperation {
+        context,
+        backend: registration.backend,
+    })
 }
 
 /// Resolve and pin a shim alias until its native backend call has completed.
@@ -724,15 +785,24 @@ pub fn normalize_address(value: &str) -> Result<String, String> {
 }
 
 fn open_connection_at(address: &str) -> Result<TcpStream, ()> {
-    let addresses = address.to_socket_addrs().map_err(|_| ())?;
-    for socket in addresses {
-        if let Ok(stream) = TcpStream::connect_timeout(&socket, CONNECT_TIMEOUT) {
-            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-            return Ok(stream);
+    if let Ok(addresses) = address.to_socket_addrs() {
+        for socket in addresses {
+            if let Ok(stream) = TcpStream::connect_timeout(&socket, CONNECT_TIMEOUT) {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                lock(&RELAY_FAILURES).remove(address);
+                return Ok(stream);
+            }
         }
     }
+    lock(&RELAY_FAILURES).insert(address.to_owned(), Instant::now());
     Err(())
+}
+
+fn relay_recently_failed(address: &str) -> bool {
+    lock(&RELAY_FAILURES)
+        .get(address)
+        .is_some_and(|failed_at| failed_at.elapsed() < RELAY_FAILURE_COOLDOWN)
 }
 
 fn begin_card_context_operation(
@@ -939,9 +1009,16 @@ pub fn prepend_reader(mut local: Vec<String>) -> Vec<String> {
         local.retain(|entry| entry != &name);
         local.push(name);
     }
-    if enabled() {
+    if let Some(address) = lock(&SERVER).clone() {
         local.retain(|name| name != BONCASLINK_READER_NAME);
-        local.insert(0, BONCASLINK_READER_NAME.to_owned());
+        // libaribb25 tries readers in list order. A reachable relay goes first
+        // (it is the configured choice); an unreachable one goes last so a
+        // local card answers without waiting for the connect timeout.
+        if relay_recently_failed(&address) {
+            local.push(BONCASLINK_READER_NAME.to_owned());
+        } else {
+            local.insert(0, BONCASLINK_READER_NAME.to_owned());
+        }
     }
     local
 }
@@ -1095,6 +1172,79 @@ mod tests {
         assert!(!register_native_context(context));
         assert!(!lock(&NATIVE_CONTEXTS).contains_key(&context));
         assert!(release_dummy_context(context));
+    }
+
+    #[test]
+    fn virtual_reader_constant_backend_context_gets_distinct_aliases() {
+        let _guard = super::test_lock();
+        // SoftCAS-style winscard.dll returns this value for every establish
+        // (observed on a production host), and some return 0.
+        for backend in [0x3531_3239usize, 0] {
+            let first = register_native_context_alias(backend).unwrap();
+            let second = register_native_context_alias(backend).unwrap();
+            assert_ne!(first, second);
+            assert!(!is_dummy_context(first) && !is_dummy_context(second));
+
+            let first_card = register_native_card_alias(first, backend).unwrap();
+            let second_card = register_native_card_alias(second, backend).unwrap();
+            assert_ne!(first_card, second_card);
+            assert_eq!(
+                begin_native_context_operation(second)
+                    .unwrap()
+                    .backend_handle(),
+                backend
+            );
+
+            let release = begin_native_context_release(first);
+            assert!(release.was_registered());
+            assert_eq!(release.backend_handle(), backend);
+            release_context_cards(first);
+            finish_native_context_release(release, true);
+
+            // Releasing one decoder's context leaves the other one usable.
+            assert_eq!(resolve_native_card(first_card), None);
+            assert_eq!(resolve_native_card(second_card), Some(backend));
+            unregister_native_context(second);
+            assert_eq!(resolve_native_card(second_card), None);
+        }
+    }
+
+    #[test]
+    fn native_context_alias_never_reuses_a_live_dummy_context() {
+        let _guard = super::test_lock();
+        let dummy = new_dummy_context();
+        let native = register_native_context_alias(7).unwrap();
+        assert_ne!(dummy, native);
+        assert!(is_dummy_context(dummy));
+        unregister_native_context(native);
+        assert!(release_dummy_context(dummy));
+    }
+
+    #[test]
+    fn unreachable_relay_is_listed_after_local_readers() {
+        let _guard = super::test_lock();
+        // Bind then drop to get a local port that refuses connections.
+        let address = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string();
+        set_server(Some(&address)).unwrap();
+        lock(&RELAY_FAILURES).remove(&address);
+        let local = vec!["Physical Reader 0".to_owned()];
+        assert_eq!(prepend_reader(local.clone())[0], BONCASLINK_READER_NAME);
+
+        assert!(open_connection_at(&address).is_err());
+        // Other tests may leave `BonCasLink:host:port` readers registered.
+        let readers = prepend_reader(local.clone());
+        assert_eq!(readers[0], "Physical Reader 0");
+        assert_eq!(readers.last().unwrap(), BONCASLINK_READER_NAME);
+
+        let listener = TcpListener::bind(&address).unwrap();
+        assert!(open_connection_at(&address).is_ok());
+        drop(listener);
+        assert_eq!(prepend_reader(local)[0], BONCASLINK_READER_NAME);
+        set_server(None).unwrap();
     }
 
     #[test]

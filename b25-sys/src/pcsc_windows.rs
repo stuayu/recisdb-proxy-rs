@@ -130,12 +130,15 @@ pub unsafe extern "system" fn b25shim_SCardEstablishContext(
     if context.is_null() {
         return INVALID_PARAMETER;
     }
-    let status = native_establish(scope, r1, r2, context);
+    let mut backend: Context = 0;
+    let status = native_establish(scope, r1, r2, &mut backend);
     if status == SUCCESS {
-        if !boncaslink::register_native_context(windows_handle_key(*context)) {
-            let _ = native_release(*context);
-            return INVALID_HANDLE;
-        }
+        let Some(alias) = boncaslink::register_native_context_alias(windows_handle_key(backend))
+        else {
+            let _ = native_release(backend);
+            return NO_SERVICE;
+        };
+        *context = windows_handle_from_key(alias);
         return SUCCESS;
     }
     if !boncaslink::enabled() && !boncaslink::has_registered_readers() {
@@ -161,7 +164,7 @@ pub unsafe extern "system" fn b25shim_SCardReleaseContext(context: Context) -> L
     if !release.was_registered() {
         return INVALID_HANDLE;
     }
-    let status = native_release(context);
+    let status = native_release(windows_handle_from_key(release.backend_handle()));
     if status == SUCCESS {
         // Do synthetic-card cleanup only after native release succeeds. The
         // lifecycle guard prevents this id from being registered in between.
@@ -178,22 +181,35 @@ pub unsafe extern "system" fn b25shim_SCardListReaders(
     readers: *mut u16,
     len: *mut Dword,
 ) -> Long {
+    let operation = boncaslink::begin_native_context_operation(windows_handle_key(context));
     if !boncaslink::enabled() && !boncaslink::has_registered_readers() {
-        return native_list_w(context, groups, readers, len);
+        return match operation {
+            Some(operation) => native_list_w(
+                windows_handle_from_key(operation.backend_handle()),
+                groups,
+                readers,
+                len,
+            ),
+            None => INVALID_HANDLE,
+        };
     }
     if len.is_null() {
         return INVALID_PARAMETER;
     }
     let mut local = Vec::new();
     let mut needed = 0;
-    let mut status = if boncaslink::is_dummy_context(context) {
-        NO_SERVICE
-    } else {
-        native_list_w(context, groups, std::ptr::null_mut(), &mut needed)
+    let backend = operation
+        .as_ref()
+        .map(|operation| windows_handle_from_key(operation.backend_handle()));
+    let mut status = match backend {
+        Some(backend) => native_list_w(backend, groups, std::ptr::null_mut(), &mut needed),
+        None => NO_SERVICE,
     };
-    if (status == SUCCESS || status == INSUFFICIENT_BUFFER) && needed > 0 && needed < 1_000_000 {
+    if let Some(backend) = backend.filter(|_| {
+        (status == SUCCESS || status == INSUFFICIENT_BUFFER) && needed > 0 && needed < 1_000_000
+    }) {
         let mut buffer = vec![0u16; needed as usize];
-        status = native_list_w(context, groups, buffer.as_mut_ptr(), &mut needed);
+        status = native_list_w(backend, groups, buffer.as_mut_ptr(), &mut needed);
         if status == SUCCESS {
             buffer.truncate((needed as usize).min(buffer.len()));
             local = parse_multi_wide(&buffer);
@@ -241,22 +257,35 @@ pub unsafe extern "system" fn b25shim_SCardListReadersA(
     readers: *mut u8,
     len: *mut Dword,
 ) -> Long {
+    let operation = boncaslink::begin_native_context_operation(windows_handle_key(context));
     if !boncaslink::enabled() && !boncaslink::has_registered_readers() {
-        return native_list_a(context, groups, readers, len);
+        return match operation {
+            Some(operation) => native_list_a(
+                windows_handle_from_key(operation.backend_handle()),
+                groups,
+                readers,
+                len,
+            ),
+            None => INVALID_HANDLE,
+        };
     }
     if len.is_null() {
         return INVALID_PARAMETER;
     }
     let mut local = Vec::new();
     let mut needed = 0;
-    let status = if boncaslink::is_dummy_context(context) {
-        NO_SERVICE
-    } else {
-        native_list_a(context, groups, std::ptr::null_mut(), &mut needed)
+    let backend = operation
+        .as_ref()
+        .map(|operation| windows_handle_from_key(operation.backend_handle()));
+    let status = match backend {
+        Some(backend) => native_list_a(backend, groups, std::ptr::null_mut(), &mut needed),
+        None => NO_SERVICE,
     };
-    if (status == SUCCESS || status == INSUFFICIENT_BUFFER) && needed > 0 && needed < 1_000_000 {
+    if let Some(backend) = backend.filter(|_| {
+        (status == SUCCESS || status == INSUFFICIENT_BUFFER) && needed > 0 && needed < 1_000_000
+    }) {
         let mut buffer = vec![0u8; needed as usize];
-        if native_list_a(context, groups, buffer.as_mut_ptr(), &mut needed) == SUCCESS {
+        if native_list_a(backend, groups, buffer.as_mut_ptr(), &mut needed) == SUCCESS {
             buffer.truncate((needed as usize).min(buffer.len()));
             local = parse_multi(&buffer);
         }
@@ -297,14 +326,14 @@ pub unsafe extern "system" fn b25shim_SCardConnect(
             Err(()) => READER_UNAVAILABLE,
         };
     }
-    let Some(_operation) = boncaslink::begin_native_context_operation(windows_handle_key(context))
+    let Some(operation) = boncaslink::begin_native_context_operation(windows_handle_key(context))
     else {
         return INVALID_HANDLE;
     };
     let mut backend_card: Context = 0;
     let mut backend_protocol: Dword = 0;
     let status = native_connect_w(
-        context,
+        windows_handle_from_key(operation.backend_handle()),
         reader,
         share,
         protocols,
