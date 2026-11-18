@@ -359,7 +359,18 @@ impl TsAligner {
 
     /// Append `data` and return whatever whole packets are now available,
     /// starting on a sync byte. `None` when there is not (yet) a full packet.
-    pub(crate) fn push(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// The common case, a chunk that is already whole packets with nothing
+    /// held back, is returned as a refcount clone of `data` without copying.
+    pub(crate) fn push(&mut self, data: &Bytes) -> Option<Bytes> {
+        if self.carry.is_empty()
+            && !data.is_empty()
+            && data.len().is_multiple_of(TS_PACKET_SIZE)
+            && data[0] == SYNC_BYTE
+        {
+            return Some(data.clone());
+        }
+
         self.carry.extend_from_slice(data);
 
         if !self.resync() {
@@ -378,7 +389,9 @@ impl TsAligner {
             return None;
         }
 
-        Some(self.carry.drain(..aligned_len).collect())
+        Some(Bytes::from(
+            self.carry.drain(..aligned_len).collect::<Vec<u8>>(),
+        ))
     }
 
     /// Called when chunks were lost (`RecvError::Lagged`): whatever is held is
@@ -503,7 +516,8 @@ pub(crate) fn service_filtered_body_stream(
                     let Some(chunk) = state.aligner.push(&data) else {
                         continue;
                     };
-                    let filtered = state.filter.filter(&chunk);
+                    let mut filtered = Vec::with_capacity(chunk.len());
+                    state.filter.filter_into(&chunk, &mut filtered);
                     if filtered.is_empty() {
                         continue;
                     }
@@ -1609,43 +1623,57 @@ mod tests {
     #[test]
     fn aligner_passes_whole_packets_through_unchanged() {
         let mut aligner = TsAligner::new();
-        let data = ts_packets(3);
+        let data = Bytes::from(ts_packets(3));
         assert_eq!(aligner.push(&data), Some(data));
+    }
+
+    /// An aligned chunk with nothing held back must not be copied: the
+    /// returned `Bytes` is the same allocation as the input.
+    #[test]
+    fn aligner_passes_an_aligned_chunk_without_copying() {
+        let mut aligner = TsAligner::new();
+        let data = Bytes::from(ts_packets(3));
+        let out = aligner.push(&data).expect("aligned chunk is returned");
+        assert_eq!(out.as_ptr(), data.as_ptr());
+        assert_eq!(out, data);
     }
 
     #[test]
     fn aligner_holds_a_partial_packet_until_its_tail_arrives() {
-        let data = ts_packets(2);
-        let (head, tail) = data.split_at(TS_PACKET_SIZE + 50);
+        let data = Bytes::from(ts_packets(2));
+        let head = data.slice(..TS_PACKET_SIZE + 50);
+        let tail = data.slice(TS_PACKET_SIZE + 50..);
 
         let mut aligner = TsAligner::new();
         // First chunk: one whole packet plus 50 bytes of the next.
-        assert_eq!(aligner.push(head), Some(data[..TS_PACKET_SIZE].to_vec()));
+        assert_eq!(aligner.push(&head), Some(data.slice(..TS_PACKET_SIZE)));
         // Second chunk completes the held packet.
-        assert_eq!(aligner.push(tail), Some(data[TS_PACKET_SIZE..].to_vec()));
+        assert_eq!(aligner.push(&tail), Some(data.slice(TS_PACKET_SIZE..)));
     }
 
     #[test]
     fn aligner_returns_nothing_until_a_full_packet_is_available() {
         let mut aligner = TsAligner::new();
-        assert_eq!(aligner.push(&ts_packets(1)[..100]), None);
+        let partial = Bytes::from(ts_packets(1)).slice(..100);
+        assert_eq!(aligner.push(&partial), None);
     }
 
     #[test]
     fn aligner_skips_leading_garbage_to_the_first_sync_byte() {
-        let data = ts_packets(1);
+        let data = Bytes::from(ts_packets(1));
         let mut with_garbage = vec![0x00, 0x11, 0x22];
         with_garbage.extend_from_slice(&data);
 
         let mut aligner = TsAligner::new();
-        assert_eq!(aligner.push(&with_garbage), Some(data));
+        assert_eq!(aligner.push(&Bytes::from(with_garbage)), Some(data));
     }
 
     #[test]
     fn aligner_never_grows_without_bound_on_garbage() {
         let mut aligner = TsAligner::new();
+        let garbage = Bytes::from_static(&[0x00; 1024]);
         for _ in 0..100 {
-            assert_eq!(aligner.push(&[0x00; 1024]), None);
+            assert_eq!(aligner.push(&garbage), None);
         }
         assert!(aligner.carry.len() <= TsAligner::MAX_CARRY + 1024);
     }
@@ -1655,17 +1683,17 @@ mod tests {
     /// together and desynchronize everything downstream.
     #[test]
     fn aligner_drops_the_partial_packet_after_a_gap() {
-        let data = ts_packets(2);
+        let data = Bytes::from(ts_packets(2));
         let mut aligner = TsAligner::new();
 
         assert_eq!(
-            aligner.push(&data[..TS_PACKET_SIZE + 50]),
-            Some(data[..TS_PACKET_SIZE].to_vec())
+            aligner.push(&data.slice(..TS_PACKET_SIZE + 50)),
+            Some(data.slice(..TS_PACKET_SIZE))
         );
         aligner.on_gap();
 
-        let next = ts_packets(1);
-        assert_eq!(aligner.push(&next), Some(next));
+        let next = Bytes::from(ts_packets(1));
+        assert_eq!(aligner.push(&next), Some(next.clone()));
     }
 
     fn test_web_state() -> Arc<WebState> {

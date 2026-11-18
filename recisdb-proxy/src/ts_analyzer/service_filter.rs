@@ -17,8 +17,6 @@
 //! target service to dynamically update the PID whitelist.  When the PAT or
 //! PMT changes (version update), the whitelist is rebuilt automatically.
 
-use std::collections::HashSet;
-
 use log::{debug, trace, warn};
 
 use super::packet::{TsPacket, SYNC_BYTE, TS_PACKET_SIZE};
@@ -48,6 +46,46 @@ const ALWAYS_PASS_PIDS: &[u16] = &[
     0x0024,
 ];
 
+/// Largest PID value (13 bits).
+const MAX_PID: u16 = 0x1FFF;
+
+/// Fixed PID membership set: one bit per possible 13-bit PID.
+///
+/// The filter probes this for every 188-byte packet, so it is a plain bit
+/// test instead of a hashed lookup.
+struct PidSet([u64; 128]);
+
+impl PidSet {
+    fn new() -> Self {
+        Self([0; 128])
+    }
+
+    /// PIDs above 13 bits can never occur in a packet header, so they are
+    /// ignored rather than stored.
+    fn insert(&mut self, pid: u16) {
+        if pid <= MAX_PID {
+            let pid = usize::from(pid);
+            self.0[pid >> 6] |= 1 << (pid & 63);
+        }
+    }
+
+    fn contains(&self, pid: u16) -> bool {
+        if pid > MAX_PID {
+            return false;
+        }
+        let pid = usize::from(pid);
+        self.0[pid >> 6] & (1 << (pid & 63)) != 0
+    }
+
+    fn clear(&mut self) {
+        self.0 = [0; 128];
+    }
+
+    fn count(&self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
+    }
+}
+
 fn is_newer_version(current: u8, new: u8) -> bool {
     let delta = (new & 0x1F).wrapping_sub(current & 0x1F) & 0x1F;
     delta != 0 && delta < 16
@@ -58,7 +96,7 @@ pub struct TsServiceFilter {
     /// Target service ID (program_number in PAT).
     target_sid: u16,
     /// Set of PIDs to pass through.
-    allowed_pids: HashSet<u16>,
+    allowed_pids: PidSet,
     /// PMT PID for the target service (from PAT).
     pmt_pid: Option<u16>,
     /// PAT section collector.
@@ -80,7 +118,7 @@ pub struct TsServiceFilter {
 impl TsServiceFilter {
     /// Create a new service filter for the given SID.
     pub fn new(target_sid: u16) -> Self {
-        let mut allowed_pids = HashSet::new();
+        let mut allowed_pids = PidSet::new();
         for &pid in ALWAYS_PASS_PIDS {
             allowed_pids.insert(pid);
         }
@@ -127,9 +165,16 @@ impl TsServiceFilter {
     /// Returns filtered data containing only packets for the target service.
     /// Non-target packets are dropped (not null-stuffed) to reduce bandwidth.
     pub fn filter(&mut self, data: &[u8]) -> Vec<u8> {
-        let packet_count = data.len() / TS_PACKET_SIZE;
         // Pre-allocate for worst case (all packets pass)
         let mut output = Vec::with_capacity(data.len());
+        self.filter_into(data, &mut output);
+        output
+    }
+
+    /// Same as [`Self::filter`], but appends the surviving packets to
+    /// `output` so the caller can reuse one buffer across chunks.
+    pub fn filter_into(&mut self, data: &[u8], output: &mut Vec<u8>) {
+        let packet_count = data.len() / TS_PACKET_SIZE;
 
         for i in 0..packet_count {
             let offset = i * TS_PACKET_SIZE;
@@ -162,13 +207,11 @@ impl TsServiceFilter {
             }
 
             // Pass through allowed PIDs
-            if self.allowed_pids.contains(&pid) {
+            if self.allowed_pids.contains(pid) {
                 output.extend_from_slice(pkt_data);
             }
             // All other PIDs are dropped
         }
-
-        output
     }
 
     /// Process a PAT packet and update PMT PID for the target SID.
@@ -334,7 +377,7 @@ impl TsServiceFilter {
         self.ready = true;
         debug!(
             "TsServiceFilter: Ready, {} PIDs allowed for SID {}",
-            self.allowed_pids.len(),
+            self.allowed_pids.count(),
             self.target_sid
         );
     }
@@ -441,11 +484,11 @@ mod tests {
     #[test]
     fn test_new_filter_has_base_pids() {
         let filter = TsServiceFilter::new(0x0400);
-        assert!(filter.allowed_pids.contains(&0x0000)); // PAT
-        assert!(filter.allowed_pids.contains(&0x0010)); // NIT
-        assert!(filter.allowed_pids.contains(&0x0011)); // SDT
-        assert!(filter.allowed_pids.contains(&0x0012)); // EIT
-        assert!(filter.allowed_pids.contains(&0x0014)); // TOT/TDT
+        assert!(filter.allowed_pids.contains(0x0000)); // PAT
+        assert!(filter.allowed_pids.contains(0x0010)); // NIT
+        assert!(filter.allowed_pids.contains(0x0011)); // SDT
+        assert!(filter.allowed_pids.contains(0x0012)); // EIT
+        assert!(filter.allowed_pids.contains(0x0014)); // TOT/TDT
         assert!(!filter.is_ready());
     }
 
@@ -454,12 +497,12 @@ mod tests {
     #[test]
     fn bit_is_passed_through_so_affiliations_can_be_harvested() {
         let filter = TsServiceFilter::new(0x0400);
-        assert!(filter.allowed_pids.contains(&0x0024));
+        assert!(filter.allowed_pids.contains(0x0024));
 
         let mut filter = filter;
         filter.reset();
         assert!(
-            filter.allowed_pids.contains(&0x0024),
+            filter.allowed_pids.contains(0x0024),
             "reset must restore it too"
         );
     }
@@ -472,5 +515,114 @@ mod tests {
         filter.reset();
         assert!(!filter.is_ready());
         assert!(filter.pmt_pid.is_none());
+    }
+
+    /// PAT carrying one program `sid` -> `pmt_pid`, in a single TS packet.
+    fn pat_packet(sid: u16, pmt_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x00, 0xB0, 0x00, 0x00, 0x01, 0xC1, 0x00, 0x00];
+        section.extend_from_slice(&sid.to_be_bytes());
+        section.extend_from_slice(&(0xE000 | pmt_pid).to_be_bytes());
+        finish_section(&mut section);
+        ts_packet(0x0000, 0, &section)
+    }
+
+    /// PMT for `sid` on `pmt_pid` with one H.264 video ES on `es_pid`.
+    fn pmt_packet(sid: u16, pmt_pid: u16, es_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x02, 0xB0, 0x00];
+        section.extend_from_slice(&sid.to_be_bytes());
+        section.extend_from_slice(&[0xC1, 0x00, 0x00]);
+        section.extend_from_slice(&(0xE000 | es_pid).to_be_bytes()); // PCR PID
+        section.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
+        section.push(0x1B); // H.264 video
+        section.extend_from_slice(&(0xE000 | es_pid).to_be_bytes());
+        section.extend_from_slice(&[0xF0, 0x00]); // ES_info_length = 0
+        finish_section(&mut section);
+        ts_packet(pmt_pid, 0, &section)
+    }
+
+    /// Fill in section_length and append the CRC32 of a PSI section whose
+    /// first three bytes are a placeholder header.
+    fn finish_section(section: &mut Vec<u8>) {
+        let length = (section.len() - 3 + 4) as u16;
+        section[1] = 0xB0 | (length >> 8) as u8;
+        section[2] = length as u8;
+        let crc = crc32_mpeg2(section);
+        section.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    /// One TS packet with PUSI set, a pointer field of 0, and `section` as
+    /// payload, padded with 0xFF.
+    fn ts_packet(pid: u16, cc: u8, section: &[u8]) -> Vec<u8> {
+        let mut packet = vec![
+            SYNC_BYTE,
+            0x40 | ((pid >> 8) as u8 & 0x1F),
+            (pid & 0xFF) as u8,
+            0x10 | (cc & 0x0F),
+            0x00,
+        ];
+        packet.extend_from_slice(section);
+        packet.resize(TS_PACKET_SIZE, 0xFF);
+        packet
+    }
+
+    /// Plain payload-only packet on `pid`, used as the data under test.
+    fn data_packet(pid: u16) -> Vec<u8> {
+        let mut packet = vec![SYNC_BYTE, (pid >> 8) as u8 & 0x1F, (pid & 0xFF) as u8, 0x10];
+        packet.resize(TS_PACKET_SIZE, 0x55);
+        packet
+    }
+
+    #[test]
+    fn pid_inserted_from_pmt_is_passed_and_unrelated_pid_is_dropped() {
+        let mut filter = TsServiceFilter::new(0x0400);
+        let mut input = Vec::new();
+        input.extend(pat_packet(0x0400, 0x0100));
+        input.extend(pmt_packet(0x0400, 0x0100, 0x0101));
+        input.extend(data_packet(0x0101)); // ES listed in the PMT
+        input.extend(data_packet(0x0200)); // not in any table for this service
+
+        let out = filter.filter(&input);
+
+        assert!(filter.is_ready());
+        assert!(filter.allowed_pids.contains(0x0101));
+        assert!(!filter.allowed_pids.contains(0x0200));
+        let pids: Vec<u16> = out
+            .chunks(TS_PACKET_SIZE)
+            .map(|p| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16)
+            .collect();
+        assert!(pids.contains(&0x0101), "ES packet must pass: {pids:?}");
+        assert!(
+            !pids.contains(&0x0200),
+            "unrelated packet must drop: {pids:?}"
+        );
+    }
+
+    #[test]
+    fn pid_set_covers_the_full_13_bit_range() {
+        let mut set = PidSet::new();
+        assert_eq!(set.count(), 0);
+        for pid in [0x0000, 0x003F, 0x0040, 0x0101, 0x1FFE, MAX_PID] {
+            assert!(!set.contains(pid));
+            set.insert(pid);
+            assert!(set.contains(pid));
+        }
+        assert!(!set.contains(0x0102));
+        assert_eq!(set.count(), 6);
+        // Out-of-range PIDs are never stored and never match.
+        set.insert(0x2000);
+        assert!(!set.contains(0x2000));
+        set.clear();
+        assert_eq!(set.count(), 0);
+        assert!(!set.contains(0x0101));
+    }
+
+    #[test]
+    fn filter_into_appends_to_the_existing_buffer() {
+        let mut filter = TsServiceFilter::new(0x0400);
+        let input = data_packet(0x0014); // always-pass PID
+        let mut out = vec![0xAB; 3];
+        filter.filter_into(&input, &mut out);
+        assert_eq!(&out[..3], &[0xAB; 3]);
+        assert_eq!(&out[3..], &input[..]);
     }
 }

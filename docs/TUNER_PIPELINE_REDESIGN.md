@@ -379,7 +379,6 @@ P2b に残した (下記)。
 
   | 定数 | 値 | 根拠 |
   |---|---|---|
-  | `SET_CHANNEL_STABILIZATION_SLEEP_MS` | 500ms | SetChannel 直後、新規ドライバのバッファに何か溜まるまでの安定化待ち |
   | `STOP_READER_TIMEOUT_MS` | 1000ms | `stop_reader()` の handle ロック取得・join の各タイムアウト。読み取りループの stop チェック間隔 (100ms) の約5倍のマージン |
   | `WAIT_TS_STREAM_POLL_MS` | 100ms | 読み取りループの `wait_ts_stream` ポーリング間隔 |
   | `WAIT_FIRST_DATA_POLL_MS` | 50ms | `wait_first_data` のポーリング間隔 |
@@ -393,6 +392,15 @@ P2b に残した (下記)。
   「触る理由がある値」ではない。DB 化すると `TunerPoolConfig` へのフィールド
   追加 → マイグレーション → ダッシュボード改修まで波及するが、それに見合う
   運用上の必要性がない。
+
+- **SetChannel 直後の固定 500ms 安定化待ち (`SET_CHANNEL_STABILIZATION_SLEEP_MS`) は削除した (2026-11)。**
+  元の目的は「新規ドライバのバッファが空のうちに読むと `get_ts_stream` が 0 byte を返し、
+  起動直後の警告ログが出る」ことを避けるだけだった。読み取りループの `wait_ts_stream`
+  ポーリングが最初のチャンクを待つので、固定待ちは不要。空の初回読みは起動猶予
+  (`first_data_grace_ms`) の内側では `debug!` にし、猶予を過ぎたものだけ `warn!` にする。
+  あわせて B25 デコーダの初期化は SetChannel と並行する helper スレッド (`b25-init`) で
+  行い、SetChannel と MMT 変換器の起動が済んでから join する。B-CAS カードのオープンは
+  ネットワークカードリーダー経由だと数秒かかり得るため、直列だと起動時間に直接乗っていた。
 
 - 追加したテスト (`tuner/shared.rs`, `tuner/timing.rs`, `tuner/ts_source.rs`):
   - `tuner::timing::tests::reader_ready_timeout_*`: ready タイムアウトが

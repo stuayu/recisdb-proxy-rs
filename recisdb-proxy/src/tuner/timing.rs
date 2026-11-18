@@ -13,14 +13,6 @@
 
 use std::time::Duration;
 
-/// After `SetChannel` succeeds, how long to wait before the read loop starts
-/// pulling from `GetTsStream`. Newly-tuned BonDrivers (especially
-/// network-backed or PCIe drivers) need a short settle time before their
-/// internal buffer has anything in it; without this, the very first
-/// `get_ts_stream` calls reliably return 0 bytes and get logged as spurious
-/// "early startup" warnings.
-pub(crate) const SET_CHANNEL_STABILIZATION_SLEEP_MS: u64 = 500;
-
 /// Upper bound `stop_reader()` waits for the reader task to actually exit —
 /// applied twice (once to acquire the `reader_handle` lock, once to join the
 /// task itself). The read loop re-checks its stop flag every

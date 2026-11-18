@@ -25,6 +25,7 @@ use futures::stream::{self, StreamExt};
 use recisdb_protocol::StreamClass;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
+use tower_http::compression::CompressionLayer;
 
 use super::frame::{FrameFlags, NodeTsFrame};
 use super::identity::{NodeCredential, NodeIdentity, PairingAcceptance, PairingCode};
@@ -456,6 +457,13 @@ impl NodeTransportState {
 }
 
 pub fn router(state: Arc<NodeTransportState>) -> Router {
+    // Only the EPG routes are gzip-encoded. Stream and probe responses must
+    // stay uncompressed: the TS body is long-lived and the probe measures
+    // raw throughput.
+    let epg = Router::new()
+        .route("/node/v3/epg/metadata", post(epg_metadata))
+        .route("/node/v3/epg/programs", post(epg_programs))
+        .layer(CompressionLayer::new());
     Router::new()
         .route("/node/v3/pair", post(pair))
         .route("/node/v3/peer", delete(unpair_peer))
@@ -468,8 +476,7 @@ pub fn router(state: Arc<NodeTransportState>) -> Router {
         .route("/node/v3/lease/:id/renew", post(renew_lease))
         .route("/node/v3/lease/:id", delete(release_lease))
         .route("/node/v3/stream/:id", get(stream_lease))
-        .route("/node/v3/epg/metadata", post(epg_metadata))
-        .route("/node/v3/epg/programs", post(epg_programs))
+        .merge(epg)
         .with_state(state)
 }
 
@@ -598,7 +605,10 @@ pub async fn serve_h2c_on_addresses(
                 "Node transport listening on {} (HTTP/2 prior-knowledge / trusted overlay)",
                 address
             );
-            if let Err(error) = axum::serve(listener, router(serve_state)).await {
+            if let Err(error) = axum::serve(listener, router(serve_state))
+                .tcp_nodelay(true)
+                .await
+            {
                 log::error!("Node transport listener {} stopped: {}", address, error);
             }
         });
@@ -631,7 +641,10 @@ pub async fn serve_h2c_on_addresses(
                             "Node transport added Tailscale listener {} (HTTP/2 prior-knowledge / trusted overlay)",
                             address
                         );
-                        if let Err(error) = axum::serve(listener, router(serve_state)).await {
+                        if let Err(error) = axum::serve(listener, router(serve_state))
+                            .tcp_nodelay(true)
+                            .await
+                        {
                             log::error!("Node transport listener {} stopped: {}", address, error);
                         }
                     });
@@ -1563,6 +1576,55 @@ mod tests {
         let request: RemoteEpgMetadataRequest = serde_json::from_value(json).unwrap();
         assert_eq!(request.dwell, None);
         assert_eq!(request.dwell_secs, 30);
+    }
+
+    #[tokio::test]
+    async fn only_epg_routes_are_gzip_encoded() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (state, _database) = test_state_with_db();
+        let peer = NodeId::new("site-b").unwrap();
+        let credential = NodeCredential::random();
+        state.trust_peer(peer.clone(), credential.clone()).await;
+        let bearer = format!("Bearer {}", credential.expose());
+
+        let epg = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/node/v3/epg/programs")
+                    .header("x-recisdb-node-id", peer.as_str())
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(epg.status(), StatusCode::OK);
+        assert_eq!(
+            epg.headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
+            Some(b"gzip".as_slice())
+        );
+
+        let hello = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/node/v3/hello")
+                    .header("x-recisdb-node-id", peer.as_str())
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hello.status(), StatusCode::OK);
+        assert!(hello.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[test]

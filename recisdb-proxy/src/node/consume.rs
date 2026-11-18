@@ -30,7 +30,7 @@ use tokio::sync::broadcast;
 use crate::server::listener::DatabaseHandle;
 use crate::tuner::EffectiveClaim;
 
-use super::frame::{FrameFlags, NodeTsFrame, NODE_TS_HEADER_LEN};
+use super::frame::{FrameFlags, NodeTsFrame};
 use super::identity::NodeIdentity;
 use super::path::{score_path, PathHealth, PathPolicy, TransportPath};
 use super::route::{rank_remote_routes, RemoteRouteCandidate};
@@ -628,18 +628,13 @@ async fn pump_once(
         buffer.extend_from_slice(&chunk);
 
         loop {
-            if buffer.len() < NODE_TS_HEADER_LEN {
-                break;
-            }
-            let (frame, consumed) = match NodeTsFrame::decode(&buffer) {
-                Ok(decoded) => decoded,
+            let frame = match NodeTsFrame::decode_from(&mut buffer) {
+                Ok(Some(frame)) => frame,
                 // Not enough bytes for the declared payload yet — HTTP/2 DATA
                 // boundaries are not frame boundaries.
-                Err(super::frame::FrameError::Incomplete { .. })
-                | Err(super::frame::FrameError::TooShort) => break,
+                Ok(None) => break,
                 Err(e) => return Err(ConsumeError::Transport(e.to_string())),
             };
-            let _ = buffer.split_to(consumed);
 
             // Replayed frames re-deliver history the downstream consumer has
             // by definition not seen (we asked from `last_sequence + 1`), so

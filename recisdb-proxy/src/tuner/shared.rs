@@ -333,6 +333,29 @@ pub fn probe_b25_availability() {
     });
 }
 
+/// reader 起動で使う B25 デコーダの設定。
+fn b25_decoder_options() -> DecoderOptions {
+    DecoderOptions {
+        strip: true,
+        emm: true,
+        simd: true,
+        round: 4,
+        enable_working_key: false,
+    }
+}
+
+/// `init_b25_with_deadline` の結果を helper スレッドから reader スレッドへ運ぶ。
+///
+/// `B25Pipe` は `Send` ではないので、戻り値をこの型で包む。
+struct SendB25(Option<B25Pipe>);
+
+// SAFETY: the decoder is created on the `b25-init` helper thread and its
+// ownership is moved wholesale to the reader thread after `join`. It is never
+// accessed from two threads at once. libaribb25 and PC/SC handles are not
+// thread-affine: an SCard handle may be used from another thread as long as
+// the uses are not concurrent.
+unsafe impl Send for SendB25 {}
+
 /// B25 デコーダを作る。ただし**まだ使えると分かっていない間は作らない**。
 ///
 /// libaribb25 の初期化は、見つかったカードリーダーへ順に接続を試みる。応答しない
@@ -1276,6 +1299,33 @@ impl SharedTuner {
         // it would erase the stop request and resurrect the reader.
         info!("[SharedTuner] Using BonDriver: {}", tuner_path);
 
+        // Start the B25 decoder init now so it overlaps SetChannel: opening
+        // the B-CAS card can take seconds through a network card relay. Joined
+        // after SetChannel and the MMT setup succeed. Dropping the handle on an
+        // early return only detaches the thread.
+        let b25_handle = if startup_config.b25_enabled {
+            let card_reader = startup_config.b25_card_reader.clone();
+            match std::thread::Builder::new()
+                .name("b25-init".into())
+                .spawn(move || {
+                    SendB25(init_b25_with_deadline(
+                        b25_decoder_options(),
+                        card_reader.as_deref(),
+                    ))
+                }) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    warn!(
+                        "[SharedTuner] Failed to spawn b25-init thread for {:?}: {}; initializing B25 after SetChannel",
+                        shared.key, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Set channel with retry for network-latency environments
         info!(
             "[SharedTuner] Setting channel: space={}, channel={}",
@@ -1352,23 +1402,12 @@ impl SharedTuner {
             }
         }
 
-        // Purge stale data and give the driver a moment to fill its buffer —
-        // except where SetChannel itself waits for lock and purges.
+        // Purge stale data — except where SetChannel itself waits for lock and
+        // purges. No fixed settle sleep here: the read loop's `wait_ts_stream`
+        // poll already waits for the first chunk.
         if !crate::bondriver::set_channel_settles_stream(&tuner_path) {
             tuner.purge_ts_stream();
-            std::thread::sleep(std::time::Duration::from_millis(
-                timing::SET_CHANNEL_STABILIZATION_SLEEP_MS,
-            ));
         }
-
-        // ===== B25 decoder init =====
-        let b25_opt = DecoderOptions {
-            strip: true,
-            emm: true,
-            simd: true,
-            round: 4,
-            enable_working_key: false,
-        };
 
         // ===== MMT/TLV → TS converter (4K) =====
         // Runs before everything else: the rest of this loop, the analyzer and
@@ -1404,7 +1443,22 @@ impl SharedTuner {
         };
 
         let mut b25 = if startup_config.b25_enabled {
-            init_b25_with_deadline(b25_opt, startup_config.b25_card_reader.as_deref())
+            match b25_handle {
+                Some(handle) => match handle.join() {
+                    Ok(SendB25(decoder)) => decoder,
+                    Err(_) => {
+                        error!(
+                            "[SharedTuner] b25-init thread panicked for {:?}; continuing without B25",
+                            shared.key
+                        );
+                        None
+                    }
+                },
+                None => init_b25_with_deadline(
+                    b25_decoder_options(),
+                    startup_config.b25_card_reader.as_deref(),
+                ),
+            }
         } else {
             info!(
                 "[SharedTuner] B25 disabled for {:?} (source is already descrambled)",
@@ -1683,8 +1737,18 @@ impl SharedTuner {
                     if n == 0 {
                         consecutive_empty = consecutive_empty.saturating_add(1);
                         if consecutive_empty == 1 {
-                            warn!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...",
-                                  total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
+                            // Inside the startup grace window an empty first read is
+                            // expected (the driver has not filled its buffer yet).
+                            if reader_first_read
+                                && reader_start_time.elapsed().as_millis()
+                                    < startup_config.first_data_grace_ms as u128
+                            {
+                                debug!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...",
+                                      total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
+                            } else {
+                                warn!("[SharedTuner] First get_ts_stream returned 0 bytes after reading {} total bytes, remaining={}, elapsed={}ms, continuing to wait...",
+                                      total_bytes_read, remaining, reader_start_time.elapsed().as_millis());
+                            }
                         }
                         if reader_first_read
                             && reader_start_time.elapsed().as_millis()
@@ -3183,9 +3247,8 @@ mod tests {
         drop(ready_rx);
 
         // Poll (rather than a single fixed sleep) for the fake reader's
-        // blocking thread to run past its startup delay, the fixed
-        // post-SetChannel stabilization sleep
-        // (`timing::SET_CHANNEL_STABILIZATION_SLEEP_MS`, 500 ms), and real
+        // blocking thread to run past its startup delay, the B25 init join
+        // (which overlaps SetChannel, see the reader startup), and real
         // (if failing, in this test environment) B25 decoder library-load
         // probing, transition to Running, and attempt `ready_tx.send(Ok(()))`
         // — which must now fail since the receiver is gone. Polling up to a

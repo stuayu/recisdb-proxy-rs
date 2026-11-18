@@ -520,10 +520,13 @@ pub async fn start_web_server(
 
     // `with_connect_info` makes the client's SocketAddr available to the
     // access-log middleware (see `access_log`) via `ConnectInfo`.
+    // TCP_NODELAY: stream chunks are latency-sensitive, so don't let Nagle
+    // hold small writes back.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .tcp_nodelay(true)
     .with_graceful_shutdown(web_shutdown_signal())
     .await?;
 

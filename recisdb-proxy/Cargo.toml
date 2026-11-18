@@ -65,7 +65,7 @@ rust-embed = "8.7"
 getrandom = "0.2"
 sha2 = "0.10"
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+reqwest = { version = "0.11", features = ["json", "blocking", "gzip"] }
 dns-lookup = "1.0"
 # Self-update (web/api/update.rs): GitHub release archive extraction and
 # in-place binary replacement.

@@ -103,6 +103,57 @@ fn concurrent_decoders_all_initialize_and_descramble() {
     }
 }
 
+/// recisdb-proxy はデコーダーを `b25-init` スレッドで作り、SetChannel と並行させた
+/// あとで読み取りスレッドへ渡す(`tuner/shared.rs` の `SendB25`)。作成と使用が別
+/// スレッドでも PC/SC ハンドルが使えることを、実カードで確かめる。
+#[test]
+#[ignore]
+fn decoder_created_on_another_thread_descrambles() {
+    use std::io::{Read, Write};
+
+    struct Moved(b25_sys::StreamDecoder);
+    // SAFETY: 作成スレッドは join 後に終了しており、同時に触れるスレッドはない。
+    unsafe impl Send for Moved {}
+
+    let decoder = std::thread::spawn(|| {
+        Moved(b25_sys::StreamDecoder::new(b25_sys::DecoderOptions::default()).unwrap())
+    })
+    .join()
+    .expect("init thread panicked");
+    let mut decoder = decoder.0;
+    let Ok(path) = std::env::var("B25_TEST_TS") else {
+        return;
+    };
+    let input = std::fs::read(path).expect("B25_TEST_TS を読めない");
+    let mut output = Vec::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    for chunk in input.chunks(188 * 256) {
+        decoder.write_all(chunk).unwrap();
+        loop {
+            let length = decoder.read(&mut buffer).unwrap();
+            if length == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..length]);
+        }
+    }
+    decoder.flush().unwrap();
+    loop {
+        let length = decoder.read(&mut buffer).unwrap();
+        if length == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..length]);
+    }
+    let packets = output.chunks_exact(188).filter(|p| p[0] == 0x47);
+    let (total, scrambled) = packets.fold((0usize, 0usize), |(t, s), p| {
+        (t + 1, s + usize::from(p[3] & 0xc0 != 0))
+    });
+    println!("cross-thread decoder: {total} packets, {scrambled} scrambled");
+    assert!(total > 0);
+    assert!(scrambled * 100 <= total, "{scrambled}/{total} scrambled");
+}
+
 #[test]
 #[ignore]
 fn list_card_readers_reports_what_pcsc_sees() {

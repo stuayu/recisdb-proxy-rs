@@ -11,12 +11,13 @@ use super::store::NodeStore;
 use super::transport::{
     EpgProgramsReply, EpgProgramsRequest, NodeTransportClient, NodeTransportState,
 };
+use super::types::NodeEndpoint;
 use super::{NodeCredential, NodeId};
 
 pub const INITIAL_DELAY: Duration = Duration::from_secs(60);
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_PAGES_PER_CYCLE: usize = 100;
-const PAGE_LIMIT: u32 = 1000;
+const PAGE_LIMIT: u32 = 2000;
 /// EpgWriter's 10-second maximum delay plus a safety margin for sync paging.
 pub(crate) const CURSOR_SAFETY_WINDOW_SECS: i64 = 120;
 
@@ -34,10 +35,23 @@ fn cursor_after_cycle(
     }
 }
 
+/// Result of pulling one peer's program table for this cycle.
+struct PeerSyncOutcome {
+    /// Cursor to remember for the next cycle, or `None` when the cycle made no
+    /// progress (not completed and no rows applied).
+    stored: Option<(i64, i64)>,
+    rows: usize,
+    muxes: usize,
+    failed: Option<String>,
+}
+
 pub struct EpgProgramSync {
     state: Arc<NodeTransportState>,
     database: DatabaseHandle,
     cursors: HashMap<NodeId, (i64, i64)>,
+    /// Per-peer clients kept across cycles so their connection pools survive.
+    /// Rebuilt when the peer's credential changes.
+    clients: HashMap<NodeId, (NodeCredential, Arc<NodeTransportClient>)>,
 }
 
 impl EpgProgramSync {
@@ -46,6 +60,7 @@ impl EpgProgramSync {
             state,
             database,
             cursors: HashMap::new(),
+            clients: HashMap::new(),
         }
     }
 
@@ -112,97 +127,155 @@ impl EpgProgramSync {
                 }
             }
         };
-        for (node_id, name, credential, endpoints) in self.peers().await {
-            let Ok(client) =
-                NodeTransportClient::new(self.state.identity.node_id.clone(), credential)
-            else {
-                continue;
+        let peers = self.peers().await;
+        // Forget clients for peers that are gone or disabled.
+        self.clients
+            .retain(|node_id, _| peers.iter().any(|(id, ..)| id == node_id));
+        let mut jobs = Vec::new();
+        for (node_id, name, credential, endpoints) in peers {
+            let cached = self
+                .clients
+                .get(&node_id)
+                .filter(|(cached, _)| *cached == credential)
+                .map(|(_, client)| Arc::clone(client));
+            let client = match cached {
+                Some(client) => client,
+                None => {
+                    let Ok(client) = NodeTransportClient::new(
+                        self.state.identity.node_id.clone(),
+                        credential.clone(),
+                    ) else {
+                        continue;
+                    };
+                    let client = Arc::new(client);
+                    self.clients
+                        .insert(node_id.clone(), (credential, Arc::clone(&client)));
+                    client
+                }
             };
-            let mut cursor = *self.cursors.get(&node_id).unwrap_or(&(0, 0));
-            let mut rows = 0usize;
-            let mut muxes = 0usize;
-            let mut failed = None;
-            let mut completed = false;
-            let mut stable_watermark = None;
-            for page in 0..MAX_PAGES_PER_CYCLE {
-                let request = EpgProgramsRequest {
-                    network_ids: network_ids.clone(),
-                    cursor_updated_at: cursor.0,
-                    cursor_id: cursor.1,
-                    max_updated_at: stable_watermark,
-                    limit: PAGE_LIMIT,
-                    include_coverage: page == 0,
-                };
-                let mut reply = None;
-                let mut last_error = None;
-                for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
-                    match client.fetch_epg_programs(&endpoint.address, &request).await {
-                        Ok(value) => {
-                            reply = Some(value);
-                            break;
-                        }
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                let Some(reply) = reply else {
-                    if let Some(error) = last_error {
-                        if matches!(
-                            error.status(),
-                            Some(
-                                reqwest::StatusCode::NOT_FOUND
-                                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
-                            )
-                        ) {
-                            log::debug!("[node] EPG program sync from {name} is unsupported");
-                        } else {
-                            failed = Some(error.to_string());
-                        }
-                    }
-                    break;
-                };
-                let next = (reply.next_cursor_updated_at, reply.next_cursor_id);
-                if let Some(expected) = stable_watermark {
-                    if reply.max_updated_at != Some(expected) {
-                        failed = Some("peer changed or omitted the EPG sync watermark".into());
-                        break;
-                    }
-                } else {
-                    stable_watermark = reply.max_updated_at;
-                }
-                match apply_reply(&self.database, &network_ids, &reply).await {
-                    Ok((applied, coverage_count)) => {
-                        rows += applied;
-                        muxes += coverage_count;
-                    }
-                    Err(error) => {
-                        failed = Some(error.to_string());
-                        break;
-                    }
-                }
-                cursor = next;
-                if !reply.has_more {
-                    completed = true;
-                    break;
-                }
-                if next == (request.cursor_updated_at, request.cursor_id) {
-                    failed = Some("peer returned an unchanged cursor".into());
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            if completed || rows > 0 {
-                let stored = cursor_after_cycle(cursor, completed, stable_watermark);
+            jobs.push((node_id, name, endpoints, client));
+        }
+
+        let cursors = &self.cursors;
+        let database = &self.database;
+        let network_ids = &network_ids;
+        let outcomes = futures::future::join_all(jobs.iter().map(
+            |(node_id, name, endpoints, client)| async move {
+                let cursor = *cursors.get(node_id).unwrap_or(&(0, 0));
+                let outcome =
+                    sync_peer(database, client, name, endpoints, network_ids, cursor).await;
+                (node_id, name, outcome)
+            },
+        ))
+        .await;
+
+        for (node_id, name, outcome) in outcomes {
+            if let Some(stored) = outcome.stored {
                 self.cursors.insert(node_id.clone(), stored);
-                if rows == 0 {
-                    log::debug!("[node] EPG sync from {name}: 0 rows, {muxes} muxes coverage");
+                if outcome.rows == 0 {
+                    log::debug!(
+                        "[node] EPG sync from {name}: 0 rows, {} muxes coverage",
+                        outcome.muxes
+                    );
                 } else {
-                    log::info!("[node] EPG sync from {name}: {rows} rows, {muxes} muxes coverage");
+                    log::info!(
+                        "[node] EPG sync from {name}: {} rows, {} muxes coverage",
+                        outcome.rows,
+                        outcome.muxes
+                    );
                 }
             }
-            if let Some(error) = failed {
+            if let Some(error) = outcome.failed {
                 log::warn!("[node] EPG sync from {name} failed: {error}");
             }
         }
+    }
+}
+
+async fn sync_peer(
+    database: &DatabaseHandle,
+    client: &NodeTransportClient,
+    name: &str,
+    endpoints: &[NodeEndpoint],
+    network_ids: &[u16],
+    cursor: (i64, i64),
+) -> PeerSyncOutcome {
+    let mut cursor = cursor;
+    let mut rows = 0usize;
+    let mut muxes = 0usize;
+    let mut failed = None;
+    let mut completed = false;
+    let mut stable_watermark = None;
+    for page in 0..MAX_PAGES_PER_CYCLE {
+        let request = EpgProgramsRequest {
+            network_ids: network_ids.to_vec(),
+            cursor_updated_at: cursor.0,
+            cursor_id: cursor.1,
+            max_updated_at: stable_watermark,
+            limit: PAGE_LIMIT,
+            include_coverage: page == 0,
+        };
+        let mut reply = None;
+        let mut last_error = None;
+        for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
+            match client.fetch_epg_programs(&endpoint.address, &request).await {
+                Ok(value) => {
+                    reply = Some(value);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let Some(reply) = reply else {
+            if let Some(error) = last_error {
+                if matches!(
+                    error.status(),
+                    Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED)
+                ) {
+                    log::debug!("[node] EPG program sync from {name} is unsupported");
+                } else {
+                    failed = Some(error.to_string());
+                }
+            }
+            break;
+        };
+        let next = (reply.next_cursor_updated_at, reply.next_cursor_id);
+        if let Some(expected) = stable_watermark {
+            if reply.max_updated_at != Some(expected) {
+                failed = Some("peer changed or omitted the EPG sync watermark".into());
+                break;
+            }
+        } else {
+            stable_watermark = reply.max_updated_at;
+        }
+        match apply_reply(database, network_ids, &reply).await {
+            Ok((applied, coverage_count)) => {
+                rows += applied;
+                muxes += coverage_count;
+            }
+            Err(error) => {
+                failed = Some(error.to_string());
+                break;
+            }
+        }
+        cursor = next;
+        if !reply.has_more {
+            completed = true;
+            break;
+        }
+        if next == (request.cursor_updated_at, request.cursor_id) {
+            failed = Some("peer returned an unchanged cursor".into());
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let stored =
+        (completed || rows > 0).then(|| cursor_after_cycle(cursor, completed, stable_watermark));
+    PeerSyncOutcome {
+        stored,
+        rows,
+        muxes,
+        failed,
     }
 }
 

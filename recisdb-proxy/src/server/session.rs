@@ -3245,53 +3245,62 @@ impl Session {
         self.bytes_since_last += send_data.len() as u64;
 
         // Analyze TS quality for this session.
-        // Encoder/pipe output chunks are not guaranteed to be aligned on 188-byte TS boundaries,
-        // so we keep carry and resync by sync byte before feeding analyzer.
-        self.ts_quality_carry.extend_from_slice(&send_data);
+        // Already-aligned chunks with nothing held back (the common case) go
+        // straight to the analyzer; the carry buffer is only for the rest.
+        let mut delta = crate::tuner::ts_analyzer::TsStreamQualityDelta::default();
+        if self.ts_quality_carry.is_empty()
+            && send_data.len().is_multiple_of(188)
+            && send_data.first() == Some(&0x47)
+        {
+            delta = self.ts_quality_analyzer.analyze(&send_data);
+        } else {
+            // Encoder/pipe output chunks are not guaranteed to be aligned on 188-byte TS boundaries,
+            // so we keep carry and resync by sync byte before feeding analyzer.
+            self.ts_quality_carry.extend_from_slice(&send_data);
 
-        // Best-effort resync if head is not sync byte (0x47)
-        if !self.ts_quality_carry.is_empty() && self.ts_quality_carry[0] != 0x47 {
-            let mut sync_pos: Option<usize> = None;
-            for i in 0..self.ts_quality_carry.len() {
-                if self.ts_quality_carry[i] != 0x47 {
-                    continue;
+            // Best-effort resync if head is not sync byte (0x47)
+            if !self.ts_quality_carry.is_empty() && self.ts_quality_carry[0] != 0x47 {
+                let mut sync_pos: Option<usize> = None;
+                for i in 0..self.ts_quality_carry.len() {
+                    if self.ts_quality_carry[i] != 0x47 {
+                        continue;
+                    }
+
+                    let ok_188 = i + 188 < self.ts_quality_carry.len()
+                        && self.ts_quality_carry[i + 188] == 0x47;
+                    let ok_376 = i + 376 < self.ts_quality_carry.len()
+                        && self.ts_quality_carry[i + 376] == 0x47;
+                    if ok_188 || ok_376 {
+                        sync_pos = Some(i);
+                        break;
+                    }
                 }
 
-                let ok_188 =
-                    i + 188 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 188] == 0x47;
-                let ok_376 =
-                    i + 376 < self.ts_quality_carry.len() && self.ts_quality_carry[i + 376] == 0x47;
-                if ok_188 || ok_376 {
-                    sync_pos = Some(i);
-                    break;
-                }
-            }
-
-            if let Some(pos) = sync_pos {
-                if pos > 0 {
-                    self.ts_quality_carry.drain(0..pos);
-                    // Bytes were discarded mid-stream: the CC baseline per PID
-                    // no longer matches the next packet. Resync without
-                    // counting the unavoidable CC jumps as drops (same
-                    // rationale as the broadcast-Lagged handling).
+                if let Some(pos) = sync_pos {
+                    if pos > 0 {
+                        self.ts_quality_carry.drain(0..pos);
+                        // Bytes were discarded mid-stream: the CC baseline per PID
+                        // no longer matches the next packet. Resync without
+                        // counting the unavoidable CC jumps as drops (same
+                        // rationale as the broadcast-Lagged handling).
+                        self.ts_quality_analyzer.mark_discontinuity();
+                    }
+                } else if self.ts_quality_carry.len() > 188 * 4 {
+                    // Keep a small tail and wait for next chunk to find sync sequence.
+                    let keep = 188 * 4;
+                    let drop_len = self.ts_quality_carry.len() - keep;
+                    self.ts_quality_carry.drain(0..drop_len);
                     self.ts_quality_analyzer.mark_discontinuity();
                 }
-            } else if self.ts_quality_carry.len() > 188 * 4 {
-                // Keep a small tail and wait for next chunk to find sync sequence.
-                let keep = 188 * 4;
-                let drop_len = self.ts_quality_carry.len() - keep;
-                self.ts_quality_carry.drain(0..drop_len);
-                self.ts_quality_analyzer.mark_discontinuity();
             }
-        }
 
-        let mut delta = crate::tuner::ts_analyzer::TsStreamQualityDelta::default();
-        let full_len = self.ts_quality_carry.len() - (self.ts_quality_carry.len() % 188);
-        if full_len >= 188 {
-            delta = self
-                .ts_quality_analyzer
-                .analyze(&self.ts_quality_carry[..full_len]);
-            self.ts_quality_carry.drain(0..full_len);
+            let full_len = self.ts_quality_carry.len() - (self.ts_quality_carry.len() % 188);
+            if full_len >= 188 {
+                delta = self
+                    .ts_quality_analyzer
+                    .analyze(&self.ts_quality_carry[..full_len]);
+                self.ts_quality_carry.drain(0..full_len);
+            }
         }
 
         self.packets_dropped += delta.packets_dropped;
